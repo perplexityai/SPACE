@@ -13,8 +13,7 @@ from space_smoke.registry import Scenario, ScenarioRegistry
 # Unchanged cases use medians from successful Pull CI runs 42857061959,
 # 42864432253 and 42875733181 (2026-11-10, otel, 16-core runners). Exclude
 # the last run's startup-profile shard: its unrelated scenarios did not use
-# standing controller settings. Refusal uses the first two runs, with its
-# ordinary setup/restoration. GC and teardown use 42872494328/42875733181,
+# standing controller settings. GC and teardown use 42872494328/42875733181,
 # after their behavior changed; merged inline has one matching fixed-poll
 # observation from the latter run. Do not mix old holds/separate scenarios
 # into those estimates. These are scheduling hints, not latency guarantees.
@@ -23,6 +22,9 @@ from space_smoke.registry import Scenario, ScenarioRegistry
 # runs at a 45 s window (69 s), plus about 10 s for the 60 s window (15 s
 # more window, less the slack the post-window wait saves by timing from the
 # quarantine). Replace it with the Main CI median once one exists.
+# The leader-election brownout uses the median of three local Kind runs on a
+# 32-CPU host (otel, 2026-11-19), to be replaced by the CI median once CI has
+# run it.
 _DURATION_SECONDS = {
     "ecw": {
         "ecw.access_idle_reconnect_preserves_workspace": 21,
@@ -82,8 +84,7 @@ _DURATION_SECONDS = {
         "local.fork_suspended_cross_node": 14,
         "local.gentle_drain_leaves_sandbox_resident": 29,
         "local.interrupted_suspend_keeps_only_copy_until_discard": 79,
-        "local.leader_election_brownout_keeps_one_leader": 205,
-        "local.leader_election_refusal_does_not_restart": 162,
+        "local.leader_election_brownout_keeps_one_leader": 133,
         "local.node_ctl_fence_refuses_and_reconciles": 10,
         "local.node_group_boundary_schedules": 34,
         "local.node_selector_extras_render_and_enforce": 63,
