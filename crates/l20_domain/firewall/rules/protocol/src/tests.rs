@@ -440,6 +440,28 @@ fn rejects_every_document_outside_the_grammar() {
     }
 }
 
+/// Positions that hold a caller-written token, one per line as in
+/// [`REJECTED`], with `LONG` standing for a 1 MiB token.
+const OVERSIZED: &str = r##"
+left {"payload":{"protocol":"LONG","field":"dport"}}
+left {"payload":{"protocol":"tcp","field":"LONG"}}
+left {"tcp option":{"name":"LONG"}}
+rules {"id":"LONG","all_of":[GOOD]}
+op "LONG"
+right "LONG"
+"##;
+
+/// Catches an error message that quotes an oversized token in full.
+#[test]
+fn an_oversized_token_is_rejected_without_echoing_it() {
+    let long = "a".repeat(1 << 20);
+    for document in documents(OVERSIZED) {
+        let document = document.replace("LONG", &long);
+        let error = decode_revision(&document).unwrap_err().to_string();
+        assert!(error.len() < 200, "{} bytes: {error:.200}", error.len());
+    }
+}
+
 /// A path call resolves to the checked impl, not to a derive that skips it.
 #[test]
 fn a_path_call_reads_through_the_checks() {

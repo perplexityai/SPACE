@@ -49,9 +49,10 @@ pub struct Name(String);
 
 impl<'de> Deserialize<'de> for Name {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Name::new(value.as_str())
-            .map_err(|error| de::Error::custom(format_args!("name {value:?} {error}")))
+        // The error gives the length or the refused character, not the name,
+        // which may be arbitrarily long.
+        Name::new(String::deserialize(deserializer)?)
+            .map_err(|error| de::Error::custom(format_args!("name {error}")))
     }
 }
 
