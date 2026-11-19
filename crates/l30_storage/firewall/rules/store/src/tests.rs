@@ -256,7 +256,8 @@ async fn race(db: &TestDb, rollout: RolloutId, active_limit: u64) -> TestResult<
 
 /// Catches claims that don't serialize on the header or don't count work
 /// already in flight, letting two controllers act on one node or past the
-/// active limit; and a failure budget that stops on an unrelated failure.
+/// active limit; and a failure budget that stops on an unrelated failure, or
+/// an issued node that keeps its slot once it fails.
 #[tokio::test(flavor = "current_thread")]
 async fn racing_controllers_share_one_node_and_one_slot() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(5).await? else {
@@ -274,6 +275,7 @@ async fn racing_controllers_share_one_node_and_one_slot() -> TestResult {
     .bind(failed)
     .execute(&db.pool)
     .await?;
+    issue(&db.pool, rollout, failed, 1, None).await?;
 
     let leased = race(&db, rollout, 10).await?;
     assert_eq!(nodes_of(&leased), [a], "both controllers leased the node");
@@ -396,26 +398,30 @@ async fn after_an_assignment_commits_only_the_issued_canary_is_leased() -> TestR
 }
 
 /// Catches a check treated as due while unscheduled or early, which would
-/// poll a node in a loop or before its rules could have landed, and a check
-/// lease that loses the stamp of what was issued.
+/// poll a node in a loop or before its rules could have landed; a check
+/// lease that loses the stamp of what was issued; new work scanned ahead of
+/// due checks, which could crowd out proof of existing work; and a cap that
+/// doesn't count the first assignments it leases.
 #[tokio::test(flavor = "current_thread")]
 async fn issued_targets_wait_for_their_scheduled_check() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let rollout = rollout(&db.pool, "rolling").await?;
-    let nodes = online_nodes(&db.pool, 4).await?;
+    let nodes = online_nodes(&db.pool, 5).await?;
     let (unissued, unscheduled, future, due) = (nodes[0], nodes[1], nodes[2], nodes[3]);
     save_targets(&db.pool, rollout, &nodes).await?;
     issue(&db.pool, rollout, unscheduled, 1, None).await?;
     issue(&db.pool, rollout, future, 2, Some(3600.0)).await?;
     let issued_at = issue(&db.pool, rollout, due, 3, Some(-1.0)).await?;
 
-    let leased = lease(&db.pool, rollout, 10).await?;
-    assert_eq!(nodes_of(&leased), [unissued, due]);
-    assert_eq!(leased[0].work, Work::FirstAssignment);
+    // The three issued nodes and `unissued` fill the cap of 4: the last
+    // node waits.
+    let leased = lease(&db.pool, rollout, 4).await?;
+    assert_eq!(nodes_of(&leased), [due, unissued]);
+    assert_eq!(leased[1].work, Work::FirstAssignment);
     assert_eq!(
-        leased[1].work,
+        leased[0].work,
         Work::Check {
             assignment_generation: 3,
             issued_at
@@ -424,10 +430,11 @@ async fn issued_targets_wait_for_their_scheduled_check() -> TestResult {
     Ok(())
 }
 
-/// Catches an issued node that keeps its lease slot while it waits for
-/// proof, which would serialize a rolling rollout behind every check.
+/// Catches an issued node that frees its slot before it's done, which would
+/// put more than `active_limit` nodes on an unverified revision, and a due
+/// check that waits for a free slot, which would stall a full rollout.
 #[tokio::test(flavor = "current_thread")]
-async fn in_rolling_a_node_awaiting_its_check_frees_its_slot() -> TestResult {
+async fn in_rolling_a_node_awaiting_its_check_holds_its_slot() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -441,7 +448,25 @@ async fn in_rolling_a_node_awaiting_its_check_frees_its_slot() -> TestResult {
     assert!(lease(&db.pool, rollout, 1).await?.is_empty());
     issue(&db.pool, rollout, a, 1, Some(3600.0)).await?;
     assert!(requeue(&db.pool, &first[0], Requeue::Release).await?);
+    assert!(lease(&db.pool, rollout, 1).await?.is_empty());
 
+    // Due, A is rechecked at the full cap; offline, it still holds the slot.
+    issue(&db.pool, rollout, a, 1, Some(-1.0)).await?;
+    set_status(&db.pool, a, false, 60.0).await?;
+    assert!(lease(&db.pool, rollout, 1).await?.is_empty());
+    set_status(&db.pool, a, true, 60.0).await?;
+    let check = lease(&db.pool, rollout, 1).await?;
+    assert_eq!(nodes_of(&check), [a]);
+    assert!(requeue(&db.pool, &check[0], Requeue::Release).await?);
+
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_rollout_items SET phase = 'done'
+         WHERE rollout_id = $1 AND node_id = $2"
+    ))
+    .bind(rollout)
+    .bind(a)
+    .execute(&db.pool)
+    .await?;
     assert_eq!(nodes_of(&lease(&db.pool, rollout, 1).await?), [b]);
     Ok(())
 }
@@ -729,19 +754,25 @@ async fn a_node_held_elsewhere_doesnt_use_up_the_scan() -> TestResult {
 
 /// Catches a claim that trusts the scan, or rechecks before its row lock: a
 /// node that goes offline or stops being due after it would still be leased
-/// and charged an attempt.
+/// and charged an attempt; and a check that misses there handing its slot to
+/// a first assignment.
 #[tokio::test(flavor = "current_thread")]
 async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
         return Ok(());
     };
     let rollout = rollout(&db.pool, "rolling").await?;
-    let nodes = online_nodes(&db.pool, 4).await?;
-    let (first, offline, not_due, eligible) = (nodes[0], nodes[1], nodes[2], nodes[3]);
+    let nodes = online_nodes(&db.pool, 5).await?;
+    let (first, offline, not_due, eligible, new) =
+        (nodes[0], nodes[1], nodes[2], nodes[3], nodes[4]);
     save_targets(&db.pool, rollout, &nodes).await?;
-    issue(&db.pool, rollout, not_due, 1, Some(-1.0)).await?;
+    // Due checks, so the claim, which scans them first, writes `first` first.
+    // The three fill the cap of 3, so `new` waits even after the misses.
+    for node in [first, not_due, eligible] {
+        issue(&db.pool, rollout, node, 1, Some(-1.0)).await?;
+    }
 
-    // The claim scans all four, then waits to write the first, which goes
+    // The claim scans all five, then waits to write the first, which goes
     // offline during the wait.
     let mut locker = db.pool.begin().await?;
     sqlx::query(sql!(
@@ -756,7 +787,7 @@ async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
     let pool = db.pool.clone();
     let claiming = tokio::spawn(async move {
         let mut conn = pool.acquire().await?;
-        lease_targets(&mut conn, rollout, 10, LEASE, SCAN).await
+        lease_targets(&mut conn, rollout, 3, LEASE, SCAN).await
     });
     wait_for_lock_waiters(&db.pool, 1).await?;
     set_status(&db.pool, first, false, 60.0).await?;
@@ -773,7 +804,7 @@ async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
     locker.commit().await?;
 
     assert_eq!(nodes_of(&claiming.await??), [eligible]);
-    for node in [first, offline, not_due] {
+    for node in [first, offline, not_due, new] {
         assert_eq!(item(&db.pool, rollout, node).await?.0, 0);
         let phase = sqlx::query_scalar::<_, String>(sql!(
             "SELECT phase FROM firewall_rules_rollout_items

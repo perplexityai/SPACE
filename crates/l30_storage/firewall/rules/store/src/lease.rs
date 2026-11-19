@@ -14,9 +14,11 @@
 //! same `UPDATE` that checks `phase = 'in_flight' AND lease_token = $t`; the
 //! claim's canary pin relies on that.
 //!
-//! In rolling, only leases count against `active_limit`: issued targets
-//! awaiting their check free their slot. Nothing here caps them; the
-//! assignment step or the rollout controller must.
+//! In rolling, `active_limit` bounds the nodes leased or holding an
+//! unverified assignment: an issued target keeps its slot until it's done
+//! or failed, even if it never proves, and failing one that can't be reached
+//! is the controller's job. A due check adds no unverified node, so only the
+//! leases in flight bound it.
 //!
 //! A check lease spends an attempt, so repeated lapses can redrive an issued
 //! canary to failed. The pin then holds the rollout in canary, and with no
@@ -70,9 +72,10 @@ pub enum Work {
 }
 
 /// Lease up to `active_limit` of `rollout_id`'s saved targets for `lease`
-/// (clamped by [`clamp_lease`](crate::clamp_lease)), counting those already
-/// leased, from the first `scan_limit` eligible ones in node order. Commits
-/// before it returns.
+/// (clamped by [`clamp_lease`](crate::clamp_lease)), counting those leased
+/// or holding an unverified assignment, from the first `scan_limit` eligible
+/// ones, due checks first, each group in node order. Commits before it
+/// returns.
 ///
 /// A target is eligible while its node is online (reachable, with a status
 /// snapshot that isn't stale) and, once issued, while its check is due. In
@@ -95,6 +98,7 @@ pub async fn lease_targets(
         rollout_id,
         active_limit,
         held: Vec::new(),
+        unverified: 0,
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
     end_transaction(tx, leased).await
@@ -106,6 +110,9 @@ struct Claiming<'c> {
     active_limit: u64,
     /// What `held_elsewhere` read, for `candidates` to skip.
     held: Vec<uuid::Uuid>,
+    /// Nodes leased or holding an unverified assignment, as `candidates`
+    /// counted them, plus the first assignments `claim` has leased since.
+    unverified: u64,
 }
 
 impl FailedItems for Claiming<'_> {
@@ -121,7 +128,8 @@ impl ClaimStore for Claiming<'_> {
     /// Whether the rollout is in canary.
     type Header = bool;
     type Subject = NodeId;
-    type Placement = ();
+    /// Whether the target is a first assignment, which `claim` caps.
+    type Placement = bool;
     type Claimed = LeasedTarget;
 
     async fn lock_leasable(&mut self) -> Result<Option<(bool, Pacing)>, sqlx::Error> {
@@ -206,52 +214,75 @@ impl ClaimStore for Claiming<'_> {
         &mut self,
         &canary: &bool,
         scan_limit: u32,
-    ) -> Result<Candidates<NodeId, ()>, sqlx::Error> {
-        // One statement, so the in-flight count and the pending items come
-        // from one snapshot. The canary pin looks at every item before any
-        // filter: an issued canary that's offline or not due still holds it.
-        // It counts: as an EXISTS, the planner scans every rollout's items.
-        // `held` is excluded before the limit, so it can't fill the scan;
-        // under the exclusive handoff lock it can only shrink.
-        let (in_flight, pending) = sqlx::query_as::<_, (i64, Vec<uuid::Uuid>)>(sql!(
-            "SELECT
-                 (SELECT count(*)
-                  FROM firewall_rules_rollout_items
-                  WHERE rollout_id = $1
-                    AND phase = $2),
-                 ARRAY(SELECT i.node_id
-                       FROM firewall_rules_rollout_items i
-                       JOIN node_status_snapshots nss ON nss.node_id = i.node_id
-                       WHERE i.rollout_id = $1
-                         AND i.phase = $3
-                         AND (NOT $4
-                              OR i.issued_at IS NOT NULL
-                              OR (SELECT count(*)
-                                  FROM firewall_rules_rollout_items issued
-                                  WHERE issued.rollout_id = $1
-                                    AND issued.issued_at IS NOT NULL) = 0)
-                         AND (i.issued_at IS NULL
-                              OR (i.next_check_at IS NOT NULL
-                                  AND i.next_check_at <= clock_timestamp()))
-                         AND nss.reachable
-                         AND nss.stale_after > clock_timestamp()
-                         AND i.node_id <> ALL ($6)
-                       ORDER BY i.node_id
-                       LIMIT $5)"
-        ))
-        .bind(self.rollout_id)
-        .bind(ItemPhase::InFlight.as_str())
-        .bind(ItemPhase::Pending.as_str())
-        .bind(canary)
-        .bind(i64::from(scan_limit))
-        .bind(&self.held)
-        .fetch_one(&mut *self.tx)
-        .await?;
+    ) -> Result<Candidates<NodeId, bool>, sqlx::Error> {
+        // One statement, so the counts and the pending items come from one
+        // snapshot: the leases in flight, and the nodes leased or holding an
+        // unverified assignment. Due checks are scanned first; `OFFSET 0`
+        // keeps the planner from walking every snapshot in node order for
+        // them. The canary pin looks at every item before any filter: an
+        // issued canary that's offline or not due still holds it. It counts:
+        // as an EXISTS, the planner scans every rollout's items. `held` is
+        // excluded before the limits, so it can't fill the scan; under the
+        // exclusive handoff lock it can only shrink.
+        let (in_flight, unverified, due, first) =
+            sqlx::query_as::<_, (i64, i64, Vec<uuid::Uuid>, Vec<uuid::Uuid>)>(sql!(
+                "SELECT
+                     counted.in_flight,
+                     counted.unverified,
+                     ARRAY(SELECT node_id
+                           FROM (SELECT i.node_id
+                                 FROM firewall_rules_rollout_items i
+                                 JOIN node_status_snapshots nss ON nss.node_id = i.node_id
+                                 WHERE i.rollout_id = $1
+                                   AND i.phase = $3
+                                   AND i.issued_at IS NOT NULL
+                                   AND i.next_check_at <= clock_timestamp()
+                                   AND nss.reachable
+                                   AND nss.stale_after > clock_timestamp()
+                                   AND i.node_id <> ALL ($6)
+                                 OFFSET 0) due
+                           ORDER BY node_id
+                           LIMIT $5),
+                     ARRAY(SELECT i.node_id
+                           FROM firewall_rules_rollout_items i
+                           JOIN node_status_snapshots nss ON nss.node_id = i.node_id
+                           WHERE i.rollout_id = $1
+                             AND i.phase = $3
+                             AND i.issued_at IS NULL
+                             AND (NOT $4
+                                  OR (SELECT count(*)
+                                      FROM firewall_rules_rollout_items issued
+                                      WHERE issued.rollout_id = $1
+                                        AND issued.issued_at IS NOT NULL) = 0)
+                             AND nss.reachable
+                             AND nss.stale_after > clock_timestamp()
+                             AND i.node_id <> ALL ($6)
+                           ORDER BY i.node_id
+                           LIMIT $5)
+                 FROM (SELECT count(*) FILTER (WHERE phase = $2) AS in_flight,
+                              count(*) AS unverified
+                       FROM firewall_rules_rollout_items
+                       WHERE rollout_id = $1
+                         AND (phase = $2
+                              OR (phase = $3 AND issued_at IS NOT NULL))) counted"
+            ))
+            .bind(self.rollout_id)
+            .bind(ItemPhase::InFlight.as_str())
+            .bind(ItemPhase::Pending.as_str())
+            .bind(canary)
+            .bind(i64::from(scan_limit))
+            .bind(&self.held)
+            .fetch_one(&mut *self.tx)
+            .await?;
+        self.unverified = u64::try_from(unverified).unwrap_or(0);
         Ok(Candidates {
             in_flight: u64::try_from(in_flight).unwrap_or(0),
-            pending: pending
+            pending: due
                 .into_iter()
-                .map(|node| (NodeId::from_uuid(node), ()))
+                .map(|node| (node, false))
+                .chain(first.into_iter().map(|node| (node, true)))
+                .take(scan_limit as usize)
+                .map(|(node, first)| (NodeId::from_uuid(node), first))
                 .collect(),
         })
     }
@@ -260,10 +291,15 @@ impl ClaimStore for Claiming<'_> {
         &mut self,
         _canary: &bool,
         node_id: NodeId,
-        _placement: &(),
+        &first_assignment: &bool,
         lease_token: uuid::Uuid,
         lease: Duration,
     ) -> Result<Option<LeasedTarget>, sqlx::Error> {
+        // Only a first assignment adds an unverified node. Counted here, so a
+        // check that misses below can't hand its slot to one.
+        if first_assignment && self.unverified >= self.active_limit {
+            return Ok(None);
+        }
         // The online and due filters of `candidates` again, since either can
         // change after the scan; a miss spends no attempt. The canary pin
         // needs no recheck: under the header lock nothing of this rollout is
@@ -313,6 +349,9 @@ impl ClaimStore for Claiming<'_> {
         let Some((attempts, generation, issued_at)) = claimed else {
             return Ok(None);
         };
+        if first_assignment {
+            self.unverified += 1;
+        }
         // The schema keeps these non-negative and the stamp's pair together;
         // report a violation as a decode error rather than guess.
         let rollout_id = self.rollout_id;
