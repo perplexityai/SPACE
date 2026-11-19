@@ -6975,6 +6975,8 @@ dependencies = [
  "pplx-space-execution-common",
  "pplx-space-execution-spec",
  "pplx-space-file-io",
+ "pplx-space-firewall-rules-model",
+ "pplx-space-firewall-rules-protocol",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-rate-limiter",
  "pplx-space-grpc-server",
