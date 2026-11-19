@@ -125,7 +125,7 @@ a builder capacity failure does not hold up unrelated work.
 
 `scripts/space-rollout-mng.py` moves sandboxes from a source MNG to a target
 MNG through the cluster-controller drain reconciler, which evacuates each
-sandbox onto the target instead of evicting it. Target nodes register with a
+sandbox onto the target instead of evicting it. The target MNG declares a
 cohort taint that only evacuation pods tolerate. As each source node
 terminates, the script removes the taint from one Ready target node, which
 then accepts user creates; it always keeps `H` Ready target nodes tainted
@@ -150,8 +150,12 @@ time to become Ready.
 The target must carry the `space.pplx.net/rollout-cohort` taint and its
 matching node label, as `rollout-mng` declares them. The script refuses to
 start drains when target nodes lack the taint at startup, but it does not
-re-check the taints of target nodes that register later. Check that each
-new target node carries the taint as it joins during the rollout. Use a
+re-check the taints of target nodes that join later. For a custom-AMI node
+group, EKS applies node group taints after the node registers, unless the
+bootstrap passes them to kubelet with `--register-with-taints`; the shared
+worker bootstrap does not. A new target node can therefore accept a user
+pod before its taint arrives, and an operator check cannot close that
+window. Use a
 `rollout-mng` or
 `workers_rollout_cohorts` target. A `worker_capacity_groups` entry does not
 set either today, so it can be a rollout source but not a target.
