@@ -190,8 +190,7 @@ reviews:
     - writing, reconciling, uploading, backing up, or restoring sandboxes,
     snapshots, volumes, or their rows, or locking, cancellation, retries,
     timeouts, or failure handling around it;
-    - SQL in crates/l30_storage, or a domain rule in crates/l20_domain
-    (including the `*-model` crates that took common-core's types);
+    - SQL in crates/l30_storage, or a domain rule in crates/l20_domain;
     - code several services link;
     - any other untested behavior change outside ui/.
     Evidence is what Validation reports for this head, trusted once the named
