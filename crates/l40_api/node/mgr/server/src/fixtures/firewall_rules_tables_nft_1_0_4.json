@@ -1,0 +1,1 @@
+{"nftables": [{"metainfo": {"version": "1.0.4", "release_name": "Lester Gooch #3", "json_schema_version": 1}}, {"table": {"family": "ip", "name": "space_firewall_rules", "handle": 2}}]}

@@ -58,6 +58,15 @@ fn exprs(listing: &mut Value, index: usize) -> &mut Vec<Value> {
     rule(listing, index)["expr"].as_array_mut().unwrap()
 }
 
+/// The tables nft lists in the family while the owned table exists.
+fn tables() -> Value {
+    json!({"nftables": [
+        {"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}},
+        {"table": {"family": "ip", "name": "sandbox", "handle": 1}},
+        {"table": {"family": "ip", "name": "space_firewall_rules", "handle": 2}},
+    ]})
+}
+
 /// An edit to the hand-written [`listing`].
 type Change = fn(&mut Value);
 
@@ -75,15 +84,47 @@ fn listed(stdout: &[u8]) -> io::Result<Output> {
     })
 }
 
-// Catches a verifier that accepts a table differing from the revision or
-// SPACE's placement, or that rejects a table differing only in handles.
+// Catches a verifier that accepts an absent table or one differing from the
+// revision or SPACE's placement, or that rejects a table differing only in
+// handles or in nft 1.0.4's listing, the Amazon Linux 2023 version.
 #[test]
 fn every_semantic_drift_is_a_mismatch() {
-    let judged = |stdout: &[u8]| observed(&revision(), listed(stdout));
+    let tables_text = tables().to_string();
+    let judged = |stdout: &[u8]| {
+        observed(&revision(), listed(tables_text.as_bytes()), || {
+            listed(stdout)
+        })
+    };
     assert_eq!(
         judged(listing().to_string().as_bytes()),
         Verification::Match
     );
+    assert_eq!(
+        observed(
+            &revision(),
+            listed(include_bytes!(
+                "../../../fixtures/firewall_rules_tables_nft_1_0_4.json"
+            )),
+            || listed(include_bytes!(
+                "../../../fixtures/firewall_rules_table_nft_1_0_4.json"
+            )),
+        ),
+        Verification::Match
+    );
+    for absent in [
+        json!([]),
+        json!([{"table": {"family": "ip", "name": "sandbox"}}]),
+    ] {
+        let mut tables = tables();
+        objects(&mut tables).splice(1.., absent.as_array().unwrap().clone());
+        let verification = observed(&revision(), listed(tables.to_string().as_bytes()), || {
+            panic!("listed a table the tables listing did not hold")
+        });
+        assert!(
+            matches!(verification, Verification::Mismatch(_)),
+            "{tables}: {verification:?}"
+        );
+    }
     let renumbered = changed(|listing| {
         for (index, kind, handle) in [
             (1, "table", 7),
@@ -169,9 +210,38 @@ fn unreadable_or_unsupported_listings_are_inconclusive() {
         })
     };
     let text = listing().to_string();
+    let tables_text = tables().to_string();
+    let present = || listed(tables_text.as_bytes());
+    let unlisted =
+        || -> io::Result<Output> { panic!("listed the table after a failed tables listing") };
+    let tables_cases = [
+        (
+            "tables command failure",
+            Err(io::Error::from(io::ErrorKind::NotFound)),
+        ),
+        ("tables timeout", Err(io::Error::from(io::ErrorKind::TimedOut))),
+        ("tables exit", failed(1, "Error: Operation not permitted")),
+        ("malformed tables JSON", listed(b"table ip space_firewall_rules")),
+        (
+            "non-table object",
+            listed(&changed(|l| objects(l).truncate(3))),
+        ),
+        (
+            "nameless table",
+            listed(br#"{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"ip"}}]}"#),
+        ),
+    ];
+    for (case, tables) in tables_cases {
+        let verification = observed(&revision(), tables, unlisted);
+        assert!(
+            matches!(verification, Verification::Inconclusive(_)),
+            "{case}: {verification:?}"
+        );
+    }
+
     let cases = [
         (
-            "absent table",
+            "table removed after the tables listing",
             failed(
                 1,
                 "Error: No such file or directory\nlist table ip space_firewall_rules\n",
@@ -213,7 +283,7 @@ fn unreadable_or_unsupported_listings_are_inconclusive() {
         ),
     ];
     for (case, listed) in cases {
-        let verification = observed(&revision(), listed);
+        let verification = observed(&revision(), present(), || listed);
         assert!(
             matches!(verification, Verification::Inconclusive(_)),
             "{case}: {verification:?}"

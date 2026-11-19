@@ -12,42 +12,79 @@ use serde_json::{Map, Value, json};
 
 use super::{CHAIN, FAMILY, PRIORITY, TABLE, rule_comment};
 
-/// What one fresh listing of the owned table showed, for this namespace only.
+/// What fresh listings of the owned table showed, for this namespace only.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verification {
     Match,
-    /// Linux listed the table, and it breaks the contract.
+    /// Linux listed no owned table, or one that breaks the contract.
     Mismatch(String),
     /// The table could not be read or understood, so it may or may not match.
     Inconclusive(String),
 }
 
 pub fn verify(revision: &FirewallRuleRevision, netns: &File) -> Verification {
-    let listed = crate::net::command_output_in_pinned_ns(
-        netns,
-        "nft",
-        &["-j", "list", "table", FAMILY, TABLE],
-        &[],
-        crate::host_command::PROBE_BUDGET,
-    );
-    observed(revision, listed)
+    let list = |args: &[&str]| {
+        crate::net::command_output_in_pinned_ns(
+            netns,
+            "nft",
+            args,
+            &[],
+            crate::host_command::PROBE_BUDGET,
+        )
+    };
+    observed(revision, list(&["-j", "list", "tables", FAMILY]), || {
+        list(&["-j", "list", "table", FAMILY, TABLE])
+    })
 }
 
-fn observed(revision: &FirewallRuleRevision, listed: io::Result<Output>) -> Verification {
-    let output = match listed {
-        Ok(output) => output,
-        Err(error) => return inconclusive(format!("nft did not complete: {error}")),
-    };
-    // An absent table also fails here; telling it apart would mean parsing
-    // nft's error text.
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return inconclusive(format!("nft {}: {}", output.status, stderr.trim()));
-    }
-    match check(revision, &output.stdout) {
+/// Lists the table only once the family's tables include it, so an absent
+/// table is told apart from a failed command without reading nft's errors.
+fn observed(
+    revision: &FirewallRuleRevision,
+    tables: io::Result<Output>,
+    table: impl FnOnce() -> io::Result<Output>,
+) -> Verification {
+    let checked = stdout(tables)
+        .and_then(|tables| owned_table_listed(&tables))
+        .and_then(|listed| {
+            if listed {
+                stdout(table())
+            } else {
+                Err(mismatch(format!("no table {FAMILY} {TABLE}")))
+            }
+        })
+        .and_then(|table| check(revision, &table));
+    match checked {
         Ok(()) => Verification::Match,
         Err(verification) => verification,
     }
+}
+
+fn stdout(listed: io::Result<Output>) -> Result<Vec<u8>, Verification> {
+    let output = listed.map_err(|error| inconclusive(format!("nft did not complete: {error}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(inconclusive(format!(
+            "nft {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn owned_table_listed(stdout: &[u8]) -> Result<bool, Verification> {
+    let mut listed = false;
+    for object in listed_objects(stdout)? {
+        let Some(("table", body)) = object.as_object().and_then(single) else {
+            return Err(inconclusive(format!("{object} is not a table")));
+        };
+        let (Some(family), Some(name)) = (body["family"].as_str(), body["name"].as_str()) else {
+            return Err(inconclusive(format!("table {body} has no family or name")));
+        };
+        listed |= (family, name) == (FAMILY, TABLE);
+    }
+    Ok(listed)
 }
 
 fn mismatch(detail: impl Into<String>) -> Verification {
@@ -58,7 +95,8 @@ fn inconclusive(detail: impl Into<String>) -> Verification {
     Verification::Inconclusive(detail.into())
 }
 
-fn check(revision: &FirewallRuleRevision, stdout: &[u8]) -> Result<(), Verification> {
+/// The objects one nft JSON listing holds after its schema version 1 metainfo.
+fn listed_objects(stdout: &[u8]) -> Result<Vec<Value>, Verification> {
     let listing: Value = serde_json::from_slice(stdout)
         .map_err(|error| inconclusive(format!("listing is not JSON: {error}")))?;
     let objects = match listing.as_object().and_then(single) {
@@ -72,8 +110,12 @@ fn check(revision: &FirewallRuleRevision, stdout: &[u8]) -> Result<(), Verificat
         Some(("metainfo", body)) if body.get("json_schema_version") == Some(&json!(1)) => {}
         _ => return Err(inconclusive("no metainfo for JSON schema version 1")),
     }
+    Ok(objects.to_vec())
+}
+
+fn check(revision: &FirewallRuleRevision, stdout: &[u8]) -> Result<(), Verification> {
     let (mut tables, mut chains, mut rules) = (Vec::new(), Vec::new(), Vec::new());
-    for object in objects {
+    for object in &listed_objects(stdout)? {
         let Some((kind, body)) = object.as_object().and_then(single) else {
             return Err(inconclusive(format!("{object} is not a single object")));
         };

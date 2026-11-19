@@ -56,10 +56,7 @@ fn live_tables_match_only_their_revision() {
     let netns = pinned(&target);
     let empty = decoded(&[]);
     let both = decoded(&[DNS, WEB]);
-    assert!(matches!(
-        verify(&empty, &netns),
-        Verification::Inconclusive(_)
-    ));
+    assert!(matches!(verify(&empty, &netns), Verification::Mismatch(_)));
 
     committed(&render(&empty), &netns);
     assert_eq!(verify(&empty, &netns), Verification::Match);
@@ -150,16 +147,21 @@ fn verified_table_drops_denied_and_established_traffic_only() {
     sender.send_to(b"allowed", "10.0.0.1:54").unwrap();
     let received = allowed.recv(&mut buffer).unwrap();
     assert_eq!(&buffer[..received], b"allowed");
-    // The allowed datagram went last on the same link, so the dropped traffic
-    // would have arrived by now.
+    // The allowed datagram left the same socket last over the same link, so
+    // the denied one would have arrived by now.
     denied.set_nonblocking(true).unwrap();
-    server.set_nonblocking(true).unwrap();
     assert_eq!(
         denied.recv(&mut buffer).unwrap_err().kind(),
         ErrorKind::WouldBlock
     );
-    assert_eq!(
-        server.read(&mut buffer).unwrap_err().kind(),
-        ErrorKind::WouldBlock
+    // TCP keeps no order with those datagrams, so wait for the segment instead:
+    // delivered, it arrives well within the bound, retransmission included.
+    server
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let error = server.read(&mut buffer).unwrap_err();
+    assert!(
+        matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+        "{error}"
     );
 }
