@@ -207,7 +207,8 @@ fn sorted(mut nodes: Vec<NodeId>) -> Vec<NodeId> {
 /// Catches a start that adopts its candidate or writes delivery state, saves
 /// the wrong header or targets, or answers a repeated request with
 /// a second rollout or a stored success; a slot check that misses an
-/// unfinished phase or runs after the targets are judged.
+/// unfinished phase, or runs after the targets are judged or before the
+/// precondition.
 #[tokio::test(flavor = "current_thread")]
 async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -268,6 +269,13 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
             "{phase}: {repeated:?}"
         );
     }
+    let saved = state(pool).await?;
+    let stale = start(pool, AdoptedRevision::NoRevision, &candidate).await;
+    assert!(
+        matches!(stale, Err(StartError::Stale { adopted }) if adopted == a),
+        "{stale:?}"
+    );
+    assert_eq!(state(pool).await?, saved);
     Ok(())
 }
 
