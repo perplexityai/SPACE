@@ -172,7 +172,7 @@ or (package(pplx-space-node-mgr) and test(=service::prepared_rootfs::tests::prep
 or (package(pplx-space-node-mgr) and test(/::startup_containment::tests::linux::linux_containment_benchmark$/))
 or (package(pplx-space-node-mgr) and test(=firewall::tests::linux::reinstall_over_a_leftover_sandbox_table_fails_whole))
 or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::install_creates_and_replaces_only_the_owned_table))
-or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::rejected_replacement_keeps_the_previous_table))
+or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::late_kernel_refusal_leaves_the_previous_table))
 or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::timeout_after_dispatch_is_unknown_and_reaps_the_child))
 or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_service_uids_can_exchange_downloads))
 or (package(pplx-space-sbx-mgr) and test(=snapshot_upload::tests::volume_manager_reads_deferred_metadata_through_the_shared_cache_group))

@@ -102,9 +102,10 @@ fn install_creates_and_replaces_only_the_owned_table() {
 }
 
 // Catches a replacement split into separate delete and rebuild commits: a
-// late kernel refusal must leave the old table and its handles in place.
+// late kernel refusal must leave the old table and its handles in place. This
+// is the usual Rejected case, not a promise Rejected makes.
 #[test]
-fn rejected_replacement_keeps_the_previous_table() {
+fn late_kernel_refusal_leaves_the_previous_table() {
     if !pplx_space_test_env::root_or_skip(PRIVILEGE) {
         return;
     }
