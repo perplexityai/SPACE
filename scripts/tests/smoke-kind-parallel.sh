@@ -250,9 +250,14 @@ inside_checkout() {
   [[ "$1" == "$repo" || "$1" == "$repo"/* ]]
 }
 inside_checkout "$KIND_BENCH_ROOT" && die "SPACE_KIND_BENCH_ROOT must be outside the checkout: $KIND_BENCH_ROOT"
+# The default output directory is a run ID under OUT_PARENT, checked here
+# because the run ID needs N, which comes after the stale-bench cleanup.
+OUT_PARENT="$(realpath -m -- "$HOME/.space-devbox/kind-parallel")"
 if [[ -n "$OUT" ]]; then
   OUT="$(realpath -m -- "$OUT")"
   inside_checkout "$OUT" && die "--out must be outside the checkout: $OUT"
+elif [[ "$COMMAND" == run ]] && inside_checkout "$OUT_PARENT"; then
+  die "the default output directory $OUT_PARENT is inside the checkout; pass --out outside it"
 fi
 kind_bench_lock
 if [[ "$COMMAND" == teardown ]]; then
@@ -365,7 +370,7 @@ if [[ -z "$BENCHES" ]]; then
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-n${BENCHES}"
-OUT="${OUT:-$HOME/.space-devbox/kind-parallel/$RUN_ID}"
+OUT="${OUT:-$OUT_PARENT/$RUN_ID}"
 # An earlier run's host/<step>.ok markers would satisfy this run's waits.
 if [[ -d "$OUT" && -n "$(ls -A "$OUT" 2>/dev/null)" ]]; then
   die "--out $OUT is not empty; give each run a directory of its own"
