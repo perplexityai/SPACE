@@ -40,6 +40,21 @@ impl Drop for TestNamespace {
     }
 }
 
+/// Runs `f` on a thread moved into a fresh network namespace, which threads
+/// and processes `f` starts inherit: a missed namespace entry must land in a
+/// throwaway namespace, not the runner's.
+pub(crate) fn contained<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).expect("unshare runs");
+                f()
+            })
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 pub(crate) fn ip(args: &[&str]) {
     let output = std::process::Command::new("ip")
         .args(args)

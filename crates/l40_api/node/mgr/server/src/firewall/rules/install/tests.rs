@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use super::{InstallOutcome, install, submit};
 use crate::firewall::rules::{TableConstruction, render};
 use crate::firewall::{apply_nft_json, nft_output};
-use crate::netns_tests::TestNamespace;
+use crate::netns_tests::{TestNamespace, contained};
 
 const PRIVILEGE: &str = "create network namespaces and nftables tables";
 
@@ -61,21 +61,6 @@ fn as_added(listing: Value) -> Vec<Value> {
         added.push(json!({"add": object}));
     }
     added
-}
-
-/// Runs `f` on a thread moved into a fresh network namespace. Threads and
-/// processes `f` starts inherit it, so a call that never enters its target
-/// changes that namespace rather than the runner's.
-fn contained<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-                f()
-            })
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
 }
 
 fn committed(construction: &TableConstruction, netns: &File) {
