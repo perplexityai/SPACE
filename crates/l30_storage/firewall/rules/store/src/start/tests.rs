@@ -509,11 +509,13 @@ async fn the_whole_candidate_is_validated_and_stored_exactly() -> TestResult {
     set_phase(pool, started.rollout_id, "aborted").await?;
 
     let past_limit = revision(&[dns(), rule("big", &[("tcp", "dport", u64::MAX)])]);
+    let saved = state(pool).await?;
     let invalid = start(pool, a, &past_limit).await;
     assert!(
         matches!(invalid, Err(StartError::Invalid(_))),
         "{invalid:?}"
     );
+    assert_eq!(state(pool).await?, saved);
     // `web` is unchanged from A, and one target can't enforce it.
     let pinned = Fixture {
         incompatible: Some((nodes[1], id("web"))),
