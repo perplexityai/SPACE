@@ -2,12 +2,13 @@
 // cluster controller's drain v2 config, its replicas, and a fake EC2
 // instance for each worker a v2 drain runs on.
 //
-// The API serves `:drain {engine: v2}` on Kind (values-kind.yaml turns
-// SPACE_DRAIN_V2_ENABLED on), but only the cluster controller's v2 loop moves
-// such a drain along, and it runs with SPACE_DRAIN_V2_ENABLED and the `aws`
-// terminator, against Kind's fake EC2. A v2 drain also needs the node's EC2
-// instance recorded, so its worker is re-registered under a fake AWS
-// providerID first. This is the approach of `space_smoke/drain_v2.py`
+// Kind's values turn SPACE_DRAIN_V2_ENABLED on for the API, which serves
+// `:drain {engine: v2}`, and for the cluster controller, whose v2 loop moves
+// such a drain along; a run only checks it. The loop terminates a node, and
+// asks EC2 about its instance, only under the `aws` terminator, against
+// Kind's fake EC2, which a run turns on for itself: Kind's v1 drains run
+// `kube-delete`. A v2 drain also needs the node's EC2 instance recorded, so
+// its worker is re-registered under a fake AWS providerID first. This is the approach of `space_smoke/drain_v2.py`
 // (`v2_controller`, `give_fake_instance`), under the same cluster-visible
 // Leases, so a loop and a smoke never change the controller or cordon
 // workers at once.
@@ -23,9 +24,10 @@ const KUBELET_FLAGS = '/var/lib/kubelet/kubeadm-flags.env';
 const CONTEXT = /^kind-[a-z0-9][a-z0-9-]*$/;
 const NODE_NAME = /^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/;
 
+// The drain v2 switch Kind's values render on the controller; read, never written.
+export const DRAIN_V2_SWITCH = 'SPACE_DRAIN_V2_ENABLED';
 // The controller env a v2 run scopes to itself, and the only keys it touches.
 export const V2_CONTROLLER_ENV: Record<string, string> = {
-  SPACE_DRAIN_V2_ENABLED: 'true',
   SPACE_NODE_DRAIN_TERMINATOR_KIND: 'aws',
 };
 export const V2_CONTROLLER_KEYS = Object.keys(V2_CONTROLLER_ENV);
@@ -214,8 +216,17 @@ export class KindV2Control {
   }
 
   controllerEnv(): Record<string, string | null> {
+    return this.controllerLiterals(V2_CONTROLLER_KEYS);
+  }
+
+  // The controller's SPACE_DRAIN_V2_ENABLED, as the bench's values rendered it.
+  drainV2Switch(): string | null {
+    return this.controllerLiterals([DRAIN_V2_SWITCH])[DRAIN_V2_SWITCH];
+  }
+
+  private controllerLiterals(keys: readonly string[]): Record<string, string | null> {
     const env = this.kubectl('get', 'deploy', this.controllerDeployment(), '-o', 'jsonpath={.spec.template.spec.containers[0].env}');
-    return envLiterals(JSON.parse(env || '[]'), V2_CONTROLLER_KEYS);
+    return envLiterals(JSON.parse(env || '[]'), keys);
   }
 
   // Writes `values` to the controller's env and waits for its rollout; a

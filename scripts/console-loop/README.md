@@ -193,10 +193,11 @@ on a real Kind worker. The API serves them on Kind, but only the cluster
 controller's v2 loop moves one along, and a v2 drain needs the node's EC2
 instance recorded, so `nodes-v2-setup` does what `space_smoke`'s drain v2
 scenarios do, with `kubectl` and `docker` through `--kube-context`: it takes
-the smokes' controller and worker-cordon Leases, records the controller's
-standing `SPACE_DRAIN_V2_ENABLED` and `SPACE_NODE_DRAIN_TERMINATOR_KIND` and
-its replicas in `out/drain-v2-standing.json`, turns the v2 loop on with the
-`aws` terminator (against Kind's fake EC2) and waits for the rollout, and
+the smokes' controller and worker-cordon Leases, checks that the bench's
+values turn `SPACE_DRAIN_V2_ENABLED` on for the controller, records its
+standing `SPACE_NODE_DRAIN_TERMINATOR_KIND` and its replicas in
+`out/drain-v2-standing.json`, turns the `aws` terminator on (against Kind's
+fake EC2; Kind's v1 drains run `kube-delete`) and waits for the rollout, and
 re-registers each worker that holds no sandbox under a fake AWS providerID,
 waiting until the node's preview no longer names its instance unrecorded.
 `nodes-v2-teardown` puts the recorded config back and releases the Leases;
@@ -216,13 +217,15 @@ loop's own API client, outside the page, so that the node answers the page
 receives are the console's own:
 
 - `node-v2-drain-now` starts a v2 drain with the hold Now (`hold_seconds:
-  0`), follows the empty worker to `drained`, shows Terminate's refusals
-  (the two v2 refusals as the API words them, answered by the step, and the
-  API's own phase refusal for a terminate sent after an undrain), and waits
-  for the undrain's cancel to finish;
+  0`), follows the empty worker to `drained`, shows the API's own phase
+  refusal for a terminate sent after an undrain (`:terminate` refuses a v2
+  node only on its phase), and waits for the undrain's cancel to finish;
 - `node-v2-hold-shorten-undrain` places one running sandbox on the worker,
-  starts with a custom hold of 600 s, checks the panel and the nodes-list
-  cell, previews the sealed node, shows that Shorten hold refuses a longer
+  starts with a custom hold of 600 s, waits for the controller to store the
+  node's report under the drain's generation (the API doesn't show the seal),
+  checks the panel and the nodes-list cell, shows the API's 409
+  `drain_v2_in_progress` for a preview of the drained node, shows that
+  Shorten hold refuses a longer
   hold before sending it, shortens the hold to 300 s and follows the deadline
   there, gets the API's 409 for a shorten a stale page sends
   after another client shortened the drain, the API's 400 for `mode` beside
@@ -235,10 +238,27 @@ receives are the console's own:
   heartbeat's 409 and the switched-off 400, each answered by the step with
   the API's body;
 - `node-v2-states` renders states the stack can't be put in on demand from
-  the node's own answer with its drain fields changed: terminating, a v2
-  drain whose progress the API left out, an unknown phase and engine, a
-  malformed and an unrecognized report, the nodes list with a malformed one,
-  and a node the drain let go (404).
+  the node's own answer with its drain fields changed: terminating with the
+  instance fenced, a v2 drain whose progress the API left out, an unknown
+  phase and engine, a malformed and an unrecognized report, a node the
+  controller's fresh terminate check returned to `drained` with why in
+  `drain_last_error`, the nodes list with a malformed one, and a node the
+  drain let go (404);
+- `node-drain-progress` places two running sandboxes and a paused one on
+  the worker (a v2 drain refuses a node that holds a stopped sandbox),
+  drains it with a hold of 150 s, and at each stage (held until the
+  deadline, the paused one evacuated at once, past the
+  deadline, every one evacuated, `drained`) checks the Drain progress panel
+  against the answer the page rendered it from (its headline, the counts
+  from `evacuated_total` and the report, each pending row's wait, `running`
+  and warm-pool label, each evacuated row) and each sandbox's own row
+  against that answer, and at `drained` that every resident is counted,
+  a released one through `evacuated_total`; a warm-pool member, stalled
+  (past the deadline, 15 minutes after `evacuated_grew_at`) and cancelling
+  are that answer with the fields that make each set by the step. It writes
+  every report it read to
+  `node-drain-progress-timeline.json` in the run directory and deletes the
+  sandboxes at the end.
 
 A step that answers the page itself notes `SYNTHETIC:` and what it answered.
 
@@ -292,7 +312,7 @@ also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 [--max-seconds N]` cuts that recording into one GIF per step,
 `<run>/gifs/<NNN>-<step>.gif`, with `ffmpeg`; a step longer than
 `--max-seconds` (40) plays faster so its GIF lasts that long, and
-`gifs/cuts.json` says by how much.  `npm run typecheck` and `npm test` (unit
+`gifs/cuts.json` says by how much. Run `npm run typecheck` and `npm test` (unit
 tests that need no stack) after changing the scripts; the SPACE Guide job of
 Pull CI runs both. The tool lives under `scripts/`, outside the paths that
 select the Kind smoke (`ci/kind-pull-paths.txt`) and outside `ui/`'s build.

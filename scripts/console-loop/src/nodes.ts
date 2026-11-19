@@ -216,91 +216,156 @@ export function previewResultsMismatches(
 // `sbx_` prefix and dashes.
 export const bareSandboxId = (id: string): string => id.trim().toLowerCase().replace(/^sbx_/, '').replaceAll('-', '');
 
-// The admin node response's `drain` (`AdminNodeDrain`), as the steps read it.
+// The admin node response's `drain` (`AdminNodeDrain` in the admin
+// protocol), as the steps read it. The node's seal isn't shown: a report
+// stored under `generation` (`reported_at` set) is what the API shows of it.
 export interface ApiDrain {
-  epoch: number;
+  generation: number;
   deadline: string | null;
-  sealed: boolean;
   cancelling: boolean;
-  waiting_for_slot?: boolean;
-  done: boolean;
+  fenced: boolean;
   reported_at: string | null;
-  stalled_since: string | null;
+  evacuated_grew_at: string | null;
+  evacuated_total: string[];
   evacuated: { sandbox_id: string; artifact_kind: string; was_running: boolean; recorded: boolean }[];
-  pending: { sandbox_id: string; action: string; reason: string | null; since: string | null }[];
+  pending: { sandbox_id: string; wait: string; running: boolean; pool_member: boolean; reason: string | null; since: string | null }[];
   blocked: { reason: string }[];
 }
+
+// The wait a pending entry has while the drain keeps it running until its
+// deadline.
+export const HOLD_WAIT = 'hold';
 
 // What the node page's Drain progress panel shows, read from its card.
 export interface PanelRead {
   // Every tag in the card's header row, in order: the headline first.
   tags: string[];
   text: string;
-  pending: { sandbox: string; action: string; state: string }[];
+  // Each pending row: its sandbox, whether it is labelled a warm-pool
+  // member, its wait and whether it is marked running, and its State cell.
+  pending: { sandbox: string; pool: boolean; wait: string; running: boolean; state: string }[];
   evacuated: { sandbox: string; artifact: string; wasRunning: string; controller: string }[];
 }
 
-// The stage of a v2 drain, from the API's answer at `nowMs`, by the design:
-// cancelling and done first, then waiting for a slot, then the deadline.
-export type DrainStage = 'cancelling' | 'done' | 'waiting_for_slot' | 'holding' | 'past_deadline' | 'unacknowledged';
+// How long past its deadline a drain may evacuate nothing further before it
+// is stalled (`STALL_BOUND_MS` in `ui/src/lib/drain-progress.ts`).
+export const STALL_BOUND_MS = 15 * 60 * 1000;
+
+const msOf = (iso: string | null | undefined): number | null => {
+  if (!iso) return null;
+  const parsed = Date.parse(iso);
+  return Number.isNaN(parsed) ? null : parsed;
+};
+
+// The drain is past its deadline at `nowMs`; one without a deadline holds
+// nothing.
+const pastDeadline = (drain: Pick<ApiDrain, 'deadline'>, nowMs: number): boolean => {
+  const deadline = msOf(drain.deadline);
+  return deadline === null || nowMs >= deadline;
+};
+
+// The node's last report lists nothing pending or blocked, and every
+// evacuation it lists is recorded. A drain with no report yet isn't.
+export function drainFinished(drain: ApiDrain): boolean {
+  return drain.reported_at !== null && drain.pending.length === 0 && drain.blocked.length === 0 && drain.evacuated.every((e) => e.recorded);
+}
+
+// The panel's counts: evacuated is every sandbox the controller recorded in
+// this drain (`evacuated_total`, a released one included) with the ones the
+// last report lists; pending each sandbox the report still lists, once.
+export function drainCountsOf(drain: Pick<ApiDrain, 'evacuated' | 'evacuated_total' | 'pending' | 'blocked'>): {
+  evacuated: number; recording: number; pending: number; held: number; poolMembers: number; total: number; blocked: number;
+} {
+  const evacuated = new Set([...drain.evacuated_total, ...drain.evacuated.map((e) => e.sandbox_id)].map(bareSandboxId));
+  const waits = new Map<string, string[]>();
+  const pool = new Set<string>();
+  for (const entry of drain.pending) {
+    const id = bareSandboxId(entry.sandbox_id);
+    if (evacuated.has(id)) continue;
+    waits.set(id, [...(waits.get(id) ?? []), entry.wait]);
+    if (entry.pool_member) pool.add(id);
+  }
+  return {
+    evacuated: evacuated.size,
+    recording: drain.evacuated.filter((e) => !e.recorded).length,
+    pending: waits.size,
+    held: [...waits.values()].filter((list) => list.every((w) => w === HOLD_WAIT)).length,
+    poolMembers: pool.size,
+    total: evacuated.size + waits.size,
+    blocked: drain.blocked.length,
+  };
+}
+
+// When the drain became stalled, in ms, or null while it isn't: past its
+// deadline, unfinished and not cancelling, with nothing evacuated for the
+// stall bound since `evacuated_grew_at`.
+export function stalledSince(drain: ApiDrain, nowMs: number): number | null {
+  const grew = msOf(drain.evacuated_grew_at);
+  if (grew === null || drain.cancelling || drainFinished(drain) || !pastDeadline(drain, nowMs)) return null;
+  return nowMs >= grew + STALL_BOUND_MS ? grew + STALL_BOUND_MS : null;
+}
+
+// The stage of a v2 drain, from the API's answer at `nowMs`, as the panel's
+// headline names it: cancelling, then finished, then either side of the
+// deadline.
+export type DrainStage = 'cancelling' | 'finished' | 'holding' | 'evacuating';
 
 export function drainStageOf(drain: ApiDrain, nowMs: number): DrainStage {
   if (drain.cancelling) return 'cancelling';
-  if (drain.done) return 'done';
-  if (drain.waiting_for_slot) return 'waiting_for_slot';
-  const deadline = drain.deadline ? Date.parse(drain.deadline) : NaN;
-  if (Number.isFinite(deadline) && nowMs < deadline) return 'holding';
-  return drain.sealed ? 'past_deadline' : 'unacknowledged';
+  if (drainFinished(drain)) return 'finished';
+  return pastDeadline(drain, nowMs) ? 'evacuating' : 'holding';
 }
 
 // What the panel's headline must say at each stage.
 export const STAGE_HEADLINE: Record<DrainStage, RegExp> = {
-  cancelling: /cancelling/i,
-  done: /^Done\b/,
-  waiting_for_slot: /waiting for an evacuation slot/i,
+  cancelling: /^Undrained: cancelling the drain on the node/,
+  finished: /^Finished: everything on the node is durable elsewhere/,
   holding: /^deadline in \d/,
-  past_deadline: /^past the deadline$/,
-  unacknowledged: /not acknowledged the seal/,
+  evacuating: /^past the deadline/,
 };
 
-// How far the console's clock and the deadline may disagree before a
-// headline read on either side of it counts as wrong.
-const DEADLINE_SLACK_MS = 6_000;
+// How far the console's clock and the API's stamps may disagree before a
+// reading on either side of a boundary counts as wrong.
+const SLACK_MS = 6_000;
 
 // What the panel gets wrong against `drain`, the answer the page rendered it
-// from, at `nowMs`: its headline, seal and stall tags, its progress count,
-// and one row per pending entry and per evacuated sandbox, each as the node
-// reported it. Empty when the panel matches.
+// from, at `nowMs`: its headline, fence and stall tags, its counts, and one
+// row per pending entry and per evacuated sandbox, each as the node reported
+// it. Empty when the panel matches.
 export function panelMismatches(panel: PanelRead, drain: ApiDrain, nowMs: number): string[] {
   const out: string[] = [];
   const headline = panel.tags[0] ?? '';
   const stage = drainStageOf(drain, nowMs);
-  const deadline = drain.deadline ? Date.parse(drain.deadline) : NaN;
-  const nearDeadline = Number.isFinite(deadline) && Math.abs(deadline - nowMs) < DEADLINE_SLACK_MS;
-  const stages = nearDeadline && (stage === 'holding' || stage === 'past_deadline' || stage === 'unacknowledged')
-    ? (['holding', 'past_deadline', 'unacknowledged'] as DrainStage[])
-    : [stage];
+  const deadline = msOf(drain.deadline);
+  const nearDeadline = deadline !== null && Math.abs(deadline - nowMs) < SLACK_MS;
+  const stages: DrainStage[] = nearDeadline && (stage === 'holding' || stage === 'evacuating') ? ['holding', 'evacuating'] : [stage];
   if (!stages.some((s) => STAGE_HEADLINE[s].test(headline))) out.push(`the headline reads "${headline}", not the ${stage} stage`);
-  const sealTag = drain.sealed ? 'Node sealed' : 'Not yet acknowledged';
-  if (!panel.tags.includes(sealTag)) out.push(`the seal tag is not "${sealTag}" (${panel.tags.join(' | ')})`);
+  const fencedTag = panel.tags.includes('instance fenced for termination');
+  if (fencedTag !== drain.fenced) out.push(`the fence tag is ${fencedTag ? 'shown' : 'missing'} while fenced is ${drain.fenced}`);
   const stalledTag = panel.tags.some((tag) => /^stalled since /.test(tag));
-  if (stalledTag !== (drain.stalled_since !== null)) out.push(`the stall tag is ${stalledTag ? 'shown' : 'missing'} while stalled_since is ${drain.stalled_since}`);
-  const evacuatedIds = new Set(drain.evacuated.map((e) => bareSandboxId(e.sandbox_id)));
-  const pendingIds = new Set(drain.pending.map((p) => bareSandboxId(p.sandbox_id)).filter((id) => !evacuatedIds.has(id)));
-  const progress = `${evacuatedIds.size}/${evacuatedIds.size + pendingIds.size} evacuated`;
+  const stalled = stalledSince(drain, nowMs) !== null;
+  const grew = msOf(drain.evacuated_grew_at);
+  const nearStall = grew !== null && Math.abs(grew + STALL_BOUND_MS - nowMs) < SLACK_MS;
+  if (stalledTag !== stalled && !nearStall && !nearDeadline) out.push(`the stall tag is ${stalledTag ? 'shown' : 'missing'} while the drain is ${stalled ? '' : 'not '}stalled`);
+  const counts = drainCountsOf(drain);
+  const progress = `${counts.evacuated}/${counts.total} evacuated`;
   if (!panel.text.includes(progress)) out.push(`the progress does not read "${progress}"`);
+  if (counts.poolMembers && !panel.text.includes(`(${counts.poolMembers} warm-pool)`)) out.push(`the pending count does not say ${counts.poolMembers} are warm-pool members`);
   if (panel.pending.length !== drain.pending.length) out.push(`the pending table has ${panel.pending.length} rows, the report ${drain.pending.length}`);
   const holding = stage === 'holding' && !nearDeadline;
   for (const entry of drain.pending) {
     const id = bareSandboxId(entry.sandbox_id);
-    const row = panel.pending.find((r) => bareSandboxId(r.sandbox) === id && r.action === entry.action);
+    const row = panel.pending.find((r) => bareSandboxId(r.sandbox) === id && r.wait === entry.wait);
     if (!row) {
-      out.push(`no pending row for ${entry.sandbox_id} ${entry.action}`);
+      out.push(`no pending row for ${entry.sandbox_id} waiting ${entry.wait}`);
       continue;
     }
-    if (entry.action === 'hold' && holding && !/running until the deadline/.test(row.state)) out.push(`the hold of ${entry.sandbox_id} does not read "running until the deadline"`);
+    if (row.running !== entry.running) out.push(`the row of ${entry.sandbox_id} is ${row.running ? '' : 'not '}marked running, but the report says running ${entry.running}`);
+    if (row.pool !== entry.pool_member) out.push(`the row of ${entry.sandbox_id} is ${row.pool ? '' : 'not '}labelled a warm-pool member, but the report says pool_member ${entry.pool_member}`);
+    if (entry.wait === HOLD_WAIT && holding && !/running until the deadline/.test(row.state)) out.push(`the hold of ${entry.sandbox_id} does not read "running until the deadline"`);
     if (entry.since && !/in this state since/.test(row.state)) out.push(`the row of ${entry.sandbox_id} does not say since when it is in its state`);
-    if (entry.reason && !row.state.includes(entry.reason)) out.push(`the row of ${entry.sandbox_id} does not show its reason "${entry.reason}"`);
+    // Displayed as given: compared with the report, never read.
+    if (entry.reason && !row.state.includes(entry.reason)) out.push(`the row of ${entry.sandbox_id} does not show the node's reason`);
   }
   if (panel.evacuated.length !== drain.evacuated.length) out.push(`the evacuated table has ${panel.evacuated.length} rows, the report ${drain.evacuated.length}`);
   for (const entry of drain.evacuated) {
@@ -332,8 +397,14 @@ export function rowMismatches(drain: ApiDrain, statuses: ReadonlyMap<string, str
   }
   for (const entry of drain.pending) {
     const id = bareSandboxId(entry.sandbox_id);
-    if (evacuated.has(id) || !statuses.has(id) || entry.action !== 'hold') continue;
+    if (evacuated.has(id) || !statuses.has(id) || entry.wait !== HOLD_WAIT) continue;
     if (statuses.get(id) !== 'started') out.push(`${entry.sandbox_id} is held but its row is ${statuses.get(id)}`);
   }
   return out;
+}
+
+// The controller stored the node's report under `generation`: what the API
+// shows of a node answering the drain, since it doesn't show the seal.
+export function reportedUnder(drain: ApiDrain | undefined, generation: number | undefined): boolean {
+  return !!drain && generation !== undefined && drain.generation === generation && drain.reported_at !== null;
 }
