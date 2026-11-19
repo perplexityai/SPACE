@@ -657,7 +657,8 @@ async fn requeues_and_redrives_are_fenced_and_write_no_delivery_state() -> TestR
 }
 
 /// Catches a new rollout leasing a node an earlier, finished rollout's
-/// controller may still be working on, and a renewal of that lease.
+/// controller may still be working on, a renewal of that lease, and a
+/// claim that also takes the finished rollout's pending item.
 #[tokio::test(flavor = "current_thread")]
 async fn a_finished_rollouts_live_lease_holds_its_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -670,12 +671,21 @@ async fn a_finished_rollouts_live_lease_holds_its_node() -> TestResult {
     let held = lease(&db.pool, first, 1).await?.remove(0);
     set_phase(&db.pool, first, "aborted").await?;
 
+    // Held until released.
     let second = rollout(&db.pool, "rolling").await?;
     save_targets(&db.pool, second, &nodes).await?;
     assert!(lease(&db.pool, second, 1).await?.is_empty());
     let mut conn = db.pool.acquire().await?;
     assert!(!renew_lease(&mut conn, &held, LEASE).await?);
-    lapse(&db.pool, first, node).await?;
+    assert!(requeue(&db.pool, &held, Requeue::Release).await?);
     assert_eq!(nodes_of(&lease(&db.pool, second, 1).await?), [node]);
+    set_phase(&db.pool, second, "aborted").await?;
+
+    // Held until it lapses.
+    let third = rollout(&db.pool, "rolling").await?;
+    save_targets(&db.pool, third, &nodes).await?;
+    assert!(lease(&db.pool, third, 1).await?.is_empty());
+    lapse(&db.pool, second, node).await?;
+    assert_eq!(nodes_of(&lease(&db.pool, third, 1).await?), [node]);
     Ok(())
 }
