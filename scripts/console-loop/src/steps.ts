@@ -12,15 +12,16 @@ import {
   SECRET_PLACEHOLDER, adminFetch, carriesSecret, confirmPopover, content, fetchWithoutRedirect, pickSelect, settle, shortLabel,
   signIn, takeToasts, text, visit, waitForStatus, withoutSecret, type Ctx,
 } from './browser.ts';
-import { Api, ApiError, TERMINAL_OPERATION_STATES } from './api.ts';
+import { Api, ApiError, TERMINAL_OPERATION_STATES, sleep } from './api.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { SYNTHETIC_HEADER } from './recorder.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
 import {
-  CONSOLE_PREVIEW_CONCURRENCY, DRAIN_KEEP_ANNOTATION, KindNodes, bareSandboxId, drainCandidate, everyPage, panelMismatches, previewAllWaitMs,
-  previewResultsMismatches, previewVerdictIn, previewWaitMs, rowMismatches, type AdminNode, type ApiDrain, type PanelRead, type ResultVerdict,
+  CONSOLE_PREVIEW_CONCURRENCY, DRAIN_KEEP_ANNOTATION, HOLD_WAIT, KindNodes, bareSandboxId, drainCandidate, drainCountsOf, drainFinished, everyPage,
+  panelMismatches, previewAllWaitMs, previewResultsMismatches, previewVerdictIn, previewWaitMs, reportedUnder, rowMismatches,
+  type AdminNode, type ApiDrain, type PanelRead, type ResultVerdict,
 } from './nodes.ts';
-import { KindV2Control, V2_CONTROLLER_ENV, type Lease } from './drain-v2.ts';
+import { DRAIN_V2_SWITCH, KindV2Control, V2_CONTROLLER_ENV, V2_CONTROLLER_KEYS, drainV2Enabled, v1DrainSkip, type Lease } from './drain-v2.ts';
 
 export interface Step {
   name: string;
@@ -1658,6 +1659,8 @@ step('node-history-filters', ['nodes'], async (c) => {
 });
 
 step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
+  const skip = v1DrainSkip(drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node, kube) => {
     await visit(c, `/dashboard/nodes/${node.id}`, 3000);
     const phrase = node.name ?? node.id;
@@ -1701,6 +1704,8 @@ step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
 }, true);
 
 step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
+  const skip = v1DrainSkip(drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node) => {
     const phrase = node.name ?? node.id;
     const drained = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:drain`, { mode: 'forced' });
@@ -1790,6 +1795,8 @@ step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
 // A v1 gentle drain, as on main: Drain sends `mode: gentle` and no engine,
 // and the page shows no v2 drain.
 step('node-gentle-drain-undrain', ['nodes', 'flows'], async (c) => {
+  const skip = v1DrainSkip(drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node, kube) => {
     await visit(c, `/dashboard/nodes/${node.id}`, 3000);
     await exactButton(c.page, 'Drain').click();
@@ -1944,7 +1951,6 @@ step('node-drain-preview', ['nodes', 'flows'], async (c) => {
   c.rec.check(CHANGES_NOTHING.test(t), 'the panel says a preview changes nothing on the node');
   c.rec.check(verdict !== null, `the panel says whether a drain would finish, wait or block (${verdict})`);
   c.rec.check(tag !== null && tag === verdict, `the verdict is tagged with the same verdict (${tag})`);
-  c.rec.check(/Not sealed|Sealed under epoch \d+/.test(t), "the panel shows the node's seal");
   c.rec.check(/Blockers \(\d+\)/.test(t) && /What a drain would do \(\d+\)/.test(t), 'the panel lists the blockers and what a drain would do');
   if (body) {
     c.rec.check(t.includes(`Blockers (${body.blocked.length})`), `the panel counts the ${body.blocked.length} blockers the API reported`);
@@ -1952,7 +1958,10 @@ step('node-drain-preview', ['nodes', 'flows'], async (c) => {
     for (const blocked of body.blocked.slice(0, 5)) {
       c.rec.check(t.includes(blocked.reason), `the panel shows the blocker "${blocked.reason.slice(0, 80)}"`);
     }
-    c.rec.note(`preview of ${node.name ?? node.id}: would_finish=${body.would_finish}, sealed_epoch=${body.sealed_epoch}, ${body.blocked.length} blocked, ${body.pending.length} pending`);
+    c.rec.check(new RegExp(`Already evacuated\\s*${body.evacuated.length}(?!\\d)`).test(t), `the panel counts the ${body.evacuated.length} sandboxes the API reported already evacuated`);
+    const running = body.pending.filter((p: { running: boolean }) => p.running).length;
+    c.rec.check(new RegExp(`Running\\s*${running}(?!\\d)`).test(t), `the panel counts the ${running} pending sandboxes the API reported running`);
+    c.rec.note(`preview of ${node.name ?? node.id}: ${body.evacuated.length} evacuated, ${body.blocked.length} blocked, ${body.pending.length} pending (${body.pending.map((p: { wait: string }) => p.wait).join(', ') || 'none'})`);
   }
   await previewCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
   await shot(c, 'panel');
@@ -2035,7 +2044,9 @@ step('nodes-drain-preview-all', ['nodes', 'flows'], async (c) => {
 // answers the page itself with the API's own shape, marked synthetic, and
 // says so in its notes.
 
-const V2_STEPS = ['node-v2-drain-now', 'node-v2-hold-shorten-undrain', 'node-v2-refusals', 'node-v2-states'];
+const V2_STEPS = [
+  'node-v2-drain-now', 'node-v2-hold-shorten-undrain', 'node-v2-refusals', 'node-v2-states', 'node-drain-progress',
+];
 // Setup and teardown also carry each flow's name, so selecting a flow runs them.
 const V2_TAGS = ['nodes', 'flows', 'drain-v2'];
 const V2_AROUND = [...V2_TAGS, ...V2_STEPS];
@@ -2049,10 +2060,20 @@ interface V2Setup {
 }
 let v2: V2Setup | null = null;
 
-// Put the controller's standing config, recorded in `file`, back: its env
-// and its replicas. The env put back.
+// Whether the bench runs drain v2, read once per run from the controller.
+let drainV2Read: boolean | null = null;
+function drainV2On(c: Ctx): boolean {
+  if (drainV2Read === null) drainV2Read = drainV2Enabled(new KindV2Control(c.config.kubeContext).drainV2Switch());
+  return drainV2Read;
+}
+
+// Put the controller's standing config, recorded in `file`, back: the keys a
+// run writes and its replicas. The config put back.
 function putStandingBack(control: KindV2Control, lease: Lease, file: string): Record<string, string | null> {
-  const { env, replicas } = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const { env: recorded, replicas } = JSON.parse(fs.readFileSync(file, 'utf8'));
+  // Only the keys a run writes go back; a record from before the switch
+  // moved to Kind's values may also hold it.
+  const env = Object.fromEntries(V2_CONTROLLER_KEYS.map((key) => [key, recorded[key] ?? null]));
   if (control.controllerReplicas() !== replicas) control.scaleController(lease, replicas);
   control.setControllerEnv(lease, env);
   return env;
@@ -2080,8 +2101,12 @@ const exactButton = (page: Page, name: string) =>
 // nothing.
 async function v2Refusals(c: Ctx, nodeId: string): Promise<string[] | null> {
   const res = await adminFetch(c.page, 'GET', `/admin/api/v1/nodes/${nodeId}/drain-v2-preview`, undefined, { timeoutMs: 80_000 });
+  // A node busy with another preview (503 `node_busy`) is retryable
+  // contention: no answer yet.
+  if (res.status === 503 && res.json?.reason === 'node_busy') return null;
   if (res.status !== 200) return Array.isArray(res.json?.refusals) ? res.json.refusals : null;
-  return (res.json?.blocked ?? []).filter((b: { sandbox_id: string | null }) => b.sandbox_id === null).map((b: { reason: string }) => b.reason);
+  // Every blocker is node-wide; the API's own refusals come first among them.
+  return (res.json?.blocked ?? []).map((b: { reason: string }) => b.reason);
 }
 
 // Waits until the API would start a v2 drain of the node: its instance is
@@ -2104,6 +2129,8 @@ step('nodes-v2-setup', V2_AROUND, async (c) => {
   let cordonLease: Lease | null = null;
   try {
     cordonLease = control.acquireLease('cordon');
+    const enabled = control.drainV2Switch();
+    c.rec.check(enabled === 'true', `the bench's values turn drain v2 on for the controller (${DRAIN_V2_SWITCH}=${enabled})`);
     // A standing config an interrupted run recorded is the one to put back.
     const file = v2StandingPath(c);
     const standing = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).env : control.controllerEnv();
@@ -2113,7 +2140,7 @@ step('nodes-v2-setup', V2_AROUND, async (c) => {
     c.rec.note(`standing controller config: ${JSON.stringify(standing)}, ${replicas} replicas (kept in ${file})`);
     if (control.controllerReplicas() !== replicas) control.scaleController(lease, replicas);
     const rolled = control.setControllerEnv(lease, V2_CONTROLLER_ENV);
-    c.rec.note(rolled ? 'turned the controller\'s v2 loop on and waited for its rollout' : 'the controller\'s v2 loop was already on');
+    c.rec.note(rolled ? 'turned the controller\'s aws terminator on and waited for its rollout' : 'the controller\'s aws terminator was already on');
     const env = control.controllerEnv();
     c.rec.check(Object.entries(V2_CONTROLLER_ENV).every(([key, value]) => env[key] === value), `the controller runs the v2 loop with the aws terminator (${JSON.stringify(env)})`);
     // Every empty Kubernetes worker gets a fake instance; one that holds a
@@ -2307,7 +2334,15 @@ async function readPanel(page: Page): Promise<PanelRead> {
   const text = (await card.innerText().catch(() => '')).replace(/\s+/g, ' ');
   const table = (title: string) => card.locator('.ant-table-wrapper', { has: page.locator('.ant-table-title', { hasText: new RegExp(`^${title}$`) }) });
   const rows = async (title: string) => table(title).locator('.ant-table-tbody tr.ant-table-row').evaluateAll((trs) => trs.map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => (td as HTMLElement).innerText.replace(/\s+/g, ' ').trim())));
-  const pending = (await rows('Pending').catch(() => [] as string[][])).map(([sandbox, action, state]) => ({ sandbox, action, state: state ?? '' }));
+  // The Sandbox cell is the id, then a `warm-pool member` tag for a pool
+  // member; the Wait cell is the wait's tag, then `running` for a running one.
+  const pending = (await rows('Pending').catch(() => [] as string[][])).map(([sandbox = '', wait = '', state = '']) => ({
+    sandbox: sandbox.split(' ')[0] ?? '',
+    pool: /\bwarm-pool member\b/.test(sandbox),
+    wait: wait.split(' ')[0] ?? '',
+    running: /\brunning\b/.test(wait.split(' ').slice(1).join(' ')),
+    state,
+  }));
   const evacuated = (await rows('Evacuated').catch(() => [] as string[][])).map(([sandbox, artifact, wasRunning, controller]) => ({ sandbox, artifact, wasRunning, controller }));
   return { tags, text, pending, evacuated };
 }
@@ -2455,37 +2490,13 @@ step('node-v2-drain-now', V2_TAGS, async (c) => {
     await panelShot(c, '03-draining');
     c.rec.check(!!(await waitForNode(c, node.id, (n) => n.drain_phase === 'drained', 300_000)), 'the empty worker reaches drained');
     c.rec.check(await waitForSection(c, /Phase\s+drained/, 20_000), "the page's poll shows drained without a reload");
-    c.rec.check(await waitForPanel(c, /Done: everything on the node is durable elsewhere/, 20_000), 'the panel says the drain is done');
+    c.rec.check(await waitForPanel(c, /Finished: everything on the node is durable elsewhere/, 20_000), 'the panel says the drain is finished');
     c.rec.check(await exactButton(c.page, 'Terminate').count() === 1, 'a drained v2 node offers Terminate');
     await panelShot(c, '04-drained');
 
-    // Terminate's refusals. The first two are answers the API gives a v2
-    // terminate (`routes/admin/nodes.rs`), answered by the step: nothing is
-    // sent. The third is the API's own: the node is undrained while the
-    // confirmation is open.
-    const synthetic: [string, unknown, RegExp, RegExp][] = [
-      ['05-refused-not-done', { error: "the node has not reported, under its drain's epoch, that everything on it is durable elsewhere", drain_status: { epoch: 1 } },
-        /not reported its drain done/, /not reported, under its drain's epoch/],
-      ['06-refused-named', { error: 'rows or executions still name the node; it is terminated only once nothing does', held_by: 'active_node_id held by 01a1f4900000700080000000000000aa', active_node_id: ['01a1f4900000700080000000000000aa'], target_node_id: [], active_executions: [] },
-        /still name the node/, /active_node_id held by/],
-    ];
-    for (const [name, body, title, reason] of synthetic) {
-      const unroute = await answerAction(c, node.id, 'terminate', 409, body);
-      try {
-        const confirm = await openTyped(c, 'Terminate');
-        c.rec.check(/cannot be undrained/.test(await confirm.innerText()), 'the terminate confirmation says a terminating node cannot be undrained');
-        await confirmTyped(c, confirm, 'Terminate', node.id, 'terminate', phrase);
-        const reasons = await refusalReasons(c, title);
-        c.rec.note(`SYNTHETIC: ${name} is the API's 409 body for a v2 terminate, answered by the step; no terminate was sent`);
-        c.rec.check(reasons !== null && reasons.some((r) => reason.test(r)), `the v2 terminate refusal is listed as reasons (${reasons?.join(' | ') ?? 'no refusal shown'})`);
-        await expectToast(c, title, 'the refusal');
-        await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
-        await shot(c, name);
-        await drainCard(c.page).locator('.ant-alert-error .ant-alert-close-icon').click({ timeout: 3000 }).catch(() => {});
-      } finally {
-        await unroute();
-      }
-    }
+    // Terminate's refusal: `:terminate` refuses a v2 node only on its phase.
+    // The API's own, for a terminate sent after the node is undrained while
+    // the confirmation is open.
     let refusedStatus: number | null = null;
     const terminateUrl = (url: URL) => url.pathname.endsWith(`/nodes/${node.id}:terminate`);
     const guard = async (route: Route) => {
@@ -2502,6 +2513,9 @@ step('node-v2-drain-now', V2_TAGS, async (c) => {
     await c.page.route(terminateUrl, guard);
     try {
       const confirm = await openTyped(c, 'Terminate');
+      // A v2 node can be undrained from terminating until its instance is
+      // fenced (`V2_TERMINATE_ENDS` in ui/src/lib/node-actions.ts).
+      c.rec.check(/can still be undrained/.test(await confirm.innerText()), 'the terminate confirmation says the node can be undrained until its instance is fenced');
       const undrained = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:undrain`);
       c.rec.check(undrained.status === 200, 'the node is undrained while the confirmation is open');
       if (!(await waitForNode(c, node.id, (n) => n.drain_phase === null, 30_000))) return c.rec.check(false, 'the undrain cleared the phase');
@@ -2511,14 +2525,14 @@ step('node-v2-drain-now', V2_TAGS, async (c) => {
       c.rec.check(reasons !== null && reasons.some((r) => /accepted only from: drained/.test(r)), `the phase refusal is listed as reasons (${reasons?.join(' | ')})`);
       await expectToast(c, /Terminate refused: the node is not drained/, 'the refusal');
       await typedModal(c.page).waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {});
-      await shot(c, '07-refused-phase');
+      await shot(c, '05-refused-phase');
     } finally {
       await c.page.unroute(terminateUrl, guard);
     }
     c.rec.check(await waitForV2Gone(c, node.id, 120_000), 'the undrain\'s cancel finishes on the node');
     c.rec.check(await waitForSection(c, /Phase\s+not draining/, 20_000), 'the Drain section shows not draining');
     c.rec.check(await progressCard(c.page).waitFor({ state: 'detached', timeout: 15_000 }).then(() => true, () => false), 'the Drain progress panel is gone once the cancel finished');
-    await shot(c, '08-undrained');
+    await shot(c, '06-undrained');
   });
 }, true);
 
@@ -2546,10 +2560,14 @@ step('node-v2-hold-shorten-undrain', V2_TAGS, async (c) => {
       const started = await confirmTyped(c, dialog, 'v2 drain', node.id, 'drain', phrase);
       c.rec.check(started?.status() === 200, `the v2 drain is accepted (${started?.status()})`);
       c.rec.check(JSON.stringify(started?.request().postDataJSON()) === '{"engine":"v2","hold_seconds":600,"require_undrained":true}', `the request asks for engine v2 with hold 600, start-only (${started?.request().postData()})`);
-      const sealed = await waitForNode(c, node.id, (n) => n.drain?.sealed === true, 120_000);
-      c.rec.check(!!sealed, 'the node acknowledges the seal');
-      c.rec.check(await waitForPanel(c, /deadline in (9|10)m .*Node sealed/, 20_000), 'the panel counts down to the deadline and shows the node sealed');
-      await panelMatchesAnswer(c, answers, residents, 'holding', (d) => d.sealed && d.pending.some((p) => p.action === 'hold'));
+      // The API doesn't show the node's seal: the controller storing a report
+      // under the drain's generation is what shows the node answered it.
+      const generation = (await waitForNode(c, node.id, (n) => n.drain_engine === 'v2' && !!n.drain, 30_000))?.drain?.generation;
+      c.rec.check(generation !== undefined, `the drain records its generation (${generation})`);
+      const reported = await waitForNode(c, node.id, (n) => reportedUnder(n.drain, generation), 120_000);
+      c.rec.check(!!reported, 'the controller stores the node\'s report under the drain\'s generation');
+      c.rec.check(await waitForPanel(c, /deadline in (9|10)m/, 20_000), 'the panel counts down to the deadline');
+      await panelMatchesAnswer(c, answers, residents, 'holding', (d) => reportedUnder(d, generation) && d.pending.some((p) => p.wait === HOLD_WAIT));
       await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
       await panelShot(c, '02-holding');
 
@@ -2558,19 +2576,42 @@ step('node-v2-hold-shorten-undrain', V2_TAGS, async (c) => {
       await visit(c, '/dashboard/nodes', 3000);
       const row = content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) });
       const cell = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ');
-      c.rec.check(/draining · v2/.test(cell) && /0\/1 evacuated · deadline (9|10)m/.test(cell), `the nodes list shows the drain in one line (${cell.slice(0, 160)})`);
+      // Counted as the panel counts, from the answer: the worker may also
+      // hold an earlier run's durable sandbox, which the report lists
+      // evacuated.
+      const listed = (await apiNode(c, node.id))?.drain;
+      const counts = listed ? drainCountsOf(listed) : null;
+      const progress = counts ? `${counts.evacuated}/${counts.total} evacuated` : 'no drain answer';
+      c.rec.check(/draining · v2/.test(cell) && cell.includes(`${progress} · deadline`) && /deadline (9|10)m/.test(cell), `the nodes list shows the drain in one line, ${progress} (${cell.slice(0, 160)})`);
       await shot(c, '03-nodes-list');
       await visit(c, `/dashboard/nodes/${node.id}`, 3000);
 
-      // 3. A preview of the sealed node.
+      // 3. A preview of the drained node: the API answers a node a v2 drain
+      // holds with a 409 and asks the node nothing. The step passes the
+      // API's answer on, marked synthetic so the recorder doesn't count the
+      // 409 it expects.
       c.rec.note('stage 3');
-      const previewed = c.page.waitForResponse((res) => new URL(res.url()).pathname.endsWith(`/nodes/${node.id}/drain-v2-preview`), { timeout: previewWaitMs() }).catch(() => null);
-      await content(c.page).getByRole('button', { name: 'Preview v2 drain' }).click();
-      const preview = await jsonOf(await previewed);
-      await previewCard(c.page).locator('[data-testid="drain-preview-verdict"]').waitFor({ timeout: 15_000 }).catch(() => {});
-      c.rec.check(preview?.sealed_epoch === sealed?.drain?.epoch && (await previewCard(c.page).innerText()).includes(`Sealed under epoch ${preview?.sealed_epoch}`), `the preview shows the drain's seal (epoch ${preview?.sealed_epoch})`);
-      await previewCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
-      await shot(c, '04-preview-sealed');
+      const previewUrl = (url: URL) => url.pathname.endsWith(`/nodes/${node.id}/drain-v2-preview`);
+      let previewed: { status: number; body: any } | null = null;
+      const passOn = async (route: Route) => {
+        const res = await fetchWithoutRedirect(route);
+        if (!res) return;
+        const text = await res.text().catch(() => '');
+        previewed = { status: res.status(), body: (() => { try { return JSON.parse(text); } catch { return null; } })() };
+        return route.fulfill({ status: res.status(), headers: { ...res.headers(), [SYNTHETIC_HEADER]: '1' }, body: text });
+      };
+      await c.page.route(previewUrl, passOn);
+      try {
+        await content(c.page).getByRole('button', { name: 'Preview v2 drain' }).click();
+        const refused = previewCard(c.page).locator('.ant-alert', { hasText: 'Could not preview this node (v2 drain in progress)' });
+        c.rec.check(await refused.waitFor({ timeout: previewWaitMs() }).then(() => true, () => false), 'the preview panel says a v2 drain holds the node');
+        const got = previewed as { status: number; body: any } | null;
+        c.rec.check(got?.status === 409 && got.body?.reason === 'drain_v2_in_progress', `the API answers the preview of a node a v2 drain holds with 409 drain_v2_in_progress (${got?.status} ${got?.body?.reason})`);
+        await previewCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await shot(c, '04-preview-draining');
+      } finally {
+        await c.page.unroute(previewUrl, passOn);
+      }
 
       // 4. A longer hold: the deadline only moves earlier.
       c.rec.note('stage 4');
@@ -2723,7 +2764,9 @@ step('node-v2-hold-shorten-undrain', V2_TAGS, async (c) => {
       c.rec.check(await waitForPanel(c, /Undrained: cancelling the drain on the node/, 20_000), 'the panel says the cancel is in progress');
       c.rec.check(await waitForSection(c, /Phase\s+not draining.*Engine\s+v2/s, 15_000), 'the Drain section shows no phase, under engine v2');
       const offered = { drain: await exactButton(c.page, 'Drain').count(), forced: await exactButton(c.page, 'Forced drain').count(), v2: await exactButton(c.page, 'v2 drain').count() };
-      c.rec.check(offered.drain === 0 && offered.forced === 0 && offered.v2 === 1, `while the cancel is pending only a v2 drain is offered (${JSON.stringify(offered)})`);
+      // The API refuses every drain until the cancel finishes ("undrain still
+      // finishing"), so the page offers none.
+      c.rec.check(offered.drain === 0 && offered.forced === 0 && offered.v2 === 0, `while the cancel is pending no drain is offered (${JSON.stringify(offered)})`);
       await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
       await panelShot(c, '14-cancelling');
       await visit(c, '/dashboard/nodes', 3000);
@@ -2791,20 +2834,23 @@ step('node-v2-states', V2_TAGS, async (c) => {
   const now = Date.now();
   const at = (ms: number) => new Date(now + ms).toISOString();
   const report = (over: Record<string, unknown> = {}) => ({
-    epoch: 7, deadline: at(-60_000), sealed: true, cancelling: false, done: false, reported_at: at(-5_000), stalled_since: null,
-    evacuated: [], pending: [], blocked: [], ...over,
+    generation: 1_763_553_600_000_000, deadline: at(-60_000), cancelling: false, fenced: false, reported_at: at(-5_000), evacuated_grew_at: at(-60_000),
+    evacuated_total: [], evacuated: [], pending: [], blocked: [], ...over,
   });
   // Each is the API's answer for the node with its drain fields changed;
   // the page renders it, and must neither crash nor misread it.
   const states: [string, (n: any) => any, RegExp][] = [
-    ['01-terminating', (n) => ({ ...n, drain_phase: 'terminating', drain_engine: 'v2', drain_started_at: at(-600_000), drain: report({ done: true }) }), /Done: everything on the node is durable elsewhere/],
+    ['01-terminating', (n) => ({ ...n, drain_phase: 'terminating', drain_engine: 'v2', drain_started_at: at(-600_000), drain: report({ fenced: true }) }), /Finished: everything on the node is durable elsewhere.*instance fenced for termination/],
     ['02-unreadable', (n) => ({ ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: undefined }), /can't be shown|Drain/],
     ['03-unknown-phase-engine', (n) => ({ ...n, drain_phase: 'quiescing', drain_engine: 'v3', drain_started_at: at(-600_000) }), /quiescing/],
-    ['04-malformed-report', (n) => ({ ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: { epoch: 7, deadline: at(60_000), sealed: true, pending: [{ sandbox_id: '01a1f4900000700080000000000000bb', action: 'reticulate' }] } }), /deadline in|Drain progress/],
+    ['04-malformed-report', (n) => ({ ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: { generation: 7, deadline: at(60_000), pending: [{ sandbox_id: '01a1f4900000700080000000000000bb', wait: 'reticulate' }] } }), /deadline in|Drain progress/],
     ['05-unknown-entries', (n) => ({ ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: report({
       evacuated: [{ sandbox_id: '01a1f4900000700080000000000000cc', artifact_kind: 'unknown', was_running: false, recorded: true }],
-      pending: [{ sandbox_id: '01a1f4900000700080000000000000dd', action: 'reticulate', reason: 'a newer node reports it', since: at(-120_000) }],
+      pending: [{ sandbox_id: '01a1f4900000700080000000000000dd', wait: 'reticulate', running: false, pool_member: false, reason: 'a newer node reports it', since: at(-120_000) }],
     }) }), /reticulate/],
+    // `:terminate` refuses a v2 node only on its phase; the terminating
+    // tick's fresh check, refused, returns it to drained with why.
+    ['06-terminate-refused', (n) => ({ ...n, drain_phase: 'drained', drain_engine: 'v2', drain_started_at: at(-600_000), drain_last_error: 'terminate refused: the node reports 1 pending, 0 blocked: synthetic', drain: report() }), /The last terminate was refused: the node is back in drained/],
   ];
   for (const [name, change, shows] of states) {
     const unroute = await overlayNode(c, node.id, change);
@@ -2830,7 +2876,7 @@ step('node-v2-states', V2_TAGS, async (c) => {
     const res = await fetchWithoutRedirect(route);
     if (!res) return;
     const body = await res.json().catch(() => null);
-    const changed = Array.isArray(body) ? body.map((n: any) => (n.id === node.id ? { ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: { epoch: 7, deadline: at(60_000) } } : n)) : body;
+    const changed = Array.isArray(body) ? body.map((n: any) => (n.id === node.id ? { ...n, drain_phase: 'draining', drain_engine: 'v2', drain_started_at: at(-600_000), drain: { generation: 7, deadline: at(60_000) } } : n)) : body;
     return route.fulfill({ status: res.status(), contentType: 'application/json', headers: { [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify(changed) });
   };
   await c.page.route(listUrl, list);
@@ -2838,7 +2884,7 @@ step('node-v2-states', V2_TAGS, async (c) => {
     await visit(c, '/dashboard/nodes', 3000);
     c.rec.note('SYNTHETIC: the nodes list with a v2 drain whose report has no entries, answered by the step');
     c.rec.check(await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).count() === 1, 'the nodes list renders the node');
-    await shot(c, '06-nodes-list-malformed');
+    await shot(c, '07-nodes-list-malformed');
   } finally {
     await c.page.unroute(listUrl, list);
   }
@@ -2850,7 +2896,7 @@ step('node-v2-states', V2_TAGS, async (c) => {
     await visit(c, `/dashboard/nodes/${node.id}`, 3000);
     c.rec.note('SYNTHETIC: the node read answers 404, as for a v2 node the drain let go and deleted');
     c.rec.check(/Node not found/.test(await content(c.page).innerText()), 'a let-go node\'s page says the node is not found');
-    await shot(c, '07-let-go');
+    await shot(c, '08-let-go');
   } finally {
     await c.page.unroute(nodeUrl, gone);
   }
@@ -2951,6 +2997,199 @@ async function deleteResidents(c: Ctx, ids: string[]): Promise<void> {
     c.rec.check(status === 'deleted' || status === null, `cleanup: ${id} is deleted (${status})`);
   }
 }
+
+const HOLD_SECONDS = 150;
+
+step('node-drain-progress', V2_TAGS, async (c) => {
+  await withV2Worker(c, async (node) => {
+    const phrase = node.name ?? node.id;
+    let residents: string[] = [];
+    const answers = watchNodeAnswers(c.page, node.id);
+    // Every report the loop reads, and each resident's evacuated entry the
+    // first time a report lists it: the node's report lists only what is
+    // still on the node, so a sandbox the drain has released drops out.
+    const timeline: { at: string; phase: string | null; drain: ApiDrain | undefined }[] = [];
+    const firstEvacuated = new Map<string, ApiDrain['evacuated'][number]>();
+    const seen = (n: AdminNode) => {
+      const last = timeline.at(-1);
+      if (!last || JSON.stringify(last.drain) !== JSON.stringify(n.drain) || last.phase !== n.drain_phase) {
+        timeline.push({ at: new Date().toISOString(), phase: n.drain_phase, drain: n.drain });
+      }
+      for (const entry of n.drain?.evacuated ?? []) if (!firstEvacuated.has(bareSandboxId(entry.sandbox_id))) firstEvacuated.set(bareSandboxId(entry.sandbox_id), entry);
+    };
+    // The loop reads the node every 2 s for the whole flow.
+    let polling = true;
+    const poll = (async () => {
+      while (polling) {
+        const n = await apiNode(c, node.id).catch(() => null);
+        if (n) seen(n);
+        await sleep(2000);
+      }
+    })();
+    try {
+      residents = await createResidents(c, node);
+      const [runA, runB, paused] = residents;
+      await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+      await shot(c, '01-before');
+      const dialog = await openTyped(c, 'v2 drain');
+      await pickHold(dialog, HOLD_SECONDS);
+      await dialog.getByLabel('Type the node name to confirm').fill(phrase);
+      await shot(c, '02-confirm', { dialog: true });
+      const started = await confirmTyped(c, dialog, 'v2 drain', node.id, 'drain', phrase);
+      c.rec.check(started?.status() === 200, `the v2 drain is accepted (${started?.status()})`);
+      const startedAt = Date.now();
+      const generation = (await waitForNode(c, node.id, (n) => n.drain_engine === 'v2' && !!n.drain, 30_000))?.drain?.generation;
+      c.rec.check(generation !== undefined, `the drain records its generation (${generation})`);
+
+      // Before the deadline: the running sandboxes are held and the paused
+      // one suspended at once. A report
+      // stored under the drain's generation is what shows the node answered.
+      const holds = (d: ApiDrain) => reportedUnder(d, generation)
+        && [runA, runB].every((id) => d.pending.some((p) => p.wait === HOLD_WAIT && p.running && bareSandboxId(p.sandbox_id) === bareSandboxId(id)));
+      const holding = await waitForNode(c, node.id, (n) => !!n.drain && holds(n.drain), 120_000);
+      c.rec.check(!!holding, 'the node holds both running sandboxes until the deadline, each pending hold and running');
+      await panelMatchesAnswer(c, answers, residents, 'holding', holds);
+      c.rec.check(/running until the deadline/.test(await progressCard(c.page).innerText()), 'a held sandbox reads "running until the deadline"');
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, '03-holding');
+      const early = await waitForNode(c, node.id, (n) => !!n.drain?.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(paused)), 90_000);
+      c.rec.check(!!early, 'the paused sandbox is evacuated before the deadline');
+      const earlyDone = (d: ApiDrain) => d.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(paused));
+      const earlyDrain = await panelMatchesAnswer(c, answers, residents, 'evacuated before the deadline', earlyDone);
+      if (earlyDrain) {
+        const kind = (id: string) => earlyDrain.evacuated.find((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(id));
+        c.rec.check(kind(paused)?.artifact_kind === 'full' && kind(paused)?.was_running === false, 'the paused sandbox is a snapshot that was not running');
+      }
+      await panelShot(c, '04-evacuated-early');
+
+      // The nodes list's cell.
+      await visit(c, '/dashboard/nodes', 2500);
+      const cell = (await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).innerText().catch(() => '')).replace(/\s+/g, ' ');
+      c.rec.check(/[0-9]+\/3 evacuated · deadline \d+(s|m)/.test(cell), `the nodes list reads evacuated of 3 and the deadline (${cell.slice(0, 160)})`);
+      await shot(c, '05-nodes-list');
+      await visit(c, `/dashboard/nodes/${node.id}`, 2500);
+
+      // A warm-pool member, stalled and cancelling: the node's own answer
+      // with the fields that make each set by the step, as the API reports
+      // them. Stalled is past the deadline with nothing evacuated for 15
+      // minutes since `evacuated_grew_at`.
+      const POOL_MEMBER = '01a1f4900000700080000000000000ee';
+      for (const [name, change, pattern] of [
+        ['06-pool-member', (d: any) => ({ ...d, pending: [...d.pending, { sandbox_id: POOL_MEMBER, wait: 'external', running: false, pool_member: true, since: null }] }), /warm-pool member.*\(1 warm-pool\)|\(1 warm-pool\).*warm-pool member/],
+        ['07-stalled', (d: any) => ({ ...d, deadline: new Date(Date.now() - 20 * 60_000).toISOString(), evacuated_grew_at: new Date(Date.now() - 16 * 60_000).toISOString() }), /stalled since/],
+        ['08-cancelling', (d: any) => ({ ...d, cancelling: true }), /Undrained: cancelling the drain on the node/],
+      ] as const) {
+        const unroute = await overlayNode(c, node.id, (n) => (n.drain ? {
+          ...n,
+          drain: change(n.drain),
+          ...(name === '07-stalled' ? { drain_last_error: 'the drain is stalled: synthetic' } : {}),
+          ...(name === '08-cancelling' ? { drain_phase: null } : {}),
+        } : n));
+        try {
+          c.rec.note(`SYNTHETIC: ${name}: the node's own answer with one field set by the step`);
+          c.rec.check(await waitForPanel(c, pattern, 15_000), `${name}: the panel shows it (${pattern})`);
+          if (name === '06-pool-member') {
+            const row = (await readPanel(c.page)).pending.find((r) => bareSandboxId(r.sandbox) === POOL_MEMBER);
+            c.rec.check(!!row?.pool && row.wait === 'external' && !row.running, `${name}: the member's row is labelled a warm-pool member, with its wait and not running (${JSON.stringify(row)})`);
+          }
+          if (name === '07-stalled') {
+            const listUrl = (url: URL) => url.pathname === '/admin/api/v1/nodes';
+            const list = async (route: Route) => {
+              const res = await fetchWithoutRedirect(route);
+              if (!res) return;
+              const body = await res.json().catch(() => null);
+              const changed = Array.isArray(body) ? body.map((n: any) => (n.id === node.id && n.drain ? { ...n, drain: change(n.drain) } : n)) : body;
+              return route.fulfill({ status: res.status(), contentType: 'application/json', headers: { [SYNTHETIC_HEADER]: '1' }, body: JSON.stringify(changed) });
+            };
+            await c.page.route(listUrl, list);
+            await visit(c, '/dashboard/nodes', 2000);
+            c.rec.check(/stalled/.test(await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).innerText().catch(() => '')), 'the nodes list marks the drain stalled');
+            await shot(c, '07b-nodes-list-stalled');
+            await c.page.unroute(listUrl, list);
+            await visit(c, `/dashboard/nodes/${node.id}`, 2000);
+            await waitForPanel(c, pattern, 10_000);
+          }
+          await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+          await panelShot(c, name);
+        } finally {
+          await unroute();
+        }
+      }
+
+      // Past the deadline: the node suspends what it held.
+      const due = startedAt + HOLD_SECONDS * 1000 - Date.now();
+      if (due > 0) await c.page.waitForTimeout(due);
+      const suspending = await waitForNode(c, node.id, (n) => !!n.drain && n.drain.deadline !== null && Date.now() >= Date.parse(n.drain.deadline) && n.drain.pending.some((p) => p.wait !== HOLD_WAIT), 60_000, 1000);
+      // The node lists the held sandboxes pending, moving, for a few seconds;
+      // the page polls every 5 s, so its own answers may miss them.
+      const pendingSuspends = (d: ApiDrain) => !!d.deadline && Date.now() >= Date.parse(d.deadline) && d.pending.some((p) => p.wait !== HOLD_WAIT);
+      const pageCaught = async () => {
+        const by = Date.now() + 15_000;
+        while (Date.now() < by) {
+          const latest = answers.latest()?.body?.drain;
+          if (latest && pendingSuspends(latest)) return true;
+          await c.page.waitForTimeout(250);
+        }
+        return false;
+      };
+      if (suspending && await pageCaught()) {
+        await panelMatchesAnswer(c, answers, residents, 'past the deadline, pending suspends', pendingSuspends, { current: true });
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '09-past-deadline');
+      } else {
+        c.rec.note(`the page's poll did not catch the pending suspends past the deadline (${suspending ? 'the loop read them' : 'no read listed them'}); the panel is checked against the next answer`);
+        await panelMatchesAnswer(c, answers, residents, 'past the deadline');
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '09-past-deadline');
+      }
+      // Each resident is reported evacuated, as what it was, by some report:
+      // a report lists only what is still on the node.
+      const reported = (id: string) => firstEvacuated.get(bareSandboxId(id));
+      c.rec.check(!!(await waitForNode(c, node.id, () => residents.every((id) => reported(id)), 300_000, 2000)), 'every resident is reported evacuated');
+      c.rec.check([runA, runB].every((id) => reported(id)?.artifact_kind === 'full' && reported(id)?.was_running === true), 'the held sandboxes are reported as snapshots that were running');
+      c.rec.check(reported(paused)?.artifact_kind === 'full' && reported(paused)?.was_running === false, 'the paused sandbox is reported as a snapshot that was not running');
+      const heldOut = (d: ApiDrain) => [runA, runB].some((id) => d.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(id)));
+      if (answers.latest()?.body?.drain && heldOut(answers.latest()!.body.drain)) {
+        await panelMatchesAnswer(c, answers, residents, 'evacuated', heldOut);
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '10-evacuated');
+      } else {
+        await panelMatchesAnswer(c, answers, residents, 'evacuated');
+        await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+        await panelShot(c, '10-evacuated');
+      }
+      c.rec.check(!!(await waitForNode(c, node.id, (n) => n.drain_phase === 'drained', 300_000)), 'the drain reaches drained');
+      await waitForPanel(c, /Finished: everything on the node is durable elsewhere/, 20_000);
+      const final = await panelMatchesAnswer(c, answers, residents, 'drained', drainFinished);
+      c.rec.check(await waitForSection(c, /Phase\s+drained/, 15_000), 'the Drain section shows drained');
+      await progressCard(c.page).scrollIntoViewIfNeeded().catch(() => {});
+      await panelShot(c, '11-drained');
+      // A sandbox the drain released drops out of the node's report, and
+      // stays in `evacuated_total`, which the panel counts from.
+      if (final) {
+        const total = new Set(final.evacuated_total.map(bareSandboxId));
+        const missing = residents.filter((id) => !total.has(bareSandboxId(id)) && !final.evacuated.some((e) => bareSandboxId(e.sandbox_id) === bareSandboxId(id)));
+        c.rec.check(missing.length === 0, `the drained drain counts every resident evacuated, a released one through evacuated_total (${final.evacuated.length} in the report, ${final.evacuated_total.length} recorded${missing.length ? `; missing ${missing.join(', ')}` : ''})`);
+        const counts = drainCountsOf(final);
+        c.rec.check((await progressCard(c.page).innerText().catch(() => '')).includes(`${counts.evacuated}/${counts.total} evacuated`), `the panel reads ${counts.evacuated}/${counts.total} evacuated`);
+      }
+      await visit(c, '/dashboard/nodes', 2500);
+      const done = (await content(c.page).locator('tr', { has: c.page.locator(`a[href="/dashboard/nodes/${node.id}"]`) }).innerText().catch(() => '')).replace(/\s+/g, ' ');
+      const finalCounts = final ? drainCountsOf(final) : null;
+      const listed = finalCounts ? `${finalCounts.evacuated}/${finalCounts.total} evacuated · finished` : 'evacuated · finished';
+      c.rec.check(done.includes(listed), `the nodes list reads "${listed}", as the report says (${done.slice(0, 160)})`);
+      await shot(c, '12-nodes-list-done');
+    } finally {
+      answers.stop();
+      polling = false;
+      await poll;
+      fs.writeFileSync(path.join(c.rec.outDir, 'node-drain-progress-timeline.json'), JSON.stringify(timeline, null, 2));
+      // The drain is undrained by withV2Worker; the residents go first, so
+      // the worker is empty again for the next run.
+      if (residents.length) await deleteResidents(c, residents);
+    }
+  });
+}, true);
 
 step('nodes-v2-teardown', V2_AROUND, async (c) => {
   if (!v2) return c.rec.note('nodes-v2-setup did not run in this run');
