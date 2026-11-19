@@ -777,9 +777,9 @@ variable "builders_instance_types" {
 }
 
 variable "builders_min_size" {
-  description = "Minimum size of the builders node group. The default of 2 keeps a builder serving while the other is replaced under the MINIMAL update strategy (`builders_update_strategy`)."
+  description = "Minimum size of the builders node group"
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "builders_max_size" {
@@ -789,9 +789,9 @@ variable "builders_max_size" {
 }
 
 variable "builders_desired_size" {
-  description = "Desired size of the builders node group. The default of 2 keeps a builder serving while the other is replaced under the MINIMAL update strategy (`builders_update_strategy`)."
+  description = "Desired size of the builders node group"
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "builders_capacity_type" {
@@ -839,13 +839,14 @@ variable "builders_update_strategy" {
     beyond the group's size: a small bare-metal group whose instances come
     from a fully used capacity reservation can roll. `MINIMAL` avoids a
     builder gap only with more than one builder: the group replaces one node
-    at a time (max_unavailable = 1) while the others keep serving builds,
-    which is why `builders_min_size` and `builders_desired_size` default to 2.
-    A single-node group has no builder until its replacement joins. `DEFAULT`
-    launches the replacement first, which keeps a builder up throughout but
-    needs a spare instance of the same type in the old node's Availability
-    Zone; without one the roll fails and EKS rolls it back. Never null: EKS
-    cannot clear a strategy once set, so null would plan a diff on every run.
+    at a time (max_unavailable = 1) while the others keep serving builds, so
+    set `builders_min_size` and `builders_desired_size` to at least 2 to roll
+    without a gap. A single-node group has no builder until its replacement
+    joins. `DEFAULT` launches the replacement first, which keeps a builder up
+    throughout but needs a spare instance of the same type in the old node's
+    Availability Zone; without one the roll fails and EKS rolls it back. Never
+    null: EKS cannot clear a strategy once set, so null would plan a diff on
+    every run.
 
     Upgrade: an existing builders group keeps its nodes when the strategy
     changes and rolls under `MINIMAL` at its next roll. On a single-node
@@ -854,12 +855,6 @@ variable "builders_update_strategy" {
     to avoid that. Set `DEFAULT` to keep the previous behavior, but only where
     a spare instance of the same type is available in the group's Availability
     Zones.
-
-    Sizes: `builders_min_size` and `builders_desired_size` now default to 2,
-    so a caller that inherits them goes from one builder to two on its next
-    apply, an in-place scaling change that launches one more instance. Check
-    that the instance type has capacity for it first, or set both to 1 to
-    keep a single builder.
 
     Apply a strategy change on its own, before any launch template or AMI
     change to the group. In a combined apply the provider updates the node
