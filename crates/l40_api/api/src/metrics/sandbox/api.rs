@@ -251,14 +251,12 @@ pub struct DormantActivation<'a> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ReconnectEntrypoint {
     Connect,
-    Dataplane,
 }
 
 impl ReconnectEntrypoint {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Connect => "connect",
-            Self::Dataplane => "dataplane",
         }
     }
 }
@@ -348,7 +346,6 @@ pub enum ReconnectReason {
     Conflict,
     Unavailable,
     Failed,
-    Timeout,
     Cancelled,
     NotFound,
     Unsupported,
@@ -374,7 +371,6 @@ impl ReconnectReason {
             Self::Conflict => "conflict",
             Self::Unavailable => "unavailable",
             Self::Failed => "failed",
-            Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::NotFound => "not_found",
             Self::Unsupported => "unsupported",

@@ -509,7 +509,6 @@ fn create_auto_lifecycle_policy(
 fn reconnect_entrypoint(identity: SandboxApiMetricIdentity) -> Option<ReconnectEntrypoint> {
     match (identity.surface, identity.op) {
         (SandboxApiSurface::Ecw, "connect") => Some(ReconnectEntrypoint::Connect),
-        (_, "access") => Some(ReconnectEntrypoint::Dataplane),
         _ => None,
     }
 }
@@ -567,44 +566,6 @@ fn wait_ready_reason(phase: WaitReadyTimeoutPhase) -> ReconnectReason {
         WaitReadyTimeoutPhase::PodNeverReady => ReconnectReason::PodNeverReady,
         WaitReadyTimeoutPhase::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
         WaitReadyTimeoutPhase::GuestNotReady => ReconnectReason::GuestNotReady,
-    }
-}
-
-fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> ReconnectTerminalPhase {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectTerminalPhase::Restore,
-        ControllerRetryAfterCause::PodNeverReady => ReconnectTerminalPhase::PodNeverReady,
-        ControllerRetryAfterCause::ProxyUnreachable => ReconnectTerminalPhase::ProxyUnreachable,
-        ControllerRetryAfterCause::GuestNotReady => ReconnectTerminalPhase::GuestNotReady,
-        // Cluster-admission backpressure is a front-door 429, not a reconnect
-        // outcome; it shouldn't reach the reconnect terminal path. Map it to the
-        // API phase defensively.
-        ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectTerminalPhase::Api,
-    }
-}
-
-fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectReason::RestoreInFlight,
-        ControllerRetryAfterCause::PodNeverReady => ReconnectReason::PodNeverReady,
-        ControllerRetryAfterCause::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
-        ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
-        // See note above: not a reconnect cause. Treat as a retryable wait.
-        ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectReason::WaitBudget,
-    }
-}
-
-fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutcome {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectOutcome::WakeInProgress,
-        ControllerRetryAfterCause::PodNeverReady
-        | ControllerRetryAfterCause::ProxyUnreachable
-        | ControllerRetryAfterCause::GuestNotReady
-        // See note above: not a reconnect cause. Treat as retryable (exhausted).
-        | ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectOutcome::Exhausted,
     }
 }
 
@@ -717,38 +678,14 @@ fn reconnect_error_outcome(
     }
 }
 
-fn reconnect_controller_error_outcome(
-    initial_lifecycle: &str,
+/// Classify a wake that activation admission refused. The only caller, the
+/// `Wake` / `ImplicitWake` admission check in `SandboxController::action`,
+/// passes what `admit_action_cluster_activation` returns: a live-cap refusal,
+/// or a cluster-activation 429. That check never runs the slot check, so a
+/// `NoFreeSlot` 503 doesn't arrive here.
+fn reconnect_admission_refusal_outcome(
     err: &ControllerError,
 ) -> (ReconnectOutcome, ReconnectTerminalPhase, ReconnectReason) {
-    if err.is_restore_context_unavailable() {
-        return (
-            ReconnectOutcome::WakeFailed,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::RestoreContextUnavailable,
-        );
-    }
-    // Mirroring `reconnect_error_outcome`'s `LockContention` arm.
-    // A contention error is a 503 carrying neither a cause nor a `retry_after`,
-    // so without this it falls to the `SERVICE_UNAVAILABLE` arm below and is
-    // labelled `wake_failed` / `unavailable` — the wake-fault series a lost
-    // race must never enter, and with no `lock_contention` reason for the
-    // `lock_timeout` rollout to watch.
-    //
-    // Pre-emptive today. The only production caller, the `Wake` /
-    // `ImplicitWake` admission check in `SandboxController::action`, passes a
-    // cluster-admission rejection (a 429), which never carries the
-    // lock-contention marker. The arm is for a caller that forwards a
-    // substrate error: `From<SubstrateError>` turns `LockContention` into
-    // `ControllerError::lock_contention`, which would otherwise be labelled
-    // `wake_failed` / `unavailable` here. `reconnect_metrics_tests` pins it.
-    if err.is_lock_contention() {
-        return (
-            ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::LockContention,
-        );
-    }
     // A client at its live cap is a per-client refusal, recorded like the
     // concurrency limiter's. Without this its bare 429 and `Retry-After` read
     // as `wait_budget`, the cluster-saturation tag.
@@ -759,59 +696,23 @@ fn reconnect_controller_error_outcome(
             ReconnectReason::RateLimited,
         );
     }
-    if let Some(cause) = err.retry_after_cause() {
-        return (
-            retry_after_cause_outcome(cause),
-            retry_after_cause_terminal_phase(cause),
-            retry_after_cause_reason(cause),
-        );
-    }
-    if err.retry_after().is_some() {
+    // Cluster-activation backpressure: the rate-limited case carries a
+    // `ClusterActivationAdmission` cause, and the empty-cluster (zero-capacity)
+    // case is a bare 429 with only a Retry-After header. Both are admission
+    // exhaustion, not a substrate failure — classify them the same so a
+    // capacity outage isn't misattributed on the retry-storm dashboard.
+    if err.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
         return (
             ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
+            ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         );
     }
-
-    match err.status() {
-        axum::http::StatusCode::CONFLICT | axum::http::StatusCode::PRECONDITION_FAILED => (
-            ReconnectOutcome::Rejected,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::Conflict,
-        ),
-        axum::http::StatusCode::NOT_FOUND => (
-            ReconnectOutcome::Rejected,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::NotFound,
-        ),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE => (
-            ReconnectOutcome::WakeFailed,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::Unavailable,
-        ),
-        axum::http::StatusCode::REQUEST_TIMEOUT | axum::http::StatusCode::GATEWAY_TIMEOUT => (
-            ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::Timeout,
-        ),
-        // Cluster-activation backpressure. The rate-limited case carries a
-        // `ClusterActivationAdmission` cause and is classified above; the
-        // empty-cluster (zero-capacity) case is a bare 429 with only a
-        // Retry-After header and no cause, so it lands here. Both are admission
-        // exhaustion, not a substrate failure — classify them the same so a
-        // capacity outage isn't misattributed on the retry-storm dashboard.
-        axum::http::StatusCode::TOO_MANY_REQUESTS => (
-            ReconnectOutcome::Exhausted,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::WaitBudget,
-        ),
-        _ => (
-            ReconnectOutcome::WakeFailed,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::Substrate,
-        ),
-    }
+    (
+        ReconnectOutcome::WakeFailed,
+        ReconnectTerminalPhase::Api,
+        ReconnectReason::Substrate,
+    )
 }
 
 #[derive(Clone, Copy)]

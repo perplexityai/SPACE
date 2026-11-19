@@ -1139,7 +1139,6 @@ impl KubernetesSubstrate {
         metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         timeout: Duration,
         charge: RecoveryCharge,
-        suspend_restore_storage_uri: Option<&str>,
     ) -> Result<ExecutionBinding, ControllerError> {
         let sandbox_id = sandbox.id;
         let (_, join_deadline) = ready_wait_bounds(timeout);
@@ -1217,7 +1216,7 @@ impl KubernetesSubstrate {
                     // started-recovery lease can't fence the re-drive a required
                     // pin would trigger.
                     None,
-                    suspend_restore_storage_uri,
+                    None,
                     PodMaterializationOwnership::new(
                         started_recovery,
                         // Access/join path holds no restore lease.
@@ -1274,8 +1273,7 @@ impl KubernetesSubstrate {
                                     vcpu: sandbox_vcpu_option(sandbox),
                                     memory_mib: sandbox_memory_mib_option(sandbox),
                                     netns_path: None,
-                                    suspend_restore_storage_uri: suspend_restore_storage_uri
-                                        .map(ToOwned::to_owned),
+                                    suspend_restore_storage_uri: None,
                                     suspend_restore_source_node: None,
                                     expected_local_artifact_id: None,
                                     route_identity: Some(wake_request_route_identity(

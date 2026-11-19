@@ -1727,9 +1727,10 @@ impl SandboxController {
                     // cluster-activation 429/backpressure here is the
                     // control-plane-saturation signature the retry-storm alert
                     // exists to catch, so record it on the reconnect series (the
-                    // error classifier maps the retry-after to exhausted/wait_budget)
-                    // before returning — otherwise a storm throttled by the cluster
-                    // limiter is invisible to the monitor.
+                    // classifier records a cluster-activation 429 as
+                    // exhausted/wait_budget and a live-cap refusal as
+                    // rejected/rate_limited) before returning — otherwise a storm
+                    // throttled by the cluster limiter is invisible to the monitor.
                     if Self::defers_to_restore_claim(Some(lifecycle)) {
                         None
                     } else {
@@ -1745,10 +1746,7 @@ impl SandboxController {
                             Ok(live) => live,
                             Err(err) => {
                                 let (outcome, terminal_phase, reason) =
-                                    reconnect_controller_error_outcome(
-                                        sandbox.lifecycle.as_str(),
-                                        &err,
-                                    );
+                                    reconnect_admission_refusal_outcome(&err);
                                 record_reconnect_attempt(
                                     metric_identity,
                                     sandbox.lifecycle.as_str(),

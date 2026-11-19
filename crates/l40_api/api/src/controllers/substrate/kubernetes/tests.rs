@@ -3383,7 +3383,6 @@ mod kubernetes_tests {
                     SandboxApiMetricIdentity::ecw("connect"),
                     Duration::from_secs(3),
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    None,
                 )
                 .await
         });
@@ -3401,7 +3400,6 @@ mod kubernetes_tests {
                     SandboxApiMetricIdentity::ecw("connect"),
                     Duration::from_secs(3),
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    None,
                 )
                 .await
         });
@@ -3554,7 +3552,6 @@ mod kubernetes_tests {
                     SandboxApiMetricIdentity::native("runtime_client"),
                     Duration::from_secs(5),
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    None,
                 )
                 .await
         });
@@ -7082,7 +7079,6 @@ mod kubernetes_tests {
                     SandboxApiMetricIdentity::ecw("spaced"),
                     Duration::from_secs(1),
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    None,
                 )
                 .await
         });
@@ -7105,7 +7101,6 @@ mod kubernetes_tests {
                     SandboxApiMetricIdentity::ecw("spaced"),
                     Duration::from_secs(1),
                     crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
-                    None,
                 )
                 .await
         });
@@ -10356,7 +10351,6 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::native("runtime_client"),
                 Duration::from_secs(1),
                 crate::controllers::substrate::RecoveryCharge::enforce_for_tests(Some(&admission)),
-                None,
             )
             .await
             .expect_err("a follower must wait for the active recovery owner");
@@ -10415,7 +10409,6 @@ mod kubernetes_tests {
                 SandboxApiMetricIdentity::native("runtime_client"),
                 Duration::from_secs(1),
                 crate::controllers::substrate::RecoveryCharge::enforce_for_tests(Some(&admission)),
-                None,
             )
             .await
             .expect_err("access must join suspend finalization before activation admission");
