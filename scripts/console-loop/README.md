@@ -183,6 +183,11 @@ the annotation with
 where `<context>` is the run's `--kube-context` or `CONSOLE_LOOP_KUBE_CONTEXT`
 (`kind-space-local` by default).
 
+`node-gentle-drain-undrain` drains a worker the same way through the node
+page's Drain, a v1 gentle drain: it checks that the request is
+`{"mode":"gentle"}` with no engine and that the page shows a mode, no
+engine and no Drain progress panel, then undrains it.
+
 Two read-only `nodes` steps cover what holds a node. Both pick the worker
 the admin API's `GET /v1/nodes/{id}/holds` reports the most holds for, a node
 in a drain phase first. `node-holds-panel` checks that the node page's "What
