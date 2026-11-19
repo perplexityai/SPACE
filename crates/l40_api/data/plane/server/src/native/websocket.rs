@@ -844,6 +844,7 @@ pub(crate) async fn bridge_process_session(
                                             &current_process_id,
                                             attached.space_api_route_token.as_ref(),
                                             output_seq,
+                                            UNPOSITIONED_SEQ_BASE - 1,
                                         ),
                                     )
                                     .await

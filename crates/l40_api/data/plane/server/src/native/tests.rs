@@ -3083,6 +3083,20 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
             FakeOpen::Start => panic!("the process is already bound"),
         }
     }
+    // The same guest with its output at `FAR`, past the positions an SSE
+    // event id carries but not a `seq`.
+    const FAR: u64 = 1 << 40;
+    const { assert!(FAR > PROCESS_EVENT_ID_MAX_POSITION) };
+    assert_eq!(FAR + 2, 1_099_511_627_778);
+    fn far_older_guest(open: FakeOpen) -> Vec<FakeReply> {
+        match open {
+            FakeOpen::Connect(Some(cursor)) if cursor < FAR => {
+                vec![connected(), untagged_lagged()]
+            }
+            FakeOpen::Connect(Some(cursor)) => older_guest(FakeOpen::Connect(Some(cursor - FAR))),
+            open => older_guest(open),
+        }
+    }
     let cases = [
         Case {
             name: "reattach without after_seq",
@@ -3202,6 +3216,18 @@ async fn websocket_reattach_continues_after_the_last_seq_received() {
             replies: Arc::new(|_, open| older_guest(open)),
             query: "?after_seq=2",
             stdout: &[(6, "6\n"), (7, "7\n"), (8, "8\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: None,
+        },
+        Case {
+            name: "older guest evicted an exited process's output past SSE positions",
+            bound: true,
+            running: false,
+            replies: Arc::new(|_, open| far_older_guest(open)),
+            // `FAR + 2`.
+            query: "?after_seq=1099511627778",
+            stdout: &[(FAR + 6, "6\n"), (FAR + 7, "7\n"), (FAR + 8, "8\n")],
             resyncs: &["cursor_out_of_window"],
             truncated: true,
             opens: None,

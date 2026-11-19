@@ -345,7 +345,7 @@ const PROCESS_EVENT_ID_FIELD_BITS: u32 = PROCESS_EVENT_ID_TAG_BIT - PROCESS_EVEN
 const PROCESS_EVENT_ID_FIELD_MASK: u64 = (1 << PROCESS_EVENT_ID_FIELD_BITS) - 1;
 pub(super) const PROCESS_EVENT_ID_MAX_FRAME: u64 = (1 << PROCESS_EVENT_ID_FRAME_BITS) - 1;
 const PROCESS_EVENT_ID_UNKNOWN: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 1);
-const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
+pub(super) const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
 /// The highest block a resumed stream starts in: half the blocks, so every
 /// stream has at least 2^(field + frame - 2) = 2^34 ids left to send.
 const PROCESS_EVENT_ID_MAX_RESUME_BLOCK: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 2);
@@ -709,6 +709,7 @@ impl ProcessSseState {
                         &process_id,
                         self.attached.space_api_route_token.as_ref(),
                         cursor,
+                        PROCESS_EVENT_ID_MAX_POSITION,
                     ),
                 )
                 .await
@@ -1090,13 +1091,15 @@ pub(super) const RETAINED_START_SEARCH_TIMEOUT: Duration = Duration::from_secs(3
 /// past the output, which such a guest answers with the exit), then bisects,
 /// one connect per cursor. Such a guest lists only running processes, so one
 /// it lists is still running; that, or any answer other than these, gives
-/// `None`, and the stream follows the live tail as before.
+/// `None`, and the stream follows the live tail as before. So does a start
+/// above `max_position`, the highest cursor the caller can number output from.
 pub(super) async fn exited_process_retained_start(
     client: &mut WorkerApiClient<GrpcClientTrace<Channel>>,
     sandbox_id: &SandboxId,
     process_id: &ProcessId,
     route_token: Option<&SpaceApiRouteTokenState>,
     evicted: u64,
+    max_position: u64,
 ) -> Option<u64> {
     let request = node_api_request_with_timeout_and_route_token_state(
         SpacedListProcessesRequest {
@@ -1127,7 +1130,7 @@ pub(super) async fn exited_process_retained_start(
     let mut retained = loop {
         let cursor = below
             .checked_add(step)
-            .filter(|cursor| *cursor <= PROCESS_EVENT_ID_MAX_POSITION)?;
+            .filter(|cursor| *cursor <= max_position)?;
         if output_retained_at(client, sandbox_id, process_id, route_token, cursor).await? {
             break cursor;
         }
