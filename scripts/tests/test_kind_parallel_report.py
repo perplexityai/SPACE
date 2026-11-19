@@ -173,6 +173,16 @@ def test_a_pair_covered_twice_is_duplicated(tmp_path, second):
     assert summary["coverage"]["surfaces"]["ecw"]["duplicated"] == ["ecw.a"]
 
 
+def test_a_failed_attempt_of_a_scenario_run_twice_still_fails_the_run(tmp_path):
+    # The later passing attempt does not replace the failed one's exit.
+    status, summary = run(
+        tmp_path, [shard([("ecw.a", 1), ("ecw.a", 0)], [("native.c", 0)]), shard([("ecw.b", 0)], [("native.d", 0)])]
+    )
+    assert status == 1
+    assert [(row["scenario"], row["verdict"]) for row in summary["not_passed"]] == [("ecw.a", "fail")]
+    assert summary["coverage"]["surfaces"]["ecw"]["duplicated"] == ["ecw.a"]
+
+
 def test_a_pair_skipped_on_two_benches_is_duplicated(tmp_path):
     status, summary = run(
         tmp_path,
@@ -212,8 +222,8 @@ def test_the_parser_reads_an_end_marker_glued_to_output(tmp_path):
     log, _ = typed_log([("ecw.a", 1)], [("native.c", 0)], glued=True)
     (tmp_path / "typed.log").write_text(log)
     parsed = report.parse_typed(tmp_path / "typed.log")
-    assert parsed["ecw"]["exits"] == {"ecw.a": 1}
-    assert parsed["native"]["exits"] == {"native.c": 0}
+    assert parsed["ecw"]["run"] == [["ecw.a", 1]]
+    assert parsed["native"]["run"] == [["native.c", 0]]
 
 
 def test_the_parser_keeps_each_pass_s_counts_over_the_closing_summary(tmp_path):

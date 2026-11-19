@@ -111,7 +111,7 @@ VERDICT = {0: "pass", 42: "warn", 1: "fail"}
 
 
 def parse_typed(log: Path) -> dict:
-    """Per surface: scenarios run with their exit codes, post-partition skips, SUITE."""
+    """Per surface: each attempt as [scenario, exit or None], post-partition skips, SUITE."""
 
     surfaces: dict[str, dict] = {}
     current = None
@@ -124,12 +124,12 @@ def parse_typed(log: Path) -> dict:
             if match := PASS_STATUS.match(line):
                 for surface, status in zip(SURFACES, match.groups()):
                     surfaces.setdefault(
-                        surface, {"run": [], "exits": {}, "skipped": [], "known": set(), "suite": None}
+                        surface, {"run": [], "skipped": [], "known": set(), "suite": None}
                     )["status"] = int(status)
             break
         if match := SURFACE.match(line):
             current = surfaces.setdefault(
-                match[1], {"run": [], "exits": {}, "skipped": [], "known": set(), "suite": None}
+                match[1], {"run": [], "skipped": [], "known": set(), "suite": None}
             )
             partitioned = False
             continue
@@ -138,9 +138,16 @@ def parse_typed(log: Path) -> dict:
         if SHARD.match(line):
             partitioned = True
         elif match := RUN.match(line):
-            current["run"].append(match[1])
+            current["run"].append([match[1], None])
         elif match := END.search(line):
-            current["exits"][match[1]] = int(match[2])
+            # Each attempt keeps its own exit: a scenario run twice in one pass
+            # is two attempts, and a pass after a failure does not undo it. The
+            # runner runs one scenario at a time, so an END closes the latest
+            # open attempt of its scenario.
+            for attempt in reversed(current["run"]):
+                if attempt[0] == match[1] and attempt[1] is None:
+                    attempt[1] = int(match[2])
+                    break
         elif match := KNOWN_FAILURE.match(line):
             current["known"].add(match[1])
         elif (match := SKIPPED.match(line)) and partitioned:
@@ -302,10 +309,9 @@ def summarize(out: Path) -> int:
             incomplete = True
         for surface, data in typed.items():
             pass_failed = False
-            seen.setdefault(surface, Counter()).update(data["run"])
+            seen.setdefault(surface, Counter()).update(scenario for scenario, _ in data["run"])
             skipped.setdefault(surface, Counter()).update(data["skipped"])
-            for scenario in data["run"]:
-                code = data["exits"].get(scenario)
+            for scenario, code in data["run"]:
                 if code != 0:
                     if code is None:
                         verdict = "unfinished"
