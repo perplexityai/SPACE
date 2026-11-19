@@ -83,6 +83,7 @@ pub async fn lease_targets(
         tx: &mut tx,
         rollout_id,
         active_limit,
+        held: Vec::new(),
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
     end_transaction(tx, leased).await
@@ -92,6 +93,8 @@ struct Claiming<'c> {
     tx: &'c mut PgConnection,
     rollout_id: RolloutId,
     active_limit: u64,
+    /// What `held_elsewhere` read, for `candidates` to skip.
+    held: Vec<uuid::Uuid>,
 }
 
 impl FailedItems for Claiming<'_> {
@@ -172,9 +175,8 @@ impl ClaimStore for Claiming<'_> {
     async fn held_elsewhere(&mut self, _canary: &bool) -> Result<HashSet<NodeId>, sqlx::Error> {
         // Any phase: a finished rollout's lease holds its node until it ends,
         // since its controller may still be on it. Rollouts first, so each
-        // one's in-flight items come from the item index. `candidates`
-        // already excludes these; this is the shared loop's safety net.
-        let held = sqlx::query_scalar::<_, NodeId>(sql!(
+        // one's in-flight items come from the item index.
+        self.held = sqlx::query_scalar::<_, uuid::Uuid>(sql!(
             "SELECT i.node_id
              FROM firewall_rules_rollouts r
              JOIN firewall_rules_rollout_items i ON i.rollout_id = r.id AND i.phase = $2
@@ -185,7 +187,7 @@ impl ClaimStore for Claiming<'_> {
         .bind(ItemPhase::InFlight.as_str())
         .fetch_all(&mut *self.tx)
         .await?;
-        Ok(held.into_iter().collect())
+        Ok(self.held.iter().copied().map(NodeId::from_uuid).collect())
     }
 
     /// Where eligibility is decided; `claim` mirrors the online and due
@@ -205,8 +207,9 @@ impl ClaimStore for Claiming<'_> {
         // One statement, so the in-flight count and the pending items come
         // from one snapshot. The canary pin looks at every item before any
         // filter: an issued canary that's offline or not due still holds it.
-        // Nodes held elsewhere are excluded before the limit, so they can't
-        // fill the scan.
+        // It counts: as an EXISTS, the planner scans every rollout's items.
+        // `held` is excluded before the limit, so it can't fill the scan;
+        // under the exclusive handoff lock it can only shrink.
         let (in_flight, pending) = sqlx::query_as::<_, (i64, Vec<uuid::Uuid>)>(sql!(
             "SELECT
                  (SELECT count(*)
@@ -220,25 +223,16 @@ impl ClaimStore for Claiming<'_> {
                          AND i.phase = $3
                          AND (NOT $4
                               OR i.issued_at IS NOT NULL
-                              OR NOT EXISTS (
-                                  SELECT 1
+                              OR (SELECT count(*)
                                   FROM firewall_rules_rollout_items issued
                                   WHERE issued.rollout_id = $1
-                                    AND issued.issued_at IS NOT NULL))
+                                    AND issued.issued_at IS NOT NULL) = 0)
                          AND (i.issued_at IS NULL
                               OR (i.next_check_at IS NOT NULL
                                   AND i.next_check_at <= clock_timestamp()))
                          AND nss.reachable
                          AND nss.stale_after > clock_timestamp()
-                         AND NOT EXISTS (
-                             SELECT 1
-                             FROM firewall_rules_rollouts r
-                             JOIN firewall_rules_rollout_items held
-                               ON held.rollout_id = r.id
-                              AND held.phase = $2
-                              AND held.node_id = i.node_id
-                             WHERE r.id <> $1
-                               AND held.lease_expires_at > clock_timestamp())
+                         AND i.node_id <> ALL ($6)
                        ORDER BY i.node_id
                        LIMIT $5)"
         ))
@@ -247,6 +241,7 @@ impl ClaimStore for Claiming<'_> {
         .bind(ItemPhase::Pending.as_str())
         .bind(canary)
         .bind(i64::from(scan_limit))
+        .bind(&self.held)
         .fetch_one(&mut *self.tx)
         .await?;
         Ok(Candidates {
