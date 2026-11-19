@@ -9,6 +9,9 @@
 //! * `firewall_rules_node_assignments`: each node's current intent.
 //! * `firewall_rules_node_observations`: each node's accepted observations.
 //!
+//! [`start_rollout`] saves a reviewed revision and the nodes it targets
+//! without adopting it; [`adopt_rollout_revision`] adopts it later, inside
+//! the completion that proves it.
 //! [`lease_targets`] leases a rollout's saved targets to a controller under
 //! the shared queue's rules ([`pplx_space_rollout_queue`]); [`renew_lease`],
 //! [`requeue`] and [`redrive_expired`] keep or end the lease.
@@ -18,11 +21,16 @@ use std::fmt;
 use pplx_space_rollout_queue::HeaderPhase;
 
 mod lease;
+mod start;
 
 pub use lease::{
     LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
+pub use start::{
+    AdoptedRevision, Review, StartError, StartRollout, StartedRollout, adopt_rollout_revision,
+    start_rollout,
+};
 
 #[cfg(test)]
 mod tests;
@@ -33,6 +41,17 @@ mod tests;
 pub struct RolloutId(pub uuid::Uuid);
 
 impl fmt::Display for RolloutId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A revision's id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct RevisionId(pub uuid::Uuid);
+
+impl fmt::Display for RevisionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -72,10 +91,10 @@ impl ItemPhase {
 
 /// Commit on `Ok`, roll back otherwise, so a verb's locks end with it rather
 /// than when the connection is next used.
-async fn end_transaction<T>(
+async fn end_transaction<T, E: From<sqlx::Error>>(
     tx: sqlx::Transaction<'_, sqlx::Postgres>,
-    result: Result<T, sqlx::Error>,
-) -> Result<T, sqlx::Error> {
+    result: Result<T, E>,
+) -> Result<T, E> {
     match result {
         Ok(value) => {
             tx.commit().await?;
