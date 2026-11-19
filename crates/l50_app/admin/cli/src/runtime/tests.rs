@@ -11,8 +11,10 @@ use tokio::sync::mpsc;
 
 use crate::cli::{Cli, Commands};
 
-const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+pub(super) const E0: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+pub(super) const E1: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const NODE_A: &str = "01900000-0000-7000-8000-00000000000a";
 const NODE_B: &str = "01900000-0000-7000-8000-00000000000b";
 
@@ -26,19 +28,20 @@ fn env(args: &[&str]) -> RuntimeCommands {
     command
 }
 
-/// Whether `space-admin-cli runtime env <args>` parses.
-fn if_match(headers: &HeaderMap) -> Option<String> {
+/// The request's `If-Match` header, if any.
+pub(super) fn if_match(headers: &HeaderMap) -> Option<String> {
     headers
         .get("if-match")
         .map(|value| value.to_str().unwrap().to_string())
 }
 
+/// Whether `space-admin-cli runtime env <args>` parses.
 fn env_parses(args: &[&str]) -> bool {
     Cli::try_parse_from(["space-admin-cli", "runtime", "env"].iter().chain(args)).is_ok()
 }
 
 /// Serve `app` on a loopback port for the duration of `run`.
-async fn with_server<F, Fut>(app: Router, run: F)
+pub(super) async fn with_server<F, Fut>(app: Router, run: F)
 where
     F: FnOnce(AdminClient) -> Fut,
     Fut: std::future::Future<Output = ()>,
