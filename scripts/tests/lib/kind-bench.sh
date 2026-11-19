@@ -503,10 +503,21 @@ kind_bench_teardown() {
   comment="$(kind_bench_comment "$i")"
   # A bench created under another bench root keeps its data there: removing
   # its namespace and /run state from here would leave that data with nothing
-  # to find it by.
+  # to find it by. Its root is the one its /run directory records or, with no
+  # record, this root if the bench's marked directory is here; a bench whose
+  # root is known neither way is left as it is.
   local recorded
   recorded="$(sudo -n cat "$run/root" 2>/dev/null || true)"
-  if [[ -n "$recorded" && "$recorded" != "$KIND_BENCH_ROOT" ]]; then
+  if [[ -z "$recorded" && -e "$dir/$KIND_BENCH_MARKER" ]]; then
+    recorded="$KIND_BENCH_ROOT"
+  fi
+  if [[ -z "$recorded" ]]; then
+    kind_bench_log "bench $i records no bench root and has no marked directory under $KIND_BENCH_ROOT;" \
+      "tear it down with SPACE_KIND_BENCH_ROOT set to the root it was created under" \
+      "(if its data is gone, remove $run and the network namespace $ns with sudo)"
+    return 1
+  fi
+  if [[ "$recorded" != "$KIND_BENCH_ROOT" ]]; then
     kind_bench_log "bench $i was created under $recorded; tear it down with SPACE_KIND_BENCH_ROOT=$recorded"
     return 1
   fi
