@@ -241,22 +241,34 @@ pub enum Read {
 }
 
 /// A protocol header field, named as the caller wrote it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadHeader {
     pub protocol: Name,
     pub field: Name,
 }
 
+// The derives sit on private shadows, so the checked trait impls are the only
+// public way in.
+#[derive(Serialize, Deserialize)]
+#[serde(
+    remote = "PayloadHeader",
+    rename = "PayloadHeader",
+    deny_unknown_fields
+)]
+struct PayloadHeaderFields {
+    protocol: Name,
+    field: Name,
+}
+
 impl Serialize for PayloadHeader {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        Self::serialize(self, serializer)
+        PayloadHeaderFields::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for PayloadHeader {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::deserialize(MapOnly(deserializer))
+        PayloadHeaderFields::deserialize(MapOnly(deserializer))
     }
 }
 
@@ -265,8 +277,7 @@ impl<'de> Deserialize<'de> for PayloadHeader {
 /// Values that match the same packets stay distinct: `Integer(80)` is not
 /// `Range` 80 to 80, and an address is not its `/32` prefix. Re-encoding a
 /// rule from one form to the other is a replacement in a diff.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(expecting = "expected an unsigned integer, an IPv4 address, true, a prefix or a range")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum Value {
     #[serde(rename = "prefix")]
     Ipv4Prefix(Ipv4Prefix),
@@ -278,27 +289,39 @@ pub enum Value {
     Ipv4(Ipv4Addr),
     /// The literal `true`, as in "this TCP option is present". There is no
     /// `false`.
-    #[serde(untagged, with = "shape::literal_true")]
+    #[serde(untagged, serialize_with = "shape::literal_true")]
     True,
 }
 
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(shape::ValueVisitor)
+    }
+}
+
 /// An IPv4 prefix. The address is kept as written, including host bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipv4Prefix {
+    addr: Ipv4Addr,
+    len: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Ipv4Prefix", rename = "Ipv4Prefix", deny_unknown_fields)]
+struct Ipv4PrefixFields {
     addr: Ipv4Addr,
     len: u8,
 }
 
 impl Serialize for Ipv4Prefix {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        Self::serialize(self, serializer)
+        Ipv4PrefixFields::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Ipv4Prefix {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let read = Self::deserialize(MapOnly(deserializer))?;
+        let read = Ipv4PrefixFields::deserialize(MapOnly(deserializer))?;
         Ipv4Prefix::new(read.addr, read.len).map_err(de::Error::custom)
     }
 }

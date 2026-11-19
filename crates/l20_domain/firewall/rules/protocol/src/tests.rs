@@ -2,9 +2,11 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
 use pplx_space_firewall_rules_model::{
-    FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, PayloadHeader, Read, Rule, RuleId,
-    Value,
+    FirewallRuleRevision, IntegerRange, Ipv4Prefix, Match, Name, NameError, PayloadHeader, Read,
+    Rule, RuleId, RuleRevisionError, Value,
 };
+use serde::Deserialize;
+use serde_json::json;
 
 use crate::{DecodeError, decode_revision, encode_revision};
 
@@ -430,4 +432,82 @@ fn rejects_every_document_outside_the_grammar() {
     for document in documents(REJECTED).iter().chain([&deep]) {
         assert!(decode_revision(document).is_err(), "accepted {document}");
     }
+}
+
+/// A path call resolves to the checked impl, not to a derive that skips it.
+#[test]
+fn a_path_call_reads_through_the_checks() {
+    for prefix in [
+        json!({"addr": "10.0.0.0", "len": 200}),
+        json!(["10.0.0.0", 200]),
+        json!(["10.0.0.0", 24]),
+    ] {
+        assert!(Ipv4Prefix::deserialize(&prefix).is_err(), "{prefix}");
+    }
+    PayloadHeader::deserialize(&json!(["tcp", "dport"])).unwrap_err();
+}
+
+#[test]
+fn an_invalid_value_reports_its_own_reason() {
+    for (right, reason) in [
+        (
+            r#"{"range":[443,80]}"#,
+            "range start 443 exceeds its end 80",
+        ),
+        (
+            r#"{"prefix":{"addr":"198.51.100.0","len":33}}"#,
+            "IPv4 prefix length 33 is outside 0..=32",
+        ),
+        (r#""300.0.0.1""#, r#"invalid value: string "300.0.0.1""#),
+        (
+            r#"{"prefix":{"addr":"198.51.100.0","x":1}}"#,
+            "unknown field `x`",
+        ),
+        ("false", "false is not a value"),
+        (r#"{"set":[1]}"#, "unknown field `set`"),
+    ] {
+        let error = decode_revision(&with_right(right)).unwrap_err().to_string();
+        assert!(error.contains(reason), "{right}: {error}");
+    }
+}
+
+#[test]
+fn rule_checks_report_the_rule_and_the_typed_cause() {
+    let good = format!(r#"{{"left":{DPORT},"op":"==","right":1}}"#);
+    let decode = |rules: &str| decode_revision(&doc(&rules.replace("GOOD", &good))).unwrap_err();
+
+    let error = decode(r#"{"id":"a","all_of":[GOOD]},{"id":"-b","all_of":[GOOD]}"#);
+    assert_eq!(
+        error.to_string(),
+        r#"invalid firewall rules: rules[1]: id holds '-' at byte 0, which its syntax rule refuses"#
+    );
+    assert!(matches!(
+        error,
+        DecodeError::InvalidRuleId {
+            index: 1,
+            source: NameError::InvalidCharacter {
+                index: 0,
+                found: '-'
+            },
+        }
+    ));
+
+    let error = decode(r#"{"id":"a","all_of":[GOOD]},{"id":"b","all_of":[]}"#);
+    assert_eq!(
+        error.to_string(),
+        r#"invalid firewall rules: rules[1] ("b"): all_of must contain at least one comparison"#
+    );
+    assert!(
+        matches!(error, DecodeError::EmptyAllOf { index: 1, ref id, .. } if id.as_str() == "b")
+    );
+
+    let error = decode(r#"{"id":"a","all_of":[GOOD]},{"id":"a","all_of":[GOOD]}"#);
+    assert_eq!(
+        error.to_string(),
+        r#"invalid firewall rules: rule ID "a" appears more than once"#
+    );
+    assert!(matches!(
+        error,
+        DecodeError::Revision(RuleRevisionError::DuplicateRuleId { ref id }) if id.as_str() == "a"
+    ));
 }

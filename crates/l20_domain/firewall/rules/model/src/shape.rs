@@ -1,13 +1,15 @@
 //! The serde shapes a derive alone would get wrong: objects read only from
 //! JSON objects, the `{left, op, right}` comparison, the TCP option and masked
-//! reads, and the literal `true`.
+//! reads, and the value.
 
+use std::fmt;
+use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 
-use serde::de::{self, Deserializer, Visitor};
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Unexpected, Visitor};
 use serde::{Deserialize, Serialize, Serializer, forward_to_deserialize_any};
 
-use crate::model::{Name, PayloadHeader};
+use crate::model::{Name, PayloadHeader, Value};
 
 /// Reads anything as a map. A derived struct also accepts an array of its
 /// fields in order, which the grammar does not.
@@ -125,18 +127,61 @@ pub(crate) mod masked {
 }
 
 /// The literal `true`; `false` is not a value.
-pub(crate) mod literal_true {
-    use super::*;
+pub(crate) fn literal_true<S: Serializer>(serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bool(true)
+}
 
-    pub(crate) fn serialize<S: Serializer>(serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bool(true)
+/// Reads a [`Value`] by its JSON type, so a bad value reports its own reason.
+pub(crate) struct ValueVisitor;
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "lowercase")]
+enum ValueKey {
+    Prefix,
+    Range,
+}
+
+impl<'de> Visitor<'de> for ValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an unsigned integer, an IPv4 address, true, a prefix or a range")
     }
 
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
-        if bool::deserialize(deserializer)? {
-            Ok(())
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Integer(value))
+    }
+
+    // serde_json reads a non-negative integer as `u64`; other formats may not.
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        let negative = |_| E::invalid_value(Unexpected::Signed(value), &self);
+        u64::try_from(value).map(Value::Integer).map_err(negative)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        let invalid = |_| E::invalid_value(Unexpected::Str(value), &"an IPv4 address");
+        value.parse::<Ipv4Addr>().map(Value::Ipv4).map_err(invalid)
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        if value {
+            Ok(Value::True)
         } else {
-            Err(de::Error::custom("false is not a value; only true is"))
+            Err(E::custom("false is not a value; only true is"))
+        }
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let value = match map.next_key()? {
+            Some(ValueKey::Prefix) => Some(Value::Ipv4Prefix(map.next_value()?)),
+            Some(ValueKey::Range) => Some(Value::Range(map.next_value()?)),
+            None => None,
+        };
+        match (value, map.next_key::<IgnoredAny>()?) {
+            (Some(value), None) => Ok(value),
+            _ => Err(de::Error::custom(
+                "expected an object with exactly one key, prefix or range",
+            )),
         }
     }
 }

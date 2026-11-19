@@ -2,7 +2,9 @@
 //! comparisons, then the model constructors check rule IDs, non-empty `all_of`
 //! and unique IDs.
 
-use pplx_space_firewall_rules_model::{FirewallRuleRevision, Match, Rule, RuleId};
+use pplx_space_firewall_rules_model::{
+    EmptyAllOfError, FirewallRuleRevision, Match, NameError, Rule, RuleId, RuleRevisionError,
+};
 
 use crate::SCHEMA_VERSION;
 use crate::wire::{Object, RevisionV1, RuleV1, Version};
@@ -29,10 +31,19 @@ pub enum DecodeError {
     /// holds.
     #[error("unsupported schema version {0}; only {SCHEMA_VERSION} is supported")]
     UnsupportedSchemaVersion(u64),
-    /// A rule whose ID breaks its syntax rule or whose `all_of` is empty, named
-    /// by its index and, once it is valid, its ID; or a repeated rule ID.
+    /// The rule at `index` has an ID that breaks its syntax rule.
+    #[error("invalid firewall rules: rules[{index}]: id {source}")]
+    InvalidRuleId { index: usize, source: NameError },
+    /// The rule at `index` has an empty `all_of`.
+    #[error("invalid firewall rules: rules[{index}] ({id:?}): {source}", id = .id.as_str())]
+    EmptyAllOf {
+        index: usize,
+        id: RuleId,
+        source: EmptyAllOfError,
+    },
+    /// Valid rules that cannot form a revision, such as a repeated rule ID.
     #[error("invalid firewall rules: {0}")]
-    Invalid(String),
+    Revision(#[from] RuleRevisionError),
 }
 
 /// The version is read before the grammar is checked, so a newer document is
@@ -51,12 +62,14 @@ fn decode_v1(revision: DocumentV1) -> Result<FirewallRuleRevision, DecodeError> 
         .enumerate()
         .map(|(index, Object(rule))| decode_rule(index, rule))
         .collect::<Result<_, _>>()?;
-    FirewallRuleRevision::new(rules).map_err(|error| DecodeError::Invalid(error.to_string()))
+    Ok(FirewallRuleRevision::new(rules)?)
 }
 
 fn decode_rule(index: usize, rule: RuleV1<String, Vec<Match>>) -> Result<Rule, DecodeError> {
-    let id = RuleId::new(rule.id)
-        .map_err(|error| DecodeError::Invalid(format!("rules[{index}]: id {error}")))?;
-    let at = format!("rules[{index}] ({:?})", id.as_str());
-    Rule::new(id, rule.all_of).map_err(|error| DecodeError::Invalid(format!("{at}: {error}")))
+    let id = RuleId::new(rule.id).map_err(|source| DecodeError::InvalidRuleId { index, source })?;
+    Rule::new(id.clone(), rule.all_of).map_err(|source| DecodeError::EmptyAllOf {
+        index,
+        id,
+        source,
+    })
 }

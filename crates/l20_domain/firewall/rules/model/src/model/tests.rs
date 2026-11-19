@@ -86,3 +86,13 @@ fn names_follow_their_syntax_rules() {
     );
     assert_eq!(RuleId::new("web").unwrap().to_string(), "web");
 }
+
+#[test]
+fn a_value_reads_a_non_negative_signed_integer() {
+    use serde::de::IntoDeserializer;
+    use serde::de::value::{Error, I64Deserializer};
+
+    let read = |n: i64| Value::deserialize::<I64Deserializer<Error>>(n.into_deserializer());
+    assert_eq!(read(80), Ok(Value::Integer(80)));
+    read(-1).unwrap_err();
+}
