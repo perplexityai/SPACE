@@ -53,7 +53,9 @@ SELECT id,
        materialized_at AS pod_materialized_at,
        runtime_upgrade_operation_id,
        runtime_upgrade_target_environment_ref,
-       runtime_upgrade_authorization_id
+       runtime_upgrade_authorization_id,
+       restore_dispatch_fence_token,
+       restore_dispatch_fence_expires_at
 FROM sandbox_execution_records
 WHERE managed_by = 'k8s'
 WITH CASCADED CHECK OPTION;
@@ -89,7 +91,7 @@ GRANT SELECT (
     activation_attempt_expires_at, activation_attempt_target_state,
     route_activation_id, materialized_at, runtime_upgrade_operation_id,
     runtime_upgrade_target_environment_ref, runtime_upgrade_authorization_id,
-    managed_by
+    restore_dispatch_fence_token, restore_dispatch_fence_expires_at, managed_by
 ) ON sandbox_execution_records TO space_credmgr;
 GRANT SELECT (node_id, k8s_node_name, k8s_node_uid)
     ON node_k8s TO space_credmgr;
