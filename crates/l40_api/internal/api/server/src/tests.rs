@@ -2791,6 +2791,7 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id: session_id.clone(),
             protocol_session_id: None,
             process_id: "proc_1".to_string(),
+            records_exit: false,
         }))
         .await?
         .into_inner();
@@ -2803,6 +2804,7 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id: session_id.clone(),
             protocol_session_id: None,
             process_id: "proc_1".to_string(),
+            records_exit: false,
         }))
         .await?
         .into_inner();
@@ -2828,10 +2830,129 @@ async fn data_plane_process_binding_is_idempotent_and_conflict_checked() -> Test
             session_id,
             protocol_session_id: None,
             process_id: "proc_2".to_string(),
+            records_exit: false,
         }))
         .await
         .expect_err("second process id should be rejected");
     assert_eq!(conflict.code(), Code::AlreadyExists);
+    Ok(())
+}
+
+/// A session's public state follows its process: `pending` until a stream
+/// binds the process it started, `open` while it runs, and `closed` once a
+/// stream reports its exit. A bind from a caller that does not report exits
+/// leaves the session `pending`. A report about another process, a repeated
+/// one, and one for a revoked session leave the state as it is, and so does
+/// a repeated bind of a closed or revoked session.
+#[tokio::test(flavor = "current_thread")]
+async fn data_plane_session_state_follows_its_process() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_data_plane_worker_node(&fixture.service.pool, node_id, "10.0.0.43").await?;
+    insert_data_plane_active_sandbox(&fixture.service.pool, sandbox_id, node_id).await?;
+    let state = |session_id: String| {
+        let pool = fixture.service.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM data_plane_sessions WHERE session_id = $1",
+            )
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    let bind = |session_id: &str, records_exit: bool| {
+        Request::new(BindDataPlaneSessionProcessRequest {
+            session_id: session_id.to_string(),
+            protocol_session_id: None,
+            process_id: "proc_1".to_string(),
+            records_exit,
+        })
+    };
+    let exited = |session_id: &str, process_id: &str| {
+        Request::new(RecordDataPlaneSessionProcessExitedRequest {
+            session_id: session_id.to_string(),
+            protocol_session_id: None,
+            process_id: process_id.to_string(),
+        })
+    };
+
+    let session_id = format!("proc_{}", Uuid::now_v7());
+    let revoked_id = format!("proc_{}", Uuid::now_v7());
+    let untracked_id = format!("proc_{}", Uuid::now_v7());
+    for (session_id, records_exit) in [
+        (&session_id, true),
+        (&revoked_id, true),
+        (&untracked_id, false),
+    ] {
+        insert_data_plane_session_with_protocol(
+            &fixture.service.pool,
+            session_id,
+            None,
+            sandbox_id,
+            "process",
+        )
+        .await?;
+        // As the public API creates a session.
+        sqlx::query("UPDATE data_plane_sessions SET state = 'pending' WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&fixture.service.pool)
+            .await?;
+        fixture
+            .service
+            .bind_data_plane_session_process(bind(session_id, records_exit))
+            .await?;
+    }
+    assert_eq!(state(session_id.clone()).await?, "open");
+    assert_eq!(state(untracked_id).await?, "pending");
+
+    let other = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&session_id, "proc_2"))
+        .await?
+        .into_inner();
+    assert!(!other.closed);
+    assert_eq!(state(session_id.clone()).await?, "open");
+
+    let first = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&session_id, "proc_1"))
+        .await?
+        .into_inner();
+    assert!(first.closed);
+    assert_eq!(state(session_id.clone()).await?, "closed");
+    let again = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&session_id, "proc_1"))
+        .await?
+        .into_inner();
+    assert!(!again.closed);
+    assert_eq!(state(session_id.clone()).await?, "closed");
+    fixture
+        .service
+        .bind_data_plane_session_process(bind(&session_id, true))
+        .await?;
+    assert_eq!(state(session_id.clone()).await?, "closed");
+
+    sqlx::query("UPDATE data_plane_sessions SET state = 'revoked' WHERE session_id = $1")
+        .bind(&revoked_id)
+        .execute(&fixture.service.pool)
+        .await?;
+    let revoked = fixture
+        .service
+        .record_data_plane_session_process_exited(exited(&revoked_id, "proc_1"))
+        .await?
+        .into_inner();
+    assert!(!revoked.closed);
+    assert_eq!(state(revoked_id.clone()).await?, "revoked");
+    fixture
+        .service
+        .bind_data_plane_session_process(bind(&revoked_id, true))
+        .await?;
+    assert_eq!(state(revoked_id).await?, "revoked");
     Ok(())
 }
 

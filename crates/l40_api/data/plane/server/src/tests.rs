@@ -1164,6 +1164,8 @@ async fn test_data_plane_state_with_runtime_access(
         revocation_check_interval: Duration::from_secs(1),
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
+        process_exit_record_timeout: PROCESS_EXIT_RECORD_TIMEOUT,
+        process_exit_record_retry_delay: PROCESS_EXIT_RECORD_RETRY_DELAY,
         route_cache_ttl: Duration::from_secs(60),
         // Pings would interleave with the frames tests read; the keepalive
         // test sets its own interval.

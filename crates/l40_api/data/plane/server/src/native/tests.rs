@@ -2,7 +2,7 @@ use super::*;
 use axum::extract::ws::Message;
 use pplx_space_api_route::{RouteIdentityRemediation, set_route_identity_rejection_metadata};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[tokio::test]
 async fn process_start_http_errors_preserve_permanent_guest_failures() {
@@ -625,7 +625,14 @@ async fn open_process_events(
     session_id: DataPlaneSessionId,
     last_event_id: Option<u64>,
 ) -> (DataPlaneState, tokio::sync::mpsc::UnboundedReceiver<String>) {
-    let state = fake_state(endpoint).await;
+    open_process_events_on(fake_state(endpoint).await, session_id, last_event_id).await
+}
+
+async fn open_process_events_on(
+    state: DataPlaneState,
+    session_id: DataPlaneSessionId,
+    last_event_id: Option<u64>,
+) -> (DataPlaneState, tokio::sync::mpsc::UnboundedReceiver<String>) {
     let response = get_session_events(&state, session_id, last_event_id).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
@@ -698,6 +705,9 @@ async fn process_start_reaches_the_client_before_its_binding_commits() {
         vec![pplx_space_public_api::process_id_for_session(session_id).to_string()],
         "bound exactly once, to the derived process id"
     );
+    // The stream records the exit, so its bind may move the session to
+    // `open`.
+    assert_eq!(*fake.binds_record_exit.lock().unwrap(), [true]);
 }
 
 #[tokio::test]
@@ -730,6 +740,114 @@ async fn process_exit_is_reported_only_after_its_binding_commits() {
     fake.release.add_permits(1);
     read_until(&mut chunks, &mut seen, "process_exited").await;
     read_until(&mut chunks, &mut seen, "backend_closed").await;
+}
+
+/// A stream, SSE or WebSocket, records the bound process's exit before it
+/// reports the exit, so a client that reads the session after
+/// `process_exited` finds it closed; a reattach that reads the exit again
+/// records it again.
+#[tokio::test]
+async fn process_exit_is_recorded_before_the_client_sees_it() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+    )
+    .await;
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+
+    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    assert_eq!(
+        *fake.exited_process_ids.lock().unwrap(),
+        std::slice::from_ref(&process_id),
+        "{seen}"
+    );
+
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "process_exited").await;
+    assert_eq!(
+        *fake.exited_process_ids.lock().unwrap(),
+        [process_id.clone(), process_id],
+        "{seen}"
+    );
+}
+
+/// A cluster API that does not answer the exit record does not hold the exit
+/// back from the client past the record's own deadline.
+#[tokio::test]
+async fn an_unanswered_exit_record_does_not_hold_back_the_exit() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+    )
+    .await;
+    fake.exit_records_unanswered.store(true, Ordering::SeqCst);
+    let mut state = fake_state(&fake.endpoint).await;
+    state.process_exit_record_timeout = Duration::from_millis(50);
+
+    let (_state, mut chunks) = open_process_events_on(state, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    assert_eq!(
+        *fake.exited_process_ids.lock().unwrap(),
+        [pplx_space_public_api::process_id_for_session(session_id).to_string()],
+        "the stream tried to record the exit; {seen}"
+    );
+}
+
+/// An exit record the cluster API could not take for now, because it was
+/// unavailable or its database write failed, is sent again after the stream
+/// has reported the exit, so the session still closes although no client
+/// reattaches.
+#[tokio::test]
+async fn an_exit_record_the_cluster_api_refused_for_now_is_retried() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+    )
+    .await;
+    fake.exit_record_refusals.store(2, Ordering::SeqCst);
+    let mut state = fake_state(&fake.endpoint).await;
+    state.process_exit_record_retry_delay = Duration::from_millis(10);
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+
+    let (_state, mut chunks) = open_process_events_on(state, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "process_exited").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.exited_process_ids.lock().unwrap().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the refused record was not sent again: {:?}",
+            fake.exited_process_ids.lock().unwrap()
+        )
+    });
+    assert_eq!(fake.exit_record_refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *fake.exited_process_ids.lock().unwrap(),
+        [process_id.clone(), process_id.clone(), process_id]
+    );
 }
 
 #[tokio::test]
@@ -2454,6 +2572,16 @@ struct ProcessFake {
     release: Arc<tokio::sync::Semaphore>,
     bind_started: Arc<tokio::sync::Notify>,
     bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Each bind's `records_exit`, in order.
+    binds_record_exit: Arc<std::sync::Mutex<Vec<bool>>>,
+    /// The process id of each exit a stream recorded, in order.
+    exited_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Set to take exit records without ever answering them.
+    exit_records_unanswered: Arc<AtomicBool>,
+    /// How many exit records still to refuse before taking one: the last
+    /// refusal answers Internal, as a failed database write does, and any
+    /// before it Unavailable.
+    exit_record_refusals: Arc<AtomicUsize>,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
     started_stdin: Arc<std::sync::Mutex<Vec<bool>>>,
     /// Whether the guest lists the session's process as running.
@@ -2510,6 +2638,10 @@ async fn spawn_process_fake(
         release: Arc::new(tokio::sync::Semaphore::new(0)),
         bind_started: Arc::new(tokio::sync::Notify::new()),
         bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        binds_record_exit: Arc::new(std::sync::Mutex::new(Vec::new())),
+        exited_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        exit_records_unanswered: Arc::new(AtomicBool::new(false)),
+        exit_record_refusals: Arc::new(AtomicUsize::new(0)),
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         started_stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
         running: Arc::new(AtomicBool::new(true)),
@@ -2521,7 +2653,11 @@ async fn spawn_process_fake(
     let release = Arc::clone(&fake.release);
     let bind_started = Arc::clone(&fake.bind_started);
     let bound_process_ids = Arc::clone(&fake.bound_process_ids);
+    let binds_record_exit = Arc::clone(&fake.binds_record_exit);
     let running = Arc::clone(&fake.running);
+    let exited_process_ids = Arc::clone(&fake.exited_process_ids);
+    let exit_records_unanswered = Arc::clone(&fake.exit_records_unanswered);
+    let exit_record_refusals = Arc::clone(&fake.exit_record_refusals);
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
         let mut route = route.clone();
         let process_id = process_id.clone();
@@ -2531,6 +2667,10 @@ async fn spawn_process_fake(
         let release = Arc::clone(&release);
         let bind_started = Arc::clone(&bind_started);
         let bound_process_ids = Arc::clone(&bound_process_ids);
+        let binds_record_exit = Arc::clone(&binds_record_exit);
+        let exited_process_ids = Arc::clone(&exited_process_ids);
+        let exit_records_unanswered = Arc::clone(&exit_records_unanswered);
+        let exit_record_refusals = Arc::clone(&exit_record_refusals);
         let calls = Arc::clone(&calls);
         let started_stdin = Arc::clone(&started_stdin);
         let route_lookups = Arc::clone(&route_lookups);
@@ -2554,6 +2694,7 @@ async fn spawn_process_fake(
                 let body = request.into_body().collect().await.unwrap().to_bytes();
                 let request = BindDataPlaneSessionProcessRequest::decode(&body[5..]).unwrap();
                 bound_process_ids.lock().unwrap().push(request.process_id);
+                binds_record_exit.lock().unwrap().push(request.records_exit);
                 if let Some(bind) = gated_bind {
                     bind_started.notify_one();
                     release.acquire().await.unwrap().forget();
@@ -2584,6 +2725,27 @@ async fn spawn_process_fake(
                     pplx_space_sbx_mgr_client::proto::SpacedListProcessesResponse { processes }
                         .encode_to_vec(),
                 );
+            }
+            if path.ends_with("/RecordDataPlaneSessionProcessExited") {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let request =
+                    RecordDataPlaneSessionProcessExitedRequest::decode(&body[5..]).unwrap();
+                exited_process_ids.lock().unwrap().push(request.process_id);
+                if exit_records_unanswered.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                // A stream sends its records one at a time.
+                let left = exit_record_refusals.load(Ordering::SeqCst);
+                if left > 0 {
+                    exit_record_refusals.fetch_sub(1, Ordering::SeqCst);
+                    let refusal = if left == 1 {
+                        tonic::Status::internal("database write failed")
+                    } else {
+                        tonic::Status::unavailable("cluster API restarting")
+                    };
+                    return refusal.into_http();
+                }
+                return crate::tests::grpc_test_response(Vec::new());
             }
             let open = if path.ends_with("/SpacedWatch") {
                 // A file-watch session's watch is answered as a start, so a
