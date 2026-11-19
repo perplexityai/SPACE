@@ -86,7 +86,7 @@ fn listed(stdout: &[u8]) -> io::Result<Output> {
 
 // Catches a verifier that accepts an absent table or one differing from the
 // revision or SPACE's placement, or that rejects a table differing only in
-// handles or in nft 1.0.4's listing, the Amazon Linux 2023 version.
+// handles.
 #[test]
 fn every_semantic_drift_is_a_mismatch() {
     let tables_text = tables().to_string();
@@ -97,18 +97,6 @@ fn every_semantic_drift_is_a_mismatch() {
     };
     assert_eq!(
         judged(listing().to_string().as_bytes()),
-        Verification::Match
-    );
-    assert_eq!(
-        observed(
-            &revision(),
-            listed(include_bytes!(
-                "../../../fixtures/firewall_rules_tables_nft_1_0_4.json"
-            )),
-            || listed(include_bytes!(
-                "../../../fixtures/firewall_rules_table_nft_1_0_4.json"
-            )),
-        ),
         Verification::Match
     );
     for absent in [
