@@ -87,8 +87,9 @@ with exit `1`; one the known-failures list excused is listed as
 `known failure` and leaves the exit status as the rest of the run sets it. If
 a failed scenario passes when rerun, report both runs. Call a failure
 contention only when it fails beside other benches more than once and passes
-each time with `--benches 1`. "The whole suite on one host" in `infra/space/kind/README.md`
-lists every host change, what each bench shares, and what it costs.
+each time with `--benches 1`. "The whole suite on one host" in
+`infra/space/kind/README.md` lists every host change, what each bench shares,
+and what it costs.
 
 ## Scenario-scoped cluster knobs (kind)
 
