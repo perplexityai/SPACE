@@ -11,7 +11,7 @@ use pplx_space_firewall_rules_protocol::decode_revision;
 use super::super::{Verification, verify};
 use crate::firewall::rules::install::{InstallOutcome, install};
 use crate::firewall::rules::{TableConstruction, render};
-use crate::netns_tests::{TestNamespace, ip};
+use crate::netns_tests::{TestNamespace, contained, ip};
 
 const PRIVILEGE: &str = "create network namespaces and nftables tables";
 const DNS: &str = r#"{"id":"dns","all_of":[{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}"#;
@@ -27,7 +27,7 @@ fn pinned(namespace: &TestNamespace) -> File {
 }
 
 fn committed(construction: &TableConstruction, netns: &File) {
-    let outcome = install(construction, netns);
+    let outcome = contained(|| install(construction, netns));
     assert!(matches!(outcome, InstallOutcome::Committed), "{outcome:?}");
 }
 
@@ -56,15 +56,18 @@ fn live_tables_match_only_their_revision() {
     let netns = pinned(&target);
     let empty = decoded(&[]);
     let both = decoded(&[DNS, WEB]);
-    assert!(matches!(verify(&empty, &netns), Verification::Mismatch(_)));
+    assert!(matches!(
+        contained(|| verify(&empty, &netns)),
+        Verification::Mismatch(_)
+    ));
 
     committed(&render(&empty), &netns);
-    assert_eq!(verify(&empty, &netns), Verification::Match);
+    assert_eq!(contained(|| verify(&empty, &netns)), Verification::Match);
     // Replacing the table gives it a new handle.
     committed(&render(&both), &netns);
-    assert_eq!(verify(&both, &netns), Verification::Match);
+    assert_eq!(contained(|| verify(&both, &netns)), Verification::Match);
     for other in [decoded(&[WEB, DNS]), empty] {
-        let verification = verify(&other, &netns);
+        let verification = contained(|| verify(&other, &netns));
         assert!(
             matches!(verification, Verification::Mismatch(_)),
             "{verification:?}"
@@ -88,7 +91,7 @@ fn guardless_rule_installed_by_the_installer_is_a_mismatch() {
         .unwrap()
         .remove(0);
     committed(&construction, &netns);
-    let verification = verify(&revision, &netns);
+    let verification = contained(|| verify(&revision, &netns));
     assert!(
         matches!(verification, Verification::Mismatch(_)),
         "{verification:?}"
@@ -140,7 +143,10 @@ fn verified_table_drops_denied_and_established_traffic_only() {
 
     let revision = decoded(&[DNS, WEB]);
     committed(&render(&revision), &pinned(&target));
-    assert_eq!(verify(&revision, &pinned(&target)), Verification::Match);
+    assert_eq!(
+        contained(|| verify(&revision, &pinned(&target))),
+        Verification::Match
+    );
 
     client.write_all(b"after").unwrap();
     sender.send_to(b"denied", "10.0.0.1:53").unwrap();

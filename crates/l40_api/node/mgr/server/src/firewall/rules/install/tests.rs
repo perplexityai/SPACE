@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use super::{InstallOutcome, install, submit};
 use crate::firewall::rules::{TableConstruction, render};
 use crate::firewall::{apply_nft_json, nft_output};
-use crate::netns_tests::TestNamespace;
+use crate::netns_tests::{TestNamespace, contained};
 
 const PRIVILEGE: &str = "create network namespaces and nftables tables";
 
@@ -64,7 +64,7 @@ fn as_added(listing: Value) -> Vec<Value> {
 }
 
 fn committed(construction: &TableConstruction, netns: &File) {
-    let outcome = install(construction, netns);
+    let outcome = contained(|| install(construction, netns));
     assert!(matches!(outcome, InstallOutcome::Committed), "{outcome:?}");
 }
 
@@ -121,7 +121,7 @@ fn late_kernel_refusal_leaves_the_previous_table() {
         "family": "ip", "table": "space_firewall_rules", "chain": "guest_drop",
         "handle": 999_999,
     }}}));
-    let outcome = install(&replacement, &netns);
+    let outcome = contained(|| install(&replacement, &netns));
     // nft's wording for a refusal from the kernel, not from its own checks.
     assert!(
         matches!(&outcome, InstallOutcome::Rejected { stderr } if stderr.contains("Could not process rule")),
@@ -152,12 +152,14 @@ fn timeout_after_dispatch_is_unknown_and_reaps_the_child() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let outcome = submit(
-        &udp_port(53),
-        &pinned(&target),
-        fake.to_str().unwrap(),
-        Duration::from_millis(500),
-    );
+    let outcome = contained(|| {
+        submit(
+            &udp_port(53),
+            &pinned(&target),
+            fake.to_str().unwrap(),
+            Duration::from_millis(500),
+        )
+    });
     let InstallOutcome::Unknown { error } = outcome else {
         panic!("expected Unknown, got {outcome:?}");
     };
