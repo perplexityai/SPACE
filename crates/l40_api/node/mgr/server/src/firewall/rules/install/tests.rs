@@ -63,8 +63,23 @@ fn as_added(listing: Value) -> Vec<Value> {
     added
 }
 
+/// Runs `f` on a thread moved into a fresh network namespace. Threads and
+/// processes `f` starts inherit it, so a call that never enters its target
+/// changes that namespace rather than the runner's.
+fn contained<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+                f()
+            })
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 fn committed(construction: &TableConstruction, netns: &File) {
-    let outcome = install(construction, netns);
+    let outcome = contained(|| install(construction, netns));
     assert!(matches!(outcome, InstallOutcome::Committed), "{outcome:?}");
 }
 
@@ -121,7 +136,7 @@ fn late_kernel_refusal_leaves_the_previous_table() {
         "family": "ip", "table": "space_firewall_rules", "chain": "guest_drop",
         "handle": 999_999,
     }}}));
-    let outcome = install(&replacement, &netns);
+    let outcome = contained(|| install(&replacement, &netns));
     // nft's wording for a refusal from the kernel, not from its own checks.
     assert!(
         matches!(&outcome, InstallOutcome::Rejected { stderr } if stderr.contains("Could not process rule")),
@@ -152,12 +167,14 @@ fn timeout_after_dispatch_is_unknown_and_reaps_the_child() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let outcome = submit(
-        &udp_port(53),
-        &pinned(&target),
-        fake.to_str().unwrap(),
-        Duration::from_millis(500),
-    );
+    let outcome = contained(|| {
+        submit(
+            &udp_port(53),
+            &pinned(&target),
+            fake.to_str().unwrap(),
+            Duration::from_millis(500),
+        )
+    });
     let InstallOutcome::Unknown { error } = outcome else {
         panic!("expected Unknown, got {outcome:?}");
     };
