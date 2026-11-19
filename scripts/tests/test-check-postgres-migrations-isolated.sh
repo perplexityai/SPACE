@@ -10,6 +10,7 @@ unset GIT_ASKPASS SSH_ASKPASS GIT_SSH GIT_SSH_COMMAND GIT_CONFIG_PARAMETERS
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${repo_root}/scripts/check-postgres-migrations-isolated.sh"
+base_helper="${repo_root}/scripts/lib/migration-base.sh"
 bootstrap_roles_path="crates/l30_storage/db/migrate/src/bootstrap_roles.rs"
 postgres_bootstrap_test_path="crates/l30_storage/db/migrate/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs"
 postgres_bootstrap_test_with_credential_table="fn new_credential_table_is_fenced() {}"
@@ -235,8 +236,9 @@ commit_scenario() {
 }
 
 work_repo="${tmp_dir}/repo"
-mkdir -p "${work_repo}/scripts"
+mkdir -p "${work_repo}/scripts/lib"
 cp "${script}" "${work_repo}/scripts/check-postgres-migrations-isolated.sh"
+cp "${base_helper}" "${work_repo}/scripts/lib/migration-base.sh"
 cp "${repo_root}/scripts/check_postgres_partial_indexes.py" "${work_repo}/scripts/"
 mkdir -p "${work_repo}/ci/scripts"
 cp "${repo_root}/ci/scripts/ensure-uv.sh" "${work_repo}/ci/scripts/"
@@ -681,8 +683,9 @@ grep -F "scripts/space-deploy.py" "${tmp_dir}/migration-plus-deploy-script.stder
 # from real main, so a migration-only PR is reported as "migration + runtime app
 # change" and fails a PR that is correct. Freshening is what keeps it honest.
 stale_remote="${tmp_dir}/stale-remote"
-mkdir -p "${stale_remote}/scripts"
+mkdir -p "${stale_remote}/scripts/lib"
 cp "${script}" "${stale_remote}/scripts/check-postgres-migrations-isolated.sh"
+cp "${base_helper}" "${stale_remote}/scripts/lib/migration-base.sh"
 
 git -C "${stale_remote}" init --quiet --initial-branch=main
 git -C "${stale_remote}" config user.email test@example.com
@@ -946,8 +949,9 @@ fi
 # base fetch must deepen history enough for a three-dot diff instead of falling
 # back to a direct tree comparison.
 shallow_remote="${tmp_dir}/shallow-remote"
-mkdir -p "${shallow_remote}/scripts"
+mkdir -p "${shallow_remote}/scripts/lib"
 cp "${script}" "${shallow_remote}/scripts/check-postgres-migrations-isolated.sh"
+cp "${base_helper}" "${shallow_remote}/scripts/lib/migration-base.sh"
 git -C "${shallow_remote}" init --quiet --initial-branch=main
 git -C "${shallow_remote}" config user.email test@example.com
 git -C "${shallow_remote}" config user.name "Migration Isolation Test"

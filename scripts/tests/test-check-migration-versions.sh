@@ -21,6 +21,7 @@ unset GIT_ASKPASS SSH_ASKPASS GIT_SSH GIT_SSH_COMMAND GIT_CONFIG_PARAMETERS
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="${repo_root}/scripts/check-migration-versions.sh"
+base_helper="${repo_root}/scripts/lib/migration-base.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
@@ -161,8 +162,9 @@ expect_guard_failure() {
 }
 
 work_repo="${tmp_dir}/repo"
-mkdir -p "${work_repo}/scripts" "${work_repo}/db/postgres"
+mkdir -p "${work_repo}/scripts/lib" "${work_repo}/db/postgres"
 cp "${script}" "${work_repo}/scripts/check-migration-versions.sh"
+cp "${base_helper}" "${work_repo}/scripts/lib/migration-base.sh"
 
 git -C "${work_repo}" init --quiet --initial-branch=main
 git -C "${work_repo}" config user.email test@example.com
@@ -379,8 +381,9 @@ fi
 # on a divergent lineage, so it also covers the forcing half of the refspec: a
 # fetch without the leading `+` refuses a non-fast-forward and leaves it stale.
 remote_repo="${tmp_dir}/remote"
-mkdir -p "${remote_repo}/scripts" "${remote_repo}/db/postgres"
+mkdir -p "${remote_repo}/scripts/lib" "${remote_repo}/db/postgres"
 cp "${script}" "${remote_repo}/scripts/check-migration-versions.sh"
+cp "${base_helper}" "${remote_repo}/scripts/lib/migration-base.sh"
 
 git -C "${remote_repo}" init --quiet --initial-branch=main
 git -C "${remote_repo}" config user.email test@example.com
@@ -716,8 +719,9 @@ fi
 # two-tree diff. Assert on the absence of the no-merge-base WARN, which is the
 # observable difference.
 shallow_remote="${tmp_dir}/shallow-remote"
-mkdir -p "${shallow_remote}/scripts" "${shallow_remote}/db/postgres"
+mkdir -p "${shallow_remote}/scripts/lib" "${shallow_remote}/db/postgres"
 cp "${script}" "${shallow_remote}/scripts/check-migration-versions.sh"
+cp "${base_helper}" "${shallow_remote}/scripts/lib/migration-base.sh"
 
 git -C "${shallow_remote}" init --quiet --initial-branch=main
 git -C "${shallow_remote}" config user.email test@example.com
