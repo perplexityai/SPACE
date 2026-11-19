@@ -1,7 +1,10 @@
 //! Starting a rollout: saving the exact reviewed revision and the fixed set
 //! of nodes that should receive it. A start adopts nothing and writes no
-//! assignment, observation, lease or wakeup; the completion that proves the
-//! rollout adopts it with [`adopt_rollout_revision`].
+//! assignment, observation, lease or wakeup.
+//!
+//! Adoption is the completion step's job: only after verification, it locks
+//! the control row before the rollout row, then adopts the revision, finishes
+//! the rollout and releases the slot in one transaction.
 //!
 //! Firewall writers lock the `firewall_rules_control` row first. An
 //! enrollment writer must lock it `FOR SHARE` or stronger, so a node is
@@ -19,7 +22,7 @@ use pplx_space_firewall_rules_model::{FirewallRuleRevision, RuleRevisionDiff, di
 use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision, encode_revision};
 use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
-use sqlx::{Connection, PgConnection, Postgres, Transaction};
+use sqlx::{Connection, PgConnection};
 
 use crate::{ItemPhase, RevisionId, RolloutId, end_transaction, rollout_phase};
 
@@ -292,48 +295,4 @@ async fn read_revision(
     .fetch_one(executor)
     .await?;
     decode_revision(&document).map_err(|source| StartError::StoredRevision { id, source })
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AdoptError {
-    #[error("the firewall_rules_control row is missing")]
-    MissingControlRow,
-    #[error(transparent)]
-    Database(#[from] sqlx::Error),
-}
-
-/// Make `rollout`'s revision the enrollment default in the caller's
-/// transaction, which this neither commits nor rolls back. For the
-/// completion that proved the rollout, which then finishes the header in
-/// the same transaction. Locks the control row, then the header, so call it
-/// before locking the header. `None`, writing nothing, when the rollout is
-/// missing or finished (an aborted or superseded revision is never
-/// adopted): then don't complete.
-pub async fn adopt_rollout_revision(
-    tx: &mut Transaction<'_, Postgres>,
-    rollout: RolloutId,
-) -> Result<Option<RevisionId>, AdoptError> {
-    lock_control(tx)
-        .await?
-        .ok_or(AdoptError::MissingControlRow)?;
-    let Some(revision) = sqlx::query_scalar::<_, RevisionId>(sql!(
-        "SELECT to_revision_id
-         FROM firewall_rules_rollouts
-         WHERE id = $1
-           AND finished_at IS NULL
-         FOR UPDATE"
-    ))
-    .bind(rollout)
-    .fetch_optional(&mut **tx)
-    .await?
-    else {
-        return Ok(None);
-    };
-    sqlx::query(sql!(
-        "UPDATE firewall_rules_control SET enrollment_default_revision_id = $1 WHERE singleton"
-    ))
-    .bind(revision)
-    .execute(&mut **tx)
-    .await?;
-    Ok(Some(revision))
 }

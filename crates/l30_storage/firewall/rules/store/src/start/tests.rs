@@ -126,46 +126,24 @@ fn spawn_start(
     tokio::spawn(async move { start_by(&pool, expected_adopted, &revision, targets).await })
 }
 
-/// A representative completion: adopt `rollout`'s revision and finish the
-/// header in one transaction, then commit or roll back. What adoption
-/// returned.
-async fn complete(
-    pool: &PgPool,
-    rollout: RolloutId,
-    commit: bool,
-) -> TestResult<Option<RevisionId>> {
-    let mut tx = pool.begin().await?;
-    let adopted = adopt_rollout_revision(&mut tx, rollout).await?;
+/// Stand in for the completion step: finish `started` and adopt its
+/// revision.
+async fn complete(pool: &PgPool, started: &StartedRollout) -> TestResult {
+    set_phase(pool, started.rollout_id, "completed").await?;
     sqlx::query(sql!(
-        "UPDATE firewall_rules_rollouts
-         SET phase = 'completed', unfinished_slot = NULL, finished_at = now()
-         WHERE id = $1"
+        "UPDATE firewall_rules_control SET enrollment_default_revision_id = $1"
     ))
-    .bind(rollout)
-    .execute(&mut *tx)
+    .bind(started.revision_id)
+    .execute(pool)
     .await?;
-    if commit {
-        tx.commit().await?;
-    } else {
-        tx.rollback().await?;
-    }
-    Ok(adopted)
+    Ok(())
 }
 
 /// Push `revision` first and complete it, so it's the adopted default.
 async fn adopt(pool: &PgPool, revision: &FirewallRuleRevision) -> TestResult<RevisionId> {
     let started = start(pool, AdoptedRevision::NoRevision, revision).await?;
-    complete(pool, started.rollout_id, true).await?;
+    complete(pool, &started).await?;
     Ok(started.revision_id)
-}
-
-async fn adopted_now(pool: &PgPool) -> TestResult<AdoptedRevision> {
-    let id = sqlx::query_scalar::<_, Option<RevisionId>>(sql!(
-        "SELECT enrollment_default_revision_id FROM firewall_rules_control"
-    ))
-    .fetch_one(pool)
-    .await?;
-    Ok(id.into())
 }
 
 /// What a start must never change (the default and every delivery record),
@@ -331,7 +309,7 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
     let first = start(pool, AdoptedRevision::NoRevision, &candidate).await?;
     assert_eq!(first.review, Review::FirstPush);
 
-    complete(pool, first.rollout_id, true).await?;
+    complete(pool, &first).await?;
     let a = AdoptedRevision::Revision(first.revision_id);
     // A real revision that isn't adopted: an aborted candidate.
     let aborted = start(pool, a, &revision(&[web()])).await?;
@@ -355,46 +333,6 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
         matches!(refused, Err(StartError::MissingControlRow)),
         "{refused:?}"
     );
-    let mut tx = pool.begin().await?;
-    let refused = adopt_rollout_revision(&mut tx, aborted.rollout_id).await;
-    assert!(
-        matches!(refused, Err(AdoptError::MissingControlRow)),
-        "{refused:?}"
-    );
-    tx.commit().await?;
-    Ok(())
-}
-
-/// Catches adoption that commits on its own, outlives a rolled-back
-/// completion or runs at start, and adoption of a finished rollout, which
-/// would roll the default back to an aborted or superseded revision.
-#[tokio::test(flavor = "current_thread")]
-async fn adoption_commits_or_rolls_back_with_the_completion() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let pool = &db.pool;
-    // A to B: adoption replaces a set default, not only NULL.
-    let superseded = start(pool, AdoptedRevision::NoRevision, &revision(&[dns()])).await?;
-    complete(pool, superseded.rollout_id, true).await?;
-    let a = AdoptedRevision::Revision(superseded.revision_id);
-    let started = start(pool, a, &revision(&[dns(), web()])).await?;
-    let candidate = Some(started.revision_id);
-    assert_eq!(complete(pool, started.rollout_id, false).await?, candidate);
-    assert_eq!(adopted_now(pool).await?, a);
-
-    complete(pool, started.rollout_id, true).await?;
-    let adopted = AdoptedRevision::from(candidate);
-    assert_eq!(adopted_now(pool).await?, adopted);
-
-    let aborted = start(pool, adopted, &revision(&[ssh()])).await?;
-    set_phase(pool, aborted.rollout_id, "aborted").await?;
-    let mut tx = pool.begin().await?;
-    for finished in [aborted.rollout_id, superseded.rollout_id] {
-        assert_eq!(adopt_rollout_revision(&mut tx, finished).await?, None);
-    }
-    tx.commit().await?;
-    assert_eq!(adopted_now(pool).await?, adopted);
     Ok(())
 }
 
@@ -450,7 +388,7 @@ async fn racing_starts_serialize_on_the_control_row() -> TestResult {
         matches!(second, Err(StartError::RolloutInProgress)),
         "{second:?}"
     );
-    complete(pool, first.rollout_id, true).await?;
+    complete(pool, &first).await?;
     let expected = AdoptedRevision::Revision(first.revision_id);
 
     // A writer that skips the control lock meets the slot key instead.

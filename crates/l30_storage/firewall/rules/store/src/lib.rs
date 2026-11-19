@@ -10,8 +10,7 @@
 //! * `firewall_rules_node_observations`: each node's accepted observations.
 //!
 //! [`start_rollout`] saves a reviewed revision and the nodes it targets
-//! without adopting it; [`adopt_rollout_revision`] adopts it later, inside
-//! the completion that proves it.
+//! without adopting it.
 //!
 //! [`lease_targets`] leases a rollout's saved targets to a controller under
 //! the shared queue's rules ([`pplx_space_rollout_queue`]); [`renew_lease`],
@@ -28,10 +27,7 @@ pub use lease::{
     LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
-pub use start::{
-    AdoptError, AdoptedRevision, Review, StartError, StartRollout, StartedRollout,
-    adopt_rollout_revision, start_rollout,
-};
+pub use start::{AdoptedRevision, Review, StartError, StartRollout, StartedRollout, start_rollout};
 
 #[cfg(test)]
 mod tests;
