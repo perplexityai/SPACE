@@ -829,6 +829,7 @@ async fn spawn_session_fake(session_id: DataPlaneSessionId, session: FakeSession
         FakeRoute {
             adapter_state,
             bound,
+            ..FakeRoute::unbound()
         },
         Some(bind),
         Arc::new(move |_, open| {
@@ -2056,6 +2057,31 @@ async fn attach_native_websocket(
     endpoint: &str,
     session_id: DataPlaneSessionId,
 ) -> tokio::net::TcpStream {
+    attach_native_websocket_with(endpoint, session_id, "", None).await
+}
+
+/// [`attach_native_websocket`] with `query` on the attach URL and, when set,
+/// the data plane pinging attached sockets every `ping_interval`.
+async fn attach_native_websocket_with(
+    endpoint: &str,
+    session_id: DataPlaneSessionId,
+    query: &str,
+    ping_interval: Option<Duration>,
+) -> tokio::net::TcpStream {
+    let (tcp, response) =
+        request_native_websocket(endpoint, session_id, query, ping_interval).await;
+    assert!(response.starts_with(b"HTTP/1.1 101"));
+    tcp
+}
+
+/// Sends a native WebSocket attach request, returning the connection and the
+/// head of the response to it.
+async fn request_native_websocket(
+    endpoint: &str,
+    session_id: DataPlaneSessionId,
+    query: &str,
+    ping_interval: Option<Duration>,
+) -> (tokio::net::TcpStream, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut state = crate::tests::test_data_plane_state().await;
     state.cluster_api = ClusterApiClients::service_only(
@@ -2064,6 +2090,9 @@ async fn attach_native_websocket(
             .unwrap(),
     );
     state.revocation_check_interval = Duration::from_secs(3600);
+    if let Some(ping_interval) = ping_interval {
+        state.websocket_ping_interval = ping_interval;
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -2077,7 +2106,7 @@ async fn attach_native_websocket(
     let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     tcp.write_all(
         format!(
-            "GET /v1/sessions/{session_id}/attach HTTP/1.1\r\n\
+            "GET /v1/sessions/{session_id}/attach{query} HTTP/1.1\r\n\
              Host: data-plane.test\r\n\
              Authorization: Bearer {DATA_PLANE_TOKEN_PREFIX}{}\r\n\
              Connection: Upgrade\r\n\
@@ -2097,8 +2126,43 @@ async fn attach_native_websocket(
         tcp.read_exact(&mut byte).await.expect("upgrade response");
         response.push(byte[0]);
     }
-    assert!(response.starts_with(b"HTTP/1.1 101"));
-    tcp
+    (tcp, response)
+}
+
+/// `after_seq` is one unsigned `int64`, and only a process or terminal
+/// session has output for it to name.
+#[tokio::test]
+async fn websocket_after_seq_is_one_output_position() {
+    assert_eq!(websocket_after_seq(None).unwrap(), None);
+    assert_eq!(websocket_after_seq(Some("other=1")).unwrap(), None);
+    assert_eq!(websocket_after_seq(Some("after_seq=7")).unwrap(), Some(7));
+    let max = format!("after_seq={}", i64::MAX);
+    assert_eq!(
+        websocket_after_seq(Some(&max)).unwrap(),
+        Some(i64::MAX as u64)
+    );
+    for query in [
+        "after_seq=",
+        "after_seq=-1",
+        "after_seq=x",
+        "after_seq=9223372036854775808",
+        "after_seq=1&after_seq=1",
+    ] {
+        assert!(websocket_after_seq(Some(query)).is_err(), "{query}");
+    }
+
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::FileWatch);
+    let endpoint = spawn_backend_failure_fake(session_id, BackendFailure::ResizeRefused).await;
+    let (_tcp, response) =
+        request_native_websocket(&endpoint, session_id, "?after_seq=1", None).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
 }
 
 /// Reads server text frames into `seen` until one contains `marker`.
@@ -2112,6 +2176,29 @@ async fn read_websocket_until(tcp: &mut tokio::net::TcpStream, seen: &mut String
     })
     .await
     .unwrap_or_else(|_| panic!("{marker} within 5s; saw {seen}"));
+}
+
+/// The JSON text frames a native WebSocket sends until its `closed` frame,
+/// past any control frames.
+async fn websocket_frames_to_close(tcp: &mut tokio::net::TcpStream) -> Vec<serde_json::Value> {
+    let mut frames = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (opcode, payload) = crate::tests::read_server_frame(tcp).await;
+            if opcode != 0x1 {
+                continue;
+            }
+            let frame: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            let closed = frame["type"] == "closed";
+            frames.push(frame);
+            if closed {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("closed within 10s; saw {frames:?}"));
+    frames
 }
 
 /// Sends one short client text frame. Client frames must be masked; an
@@ -2331,6 +2418,10 @@ struct FakeRoute {
     /// the session; the last answer repeats. Once a bind succeeds, every
     /// lookup reports it bound.
     bound: &'static [bool],
+    /// The route carries a route token inside its refresh window, and each
+    /// lookup reports a new route generation, so the session refreshes its
+    /// route, and finds it moved, whenever it uses the token.
+    refreshing_token: bool,
 }
 
 impl FakeRoute {
@@ -2338,6 +2429,7 @@ impl FakeRoute {
         Self {
             adapter_state: r#"{"command":["true"]}"#,
             bound: &[false],
+            refreshing_token: false,
         }
     }
 
@@ -2401,7 +2493,12 @@ async fn spawn_process_fake(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
-    let mut route = crate::tests::route_response_with_token(session_id, None);
+    let mut route = crate::tests::route_response_with_token(
+        session_id,
+        fake_route
+            .refreshing_token
+            .then(|| crate::tests::proto_space_api_route_token_expiring_in(30)),
+    );
     route.backend.as_mut().unwrap().endpoint = endpoint.clone();
     route.adapter_state_json = fake_route.adapter_state.to_string();
     let lookups = fake_route.bound;
@@ -2448,6 +2545,9 @@ async fn spawn_process_fake(
                 let lookup = route_lookups.fetch_add(1, Ordering::SeqCst);
                 let bound = bound.load(Ordering::SeqCst) || lookups[lookup.min(lookups.len() - 1)];
                 route.backend_process_id = bound.then(|| process_id.clone());
+                if fake_route.refreshing_token {
+                    route.route_generation += lookup as u64;
+                }
                 return crate::tests::grpc_test_response(route.encode_to_vec());
             }
             if path.ends_with("/BindDataPlaneSessionProcess") {
@@ -2861,10 +2961,10 @@ async fn process_exit_reports_whether_the_stream_skipped_output() {
     }
 }
 
-/// A WebSocket stream reopens a failed backend at the live tail, so its
-/// `process_exited` reports that output may be missing.
+/// A WebSocket stream reopens a failed backend where it stopped, so the
+/// output arrives whole and once, without a resync.
 #[tokio::test]
-async fn websocket_exit_after_a_live_reopen_reports_skipped_output() {
+async fn websocket_backend_reconnect_continues_at_its_position() {
     if !binding_fake_test_process() {
         return;
     }
@@ -2872,24 +2972,443 @@ async fn websocket_exit_after_a_live_reopen_reports_skipped_output() {
     let fake = spawn_journal_fake(
         session_id,
         true,
-        Arc::new(|opened, _| match opened {
+        Arc::new(|opened, open| match opened {
             0 => vec![
                 connected(),
                 stdout(JOURNAL[0]),
                 FakeReply::End(tonic::Status::unavailable("worker restarted")),
             ],
-            _ => vec![connected(), stdout(JOURNAL[3]), exited()],
+            _ => journal_replay(&JOURNAL, open),
         }),
     )
     .await;
 
     let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
-    let mut seen = String::new();
-    read_websocket_until(&mut tcp, &mut seen, "process_exited").await;
+    let frames = websocket_frames_to_close(&mut tcp).await;
 
-    assert!(seen.contains("process_stream_reconnected"), "{seen}");
-    assert!(seen.contains(r#""output_truncated":true"#), "{seen}");
-    assert_eq!(fake.opens.lock().unwrap().len(), 2);
+    assert_eq!(
+        websocket_stdout(&frames),
+        seq_lines(&[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")])
+    );
+    assert_eq!(websocket_resyncs(&frames), Vec::<String>::new());
+    assert_eq!(websocket_output_truncated(&frames), Some(false));
+    assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), Some(1)]));
+}
+
+/// Each output `seq` and the text it carries.
+fn websocket_stdout(frames: &[serde_json::Value]) -> Vec<(u64, String)> {
+    frames
+        .iter()
+        .filter(|frame| frame["type"] == "stdout")
+        .map(|frame| {
+            let data = BASE64_STANDARD
+                .decode(frame["data_base64"].as_str().unwrap())
+                .unwrap();
+            (
+                frame["seq"].as_u64().unwrap(),
+                String::from_utf8(data).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// `stdout` as [`websocket_stdout`] returns it.
+fn seq_lines(stdout: &[(u64, &str)]) -> Vec<(u64, String)> {
+    stdout
+        .iter()
+        .map(|(seq, line)| (*seq, (*line).to_string()))
+        .collect()
+}
+
+fn websocket_resyncs(frames: &[serde_json::Value]) -> Vec<String> {
+    frames
+        .iter()
+        .filter(|frame| frame["type"] == "resync_required")
+        .map(|frame| frame["reason"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn websocket_output_truncated(frames: &[serde_json::Value]) -> Option<bool> {
+    frames
+        .iter()
+        .find(|frame| frame["type"] == "process_exited")
+        .map(|frame| frame["output_truncated"].as_bool().unwrap())
+}
+
+/// A WebSocket reattach, on any replica, continues after the `after_seq` it
+/// names, the `seq` of the last output the client received: output `seq`s
+/// are the output's positions, so the attaches of a session carry each output
+/// once. Output no longer retained, an `after_seq` past the output, and one
+/// from before this attach started the process are each reported with
+/// `resync_required`. A guest too old to say where its retained output
+/// starts answers an evicted cursor with a bare lag status: the stream finds
+/// that start once the process has exited, and follows the live tail while it
+/// runs, as an SSE stream does. The live tail's output has no position, so
+/// its `seq`s are past any, and a reattach after one replays from the start.
+#[tokio::test]
+async fn websocket_reattach_continues_after_the_last_seq_received() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    assert_eq!(UNPOSITIONED_SEQ_BASE + 1, 4_611_686_018_427_387_905);
+    struct Case {
+        name: &'static str,
+        bound: bool,
+        running: bool,
+        replies: FakeReplies,
+        query: &'static str,
+        stdout: &'static [(u64, &'static str)],
+        resyncs: &'static [&'static str],
+        truncated: bool,
+        /// `None` where the stream's search for retained output makes
+        /// connects of its own.
+        opens: Option<Vec<FakeOpen>>,
+    }
+    // An older guest that evicted the output before `FIRST_RETAINED` of a
+    // process that wrote `LINES`; without a cursor it sends live output.
+    const LINES: [&str; 8] = ["1\n", "2\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n"];
+    const FIRST_RETAINED: u64 = 5;
+    fn older_guest(open: FakeOpen) -> Vec<FakeReply> {
+        match open {
+            FakeOpen::Connect(Some(cursor)) if cursor < FIRST_RETAINED => {
+                vec![connected(), untagged_lagged()]
+            }
+            FakeOpen::Connect(Some(cursor)) => {
+                let mut replies = vec![connected()];
+                replies.extend(LINES.iter().skip(cursor as usize).map(|line| stdout(line)));
+                replies.push(exited());
+                replies
+            }
+            FakeOpen::Connect(None) => vec![connected(), stdout("live\n"), exited()],
+            FakeOpen::Start => panic!("the process is already bound"),
+        }
+    }
+    // The same guest with its output at `FAR`, past the positions an SSE
+    // event id carries but not a `seq`.
+    const FAR: u64 = 1 << 40;
+    const { assert!(FAR > PROCESS_EVENT_ID_MAX_POSITION) };
+    assert_eq!(FAR + 2, 1_099_511_627_778);
+    fn far_older_guest(open: FakeOpen) -> Vec<FakeReply> {
+        match open {
+            FakeOpen::Connect(Some(cursor)) if cursor < FAR => {
+                vec![connected(), untagged_lagged()]
+            }
+            FakeOpen::Connect(Some(cursor)) => older_guest(FakeOpen::Connect(Some(cursor - FAR))),
+            open => older_guest(open),
+        }
+    }
+    let cases = [
+        Case {
+            name: "reattach without after_seq",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            query: "",
+            stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
+            resyncs: &[],
+            truncated: false,
+            opens: Some(connects(&[Some(0)])),
+        },
+        Case {
+            name: "reattach after the second output",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            query: "?after_seq=2",
+            stdout: &[(3, "three\n"), (4, "four\n")],
+            resyncs: &[],
+            truncated: false,
+            opens: Some(connects(&[Some(2)])),
+        },
+        Case {
+            name: "reattach after evicted output",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| match open {
+                FakeOpen::Connect(Some(cursor)) if cursor < 3 => {
+                    let mut replies = vec![connected_at(3)];
+                    replies.extend(
+                        journal_replay(&JOURNAL, FakeOpen::Connect(Some(3)))
+                            .into_iter()
+                            .skip(1),
+                    );
+                    replies
+                }
+                open => journal_replay(&JOURNAL, open),
+            }),
+            query: "?after_seq=1",
+            stdout: &[(4, "four\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: Some(connects(&[Some(1)])),
+        },
+        Case {
+            name: "reattach past the output",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            query: "?after_seq=9",
+            stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: false,
+            opens: Some(connects(&[Some(9), Some(0)])),
+        },
+        Case {
+            name: "attach that starts the process",
+            bound: false,
+            running: true,
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            query: "?after_seq=2",
+            stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: false,
+            opens: Some(vec![FakeOpen::Start]),
+        },
+        Case {
+            name: "older guest evicted a running process's output, without after_seq",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "",
+            stdout: &[(UNPOSITIONED_SEQ_BASE + 1, "live\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: Some(connects(&[Some(0), None])),
+        },
+        Case {
+            name: "older guest evicted a running process's output, after_seq before it",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "?after_seq=2",
+            stdout: &[(UNPOSITIONED_SEQ_BASE + 1, "live\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: Some(connects(&[Some(2), None])),
+        },
+        Case {
+            name: "reattach after the live tail's output",
+            bound: true,
+            running: true,
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            // `UNPOSITIONED_SEQ_BASE + 1`, the first live tail output's.
+            query: "?after_seq=4611686018427387905",
+            stdout: &[(1, "one\n"), (2, "two\n"), (3, "three\n"), (4, "four\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: false,
+            opens: Some(connects(&[Some(0)])),
+        },
+        Case {
+            name: "older guest evicted an exited process's output, without after_seq",
+            bound: true,
+            running: false,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "",
+            stdout: &[(6, "6\n"), (7, "7\n"), (8, "8\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: None,
+        },
+        Case {
+            name: "older guest evicted an exited process's output, after_seq before it",
+            bound: true,
+            running: false,
+            replies: Arc::new(|_, open| older_guest(open)),
+            query: "?after_seq=2",
+            stdout: &[(6, "6\n"), (7, "7\n"), (8, "8\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: None,
+        },
+        Case {
+            name: "older guest evicted an exited process's output past SSE positions",
+            bound: true,
+            running: false,
+            replies: Arc::new(|_, open| far_older_guest(open)),
+            // `FAR + 2`.
+            query: "?after_seq=1099511627778",
+            stdout: &[(FAR + 6, "6\n"), (FAR + 7, "7\n"), (FAR + 8, "8\n")],
+            resyncs: &["cursor_out_of_window"],
+            truncated: true,
+            opens: None,
+        },
+    ];
+    for case in cases {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_journal_fake(session_id, case.bound, case.replies).await;
+        fake.running.store(case.running, Ordering::SeqCst);
+
+        let mut tcp =
+            attach_native_websocket_with(&fake.endpoint, session_id, case.query, None).await;
+        let frames = websocket_frames_to_close(&mut tcp).await;
+
+        assert_eq!(
+            websocket_stdout(&frames),
+            seq_lines(case.stdout),
+            "{}",
+            case.name
+        );
+        assert_eq!(websocket_resyncs(&frames), case.resyncs, "{}", case.name);
+        assert_eq!(
+            websocket_output_truncated(&frames),
+            Some(case.truncated),
+            "{}",
+            case.name
+        );
+        if let Some(opens) = case.opens {
+            assert_eq!(*fake.opens.lock().unwrap(), opens, "{}", case.name);
+        }
+    }
+}
+
+/// A stream that follows the live tail of an older guest, and moves to
+/// another worker when its route token is refreshed, reopens at the live tail
+/// there too: its `seq`s are not positions to send the guest, and the
+/// reopened stream's start is no start of the process.
+#[tokio::test]
+async fn websocket_route_token_refresh_keeps_following_the_live_tail() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_process_fake(
+        session_id,
+        FakeRoute {
+            refreshing_token: true,
+            ..FakeRoute::bound()
+        },
+        None,
+        Arc::new(|opened, open| match open {
+            FakeOpen::Connect(Some(_)) => vec![connected(), untagged_lagged()],
+            // The first live tail stays open until the client's next frame.
+            FakeOpen::Connect(None) if opened == 1 => vec![connected(), stdout("one\n")],
+            // Such a guest may answer a connect without a cursor as a start.
+            FakeOpen::Connect(None) => vec![started(), stdout("two\n"), exited()],
+            FakeOpen::Start => panic!("the process is already bound"),
+        }),
+    )
+    .await;
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "stdout").await;
+    send_websocket_text(&mut tcp, r#"{"type":"heartbeat","seq":1}"#).await;
+    let frames = websocket_frames_to_close(&mut tcp).await;
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["type"] == "backend_reconnected"),
+        "{frames:?}"
+    );
+    assert_eq!(
+        websocket_stdout(&frames),
+        seq_lines(&[(UNPOSITIONED_SEQ_BASE + 2, "two\n")])
+    );
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(0), None, None])
+    );
+}
+
+/// A guest can refuse each reopen after a window miss the same way before
+/// any output arrives, as one that keeps evicting past the stream would. The
+/// stream stops reopening after `PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`
+/// and ends with an error, as an SSE stream does; reopens between which
+/// output arrives are not counted together.
+#[tokio::test]
+async fn websocket_window_miss_reopens_without_output_are_bounded() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let limit = PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS as usize;
+
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| match open {
+            FakeOpen::Connect(Some(cursor)) => vec![connected(), lagged(Some(cursor + 1))],
+            open => panic!("unexpected open {open:?}"),
+        }),
+    )
+    .await;
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "backend_stream_error").await;
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&(0..=limit as u64).map(Some).collect::<Vec<_>>()),
+        "{seen}"
+    );
+    assert_eq!(
+        seen.matches("cursor_out_of_window").count(),
+        limit,
+        "{seen}"
+    );
+
+    // Each reopen here follows output, so the stream reopens more often than
+    // the cap and reaches the exit: every other output is evicted.
+    const LINES: [&str; 10] = [
+        "1\n", "2\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n", "9\n", "10\n",
+    ];
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| match open {
+            FakeOpen::Connect(Some(cursor)) if (cursor as usize) < LINES.len() => vec![
+                connected(),
+                stdout(LINES[cursor as usize]),
+                lagged(Some(cursor + 2)),
+            ],
+            FakeOpen::Connect(Some(_)) => vec![connected(), exited()],
+            open => panic!("unexpected open {open:?}"),
+        }),
+    )
+    .await;
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let frames = websocket_frames_to_close(&mut tcp).await;
+    assert_eq!(
+        websocket_stdout(&frames),
+        seq_lines(&[(1, "1\n"), (3, "3\n"), (5, "5\n"), (7, "7\n"), (9, "9\n")]),
+        "{frames:?}"
+    );
+    assert_eq!(websocket_output_truncated(&frames), Some(true));
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(0), Some(2), Some(4), Some(6), Some(8), Some(10)])
+    );
+}
+
+/// An attached process or file-watch socket is pinged while its session is
+/// quiet.
+#[tokio::test]
+async fn quiet_websocket_sessions_are_pinged() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    for kind in [SessionKind::Process, SessionKind::FileWatch] {
+        let session_id = DataPlaneSessionId::new_for_kind(kind);
+        let endpoint = spawn_backend_failure_fake(session_id, BackendFailure::ResizeRefused).await;
+        let mut tcp = attach_native_websocket_with(
+            &endpoint,
+            session_id,
+            "",
+            Some(Duration::from_millis(50)),
+        )
+        .await;
+        let pinged = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (opcode, _) = crate::tests::read_server_frame(&mut tcp).await;
+                if opcode == 0x9 {
+                    return;
+                }
+                assert_eq!(opcode, 0x1, "{kind:?}: only text frames before the ping");
+            }
+        })
+        .await;
+        assert!(pinged.is_ok(), "{kind:?}: no ping within 5s");
+    }
 }
 
 /// A guest that starts a lagged connect at its oldest retained output, and

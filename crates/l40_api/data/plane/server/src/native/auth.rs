@@ -109,6 +109,29 @@ pub(crate) fn reject_query_tokens(query: Option<&str>) -> Result<(), AttachError
     Ok(())
 }
 
+/// The `after_seq` a WebSocket attach resumes a process or terminal session
+/// after: the `seq` of the last `stdout` or `stderr` frame the client
+/// received. At most the OpenAPI parameter's `int64` maximum.
+pub(crate) fn websocket_after_seq(query: Option<&str>) -> Result<Option<u64>, AttachError> {
+    let mut values = form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .filter(|(key, _)| key == "after_seq")
+        .map(|(_, value)| value);
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(AttachError::BadRequest(
+            "after_seq must be sent at most once",
+        ));
+    }
+    match value.parse::<u64>() {
+        Ok(after_seq) if after_seq <= i64::MAX as u64 => Ok(Some(after_seq)),
+        _ => Err(AttachError::BadRequest(
+            "after_seq must be an unsigned integer no greater than 9223372036854775807",
+        )),
+    }
+}
+
 /// Largest `Last-Event-ID` a client may resume from. It is the OpenAPI
 /// parameter's `int64` maximum, and it leaves room for the `last + 1` id a
 /// file-watch resume sends, so that stream can never saturate onto an id the

@@ -1165,6 +1165,9 @@ async fn test_data_plane_state_with_runtime_access(
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         route_cache_ttl: Duration::from_secs(60),
+        // Pings would interleave with the frames tests read; the keepalive
+        // test sets its own interval.
+        websocket_ping_interval: Duration::from_secs(3600),
         drain_started: CancellationToken::new(),
         stream_shutdown_token: CancellationToken::new(),
         upgrade_tasks: TaskTracker::new(),
@@ -1256,6 +1259,15 @@ fn space_api_route_claims() -> SpaceApiRouteEd25519Claims {
         test_route_identity(),
     )
     .unwrap()
+}
+
+/// A route token for a native session's bridge that expires `ttl_secs`
+/// after it is issued, so one inside the refresh window is refreshed when
+/// the session next uses it.
+pub(crate) fn proto_space_api_route_token_expiring_in(ttl_secs: u64) -> ProtoSpaceApiRouteToken {
+    let mut claims = space_api_route_claims();
+    claims.expires_at_unix_secs = claims.issued_at_unix_secs + ttl_secs;
+    proto_space_api_route_token_with_claims(claims)
 }
 
 fn proto_space_api_route_token_with_claims(

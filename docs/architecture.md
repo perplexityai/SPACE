@@ -216,7 +216,8 @@ after activation, within the original request deadline. The cluster API does
 not construct a Kubernetes substrate or retain the sandbox-pod reflector cache.
 Accepted activation remains owned by the API's tracked lifecycle tasks and
 existing execution leases; a caller timeout only ends its wait. Transport idle
-limits still apply, and SPACE does not generate WebSocket keepalives.
+limits still apply, and SPACE does not generate keepalives on proxied
+service-port WebSockets.
 During coordinated deployment, a temporary metadata opt-in falls back to ordinary
 stream termination for older callers or gateways. Drain existing attachments
 before rollback; old decoding forwarders are not a supported steady state. The
