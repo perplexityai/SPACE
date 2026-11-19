@@ -68,8 +68,9 @@ The runner changes the host beyond its benches, and some changes stay: it
 raises kernel limits, loads device-mapper modules and stages loop-device nodes,
 installs packages and Docker's static release under `/opt`, adds iptables rules,
 a dummy interface and two registry containers that keep running between runs,
-and holds about 50 GB of disk per bench. It has been run on one host shape so
-far (32 CPUs, 123 GiB, one ~330 MB/s volume). Don't start it without the host
+and holds about 50 GB of disk per bench. It has been run on two host shapes so
+far (32 CPUs with 123 GiB and 48 CPUs with 185 GiB, each with one ~330 MB/s
+volume). Don't start it without the host
 owner's go-ahead, even with passwordless sudo. On any other machine, and against
 a stack that is already up or to reproduce one shard, use
 `smoke-kind-typed.sh all [i/N]`.

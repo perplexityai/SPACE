@@ -341,10 +341,10 @@ slowest, so more shards would not shorten the run.
 Linux/KVM host at once, as N isolated benches side by side. It is the default
 way to run the whole typed suite **on a dedicated Linux KVM development host
 whose owner has agreed to the host-wide changes listed below**. It has been run
-on one host shape so far: 32 CPUs, 123 GiB of memory, the bench data on one
-network block volume of about 330 MB/s, and the host's Docker in a sidecar
-container. On any other machine, bring up one stack and run
-`scripts/tests/smoke-kind-typed.sh all` (see
+on two host shapes so far, 32 CPUs with 123 GiB of memory and 48 CPUs with
+185 GiB, each with the bench data on one network block volume of about
+330 MB/s and the host's Docker in a sidecar container. On any other machine,
+bring up one stack and run `scripts/tests/smoke-kind-typed.sh all` (see
 [CI smoke partitions](#ci-smoke-partitions)).
 
 ```bash
@@ -374,13 +374,13 @@ removes the benches an interrupted or `--keep` run left; only directories
 marked as a bench's when it was created are ever deleted.
 
 It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo, `curl`
-on the caller's `PATH`, `iptables`, and Docker Engine 28 or later on this host (the endpoint the docker
-CLI resolves from `DOCKER_HOST`, `DOCKER_CONTEXT` or the active context must be a
-Unix socket or a loopback address) with the containerd image store. It refuses
-a host whose `/etc/resolv.conf` names a loopback resolver (such as
-systemd-resolved's `127.0.0.53` stub) or that has a route in 192.168.0.0/16
-other than its own benches', and a bench root or `--out` directory inside the
-checkout. What it changes on the host:
+on the caller's `PATH`, `iptables`, and Docker Engine 28 or later on this host
+(the endpoint the docker CLI resolves from `DOCKER_HOST`, `DOCKER_CONTEXT` or
+the active context must be a Unix socket or a loopback address) with the
+containerd image store. It refuses a host whose `/etc/resolv.conf` names a
+loopback resolver (such as systemd-resolved's `127.0.0.53` stub) or that has a
+route in 192.168.0.0/16 other than its own benches', and a bench root or
+`--out` directory inside the checkout. What it changes on the host:
 
 - **Kernel and limits:** raises the inotify and aio limits (only ever upward),
   sets `net.ipv4.ip_forward=1`, loads the device-mapper crypt and snapshot
