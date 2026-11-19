@@ -259,6 +259,17 @@ if [[ -n "$OUT" ]]; then
 elif [[ "$COMMAND" == run ]] && inside_checkout "$OUT_PARENT"; then
   die "the default output directory $OUT_PARENT is inside the checkout; pass --out outside it"
 fi
+# The host's Docker builds the shared images, bind-mounts the seed and the
+# registries' data from this host's paths, and publishes the registries that
+# the benches reach on this host; teardown removes the registries from it. So
+# the daemon the docker CLI resolves (DOCKER_HOST, DOCKER_CONTEXT or the active
+# context) must be on this host, for both commands.
+docker_endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)" \
+  || die "cannot resolve the docker CLI's endpoint (docker context inspect)"
+case "$docker_endpoint" in
+  unix://* | tcp://localhost:* | tcp://127.0.0.1:*) ;;
+  *) die "the docker CLI's endpoint $docker_endpoint is not a daemon on this host; the runner needs a local one" ;;
+esac
 kind_bench_lock
 if [[ "$COMMAND" == teardown ]]; then
   sudo -n true 2>/dev/null || die "teardown needs passwordless sudo"
@@ -343,15 +354,8 @@ if [[ ! -e "$KIND_BENCH_ROOT" ]]; then
     || die "cannot create $KIND_BENCH_ROOT"
 fi
 
-# The host's Docker builds the shared images, bind-mounts the seed and the
-# registries' data from this host's paths, and publishes the registries that
-# the benches reach on this host, so it must be a daemon on this host, and
-# one that keeps a port published on 127.0.0.1 (the layer cache) to this host,
-# which Docker Engine does from 28.0.
-case "${DOCKER_HOST:-}" in
-  "" | unix://* | tcp://localhost:* | tcp://127.0.0.1:*) ;;
-  *) die "DOCKER_HOST=$DOCKER_HOST is not a daemon on this host; the runner needs a local one" ;;
-esac
+# The host's Docker must keep a port published on 127.0.0.1 (the layer cache)
+# to this host, which Docker Engine does from 28.0.
 engine="$(timeout 30 docker version --format '{{.Server.Version}}' 2>/dev/null)" \
   || die "the host's Docker does not answer"
 [[ "${engine%%.*}" =~ ^[0-9]+$ ]] && (( ${engine%%.*} >= 28 )) \

@@ -374,8 +374,9 @@ removes the benches an interrupted or `--keep` run left; only directories
 marked as a bench's when it was created are ever deleted.
 
 It needs Linux with cgroup v2, read-write `/dev/kvm`, passwordless sudo, `curl`,
-`iptables`, and Docker Engine 28 or later on this host (`DOCKER_HOST` unset, a
-Unix socket, or a loopback address) with the containerd image store. It refuses
+`iptables`, and Docker Engine 28 or later on this host (the endpoint the docker
+CLI resolves from `DOCKER_HOST`, `DOCKER_CONTEXT` or the active context must be a
+Unix socket or a loopback address) with the containerd image store. It refuses
 a host whose `/etc/resolv.conf` names a loopback resolver (such as
 systemd-resolved's `127.0.0.53` stub) or that has a route in 192.168.0.0/16
 other than its own benches', and a bench root or `--out` directory inside the
