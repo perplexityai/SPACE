@@ -1,9 +1,10 @@
 //! The strict, versioned decoder: serde reads the envelope and the model's
 //! comparisons, then the model constructors check rule IDs, non-empty `all_of`
-//! and unique IDs.
+//! and unique IDs, and the decoder refuses what nft cannot install or verify.
 
 use pplx_space_firewall_rules_model::{
-    EmptyAllOfError, FirewallRuleRevision, Match, NameError, Rule, RuleId, RuleRevisionError,
+    EmptyAllOfError, FirewallRuleRevision, Match, NameError, Read, Rule, RuleId, RuleRevisionError,
+    Value,
 };
 
 use crate::SCHEMA_VERSION;
@@ -41,6 +42,16 @@ pub enum DecodeError {
         id: RuleId,
         source: EmptyAllOfError,
     },
+    /// The rule at `index` masks `tcp flags`.
+    #[error("invalid firewall rules: rules[{index}] ({id:?}): tcp flags cannot be masked", id = .id.as_str())]
+    MaskedTcpFlags { index: usize, id: RuleId },
+    /// The rule at `index` holds an integer that nft's JSON parser refuses.
+    #[error("invalid firewall rules: rules[{index}] ({id:?}): {value} is above {MAX_INTEGER}", id = .id.as_str())]
+    IntegerTooLarge {
+        index: usize,
+        id: RuleId,
+        value: u64,
+    },
     /// Valid rules that cannot form a revision, such as a repeated rule ID.
     #[error("invalid firewall rules: {0}")]
     Revision(#[from] RuleRevisionError),
@@ -67,9 +78,44 @@ fn decode_v1(revision: DocumentV1) -> Result<FirewallRuleRevision, DecodeError> 
 
 fn decode_rule(index: usize, rule: RuleV1<String, Vec<Match>>) -> Result<Rule, DecodeError> {
     let id = RuleId::new(rule.id).map_err(|source| DecodeError::InvalidRuleId { index, source })?;
-    Rule::new(id.clone(), rule.all_of).map_err(|source| DecodeError::EmptyAllOf {
+    let rule = Rule::new(id.clone(), rule.all_of).map_err(|source| DecodeError::EmptyAllOf {
         index,
         id,
         source,
-    })
+    })?;
+    check_nft_limits(index, &rule)?;
+    Ok(rule)
+}
+
+/// The largest integer nft's JSON parser reads.
+const MAX_INTEGER: u64 = i64::MAX.cast_unsigned();
+
+fn check_nft_limits(index: usize, rule: &Rule) -> Result<(), DecodeError> {
+    let id = || rule.id().clone();
+    for comparison in rule.all_of() {
+        let mask = match &comparison.left {
+            Read::MaskedPayload { header, mask } => {
+                // nft lists flag masks symbolically, so they can't be verified.
+                if header.protocol.as_str() == "tcp" && header.field.as_str() == "flags" {
+                    return Err(DecodeError::MaskedTcpFlags { index, id: id() });
+                }
+                Some(mask.get())
+            }
+            Read::Payload(_) | Read::TcpOption(_) => None,
+        };
+        let value = match comparison.right {
+            Value::Integer(value) => Some(value),
+            // The end is never below the start.
+            Value::Range(range) => Some(range.end()),
+            Value::Ipv4Prefix(_) | Value::Ipv4(_) | Value::True => None,
+        };
+        if let Some(value) = mask.into_iter().chain(value).find(|&n| n > MAX_INTEGER) {
+            return Err(DecodeError::IntegerTooLarge {
+                index,
+                id: id(),
+                value,
+            });
+        }
+    }
+    Ok(())
 }

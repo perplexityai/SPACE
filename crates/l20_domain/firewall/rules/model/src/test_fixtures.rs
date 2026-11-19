@@ -104,10 +104,10 @@ pub(crate) fn acceptance_probe() -> Rule {
             },
             Match {
                 left: Read::MaskedPayload {
-                    header: header("tcp", "flags"),
-                    mask: NonZeroU64::new(2).unwrap(),
+                    header: header("ip", "frag-off"),
+                    mask: NonZeroU64::new(8191).unwrap(),
                 },
-                right: Value::Integer(2),
+                right: Value::Integer(0),
             },
         ],
     )

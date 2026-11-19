@@ -17,7 +17,7 @@ const ALL_VARIANTS: &str = concat!(
     r#"{"id":"first","all_of":["#,
     r#"{"left":{"payload":{"protocol":"ip","field":"daddr"}},"op":"==","right":"192.0.2.1"},"#,
     r#"{"left":{"tcp option":{"name":"mptcp"}},"op":"==","right":true},"#,
-    r#"{"left":{"&":[{"payload":{"protocol":"tcp","field":"flags"}},18]},"op":"==","right":2}]},"#,
+    r#"{"left":{"&":[{"payload":{"protocol":"ip","field":"frag-off"}},8191]},"op":"==","right":0}]},"#,
     r#"{"id":"second","all_of":["#,
     r#"{"left":{"payload":{"protocol":"ip","field":"saddr"}},"op":"==","right":{"prefix":{"addr":"198.51.100.0","len":24}}},"#,
     r#"{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":{"range":[1024,65535]}}]}"#,
@@ -103,10 +103,10 @@ fn documents_round_trip_through_the_canonical_form() {
                 eq(Read::TcpOption(Name::new("mptcp").unwrap()), Value::True),
                 eq(
                     Read::MaskedPayload {
-                        header: header("tcp", "flags"),
-                        mask: NonZeroU64::new(18).unwrap(),
+                        header: header("ip", "frag-off"),
+                        mask: NonZeroU64::new(8191).unwrap(),
                     },
-                    Value::Integer(2),
+                    Value::Integer(0),
                 ),
             ],
         ),
@@ -132,7 +132,7 @@ fn documents_round_trip_through_the_canonical_form() {
         {"all_of":[
             {"right":"192.0.2.1","op":"==","left":{"payload":{"field":"daddr","protocol":"ip"}}},
             {"op":"==","right":true,"left":{"tcp option":{"name":"mptcp"}}},
-            {"right":2,"left":{"&":[{"payload":{"field":"flags","protocol":"tcp"}},18]},"op":"=="}
+            {"right":0,"left":{"&":[{"payload":{"field":"frag-off","protocol":"ip"}},8191]},"op":"=="}
         ],"id":"first"},
         {"all_of":[
             {"right":{"prefix":{"len":24,"addr":"198.51.100.0"}},"left":{"payload":{"field":"saddr","protocol":"ip"}},"op":"=="},
@@ -230,15 +230,16 @@ fn a_decoded_comparison_is_an_nft_match_operand() {
 const CANONICAL: &str = r##"
 document {"schema_version":1,"rules":[]}
 right 0
-right 18446744073709551615
+right 9223372036854775807
 right "0.0.0.0"
 right "255.255.255.255"
 right {"prefix":{"addr":"0.0.0.0","len":0}}
 right {"prefix":{"addr":"192.0.2.7","len":24}}
 right {"prefix":{"addr":"192.0.2.7","len":32}}
 right {"range":[5,5]}
-right {"range":[0,18446744073709551615]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},18446744073709551615]}
+right {"range":[0,9223372036854775807]}
+left {"&":[{"payload":{"protocol":"ip","field":"frag-off"}},9223372036854775807]}
+left {"payload":{"protocol":"tcp","field":"flags"}}
 left {"payload":{"protocol":"udplite","field":"csumcov"}}
 rules {"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","all_of":[GOOD]}
 rules {"id":"Az09.Z_z-9","all_of":[GOOD]}
@@ -336,9 +337,9 @@ op null
 left {"payload":"tcp dport"}
 left {"payload":{"protocol":null,"field":"dport"}}
 left {"tcp option":"mptcp"}
-left {"&":{"payload":{"protocol":"tcp","field":"flags"}}}
-left {"&":[2,{"payload":{"protocol":"tcp","field":"flags"}}]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},"0x02"]}
+left {"&":{"payload":{"protocol":"ip","field":"frag-off"}}}
+left {"&":[2,{"payload":{"protocol":"ip","field":"frag-off"}}]}
+left {"&":[{"payload":{"protocol":"ip","field":"frag-off"}},"0x02"]}
 right null
 right [1,2]
 right {"prefix":"192.0.2.0/24"}
@@ -352,7 +353,7 @@ rules {"id":"a","all_of":[GOOD],"table":"accept"}
 right 1,"verdict":"accept"
 left {"payload":{"protocol":"tcp","field":"dport","interface":"eth0"}}
 left {"tcp option":{"name":"mptcp","field":"kind"}}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"},"x":1},1]}
+left {"&":[{"payload":{"protocol":"ip","field":"frag-off"},"x":1},1]}
 right {"prefix":{"addr":"192.0.2.0","len":24,"table":"filter"}}
 # Missing or unknown variant
 left {}
@@ -368,7 +369,7 @@ right 1,"right":2
 left {"payload":{"protocol":"tcp","field":"dport"},"payload":{"protocol":"udp","field":"dport"}}
 left {"payload":{"protocol":"tcp","protocol":"udp","field":"dport"}}
 left {"tcp option":{"name":"mptcp","name":"sack"}}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"},"payload":{"protocol":"udp","field":"flags"}},1]}
+left {"&":[{"payload":{"protocol":"ip","field":"frag-off"},"payload":{"protocol":"udp","field":"flags"}},1]}
 right {"range":[1,2],"range":[3,4]}
 right {"prefix":{"addr":"192.0.2.0","len":33,"len":24}}
 # Competing variants
@@ -379,7 +380,7 @@ right false
 right -1
 right 1.5
 right 18446744073709551616
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},0]}
+left {"&":[{"payload":{"protocol":"ip","field":"frag-off"}},0]}
 # Malformed or IPv6 address
 right "01.2.3.4"
 right "2001:db8::1"
@@ -388,7 +389,12 @@ right {"prefix":{"addr":"192.0.2.0","len":33}}
 right {"prefix":{"addr":"192.0.2.0","len":256}}
 right {"range":[5,4]}
 right {"range":[1,2,3]}
-left {"&":[{"payload":{"protocol":"tcp","field":"flags"}}]}
+left {"&":[{"payload":{"protocol":"ip","field":"frag-off"}}]}
+# nft limits: a tcp flags mask, and an integer, range end or mask above i64::MAX
+left {"&":[{"payload":{"protocol":"tcp","field":"flags"}},2]}
+right 9223372036854775808
+right {"range":[0,9223372036854775808]}
+left {"&":[{"payload":{"protocol":"ip","field":"frag-off"}},9223372036854775808]}
 # Operator other than ==
 op "!="
 # Rule IDs and names outside their character sets
@@ -417,7 +423,7 @@ rules ["a",[GOOD]]
 match [{"payload":{"protocol":"tcp","field":"dport"}},"==",1]
 left {"payload":["tcp","dport"]}
 left {"tcp option":["mptcp"]}
-left {"&":[[{"protocol":"tcp","field":"flags"}],1]}
+left {"&":[[{"protocol":"ip","field":"frag-off"}],1]}
 right {"prefix":["192.0.2.0",24]}
 op {"==":null}
 left "payload"
@@ -500,6 +506,32 @@ fn rule_checks_report_the_rule_and_the_typed_cause() {
     assert!(
         matches!(error, DecodeError::EmptyAllOf { index: 1, ref id, .. } if id.as_str() == "b")
     );
+
+    let flags =
+        r#"{"left":{"&":[{"payload":{"protocol":"tcp","field":"flags"}},2]},"op":"==","right":2}"#;
+    let error = decode(&format!(
+        r#"{{"id":"a","all_of":[GOOD]}},{{"id":"syn","all_of":[{flags}]}}"#
+    ));
+    assert_eq!(
+        error.to_string(),
+        r#"invalid firewall rules: rules[1] ("syn"): tcp flags cannot be masked"#
+    );
+    assert!(
+        matches!(error, DecodeError::MaskedTcpFlags { index: 1, ref id } if id.as_str() == "syn")
+    );
+
+    let big =
+        format!(r#"{{"left":{DPORT},"op":"==","right":{{"range":[1,9223372036854775808]}}}}"#);
+    let error = decode(&format!(r#"{{"id":"big","all_of":[GOOD,{big}]}}"#));
+    assert_eq!(
+        error.to_string(),
+        r#"invalid firewall rules: rules[0] ("big"): 9223372036854775808 is above 9223372036854775807"#
+    );
+    assert!(matches!(
+        error,
+        DecodeError::IntegerTooLarge { index: 0, ref id, value: 9_223_372_036_854_775_808 }
+            if id.as_str() == "big"
+    ));
 
     let error = decode(r#"{"id":"a","all_of":[GOOD]},{"id":"a","all_of":[GOOD]}"#);
     assert_eq!(

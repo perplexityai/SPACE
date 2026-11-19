@@ -7,8 +7,10 @@ use crate::SCHEMA_VERSION;
 use crate::wire::{RevisionV1, RuleV1};
 
 /// Writes `revision` in its canonical form: fields in grammar order, rules and
-/// comparisons in their own order, and no whitespace. Decoding the result
-/// gives back an equal revision, and equal revisions encode to equal bytes.
+/// comparisons in their own order, and no whitespace. Equal revisions encode
+/// to equal bytes. A revision [`decode_revision`](crate::decode_revision)
+/// returned decodes back to an equal one; one built with the model's
+/// constructors may break nft's limits and not decode.
 pub fn encode_revision(revision: &FirewallRuleRevision) -> String {
     let document = RevisionV1 {
         schema_version: SCHEMA_VERSION,
