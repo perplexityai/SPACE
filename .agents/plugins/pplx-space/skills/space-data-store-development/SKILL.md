@@ -65,6 +65,14 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   and the upgrade decision have to agree on which nodes can run what. Build
   the statement once, bind every value, and keep the rest of the statement
   whole at its query site.
+- Another is `pplx_space_template_release_store::resolved_release_sql`, the
+  single definition of which release of a template build a create runs (the
+  default-bound one, else a twin in an allowed then a deprecated environment,
+  else the original, never a blocked one). Interpolate it rather than
+  re-spelling the order: create resolution, pod placement, pool claims, the
+  warm-pool autoscaler and the environment block guard have to agree on which
+  release serves. Build the statement once, bind every value, and keep the
+  rest of the statement whole at its query site.
 - The last is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it
