@@ -11,12 +11,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 # The owner publishes this wildcard identity for local development (BSD-2-Clause).
-# Pin every downloaded byte; renewal requires reviewing and updating this pin.
-REVISION = "5326d41785f3817c14a0d8a26da26e3a188c992f"
+# Pin every downloaded byte; renewal requires reviewing and updating this pin
+# and the key.pem digest's exception in .gitleaks.toml.
+REVISION = "ed2033f452f389d6701d564123e440ed118543b8"
 SOURCE = f"https://raw.githubusercontent.com/appcove/127-0-0-1.dev/{REVISION}"
 ASSETS = {
-    "cert.pem": "635f1722e376e4ea75d01d2fec8f3e568fd219833212ede9722574bc2e537367",
-    "key.pem": "ab7de02813ef2dc94c6ce3d3b4a2a28b2d1bbc39896f011210d6a5f29fd022b4",
+    "cert.pem": "0294b5beca73f9509197621194cf68926fcf96f90f7c1b0bbd8de2372accd1fe",
+    "key.pem": "38d486a39fc236573de43d463fcd74ed94c74a041f743c2d0a4f05d6a6357ef2",
     "LICENSE": "0a95cdc913f29607f99ef2c520d413e49c839d9ec15117e3ef9724bb1dbf8a72",
 }
 
