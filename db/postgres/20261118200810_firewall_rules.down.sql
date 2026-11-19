@@ -7,18 +7,19 @@ SET LOCAL statement_timeout = '5s';
 -- Refuse while a rollout is unfinished (paused included), while any item holds
 -- an unexpired lease, or while any node assignment or the enrollment default is
 -- set. Dropping those would silently stop a rollout partway and lose which
--- revision each node is meant to enforce. Revisions, receipts, finished
--- rollouts and observations are only history and evidence, and may go. Once
--- that code is gone, a cluster administrator clears a refusal with direct SQL:
+-- revision each node is meant to enforce. Revisions, finished rollouts and
+-- observations are only history and evidence, and may go. Once that code is
+-- gone, a cluster administrator clears a refusal with direct SQL:
 -- abort each unfinished rollout (phase 'aborted', unfinished_slot NULL,
 -- finished_at now()), fail each leased item (phase 'failed', lease_token and
 -- lease_expires_at NULL) once no worker can still hold it, delete the node
 -- assignments, and set the enrollment default to NULL.
 -- Holding the locks keeps any write from landing between the check and the
--- drop.
-LOCK TABLE firewall_rules_revisions,
+-- drop. Users is locked first to match a user deletion's ON DELETE SET NULL
+-- cascade into the rollouts.
+LOCK TABLE users,
+    firewall_rules_revisions,
     firewall_rules_control,
-    firewall_rules_mutation_receipts,
     firewall_rules_rollouts,
     firewall_rules_rollout_items,
     firewall_rules_node_assignments,
@@ -78,5 +79,4 @@ DROP TABLE firewall_rules_node_assignments;
 DROP TABLE firewall_rules_rollout_items;
 DROP TABLE firewall_rules_rollouts;
 DROP TABLE firewall_rules_control;
-DROP TABLE firewall_rules_mutation_receipts;
 DROP TABLE firewall_rules_revisions;

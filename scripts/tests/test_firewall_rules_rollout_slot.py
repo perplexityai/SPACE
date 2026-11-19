@@ -6,8 +6,8 @@ unfinished header must hold unfinished_slot 1, which a unique key admits once.
 These tests apply every db/postgres up migration to a new database, and the
 first two race two connections to it. No rollout has items, so the rule holds
 before membership does. Each refusal is checked by constraint name, and
-the fixtures are valid revisions and receipts, so an unrelated constraint
-can't stand in for the slot.
+the fixtures are a valid revision and user, so an unrelated constraint can't
+stand in for the slot.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from psycopg.conninfo import make_conninfo
 from required_test_deps import unavailable_dependency
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "db" / "postgres"
+# The organization the migrations seed.
+LOCAL_ORG = uuid.UUID("00000000-0000-0000-0000-000000000001")
 SLOT_KEY = "firewall_rules_rollouts_unfinished_slot_key"
 SLOT_CHECK = "firewall_rules_rollouts_unfinished_slot_check"
 UNFINISHED_PHASES = ("canary", "rolling", "paused")
@@ -90,6 +92,7 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
             apply_migrations(cls.url)
             with psycopg.connect(cls.url, autocommit=True) as conn:
                 cls.revision = cls._insert_revision(conn)
+                cls.user = cls._insert_user(conn)
         except BaseException:
             cls._drop_database()
             raise
@@ -117,6 +120,16 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
         )
         return revision
 
+    @staticmethod
+    def _insert_user(conn: psycopg.Connection) -> uuid.UUID:
+        user = uuid.uuid4()
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, display_name, org_id, role)"
+            " VALUES (%s, %s, 'test', 'test', %s, 'member')",
+            (user, f"{user}@example.com", LOCAL_ORG),
+        )
+        return user
+
     def setUp(self) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM firewall_rules_rollouts")
@@ -131,24 +144,16 @@ class FirewallRulesRolloutSlotTest(unittest.TestCase):
     def insert_header(
         self, conn: psycopg.Connection, phase: str, unfinished_slot: int | None
     ) -> uuid.UUID:
-        """Insert a rollout header with its own new receipt, in conn's open
-        transaction."""
-        receipt = uuid.uuid4()
-        conn.execute(
-            "INSERT INTO firewall_rules_mutation_receipts"
-            " (id, actor, idempotency_key, request_fingerprint, result)"
-            " VALUES (%s, 'operator:test', %s, %s, '{}'::jsonb)",
-            (receipt, str(receipt), "0" * 64),
-        )
+        """Insert a rollout header in conn's open transaction."""
         rollout = uuid.uuid4()
         conn.execute(
             "INSERT INTO firewall_rules_rollouts"
-            " (id, to_revision_id, created_by_receipt_id, phase, unfinished_slot, reason)"
+            " (id, to_revision_id, created_by_user_id, phase, unfinished_slot, reason)"
             " VALUES (%s, %s, %s, %s, %s, 'test')",
             (
                 rollout,
                 self.revision,
-                receipt,
+                self.user,
                 phase,
                 unfinished_slot,
             ),
