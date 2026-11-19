@@ -1,7 +1,8 @@
 //! Leasing a rollout's saved targets: permission for one controller to work
 //! on one node for a while. A lease is not an assignment. Nothing here writes
-//! an assignment, an issuance stamp, `next_check_at`, an observation or a
-//! wakeup; the later assignment transaction does, under the lease.
+//! an assignment, an issuance stamp, an observation or a wakeup; the later
+//! assignment transaction does, under the lease. Only a retried check
+//! reschedules `next_check_at` ([`Requeue::Retry`]).
 //!
 //! Claims and renewals run [`pplx_space_rollout_queue::claim`] and
 //! [`pplx_space_rollout_queue::renew`] on these tables, in their lock order:
@@ -17,8 +18,9 @@
 //! In rolling, `active_limit` bounds the nodes leased or holding an
 //! unverified assignment: an issued target keeps its slot until it's done
 //! or failed, even if it never proves, and failing one that can't be reached
-//! is the controller's job. A due check adds no unverified node, so only the
-//! leases in flight bound it.
+//! is the controller's job; one whose node deregistered (no status snapshot)
+//! frees its slot. A due check adds no unverified node, so only the leases in
+//! flight bound it.
 //!
 //! A check lease spends an attempt, so repeated lapses can redrive an issued
 //! canary to failed. The pin then holds the rollout in canary, and with no
@@ -208,8 +210,8 @@ impl ClaimStore for Claiming<'_> {
     /// Online is the node's status snapshot: reachable, and not past the
     /// `stale_after` its writer derives from node-ctl's poll interval. A
     /// deregistered node has no snapshot (it cascades with the `nodes` row).
-    /// Provisional: no firewall online signal is agreed yet, so this is the
-    /// heartbeat rule other node readers use, on the lease's clock.
+    /// Provisional: no firewall online signal is agreed yet, so this mirrors
+    /// sandbox-residency's `node_heartbeat_fresh`, on the lease's clock.
     async fn candidates(
         &mut self,
         &canary: &bool,
@@ -223,7 +225,9 @@ impl ClaimStore for Claiming<'_> {
         // issued canary that's offline or not due still holds it. It counts:
         // as an EXISTS, the planner scans every rollout's items. `held` is
         // excluded before the limits, so it can't fill the scan; under the
-        // exclusive handoff lock it can only shrink.
+        // exclusive handoff lock it can only shrink. A deregistered node's
+        // issued item isn't counted; the scalar subquery probes the snapshot
+        // index per issued item, where an EXISTS is hashed over every node.
         let (in_flight, unverified, due, first) =
             sqlx::query_as::<_, (i64, i64, Vec<uuid::Uuid>, Vec<uuid::Uuid>)>(sql!(
                 "SELECT
@@ -259,12 +263,16 @@ impl ClaimStore for Claiming<'_> {
                              AND i.node_id <> ALL ($6)
                            ORDER BY i.node_id
                            LIMIT $5)
-                 FROM (SELECT count(*) FILTER (WHERE phase = $2) AS in_flight,
+                 FROM (SELECT count(*) FILTER (WHERE i.phase = $2) AS in_flight,
                               count(*) AS unverified
-                       FROM firewall_rules_rollout_items
-                       WHERE rollout_id = $1
-                         AND (phase = $2
-                              OR (phase = $3 AND issued_at IS NOT NULL))) counted"
+                       FROM firewall_rules_rollout_items i
+                       WHERE i.rollout_id = $1
+                         AND (i.phase = $2
+                              OR (i.phase = $3
+                                  AND i.issued_at IS NOT NULL
+                                  AND (SELECT true
+                                       FROM node_status_snapshots nss
+                                       WHERE nss.node_id = i.node_id)))) counted"
             ))
             .bind(self.rollout_id)
             .bind(ItemPhase::InFlight.as_str())
@@ -468,33 +476,54 @@ impl RenewStore for Renewing<'_, '_> {
     }
 }
 
-/// How a lease ends without finishing its target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// How a lease ends without finishing its target. `error` becomes the item's
+/// `last_error`, `None` clearing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Requeue {
     /// Not attempted: the lease's attempt is given back.
-    Release,
-    /// Attempted and to be tried again: the attempt counts.
-    Retry,
+    Release { error: Option<String> },
+    /// Attempted and to be tried again: the attempt counts. A check is next
+    /// due `next_check_in` from now on the database clock. A first assignment
+    /// has no schedule, so its `next_check_at` stays as it is and the
+    /// controller paces its retries.
+    Retry {
+        next_check_in: Duration,
+        error: Option<String>,
+    },
 }
 
 /// End `target`'s lease and return the item to pending. `false` when the
 /// token no longer holds the item, in which case nothing changes. A lapsed
 /// lease that hasn't been redriven still requeues: nobody else holds the
-/// item. Bookkeeping only; it permits no assignment. Issuance and scheduling
-/// are left as they are.
+/// item. Bookkeeping only; it permits no assignment. Issuance is left as it
+/// is.
 pub async fn requeue(
     executor: impl sqlx::PgExecutor<'_>,
     target: &LeasedTarget,
-    requeue: Requeue,
+    requeue: &Requeue,
 ) -> Result<bool, sqlx::Error> {
-    let refund: i64 = match requeue {
-        Requeue::Release => 1,
-        Requeue::Retry => 0,
+    let (refund, next_check_in, error): (i64, _, _) = match requeue {
+        Requeue::Release { error } => (1, None, error),
+        Requeue::Retry {
+            next_check_in,
+            error,
+        } => (0, Some(next_check_in.as_secs_f64()), error),
     };
+    // As the schema's check allows: no NULs, which Postgres text can't hold,
+    // at most 4096 characters, and never empty.
+    let error = error.as_deref().and_then(|error| {
+        let error: String = error.chars().filter(|c| *c != '\0').take(4096).collect();
+        (!error.is_empty()).then_some(error)
+    });
     let requeued = sqlx::query(sql!(
         "UPDATE firewall_rules_rollout_items
          SET phase = $4,
              attempts = GREATEST(attempts - $6, 0),
+             last_error = $8,
+             next_check_at = CASE
+                 WHEN $7::float8 IS NULL OR issued_at IS NULL THEN next_check_at
+                 ELSE clock_timestamp() + make_interval(secs => $7)
+             END,
              lease_token = NULL,
              lease_expires_at = NULL
          WHERE rollout_id = $1
@@ -508,6 +537,8 @@ pub async fn requeue(
     .bind(ItemPhase::Pending.as_str())
     .bind(ItemPhase::InFlight.as_str())
     .bind(refund)
+    .bind(next_check_in)
+    .bind(error)
     .execute(executor)
     .await?
     .rows_affected();

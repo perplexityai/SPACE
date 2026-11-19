@@ -6122,6 +6122,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
+ "pplx-space-node-status-store",
  "pplx-space-rollout-queue",
  "pplx-space-sql-locator",
  "pplx-space-test-env",

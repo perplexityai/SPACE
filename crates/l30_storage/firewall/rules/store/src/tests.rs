@@ -5,6 +5,7 @@ use pplx_space_db_test_fixtures::{
     SEED_USER_ID, TestDb, insert_ready_worker_node, try_pg_test_db,
     try_pg_test_db_with_max_connections,
 };
+use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
 use pplx_space_rollout_queue::LEASE_EXPIRED;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
@@ -17,6 +18,7 @@ use super::*;
 const LEASE: Duration = Duration::from_secs(600);
 const SCAN: u32 = 100;
 const MAX_ATTEMPTS: u64 = 5;
+const RELEASE: Requeue = Requeue::Release { error: None };
 
 /// A rollout header in `phase`, with the revision it references, created by
 /// the seeded user. The schema admits one unfinished header per database.
@@ -72,15 +74,7 @@ async fn online_nodes(pool: &PgPool, count: usize) -> TestResult<Vec<NodeId>> {
     for _ in 0..count {
         let node = NodeId::new();
         insert_ready_worker_node(pool, node).await?;
-        sqlx::query(sql!(
-            "INSERT INTO node_status_snapshots (
-                 node_id, observed_at, stale_after, reachable, services, updated_at
-             )
-             VALUES ($1, now(), now() + interval '1 minute', true, '[]'::jsonb, now())"
-        ))
-        .bind(node)
-        .execute(pool)
-        .await?;
+        upsert_snapshot(pool, node, SnapshotSeed::default()).await?;
         nodes.push(node);
     }
     nodes.sort_by_key(|node| node.as_uuid());
@@ -95,17 +89,12 @@ async fn set_status(
     reachable: bool,
     stale_in_secs: f64,
 ) -> TestResult {
-    sqlx::query(sql!(
-        "UPDATE node_status_snapshots
-         SET reachable = $2, stale_after = now() + make_interval(secs => $3)
-         WHERE node_id = $1"
-    ))
-    .bind(node)
-    .bind(reachable)
-    .bind(stale_in_secs)
-    .execute(pool)
-    .await?;
-    Ok(())
+    let seed = SnapshotSeed {
+        reachable,
+        stale_in_secs,
+        ..SnapshotSeed::default()
+    };
+    Ok(upsert_snapshot(pool, node, seed).await?)
 }
 
 async fn save_targets(pool: &PgPool, rollout: RolloutId, nodes: &[NodeId]) -> TestResult {
@@ -280,7 +269,7 @@ async fn racing_controllers_share_one_node_and_one_slot() -> TestResult {
     let leased = race(&db, rollout, 10).await?;
     assert_eq!(nodes_of(&leased), [a], "both controllers leased the node");
 
-    assert!(requeue(&db.pool, &leased[0], Requeue::Release).await?);
+    assert!(requeue(&db.pool, &leased[0], &RELEASE).await?);
     save_targets(&db.pool, rollout, &[b]).await?;
     let leased = race(&db, rollout, 1).await?;
     assert_eq!(
@@ -332,12 +321,12 @@ async fn after_an_assignment_commits_only_the_issued_canary_is_leased() -> TestR
     let canary = lease(&db.pool, rollout, 10).await?;
     assert_eq!(nodes_of(&canary), [b]);
     issue(&db.pool, rollout, b, 7, Some(-1.0)).await?;
-    assert!(requeue(&db.pool, &canary[0], Requeue::Release).await?);
+    assert!(requeue(&db.pool, &canary[0], &RELEASE).await?);
     set_status(&db.pool, a, true, 60.0).await?;
 
     let leased = lease(&db.pool, rollout, 10).await?;
     assert_eq!(nodes_of(&leased), [b]);
-    assert!(requeue(&db.pool, &leased[0], Requeue::Release).await?);
+    assert!(requeue(&db.pool, &leased[0], &RELEASE).await?);
 
     // Each case fails the scan's other filters for B; the pin is decided
     // before them, so it still holds.
@@ -431,23 +420,24 @@ async fn issued_targets_wait_for_their_scheduled_check() -> TestResult {
 }
 
 /// Catches an issued node that frees its slot before it's done, which would
-/// put more than `active_limit` nodes on an unverified revision, and a due
-/// check that waits for a free slot, which would stall a full rollout.
+/// put more than `active_limit` nodes on an unverified revision; a due check
+/// that waits for a free slot, which would stall a full rollout; and a
+/// deregistered node that keeps its slot, which would stall it for good.
 #[tokio::test(flavor = "current_thread")]
 async fn in_rolling_a_node_awaiting_its_check_holds_its_slot() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let rollout = rollout(&db.pool, "rolling").await?;
-    let nodes = online_nodes(&db.pool, 2).await?;
-    let (a, b) = (nodes[0], nodes[1]);
+    let nodes = online_nodes(&db.pool, 3).await?;
+    let (a, b, c) = (nodes[0], nodes[1], nodes[2]);
     save_targets(&db.pool, rollout, &nodes).await?;
 
     let first = lease(&db.pool, rollout, 1).await?;
     assert_eq!(nodes_of(&first), [a]);
     assert!(lease(&db.pool, rollout, 1).await?.is_empty());
     issue(&db.pool, rollout, a, 1, Some(3600.0)).await?;
-    assert!(requeue(&db.pool, &first[0], Requeue::Release).await?);
+    assert!(requeue(&db.pool, &first[0], &RELEASE).await?);
     assert!(lease(&db.pool, rollout, 1).await?.is_empty());
 
     // Due, A is rechecked at the full cap; offline, it still holds the slot.
@@ -457,7 +447,7 @@ async fn in_rolling_a_node_awaiting_its_check_holds_its_slot() -> TestResult {
     set_status(&db.pool, a, true, 60.0).await?;
     let check = lease(&db.pool, rollout, 1).await?;
     assert_eq!(nodes_of(&check), [a]);
-    assert!(requeue(&db.pool, &check[0], Requeue::Release).await?);
+    assert!(requeue(&db.pool, &check[0], &RELEASE).await?);
 
     sqlx::query(sql!(
         "UPDATE firewall_rules_rollout_items SET phase = 'done'
@@ -467,7 +457,17 @@ async fn in_rolling_a_node_awaiting_its_check_holds_its_slot() -> TestResult {
     .bind(a)
     .execute(&db.pool)
     .await?;
-    assert_eq!(nodes_of(&lease(&db.pool, rollout, 1).await?), [b]);
+    let second = lease(&db.pool, rollout, 1).await?;
+    assert_eq!(nodes_of(&second), [b]);
+
+    // Issued, B holds the slot until its node deregisters.
+    issue(&db.pool, rollout, b, 1, Some(3600.0)).await?;
+    assert!(requeue(&db.pool, &second[0], &RELEASE).await?);
+    sqlx::query(sql!("DELETE FROM nodes WHERE id = $1"))
+        .bind(b)
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(nodes_of(&lease(&db.pool, rollout, 1).await?), [c]);
     Ok(())
 }
 
@@ -530,7 +530,7 @@ async fn only_a_live_token_renews_even_after_a_lock_wait() -> TestResult {
     };
 
     let replaced = lease(&db.pool, rollout, 1).await?.remove(0);
-    assert!(requeue(&db.pool, &replaced, Requeue::Release).await?);
+    assert!(requeue(&db.pool, &replaced, &RELEASE).await?);
     let before = clock().await?;
     let live = lease(&db.pool, rollout, 1).await?.remove(0);
     let after = clock().await?;
@@ -613,11 +613,12 @@ async fn only_a_live_token_renews_even_after_a_lock_wait() -> TestResult {
 }
 
 /// Catches a release that keeps its attempt or a retry that gives it back,
-/// which would misjudge a node's attempt limit; an old token that changes a
-/// reclaimed item; a redrive of a live lease; and bookkeeping that writes
-/// delivery state: an assignment, issuance, schedule, observation or wakeup
-/// would tell the node to act, or say it had, without the assignment
-/// transaction.
+/// which would misjudge a node's attempt limit; a requeue that drops its
+/// error or keeps a stale one; a retried check due at once, which would poll
+/// the node in a loop; an old token that changes a reclaimed item; a redrive
+/// of a live lease; and bookkeeping that writes other delivery state: an
+/// assignment, issuance, observation or wakeup would tell the node to act, or
+/// say it had, without the assignment transaction.
 #[tokio::test(flavor = "current_thread")]
 async fn requeues_and_redrives_are_fenced_and_write_no_delivery_state() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -662,11 +663,41 @@ async fn requeues_and_redrives_are_fenced_and_write_no_delivery_state() -> TestR
     let mut conn = db.pool.acquire().await?;
     let released = lease(&db.pool, rollout, 1).await?.remove(0);
     assert!(renew_lease(&mut conn, &released, LEASE).await?);
-    assert!(requeue(&db.pool, &released, Requeue::Release).await?);
-    assert_eq!(item(&db.pool, rollout, node).await?.0, 0);
+    let not_ready = Requeue::Release {
+        error: Some("not ready".to_owned()),
+    };
+    assert!(requeue(&db.pool, &released, &not_ready).await?);
+    assert_eq!(
+        item(&db.pool, rollout, node).await?,
+        (0, Some("not ready".to_owned()))
+    );
 
     let retried = lease(&db.pool, rollout, 1).await?.remove(0);
-    assert!(requeue(&db.pool, &retried, Requeue::Retry).await?);
+    let scheduled = sqlx::query_scalar::<_, OffsetDateTime>(sql!(
+        "SELECT next_check_at FROM firewall_rules_rollout_items
+         WHERE rollout_id = $1 AND node_id = $2"
+    ))
+    .bind(rollout)
+    .bind(node)
+    .fetch_one(&db.pool)
+    .await?;
+    let retry = Requeue::Retry {
+        next_check_in: Duration::from_secs(3600),
+        error: None,
+    };
+    assert!(requeue(&db.pool, &retried, &retry).await?);
+    assert_eq!(item(&db.pool, rollout, node).await?.1, None);
+    assert!(lease(&db.pool, rollout, 1).await?.is_empty());
+    // Due again, as it was, for the rest of the test.
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_rollout_items SET next_check_at = $3
+         WHERE rollout_id = $1 AND node_id = $2"
+    ))
+    .bind(rollout)
+    .bind(node)
+    .bind(scheduled)
+    .execute(&db.pool)
+    .await?;
 
     let expired = lease(&db.pool, rollout, 1).await?.remove(0);
     assert_eq!(
@@ -689,7 +720,7 @@ async fn requeues_and_redrives_are_fenced_and_write_no_delivery_state() -> TestR
     // The retried and the redriven leases count; the released one doesn't.
     let reclaimed = lease(&db.pool, rollout, 1).await?.remove(0);
     assert_eq!(reclaimed.attempts, 3);
-    assert!(!requeue(&db.pool, &expired, Requeue::Release).await?);
+    assert!(!requeue(&db.pool, &expired, &RELEASE).await?);
 
     lapse(&db.pool, rollout, node).await?;
     assert_eq!(
@@ -724,7 +755,7 @@ async fn a_finished_rollouts_live_lease_holds_its_node() -> TestResult {
     assert!(lease(&db.pool, second, 1).await?.is_empty());
     let mut conn = db.pool.acquire().await?;
     assert!(!renew_lease(&mut conn, &held, LEASE).await?);
-    assert!(requeue(&db.pool, &held, Requeue::Release).await?);
+    assert!(requeue(&db.pool, &held, &RELEASE).await?);
     assert_eq!(nodes_of(&lease(&db.pool, second, 1).await?), [node]);
     set_phase(&db.pool, second, "aborted").await?;
 
