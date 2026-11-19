@@ -15,14 +15,18 @@
 //! [`lease_targets`] leases a rollout's saved targets to a controller under
 //! the shared queue's rules ([`pplx_space_rollout_queue`]); [`renew_lease`],
 //! [`requeue`] and [`redrive_expired`] keep or end the lease.
+//! [`issue_first_assignment`] issues a leased target's first assignment with
+//! its node's wakeup.
 
 use std::fmt;
 
 use pplx_space_rollout_queue::HeaderPhase;
 
+mod issue;
 mod lease;
 mod start;
 
+pub use issue::{Issuance, Refusal, Stamp, Wakeup, issue_first_assignment};
 pub use lease::{
     LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
 };
@@ -98,13 +102,17 @@ async fn end_transaction<T, E: From<sqlx::Error>>(
             Ok(value)
         }
         Err(error) => {
-            if let Err(rollback) = tx.rollback().await {
-                tracing::warn!(
-                    error = %rollback,
-                    "couldn't roll back a firewall rules store verb's transaction"
-                );
-            }
+            roll_back(tx).await;
             Err(error)
         }
+    }
+}
+
+async fn roll_back(tx: sqlx::Transaction<'_, sqlx::Postgres>) {
+    if let Err(rollback) = tx.rollback().await {
+        tracing::warn!(
+            error = %rollback,
+            "couldn't roll back a firewall rules store verb's transaction"
+        );
     }
 }

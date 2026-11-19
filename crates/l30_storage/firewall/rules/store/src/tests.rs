@@ -15,6 +15,8 @@ use uuid::Uuid;
 
 use super::*;
 
+mod issuance;
+
 const LEASE: Duration = Duration::from_secs(600);
 const SCAN: u32 = 100;
 const MAX_ATTEMPTS: u64 = 5;
@@ -52,7 +54,11 @@ async fn rollout(pool: &PgPool, phase: &str) -> TestResult<RolloutId> {
 }
 
 /// Move `rollout` to `phase`, keeping the slot and finish time consistent.
-pub(crate) async fn set_phase(pool: &PgPool, rollout: RolloutId, phase: &str) -> TestResult {
+pub(crate) async fn set_phase(
+    executor: impl sqlx::PgExecutor<'_>,
+    rollout: RolloutId,
+    phase: &str,
+) -> TestResult {
     sqlx::query(sql!(
         "UPDATE firewall_rules_rollouts
          SET phase = $2,
@@ -62,7 +68,7 @@ pub(crate) async fn set_phase(pool: &PgPool, rollout: RolloutId, phase: &str) ->
     ))
     .bind(rollout)
     .bind(phase)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

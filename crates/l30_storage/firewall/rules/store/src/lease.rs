@@ -1,8 +1,9 @@
 //! Leasing a rollout's saved targets: permission for one controller to work
 //! on one node for a while. A lease is not an assignment. Nothing here writes
-//! an assignment, an issuance stamp, an observation or a wakeup; the later
-//! assignment transaction does, under the lease. Only a retried check
-//! reschedules `next_check_at` ([`Requeue::Retry`]).
+//! an assignment, an issuance stamp, an observation or a wakeup;
+//! [`issue_first_assignment`](crate::issue_first_assignment) does, under the
+//! lease. Only a retried check reschedules `next_check_at`
+//! ([`Requeue::Retry`]).
 //!
 //! Claims and renewals run [`pplx_space_rollout_queue::claim`] and
 //! [`pplx_space_rollout_queue::renew`] on these tables, in their lock order:
@@ -47,7 +48,7 @@ const NO_FAILURE_BUDGET: u64 = u64::MAX;
 
 /// Key of the advisory lock that hands a node between rollouts. Frozen:
 /// mixed versions must contend on the same key.
-const HANDOFF_LOCK: &str = "firewall_rules_rollout_items/lease";
+pub(crate) const HANDOFF_LOCK: &str = "firewall_rules_rollout_items/lease";
 
 /// One saved target leased to the caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -361,32 +362,41 @@ impl ClaimStore for Claiming<'_> {
         if first_assignment {
             self.unverified += 1;
         }
-        // The schema keeps these non-negative and the stamp's pair together;
-        // report a violation, or a time jiff can't hold, as a decode error
-        // rather than guess.
         let rollout_id = self.rollout_id;
-        let invalid = |what: &str| {
-            sqlx::Error::Decode(
-                format!("firewall rules rollout item {rollout_id}/{node_id} has {what}").into(),
-            )
-        };
-        let work = match (generation, issued_at) {
-            (None, None) => Work::FirstAssignment,
-            (Some(generation), Some(issued_at)) => Work::Check {
-                assignment_generation: u64::try_from(generation)
-                    .map_err(|_| invalid("a negative generation"))?,
-                issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
-                    .map_err(|_| invalid("an out-of-range issuance time"))?,
-            },
-            _ => return Err(invalid("half an issuance stamp")),
-        };
         Ok(Some(LeasedTarget {
             rollout_id,
             node_id,
             lease_token,
-            attempts: u64::try_from(attempts).map_err(|_| invalid("negative attempts"))?,
-            work,
+            attempts: u64::try_from(attempts)
+                .map_err(|_| invalid_item(rollout_id, node_id, "negative attempts"))?,
+            work: stamped_work(rollout_id, node_id, generation, issued_at)?,
         }))
+    }
+}
+
+/// The schema keeps an item's counts non-negative and its stamp's pair
+/// together; a violation is a decode error rather than a guess.
+fn invalid_item(rollout_id: RolloutId, node_id: NodeId, what: &str) -> sqlx::Error {
+    sqlx::Error::Decode(
+        format!("firewall rules rollout item {rollout_id}/{node_id} has {what}").into(),
+    )
+}
+
+/// The work an item's issuance stamp leaves.
+pub(crate) fn stamped_work(
+    rollout_id: RolloutId,
+    node_id: NodeId,
+    generation: Option<i64>,
+    issued_at: Option<OffsetDateTime>,
+) -> Result<Work, sqlx::Error> {
+    match (generation, issued_at) {
+        (None, None) => Ok(Work::FirstAssignment),
+        (Some(generation), Some(issued_at)) => Ok(Work::Check {
+            assignment_generation: u64::try_from(generation)
+                .map_err(|_| invalid_item(rollout_id, node_id, "a negative generation"))?,
+            issued_at,
+        }),
+        _ => Err(invalid_item(rollout_id, node_id, "half an issuance stamp")),
     }
 }
 

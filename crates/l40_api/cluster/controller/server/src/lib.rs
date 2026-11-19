@@ -21,6 +21,7 @@ mod environment_edge_recompute;
 #[cfg(feature = "kubernetes")]
 mod environment_placement_census;
 mod failed_restorable_repair;
+pub mod firewall_rules_issue;
 mod gone_node_write_off;
 mod kube_node_sync;
 mod leader_election;
