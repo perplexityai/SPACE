@@ -836,7 +836,6 @@ fn classify_begin_error(error: BeginArtifactBackupError) -> JobError {
 /// Mark failed the row an upload registered whose job was cancelled because
 /// a later publication superseded its artifact, as an exhausted upload's is
 /// ([`converge_failed_upload`]).
-#[cfg(test)]
 pub(crate) async fn converge_superseded_upload(job: &Job) {
     match job.payload_as::<SnapshotUploadJobs>() {
         Ok(payload) => {
