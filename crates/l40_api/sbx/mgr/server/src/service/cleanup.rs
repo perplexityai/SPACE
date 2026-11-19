@@ -3023,26 +3023,64 @@ impl SandboxManagerService {
         )?;
         if row_missing {
             // A late legacy Delete can arrive after durable deletion removed
-            // the row. Durable DeleteRow completes only after node-manager
-            // verified the canonical cache directory absent, so a missing row
-            // with no cache directory is completed deletion: not authority to
-            // send an unfenced node cleanup or acknowledge it. A rowless
-            // sandbox whose cache directory remains was selected from disk and
-            // is not deleted; keep it retryable rather than reporting success.
-            let cache_dir = self.sandbox_cache_root().join(sandbox_id);
-            return match std::fs::symlink_metadata(&cache_dir) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Ok(_) => Err(Status::unavailable(format!(
-                    "sandbox {sandbox_id} has no row but {} remains; retain resources",
-                    cache_dir.display()
-                ))),
-                Err(error) => Err(Status::unavailable(format!(
-                    "inspect rowless sandbox cache {}: {error}; retain resources",
-                    cache_dir.display()
-                ))),
-            };
+            // the row: not authority to send an unfenced node cleanup or
+            // acknowledge it.
+            return self.rowless_cleanup_outcome(sandbox_id, Ok(()));
         }
-        node_dispatch().await
+        let dispatched = node_dispatch().await;
+        // Durable deletion can remove the row while this cleanup runs, most
+        // often while a Stop's guest flush waits on a guest that is already
+        // gone. The dispatch then fails reading the row's execution fence, and
+        // the sandbox no longer exists.
+        match dispatched {
+            Err(error) if self.sandbox_row_is_absent(sandbox_id) => {
+                let completed = if request.completion == CleanupCompletion::DeleteRow {
+                    Ok(())
+                } else {
+                    Err(Status::not_found(format!(
+                        "sandbox {sandbox_id} was deleted"
+                    )))
+                };
+                tracing::debug!(%error, sandbox_id, "sandbox row removed during unpersisted cleanup");
+                self.rowless_cleanup_outcome(sandbox_id, completed)
+            }
+            dispatched => dispatched,
+        }
+    }
+
+    /// Whether the row is definitely gone. A failed read is not absence.
+    fn sandbox_row_is_absent(&self, sandbox_id: &str) -> bool {
+        let Ok(db) = self.db.lock() else {
+            return false;
+        };
+        matches!(
+            crate::db::read::sandbox_view(&db, sandbox_id).current_status(),
+            Ok(None)
+        )
+    }
+
+    /// Durable DeleteRow completes only after node-manager verified the
+    /// canonical cache directory absent, so a missing row with no cache
+    /// directory is completed deletion and yields `completed`. A rowless
+    /// sandbox whose cache directory remains was selected from disk and is
+    /// not deleted; keep it retryable rather than reporting either outcome.
+    fn rowless_cleanup_outcome(
+        &self,
+        sandbox_id: &str,
+        completed: Result<(), Status>,
+    ) -> Result<(), Status> {
+        let cache_dir = self.sandbox_cache_root().join(sandbox_id);
+        match std::fs::symlink_metadata(&cache_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => completed,
+            Ok(_) => Err(Status::unavailable(format!(
+                "sandbox {sandbox_id} has no row but {} remains; retain resources",
+                cache_dir.display()
+            ))),
+            Err(error) => Err(Status::unavailable(format!(
+                "inspect rowless sandbox cache {}: {error}; retain resources",
+                cache_dir.display()
+            ))),
+        }
     }
 
     pub(super) fn schedule_async_cleanup(&self, request: AsyncCleanupRequest) {

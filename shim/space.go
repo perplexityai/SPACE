@@ -1154,6 +1154,10 @@ func releaseLegacyTaskTeardown(ctx context.Context, client pb.SandboxManagerClie
 		if stopRefused(err, trailer) && recordStopIssued != nil {
 			recordStopIssued(identity.legacyStopIssued)
 		}
+		// Durable deletion may finish while the Stop runs, as for Delete.
+		if status.Code(err) == codes.NotFound {
+			return true, nil
+		}
 	case "delete":
 		// A retried release only observes. The id-only Delete carries no
 		// execution, and by the retry the row may belong to a successor
