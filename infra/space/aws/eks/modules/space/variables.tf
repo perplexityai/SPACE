@@ -855,6 +855,12 @@ variable "builders_update_strategy" {
     a spare instance of the same type is available in the group's Availability
     Zones.
 
+    Sizes: `builders_min_size` and `builders_desired_size` now default to 2,
+    so a caller that inherits them goes from one builder to two on its next
+    apply, an in-place scaling change that launches one more instance. Check
+    that the instance type has capacity for it first, or set both to 1 to
+    keep a single builder.
+
     Apply a strategy change on its own, before any launch template or AMI
     change to the group. In a combined apply the provider updates the node
     group version first, so the roll runs under the old strategy, and if it
