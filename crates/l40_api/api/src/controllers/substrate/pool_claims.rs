@@ -140,6 +140,9 @@ pub struct PooledExecutionClaim {
     pub pool_slot_id: Option<Uuid>,
     pub sandbox_id: SandboxId,
     pub content_hash: String,
+    /// The release whose warm-pool slot the claim holds, which the pool
+    /// rendered the pod for. `None` for a claim that holds no such slot.
+    pub template_release_id: Option<Uuid>,
     pub pod_name: String,
     pub pod_uid: Option<PodUid>,
     pub execution_generation: u64,

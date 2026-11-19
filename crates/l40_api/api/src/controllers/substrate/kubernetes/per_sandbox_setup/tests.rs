@@ -90,6 +90,7 @@ fn assert_cold_matches_adoption(
         pool_slot_id: Some(Uuid::now_v7()),
         sandbox_id: SandboxId::new(),
         content_hash: "hash".to_string(),
+        template_release_id: None,
         pod_name: "space-sbx-test-g1".to_string(),
         pod_uid: None,
         execution_generation: 1,

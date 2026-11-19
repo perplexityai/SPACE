@@ -442,6 +442,10 @@ pplx-space-snapshot-store = [
   "pplx-space-snapshot-retention",
 ]
 pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
+# The API resolves creates, placement and pool claims to a release's twin
+# through the store, and the cluster pool's autoscaler embeds its resolution
+# SQL so demand follows the release creates run.
+pplx-space-template-release-store = ["pplx-space-api", "pplx-space-cluster-pool"]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]

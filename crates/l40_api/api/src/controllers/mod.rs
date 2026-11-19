@@ -581,13 +581,40 @@ pub(crate) fn db_contention_error(message: &str, error: &sqlx::Error) -> Control
     ControllerError::internal(format!("{message}: {error}"))
 }
 
+/// The release a create of `template`'s build at `content_hash` runs, where
+/// creates boot the twin they resolve to (`boots_template_twins`,
+/// [`substrate::Substrate::boots_template_twins`]): the one
+/// `pplx_space_template_release_store::resolved_release_sql` picks, which may
+/// be the original or a twin. `None` anywhere else, and when no release of
+/// the build qualifies, so the caller keeps the release its tag or digest
+/// names.
+pub(crate) async fn resolved_create_release(
+    executor: impl sqlx::PgExecutor<'_>,
+    template: &str,
+    content_hash: &str,
+    boots_template_twins: bool,
+) -> Result<Option<uuid::Uuid>, ControllerError> {
+    if !boots_template_twins {
+        return Ok(None);
+    }
+    let resolved = pplx_space_template_release_store::resolved_release(
+        executor,
+        template,
+        content_hash,
+        pplx_space_execution_catalog::catalog::initial_environment_reference(),
+    )
+    .await
+    .map_err(|err| db_contention_error("failed to resolve the release a create runs", &err))?;
+    Ok(resolved.map(|(release, _)| release))
+}
+
 /// [`db_contention_error`] for the warm-pool store's errors.
 ///
-/// Used at 14 call sites — 13 in `substrate::kubernetes::pool` and one in
-/// `sandbox::queries`. Twelve of them are `.map_err(…)?` and could equally
-/// call [`substrate::DbContext::db_context`], since
+/// Used mostly in `substrate::kubernetes::pool`, and in `sandbox::queries`
+/// and the admin sandbox list. A `.map_err(…)?` call site could equally call
+/// [`substrate::DbContext::db_context`], since
 /// `From<SubstrateError> for ControllerError` converts; this function exists
-/// for the two that cannot (see [`substrate::pool_error`] for which and why).
+/// for those that cannot (see [`substrate::pool_error`] for why).
 ///
 /// The variant split lives once, on [`substrate::pool_error`]; this only
 /// converts. The two are equivalent because

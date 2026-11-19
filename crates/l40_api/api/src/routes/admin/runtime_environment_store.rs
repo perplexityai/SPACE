@@ -81,9 +81,13 @@ pub(super) struct TemplateReleasePopulationRow {
     /// Unparsed, like [`SandboxPopulationRow::environment_ref`]. `None` for
     /// a release built before environments were recorded.
     pub(super) environment_ref: Option<String>,
-    /// Whether a tag points to these releases, which creates by tag resolve
-    /// to, or an enabled pool config pins them, which keeps creating warm
-    /// slots. Any other release is reachable only by pinning its exact hash.
+    /// Whether creates by tag run these releases, or an enabled pool config
+    /// pins them, which keeps creating warm slots. Any other release is
+    /// reachable only by pinning its exact hash. A create by tag runs the
+    /// tagged build's resolved release
+    /// (`pplx_space_template_release_store::resolved_release_sql`), which may
+    /// be a twin, where creates boot the twin they resolve to; anywhere else,
+    /// and when no release of the build qualifies, the tagged release itself.
     pub(super) in_use: bool,
     /// As [`SandboxPopulationRow::malformed`].
     pub(super) malformed: bool,
@@ -91,29 +95,54 @@ pub(super) struct TemplateReleasePopulationRow {
 }
 
 /// Count every template release by the environment it was built for and
-/// whether it's in use.
+/// whether it's in use. Resolution counts an unbound release as the initial
+/// environment's; the rows still report it as unbound.
 pub(super) async fn template_release_population(
     executor: impl sqlx::PgExecutor<'_>,
+    boots_template_twins: bool,
 ) -> Result<Vec<TemplateReleasePopulationRow>, sqlx::Error> {
-    sqlx::query_as(sql!(
-        "SELECT tr.execution_metadata ->> 'environment' AS environment_ref,
-                (EXISTS (
-                     SELECT 1 FROM template_release_tags tag
-                     WHERE tag.template_release_id = tr.id
-                 )
-                 OR EXISTS (
-                     SELECT 1 FROM kubernetes_pool_configs pool
-                     WHERE pool.template_release_id = tr.id AND pool.enabled
-                 )) AS in_use,
-                (tr.execution_metadata IS NOT NULL
-                 AND (jsonb_typeof(tr.execution_metadata) <> 'object'
-                      OR (tr.execution_metadata ? 'environment'
-                          AND jsonb_typeof(tr.execution_metadata -> 'environment') NOT IN ('string', 'null'))))
-                    AS malformed,
-                COUNT(*) AS template_releases
-         FROM template_releases tr
-         GROUP BY 1, 2, 3"
-    ))
-    .fetch_all(executor)
-    .await
+    static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        sql!(format!(
+            "SELECT tr.execution_metadata ->> 'environment' AS environment_ref,
+                    (EXISTS (
+                         SELECT 1
+                         FROM template_release_tags tag
+                         JOIN template_releases tagged ON tagged.id = tag.template_release_id
+                         WHERE tagged.template_name = tr.template_name
+                           -- Either spelling of the build's hash, as the
+                           -- resolver matches it, in a form the
+                           -- (template_name, hash, ...) index serves.
+                           AND tagged.hash IN (
+                               tr.hash,
+                               replace(tr.hash, 'sha256:', ''),
+                               'sha256:' || replace(tr.hash, 'sha256:', ''))
+                           AND CASE
+                                   WHEN $1 THEN COALESCE({resolved}, tagged.id) = tr.id
+                                   ELSE tagged.id = tr.id
+                               END
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM kubernetes_pool_configs pool
+                         WHERE pool.template_release_id = tr.id AND pool.enabled
+                     )) AS in_use,
+                    (tr.execution_metadata IS NOT NULL
+                     AND (jsonb_typeof(tr.execution_metadata) <> 'object'
+                          OR (tr.execution_metadata ? 'environment'
+                              AND jsonb_typeof(tr.execution_metadata -> 'environment') NOT IN ('string', 'null'))))
+                        AS malformed,
+                    COUNT(*) AS template_releases
+             FROM template_releases tr
+             GROUP BY 1, 2, 3",
+            resolved = pplx_space_template_release_store::resolved_release_sql(
+                "tagged.template_name",
+                "tagged.hash",
+                "$2",
+            ),
+        ))
+    });
+    sqlx::query_as(sqlx::AssertSqlSafe(STATEMENT.as_str()))
+        .bind(boots_template_twins)
+        .bind(pplx_space_execution_catalog::catalog::initial_environment_reference().to_string())
+        .fetch_all(executor)
+        .await
 }

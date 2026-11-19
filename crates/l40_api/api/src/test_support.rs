@@ -13,6 +13,26 @@ pub(crate) mod kubernetes;
 const SIM_WORKER_TOKEN: &str = "sim-worker-test-token";
 const SIM_WORKER_CONTROL_TOKEN: &str = "sim-worker-test-control-token";
 
+/// Make `environment` the cluster default through the policy store, which
+/// records it as `allowed`, as an operator's `PUT .../default` does.
+#[cfg(feature = "kubernetes")]
+pub(crate) async fn set_default_environment(
+    pool: &PgPool,
+    environment: &str,
+) -> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_runtime_environment_policy_store::{
+        PolicyChange, PolicyChangeReason, set_default,
+    };
+    let change = PolicyChange {
+        actor: None,
+        reason: PolicyChangeReason::new("test")?,
+    };
+    let mut tx = pool.begin().await?;
+    set_default(&mut tx, environment.parse()?, &change).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Enter before awaiting fixtures: authenticated clients need process credentials.
 pub(crate) fn enter_sim_worker_process() -> bool {
     enter_sim_worker_process_with_token_paths(None, None, &[])

@@ -62,6 +62,7 @@ impl PooledInputs {
                 pool_slot_id: Some(Uuid::now_v7()),
                 sandbox_id: SandboxId::new(),
                 content_hash: "sha256:seed".to_string(),
+                template_release_id: None,
                 pod_name: POOLED_POD_NAME.to_string(),
                 pod_uid: Some(PodUid::parse(POOLED_POD_UID).expect("static pod uid parses")),
                 execution_generation: 1,

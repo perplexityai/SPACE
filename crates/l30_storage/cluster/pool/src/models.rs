@@ -223,6 +223,16 @@ pub struct ClaimedSlotBindSource {
     pub k8s_node_name: Option<String>,
 }
 
+/// A config [`crate::WarmPoolStore::disable_config`] disabled: its release
+/// and shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisabledPoolConfig {
+    pub template_release_id: uuid::Uuid,
+    pub vcpu: i32,
+    pub memory_mib: i32,
+    pub encryptable: bool,
+}
+
 /// Operator-requested (`managed_by = 'manual'`) pool config shape for
 /// [`crate::WarmPoolStore::upsert_manual_config`]. Numeric fields are already
 /// range-validated by the API boundary; they keep the storage width here.

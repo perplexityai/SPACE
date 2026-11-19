@@ -1672,6 +1672,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 self.store.pool(),
                 request,
                 &self.k8s.sandbox_namespace,
+                self.boots_template_twins(),
             )
             .await?;
             attempted_pool_shape = claim_attempt.pool_shape;
@@ -1714,22 +1715,27 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 pool::invalidate_claimed_pool_slot(self.store.pool(), &claim).await?;
                 continue;
             }
-            // The environment gate, on, admits only a node that publishes
-            // the work's environment. A refused slot leaves the pool, so the
-            // reconciler replaces it with a pod that requires the label.
+            // The environment gate, on, admits only a pod whose worker booted
+            // the work's environment, on a node that publishes it. A refused
+            // slot leaves the pool, so the reconciler replaces it with a pod
+            // that requires both, and the create tries the next slot or boots
+            // cold.
             match self
-                .pooled_pod_environment(request.template, &claim.content_hash, pod.as_deref())
+                .pooled_pod_environment(request.template, &claim, pod.as_deref())
                 .await
             {
                 Ok(PooledPodEnvironment::Admitted) => {}
-                Ok(PooledPodEnvironment::NotPublished) => {
+                Ok(
+                    refused
+                    @ (PooledPodEnvironment::NotPublished | PooledPodEnvironment::NotBooted),
+                ) => {
                     tracing::info!(
                         claim_id = %claim.claim_id,
                         sandbox_id = %claim.sandbox_id,
                         pod_name = %claim.pod_name,
                         attempt,
-                        "invalidating a warm-pool slot whose node doesn't publish the work's \
-                         environment"
+                        ?refused,
+                        "invalidating a warm-pool slot whose pod can't run the work's environment"
                     );
                     pool::invalidate_claimed_pool_slot(self.store.pool(), &claim).await?;
                     continue;
@@ -2265,11 +2271,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         .admitted_pool_pod_placement_admits(request, pod.as_deref())
                         .await
                     && match self
-                        .pooled_pod_environment(
-                            request.template,
-                            &claim.content_hash,
-                            pod.as_deref(),
-                        )
+                        .pooled_pod_environment(request.template, &claim, pod.as_deref())
                         .await
                     {
                         Ok(environment) => environment == PooledPodEnvironment::Admitted,
@@ -2766,7 +2768,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         request: ClusterPoolConfigRequest,
     ) -> Result<ClusterPoolConfigResponse, ControllerError> {
-        pool::upsert_pool_config(&self.store, request).await
+        pool::upsert_pool_config(&self.store, request, self.boots_template_twins()).await
     }
 
     async fn disable_pool_config(

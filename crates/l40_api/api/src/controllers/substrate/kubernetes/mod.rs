@@ -6,7 +6,7 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`. A runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. With `on`, a cold create requires the pod's environment (`space.pplx.net/environment-required`), so the worker boots that environment's build of the digest, pulling it when the node holds the digest only under another environment. A shim that predates the annotation ignores it, so `on` also needs every worker's shim from that release. `shadow` records, labels and counts, and places as `off` | the-gigi-pplx | activation pods recording an upgrade's target |
+//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`. A runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. With `on`, a cold create requires the pod's environment (`space.pplx.net/environment-required`), so the worker boots that environment's build of the digest, pulling it when the node holds the digest only under another environment. A shim that predates the annotation ignores it, so `on` also needs every worker's shim from that release. `shadow` records, labels and counts, and places as `off`. Until `on` runs, creates keep the release a tag or digest names rather than a twin | the-gigi-pplx | activation pods recording an upgrade's target |
 
 use std::{
     fmt,
@@ -938,6 +938,14 @@ type WakeCoalescer = Arc<
 >;
 
 impl KubernetesSubstrate {
+    /// Whether this substrate's creates boot the twin they resolve to: the
+    /// Kubernetes worker boots a create's required environment, which a pod
+    /// carries only with the environment placement gate `on`
+    /// ([`super::Substrate::boots_template_twins`]).
+    pub(crate) fn boots_template_twins(&self) -> bool {
+        self.capabilities().boots_required_environment && self.k8s.environment_placement.refuses()
+    }
+
     pub async fn try_from_env(
         pool: &PgPool,
         shutdown_token: CancellationToken,

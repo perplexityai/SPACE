@@ -280,6 +280,45 @@ impl WarmPoolStore {
         Ok(rows)
     }
 
+    /// The disk size config `id` sets, `None` for the template default or
+    /// when there's no such config. Read in `tx`, so it sees the caller's
+    /// own writes.
+    pub async fn config_disk_mib(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+    ) -> Result<Option<i32>> {
+        Ok(sqlx::query_scalar::<_, Option<i32>>(sql!(
+            "SELECT disk_mib FROM kubernetes_pool_configs WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten())
+    }
+
+    /// Set config `to`'s disk I/O limits to config `from`'s. Does nothing when
+    /// either config is gone. Runs in `tx`, so it reads the caller's own
+    /// writes.
+    pub async fn copy_config_disk_io_limits(
+        tx: &mut Transaction<'_, Postgres>,
+        from: Uuid,
+        to: Uuid,
+    ) -> Result<()> {
+        sqlx::query(sql!(
+            "UPDATE kubernetes_pool_configs t
+             SET disk_io_max_operations_per_sec = f.disk_io_max_operations_per_sec,
+                 disk_io_max_bandwidth_mib_per_sec = f.disk_io_max_bandwidth_mib_per_sec,
+                 updated_at = NOW()
+             FROM kubernetes_pool_configs f
+             WHERE f.id = $1 AND t.id = $2"
+        ))
+        .bind(from)
+        .bind(to)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Create or update the operator-owned pool config for the given release
     /// and shape, taking `managed_by` ownership away from the autoscaler.
     /// Runs inside the caller's transaction: the caller resolves the
@@ -377,20 +416,56 @@ impl WarmPoolStore {
 
     /// Disable a pool config and zero its target so the reconciler drains
     /// its open slots. `managed_by` is deliberately untouched: a disabled
-    /// autoscaler-owned config stays autoscaler-owned. Returns `false` when
+    /// autoscaler-owned config stays autoscaler-owned. Returns `None` when
     /// no config has this id.
-    pub async fn disable_config(&self, id: Uuid) -> Result<bool> {
+    pub async fn disable_config(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+    ) -> Result<Option<crate::DisabledPoolConfig>> {
+        Ok(sqlx::query_as::<_, (Uuid, i32, i32, bool)>(sql!(
+            "UPDATE kubernetes_pool_configs
+             SET enabled = FALSE,
+                 target_ready_slots = 0,
+                 updated_at = NOW()
+             WHERE id = $1
+             RETURNING template_release_id, vcpu, memory_mib, encryptable"
+        ))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(
+            |(template_release_id, vcpu, memory_mib, encryptable)| crate::DisabledPoolConfig {
+                template_release_id,
+                vcpu,
+                memory_mib,
+                encryptable,
+            },
+        ))
+    }
+
+    /// Disable `template_release_id`'s config for `config`'s shape as
+    /// [`Self::disable_config`] does. Returns `false` when it has none.
+    pub async fn disable_shape_config(
+        tx: &mut Transaction<'_, Postgres>,
+        template_release_id: Uuid,
+        config: &crate::DisabledPoolConfig,
+    ) -> Result<bool> {
         let result = sqlx::query(sql!(
             "UPDATE kubernetes_pool_configs
              SET enabled = FALSE,
                  target_ready_slots = 0,
                  updated_at = NOW()
-             WHERE id = $1"
+             WHERE template_release_id = $1
+               AND vcpu = $2
+               AND memory_mib = $3
+               AND encryptable = $4"
         ))
-        .bind(id)
-        .execute(&self.pool)
+        .bind(template_release_id)
+        .bind(config.vcpu)
+        .bind(config.memory_mib)
+        .bind(config.encryptable)
+        .execute(&mut **tx)
         .await?;
-
         Ok(result.rows_affected() > 0)
     }
 
@@ -523,9 +598,21 @@ impl WarmPoolStore {
     /// This sequence intentionally is not transactional: it relies on only
     /// the cluster-controller replica that holds the leader lease running it.
     /// Add serialization or a transaction before calling it concurrently.
-    pub async fn autoscale_configs(&self, namespace: &str) -> Result<AutoscaleRun> {
+    /// `initial_environment` is the initial execution environment's
+    /// reference, which unbound releases count as. A release's demand and
+    /// retained slot go to the release creates of its build resolve to
+    /// (`pplx_space_template_release_store::resolved_release_sql`), which
+    /// may be a twin, since creates claim only that release's pools. `None`
+    /// keeps every candidate on its original.
+    pub async fn autoscale_configs(
+        &self,
+        namespace: &str,
+        initial_environment: Option<&str>,
+    ) -> Result<AutoscaleRun> {
         let mut run = AutoscaleRun::default();
-        let candidates = self.autoscale_candidates(&mut run.invalid_rows).await?;
+        let candidates = self
+            .autoscale_candidates(initial_environment, &mut run.invalid_rows)
+            .await?;
 
         for candidate in &candidates {
             if let Err(error) = self.upsert_autoscale_config(candidate, namespace).await {
@@ -551,9 +638,10 @@ impl WarmPoolStore {
 
     async fn autoscale_candidates(
         &self,
+        initial_environment: Option<&str>,
         invalid: &mut Vec<InvalidAutoscaleRow>,
     ) -> Result<Vec<PoolAutoscaleCandidate>> {
-        let demand = self.observed_demand(invalid).await?;
+        let demand = self.observed_demand(initial_environment, invalid).await?;
         let demanded_release_ids = demand
             .iter()
             .filter(|observed| observed.observed_sandboxes >= AUTOSCALE_MIN_DEMAND_SANDBOXES)
@@ -561,7 +649,9 @@ impl WarmPoolStore {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let releases = self.policy_releases(&demanded_release_ids, invalid).await?;
+        let releases = self
+            .policy_releases(&demanded_release_ids, initial_environment, invalid)
+            .await?;
 
         Ok(select_autoscale_candidates(releases, demand))
     }
@@ -569,10 +659,12 @@ impl WarmPoolStore {
     async fn policy_releases(
         &self,
         demanded_release_ids: &[Uuid],
+        initial_environment: Option<&str>,
         invalid: &mut Vec<InvalidAutoscaleRow>,
     ) -> Result<Vec<PoolPolicyRelease>> {
         let mut releases: Vec<PoolPolicyRelease> = decode_autoscale_rows(
-            self.retained_policy_release_rows().await?,
+            self.retained_policy_release_rows(initial_environment)
+                .await?,
             AutoscaleRead::RetainedPolicyReleases,
             invalid,
         );
@@ -607,8 +699,10 @@ impl WarmPoolStore {
         .await?;
         // All or nothing, unlike the autoscale read: a release left out of
         // this set may be evicted from nodes.
+        // Only names and hashes are kept, which a twin shares with its
+        // original, so which of the two a row names doesn't matter here.
         let retained = self
-            .retained_policy_release_rows()
+            .retained_policy_release_rows(None)
             .await?
             .into_iter()
             .map(PoolPolicyRelease::try_from)
@@ -633,10 +727,17 @@ impl WarmPoolStore {
             .collect())
     }
 
-    async fn retained_policy_release_rows(&self) -> Result<Vec<PoolPolicyReleaseRow>> {
-        Ok(sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
-            "SELECT
-                 retained.id AS template_release_id,
+    /// The releases each enabled policy retains: its `retain_releases` newest
+    /// originals, each standing in for the release creates of its build
+    /// resolve to, given `initial_environment` ([`Self::autoscale_configs`]).
+    async fn retained_policy_release_rows(
+        &self,
+        initial_environment: Option<&str>,
+    ) -> Result<Vec<PoolPolicyReleaseRow>> {
+        static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            sql!(format!(
+                "SELECT
+                 COALESCE(twin.id, retained.id) AS template_release_id,
                  p.template_name,
                  retained.hash AS content_hash,
                  p.vcpu,
@@ -678,20 +779,35 @@ impl WarmPoolStore {
                   ORDER BY published_at DESC, release.id DESC
                   LIMIT p.retain_releases
              ) retained ON TRUE
+             -- Creates of a retained release run the release its build
+             -- resolves to, so that release's pools are the ones claimed.
+             LEFT JOIN LATERAL (
+                 SELECT CASE WHEN $3::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
+             ) twin ON TRUE
              WHERE p.enabled
              ORDER BY p.template_name, p.vcpu, p.memory_mib,
-                      retained.published_at DESC, retained.id DESC"
-        ))
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
+                      retained.published_at DESC, retained.id DESC",
+                resolved = pplx_space_template_release_store::resolved_release_sql(
+                    "p.template_name",
+                    "retained.hash",
+                    "$3",
+                ),
+            ))
+        });
+        Ok(
+            sqlx::query_as::<_, PoolPolicyReleaseRow>(sqlx::AssertSqlSafe(STATEMENT.as_str()))
+                .bind(
+                    i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
+                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
+                )
+                .bind(
+                    i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
+                        .expect("disk I/O default fits in PostgreSQL BIGINT"),
+                )
+                .bind(initial_environment)
+                .fetch_all(&self.pool)
+                .await?,
         )
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
-        )
-        .fetch_all(&self.pool)
-        .await?)
     }
 
     async fn demanded_policy_release_rows(
@@ -750,25 +866,30 @@ impl WarmPoolStore {
         .await?)
     }
 
+    /// Recent creates by release and shape. A create's release is the one
+    /// its build resolves to, given `initial_environment`
+    /// ([`Self::autoscale_configs`]), else its hash's original.
     async fn observed_demand(
         &self,
+        initial_environment: Option<&str>,
         invalid: &mut Vec<InvalidAutoscaleRow>,
     ) -> Result<Vec<PoolObservedDemand>> {
         let lookback_secs =
             i64::try_from(AUTOSCALE_LOOKBACK.as_secs()).expect("autoscale lookback fits i64");
-        let rows = sqlx::query_as::<_, PoolObservedDemandRow>(sql!(
-            // Aggregate BEFORE the release lateral. The lateral's inputs
-            // (template_id, content_hash and its bare form) are constant
-            // within a demand group, so resolving the release per distinct
-            // group instead of per sandbox row cuts the probe count from one
-            // per recent create to one per distinct (template, hash, shape)
-            // combination. Groups whose hash resolves to no release drop
-            // uniformly, and distinct hashes resolving to the same release
-            // re-merge in the outer GROUP BY — output is identical to the
-            // per-row form. Runs per tick by design: this pass also
-            // re-points pools at freshly published releases, so its
-            // frequency is deliberately untouched.
-            "WITH recent_sandboxes AS (
+        static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            sql!(format!(
+                // Aggregate BEFORE the release lateral. The lateral's inputs
+                // (template_id, content_hash and its bare form) are constant
+                // within a demand group, so resolving the release per distinct
+                // group instead of per sandbox row cuts the probe count from one
+                // per recent create to one per distinct (template, hash, shape)
+                // combination. Groups whose hash resolves to no release drop
+                // uniformly, and distinct hashes resolving to the same release
+                // re-merge in the outer GROUP BY — output is identical to the
+                // per-row form. Runs per tick by design: this pass also
+                // re-points pools at freshly published releases, so its
+                // frequency is deliberately untouched.
+                "WITH recent_sandboxes AS (
                  SELECT
                      template_id,
                      content_hash,
@@ -786,13 +907,13 @@ impl WarmPoolStore {
                  GROUP BY 1, 2, 3, 4, 5
              )
              SELECT
-                 release_by_hash.id AS template_release_id,
+                 COALESCE(twin.id, release_by_hash.id) AS template_release_id,
                  s.vcpu,
                  s.memory_mib,
                  SUM(s.observed_sandboxes)::BIGINT AS observed_sandboxes
              FROM recent_sandboxes s
              JOIN LATERAL (
-                 SELECT r.id
+                 SELECT r.id, r.template_name, r.hash
                  FROM template_releases r
                  WHERE r.template_name = s.template_id
                    AND (
@@ -811,13 +932,25 @@ impl WarmPoolStore {
                  ORDER BY (r.hash = s.content_hash) DESC, r.created_at DESC, r.id DESC
                  LIMIT 1
              ) release_by_hash ON TRUE
-             GROUP BY 1, 2, 3"
-        ))
-        .bind(lookback_secs)
-        .bind(AUTOSCALE_DEFAULT_VCPU)
-        .bind(AUTOSCALE_DEFAULT_MEMORY_MIB)
-        .fetch_all(&self.pool)
-        .await?;
+             LEFT JOIN LATERAL (
+                 SELECT CASE WHEN $4::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
+             ) twin ON TRUE
+             GROUP BY 1, 2, 3",
+                resolved = pplx_space_template_release_store::resolved_release_sql(
+                    "release_by_hash.template_name",
+                    "release_by_hash.hash",
+                    "$4",
+                ),
+            ))
+        });
+        let rows =
+            sqlx::query_as::<_, PoolObservedDemandRow>(sqlx::AssertSqlSafe(STATEMENT.as_str()))
+                .bind(lookback_secs)
+                .bind(AUTOSCALE_DEFAULT_VCPU)
+                .bind(AUTOSCALE_DEFAULT_MEMORY_MIB)
+                .bind(initial_environment)
+                .fetch_all(&self.pool)
+                .await?;
 
         Ok(decode_autoscale_rows(
             rows,

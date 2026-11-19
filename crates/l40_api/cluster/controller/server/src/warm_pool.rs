@@ -938,10 +938,20 @@ impl Reconciler {
     /// still need their slots reconciled, so a failed step does not end the
     /// pass. Returns the configs it retired.
     async fn autoscale(&self) -> PoolConfigRead {
+        // Pools follow the release creates of each build resolve to, which
+        // may be a twin, where creates boot the twin they resolve to;
+        // unbound releases count as the initial environment's. Anywhere else
+        // creates run the named release, and its pools stay.
+        let initial_environment =
+            pplx_space_execution_catalog::catalog::initial_environment_reference().to_string();
+        let resolving = self
+            .substrate
+            .boots_template_twins()
+            .then_some(initial_environment.as_str());
         let (outcome, retired) = match self
             .timed_postgres(
                 "autoscale-configs",
-                self.store.autoscale_configs(&self.namespace),
+                self.store.autoscale_configs(&self.namespace, resolving),
             )
             .await
         {

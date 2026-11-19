@@ -12754,13 +12754,15 @@ mod kubernetes_tests {
     }
 
     async fn pool_claim_fixture(pod: PooledSlotPod<'_>) -> Result<PoolClaimFixture, BoxError> {
-        pool_claim_fixture_with_node_labels(pod, &[]).await
+        pool_claim_fixture_with_node_labels(pod, &[], &[]).await
     }
 
-    /// [`pool_claim_fixture`] with `node_labels` set on every node.
+    /// [`pool_claim_fixture`] with `node_labels` set on every node and
+    /// `pod_annotations` on the pooled pod.
     async fn pool_claim_fixture_with_node_labels(
         pod: PooledSlotPod<'_>,
         node_labels: &[(String, String)],
+        pod_annotations: &[(&str, &str)],
     ) -> Result<PoolClaimFixture, BoxError> {
         use pplx_space_byte_size::MemorySize;
         use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
@@ -12854,6 +12856,12 @@ mod kubernetes_tests {
                 name: Some("space-sbx-pooled-g1".to_string()),
                 namespace: Some("space".to_string()),
                 uid: Some("pool-pod-uid".to_string()),
+                annotations: (!pod_annotations.is_empty()).then(|| {
+                    pod_annotations
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect()
+                }),
                 ..Default::default()
             },
             spec: Some(k8s_openapi::api::core::v1::PodSpec {
@@ -12930,6 +12938,7 @@ mod kubernetes_tests {
                     nodes: &[("in-set-worker", Some("workers"))],
                 },
                 &label(node_publishes),
+                &booted(E1),
             )
             .await?;
             sqlx::query(sql!(
@@ -12965,6 +12974,86 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// The annotations of a pool pod rendered with the gate `on` for work
+    /// bound to `environment`, which tell its shim to boot that environment.
+    fn booted(environment: &'static str) -> [(&'static str, &'static str); 2] {
+        use pplx_space_sandbox_pod::{
+            ENVIRONMENT_REQUIRED_ANNOTATION_VALUE, SANDBOX_ENVIRONMENT_ANNOTATION,
+            SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION,
+        };
+        [
+            (SANDBOX_ENVIRONMENT_ANNOTATION, environment),
+            (
+                SANDBOX_ENVIRONMENT_REQUIRED_ANNOTATION,
+                ENVIRONMENT_REQUIRED_ANNOTATION_VALUE,
+            ),
+        ]
+    }
+
+    /// With the environment gate on, a warm pod is adopted only if its worker
+    /// was told to boot the work's environment, even on a node that publishes
+    /// it: a pod warmed before the gate went `on` carries no requirement, so
+    /// its worker booted what it would with the gate off. Any other pod has
+    /// its slot invalidated, and the create misses the pool and boots cold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn claiming_a_warm_slot_requires_its_pod_to_have_booted_the_environment()
+    -> Result<(), BoxError> {
+        use pplx_space_sandbox_pod::{
+            ENVIRONMENT_USABLE_LABEL_VALUE, SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key,
+        };
+        const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let shadow_built = [(SANDBOX_ENVIRONMENT_ANNOTATION, E1)];
+        type Annotations<'a> = &'a [(&'a str, &'a str)];
+        let cases: [(&str, Annotations, bool); 4] = [
+            ("warmed with the gate off", &[], false),
+            ("warmed in shadow", &shadow_built, false),
+            ("booted another environment", &booted(E0), false),
+            ("booted the work's environment", &booted(E1), true),
+        ];
+        for (pod_case, annotations, adopted) in cases {
+            let mut fixture = pool_claim_fixture_with_node_labels(
+                PooledSlotPod {
+                    phase: "Running",
+                    node_name: Some("in-set-worker"),
+                    nodes: &[("in-set-worker", Some("workers"))],
+                },
+                &[(
+                    environment_label_key(&E1.parse().unwrap()),
+                    ENVIRONMENT_USABLE_LABEL_VALUE.to_string(),
+                )],
+                annotations,
+            )
+            .await?;
+            sqlx::query(sql!(
+                "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
+            ))
+            .bind(fixture.release_id)
+            .bind(sqlx::types::Json(
+                serde_json::json!({"environment": E1, "components": []}),
+            ))
+            .execute(&fixture.db.pool)
+            .await?;
+            fixture.substrate.k8s.environment_placement =
+                crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+
+            let attempt = fixture
+                .substrate
+                .claim_pooled_execution(&fixture.request())
+                .await?;
+
+            assert_eq!(attempt.claim.is_some(), adopted, "a pod {pod_case}");
+            if !adopted {
+                assert_eq!(
+                    fixture.slot_disposition().await?,
+                    ("claimed".to_string(), None),
+                    "a pod {pod_case} leaves the pool"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// A warm pod whose node the cache doesn't have proves nothing against
     /// the slot, so the claim gives it back and builds cold, as for a node
     /// group the cache can't answer: invalidating would destroy warm pods on
@@ -12973,40 +13062,50 @@ mod kubernetes_tests {
     async fn a_warm_slot_whose_node_the_cache_lacks_goes_back_under_the_environment_gate()
     -> Result<(), BoxError> {
         const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        let mut fixture = pool_claim_fixture(PooledSlotPod {
-            phase: "Running",
-            node_name: Some("uncached-worker"),
-            nodes: &[],
-        })
-        .await?;
-        sqlx::query(sql!(
-            "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
-        ))
-        .bind(fixture.release_id)
-        .bind(sqlx::types::Json(
-            serde_json::json!({"environment": E1, "components": []}),
-        ))
-        .execute(&fixture.db.pool)
-        .await?;
-        fixture.substrate.k8s.environment_placement =
-            crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
-
-        let attempt = fixture
-            .substrate
-            .claim_pooled_execution(&fixture.request())
+        let booted_e1 = booted(E1);
+        // A pod that didn't boot the environment is refused whatever its
+        // node, so its slot leaves the pool even when the node is unknown.
+        for (annotations, disposition) in [(&booted_e1[..], "ready"), (&[][..], "claimed")] {
+            let mut fixture = pool_claim_fixture_with_node_labels(
+                PooledSlotPod {
+                    phase: "Running",
+                    node_name: Some("uncached-worker"),
+                    nodes: &[],
+                },
+                &[],
+                annotations,
+            )
             .await?;
+            sqlx::query(sql!(
+                "UPDATE template_releases SET execution_metadata = $2 WHERE id = $1"
+            ))
+            .bind(fixture.release_id)
+            .bind(sqlx::types::Json(
+                serde_json::json!({"environment": E1, "components": []}),
+            ))
+            .execute(&fixture.db.pool)
+            .await?;
+            fixture.substrate.k8s.environment_placement =
+                crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
 
-        assert!(attempt.claim.is_none());
-        assert_eq!(
-            fixture.slot_disposition().await?,
-            ("ready".to_string(), None),
-            "the slot goes back to the pool"
-        );
+            let attempt = fixture
+                .substrate
+                .claim_pooled_execution(&fixture.request())
+                .await?;
+
+            assert!(attempt.claim.is_none());
+            assert_eq!(
+                fixture.slot_disposition().await?,
+                (disposition.to_string(), None),
+                "a pod annotated {annotations:?}"
+            );
+        }
         Ok(())
     }
 
     /// The slot a create admitted is adopted under the same environment rule
-    /// as an ordinary claim. Its reserved ID is already the create's public
+    /// as an ordinary claim: its node publishes the environment, and its pod
+    /// booted it. Its reserved ID is already the create's public
     /// ID, so a refusal takes it out of the inventory rather than give it
     /// back.
     #[tokio::test(flavor = "current_thread")]
@@ -13016,7 +13115,12 @@ mod kubernetes_tests {
         use pplx_space_sandbox_pod::{ENVIRONMENT_USABLE_LABEL_VALUE, environment_label_key};
         const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        for (node_publishes, adopted) in [(E0, false), (E1, true)] {
+        let booted_e1 = booted(E1);
+        for (node_publishes, annotations, adopted) in [
+            (E0, &booted_e1[..], false),
+            (E1, &[][..], false),
+            (E1, &booted_e1[..], true),
+        ] {
             let mut fixture = pool_claim_fixture_with_node_labels(
                 PooledSlotPod {
                     phase: "Running",
@@ -13027,6 +13131,7 @@ mod kubernetes_tests {
                     environment_label_key(&node_publishes.parse().unwrap()),
                     ENVIRONMENT_USABLE_LABEL_VALUE.to_string(),
                 )],
+                annotations,
             )
             .await?;
             sqlx::query(sql!(
@@ -13067,7 +13172,7 @@ mod kubernetes_tests {
             assert_eq!(
                 matches!(lookup, AdmittedPoolClaimLookup::Adoptable { .. }),
                 adopted,
-                "node publishes {node_publishes}"
+                "node publishes {node_publishes}, pod annotated {annotations:?}"
             );
             if !adopted {
                 assert_eq!(
@@ -13721,6 +13826,7 @@ mod kubernetes_tests {
             pool_slot_id: Some(Uuid::now_v7()),
             sandbox_id: SandboxId::new(),
             content_hash: "sha256:pooled".to_string(),
+            template_release_id: None,
             pod_name: "space-sbx-pooled-g1".to_string(),
             pod_uid: Some(PodUid::parse("pod-uid").unwrap()),
             execution_generation: 1,
@@ -13769,6 +13875,7 @@ mod kubernetes_tests {
             pool_slot_id: Some(pool_slot_id),
             sandbox_id,
             content_hash: "sha256:pooled".to_string(),
+            template_release_id: None,
             pod_name: "space-sbx-pooled-g1".to_string(),
             pod_uid: Some(PodUid::parse("pod-uid").unwrap()),
             execution_generation: 1,

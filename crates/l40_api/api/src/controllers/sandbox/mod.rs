@@ -262,7 +262,53 @@ pub(super) enum ReleaseMissReport {
     NotFound,
 }
 
+/// The release a create of `template` runs: among the releases of the build
+/// its tag or digest names ([`resolve_original_release`]), the one
+/// `pplx_space_template_release_store::resolved_release_sql` picks: the one
+/// bound to the cluster default, else the newest-catalog twin in an allowed,
+/// then a deprecated, environment, else the original, never one in a blocked
+/// environment. A template's creates move to a twin as the twin appears.
+/// When none qualifies, the named release stays, as before twins, and the
+/// node's policy decides. Returns the release id and the named release's
+/// stored hash.
 async fn resolve_template_release(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    miss_report: ReleaseMissReport,
+) -> Result<(Uuid, String), ControllerError> {
+    let (original, hash) =
+        resolve_original_release(pool, template, runtime, caller_org, miss_report).await?;
+    let resolved =
+        crate::controllers::resolved_create_release(pool, template.name().as_str(), &hash, true)
+            .await?;
+    Ok((resolved.unwrap_or(original), hash))
+}
+
+/// The release a create of `template` runs and claims the slots of. A create
+/// runs a twin only where it boots the twin's environment
+/// (`boots_template_twins`, [`super::substrate::Substrate::boots_template_twins`]):
+/// then [`resolve_template_release`]; anywhere else the release its tag or
+/// digest names, whose build the worker boots.
+async fn resolve_create_release(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    miss_report: ReleaseMissReport,
+    boots_template_twins: bool,
+) -> Result<(Uuid, String), ControllerError> {
+    if boots_template_twins {
+        resolve_template_release(pool, template, runtime, caller_org, miss_report).await
+    } else {
+        resolve_original_release(pool, template, runtime, caller_org, miss_report).await
+    }
+}
+
+/// The release `template`'s tag or digest names: the tagged release, or a
+/// digest's original release, never a twin.
+async fn resolve_original_release(
     pool: &PgPool,
     template: &TemplateReference,
     runtime: RuntimeKind,
@@ -1122,6 +1168,11 @@ impl SandboxController {
 
     pub fn substrate_capabilities(&self) -> super::substrate::SubstrateCapabilities {
         self.substrate.capabilities()
+    }
+
+    /// [`super::substrate::Substrate::boots_template_twins`].
+    pub fn boots_template_twins(&self) -> bool {
+        self.substrate.boots_template_twins()
     }
 
     /// Whether the substrate accepts a create pinned to a node pool (see

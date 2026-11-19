@@ -691,6 +691,7 @@ fn pooled_claim_with_pod(
         pool_slot_id: Some(Uuid::now_v7()),
         sandbox_id,
         content_hash: "sha256:pooled".to_string(),
+        template_release_id: None,
         pod_name: pod_name.to_string(),
         pod_uid: Some(PodUid::parse("pod-uid").unwrap()),
         execution_generation: 1,
@@ -2053,6 +2054,190 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     .await?;
     assert_eq!(shape(&resources), (None, None, None));
     assert_eq!(source, Some(CreateShapeSource::Default));
+    Ok(())
+}
+
+/// For a template with no enabled warm-pool policy, a cold create that
+/// resolves to a twin with no pool config of its own keeps its original's
+/// enabled one: the shape and disk I/O limits the operator set for the build.
+/// A policy shapes it instead, as for any release without a config, and the
+/// twin's own config wins over both. Twins exist only once the
+/// `(template_name, hash)` unique index is dropped, which the test does to
+/// stand in for the contract migration.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_a_twin_without_a_pool_config_takes_its_originals() -> TestResult {
+    let db = pg_test_db().await?;
+    let original = insert_template_release(&db.pool, "app-runtime", "sha256:twinned").await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+        .execute(&db.pool)
+        .await?;
+    let twin: Uuid = sqlx::query_scalar(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata, created_at)
+         SELECT template_name, type, hash,
+                jsonb_build_object('environment', 'sha256:' || repeat('e', 64)),
+                clock_timestamp()
+         FROM template_releases WHERE id = $1
+         RETURNING id",
+    )
+    .bind(original)
+    .fetch_one(&db.pool)
+    .await?;
+    let insert_config = |release: Uuid, vcpu: i32, iops: i64| {
+        sqlx::query(
+            "INSERT INTO kubernetes_pool_configs (
+                 id, template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+                 refill_per_tick, max_warming_slots, namespace, enabled,
+                 disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
+             )
+             VALUES ($1, $2, $3, 4096, 16384, 1, 1, 1, 'space', true, $4, 56)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(release)
+        .bind(vcpu)
+        .bind(iops)
+        .execute(&db.pool)
+    };
+    let set_enabled = |release: Uuid, enabled: bool| {
+        sqlx::query(
+            "UPDATE kubernetes_pool_configs SET enabled = $2 WHERE template_release_id = $1",
+        )
+        .bind(release)
+        .bind(enabled)
+        .execute(&db.pool)
+    };
+    let resolve = || resolve_kubernetes_pool_configured_resources(&db.pool, "app-runtime", twin);
+    insert_config(original, 2, 1234).await?;
+
+    let assignment = resolve()
+        .await?
+        .expect("without a policy, the original's config should shape its twin's cold create");
+    assert_eq!(assignment.source, CreateShapeSource::PoolConfig);
+    assert_eq!(
+        (
+            assignment.resources.vcpu,
+            assignment.resources.memory_mib,
+            assignment.resources.disk_mib
+        ),
+        (Some(2), Some(4096), Some(16384)),
+        "the original's shape"
+    );
+    assert_eq!(
+        assignment.disk_io_limits,
+        DiskIoLimits::try_new(1_234, 56).unwrap()
+    );
+
+    insert_config(twin, 3, 4321).await?;
+    set_enabled(twin, false).await?;
+    assert_eq!(
+        resolve().await?.map(|assignment| assignment.resources.vcpu),
+        Some(Some(2)),
+        "a twin whose own config is disabled takes the original's"
+    );
+
+    set_enabled(original, false).await?;
+    assert!(
+        resolve().await?.is_none(),
+        "a disabled config of the original shapes nothing"
+    );
+    set_enabled(original, true).await?;
+
+    sqlx::query(sql!(
+        "INSERT INTO warm_pool_policies (
+             template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
+             max_ready_slots, refill_per_tick, max_warming_slots, retain_releases,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
+         )
+         VALUES ('app-runtime', 'fc', 4, 8192, 32768, 1, 4, 1, 2, 1, 2000, 200)"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let assignment = resolve()
+        .await?
+        .expect("the policy should shape the twin's cold create");
+    assert_eq!(
+        (assignment.source, assignment.resources.vcpu),
+        (CreateShapeSource::Policy, Some(4)),
+        "with a policy, the policy shapes it, so its demand counts for the policy"
+    );
+
+    set_enabled(twin, true).await?;
+    let assignment = resolve()
+        .await?
+        .expect("the twin's own config should shape its cold create");
+    assert_eq!(
+        (assignment.source, assignment.resources.vcpu),
+        (CreateShapeSource::PoolConfig, Some(3)),
+        "the twin's own config wins"
+    );
+    assert_eq!(
+        assignment.disk_io_limits,
+        DiskIoLimits::try_new(4_321, 56).unwrap()
+    );
+    Ok(())
+}
+
+/// The original a twin takes its shape from is the one registration finds
+/// across both hash spellings: a `sha256:` release in another environment
+/// takes the bare original's config, and a `sha256:` release beside the
+/// original, in its environment, isn't a twin and takes none.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_a_twin_under_the_other_spelling_takes_the_bare_originals_config() -> TestResult {
+    let db = pg_test_db().await?;
+    let bare = "d".repeat(64);
+    let original = insert_template_release(&db.pool, "app-runtime", &bare).await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+        .execute(&db.pool)
+        .await?;
+    let mut others = Vec::new();
+    for environment in [Some(format!("sha256:{}", "e".repeat(64))), None] {
+        others.push(
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO template_releases
+                     (template_name, type, hash, execution_metadata, created_at)
+                 SELECT template_name, type, 'sha256:' || hash,
+                        CASE WHEN $2::TEXT IS NULL THEN NULL
+                             ELSE jsonb_build_object('environment', $2::TEXT) END,
+                        clock_timestamp()
+                 FROM template_releases WHERE id = $1
+                 RETURNING id",
+            )
+            .bind(original)
+            .bind(environment)
+            .fetch_one(&db.pool)
+            .await?,
+        );
+    }
+    let (elsewhere, beside) = (others[0], others[1]);
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 2, 4096, 16384, 1, 1, 1, 'space', true)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(original)
+    .execute(&db.pool)
+    .await?;
+
+    let pool = &db.pool;
+    let shape = |release: Uuid| async move {
+        Ok::<_, ControllerError>(
+            resolve_kubernetes_pool_configured_resources(pool, "app-runtime", release)
+                .await?
+                .map(|assignment| (assignment.source, assignment.resources.vcpu)),
+        )
+    };
+    assert_eq!(
+        shape(elsewhere).await?,
+        Some((CreateShapeSource::PoolConfig, Some(2))),
+        "the twin under the other spelling takes the bare original's shape"
+    );
+    assert_eq!(
+        shape(beside).await?,
+        None,
+        "a release beside the original isn't a twin"
+    );
     Ok(())
 }
 

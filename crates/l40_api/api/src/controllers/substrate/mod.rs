@@ -1231,6 +1231,15 @@ pub struct SubstrateCapabilities {
     ///
     /// Direct's suspend leaves the lifecycle to that caller write.
     pub suspend_commits_lifecycle: bool,
+    /// With the environment placement gate `on`, a create of bound work hands
+    /// its environment to the worker (`CreateRequest.required_environment`),
+    /// which boots that environment's build of the template. A Kubernetes pod
+    /// carries the requirement in its environment annotation.
+    ///
+    /// Direct's create names no environment: its worker boots the build a
+    /// create without a preference resolves, the legacy partition's (a gap
+    /// row in `direct.rs`).
+    pub boots_required_environment: bool,
 }
 
 impl SubstrateCapabilities {
@@ -1243,6 +1252,7 @@ impl SubstrateCapabilities {
         supports_node_drain: false,
         uses_kubernetes_api: false,
         suspend_commits_lifecycle: false,
+        boots_required_environment: false,
     };
 
     pub const KUBERNETES: Self = Self {
@@ -1254,6 +1264,7 @@ impl SubstrateCapabilities {
         supports_node_drain: true,
         uses_kubernetes_api: true,
         suspend_commits_lifecycle: true,
+        boots_required_environment: true,
     };
 }
 
@@ -1803,6 +1814,16 @@ impl Substrate {
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.k8s.environment_placement,
         }
+    }
+
+    /// Whether a create resolved to a template release's twin boots the twin's
+    /// environment: the worker boots a create's required environment
+    /// ([`SubstrateCapabilities::boots_required_environment`]) and the
+    /// environment placement gate is `on`, the only mode in which a create
+    /// carries one. Anywhere else it boots its build's legacy partition, as
+    /// the original does.
+    pub fn boots_template_twins(&self) -> bool {
+        self.capabilities().boots_required_environment && self.environment_placement().refuses()
     }
 
     /// Run on the Direct substrate.

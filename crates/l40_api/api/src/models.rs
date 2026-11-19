@@ -1141,6 +1141,14 @@ pub struct ClusterPoolConfigRequest {
     /// Members of an encryptable config serve only encrypted creates.
     #[serde(default)]
     pub encryptable: bool,
+    /// The release whose config this changes, for an edit of an existing
+    /// pool: the change goes to that release's config, not to the release
+    /// `template_name` and `content_hash` resolve to now. A twin named here
+    /// keeps the change to itself. The release must be one of
+    /// `template_name`'s, and `content_hash`, when given, its own spelling of
+    /// the hash.
+    #[serde(default)]
+    pub template_release_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]

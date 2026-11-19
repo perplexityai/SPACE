@@ -379,7 +379,7 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
     let template_network_policy = NetworkPolicyV1::deny_all();
     let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
 
-    let claim = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let claim = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert_eq!(
         claim.pool_shape,
         Some(PooledExecutionPoolShape::new(4, 2048, Default::default()))
@@ -492,7 +492,7 @@ async fn postgres_claim_resolves_the_worker_sharing_a_builder_node_name() -> Tes
     let template_network_policy = NetworkPolicyV1::deny_all();
     let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
 
-    let claim = claim_pooled_execution(&db.pool, &request, "space")
+    let claim = claim_pooled_execution(&db.pool, &request, "space", false)
         .await?
         .claim
         .expect("ready pool slot should be claimed");
@@ -528,7 +528,7 @@ async fn postgres_claim_requires_matching_disk_capacity_and_reports_it() -> Test
         .execute(&db.pool)
         .await?;
 
-    let stale = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let stale = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert!(stale.claim.is_none());
     assert_eq!(
         stale.pool_shape,
@@ -545,7 +545,7 @@ async fn postgres_claim_requires_matching_disk_capacity_and_reports_it() -> Test
         .execute(&db.pool)
         .await?;
 
-    let matched = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let matched = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert_eq!(
         matched.claim.as_ref().and_then(|claim| claim.disk_mib),
         Some(32768)
@@ -585,7 +585,7 @@ async fn postgres_default_shape_hit_reports_claimed_ready_slot_shape() -> TestRe
         None,
     );
 
-    let attempt = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let attempt = claim_pooled_execution(&db.pool, &request, "space", false).await?;
 
     assert_eq!(
         attempt.pool_shape,
@@ -638,7 +638,7 @@ async fn postgres_default_shape_miss_reports_preferred_enabled_config() -> TestR
         None,
     );
 
-    let attempt = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let attempt = claim_pooled_execution(&db.pool, &request, "space", false).await?;
 
     assert!(attempt.claim.is_none());
     assert_eq!(
@@ -675,7 +675,7 @@ async fn postgres_explicit_shape_hit_and_miss_stay_exact() -> TestResult {
         Some(explicit_shape),
     );
 
-    let hit = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let hit = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert_eq!(hit.pool_shape, Some(explicit_shape));
     assert_eq!(
         hit.claim
@@ -684,7 +684,7 @@ async fn postgres_explicit_shape_hit_and_miss_stay_exact() -> TestResult {
         explicit_sandbox_id
     );
 
-    let miss = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let miss = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert!(miss.claim.is_none());
     assert_eq!(miss.pool_shape, Some(explicit_shape));
     let other_shape_state: String = sqlx::query_scalar(sql!(
@@ -716,7 +716,7 @@ async fn postgres_claim_blank_pool_slot_pod_uid_as_absent() -> TestResult {
     let template_network_policy = NetworkPolicyV1::deny_all();
     let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
 
-    let claim = claim_pooled_execution(&db.pool, &request, "space")
+    let claim = claim_pooled_execution(&db.pool, &request, "space", false)
         .await?
         .claim
         .expect("ready pool slot should be claimed");
@@ -749,7 +749,7 @@ async fn postgres_release_claimed_pool_slot_restores_ready_slot() -> TestResult 
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let template_network_policy = NetworkPolicyV1::deny_all();
     let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
-    let claim = claim_pooled_execution(&db.pool, &request, "space")
+    let claim = claim_pooled_execution(&db.pool, &request, "space", false)
         .await?
         .claim
         .expect("ready pool slot should be claimed");
@@ -769,7 +769,7 @@ async fn postgres_release_claimed_pool_slot_restores_ready_slot() -> TestResult 
     assert_eq!(claim_id, None);
     assert_eq!(claimed_at, None);
 
-    let reclaimed = claim_pooled_execution(&db.pool, &request, "space")
+    let reclaimed = claim_pooled_execution(&db.pool, &request, "space", false)
         .await?
         .claim
         .expect("released pool slot should be claimable again");
@@ -787,7 +787,7 @@ async fn postgres_invalidate_claimed_pool_slot_keeps_slot_unclaimable() -> TestR
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let template_network_policy = NetworkPolicyV1::deny_all();
     let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
-    let claim = claim_pooled_execution(&db.pool, &request, "space")
+    let claim = claim_pooled_execution(&db.pool, &request, "space", false)
         .await?
         .claim
         .expect("ready pool slot should be claimed");
@@ -807,7 +807,7 @@ async fn postgres_invalidate_claimed_pool_slot_keeps_slot_unclaimable() -> TestR
     assert_eq!(claim_id, None);
     assert!(claimed_at.is_some());
 
-    let reclaimed = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let reclaimed = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert!(reclaimed.claim.is_none());
     assert_eq!(
         reclaimed.pool_shape,
@@ -841,7 +841,9 @@ async fn upsert_pool_config_uses_store_namespace() -> TestResult {
             namespace: Some("space".to_string()),
             enabled: true,
             encryptable: false,
+            template_release_id: None,
         },
+        false,
     )
     .await?;
 
@@ -904,10 +906,655 @@ async fn upsert_pool_config_resolves_the_original_not_a_twin() -> TestResult {
             namespace: None,
             enabled: true,
             encryptable: false,
+            template_release_id: None,
         },
+        false,
     )
     .await?;
     assert_eq!(config.template_release_id, original);
+    Ok(())
+}
+
+/// Creates may resolve to a release's twin (here, the one bound to the
+/// cluster default), and
+/// claim its slots, so an operator's upsert of the release's pool config
+/// changes the twin's too. The original's config is the one reported.
+#[tokio::test(flavor = "current_thread")]
+async fn upsert_pool_config_also_updates_the_twin_bound_to_the_default() -> TestResult {
+    let db = pg_test_db().await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let original: Uuid = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE hash = 'sha256:newer-untagged'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let twin: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, created_at, execution_metadata)
+         VALUES ('seed', 'fc', 'sha256:newer-untagged', NOW() + INTERVAL '1 minute',
+                 jsonb_build_object('environment', $1::TEXT))
+         RETURNING id"
+    ))
+    .bind(&e1)
+    .fetch_one(&db.pool)
+    .await?;
+    crate::test_support::set_default_environment(&db.pool, &e1).await?;
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+    let request = |target_ready_slots| ClusterPoolConfigRequest {
+        template_name: "seed".to_string(),
+        content_hash: Some("sha256:newer-untagged".to_string()),
+        vcpu: 4,
+        memory_mib: 2048,
+        disk_mib: None,
+        reset_disk_to_template_default: false,
+        target_ready_slots,
+        refill_per_tick: 1,
+        max_warming_slots: 1,
+        namespace: None,
+        enabled: true,
+        encryptable: false,
+        template_release_id: None,
+    };
+
+    // Where creates don't boot the twin they resolve to, they run the
+    // original's pools, and the twin's are left alone.
+    upsert_pool_config(
+        &store,
+        ClusterPoolConfigRequest {
+            disk_mib: Some(32768),
+            ..request(2)
+        },
+        false,
+    )
+    .await?;
+    let twin_configs: i64 = sqlx::query_scalar(sql!(
+        "SELECT count(*) FROM kubernetes_pool_configs WHERE template_release_id = $1"
+    ))
+    .bind(twin)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(twin_configs, 0);
+    // The original's disk I/O limits, as a policy the autoscaler applied
+    // before an operator took the config over would have set them.
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs
+         SET disk_io_max_operations_per_sec = 1234, disk_io_max_bandwidth_mib_per_sec = 56
+         WHERE template_release_id = $1"
+    ))
+    .bind(original)
+    .execute(&db.pool)
+    .await?;
+
+    for target in [1u32, 3] {
+        let config = upsert_pool_config(&store, request(target), true).await?;
+        assert_eq!(config.template_release_id, original);
+        let targets: Vec<(Uuid, i32)> = sqlx::query_as(sql!(
+            "SELECT template_release_id, target_ready_slots
+             FROM kubernetes_pool_configs
+             WHERE vcpu = 4 AND memory_mib = 2048
+               AND template_release_id = ANY($1)
+             ORDER BY created_at, id"
+        ))
+        .bind(vec![original, twin])
+        .fetch_all(&db.pool)
+        .await?;
+        let target = i32::try_from(target)?;
+        assert_eq!(targets, vec![(original, target), (twin, target)]);
+    }
+    // The requests named no disk size, which keeps the original's override;
+    // the twin's config, made by the first of them, takes it too.
+    let disks: Vec<(Uuid, Option<i32>)> = sqlx::query_as(sql!(
+        "SELECT template_release_id, disk_mib
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = ANY($1)
+         ORDER BY created_at, id"
+    ))
+    .bind(vec![original, twin])
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(disks, vec![(original, Some(32768)), (twin, Some(32768))]);
+    // Its disk I/O limits too, rather than the platform defaults.
+    let limits: Vec<(Uuid, Option<i64>, Option<i64>)> = sqlx::query_as(sql!(
+        "SELECT template_release_id, disk_io_max_operations_per_sec,
+                disk_io_max_bandwidth_mib_per_sec
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = ANY($1)
+         ORDER BY created_at, id"
+    ))
+    .bind(vec![original, twin])
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        limits,
+        vec![
+            (original, Some(1234), Some(56)),
+            (twin, Some(1234), Some(56))
+        ]
+    );
+
+    // Disabling the original's config disables the twin's for the shape too.
+    let original_config: Uuid = sqlx::query_scalar(sql!(
+        "SELECT id FROM kubernetes_pool_configs WHERE template_release_id = $1"
+    ))
+    .bind(original)
+    .fetch_one(&db.pool)
+    .await?;
+    let enabled = || async {
+        sqlx::query_as::<_, (Uuid, bool)>(sql!(
+            "SELECT template_release_id, enabled
+             FROM kubernetes_pool_configs
+             WHERE template_release_id = ANY($1)
+             ORDER BY created_at, id"
+        ))
+        .bind(vec![original, twin])
+        .fetch_all(&db.pool)
+        .await
+    };
+    // A superseded twin, in an environment with no state, whose config an
+    // operator disables: the twin creates use keeps its pool.
+    let superseded: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, created_at, execution_metadata)
+         VALUES ('seed', 'fc', 'sha256:newer-untagged', NOW() + INTERVAL '2 minutes',
+                 jsonb_build_object('environment', $1::TEXT))
+         RETURNING id"
+    ))
+    .bind(format!("sha256:{}", "8".repeat(64)))
+    .fetch_one(&db.pool)
+    .await?;
+    let superseded_config: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 4, 2048, 1, 1, 1, 'sandboxes', TRUE, 'manual')
+         RETURNING id"
+    ))
+    .bind(superseded)
+    .fetch_one(&db.pool)
+    .await?;
+    disable_pool_config(&store, superseded_config).await?;
+    let superseded_state: (bool, i32) = sqlx::query_as(sql!(
+        "SELECT enabled, target_ready_slots FROM kubernetes_pool_configs WHERE id = $1"
+    ))
+    .bind(superseded_config)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        superseded_state,
+        (false, 0),
+        "the superseded twin's config is disabled"
+    );
+    assert_eq!(enabled().await?, vec![(original, true), (twin, true)]);
+
+    let disabled = disable_pool_config(&store, original_config).await?;
+    assert_eq!(disabled.id, original_config);
+    assert_eq!(enabled().await?, vec![(original, false), (twin, false)]);
+    Ok(())
+}
+
+/// An edit of an existing pool names its release, and changes exactly that
+/// release's config. Here the admin UI detaches and disables twin B's
+/// autoscaler-owned config after the cluster default moved from B's
+/// environment to twin C's: B's config is disabled, and the original A and
+/// C, which creates resolve to now, keep theirs. Naming A, or no release,
+/// is a change to A, which goes to C.
+#[tokio::test(flavor = "current_thread")]
+async fn a_named_twins_detach_after_the_default_moves_changes_only_that_twin() -> TestResult {
+    let db = pg_test_db().await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let original: Uuid = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE hash = 'sha256:newer-untagged'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let insert_twin = |environment: String, minutes: i32| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(sql!(
+                "INSERT INTO template_releases (template_name, type, hash, created_at, execution_metadata)
+                 VALUES ('seed', 'fc', 'sha256:newer-untagged',
+                         NOW() + make_interval(mins => $2),
+                         jsonb_build_object('environment', $1::TEXT))
+                 RETURNING id"
+            ))
+            .bind(environment)
+            .bind(minutes)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    let e2 = format!("sha256:{}", "8".repeat(64));
+    let twin_b = insert_twin(e1.clone(), 1).await?;
+    let twin_c = insert_twin(e2.clone(), 2).await?;
+    crate::test_support::set_default_environment(&db.pool, &e1).await?;
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+    let request = |target_ready_slots, enabled, template_release_id| ClusterPoolConfigRequest {
+        template_name: "seed".to_string(),
+        content_hash: Some("sha256:newer-untagged".to_string()),
+        vcpu: 4,
+        memory_mib: 2048,
+        disk_mib: None,
+        reset_disk_to_template_default: false,
+        target_ready_slots,
+        refill_per_tick: 1,
+        max_warming_slots: 1,
+        namespace: None,
+        enabled,
+        encryptable: false,
+        template_release_id,
+    };
+    let states = || async {
+        sqlx::query_as::<_, (Uuid, bool, i32, String)>(sql!(
+            "SELECT template_release_id, enabled, target_ready_slots, managed_by::TEXT
+             FROM kubernetes_pool_configs
+             WHERE vcpu = 4 AND memory_mib = 2048
+               AND template_release_id = ANY($1)
+             ORDER BY created_at, id"
+        ))
+        .bind(vec![original, twin_b, twin_c])
+        .fetch_all(&db.pool)
+        .await
+    };
+    let state =
+        |release, enabled, target: i32, owner: &str| (release, enabled, target, owner.to_string());
+
+    // A's pool, with the default in B's environment, reaches B's config.
+    upsert_pool_config(&store, request(2, true, None), true).await?;
+    // The autoscaler owns B's config, as one it took over would be.
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs SET managed_by = 'autoscaler'
+         WHERE template_release_id = $1"
+    ))
+    .bind(twin_b)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(
+        states().await?,
+        vec![
+            state(original, true, 2, "manual"),
+            state(twin_b, true, 2, "autoscaler")
+        ]
+    );
+
+    crate::test_support::set_default_environment(&db.pool, &e2).await?;
+    let detached = upsert_pool_config(&store, request(0, false, Some(twin_b)), true).await?;
+    assert_eq!(detached.template_release_id, twin_b);
+    let after_detach = vec![
+        state(original, true, 2, "manual"),
+        state(twin_b, false, 0, "manual"),
+    ];
+    assert_eq!(
+        states().await?,
+        after_detach,
+        "only the named twin's config is detached, disabled and operator-owned"
+    );
+
+    // A release id under another hash, or of another template, is refused
+    // rather than resolved; one that names no hash needs only the template.
+    let mut wrong_hash = request(0, false, Some(twin_b));
+    wrong_hash.content_hash = Some("sha256:another-build".to_string());
+    let mut wrong_template = request(0, false, Some(twin_b));
+    wrong_template.template_name = "other".to_string();
+    for mismatched in [wrong_hash, wrong_template] {
+        let refused = upsert_pool_config(&store, mismatched, true)
+            .await
+            .expect_err("a release id the request's template and hash don't name is refused");
+        assert_eq!(refused.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+    assert_eq!(states().await?, after_detach);
+    let mut hashless = request(0, false, Some(twin_b));
+    hashless.content_hash = None;
+    let again = upsert_pool_config(&store, hashless, true).await?;
+    assert_eq!(again.template_release_id, twin_b);
+    assert_eq!(states().await?, after_detach);
+
+    // Naming the original is a change to A, which C, the twin creates
+    // resolve to now, takes too.
+    upsert_pool_config(&store, request(5, true, Some(original)), true).await?;
+    assert_eq!(
+        states().await?,
+        vec![
+            state(original, true, 5, "manual"),
+            state(twin_b, false, 0, "manual"),
+            state(twin_c, true, 5, "manual")
+        ]
+    );
+
+    // So is the same request without the id.
+    upsert_pool_config(&store, request(0, false, None), true).await?;
+    assert_eq!(
+        states().await?,
+        vec![
+            state(original, false, 0, "manual"),
+            state(twin_b, false, 0, "manual"),
+            state(twin_c, false, 0, "manual")
+        ]
+    );
+    Ok(())
+}
+
+/// A release in another environment under the other spelling of the hash
+/// isn't an original, though no earlier release shares its spelling: the
+/// build's original is the bare release registration finds, across both
+/// spellings. Upserting or disabling the other release's config leaves the
+/// original's pool for the same shape alone.
+#[tokio::test(flavor = "current_thread")]
+async fn another_spellings_release_elsewhere_leaves_the_originals_pool() -> TestResult {
+    let db = pg_test_db().await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+    let bare = "c".repeat(64);
+    let mut releases = Vec::new();
+    for (hash, environment, offset) in [
+        (bare.clone(), None, "3 minutes"),
+        (
+            format!("sha256:{bare}"),
+            Some(format!("sha256:{}", "7".repeat(64))),
+            "4 minutes",
+        ),
+    ] {
+        releases.push(
+            sqlx::query_scalar::<_, Uuid>(sql!(
+                "INSERT INTO template_releases
+                     (template_name, type, hash, created_at, execution_metadata)
+                 VALUES ('seed', 'fc', $1, NOW() + $3::INTERVAL,
+                         CASE WHEN $2::TEXT IS NULL THEN NULL
+                              ELSE jsonb_build_object('environment', $2::TEXT) END)
+                 RETURNING id"
+            ))
+            .bind(hash)
+            .bind(environment)
+            .bind(offset)
+            .fetch_one(&db.pool)
+            .await?,
+        );
+    }
+    let (original, elsewhere) = (releases[0], releases[1]);
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string)
+         VALUES ($1, 's3://templates-bucket/seed?region=us-east-1')"
+    ))
+    .bind(original)
+    .execute(&db.pool)
+    .await?;
+    let mut configs = Vec::new();
+    for release in [original, elsewhere] {
+        configs.push(
+            sqlx::query_scalar::<_, Uuid>(sql!(
+                "INSERT INTO kubernetes_pool_configs (
+                     template_release_id, vcpu, memory_mib, target_ready_slots,
+                     refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+                 )
+                 VALUES ($1, 4, 2048, 1, 1, 1, 'sandboxes', TRUE, 'manual')
+                 RETURNING id"
+            ))
+            .bind(release)
+            .fetch_one(&db.pool)
+            .await?,
+        );
+    }
+
+    // An upsert naming the other release, where creates boot twins, changes
+    // only its config, as its disable does, though creates of its spelling
+    // resolve to the original.
+    let upserted = upsert_pool_config(
+        &store,
+        ClusterPoolConfigRequest {
+            template_name: "seed".to_string(),
+            content_hash: Some(format!("sha256:{bare}")),
+            vcpu: 4,
+            memory_mib: 2048,
+            disk_mib: None,
+            reset_disk_to_template_default: false,
+            target_ready_slots: 3,
+            refill_per_tick: 1,
+            max_warming_slots: 1,
+            namespace: None,
+            enabled: true,
+            encryptable: false,
+            template_release_id: None,
+        },
+        true,
+    )
+    .await?;
+    assert_eq!(upserted.id, configs[1]);
+    let targets: Vec<(Uuid, i32)> = sqlx::query_as(sql!(
+        "SELECT template_release_id, target_ready_slots
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = ANY($1)
+         ORDER BY created_at, id"
+    ))
+    .bind(vec![original, elsewhere])
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(targets, vec![(original, 1), (elsewhere, 3)]);
+
+    disable_pool_config(&store, configs[1]).await?;
+    let enabled: Vec<(Uuid, bool)> = sqlx::query_as(sql!(
+        "SELECT template_release_id, enabled
+         FROM kubernetes_pool_configs
+         WHERE id = ANY($1)
+         ORDER BY created_at, id"
+    ))
+    .bind(&configs)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(enabled, vec![(original, true), (elsewhere, false)]);
+    Ok(())
+}
+
+/// The twin creates resolve to can change after an upsert wrote its config:
+/// here the default moves from E1 to E2. Disabling the original's config
+/// then disables the shape on every twin, the E1 twin's included, which no
+/// longer resolves. Another shape's config on a twin is left alone.
+#[tokio::test(flavor = "current_thread")]
+async fn disabling_an_original_disables_every_twins_config_for_the_shape() -> TestResult {
+    let db = pg_test_db().await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let original: Uuid = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE hash = 'sha256:newer-untagged'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    let e2 = format!("sha256:{}", "8".repeat(64));
+    let mut twins = Vec::new();
+    for (environment, offset) in [(&e1, "1 minute"), (&e2, "2 minutes")] {
+        twins.push(
+            sqlx::query_scalar::<_, Uuid>(sql!(
+                "INSERT INTO template_releases (template_name, type, hash, created_at, execution_metadata)
+                 VALUES ('seed', 'fc', 'sha256:newer-untagged', NOW() + $2::INTERVAL,
+                         jsonb_build_object('environment', $1::TEXT))
+                 RETURNING id"
+            ))
+            .bind(environment)
+            .bind(offset)
+            .fetch_one(&db.pool)
+            .await?,
+        );
+    }
+    let (twin_e1, twin_e2) = (twins[0], twins[1]);
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+    let request = |memory_mib| ClusterPoolConfigRequest {
+        template_name: "seed".to_string(),
+        content_hash: Some("sha256:newer-untagged".to_string()),
+        vcpu: 4,
+        memory_mib,
+        disk_mib: None,
+        reset_disk_to_template_default: false,
+        target_ready_slots: 2,
+        refill_per_tick: 1,
+        max_warming_slots: 1,
+        namespace: None,
+        enabled: true,
+        encryptable: false,
+        template_release_id: None,
+    };
+    let state = |release: Uuid, memory_mib: i32| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (bool, i32)>(sql!(
+                "SELECT enabled, target_ready_slots FROM kubernetes_pool_configs
+                 WHERE template_release_id = $1 AND vcpu = 4 AND memory_mib = $2"
+            ))
+            .bind(release)
+            .bind(memory_mib)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+
+    // With E1 the default, the upsert writes the E1 twin's config, for this
+    // shape and another one.
+    crate::test_support::set_default_environment(&db.pool, &e1).await?;
+    let config = upsert_pool_config(&store, request(2048), true).await?;
+    upsert_pool_config(&store, request(4096), true).await?;
+    assert_eq!(state(twin_e1, 2048).await?, (true, 2));
+    // The default moves on, and the next upsert writes the E2 twin's config.
+    crate::test_support::set_default_environment(&db.pool, &e2).await?;
+    upsert_pool_config(&store, request(2048), true).await?;
+    assert_eq!(state(twin_e2, 2048).await?, (true, 2));
+
+    disable_pool_config(&store, config.id).await?;
+    assert_eq!(state(original, 2048).await?, (false, 0));
+    assert_eq!(
+        state(twin_e1, 2048).await?,
+        (false, 0),
+        "the twin creates no longer resolve to is disabled too"
+    );
+    assert_eq!(state(twin_e2, 2048).await?, (false, 0));
+    assert_eq!(
+        state(twin_e1, 4096).await?,
+        (true, 2),
+        "another shape's config stays"
+    );
+    Ok(())
+}
+
+/// A claim that names no release takes the slots of the release its build
+/// resolves to only where creates boot the twin they resolve to. Elsewhere it
+/// keeps the tagged release's slots even when a twin bound to the default
+/// exists.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pool_claim_takes_the_twins_slots_only_where_creates_boot_it() -> TestResult {
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    // Twins exist only once the `(template_name, hash)` unique index is
+    // dropped; the test drops it to stand in for the contract migration.
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    let twin: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, created_at, execution_metadata)
+         SELECT template_name, type, hash, NOW() + INTERVAL '1 minute',
+                jsonb_build_object('environment', $2::TEXT)
+         FROM template_releases WHERE id = $1
+         RETURNING id"
+    ))
+    .bind(slot.release_id)
+    .bind(&e1)
+    .fetch_one(&db.pool)
+    .await?;
+    crate::test_support::set_default_environment(&db.pool, &e1).await?;
+    let actor = ActorRef::new(slot.user_id, slot.org_id, Email::parse("pool@example.com")?);
+    let env = BTreeMap::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+
+    // Creates resolve to the twin, which has no slots, so the claim misses
+    // and leaves the original's slot ready.
+    let miss = claim_pooled_execution(&db.pool, &request, "space", true).await?;
+    assert!(miss.claim.is_none(), "the twin has no ready slot");
+
+    // Once the twin has a ready slot, the claim takes it.
+    let twin_sandbox_id = SandboxId::new();
+    let limits = DiskIoLimits::default();
+    let twin_config: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
+         )
+         VALUES ($1, 4, 2048, 1, 1, 1, 'space', true, $2, $3)
+         RETURNING id"
+    ))
+    .bind(twin)
+    .bind(i64::try_from(limits.max_operations_per_sec())?)
+    .bind(i64::try_from(limits.max_bandwidth_mib_per_sec())?)
+    .fetch_one(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_slots (
+             config_id, template_release_id, reserved_sandbox_id, template_name,
+             content_hash, vcpu, memory_mib, pod_name, pod_namespace, pod_uid,
+             pod_ip, k8s_node_name, state, ready_at,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
+         )
+         SELECT $1, $2, $3, template_name, hash, 4, 2048, 'space-sbx-pooled-twin',
+                'space', 'twin-pod-uid', '10.90.0.12'::inet, 'pool-node-1', 'ready', NOW(),
+                $4, $5
+         FROM template_releases WHERE id = $2"
+    ))
+    .bind(twin_config)
+    .bind(twin)
+    .bind(twin_sandbox_id)
+    .bind(i64::try_from(limits.max_operations_per_sec())?)
+    .bind(i64::try_from(limits.max_bandwidth_mib_per_sec())?)
+    .execute(&db.pool)
+    .await?;
+    let twin_hit = claim_pooled_execution(&db.pool, &request, "space", true)
+        .await?
+        .claim
+        .expect("the twin's ready slot is claimed");
+    assert_eq!(twin_hit.sandbox_id, twin_sandbox_id);
+
+    // Where creates don't boot the twin, they claim the tagged release's slot.
+    let hit = claim_pooled_execution(&db.pool, &request, "space", false)
+        .await?
+        .claim
+        .expect("the original's ready slot is claimed");
+    assert_eq!(hit.sandbox_id, slot.sandbox_id);
     Ok(())
 }
 
@@ -936,10 +1583,11 @@ async fn upsert_pool_config_rejects_encryptable_configs() -> TestResult {
         namespace: None,
         enabled,
         encryptable: true,
+        template_release_id: None,
     };
 
     for enabled in [true, false] {
-        let rejected = upsert_pool_config(&store, request(enabled))
+        let rejected = upsert_pool_config(&store, request(enabled), false)
             .await
             .expect_err("encryptable configs must be refused until the index drop");
         assert_eq!(rejected.status(), axum::http::StatusCode::BAD_REQUEST);
@@ -983,28 +1631,29 @@ async fn upsert_pool_config_preserves_and_explicitly_resets_disk_capacity() -> T
         namespace: None,
         enabled: true,
         encryptable: false,
+        template_release_id: None,
     };
 
     assert_eq!(
-        upsert_pool_config(&store, request(Some(32768), false))
+        upsert_pool_config(&store, request(Some(32768), false), false)
             .await?
             .disk_mib,
         Some(32768)
     );
     for disk_mib in [0, 131073, u32::MAX] {
-        let error = upsert_pool_config(&store, request(Some(disk_mib), false))
+        let error = upsert_pool_config(&store, request(Some(disk_mib), false), false)
             .await
             .unwrap_err();
         assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
     }
     assert_eq!(
-        upsert_pool_config(&store, request(None, false))
+        upsert_pool_config(&store, request(None, false), false)
             .await?
             .disk_mib,
         Some(32768)
     );
     assert_eq!(
-        upsert_pool_config(&store, request(None, true))
+        upsert_pool_config(&store, request(None, true), false)
             .await?
             .disk_mib,
         None
@@ -1085,7 +1734,9 @@ async fn upsert_pool_config_takes_manual_ownership_from_autoscaler() -> TestResu
             namespace: None,
             enabled: false,
             encryptable: false,
+            template_release_id: None,
         },
+        false,
     )
     .await?;
 
@@ -1235,7 +1886,7 @@ async fn postgres_admitted_claim_for_a_different_slot_is_invalidated() -> TestRe
         fixture_slot_state(&db.pool, &slot).await?,
         Some(("claimed".to_string(), None))
     );
-    let reclaimed = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let reclaimed = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert!(
         reclaimed.claim.is_none(),
         "an invalidated slot is never handed out"
@@ -1265,7 +1916,7 @@ async fn postgres_admitted_claim_fences_a_slot_returned_to_ready() -> TestResult
         fixture_slot_state(&db.pool, &slot).await?,
         Some(("claimed".to_string(), None))
     );
-    let reclaimed = claim_pooled_execution(&db.pool, &request, "space").await?;
+    let reclaimed = claim_pooled_execution(&db.pool, &request, "space", false).await?;
     assert!(reclaimed.claim.is_none());
     Ok(())
 }
@@ -1336,7 +1987,7 @@ async fn claim_ready_pool_slot(
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let template_network_policy = NetworkPolicyV1::deny_all();
     let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
-    Ok(claim_pooled_execution(pool, &request, "space")
+    Ok(claim_pooled_execution(pool, &request, "space", false)
         .await?
         .claim
         .expect("ready pool slot should be claimed"))
