@@ -2654,6 +2654,7 @@ class ControllerLease:
 class ControllerPod:
     """One cluster-controller pod and its controller container's status.
 
+    `ready_changed_at` is when the pod's Ready condition last changed status;
     `started_at` is when the current container started; `last_exit_code` and
     `last_finished_at` describe the previous container, the one kubelet last
     restarted. Times are epoch seconds.
@@ -2663,6 +2664,7 @@ class ControllerPod:
     uid: str
     node: str
     ready: bool
+    ready_changed_at: float | None
     deleting: bool
     restart_count: int
     started_at: float | None
@@ -2686,18 +2688,6 @@ class NodeContainer:
     exit_code: int | None
 
 
-class ControllerLeaseWatch(Protocol):
-    """A running watch of the leadership Lease."""
-
-    def latest(self) -> ControllerLease | None:
-        """The delivered Lease with the newest `renewTime`, or None before the first."""
-        ...
-
-    def stop(self) -> None:
-        """End the watch; idempotent."""
-        ...
-
-
 class NodeExitWatch(Protocol):
     """A running watch of one node's container exits, read from its containerd."""
 
@@ -2718,11 +2708,12 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
     """Kind-only operations for the cluster-controller leader-election scenario.
 
     The faults are a third contender Pod that runs the controller's own
-    pod template under a ServiceAccount with no `leases` grant, and the
-    control-plane apiserver's static-pod manifest moved out of kubelet's
-    manifest directory. Everything asserted is read from Kubernetes objects,
-    the node's container runtime, the readiness marker file the controller's
-    probe reads, or Prometheus.
+    pod template under a ServiceAccount with no `leases` grant, a budget
+    control that runs it against an unreachable API endpoint, and the healthy
+    replicas cut off from the apiserver in their own network namespaces.
+    Everything asserted is read from Kubernetes objects, the node's container
+    runtime, the readiness marker file the controller's probe reads, or
+    Prometheus.
     """
 
     def acquire_retention_sweeper_mutation(self) -> Callable[[], None]:
@@ -2741,6 +2732,15 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """The literals of the settings that tick the histogram-recording reconcilers.
 
         Keyed by `leader_election.RECONCILER_TICK_ENV`; None when unset.
+        """
+        ...
+
+    def controller_metric_export_interval_seconds(self) -> float:
+        """The controller Deployment's OTLP metric export interval, as the binary reads it.
+
+        `OTEL_METRIC_EXPORT_INTERVAL` in milliseconds; unset or blank, the
+        SDKs' 10 s. Anything else is refused: such a controller exports no
+        metrics.
         """
         ...
 
@@ -2771,12 +2771,12 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """
         ...
 
-    def controller_lease(self) -> ControllerLease | None:
-        """The leadership Lease, or None when it does not exist yet."""
+    def await_controller_rollout(self, *, timeout: float = 180) -> None:
+        """Wait for the controller Deployment's rollout to complete."""
         ...
 
-    def watch_controller_lease(self) -> ControllerLeaseWatch:
-        """Start watching the leadership Lease; every change it delivers is kept."""
+    def controller_lease(self, *, timeout: float = 15) -> ControllerLease | None:
+        """The leadership Lease, or None when it does not exist yet; one read bounded by `timeout`."""
         ...
 
     def controller_pods(
@@ -2785,19 +2785,24 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """The healthy Deployment's pods, or the refused contender's."""
         ...
 
-    def place_budget_contender(self) -> None:
-        """Run the controller template with an unreachable pod-local API endpoint."""
+    def place_budget_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
+        """Run the controller template with an unreachable pod-local API endpoint.
+
+        Placed with the given budget and lease-TTL hooks rather than the
+        Deployment's, so it can start before the healthy replicas roll.
+        """
         ...
 
     def remove_budget_contender(self, *, wait: bool = False) -> None:
         """Delete this run's budget control without waiting for its teardown."""
         ...
 
-    def place_refused_contender(self) -> None:
+    def place_refused_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
         """Place one more pod of the controller's pod template without `leases` RBAC.
 
-        Returns once its gate container runs, holding the controller container
-        back until `release_refused_contender`. Refuses when the substitute
+        Placed with the given budget and lease-TTL hooks. Returns once its
+        gate container runs, holding the controller container back until
+        `release_refused_contender`. Refuses when the substitute
         ServiceAccount can read Leases, since every lease call then succeeds
         and nothing would be refused.
         """
@@ -2818,22 +2823,39 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """Start recording the node's container exits as containerd reports them."""
         ...
 
-    def control_plane_node(self) -> str:
-        """The Kind node container that runs the apiserver's static pod."""
+    def apiserver_cut_targets(self) -> list[str]:
+        """The `ip:port` targets a cut REJECTs: the `kubernetes` Service's ClusterIPs and endpoints.
+
+        Refused as a configuration the cut cannot cover unless every
+        ClusterIP and endpoint is IPv4 and every EndpointSlice's
+        `addressType` is `IPv4`, or unless there is a ClusterIP and an
+        endpoint.
+        """
         ...
 
-    def apiserver_answers(self) -> bool:
-        """`/readyz` answers through the kube context within a few seconds."""
+    def cut_controllers_off_from_apiserver(
+        self, pod_names: Sequence[str], targets: Sequence[str], *, timeout: float
+    ) -> dict[str, tuple[float, float]]:
+        """REJECT each pod's connections to `targets`, in its own network namespace.
+
+        With `apiserver_cut_targets`, the pod's calls are refused as through
+        a ClusterIP with no apiserver behind it, while every other client
+        keeps the apiserver. The rule lives in the pod sandbox's namespace,
+        so it outlasts a container restart. Refuses a pod on its node's
+        network. Every lookup is made first; the pods are then cut in order,
+        each by one node exec bounded by `timeout` that applies its rules in
+        one transaction. Returns each pod's exec start and end, epoch
+        seconds: its cut took hold between them.
+        """
         ...
 
-    def park_apiserver(self, node_name: str) -> None:
-        """Move the apiserver's static-pod manifest out of kubelet's directory."""
-        ...
+    def reconnect_controller_to_apiserver(
+        self, node_name: str, pod_name: str, *, timeout: float | None = None
+    ) -> None:
+        """Remove the pod's cut, if any, in one node exec; idempotent.
 
-    def restore_apiserver(self, node_name: str, *, timeout: float = 30) -> None:
-        """Put a parked apiserver manifest back; a no-op when none is parked.
-
-        The node exec is bounded by `timeout`.
+        The exec is bounded by `timeout`, or by default by the bound cleanup
+        gives each of its requests.
         """
         ...
 

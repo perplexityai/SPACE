@@ -887,6 +887,12 @@ where
             .map_or(0.0, |grace| grace.get().as_secs_f64()),
         "contending for cluster-controller leadership with resolved lease timings"
     );
+    crate::metrics::leader_election::liveness_budget(
+        &config.identity,
+        config
+            .lease_failure_grace
+            .map_or(0.0, |grace| grace.get().as_secs_f64()),
+    );
     // The failure category of the previous failed attempt, cleared by any
     // successful one. Only used to decide whether a failure is *new*, so an
     // on-sight error log fires once per run instead of once per retry. Kept

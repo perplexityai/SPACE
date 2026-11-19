@@ -26,6 +26,19 @@ pub fn is_leader(identity: &str, leader: bool) {
     );
 }
 
+/// The liveness budget this replica resolved, in seconds, `0` when it is
+/// switched off: the requested budget after its floors and ceiling, plus the
+/// per-identity spread, which no setting shows. Emitted once, before the
+/// first acquisition attempt, beside the startup log line that records the
+/// same value.
+pub fn liveness_budget(identity: &str, seconds: f64) {
+    gauge(
+        "cluster_controller.leader_election.liveness_budget_seconds",
+        seconds,
+        &[tag("identity", identity)],
+    );
+}
+
 /// A replica won the lease (a standby became the active reconciler-runner).
 pub fn acquired(identity: &str) {
     counter(
