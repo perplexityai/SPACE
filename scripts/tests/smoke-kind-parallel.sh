@@ -73,10 +73,10 @@ fi
 while (( $# > 0 )); do
   case "$1" in
     --benches) BENCHES="${2:?--benches needs a count}"; shift 2 ;;
-    --benches=*) BENCHES="${1#*=}"; shift ;;
+    --benches=*) BENCHES="${1#*=}"; [[ -n "$BENCHES" ]] || die "--benches needs a count"; shift ;;
     --keep) KEEP=1; shift ;;
     --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
-    --out=*) OUT="${1#*=}"; shift ;;
+    --out=*) OUT="${1#*=}"; [[ -n "$OUT" ]] || die "--out needs a directory"; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
