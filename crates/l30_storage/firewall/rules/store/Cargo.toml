@@ -15,7 +15,6 @@ postgres = [
     "firewall_rules_control",
     "firewall_rules_node_assignments",
     "firewall_rules_node_observations",
-    "firewall_rules_mutation_receipts",
 ]
 
 [lints]

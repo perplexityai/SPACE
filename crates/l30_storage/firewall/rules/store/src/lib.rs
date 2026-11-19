@@ -8,8 +8,6 @@
 //! * `firewall_rules_control`: the default revision for newly enrolled nodes.
 //! * `firewall_rules_node_assignments`: each node's current intent.
 //! * `firewall_rules_node_observations`: each node's accepted observations.
-//! * `firewall_rules_mutation_receipts`: idempotent responses to operator
-//!   requests.
 //!
 //! [`lease_targets`] leases a rollout's saved targets to a controller under
 //! the shared queue's rules ([`pplx_space_rollout_queue`]); [`renew_lease`],
