@@ -9,7 +9,7 @@ use crate::proto::drain_node_request::{Cancel, Drain, Op};
 use crate::proto::drain_node_response::Result as DrainResult;
 use crate::proto::{
     CancelResult, DrainBlocked, DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPending,
-    DrainReport,
+    DrainReport, PreviewDrainNodeRequest, PreviewDrainNodeResponse,
 };
 use crate::service::*;
 
@@ -111,6 +111,45 @@ impl SandboxManagerService {
         Ok(tombstone)
     }
 
+    /// One preview at a time: another that arrives meanwhile fails at once
+    /// with `Aborted`. Bounded by the drain's call timeout, as a drain call
+    /// is.
+    pub(in crate::service) async fn preview_drain_node(
+        &self,
+        request: Request<PreviewDrainNodeRequest>,
+    ) -> Result<Response<PreviewDrainNodeResponse>, Status> {
+        // It changes nothing, but answers what a drain would find on the
+        // whole node, so it takes the drain's authority.
+        self.authorize_peer(&request, "PreviewDrainNode", ALLOW_NODE_DRAIN)?;
+        let PreviewDrainNodeRequest {} = request.into_inner();
+        self.refuse_preview_while_sealed()?;
+        let _preview = self.drain_actions.enter_preview()?;
+        let timeout = self.drain_actions.call_timeout;
+        // Tagged, so what the drain's scans log during a preview says it came
+        // from one.
+        let span = tracing::info_span!("drain_node_preview", preview = true);
+        let report = tokio::time::timeout(timeout, async {
+            // Not node-manager's orphan inventory: its scans are shared by
+            // every caller on the node and few, so a preview's could evict a
+            // drain call's or node-ctl's.
+            let scans = DrainScans {
+                disk_headroom: read_disk_headroom().instrument(span.clone()).await,
+                ..DrainScans::default()
+            };
+            span.in_scope(|| self.finish_preview(scans))
+        })
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "the drain preview didn't finish within {}s",
+                timeout.as_secs()
+            ))
+        })??;
+        Ok(Response::new(PreviewDrainNodeResponse {
+            report: Some(report),
+        }))
+    }
+
     /// What a drain call scans outside the rows: node-manager's orphan
     /// inventory and the cache disk's headroom. Both only read.
     async fn read_drain_scans(&self) -> DrainScans {
@@ -160,6 +199,64 @@ impl SandboxManagerService {
             );
         }
         report(plan, &entered, &pool_members)
+    }
+
+    /// What an evacuating drain would find on this unsealed node now,
+    /// changing nothing: the plan [`Self::read_preview_plan`] makes, with
+    /// what a drain would start reported `pending` and none of it started.
+    /// A node sealed under a generation refuses it with `FailedPrecondition`
+    /// naming the generation, before its reads or after them, since a
+    /// preview describes an unsealed node; one whose seal row is unreadable
+    /// refuses it with `Internal`.
+    pub(super) fn finish_preview(&self, scans: DrainScans) -> Result<DrainReport, Status> {
+        self.refuse_preview_while_sealed()?;
+        let seal = self.activation_seal.status();
+        let DrainPass {
+            mut plan,
+            rows,
+            entered,
+            pool_members,
+        } = self
+            .read_preview_plan(scans.disk_headroom)
+            .unwrap_or_else(read_failed);
+        fold_scans(&mut plan, &rows, scans, &seal);
+        self.refuse_preview_while_sealed()?;
+        Ok(report(plan, &entered, &pool_members))
+    }
+
+    /// The refusal of a preview on a node whose seal is unreadable, or that
+    /// is sealed under a generation.
+    fn refuse_preview_while_sealed(&self) -> Result<(), Status> {
+        if let Some(error) = self.activation_seal.read_error() {
+            return Err(Status::internal(format!(
+                "activation seal unreadable: {error}"
+            )));
+        }
+        match self.activation_seal.status().sealed_generation {
+            Some(generation) => Err(Status::failed_precondition(format!(
+                "{} (generation {generation}); a drain preview reads only an unsealed node",
+                pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// A pass's reads and plan for a preview, which starts and notes
+    /// nothing. It plans as an evacuating drain would, so no started
+    /// sandbox is held. An unsealed node has no drain to continue, and a
+    /// drain call there would start with no failures, so the plan has none.
+    fn read_preview_plan(&self, disk_headroom: Option<u64>) -> Result<DrainPass, String> {
+        let PlanReads {
+            rows,
+            entered,
+            inputs,
+        } = self.read_plan_reads(disk_headroom)?;
+        Ok(DrainPass {
+            plan: plan(&rows, &inputs),
+            rows: row_ids(&rows),
+            entered,
+            pool_members: pool_member_ids(&rows),
+        })
     }
 
     /// One pass of the drain under a call's `generation`. One call runs at a
