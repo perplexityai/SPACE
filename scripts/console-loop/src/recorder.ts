@@ -35,6 +35,9 @@ export interface StepResult {
   ok: boolean;
   events: StepEvent[];
   notes: string[];
+  // With --video, where the step is in the run's recording, in ms from its
+  // start: what `npm run gifs` cuts each step's GIF from.
+  video?: { fromMs: number; toMs: number };
 }
 
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
