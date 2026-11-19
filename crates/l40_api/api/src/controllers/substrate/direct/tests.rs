@@ -16,6 +16,7 @@ use sqlx::PgPool;
 
 mod activating_client;
 mod idle_suspended;
+mod live_adoption;
 mod restore_lease_completion;
 mod substrate_scope;
 

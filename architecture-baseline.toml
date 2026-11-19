@@ -46,7 +46,6 @@
 # Writers of the control-plane Postgres `sandboxes` row outside sandbox-store.
 # They move into the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
-"crates/l40_api/api/src/controllers/substrate/direct.rs" = 1
 
 # No code outside the store names sbx-mgr's migrations or database path; the
 # database migrator takes them from the store.
