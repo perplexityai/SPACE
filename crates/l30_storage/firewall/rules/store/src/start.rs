@@ -97,8 +97,11 @@ pub enum StartError {
     RolloutInProgress,
     #[error("node {0} can't enforce the candidate firewall revision")]
     Unqualified(NodeId),
-    #[error("starting a firewall rules rollout is disabled: {0}")]
-    NotEnabled(&'static str),
+    #[error(
+        "starting a firewall rules rollout is disabled: no enrollment predicate or target \
+         qualification is approved"
+    )]
+    NotEnabled,
     #[error("stored firewall revision {id} doesn't decode: {source}")]
     StoredRevision { id: RevisionId, source: DecodeError },
     #[error("the firewall_rules_control row is missing")]
@@ -121,7 +124,7 @@ impl StartError {
 }
 
 /// Who a start targets and whether they can enforce its candidate.
-pub(crate) trait Targets {
+trait Targets {
     /// Every enrolled node, offline ones included, read once under the
     /// control lock.
     async fn enrolled(&mut self, tx: &mut PgConnection) -> Result<Vec<NodeId>, StartError>;
@@ -132,8 +135,6 @@ pub(crate) trait Targets {
     -> Result<(), StartError>;
 }
 
-const UNAPPROVED: &str = "no firewall enrollment predicate or target qualification is approved";
-
 /// Production's targets until an enrollment predicate and a qualification
 /// contract are approved: refused, with no fallback, before anything is
 /// written.
@@ -141,11 +142,11 @@ struct Unapproved;
 
 impl Targets for Unapproved {
     async fn enrolled(&mut self, _tx: &mut PgConnection) -> Result<Vec<NodeId>, StartError> {
-        Err(StartError::NotEnabled(UNAPPROVED))
+        Err(StartError::NotEnabled)
     }
 
     fn qualify(&self, _: &FirewallRuleRevision, _: &[NodeId]) -> Result<(), StartError> {
-        Err(StartError::NotEnabled(UNAPPROVED))
+        Err(StartError::NotEnabled)
     }
 }
 
@@ -159,7 +160,7 @@ pub async fn start_rollout(
     start_with(conn, start, &mut Unapproved).await
 }
 
-pub(crate) async fn start_with(
+async fn start_with(
     conn: &mut PgConnection,
     start: &StartRollout,
     targets: &mut impl Targets,
@@ -270,7 +271,7 @@ async fn lock_control(tx: &mut PgConnection) -> Result<Option<Option<RevisionId>
 }
 
 /// Read revision `id` back through the protocol's strict decoder.
-pub(crate) async fn read_revision(
+async fn read_revision(
     executor: impl sqlx::PgExecutor<'_>,
     id: RevisionId,
 ) -> Result<FirewallRuleRevision, StartError> {

@@ -12,6 +12,7 @@
 //! [`start_rollout`] saves a reviewed revision and the nodes it targets
 //! without adopting it; [`adopt_rollout_revision`] adopts it later, inside
 //! the completion that proves it.
+//!
 //! [`lease_targets`] leases a rollout's saved targets to a controller under
 //! the shared queue's rules ([`pplx_space_rollout_queue`]); [`renew_lease`],
 //! [`requeue`] and [`redrive_expired`] keep or end the lease.

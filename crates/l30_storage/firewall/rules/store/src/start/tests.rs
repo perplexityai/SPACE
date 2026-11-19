@@ -277,15 +277,9 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
     assert_eq!(state(pool).await?.0, unchanged);
 
     // The response is lost and the request repeated: refused, not answered
-    // from a receipt.
-    let repeated = start(pool, a, &candidate).await;
-    assert!(
-        matches!(repeated, Err(StartError::RolloutInProgress)),
-        "{repeated:?}"
-    );
-    // The other unfinished phases hold the slot too, checked before a target
-    // that would fail is judged.
-    for phase in ["rolling", "paused"] {
+    // from a receipt, in every unfinished phase, before a target that would
+    // fail is judged.
+    for phase in ["canary", "rolling", "paused"] {
         set_phase(pool, started.rollout_id, phase).await?;
         let pinned = Fixture {
             incompatible: Some((nodes[0], id("dns"))),
@@ -337,7 +331,7 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
     };
     let refused = start_rollout(&mut conn, &production).await;
     assert!(
-        matches!(refused, Err(StartError::NotEnabled(_))),
+        matches!(refused, Err(StartError::NotEnabled)),
         "{refused:?}"
     );
 
