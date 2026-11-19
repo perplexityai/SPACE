@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 #[cfg(target_os = "linux")]
 pub mod install;
+#[cfg(target_os = "linux")]
+pub mod verify;
 
 const FAMILY: &str = "ip";
 const TABLE: &str = "space_firewall_rules";
