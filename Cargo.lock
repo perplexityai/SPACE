@@ -8531,6 +8531,7 @@ dependencies = [
  "pplx-space-migration-checksums",
  "pplx-space-observability",
  "pplx-space-sql-locator",
+ "pplx-space-test-env",
  "rusqlite",
  "sqlx",
  "tempfile",

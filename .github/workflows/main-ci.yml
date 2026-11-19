@@ -108,7 +108,8 @@ jobs:
     with:
       base_sha: ${{ github.event.before }}
       # One push can land a whole merge-queue batch, so before..after can span
-      # several PRs; judge migration isolation per landed commit instead.
+      # several PRs; judge migration isolation and SQLite rollback safety per
+      # landed commit instead.
       per_commit_migration_isolation: true
       # Main is the one pipeline that pays for the full-scale runs. Pull
       # requests and the merge queue keep the default and rely on the

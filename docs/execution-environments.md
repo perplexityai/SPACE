@@ -1725,8 +1725,9 @@ sandbox-manager that predates activation answers `ALREADY_ON_TARGET` with no
 execution, and the shim fails the create.
 
 A sandbox-manager from this release applies the
-`sandbox_runtime_upgrade_outcomes` migration at startup, and an older one
-refuses a database whose migration history holds a version it doesn't bundle.
+`sandbox_runtime_upgrade_outcomes` migration at startup, and an older one,
+from before SQLite rollbacks became image-only, refuses a database whose
+migration history holds a version it doesn't bundle.
 So a rollback build reverts the code but keeps that migration, its files under
 `db/sandbox-manager/` and its entry in the store's migration list, as
 `db/README.md` requires of any binary rollback. The table only adds rows, and
