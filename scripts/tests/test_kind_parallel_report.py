@@ -185,6 +185,14 @@ def test_a_pair_skipped_on_two_benches_is_duplicated(tmp_path):
     assert summary["coverage"]["surfaces"]["ecw"]["duplicated"] == ["ecw.b"]
 
 
+def test_a_pair_skipped_twice_on_one_bench_is_duplicated(tmp_path):
+    status, summary = run(
+        tmp_path, [shard([("ecw.a", 0)], [("native.c", 0)]), shard([], [("native.d", 0)], skipped=["ecw.b", "ecw.b"])]
+    )
+    assert status == 2
+    assert summary["coverage"]["surfaces"]["ecw"]["duplicated"] == ["ecw.b"]
+
+
 def test_missing_and_unexpected_pairs_fail_the_coverage_check(tmp_path):
     status, summary = run(
         tmp_path, [shard([("ecw.a", 0)], [("native.c", 0)]), shard([("ecw.z", 0)], [("native.d", 0)])]

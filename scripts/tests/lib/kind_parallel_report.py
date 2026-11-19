@@ -124,12 +124,12 @@ def parse_typed(log: Path) -> dict:
             if match := PASS_STATUS.match(line):
                 for surface, status in zip(SURFACES, match.groups()):
                     surfaces.setdefault(
-                        surface, {"run": [], "exits": {}, "skipped": {}, "known": set(), "suite": None}
+                        surface, {"run": [], "exits": {}, "skipped": [], "known": set(), "suite": None}
                     )["status"] = int(status)
             break
         if match := SURFACE.match(line):
             current = surfaces.setdefault(
-                match[1], {"run": [], "exits": {}, "skipped": {}, "known": set(), "suite": None}
+                match[1], {"run": [], "exits": {}, "skipped": [], "known": set(), "suite": None}
             )
             partitioned = False
             continue
@@ -144,7 +144,8 @@ def parse_typed(log: Path) -> dict:
         elif match := KNOWN_FAILURE.match(line):
             current["known"].add(match[1])
         elif (match := SKIPPED.match(line)) and partitioned:
-            current["skipped"][match[1]] = match[2]
+            # One entry per line, as runs are: a pair skipped twice is covered twice.
+            current["skipped"].append(match[1])
         elif match := SUITE.match(line):
             current["suite"] = dict(
                 zip(("passed", "warned", "failed", "inconclusive"), map(int, match.groups()))
@@ -302,7 +303,7 @@ def summarize(out: Path) -> int:
         for surface, data in typed.items():
             pass_failed = False
             seen.setdefault(surface, Counter()).update(data["run"])
-            skipped.setdefault(surface, Counter()).update(data["skipped"].keys())
+            skipped.setdefault(surface, Counter()).update(data["skipped"])
             for scenario in data["run"]:
                 code = data["exits"].get(scenario)
                 if code != 0:
