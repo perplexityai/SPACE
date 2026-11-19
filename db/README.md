@@ -92,8 +92,10 @@ history, each recorded migration that succeeded, that it doesn't bundle, that
 records a SHA-384 checksum, and that is newer than every migration that catalog
 bundles. It leaves each one applied and logs a warning per row with the
 `store`, `migration_version` and `recorded_checksum` (the recorded SHA-384, in
-hex). The allowlist and markers in 'Rollback-safe SQLite migrations' are what
-make that safe. It still refuses, before any write:
+hex). Accepting a migration only leaves it in place; it doesn't verify that the
+older release can still read and write the data that migration left. The
+allowlist and markers in 'Rollback-safe SQLite migrations' are what make that
+safe. It still refuses, before any write:
 
 - a failed row;
 - a bundled row whose recorded checksum it doesn't accept (see 'Equivalent

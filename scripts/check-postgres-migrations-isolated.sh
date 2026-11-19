@@ -9,152 +9,33 @@ if [[ "${BUILDKITE_BRANCH:-}" == trunk-merge/* ]]; then
   exit 0
 fi
 
-base_ref() {
-  local base_branch="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
-  printf '%s\n' "${MIGRATION_ISOLATION_BASE_REF:-${MIGRATION_VERSION_GUARD_BASE_REF:-origin/${base_branch}}}"
-}
-
-ensure_base_ref() {
-  local base_branch="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
-  local override="${MIGRATION_ISOLATION_BASE_REF:-${MIGRATION_VERSION_GUARD_BASE_REF:-}}"
-
-  # Kept in step with scripts/check-migration-versions.sh, which carries the
-  # full rationale. In short: freshen every run rather than only when the ref is
-  # absent, because a persistent CI agent can carry a present-but-stale
-  # `origin/<base>` and the stale case is the one that misleads the diff. Skip
-  # only when there is no remote to fetch from (the self-tests' synthetic repos),
-  # never merely because a base ref was pinned — a pin is usually a
-  # remote-tracking ref, which is exactly what goes stale.
-  local override_branch="${override#origin/}"
-  if [[ -n "${override}" ]]; then
-    if [[ "${override}" == origin/* ]] \
-      && [[ -n "${override_branch}" ]] \
-      && [[ "${override_branch}" != HEAD ]] \
-      && [[ "${override_branch}" != *[~^:]* ]] \
-      && [[ "${override_branch}" != *"@{"* ]] \
-      && git check-ref-format --branch "${override_branch}" >/dev/null 2>&1; then
-      base_branch="${override_branch}"
-    else
-      # A raw SHA, `upstream/main`, `HEAD~1`: no branch to derive. Fetching the
-      # default base instead would force-update a ref nobody asked about — in a
-      # ref store shared with every sibling worktree — without making the
-      # requested base any more resolvable. Leave the pin alone.
-      return 0
-    fi
-  fi
-
-  if ! git remote get-url origin >/dev/null 2>&1; then
-    if [[ -n "${BUILDKITE_BUILD_ID:-}" ]] \
-      && [[ "${BUILDKITE_BRANCH:-}" != trunk-merge/* ]]; then
-      echo "ERROR: origin remote is not configured; cannot verify" \
-        "$(base_ref) is current in CI." >&2
-      return 1
-    fi
-    return 0
-  fi
-
-  # `+refs/heads/<base>` in full: the `+` forces a diverged update (a plain
-  # fetch refuses it), and the qualified source stops git deleting the
-  # destination and failing to recreate it. A second `--deepen=50` fetch runs
-  # only when a shallow checkout still lacks a merge base after the refresh.
-  # Preserve Buildkite-provided askpass and SSH authentication while keeping
-  # terminal prompts disabled. Local runs still clear askpass helpers so an IDE
-  # integration cannot open a UI or hang the guard. The version guard carries
-  # the full precedence rationale.
-  local configured_ssh_command
-  configured_ssh_command="$(git config --get core.sshCommand 2>/dev/null || true)"
-
-  local -a fetch_env=(env GIT_TERMINAL_PROMPT=0)
-  local -a git_command=(git)
-  if [[ -z "${BUILDKITE_BUILD_ID:-}" ]]; then
-    fetch_env+=(GIT_ASKPASS= SSH_ASKPASS=)
-    git_command+=(-c core.askPass=)
-  fi
-  if [[ -z "${GIT_SSH_COMMAND:-}" ]] \
-    && [[ -z "${configured_ssh_command}" ]] \
-    && [[ -z "${GIT_SSH:-}" ]] \
-    && { [[ -z "${BUILDKITE_BUILD_ID:-}" ]] || [[ -z "${SSH_ASKPASS:-}" ]]; }; then
-    fetch_env+=(GIT_SSH_COMMAND="ssh -oBatchMode=yes")
-  fi
-
-  local fetch_timeout_secs="${MIGRATION_GUARD_FETCH_TIMEOUT_SECS:-60}"
-  local timeout_bin=""
-  local fetch_failure_reason=""
-  local candidate
-  for candidate in timeout gtimeout; do
-    if command -v "${candidate}" >/dev/null 2>&1; then
-      timeout_bin="$(command -v "${candidate}")"
-      break
-    fi
-  done
-  if [[ ! "${fetch_timeout_secs}" =~ ^[1-9][0-9]*$ ]]; then
-    fetch_failure_reason="the configured fetch timeout is invalid"
-  elif [[ -z "${timeout_bin}" ]]; then
-    fetch_failure_reason="timeout/gtimeout is unavailable"
-  fi
-
-  local -a timeout_command=()
-  if [[ -z "${fetch_failure_reason}" ]]; then
-    timeout_command=("${timeout_bin}" --kill-after=5s "${fetch_timeout_secs}s")
-  fi
-  local -a fetch_command=("${git_command[@]}" fetch --no-tags origin)
-
-  if [[ -z "${fetch_failure_reason}" ]] \
-    && ! "${timeout_command[@]}" "${fetch_env[@]}" "${fetch_command[@]}" \
-    "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}" \
-    >/dev/null 2>&1; then
-    fetch_failure_reason="git fetch failed or timed out"
-  fi
-  if [[ -n "${fetch_failure_reason}" ]]; then
-    # Git and remote helpers can include credential-bearing URLs in stderr.
-    echo "WARN: could not freshen origin/${base_branch};" \
-      "${fetch_failure_reason}." >&2
-    if [[ -n "${BUILDKITE_BUILD_ID:-}" ]] \
-      && [[ "${BUILDKITE_BRANCH:-}" != trunk-merge/* ]]; then
-      if git rev-parse --verify --quiet "$(base_ref)^{commit}" >/dev/null; then
-        echo "ERROR: could not verify origin/${base_branch} is current in CI." >&2
-        echo "  Refusing to compare against a cached ref after refresh failed; it" >&2
-        echo "  may be stale and can hide or invent changes relative to the real base." >&2
-        return 1
-      fi
-      # Let the no-base gate below report the more specific missing-ref error.
-      return 0
-    fi
-    echo "WARN: comparing against the cached ref, which may be stale." >&2
-    return 0
-  fi
-
-  if git merge-base "$(base_ref)" HEAD >/dev/null 2>&1 \
-    || [[ "$(git rev-parse --is-shallow-repository 2>/dev/null || true)" != true ]]; then
-    return 0
-  fi
-
-  local -a deepen_command=("${git_command[@]}" fetch --no-tags --deepen=50 origin)
-  if ! "${timeout_command[@]}" "${fetch_env[@]}" "${deepen_command[@]}" \
-    "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}" \
-    >/dev/null 2>&1; then
-    echo "WARN: could not deepen history for origin/${base_branch};" \
-      "the direct tree fallback may include inherited files." >&2
-  fi
-}
+# shellcheck source=lib/migration-base.sh
+source "${repo_root}/scripts/lib/migration-base.sh"
+# Its own pin first, then the version guard's. A Buildkite PR build names its
+# target branch, which may be a stacked PR's parent rather than main. Merge-queue
+# builds exit above, so the `exempt` policy is never reached here.
+migration_base_configure \
+  "${MIGRATION_ISOLATION_BASE_REF:-${MIGRATION_VERSION_GUARD_BASE_REF:-}}" \
+  "${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}" exempt
 
 # Fail closed in CI when no base ref could be established. Without one the diff
 # narrows to HEAD's own commit, so a PR whose earlier commit adds a migration and whose
 # later commit edits runtime app code slips through the isolation gate.
 # A guard that cannot compare must not report success. Scoped to CI: offline
-# local runs still degrade to the WARN above and stay usable.
+# local runs still degrade to migration_base_ensure's WARNs and stay usable.
 #
 # Called from the main shell on purpose — the consumer below runs inside a
 # process substitution, where a non-zero return could not stop the script.
 require_base_ref_in_ci() {
   is_git_worktree || return 0
-  [[ -n "${BUILDKITE_BUILD_ID:-}" ]] || return 0
+  migration_base_fails_closed || return 0
 
-  local ref
-  ref="$(base_ref)"
+  local ref name
+  ref="$(migration_base_ref)"
+  name="$(migration_base_name)"
   git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null && return 0
 
-  echo "ERROR: no base ref to compare against; wanted ${ref}." >&2
+  echo "ERROR: no base ref to compare against; wanted ${name}." >&2
   echo "  Refusing to report success in CI with no base: the diff would narrow" >&2
   echo "  to HEAD alone and miss anything added in an earlier commit." >&2
   echo "  If a WARN above names a fetch failure, that is the cause; otherwise no" >&2
@@ -199,7 +80,7 @@ comparison_uses_merge_base=false
 
 resolve_changed_files_base() {
   local ref
-  ref="$(base_ref)"
+  ref="$(migration_base_ref)"
 
   if git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
     if comparison_base_commit="$(git merge-base "${ref}" HEAD 2>/dev/null)"; then
@@ -224,7 +105,7 @@ changed_files() {
     if [[ "${comparison_uses_merge_base}" == true ]]; then
       git diff --name-only --no-renames --diff-filter=ACMRTD "${comparison_base_commit}...HEAD"
     else
-      echo "WARN: no merge-base with $(base_ref); using a direct tree diff for changed files." >&2
+      echo "WARN: no merge-base with $(migration_base_name); using a direct tree diff for changed files." >&2
       echo "      That diff reports every difference between the two trees, not" >&2
       echo "      what this branch added, so it can name files inherited from the" >&2
       echo "      base. A shallow checkout whose fork point is deeper than the" >&2
@@ -641,7 +522,7 @@ is_runtime_app_change() {
 # shell: the consumer runs inside a process substitution, so a fetch from there
 # would land after the gate had already decided the base was unrecoverable.
 if is_git_worktree; then
-  if ! ensure_base_ref; then
+  if ! migration_base_ensure; then
     exit 1
   fi
 fi

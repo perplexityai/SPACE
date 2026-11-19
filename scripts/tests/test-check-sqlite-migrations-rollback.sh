@@ -31,10 +31,11 @@ fail() {
 git init -q --template= -b main "${repo}"
 git -C "${repo}" config user.name test
 git -C "${repo}" config user.email test@example.com
-mkdir -p "${repo}/scripts" "${repo}/ci/scripts" "${repo}/db/${store}" "${repo}/db/node-manager" \
+mkdir -p "${repo}/scripts/lib" "${repo}/ci/scripts" "${repo}/db/${store}" "${repo}/db/node-manager" \
   "${repo}/db/common" "${repo}/db/postgres" "${repo}/db/template-manager/history"
 cp "${repo_root}/scripts/check-sqlite-migrations-rollback.sh" \
   "${repo_root}/scripts/check_sqlite_migrations_rollback.py" "${repo}/scripts/"
+cp "${repo_root}/scripts/lib/migration-base.sh" "${repo}/scripts/lib/"
 cp "${repo_root}/ci/scripts/resolve-migration-base.sh" \
   "${repo_root}/ci/scripts/check-sqlite-migrations-rollback-per-commit.sh" "${repo}/ci/scripts/"
 printf '[rules.layers.state.shared_catalogs]\ncommon = ["%s"]\n' "${store}" >"${repo}/ARCHITECTURE.toml"
@@ -298,6 +299,37 @@ resolved="$(cd "${repo}" && bash ci/scripts/resolve-migration-base.sh "${group_b
 [[ "${resolved}" == "${group_base}" ]] || fail "merge group: resolved ${resolved}"
 MIGRATION_SQLITE_ROLLBACK_BASE_REF="${resolved}" expect_fail merge-group \
   "ERROR: db/${store}/20261102000000_entry.up.sql:1: ${store}: sandboxes.legacy: schema: " "1 SQLite rollback finding(s)"
+
+# The guard's own pin wins over the version guard's, and an empty one falls
+# back to it. HEAD as the base leaves nothing to check.
+run_guard pin-fallback MIGRATION_SQLITE_ROLLBACK_BASE_REF= MIGRATION_VERSION_GUARD_BASE_REF=HEAD \
+  || { cat "${tmp_dir}/pin-fallback.out" >&2; fail "pin-fallback: expected pass"; }
+grep -qF 'No changed SQLite migrations' "${tmp_dir}/pin-fallback.out" || fail "pin-fallback: checked against origin/main"
+# The guard's own pin (HEAD: nothing to check) must beat the version guard's
+# (the merge-group base, which has a finding), and neither may be ignored in
+# favour of the origin/main default, which has findings too.
+run_guard pin-own MIGRATION_SQLITE_ROLLBACK_BASE_REF=HEAD MIGRATION_VERSION_GUARD_BASE_REF="${resolved}" \
+  || { cat "${tmp_dir}/pin-own.out" >&2; fail "pin-own: expected pass"; }
+grep -qF 'No changed SQLite migrations' "${tmp_dir}/pin-own.out" || fail "pin-own: didn't use its own pin"
+
+# A local branch named origin/main, here at the change itself, would leave
+# nothing to check. The default base and an origin/main pin both compare with
+# refs/remotes/origin/main, the ref the refresh writes, rather than letting
+# that branch shadow it.
+commit_case shadowed-base "${file}" "DROP TABLE scratch;"
+git -C "${repo}" update-ref refs/heads/origin/main HEAD
+for pin in origin/main ""; do
+  if run_guard shadowed-base MIGRATION_SQLITE_ROLLBACK_BASE_REF="${pin}"; then
+    cat "${tmp_dir}/shadowed-base.out" >&2
+    fail "shadowed-base, pin '${pin}': expected failure"
+  fi
+  for line in "Checking changed SQLite migrations for rollback safety against ${base}:" \
+    "ERROR: ${file}:1: ${store}: scratch: schema: "; do
+    grep -qF -- "${line}" "${tmp_dir}/shadowed-base.out" \
+      || { cat "${tmp_dir}/shadowed-base.out" >&2; fail "shadowed-base, pin '${pin}': missing '${line}'"; }
+  done
+done
+git -C "${repo}" update-ref -d refs/heads/origin/main
 
 # Main's batched push: one PR creates a table and the next drops it with a
 # marker. As one change the drop is of a new table and the marker is stale;
