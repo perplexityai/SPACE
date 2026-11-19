@@ -8820,6 +8820,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-release-store"
+version = "0.8.2"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "bytes",
+ "http 1.5.0",
+ "pplx-space-artifact-model",
+ "pplx-space-content-digest",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-execution-spec",
+ "pplx-space-object-store",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-template-runtime"
 version = "0.8.2"
 dependencies = [

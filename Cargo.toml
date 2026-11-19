@@ -200,6 +200,7 @@ members = [
     "crates/l40_api/template/mgr/server",
     "crates/l40_api/template/mgr/client",
     "crates/l30_storage/template/mgr/store",
+    "crates/l30_storage/template/release/store",
     "crates/l40_api/template/publisher",
     "crates/l40_api/credmgr/client",
     "crates/l40_api/credmgr/server",
@@ -551,6 +552,7 @@ pplx-space-spaced-host-server = { path = "crates/l40_api/spaced/host/server" }
 pplx-space-template-mgr = { path = "crates/l40_api/template/mgr/server" }
 pplx-space-template-mgr-client = { path = "crates/l40_api/template/mgr/client" }
 pplx-space-template-mgr-store = { path = "crates/l30_storage/template/mgr/store" }
+pplx-space-template-release-store = { path = "crates/l30_storage/template/release/store" }
 pplx-space-template-publisher = { path = "crates/l40_api/template/publisher" }
 pplx-space-test-env = { path = "crates/test_support/test/env" }
 pplx-space-unix-socket-path = { path = "crates/l10_foundation/unix/socket/path" }
