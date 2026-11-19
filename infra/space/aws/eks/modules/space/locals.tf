@@ -313,6 +313,10 @@ locals {
       # every run for such a group. Builders pin EKS's default (surge-first)
       # explicitly; changing only the strategy does not roll nodes.
       update_strategy = name == "builders" ? "DEFAULT" : null
+      # Only builders runs a custom AMI here, and only a custom-AMI pool tracks
+      # its template's latest version; the EKS-managed pools already stay on
+      # theirs.
+      launch_template_version = name == "builders" ? var.builders_launch_template_version : null
       additional_security_group_ids = concat(
         # general_nodes carries the shared-services access RDS/Redis admit.
         # cred-authority hosts credmgr-authority, which reads DATABASE_URL from

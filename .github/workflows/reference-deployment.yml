@@ -3,10 +3,10 @@ name: Reference deployment
 # Applies infra/space/aws/reference/cluster, and then the add-ons in
 # infra/space/aws/reference/addons, on a schedule, in an AWS account with no
 # Perplexity workloads, so drift and module regressions surface without anyone
-# remembering to look. Pull requests only check formatting and validate (the
-# roots, the add-on charts, verify.sh and the node AMI recipes): they get no
-# AWS credentials, because a plan executes provider code and a
-# pull request can come from a fork.
+# remembering to look. Pull requests only check formatting, validate (the roots,
+# the add-on charts, verify.sh and the node AMI recipes) and run the eks-cluster
+# module's mocked tests: they get no AWS credentials, because a plan executes
+# provider code and a pull request can come from a fork.
 #
 # The apply job stays off until the REFERENCE_DEPLOYMENT_ROLE_ARN and
 # REFERENCE_TF_STATE_BUCKET repository variables are set from the bootstrap
@@ -87,6 +87,16 @@ jobs:
             terraform -chdir="${root}" validate
             echo "::endgroup::"
           done
+
+      # Mocked providers, so no AWS credentials. The module has no lock file of
+      # its own (the roots that call it pin the providers).
+      - name: Test the eks-cluster module
+        working-directory: infra/space/aws/eks/modules/eks-cluster
+        run: |
+          set -euo pipefail
+          export TF_PLUGIN_CACHE_DIR="${RUNNER_TEMP}/terraform-plugin-cache"
+          terraform init -backend=false -input=false
+          terraform test
 
       # The add-on charts render only at apply time otherwise. The password and
       # image are stand-ins: both charts refuse to render without them.
