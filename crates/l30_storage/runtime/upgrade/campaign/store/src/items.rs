@@ -569,32 +569,29 @@ async fn nodeless_candidates(
     subject_kind: SubjectKind,
     scan_limit: u32,
 ) -> Result<NodeCandidates, sqlx::Error> {
-    let in_flight = sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT count(*)
-         FROM runtime_upgrade_items
-         WHERE campaign_id = $1
-           AND subject_kind = $2
-           AND phase = $3"
-    ))
-    .bind(campaign_id)
-    .bind(subject_kind.as_str())
-    .bind(ItemPhase::InFlight.as_str())
-    .fetch_one(&mut *tx)
-    .await?;
-    let pending = sqlx::query_scalar::<_, uuid::Uuid>(sql!(
-        "SELECT subject_id
-         FROM runtime_upgrade_items
-         WHERE campaign_id = $1
-           AND subject_kind = $2
-           AND phase = $3
-         ORDER BY subject_id
-         LIMIT $4"
+    // One statement, so one snapshot: an item that leaves flight in between
+    // would otherwise count both in flight and pending.
+    let (in_flight, pending) = sqlx::query_as::<_, (i64, Vec<uuid::Uuid>)>(sql!(
+        "SELECT
+             (SELECT count(*)
+              FROM runtime_upgrade_items
+              WHERE campaign_id = $1
+                AND subject_kind = $2
+                AND phase = $5),
+             ARRAY(SELECT subject_id
+                   FROM runtime_upgrade_items
+                   WHERE campaign_id = $1
+                     AND subject_kind = $2
+                     AND phase = $3
+                   ORDER BY subject_id
+                   LIMIT $4)"
     ))
     .bind(campaign_id)
     .bind(subject_kind.as_str())
     .bind(ItemPhase::Pending.as_str())
     .bind(i64::from(scan_limit))
-    .fetch_all(&mut *tx)
+    .bind(ItemPhase::InFlight.as_str())
+    .fetch_one(&mut *tx)
     .await?;
     Ok((
         vec![(None, in_flight)],
