@@ -50,15 +50,27 @@ done
 curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1 \
   || error "the Kind data plane at 127.0.0.1:8090 never became healthy"
 # The runner prints no times; <log>.events stamps each scenario's start and end
-# and each pass's boundaries for smoke-kind-parallel.sh's timeline.
+# and each pass's boundaries for smoke-kind-parallel.sh's timeline. The filter
+# passes every line through to stdout (the step log), as bytes so output that
+# isn't UTF-8 can't stop it; a failed events write stops only the events. It
+# stays in the pipeline, so the events are complete when this script exits.
 bash "$REPO_ROOT/scripts/tests/smoke-kind-typed.sh" all "$SMOKE_SHARD" 2>&1 \
   | tee "$LOG" \
   | python3 -u -c '
 import re, sys, time
-pattern = re.compile(r"^(=== RUN |--- typed smoke on |SUITE: |SHARD )|=== END ")
-with open(sys.argv[1], "w") as events:
-    for line in sys.stdin:
-        if pattern.search(line):
-            events.write(f"{time.time():.0f} {line}")
+pattern = re.compile(rb"^(=== RUN |--- typed smoke on |SUITE: |SHARD )|=== END ")
+try:
+    events = open(sys.argv[1], "wb")
+except OSError as err:
+    print(f"kind-typed-shard: no timeline events: {err}", file=sys.stderr)
+    events = None
+for line in sys.stdin.buffer:
+    sys.stdout.buffer.write(line)
+    if events is not None and pattern.search(line):
+        try:
+            events.write(b"%.0f " % time.time() + line)
             events.flush()
+        except OSError as err:
+            print(f"kind-typed-shard: timeline events stopped: {err}", file=sys.stderr)
+            events = None
 ' "$LOG.events"
