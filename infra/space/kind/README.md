@@ -363,11 +363,22 @@ inventory exactly once: each (surface, scenario) pair has one `=== RUN`, or was
 skipped by a bench's mode after the partition, which counts as covered. The
 script exits as the typed suite ranks a suite: 1 when any scenario failed;
 else 2 when a bench did not come up, a scenario was inconclusive or did not
-finish, a pass exited 2 outside any scenario, the coverage check failed, or
-the run's teardown left benches on the host; else 42 when a scenario warned;
-else 0.
+finish, a pass exited 2 outside any scenario, the coverage check failed, the
+checkout changed during the run, or the run's teardown left benches on the
+host; else 42 when a scenario warned; else 0.
 A failure the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) excused is
-listed but does not fail the run. Without `--benches` it picks N
+listed but does not fail the run.
+
+The checkout must not change during a run: no edits, checkouts or commits
+until it ends. Each bench copies it, with its uncommitted changes, when it
+starts, and the host builds Rust, the images and the seed from it. The
+summary names the commit and a fingerprint of the uncommitted changes
+recorded at the start. Each bench checks its copy against that record, and
+the checkout is checked again after each host step. Any mismatch makes the
+run incomplete (exit 2, unless a scenario failure gives 1), and the summary
+says the checkout changed during the run.
+
+Without `--benches` it picks N
 from the host's CPUs, available memory, free disk and a short write-throughput
 probe of the bench volume, and prints each factor. One run or teardown
 holds the host at a time (a lock on `/run/space-bench.d`), and a run first

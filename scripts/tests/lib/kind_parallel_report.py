@@ -7,14 +7,17 @@ eligibility and partition (space_smoke.sharding.joint_inventories and
 select_shard). It needs the project environment (`uv run`), and reads the same
 variables the runner reads.
 
-`source REPO FILE` records the checkout a run starts from (see `source`).
+`source REPO FILE` records the checkout a run starts from (see `source`), and
+`check-source REPO FILE TREE` prints `same` when TREE, the checkout or a bench's
+copy of it, still matches that record.
 
 `summarize OUT` reads the run directory smoke-kind-parallel.sh wrote, writes
 summary.md, summary.json and timeline.txt there, and exits as the typed suite
 ranks a suite (space_smoke/suite.py, suite_exit_code): 1 when any scenario
 failed; else 2 when a bench did not come up, a scenario was inconclusive or did
 not finish, a pass exited 2 outside any scenario, the benches did not cover
-the inventory exactly once, or the run's teardown left benches; else 42
+the inventory exactly once, the checkout changed during the run, or the run's
+teardown left benches; else 42
 when a scenario warned; else 0. A failure the known-failures list excused
 (`KNOWN FAILURE <id>` in its pass) is listed and does not count as one, and a
 scenario a bench's mode skipped after the partition counts as covered. It
@@ -371,6 +374,13 @@ def summarize(out: Path) -> int:
             coverage["surfaces"][surface] = entry
             if not entry["exactly_once"]:
                 incomplete = True
+    # Each check that the checkout a bench copied or a host step read was the
+    # recorded one (smoke-kind-parallel.sh check_source): a mismatch means the
+    # run did not test the checkout the summary names.
+    changes_path = out / "source-changes"
+    source_changes = changes_path.read_text().splitlines() if changes_path.exists() else []
+    if source_changes:
+        incomplete = True
     # The run's own teardown (none under --keep): benches it could not remove
     # are still on the host, holding its disk and its next run.
     teardown_failed = any(
@@ -381,6 +391,7 @@ def summarize(out: Path) -> int:
     status = 1 if failed else 2 if incomplete else 42 if warned else 0
 
     source = read_json(out / "source.json") or {}
+    source["changed_during_run"] = source_changes
     manifest = read_json(out / "host" / "rust" / "manifest.json") or {}
     reuse = out / "host" / "rust-reuse.out"
     source["rust_image"] = {
@@ -415,8 +426,8 @@ def summarize(out: Path) -> int:
         f"- benches: {count}; exit status {status}; wall-clock {clock(ended - start)} (start to last phase)",
         f"- checkout: {source.get('head', 'unknown')}"
         + (
-            f" with uncommitted changes (diff from HEAD sha256 {source.get('diff_from_head_sha256')},"
-            f" untracked files sha256 {source.get('untracked_sha256')})"
+            f" with uncommitted changes (sha256 {source.get('changes_sha256')} over the paths"
+            " that differ from HEAD)"
             if source.get("dirty")
             else " (clean)"
         ),
@@ -426,6 +437,11 @@ def summarize(out: Path) -> int:
         f" {source['rust_image'].get('built_from')}"
         + (" (main's image for the same input key)" if source["rust_image"]["reused_from_main"] else ""),
     ]
+    if source_changes:
+        md.append(
+            "- **the checkout changed during the run**, so it did not test the checkout above: "
+            + "; ".join(source_changes)
+        )
     if teardown_failed:
         md.append(
             f"- teardown: FAILED, benches are left on the host; see {out / 'teardown.log'},"
@@ -493,38 +509,76 @@ def summarize(out: Path) -> int:
     return status
 
 
-def source(repo: Path, destination: Path) -> int:
-    """Record the checkout a run starts from: its commit, whether the tree
-    differs from it, a fingerprint of how, and the lane settings.
+def git(repo: Path, *args: str) -> bytes:
+    # No optional locks: the checks run while the caller may be using the
+    # checkout, whose index a refresh would lock.
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        env=os.environ | {"GIT_OPTIONAL_LOCKS": "0"},
+    ).stdout
 
-    The fingerprint covers the diff from HEAD and every untracked entry the
-    benches' checkouts copy, without following links: a symlink's target text,
-    a regular file's content, and otherwise (an embedded repository, say) the
-    path alone.
+
+def fingerprint(repo: Path, tree: Path) -> dict:
+    """The checkout as a bench's copy of <repo> reproduces it: <tree>'s HEAD,
+    and a digest of every path the copy takes from <repo> instead of HEAD
+    (kind_bench_checkout's lists), read from <tree>.
+
+    <tree> is <repo> itself or a bench's copy. Without following links, a path
+    counts as a symlink's target text, a regular file's content and executable
+    bit, or otherwise (an embedded repository, say) the path alone; a path
+    deleted from HEAD counts by whether <tree> has it.
     """
 
-    def git(*args: str) -> bytes:
-        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True).stdout
+    def names(*args: str) -> list[bytes]:
+        return sorted(set(filter(None, git(repo, *args).split(b"\0"))))
 
-    untracked = hashlib.sha256()
-    for name in sorted(filter(None, git("ls-files", "-z", "--others", "--exclude-standard").split(b"\0"))):
-        path = repo / os.fsdecode(name)
-        untracked.update(name + b"\0")
+    changes = hashlib.sha256()
+    for name in names("diff", "-z", "--no-renames", "--name-only", "--diff-filter=d", "HEAD") + names(
+        "ls-files", "-z", "--others", "--exclude-standard"
+    ):
+        path = tree / os.fsdecode(name)
+        changes.update(name + b"\0")
         if path.is_symlink():
-            untracked.update(b"link\0" + os.fsencode(os.readlink(path)))
+            changes.update(b"link\0" + os.fsencode(os.readlink(path)))
         elif path.is_file():
-            untracked.update(b"file\0" + path.read_bytes())
-        untracked.update(b"\0")
+            executable = b"x" if path.stat().st_mode & 0o100 else b"-"
+            changes.update(b"file\0" + executable + path.read_bytes())
+        changes.update(b"\0")
+    for name in names("diff", "-z", "--no-renames", "--name-only", "--diff-filter=D", "HEAD"):
+        present = os.path.lexists(tree / os.fsdecode(name))
+        changes.update(b"deleted\0" + name + (b"\0present\0" if present else b"\0absent\0"))
+    return {"head": git(tree, "rev-parse", "HEAD").decode().strip(), "changes_sha256": changes.hexdigest()}
+
+
+def source(repo: Path, destination: Path) -> int:
+    """Record the checkout a run starts from: its commit, whether the tree
+    differs from it, its fingerprint, and the lane settings."""
+
     record = {
-        "head": git("rev-parse", "HEAD").decode().strip(),
-        "dirty": bool(git("status", "--porcelain").strip()),
-        "diff_from_head_sha256": hashlib.sha256(git("diff", "HEAD", "--binary")).hexdigest(),
-        "untracked_sha256": untracked.hexdigest(),
+        **fingerprint(repo, repo),
+        "dirty": bool(git(repo, "status", "--porcelain").strip()),
         "substrate": os.environ.get("SPACE_KIND_SUBSTRATE") or "kubernetes",
         "rust_build": os.environ.get("SPACE_KIND_RUST_BUILD") or "test-hooks",
         "tiers": os.environ.get("SPACE_SMOKE_TIERS") or "routine",
     }
     destination.write_text(json.dumps(record, indent=2) + "\n")
+    return 0
+
+
+def check_source(repo: Path, recorded: Path, tree: Path) -> int:
+    """Print `same` when <tree> (<repo>, or a bench's copy of it) is still the
+    checkout <recorded> describes, else what changed."""
+
+    before = json.loads(recorded.read_text())
+    now = fingerprint(repo, tree)
+    if now["head"] != before["head"]:
+        print(f"HEAD is {now['head']}, not {before['head']}")
+    elif now["changes_sha256"] != before["changes_sha256"]:
+        print("the files that differ from HEAD are not the recorded ones")
+    else:
+        print("same")
     return 0
 
 
@@ -536,11 +590,17 @@ def main() -> int:
     recorded = commands.add_parser("source")
     recorded.add_argument("repo", type=Path)
     recorded.add_argument("destination", type=Path)
+    checked = commands.add_parser("check-source")
+    checked.add_argument("repo", type=Path)
+    checked.add_argument("recorded", type=Path)
+    checked.add_argument("tree", type=Path)
     args = parser.parse_args()
     if args.command == "inventory":
         return inventory(args.benches)
     if args.command == "source":
         return source(args.repo, args.destination)
+    if args.command == "check-source":
+        return check_source(args.repo, args.recorded, args.tree)
     return summarize(args.out)
 
 

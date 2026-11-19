@@ -61,7 +61,7 @@ exactly once (each (surface, scenario) pair has one `=== RUN`, or was skipped
 by a bench's mode after the partition, which counts as covered). Its exit
 status ranks as a typed suite's does: `1` when a scenario failed, else `2` for an
 incomplete run (a bench down, an inconclusive scenario, a coverage gap, a
-failed teardown), else
+checkout that changed during the run, a failed teardown), else
 `42` for a warning, else `0`. Don't run the CI shards one after another on one
 stack instead.
 

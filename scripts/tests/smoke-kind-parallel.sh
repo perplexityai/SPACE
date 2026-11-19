@@ -37,8 +37,10 @@
 #
 # Exit status: as the typed suite ranks a suite: 1 a scenario failed; else 2
 # a bench did not come up, a scenario was inconclusive or unfinished, a pass
-# exited 2 outside any scenario, the coverage check failed, or the teardown at
-# the end left benches; else 42 a scenario warned; else 0.
+# exited 2 outside any scenario, the coverage check failed, the checkout
+# changed before the benches had copied it or the host had built it, or the
+# teardown at the end left benches; else 42 a scenario warned; else 0. The
+# checkout must not change during a run.
 #
 # Env: SPACE_KIND_SUBSTRATE, SPACE_KIND_STORAGE_CREDENTIALS, SPACE_KIND_RUST_BUILD,
 # SPACE_SMOKE_TIERS (default routine), SPACE_SMOKE_INCLUDE_SCENARIOS,
@@ -416,12 +418,28 @@ printf '%s\n' "$BENCHES" >"$OUT/bench-count"
 
 # What this run tests, for the summary: the checkout at the run's start
 # (kind_parallel_report.py source). The summary is a validation's evidence, so
-# it has to say which tree and build it covers.
+# it has to say which tree and build it covers. The checkout must not change
+# until the run has copied and built it: check_source compares each bench's
+# copy, and the checkout after each host step, with this record.
 SPACE_KIND_SUBSTRATE="${SPACE_KIND_SUBSTRATE:-}" SPACE_KIND_RUST_BUILD="${SPACE_KIND_RUST_BUILD:-}" \
   SPACE_SMOKE_TIERS="${SPACE_SMOKE_TIERS:-}" \
   python3 "$SCRIPT_DIR/lib/kind_parallel_report.py" source "$REPO_ROOT" "$OUT/source.json" \
   || die "could not record the checkout's state"
 log "run $RUN_ID: output in $OUT"
+
+# Whether <tree> (default the checkout; else a bench's copy of it) is still the
+# checkout source.json records. A mismatch, or a check that could not run,
+# goes into source-changes, which makes the run incomplete
+# (kind_parallel_report.py summarize).
+check_source() { # <who> [tree]
+  local who="$1" tree="${2:-$REPO_ROOT}" verdict
+  verdict="$(python3 "$SCRIPT_DIR/lib/kind_parallel_report.py" check-source \
+    "$REPO_ROOT" "$OUT/source.json" "$tree" 2>&1)" \
+    || verdict="could not be checked: ${verdict##*$'\n'}"
+  [[ "$verdict" == same ]] && return 0
+  printf '%s: %s\n' "$who" "$verdict" >>"$OUT/source-changes"
+  log "the checkout changed during the run: $who: $verdict"
+}
 
 # One line per phase: <owner> <phase> <start epoch> <end epoch> <exit status>.
 #
@@ -561,11 +579,16 @@ await() {
   done
   [[ -e "$HOST/$name.ok" ]]
 }
-# Run host step <name> in the background, marking its outcome.
+# Run host step <name> in the background, marking its outcome. Every host
+# step reads the checkout, so each then checks it is still the recorded one,
+# before its marker, which the summary waits for.
 host_step() {
   local name="$1"; shift
   (
-    if phase host "$name" "$@" >"$HOST/$name.log" 2>&1; then
+    local built=0
+    phase host "$name" "$@" >"$HOST/$name.log" 2>&1 && built=1
+    check_source "the checkout after host step $name"
+    if (( built )); then
       mark "$name" ok
     else
       mark "$name" failed
@@ -824,6 +847,7 @@ run_bench() {
   local src
   src="$(kind_bench_dir "$i")/src"
   phase "bench$i" checkout kind_bench_checkout "$REPO_ROOT" "$src" || return 1
+  check_source "bench $i's copy" "$src"
   # Bench commands start in the bench's checkout (kind_bench_exec keeps $PWD).
   cd "$src" || return 1
   bx() { kind_bench_exec "$i" "$env_file" "$@"; }
