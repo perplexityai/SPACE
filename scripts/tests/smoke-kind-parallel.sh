@@ -105,6 +105,19 @@ fi
 # <bench root>/cache between runs; delete that directory to reclaim the space.
 REGISTRY_LINK="${KIND_BENCH_PREFIX:0:8}0"
 REGISTRY_IP=192.168.241.1
+# The interface is this script's when it is a dummy carrying this alias, which
+# the script gives it when it creates it; an interface of that name without
+# both is someone else's, and is neither reused nor deleted.
+REGISTRY_LINK_ALIAS="$KIND_BENCH_PREFIX registries"
+registry_link_state() { # prints ours, absent or foreign
+  ip link show "$REGISTRY_LINK" >/dev/null 2>&1 || { echo absent; return; }
+  if ip -d link show "$REGISTRY_LINK" | grep -qw dummy \
+      && [[ "$(cat "/sys/class/net/$REGISTRY_LINK/ifalias" 2>/dev/null)" == "$REGISTRY_LINK_ALIAS" ]]; then
+    echo ours
+  else
+    echo foreign
+  fi
+}
 REGISTRY_IMAGE="public.ecr.aws/docker/library/registry:2"
 # Inside the bench root, which is the caller's (a bench's own directories are
 # numbered and marked, so nothing treats this one as a bench). Resolved, since
@@ -270,6 +283,9 @@ case "$docker_endpoint" in
   unix://* | tcp://localhost:* | tcp://127.0.0.1:*) ;;
   *) die "the docker CLI's endpoint $docker_endpoint is not a daemon on this host; the runner needs a local one" ;;
 esac
+if [[ "$COMMAND" == run && "$(registry_link_state)" == foreign ]]; then
+  die "the interface $REGISTRY_LINK exists and is not this script's (a dummy with alias \"$REGISTRY_LINK_ALIAS\"); remove or rename it"
+fi
 kind_bench_lock
 if [[ "$COMMAND" == teardown ]]; then
   sudo -n true 2>/dev/null || die "teardown needs passwordless sudo"
@@ -279,7 +295,10 @@ if [[ "$COMMAND" == teardown ]]; then
   remove_registry "$MIRROR_NAME" "$CACHE_ROOT/hub-mirror"
   remove_registry "$CACHE_NAME" "$CACHE_ROOT/layer-cache"
   registry_firewall_remove
-  sudo -n ip link del "$REGISTRY_LINK" 2>/dev/null || true
+  case "$(registry_link_state)" in
+    ours) sudo -n ip link del "$REGISTRY_LINK" 2>/dev/null || true ;;
+    foreign) log "leaving the interface $REGISTRY_LINK: it is not this script's (a dummy with alias \"$REGISTRY_LINK_ALIAS\")" ;;
+  esac
   exit "$status"
 fi
 
@@ -615,12 +634,16 @@ start_registry() { # name port data-dir [env...]
 
 start_registries() {
   # Each step whatever an interrupted run left of the interface.
-  if ip link show "$REGISTRY_LINK" >/dev/null 2>&1; then
-    ip -d link show "$REGISTRY_LINK" | grep -qw dummy \
-      || { log "$REGISTRY_LINK exists and is not a dummy interface; remove it"; return 1; }
-  else
-    sudo -n ip link add "$REGISTRY_LINK" type dummy || return 1
-  fi
+  case "$(registry_link_state)" in
+    foreign)
+      log "the interface $REGISTRY_LINK exists and is not this script's (a dummy with alias \"$REGISTRY_LINK_ALIAS\"); remove or rename it"
+      return 1
+      ;;
+    absent)
+      sudo -n sh -c 'ip link add "$1" type dummy && ip link set "$1" alias "$2"' _ \
+        "$REGISTRY_LINK" "$REGISTRY_LINK_ALIAS" || return 1
+      ;;
+  esac
   sudo -n ip addr replace "$REGISTRY_IP/32" dev "$REGISTRY_LINK" || return 1
   sudo -n ip link set "$REGISTRY_LINK" up || return 1
   registry_firewall || return 1

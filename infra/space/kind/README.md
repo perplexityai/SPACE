@@ -390,9 +390,12 @@ checkout. What it changes on the host:
 - **Docker:** installs Docker's static release under
   `/opt/space-bench-docker/<version>`, and starts two registry containers on the
   host's Docker (`--restart unless-stopped`) that keep running between runs.
-- **Network:** a dummy interface holding 192.168.241.1, a mangle-table chain
-  that accepts connections to that address only from the host and the benches'
-  links, and per bench a network namespace, a veth and iptables rules.
+- **Network:** a dummy interface `space-be0` holding 192.168.241.1, with the
+  alias `space-bench registries` by which runs and `teardown` know it as theirs
+  (a run refuses an interface of that name without both, and `teardown` leaves
+  it), a mangle-table chain that accepts connections to that address only from
+  the host and the benches' links, and per bench a network namespace, a veth
+  and iptables rules.
 - **Per bench:** cgroups under `/sys/fs/cgroup/space-bench-<i>`, a dockerd and
   containerd running as root with their data under the bench root, and a
   worktree of the checkout.
