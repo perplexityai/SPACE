@@ -15,8 +15,24 @@ postgres = [
     "firewall_rules_control",
     "firewall_rules_node_assignments",
     "firewall_rules_node_observations",
-    "firewall_rules_mutation_receipts",
 ]
 
 [lints]
 workspace = true
+
+[dependencies]
+sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
+time = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+# internal
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-rollout-queue = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
+
+[dev-dependencies]
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-node-status-store = { workspace = true, features = ["test-support"] }
+pplx-space-test-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
