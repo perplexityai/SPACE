@@ -88,14 +88,19 @@ fn done() -> Response {
 
 async fn mkdir(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Mkdir;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileMkdirRequest = json_body(&request, body).await?;
-    idempotency_key(&request.headers)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
-    let fingerprint = mkdir_fingerprint(&path, body.parents, user.as_ref()).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileMkdirRequest = json_body(&request, body).await?;
+        idempotency_key(&request.headers)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        let fingerprint =
+            mkdir_fingerprint(&path, body.parents, user.as_ref()).map_err(rejected)?;
+        Ok((body.parents, user, path, fingerprint))
+    };
+    let (parents, user, path, fingerprint) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
-    let message = spaced_mkdir_request(call.grant().sandbox_id, path, body.parents, user.as_ref());
+    let message = spaced_mkdir_request(call.grant().sandbox_id, path, parents, user.as_ref());
     call.call(
         "spaced_mkdir",
         Reconnect::WhenDraining,
@@ -110,14 +115,19 @@ async fn mkdir(state: &DataPlaneState, request: Request<Body>) -> Result<Respons
 
 async fn remove(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Remove;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileRemoveRequest = json_body(&request, body).await?;
-    idempotency_key(&request.headers)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let path = parse_guest_path(body.path).map_err(rejected)?;
-    let fingerprint = remove_fingerprint(&path, body.recursive, user.as_ref()).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileRemoveRequest = json_body(&request, body).await?;
+        idempotency_key(&request.headers)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let path = parse_guest_path(body.path).map_err(rejected)?;
+        let fingerprint =
+            remove_fingerprint(&path, body.recursive, user.as_ref()).map_err(rejected)?;
+        Ok((body.recursive, user, path, fingerprint))
+    };
+    let (recursive, user, path, fingerprint) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
-    let message = remove_request(call.grant().sandbox_id, path, body.recursive, user.as_ref());
+    let message = remove_request(call.grant().sandbox_id, path, recursive, user.as_ref());
     call.call(
         "spaced_remove",
         Reconnect::WhenDraining,
@@ -132,13 +142,18 @@ async fn remove(state: &DataPlaneState, request: Request<Body>) -> Result<Respon
 
 async fn rename(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Rename;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileRenameRequest = json_body(&request, body).await?;
-    idempotency_key(&request.headers)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let old_path = parse_guest_path(body.old_path).map_err(rejected)?;
-    let new_path = parse_guest_path(body.new_path).map_err(rejected)?;
-    let fingerprint = rename_fingerprint(&old_path, &new_path, user.as_ref()).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileRenameRequest = json_body(&request, body).await?;
+        idempotency_key(&request.headers)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let old_path = parse_guest_path(body.old_path).map_err(rejected)?;
+        let new_path = parse_guest_path(body.new_path).map_err(rejected)?;
+        let fingerprint =
+            rename_fingerprint(&old_path, &new_path, user.as_ref()).map_err(rejected)?;
+        Ok((user, old_path, new_path, fingerprint))
+    };
+    let (user, old_path, new_path, fingerprint) = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
     // The API derives the key the sandbox replays the rename by, from the
     // key it bound and the fingerprint.
@@ -167,26 +182,37 @@ async fn enable_tracking(
     request: Request<Body>,
 ) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::ChangesEnable;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: Option<FileChangeTrackingRequest> = optional_json_body(&request, body).await?;
-    // Required, and neither bound nor sent to the sandbox.
-    idempotency_key(&request.headers)?;
-    let body = body.unwrap_or_default();
-    validate_tracking_enabled(&body).map_err(rejected)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    let roots = body
-        .roots
-        .into_iter()
-        .map(parse_guest_path)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: Option<FileChangeTrackingRequest> = optional_json_body(&request, body).await?;
+        // Required, and neither bound nor sent to the sandbox.
+        idempotency_key(&request.headers)?;
+        let body = body.unwrap_or_default();
+        validate_tracking_enabled(&body).map_err(rejected)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        let roots = body
+            .roots
+            .into_iter()
+            .map(parse_guest_path)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(rejected)?;
+        Ok((
+            body.include_globs,
+            body.exclude_globs,
+            body.use_default_excludes,
+            user,
+            roots,
+        ))
+    };
+    let (include_globs, exclude_globs, use_default_excludes, user, roots) =
+        request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
     let message = enable_file_changes_request(
         call.grant().sandbox_id,
         roots,
-        body.include_globs,
-        body.exclude_globs,
-        body.use_default_excludes,
+        include_globs,
+        exclude_globs,
+        use_default_excludes,
         user.as_ref(),
     );
     let response = call
@@ -211,10 +237,13 @@ async fn disable_tracking(
     request: Request<Body>,
 ) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::ChangesDisable;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: Option<FileChangeTrackingRequest> = optional_json_body(&request, body).await?;
-    idempotency_key(&request.headers)?;
-    let user = parse_guest_user(body.unwrap_or_default().user).map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: Option<FileChangeTrackingRequest> = optional_json_body(&request, body).await?;
+        idempotency_key(&request.headers)?;
+        parse_guest_user(body.unwrap_or_default().user).map_err(rejected)
+    };
+    let user = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
     let message = disable_file_changes_request(call.grant().sandbox_id, user.as_ref());
     call.call(
@@ -231,20 +260,24 @@ async fn disable_tracking(
 
 async fn modified(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Modified;
-    let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileModifiedRequest = json_body(&request, body).await?;
-    validate_modified_filters(&body).map_err(rejected)?;
-    let user = parse_guest_user(body.user).map_err(rejected)?;
-    // Built before the sandbox is reached, as the API builds it, so a filter
-    // it cannot read is refused without a wake. The grant names the sandbox.
-    let mut message = modified_files_request(
-        SandboxId::from_uuid(uuid::Uuid::nil()),
-        body.window_seconds,
-        body.since.as_deref(),
-        body.cursor,
-        user.as_ref(),
-    )
-    .map_err(rejected)?;
+    let (request, body) = FileRequest::receive(state, OPERATION, request).await?;
+    let checks = async {
+        let body: FileModifiedRequest = json_body(&request, body).await?;
+        validate_modified_filters(&body).map_err(rejected)?;
+        let user = parse_guest_user(body.user).map_err(rejected)?;
+        // Built before the sandbox is reached, as the API builds it, so a
+        // filter it cannot read is refused without a wake. The grant names
+        // the sandbox.
+        modified_files_request(
+            SandboxId::from_uuid(uuid::Uuid::nil()),
+            body.window_seconds,
+            body.since.as_deref(),
+            body.cursor,
+            user.as_ref(),
+        )
+        .map_err(rejected)
+    };
+    let mut message = request.checked(checks.await).await?;
     let call = SandboxCall::prepare(state, &request, None).await?;
     message.sandbox_id = call.grant().sandbox_id.to_string();
     let response = call
