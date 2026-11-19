@@ -135,7 +135,7 @@ once nothing is left in it.
 `--only` and `--skip` take comma-separated step names or tags, each matched
 exactly; a name that is neither is an error. The tags are `routes`, `orgs`,
 `users`, `api-keys`, `sandboxes`, `flows`, `lifecycle`, `templates`, `nodes`,
-`roles`, `terminal`. Sign-in always runs. Steps tagged `flows` create objects
+`drain-v2`, `roles`, `terminal`. Sign-in always runs. Steps tagged `flows` create objects
 and delete them again; each records its object's ID as soon as the create is answered,
 so if one fails before deleting, `npm run clean` removes it. They need a seed
 state for the prefix, and the identity check above passes before any runs.
@@ -187,6 +187,60 @@ where `<context>` is the run's `--kube-context` or `CONSOLE_LOOP_KUBE_CONTEXT`
 page's Drain, a v1 gentle drain: it checks that the request is
 `{"mode":"gentle"}` with no engine and that the page shows a mode, no
 engine and no Drain progress panel, then undrains it.
+
+The `drain-v2` steps run v2 drains (`:drain {engine: "v2", hold_seconds}`)
+on a real Kind worker. The API serves them on Kind, but only the cluster
+controller's v2 loop moves one along, and a v2 drain needs the node's EC2
+instance recorded, so `nodes-v2-setup` does what `space_smoke`'s drain v2
+scenarios do, with `kubectl` and `docker` through `--kube-context`: it takes
+the smokes' controller and worker-cordon Leases, records the controller's
+standing `SPACE_DRAIN_V2_ENABLED` and `SPACE_NODE_DRAIN_TERMINATOR_KIND` and
+its replicas in `out/drain-v2-standing.json`, turns the v2 loop on with the
+`aws` terminator (against Kind's fake EC2) and waits for the rollout, and
+re-registers each worker that holds no sandbox under a fake AWS providerID,
+waiting until the node's preview no longer names its instance unrecorded.
+`nodes-v2-teardown` puts the recorded config back and releases the Leases;
+the workers keep their fake instances. Both carry every v2 flow's name as a
+tag, so `--only node-drain-progress` runs them around it. A run interrupted
+in between leaves the file, which the next setup restores from, and Leases
+held by a loop process that is gone, which the next run on this host takes
+over.
+
+The v2 flows drain only such a worker, while no node is in any drain, under
+the drain-keep override, and undrain it in `finally`, waiting until the v2
+drain, its cancel included, is gone. A worker that a seeded sandbox runs on
+is never re-registered or v2-drained, so seed with one worker cordoned (for
+example `:cordon` it through the admin API before `npm run seed` and
+`:uncordon` it after) to keep it free. They read the node through the
+loop's own API client, outside the page, so that the node answers the page
+receives are the console's own:
+
+- `node-v2-drain-now` starts a v2 drain with the hold Now (`hold_seconds:
+  0`), follows the empty worker to `drained`, shows Terminate's refusals
+  (the two v2 refusals as the API words them, answered by the step, and the
+  API's own phase refusal for a terminate sent after an undrain), and waits
+  for the undrain's cancel to finish;
+- `node-v2-hold-shorten-undrain` places one running sandbox on the worker,
+  starts with a custom hold of 600 s, checks the panel and the nodes-list
+  cell, previews the sealed node, shows that Shorten hold refuses a longer
+  hold before sending it, shortens the hold to 300 s and follows the deadline
+  there, gets the API's 409 for a shorten a stale page sends
+  after another client shortened the drain, the API's 400 for `mode` beside
+  `engine: v2` (the step adds it to the request), a 503 and a network error
+  (answered by the step), and the page's stale-read warning, then, with the
+  cluster controller scaled to 0 so nothing moves, End hold now (`hold_seconds:
+  0`) and an undrain mid-drain, whose cancel stays pending until the
+  controller is scaled back;
+- `node-v2-refusals` shows the cap's 409 with `Retry-After`, the stale
+  heartbeat's 409 and the switched-off 400, each answered by the step with
+  the API's body;
+- `node-v2-states` renders states the stack can't be put in on demand from
+  the node's own answer with its drain fields changed: terminating, a v2
+  drain whose progress the API left out, an unknown phase and engine, a
+  malformed and an unrecognized report, the nodes list with a malformed one,
+  and a node the drain let go (404).
+
+A step that answers the page itself notes `SYNTHETIC:` and what it answered.
 
 Two read-only `nodes` steps cover what holds a node. Both pick the worker
 the admin API's `GET /v1/nodes/{id}/holds` reports the most holds for, a node
