@@ -1,7 +1,15 @@
-//! Reads, the generation, and the leases and phase changes that the operator
-//! verbs build on.
+//! Operator verbs and reads: pause, resume and abort, the generation that
+//! guards them, the leases and phase changes they build on, and the records
+//! the admin API reports.
 
 use super::*;
+
+fn change(expected_generation: Option<u64>) -> PhaseChange {
+    PhaseChange {
+        actor: Some(pplx_space_accounts::UserId::from_uuid(SEED_USER_ID)),
+        expected_generation,
+    }
+}
 
 async fn generation(pool: &PgPool, campaign: CampaignId) -> TestResult<u64> {
     Ok(get_record(pool, campaign)
@@ -27,6 +35,270 @@ async fn fail_items(db: &TestDb, campaign: CampaignId, count: usize) -> TestResu
             "the failure was recorded"
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_and_resume_raise_the_generation_and_record_the_actor() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
+    assert_eq!(generation(&db.pool, campaign).await?, 0);
+
+    let paused = pause_campaign(&db.pool, campaign, &change(Some(0))).await?;
+    assert_eq!(
+        paused,
+        PhaseChanged {
+            phase: CampaignPhase::Paused,
+            generation: 1,
+            retried: 0,
+            draining: 0,
+        }
+    );
+    let record = get_record(&db.pool, campaign).await?.expect("exists");
+    assert_eq!(record.campaign.phase, CampaignPhase::Paused);
+    assert_eq!(record.updated_by, change(None).actor);
+
+    // No item is done yet, so a resume goes back to canary. Another
+    // operator resumes, and the record names them.
+    let other = Some(pplx_space_accounts::UserId::from_uuid(
+        insert_user(&db.pool).await?,
+    ));
+    let resume = PhaseChange {
+        actor: other,
+        ..change(Some(1))
+    };
+    let resumed = resume_campaign(&db.pool, campaign, &resume, false).await?;
+    assert_eq!(resumed.phase, CampaignPhase::Canary);
+    assert_eq!(resumed.generation, 2);
+    let record = get_record(&db.pool, campaign).await?.expect("exists");
+    assert_eq!(record.campaign.phase, CampaignPhase::Canary);
+    assert_eq!(record.updated_by, other);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stale_generation_is_refused_and_changes_nothing() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
+    // The reconciler's budget pause moved the campaign after an operator
+    // read it at generation 0.
+    fail_items(&db, campaign, 3).await?;
+    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+    assert_eq!(generation(&db.pool, campaign).await?, 1);
+
+    let refused = resume_campaign(&db.pool, campaign, &change(Some(0)), true).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ChangePhaseError::Stale {
+                generation: 1,
+                expected: 0
+            })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(generation(&db.pool, campaign).await?, 1);
+    assert_eq!(
+        item_counts(&db.pool, campaign).await?.failed,
+        3,
+        "nothing retried"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_resume_at_the_failure_budget_needs_the_failed_items_retried() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
+    fail_items(&db, campaign, 3).await?;
+    assert!(pause_if_over_budget(&db.pool, campaign).await?);
+
+    let refused = resume_campaign(&db.pool, campaign, &change(None), false).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ChangePhaseError::AtFailureBudget {
+                failed: 3,
+                failure_budget: 3
+            })
+        ),
+        "{refused:?}"
+    );
+
+    let resumed = resume_campaign(&db.pool, campaign, &change(None), true).await?;
+    assert_eq!(resumed.retried, 3);
+    assert_eq!(resumed.phase, CampaignPhase::Canary);
+    let rows = sqlx::query_as::<_, (String, i64, Option<String>)>(sql!(
+        "SELECT phase, attempts, last_error FROM runtime_upgrade_items WHERE campaign_id = $1"
+    ))
+    .bind(campaign)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(
+            row,
+            ("pending".to_owned(), 0, Some("boot failed".to_owned())),
+            "pending afresh, keeping the error until a new outcome"
+        );
+    }
+    // Leasing works again: the budget counts only new failures.
+    assert_eq!(lease(&db, campaign).await?.len(), 1, "one canary");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_resume_with_a_done_item_rolls() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let canary = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            phase: CampaignPhase::Canary,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    pending_on(&db, canary, None, 2).await?;
+
+    let refused = resume_campaign(&db.pool, canary, &change(None), false).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ChangePhaseError::NotResumable(CampaignPhase::Canary))
+        ),
+        "a canary with nothing done isn't resumable: {refused:?}"
+    );
+    let leased = lease(&db, canary).await?;
+    finish_item(&db.pool, &leased[0], &ItemOutcome::Done).await?;
+    let resumed = resume_campaign(&db.pool, canary, &change(None), false).await?;
+    assert_eq!(resumed.phase, CampaignPhase::Rolling);
+
+    // Paused and resumed again: an item is done, so it keeps rolling.
+    pause_campaign(&db.pool, canary, &change(None)).await?;
+    let resumed = resume_campaign(&db.pool, canary, &change(None), false).await?;
+    assert_eq!(resumed.phase, CampaignPhase::Rolling);
+    assert_eq!(resumed.generation, 3);
+    Ok(())
+}
+
+/// What a verb did: the phase it wrote, or its refusal.
+fn outcome(result: Result<PhaseChanged, ChangePhaseError>) -> Result<CampaignPhase, String> {
+    result
+        .map(|changed| changed.phase)
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// Every verb in every phase, on a campaign with no item done and nothing
+/// failed. A resume that depends on a done canary item is covered by
+/// `a_resume_with_a_done_item_rolls`.
+#[tokio::test(flavor = "current_thread")]
+async fn each_verb_is_allowed_or_refused_in_every_phase() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let mut byte = 100;
+    for &phase in CampaignPhase::ALL {
+        let finished = Err(format!("Finished({phase:?})"));
+        // (pause, resume, abort)
+        let expected = match phase {
+            CampaignPhase::Canary => (
+                Ok(CampaignPhase::Paused),
+                Err("NotResumable(Canary)".to_owned()),
+                Ok(CampaignPhase::Aborted),
+            ),
+            CampaignPhase::Rolling => (
+                Ok(CampaignPhase::Paused),
+                Err("NotResumable(Rolling)".to_owned()),
+                Ok(CampaignPhase::Aborted),
+            ),
+            CampaignPhase::Paused => (
+                Err("AlreadyPaused".to_owned()),
+                Ok(CampaignPhase::Canary),
+                Ok(CampaignPhase::Aborted),
+            ),
+            CampaignPhase::Completed | CampaignPhase::Aborted => {
+                (finished.clone(), finished.clone(), finished)
+            }
+        };
+        let mut seed = || {
+            byte += 1;
+            insert_campaign(
+                &db.pool,
+                CampaignSeed {
+                    phase,
+                    from: environment(byte),
+                    ..CampaignSeed::default()
+                },
+            )
+        };
+        let (pause, resume, abort) = (seed().await?, seed().await?, seed().await?);
+        let got = (
+            outcome(pause_campaign(&db.pool, pause, &change(Some(0))).await),
+            outcome(resume_campaign(&db.pool, resume, &change(Some(0)), false).await),
+            outcome(abort_campaign(&db.pool, abort, &change(Some(0))).await),
+        );
+        assert_eq!(got, expected, "{phase:?}");
+        // A refusal changes nothing; an allowed change raises the generation.
+        for (campaign, result) in [(pause, &got.0), (resume, &got.1), (abort, &got.2)] {
+            let record = get_record(&db.pool, campaign).await?.expect("exists");
+            match result {
+                Ok(written) => {
+                    assert_eq!(record.campaign.phase, *written, "{phase:?}");
+                    assert_eq!(record.campaign.generation, 1, "{phase:?}");
+                }
+                Err(_) => {
+                    assert_eq!(record.campaign.phase, phase, "{phase:?}");
+                    assert_eq!(record.campaign.generation, 0, "{phase:?}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_missing_campaign_is_not_found_and_a_refusal_wins_over_a_stale_generation() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let missing = CampaignId(Uuid::now_v7());
+    assert!(matches!(
+        pause_campaign(&db.pool, missing, &change(None)).await,
+        Err(ChangePhaseError::NotFound)
+    ));
+    assert!(matches!(
+        resume_campaign(&db.pool, missing, &change(None), true).await,
+        Err(ChangePhaseError::NotFound)
+    ));
+    assert!(matches!(
+        abort_campaign(&db.pool, missing, &change(None)).await,
+        Err(ChangePhaseError::NotFound)
+    ));
+    // A refused transition wins over a stale generation, so the caller
+    // learns the phase.
+    let paused = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            phase: CampaignPhase::Paused,
+            from: environment(5),
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    assert!(matches!(
+        pause_campaign(&db.pool, paused, &change(Some(9))).await,
+        Err(ChangePhaseError::AlreadyPaused)
+    ));
+    assert_eq!(generation(&db.pool, paused).await?, 0);
     Ok(())
 }
 
@@ -240,6 +512,177 @@ async fn records_list_in_id_order_and_page() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn an_abort_ends_the_campaign_and_fences_its_leases() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let campaign = create_campaign(&db.pool, &new_campaign(40, CampaignKind::Sandboxes)).await?;
+    pending_on(&db, campaign, None, 4).await?;
+    let leased = lease(&db, campaign).await?;
+    assert_eq!(leased.len(), 4);
+    finish_item(&db.pool, &leased[0], &ItemOutcome::Done).await?;
+
+    let aborted = abort_campaign(&db.pool, campaign, &change(Some(0))).await?;
+    assert_eq!(
+        aborted,
+        PhaseChanged {
+            phase: CampaignPhase::Aborted,
+            generation: 1,
+            retried: 0,
+            draining: 3,
+        }
+    );
+    let record = get_record(&db.pool, campaign).await?.expect("exists");
+    assert_eq!(record.campaign.phase, CampaignPhase::Aborted);
+    assert!(record.finished_at.is_some());
+    assert_eq!(record.updated_by, change(None).actor);
+    // What was done stays done.
+    assert_eq!(item_counts(&db.pool, campaign).await?.done, 1);
+    // The workers can't renew a finished campaign's lease, so they stop at
+    // their next renewal. One that finishes first still records the truth.
+    for item in &leased[1..] {
+        assert!(!renew_lease(&db.pool, item, LEASE).await?);
+    }
+    assert!(finish_item(&db.pool, &leased[1], &ItemOutcome::Done).await?);
+    // Nothing adds work to the campaign again, even a subject it never had.
+    let new_subject = [insert_sandbox(
+        &db.pool,
+        SubstrateKind::Kubernetes,
+        SandboxLifecycle::Stopped,
+        None,
+    )
+    .await?];
+    assert_eq!(
+        insert_pending(
+            &db.pool,
+            campaign,
+            SubjectKind::Sandbox,
+            &new_subject,
+            MAX_ATTEMPTS
+        )
+        .await?,
+        0
+    );
+    assert_eq!(item_counts(&db.pool, campaign).await?.pending, 0);
+    assert!(list_unfinished(&db.pool).await?.is_empty());
+
+    // Once the leases lapse, the loop's sweep returns the items to pending.
+    assert_eq!(release_lapsed_in_finished(&db.pool).await?, 0, "still live");
+    lapse_leases(&db.pool, campaign).await?;
+    assert_eq!(release_lapsed_in_finished(&db.pool).await?, 2);
+    assert_eq!(
+        item_counts(&db.pool, campaign).await?,
+        ItemCounts {
+            pending: 2,
+            done: 2,
+            ..ItemCounts::default()
+        }
+    );
+    // Two items are pending with no live lease, and still nothing leases
+    // them: the campaign is aborted.
+    assert!(lease(&db, campaign).await?.is_empty());
+    Ok(())
+}
+
+/// The reconciler's phase changes leave an aborted campaign alone, even
+/// where they would act on an open one: a drained campaign under its
+/// failure budget doesn't complete, and one at its budget doesn't pause.
+#[tokio::test(flavor = "current_thread")]
+async fn completion_and_the_budget_pause_leave_an_aborted_campaign_alone() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let drained = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            from: environment(60),
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    fail_items(&db, drained, 1).await?;
+    let at_budget = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            from: environment(61),
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    fail_items(&db, at_budget, 3).await?;
+    for campaign in [drained, at_budget] {
+        abort_campaign(&db.pool, campaign, &change(None)).await?;
+    }
+    let counts = item_counts(&db.pool, drained).await?;
+    assert_eq!((counts.pending, counts.in_flight, counts.failed), (0, 0, 1));
+    assert!(!complete_if_drained(&db.pool, drained).await?);
+    assert_eq!(item_counts(&db.pool, at_budget).await?.failed, 3);
+    assert!(!pause_if_over_budget(&db.pool, at_budget).await?);
+    for campaign in [drained, at_budget] {
+        let record = get_record(&db.pool, campaign).await?.expect("exists");
+        assert_eq!(record.campaign.phase, CampaignPhase::Aborted);
+        assert_eq!(record.campaign.generation, 1);
+    }
+    Ok(())
+}
+
+/// The abort caveat: an aborted campaign's worker may still be mid-upgrade
+/// when a new campaign for the same source starts. The new campaign doesn't
+/// lease that subject while the aborted campaign's lease lives, so the two
+/// never hold it at once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_subject_an_aborted_campaign_holds_isnt_leased_to_a_new_campaign() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let first = create_campaign(&db.pool, &new_campaign(44, CampaignKind::Sandboxes)).await?;
+    let subjects = pending_on(&db, first, None, 1).await?;
+    let held = lease(&db, first).await?;
+    assert_eq!(held.len(), 1);
+    abort_campaign(&db.pool, first, &change(None)).await?;
+
+    // A new campaign starts at once and records the same subject, plus one
+    // more that nobody holds.
+    let second = create_campaign(&db.pool, &new_campaign(44, CampaignKind::Sandboxes)).await?;
+    let free = Uuid::now_v7();
+    let both = [subjects[0], free];
+    insert_pending(&db.pool, second, SubjectKind::Sandbox, &both, MAX_ATTEMPTS).await?;
+    let leased = lease(&db, second).await?;
+    assert_eq!(
+        leased
+            .iter()
+            .map(|item| item.subject_id)
+            .collect::<Vec<_>>(),
+        [free],
+        "the held subject waits for the aborted campaign's lease"
+    );
+    assert_eq!(item_phase(&db.pool, second, subjects[0]).await?, "pending");
+
+    // The old worker can't extend its hold past the lease it has.
+    assert!(!renew_lease(&db.pool, &held[0], LEASE).await?);
+    lapse_leases(&db.pool, first).await?;
+    let leased = lease(&db, second).await?;
+    assert_eq!(
+        leased
+            .iter()
+            .map(|item| item.subject_id)
+            .collect::<Vec<_>>(),
+        [subjects[0]]
+    );
+    // And the aborted worker, too late, records its outcome only on its own
+    // campaign's item, not over the new holder's.
+    assert!(
+        finish_item(&db.pool, &held[0], &ItemOutcome::Done).await?,
+        "its own item, which nothing re-drove yet, takes the outcome"
+    );
+    assert_eq!(
+        item_phase(&db.pool, second, subjects[0]).await?,
+        "in_flight"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_live_lease_in_any_other_campaign_holds_the_subject_and_a_lapsed_one_doesnt() -> TestResult
 {
     let Some(db) = try_pg_test_db().await? else {
@@ -341,12 +784,7 @@ async fn an_aborted_campaigns_lease_isnt_renewed_and_holds_its_subject_until_it_
         .await?;
     }
     let held = lease(&db, aborted).await?.remove(0);
-    sqlx::query(sql!(
-        "UPDATE runtime_upgrade_campaigns SET phase = 'aborted', finished_at = now() WHERE id = $1"
-    ))
-    .bind(aborted)
-    .execute(&db.pool)
-    .await?;
+    abort_campaign(&db.pool, aborted, &change(None)).await?;
 
     assert!(
         !renew_lease(&db.pool, &held, LEASE).await?,
@@ -370,6 +808,61 @@ async fn an_aborted_campaigns_lease_isnt_renewed_and_holds_its_subject_until_it_
         1,
         "the lapsed lease holds nothing"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_abort_at_a_stale_generation_changes_nothing() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
+    pending_on(&db, campaign, None, 1).await?;
+    let leased = lease(&db, campaign).await?;
+    pause_campaign(&db.pool, campaign, &change(None)).await?;
+
+    let refused = abort_campaign(&db.pool, campaign, &change(Some(0))).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ChangePhaseError::Stale {
+                generation: 1,
+                expected: 0
+            })
+        ),
+        "{refused:?}"
+    );
+    let record = get_record(&db.pool, campaign).await?.expect("exists");
+    assert_eq!(record.campaign.phase, CampaignPhase::Paused);
+    assert_eq!(record.finished_at, None);
+    assert!(
+        renew_lease(&db.pool, &leased[0], LEASE).await?,
+        "the lease is untouched"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_abort_inside_a_transaction_older_than_the_campaign_succeeds() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(4).await?
+    else {
+        return Ok(());
+    };
+    // The caller's transaction starts first, so its now() is from before the
+    // campaign's created_at.
+    let mut caller = db.pool.begin().await?;
+    sqlx::query(sql!("SELECT now()"))
+        .execute(&mut *caller)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let campaign = insert_campaign(&db.pool, CampaignSeed::default()).await?;
+
+    let aborted = abort_campaign(&mut *caller, campaign, &change(None)).await?;
+    assert_eq!(aborted.phase, CampaignPhase::Aborted);
+    caller.commit().await?;
+    let record = get_record(&db.pool, campaign).await?.expect("exists");
+    assert_eq!(record.campaign.phase, CampaignPhase::Aborted);
+    assert!(record.finished_at.expect("finished") >= record.created_at);
     Ok(())
 }
 
