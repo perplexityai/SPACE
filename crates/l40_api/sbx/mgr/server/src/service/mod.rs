@@ -311,7 +311,6 @@ const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
 // unseals it. A preview changes nothing but answers what a drain would find
 // on the whole node. node-api relays both for the control plane and
 // authorizes that caller first; root may drive them by hand.
-#[cfg(test)]
 const ALLOW_NODE_DRAIN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
@@ -428,7 +427,6 @@ pub struct SandboxManagerService {
     /// activation work in flight, which a drain reports as pending.
     activation_seal: Arc<crate::activation_seal::ActivationSeal>,
     /// The node drain's work in flight in this process.
-    #[cfg(test)]
     drain_actions: Arc<drain_node::DrainActions>,
     /// At most one in-process driver may advance a persisted teardown suspend
     /// for a sandbox. The durable operation itself lives in SQLite; this map
@@ -1900,7 +1898,6 @@ impl SandboxManagerService {
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
             activation_seal,
-            #[cfg(test)]
             drain_actions: Arc::new(drain_node::DrainActions::with_window(
                 drain_node::drain_node_window_from_env(),
             )),
@@ -2173,7 +2170,6 @@ pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
 pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
-#[cfg(test)]
 mod drain_node;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;

@@ -45,9 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use crate::db::SharedConnection;
-use crate::db::activation_seal::ActivationSealRecord;
-#[cfg(test)]
-use crate::db::activation_seal::write_activation_seal;
+use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
 
 /// The marker in the `FailedPrecondition` status a sealed node refuses a VM
 /// activation with. The node refuses the same activation until it is
@@ -70,7 +68,6 @@ const RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const UNREADABLE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The seal and the activations in flight, read together.
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ActivationSealStatus {
     /// The generation the node is sealed under.
@@ -128,7 +125,6 @@ impl SealState {
     /// The readable row, `None` on a node never sealed or cancelled. A row
     /// the last read couldn't read is read again first; one that still can't
     /// be read refuses the seal or cancel that asked.
-    #[cfg(test)]
     fn current(&mut self, db: &SharedConnection) -> Result<Option<ActivationSealRecord>, Status> {
         if self.is_unknown() {
             let conn = db
@@ -145,7 +141,6 @@ impl SealState {
     /// Read the row again while the seal is unknown, and publish it once it
     /// reads, which the caller does under the state lock, so no activation is
     /// admitted between the read and its publication.
-    #[cfg(test)]
     fn read_again(&mut self, conn: &crate::db::Connection) {
         if !self.is_unknown() {
             return;
@@ -335,7 +330,6 @@ impl ActivationSeal {
     /// generation at or below the cancelled one is refused, so a drain call
     /// that arrives after its own cancel seals nothing. Each refusal names
     /// both generations and changes nothing.
-    #[cfg(test)]
     pub(crate) fn seal(&self, db: &SharedConnection, generation: u64) -> Result<(), Status> {
         validate_generation(generation)?;
         let mut state = self.lock_state();
@@ -366,7 +360,6 @@ impl ActivationSeal {
     /// below the current seal's generation is refused, naming both, and
     /// changes nothing. Returns the tombstone: the generation at or below
     /// which the node now refuses seals.
-    #[cfg(test)]
     pub(crate) fn unseal(&self, db: &SharedConnection, generation: u64) -> Result<u64, Status> {
         validate_generation(generation)?;
         let mut state = self.lock_state();
@@ -401,12 +394,10 @@ impl ActivationSeal {
 
     /// Why the seal row couldn't be read, while the last read failed and no
     /// seal or cancel has read it since; a preview can't report it then.
-    #[cfg(test)]
     pub(crate) fn read_error(&self) -> Option<String> {
         self.lock_state().record.as_ref().err().cloned()
     }
 
-    #[cfg(test)]
     pub(crate) fn status(&self) -> ActivationSealStatus {
         let sealed_generation = self.lock_state().sealed_generation();
         ActivationSealStatus {
@@ -455,7 +446,6 @@ fn refuse_while_sealed(
 
 /// The refusal of a seal under `generation` while the row is `current`:
 /// sealed under another generation, or cancelled at or above it.
-#[cfg(test)]
 fn refuse_seal(current: ActivationSealRecord, generation: u64) -> Status {
     Status::failed_precondition(if current.sealed {
         format!(
@@ -472,7 +462,6 @@ fn refuse_seal(current: ActivationSealRecord, generation: u64) -> Status {
     })
 }
 
-#[cfg(test)]
 fn validate_generation(generation: u64) -> Result<(), Status> {
     if generation == 0 || i64::try_from(generation).is_err() {
         return Err(Status::invalid_argument(
@@ -482,7 +471,6 @@ fn validate_generation(generation: u64) -> Result<(), Status> {
     Ok(())
 }
 
-#[cfg(test)]
 fn persist(db: &SharedConnection, record: ActivationSealRecord) -> Result<(), Status> {
     let conn = db
         .lock()
@@ -512,7 +500,6 @@ impl InFlightRegistry {
         self.lock_entries().remove(&id);
     }
 
-    #[cfg(test)]
     fn list(&self) -> Vec<String> {
         self.lock_entries().values().cloned().collect()
     }
