@@ -10,6 +10,7 @@ use pplx_space_firewall_rules_model::{FirewallRuleRevision, Match, Rule};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::install::{Nft, nft};
 use super::{CHAIN, FAMILY, PRIORITY, TABLE, rule_comment};
 
 /// What fresh listings of the owned table showed, for this namespace only.
@@ -23,15 +24,16 @@ pub enum Verification {
 }
 
 pub fn verify(revision: &FirewallRuleRevision, netns: &File) -> Verification {
-    let list = |args: &[&str]| {
-        crate::net::command_output_in_pinned_ns(
-            netns,
-            "nft",
-            args,
-            &[],
-            crate::host_command::PROBE_BUDGET,
-        )
-    };
+    verify_with(revision, netns, &nft)
+}
+
+/// [`verify`] through a substitute for nft.
+pub(crate) fn verify_with(
+    revision: &FirewallRuleRevision,
+    netns: &File,
+    nft: &Nft<'_>,
+) -> Verification {
+    let list = |args: &[&str]| nft(netns, args, &[], crate::host_command::PROBE_BUDGET);
     observed(revision, list(&["-j", "list", "tables", FAMILY]), || {
         list(&["-j", "list", "table", FAMILY, TABLE])
     })

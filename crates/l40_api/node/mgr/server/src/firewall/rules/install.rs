@@ -9,6 +9,19 @@ use serde_json::json;
 
 use super::{FAMILY, TABLE, TableConstruction};
 
+/// Runs nft with these arguments and stdin, within the budget, in the
+/// namespace the descriptor pins.
+pub(crate) type Nft<'a> = dyn Fn(&File, &[&str], &[u8], Duration) -> std::io::Result<Output> + 'a;
+
+pub(crate) fn nft(
+    netns: &File,
+    args: &[&str],
+    stdin: &[u8],
+    budget: Duration,
+) -> std::io::Result<Output> {
+    crate::net::command_output_in_pinned_ns(netns, "nft", args, stdin, budget)
+}
+
 /// What nft reported for one submission, which is not what Linux holds.
 #[derive(Debug)]
 #[must_use = "read the table back to verify"]
@@ -25,10 +38,19 @@ pub enum InstallOutcome {
 /// Replaces `ip space_firewall_rules` in the namespace `netns` pins with
 /// `construction`, in one transaction. Never retries.
 pub fn install(construction: &TableConstruction, netns: &File) -> InstallOutcome {
+    install_with(construction, netns, &nft)
+}
+
+/// [`install`] through a substitute for nft.
+pub(crate) fn install_with(
+    construction: &TableConstruction,
+    netns: &File,
+    nft: &Nft<'_>,
+) -> InstallOutcome {
     submit(
         construction,
         netns,
-        "nft",
+        nft,
         crate::host_command::MUTATION_BUDGET,
     )
 }
@@ -36,7 +58,7 @@ pub fn install(construction: &TableConstruction, netns: &File) -> InstallOutcome
 fn submit(
     construction: &TableConstruction,
     netns: &File,
-    program: &str,
+    nft: &Nft<'_>,
     budget: Duration,
 ) -> InstallOutcome {
     let table = json!({"table": {"family": FAMILY, "name": TABLE}});
@@ -47,14 +69,12 @@ fn submit(
         .chain(construction.commands().iter().cloned())
         .collect();
     let transaction = json!({"nftables": commands}).to_string();
-    let result = crate::net::command_output_in_pinned_ns(
+    outcome(nft(
         netns,
-        program,
         &["-j", "-f", "-"],
         transaction.as_bytes(),
         budget,
-    );
-    outcome(result)
+    ))
 }
 
 fn outcome(result: std::io::Result<Output>) -> InstallOutcome {
