@@ -18,6 +18,29 @@ pub fn artifact_backup_dedup_key(local_artifact_id: LocalArtifactId) -> String {
     local_artifact_id.to_string()
 }
 
+/// Cancel the live upload of `artifact`, a drain suspend's capture that a
+/// later publication superseded, as eviction cancels an evicted artifact's
+/// ([`super::eviction`]): a pending job is cancelled outright and never runs
+/// again; a running one is marked `cancelling`, and its worker records it
+/// cancelled once its attempt returns. Returns the job as it was before, so
+/// the caller can settle what it registered; none when no live job uploads
+/// the artifact.
+pub fn cancel_superseded_upload_job(
+    conn: &Connection,
+    artifact: LocalArtifactId,
+) -> Result<Option<pplx_space_common_jobs::Job>> {
+    let Some(job) = pplx_space_common_jobs::db::find_job_by_dedup_key(
+        conn.raw(),
+        SNAPSHOT_UPLOAD_JOB_KIND,
+        &artifact_backup_dedup_key(artifact),
+    )?
+    .filter(|job| !job.is_terminal()) else {
+        return Ok(None);
+    };
+    super::eviction::cancel_live_upload_job(conn, artifact)?;
+    Ok(Some(job))
+}
+
 /// Give back the attempt a restart interrupted: every running job of `kind`
 /// with attempts left loses one; the number refunded.
 pub fn refund_interrupted_running_attempts(conn: &Connection, kind: &str) -> Result<usize> {
