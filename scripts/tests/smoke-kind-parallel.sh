@@ -255,6 +255,15 @@ fi
 # bench's mounts there by its paths' text.
 [[ "$KIND_BENCH_ROOT" != *[[:space:]\\]* ]] \
   || die "SPACE_KIND_BENCH_ROOT must not contain whitespace or backslashes: $KIND_BENCH_ROOT"
+# A run writes the root unescaped into each bench's containerd.toml, as quoted
+# strings, and every bring-up tool gets paths under it (the bench's HOME,
+# TMPDIR and checkout), so it takes only characters those carry as they are;
+# checked before the stale-bench cleanup. Teardown writes no such file, so it
+# still removes a bench under any root the check above allows.
+ROOT_CHARACTERS='^[A-Za-z0-9._/+-]+$'
+if [[ "$COMMAND" == run && ! "$KIND_BENCH_ROOT" =~ $ROOT_CHARACTERS ]]; then
+  die "SPACE_KIND_BENCH_ROOT may contain only letters, digits and . _ / + - for a run: $KIND_BENCH_ROOT"
+fi
 # Inside the checkout, a run's own files would be untracked files that every
 # bench's checkout copies (kind_bench_checkout).
 inside_checkout() {

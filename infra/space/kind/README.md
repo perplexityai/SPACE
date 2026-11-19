@@ -379,8 +379,9 @@ on the caller's `PATH`, `iptables`, and Docker Engine 28 or later on this host
 the active context must be a Unix socket or a loopback address) with the
 containerd image store. It refuses a host whose `/etc/resolv.conf` names a
 loopback resolver (such as systemd-resolved's `127.0.0.53` stub) or that has a
-route in 192.168.0.0/16 other than its own benches', and a bench root or
-`--out` directory inside the checkout. What it changes on the host:
+route in 192.168.0.0/16 other than its own benches', a bench root or
+`--out` directory inside the checkout, and a bench root whose resolved path
+holds anything but letters, digits and `._/+-`. What it changes on the host:
 
 - **Kernel and limits:** raises the inotify and aio limits (only ever upward),
   sets `net.ipv4.ip_forward=1`, loads the device-mapper crypt and snapshot
