@@ -7473,6 +7473,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-rollout-queue"
+version = "0.8.2"
+dependencies = [
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-rpc-auth"
 version = "0.8.2"
 dependencies = [
@@ -7561,6 +7569,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-node-model",
  "pplx-space-node-status-store",
+ "pplx-space-rollout-queue",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-test-env",

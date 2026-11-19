@@ -75,11 +75,11 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
 
 use pplx_space_accounts::UserId;
 use pplx_space_content_digest::DigestParseError;
 use pplx_space_execution_spec::EnvironmentReference;
+use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 
@@ -100,25 +100,13 @@ pub use items::{
     retire_skipped,
 };
 pub use phase::{complete_if_drained, pause_if_over_budget};
+pub use pplx_space_rollout_queue::{MAX_LEASE, clamp_lease};
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
-
-/// The longest lease any verb grants. A live lease blocks the down migration,
-/// so a lease must lapse within an operator's patience.
-pub const MAX_LEASE: Duration = Duration::from_secs(60 * 60);
-
-/// The lease a verb grants for a requested `lease`: clamped to 1 second
-/// through [`MAX_LEASE`]. A worker that holds the lease measures its own
-/// deadline with the same clamp, from before it sends the call that grants
-/// or renews the lease, so its deadline is never later than the database's,
-/// which runs from when the database writes it.
-pub fn clamp_lease(lease: Duration) -> Duration {
-    lease.clamp(Duration::from_secs(1), MAX_LEASE)
-}
 
 /// End a verb's transaction: commit it when `result` is `Ok`, roll it back
 /// otherwise. A read-only `Ok` commits too, which releases its row locks just
@@ -230,12 +218,32 @@ closed_vocabulary!(
 impl CampaignPhase {
     /// Whether items may be leased in this phase.
     pub const fn leases(self) -> bool {
-        matches!(self, Self::Canary | Self::Rolling)
+        self.queue_phase().leases()
     }
 
     /// Whether the campaign is over: `finished_at` is set.
     pub const fn finished(self) -> bool {
-        matches!(self, Self::Completed | Self::Aborted)
+        self.queue_phase().finished()
+    }
+
+    const fn queue_phase(self) -> HeaderPhase {
+        match self {
+            Self::Canary => HeaderPhase::Canary,
+            Self::Rolling => HeaderPhase::Rolling,
+            Self::Paused => HeaderPhase::Paused,
+            Self::Completed => HeaderPhase::Completed,
+            Self::Aborted => HeaderPhase::Aborted,
+        }
+    }
+
+    const fn from_queue(phase: HeaderPhase) -> Self {
+        match phase {
+            HeaderPhase::Canary => Self::Canary,
+            HeaderPhase::Rolling => Self::Rolling,
+            HeaderPhase::Paused => Self::Paused,
+            HeaderPhase::Completed => Self::Completed,
+            HeaderPhase::Aborted => Self::Aborted,
+        }
     }
 }
 
