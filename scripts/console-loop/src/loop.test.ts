@@ -11,6 +11,7 @@ import { SECRET_PLACEHOLDER, carriesSecret, clickTarget, loopbackAddresses, with
 import { loadConfig } from './config.ts';
 import { isSelected, parseSelection } from './loop.ts';
 import { normalizer, redact } from './recorder.ts';
+import { ffmpegArgs, gifCuts, gifFile } from './gifs.ts';
 import {
   clean, cleanSandbox, isSeededOrg, readSeedState, seedStatePath, upsertCreated, writeSeedState, type CreatedObject, type SeedState,
 } from './seed.ts';
@@ -359,4 +360,22 @@ test('clickTarget refuses a label more than one button shows', () => {
     () => clickTarget([...NODE_PAGE_BUTTONS, { text: 'Refresh', name: 'Refresh' }], 'Refresh'),
     /--click "Refresh" matches 2 buttons: "Refresh", "Refresh"/,
   );
+});
+
+test("a run's GIFs are cut from each step's place in its video", () => {
+  const results = [
+    { index: 1, name: 'login', video: { fromMs: 0, toMs: 2_000 } },
+    { index: 7, name: 'node-drain-progress', video: { fromMs: 10_000, toMs: 410_000 } },
+    { index: 8, name: 'no-video' },
+  ];
+  const cuts = gifCuts(results, null, 40);
+  assert.deepEqual(cuts.map((cut) => [cut.file, cut.fromS, cut.durationS, cut.speed]), [
+    ['001-login.gif', 0, 2, 1],
+    ['007-node-drain-progress.gif', 10, 400, 10],
+  ]);
+  assert.deepEqual(gifCuts(results, new Set(['login']), 40).map((cut) => cut.step), ['login']);
+  assert.equal(gifFile(12, 'Node V2: drain'), '012-node-v2-drain.gif');
+  const args = ffmpegArgs('run.webm', cuts[1], 'out.gif', { width: 1280, fps: 5 });
+  assert.deepEqual(args.slice(0, 9), ['-loglevel', 'error', '-y', '-ss', '10.00', '-t', '400.00', '-i', 'run.webm']);
+  assert.match(args[10], /^setpts=PTS\/10,fps=5,scale=1280:-1:flags=lanczos,split\[a\]\[b\];\[a\]palettegen/);
 });
