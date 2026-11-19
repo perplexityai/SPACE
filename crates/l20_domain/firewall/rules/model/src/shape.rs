@@ -67,15 +67,25 @@ impl TryFrom<String> for Op {
     fn try_from(op: String) -> Result<Self, Self::Error> {
         if op == "==" {
             Ok(Self::Eq)
+        } else if op.len() > MAX_QUOTED_LEN {
+            Err(UnsupportedOperator::TooLong { len: op.len() })
         } else {
-            Err(UnsupportedOperator(op))
+            Err(UnsupportedOperator::Quoted(op))
         }
     }
 }
 
+/// The longest caller string an error quotes; a longer one is reported by its
+/// length.
+const MAX_QUOTED_LEN: usize = 32;
+
 #[derive(Debug, thiserror::Error)]
-#[error("unsupported operator {0:?}; only \"==\" is supported")]
-pub(crate) struct UnsupportedOperator(String);
+pub(crate) enum UnsupportedOperator {
+    #[error("unsupported operator {0:?}; only \"==\" is supported")]
+    Quoted(String),
+    #[error("unsupported operator of {len} bytes; only \"==\" is supported")]
+    TooLong { len: usize },
+}
 
 /// `{"name": N}`, the operand of `"tcp option"`.
 pub(crate) mod tcp_option {
@@ -159,7 +169,15 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
-        let invalid = |_| E::invalid_value(Unexpected::Str(value), &"an IPv4 address");
+        let invalid = |_| {
+            let expected = &"an IPv4 address";
+            if value.len() > MAX_QUOTED_LEN {
+                let len = format!("string of {} bytes", value.len());
+                E::invalid_value(Unexpected::Other(&len), expected)
+            } else {
+                E::invalid_value(Unexpected::Str(value), expected)
+            }
+        };
         value.parse::<Ipv4Addr>().map(Value::Ipv4).map_err(invalid)
     }
 
