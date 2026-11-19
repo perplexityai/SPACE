@@ -21,3 +21,10 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''(^|/)crates/l40_api/sbx/mgr/server/src/snapshot_restore/tests\.rs$''']
 regexes = ['''^019e31d9-79a6-7132-b90f-007f1c62ddea$''']
+
+[[allowlists]]
+description = "SHA-256 pin of the public development identity's key.pem, downloaded by the TLS authority traffic runner"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)scripts/netgtw/traffic/tls-authority/run\.py$''']
+regexes = ['''^38d486a39fc236573de43d463fcd74ed94c74a041f743c2d0a4f05d6a6357ef2$''']
