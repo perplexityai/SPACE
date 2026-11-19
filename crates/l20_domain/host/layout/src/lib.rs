@@ -63,8 +63,8 @@ pub mod paths {
     pub const NODE_MANAGER_EXECUTION_POLICY_FILE: &str =
         "/space/run/node-manager/execution-policy.json";
     /// The firewall assignment node-manager last accepted, kept across
-    /// restarts. Resetting or deprovisioning a node deletes it with
-    /// `NODE_MANAGER_DB`.
+    /// restarts. Resetting or deprovisioning a node must delete it with
+    /// `NODE_MANAGER_DB`; no code does either yet.
     pub const NODE_MANAGER_FIREWALL_ASSIGNMENT_FILE: &str =
         "/space/run/node-manager/firewall-assignment.json";
     pub const RUNTIME_SUPERVISOR_SOCKET: &str =

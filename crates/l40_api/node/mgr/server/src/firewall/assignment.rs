@@ -112,6 +112,8 @@ pub enum OpenError {
     Read(#[source] std::io::Error),
     #[error("open the firewall assignment record: {0}")]
     Open(Status),
+    #[error("sync the firewall assignment record's directory: {0}")]
+    Sync(#[source] std::io::Error),
     #[error("firewall assignment record exceeds {MAX_RECORD_BYTES} bytes")]
     TooLarge,
     #[error("decode the firewall assignment record: {0}")]
@@ -137,9 +139,9 @@ impl FirewallAssignments {
     /// Any other unreadable record, such as a newer format or `schema_version`
     /// after a rollback, fails and is left in place.
     ///
-    /// Open one store per file. Its mutex serializes acceptance within the
-    /// process; node-manager's service mutex keeps a second process from
-    /// writing.
+    /// Open one store per file, only while holding node-manager's service
+    /// mutex, which keeps a second process from writing; the store's own mutex
+    /// serializes acceptance within the process.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
         let current = read_record(path)?
             .map(|record| {
@@ -263,16 +265,18 @@ fn encode_record(assignment: &DesiredAssignment) -> Vec<u8> {
 }
 
 /// Absence is checked by name, then the record is opened beneath its pinned
-/// parent without following links, as the write publishes it.
+/// parent without following links, as the write publishes it. The parent is
+/// synced first: a rename whose directory sync failed, or never ran, is only
+/// trusted once it is durable.
 fn read_record(path: &Path) -> Result<Option<Record>, OpenError> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(OpenError::Read(source)),
         Ok(_) => {}
     }
-    let file = artifact_fs::parent(path)
-        .and_then(|(directory, name)| trusted_paths::open_regular_file(&directory, name))
-        .map_err(OpenError::Open)?;
+    let (directory, name) = artifact_fs::parent(path).map_err(OpenError::Open)?;
+    let file = trusted_paths::open_regular_file(&directory, name).map_err(OpenError::Open)?;
+    directory.sync_all().map_err(OpenError::Sync)?;
     let mut bytes = Vec::new();
     file.take(MAX_RECORD_BYTES + 1)
         .read_to_end(&mut bytes)
