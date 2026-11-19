@@ -145,9 +145,10 @@ variable "node_pools" {
     `launch_template_version` pins it. `launch_template_version` applies to a
     custom-AMI pool only: null tracks the template's latest version; a number
     keeps the group on that version, so a template change only publishes a new
-    version. Changing a pin on a group with nodes starts an EKS rolling update
-    of the whole group: EKS marks every existing node unschedulable up front,
-    then replaces nodes one at a time.
+    version, and must not exceed the template's latest version. Moving a pin
+    on a group with nodes starts an EKS managed node group update of the
+    whole group; the comment at the top of the space module's
+    `worker_capacity.tf` describes its effect on the group's nodes.
     `update_strategy` is the group's rolling-update strategy: null leaves
     EKS's default, which launches replacements before draining; `MINIMAL`
     drains first, so a roll never runs more nodes than the group's size.

@@ -75,12 +75,14 @@ resource "aws_launch_template" "node_group" {
 # (`launch_template_version` null), the group tracks the template's latest
 # version, so a template change rolls the group at max_unavailable = 1. Pinned,
 # a template change only publishes a new version; the group adopts it when the
-# pin moves. Moving the pin on a group with nodes is that same EKS rolling
-# update: EKS first marks every existing node in the group unschedulable, then
-# replaces them max_unavailable at a time. Each replacement takes minutes, so a
-# large group takes hours. With the default update strategy each replacement
-# launches before its predecessor terminates, so it needs spare capacity of
-# the same instance type in the same availability zone.
+# pin moves. Moving the pin on a group with nodes is an EKS managed node group
+# update of the whole group; the comment at the top of the space module's
+# worker_capacity.tf describes what that does to the group's nodes. A pin
+# above the template's latest version fails at apply. What a replacement
+# needs depends on the pool's update_strategy: DEFAULT launches it before
+# terminating the node it replaces, so it needs spare capacity of the same
+# instance type in the same availability zone; MINIMAL terminates first, so
+# the group runs short by max_unavailable nodes during the update.
 resource "aws_eks_node_group" "custom" {
   for_each = {
     for key, value in var.node_pools : key => value
@@ -137,6 +139,16 @@ resource "aws_eks_node_group" "custom" {
   # Default 60min is too short for large pools rolling at max_unavailable=1.
   timeouts {
     update = var.node_group_update_timeout
+  }
+
+  lifecycle {
+    # Unknown while the same plan changes the template, so it's checked at
+    # apply, once the template's new latest version exists and before the
+    # node group is updated.
+    precondition {
+      condition     = each.value.launch_template_version == null ? true : tonumber(each.value.launch_template_version) <= aws_launch_template.node_group[each.key].latest_version
+      error_message = "Node pool `${each.key}` pins launch_template_version ${coalesce(each.value.launch_template_version, "<none>")}, above its launch template's latest version, ${aws_launch_template.node_group[each.key].latest_version}."
+    }
   }
 }
 

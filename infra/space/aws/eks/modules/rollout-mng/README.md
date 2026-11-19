@@ -230,10 +230,10 @@ latest version, so a template change updates it in place. Pin every
 populated entry to the version it runs, so a template change only
 publishes a new version that empty entries adopt. Moving a populated
 entry's pin is an EKS managed node group update, not a sandbox-aware
-rollout: EKS marks every node in the group unschedulable up front and
-replaces nodes one at a time through Kubernetes eviction rather than
-SPACE's drain, which can take hours for a large group. Move a populated entry to a new version
-with the flow above, or drain it to zero before moving its pin.
+rollout; the comment at the top of
+[`../space/worker_capacity.tf`](../space/worker_capacity.tf) describes
+its effect. Move a populated entry to a new version with the flow
+above, or drain it to zero before moving its pin.
 
 The cohort taint value (`cohort_taint_value`) **must** be the new
 MNG's running-number index as a string (`"1"`, `"2"`, …) to match the

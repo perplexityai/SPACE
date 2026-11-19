@@ -22,7 +22,11 @@
 # sandbox-aware two-MNG rollout instead (`../rollout-mng/README.md`,
 # `scripts/space-rollout-mng.py`), or drain it to zero first and then move the
 # pin. The worker_capacity_groups_on_latest_launch_template check warns while
-# any pin lags the latest version.
+# any pin lags the latest version; a pin above the latest version fails at
+# apply. The same EKS update applies to the builders and to the eks-cluster
+# module's custom-AMI pools when their pin moves, stepping by that group's
+# max_unavailable; what each replacement needs depends on the group's update
+# strategy (see their variable descriptions).
 #
 # A 99-node MNG ceiling limits one group's operational blast radius. It does
 # not restore full scheduler scoring once a sandbox pod can match more than
@@ -123,8 +127,7 @@ resource "aws_eks_node_group" "worker_capacity" {
     # dormant group scale months later with an obsolete AMI or an unbounded
     # ASG. Pin a populated group's version instead (launch_template_version).
     # A plan that changes the launch template version of a nonempty group is
-    # a worker rollout of the whole group; drain/zero the group or use the
-    # sandbox-aware rollout procedure before applying it.
+    # a worker rollout of the whole group; see the top of this file.
     ignore_changes = [
       scaling_config[0].desired_size,
       scaling_config[0].min_size,
@@ -136,6 +139,14 @@ resource "aws_eks_node_group" "worker_capacity" {
         each.value.subnet_pool,
       )
       error_message = "Worker group `${each.key}` selects unknown subnet_pool `${coalesce(each.value.subnet_pool, "<default>")}`; declare that pool in worker_subnet_pools first."
+    }
+
+    # Unknown while the same plan changes the template, so it's checked at
+    # apply, once the template's new latest version exists and before the
+    # node group is updated.
+    precondition {
+      condition     = each.value.launch_template_version == null ? true : tonumber(each.value.launch_template_version) <= aws_launch_template.workers.latest_version
+      error_message = "Worker group `${each.key}` pins launch_template_version ${coalesce(each.value.launch_template_version, "<none>")}, above the worker launch template's latest version, ${aws_launch_template.workers.latest_version}."
     }
 
     precondition {
