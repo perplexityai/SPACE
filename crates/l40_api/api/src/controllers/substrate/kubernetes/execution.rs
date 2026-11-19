@@ -1257,6 +1257,8 @@ impl KubernetesSubstrate {
                     sandbox_id,
                     wake_action,
                     phase_deadline,
+                    // The access path holds no restore lease.
+                    None,
                     |route_identity, activation_policy| {
                         pplx_space_sbx_mgr_client::proto::WakeRequest {
                             implicit_wake_source: 0,
@@ -2068,6 +2070,19 @@ impl KubernetesSubstrate {
         // the lifecycle cleanup decision without being reduced to a plain
         // `SubstrateError`.
         let wake_was_dispatched = AtomicBool::new(false);
+        // With the dispatch fence on, a user restore proves on its execution
+        // that it hasn't sent its Wake and renews that proof while this future
+        // lives; the Wake goes out only after ownership is confirmed under the
+        // lease token. Evacuation restores hold no token and keep the lease
+        // and execution-age guards alone.
+        let restore_dispatch = prepared
+            .restore_claim
+            .and_then(RestoreClaim::restore_lease_token)
+            .filter(|_| self.store.restore_dispatch_fence().is_enabled());
+        let _fence_renewal = restore_dispatch.and_then(|restore_lease_token| {
+            self.store
+                .renew_unsent_user_restore_fence_until_dropped(sandbox_id, restore_lease_token)
+        });
         let wait = async {
             let restore_plan = if target_state == SandboxLifecycle::Stopped {
                 Some(self.stopped_evacuation_restore_plan(&sandbox).await?)
@@ -2207,6 +2222,7 @@ impl KubernetesSubstrate {
                     sandbox_id,
                     wake_action,
                     phase_deadline,
+                    restore_dispatch,
                     |route_identity, activation_policy| {
                         pplx_space_sbx_mgr_client::proto::WakeRequest {
                             implicit_wake_source: wake_activity

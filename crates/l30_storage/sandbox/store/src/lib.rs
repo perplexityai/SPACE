@@ -137,6 +137,7 @@ pub mod orphan;
 pub mod pod_tracking;
 pub mod quarantine;
 pub mod repair;
+pub mod restore_dispatch_fence;
 pub mod restore_lease;
 pub mod restore_source;
 pub mod runtime_population;

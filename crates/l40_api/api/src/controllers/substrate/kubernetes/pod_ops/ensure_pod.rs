@@ -681,7 +681,30 @@ impl KubernetesSubstrate {
                 // normal existing-pod handling below.
             }
         }
-        if !claim.created && execution_pod_create_in_flight(claim.row.state) {
+        // A creating execution this caller didn't create normally has another
+        // request creating its pod, which the caller waits for until the
+        // execution is old enough to replace. A user restore that holds the
+        // execution's dispatch fence owns that create, as after taking the
+        // restore over from an owner that died before its Wake: it creates
+        // the pod under the same generation, or reuses the one the dead owner
+        // left, rather than waiting for that owner.
+        let owns_pod_create = match restore_lease_token {
+            Some(restore_lease_token)
+                if !claim.created
+                    && execution_pod_create_in_flight(claim.row.state)
+                    && !claim.row.create_age_expired =>
+            {
+                self.store
+                    .holds_restore_dispatch_fence(
+                        sandbox_id,
+                        claim.row.generation,
+                        restore_lease_token,
+                    )
+                    .await?
+            }
+            _ => false,
+        };
+        if !claim.created && execution_pod_create_in_flight(claim.row.state) && !owns_pod_create {
             if !stale_restore_execution_create(
                 &sandbox.lifecycle,
                 claim.row.state,
@@ -1014,7 +1037,7 @@ impl KubernetesSubstrate {
                 }
             };
 
-        if !claim.created && execution_pod_create_in_flight(claim.row.state) {
+        if !claim.created && execution_pod_create_in_flight(claim.row.state) && !owns_pod_create {
             self.require_observed_create_claim_in_flight(&sandbox, &claim)
                 .await?;
             return Ok(());

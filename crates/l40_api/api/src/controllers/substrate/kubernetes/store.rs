@@ -54,6 +54,7 @@ mod restore_lease;
 mod restore_source;
 mod runtime_attribution;
 pub(super) use runtime_attribution::attribution_update;
+mod restore_dispatch_fence;
 mod runtime_upgrade;
 mod started_recovery;
 mod suspend;
@@ -66,6 +67,8 @@ pub(super) struct K8sStore {
     namespace: String,
     /// Off, pod tracking never writes the sandbox's record.
     attribution: crate::controllers::substrate::ActivationClientAttribution,
+    /// Off, user restores write no dispatch fence and claims take none over.
+    restore_dispatch_fence: super::RestoreDispatchFence,
 }
 
 /// Where a sandbox's pod landed. Groups the identity columns
@@ -753,7 +756,20 @@ impl K8sStore {
             pool,
             namespace,
             attribution,
+            restore_dispatch_fence: super::RestoreDispatchFence::Disabled,
         }
+    }
+
+    pub(super) fn with_restore_dispatch_fence(
+        mut self,
+        restore_dispatch_fence: super::RestoreDispatchFence,
+    ) -> Self {
+        self.restore_dispatch_fence = restore_dispatch_fence;
+        self
+    }
+
+    pub(super) fn restore_dispatch_fence(&self) -> super::RestoreDispatchFence {
+        self.restore_dispatch_fence
     }
 
     pub(super) fn pool(&self) -> &PgPool {

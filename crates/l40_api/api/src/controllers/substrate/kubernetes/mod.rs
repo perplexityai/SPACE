@@ -59,6 +59,7 @@ mod cancel_rate_tracker;
 mod client_live_pods;
 mod pod_reflector;
 mod pod_worker_channels;
+mod restore_dispatch_fence;
 mod restore_waiters;
 mod sandbox_pod_view;
 mod store;
@@ -79,6 +80,7 @@ pub use sandbox_pod_view::{
 // cold-vs-genuinely-empty distinction the readiness flag exists to make.
 pub use caches::K8sCaches;
 use cancel_rate_tracker::CancelRateTracker;
+pub use restore_dispatch_fence::RestoreDispatchFence;
 use restore_waiters::RestoreWaiters;
 use store::{
     ActiveExecutionState, K8sNodeRoleUpsert, K8sStore, NodeLifecycleState, NodeStateWrite,
@@ -456,6 +458,9 @@ pub struct KubernetesState {
     /// Whether pods are labeled and the record written
     /// (`SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED`, default off).
     pub activation_client_attribution: super::ActivationClientAttribution,
+    /// Whether user restores fence their unsent Wake and re-drives take over
+    /// an expired fence (`SPACE_RESTORE_DISPATCH_FENCE_ENABLED`, default off).
+    pub restore_dispatch_fence: RestoreDispatchFence,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -520,6 +525,7 @@ impl KubernetesState {
                     &pplx_space_env_vars::ProcessEnvironment,
                 )?,
             activation_client_attribution: super::ActivationClientAttribution::from_env(),
+            restore_dispatch_fence: RestoreDispatchFence::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
@@ -945,7 +951,8 @@ impl KubernetesSubstrate {
                     pool.clone(),
                     k8s.sandbox_namespace.clone(),
                     k8s.activation_client_attribution,
-                );
+                )
+                .with_restore_dispatch_fence(k8s.restore_dispatch_fence);
                 // Read before `k8s` is moved into the struct below.
                 let node_group_placement = NodeGroupPlacementResolver::new(
                     pool.clone(),

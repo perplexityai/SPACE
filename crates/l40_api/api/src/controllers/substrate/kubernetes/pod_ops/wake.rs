@@ -41,6 +41,10 @@ struct SelectedWakeSettings {
     policy: WakeWaitPolicy,
     require_split_receipt_capability: bool,
     phase_deadline: Instant,
+    /// The user restore lease the Wake is sent under, when the restore
+    /// dispatch fence is on: ownership is confirmed under it, and its fence
+    /// cleared, before the first send.
+    restore_dispatch: Option<Uuid>,
 }
 
 impl ActivationWakeFailure {
@@ -290,6 +294,7 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         action: ActivationWakeAction,
         phase_deadline: Instant,
+        restore_dispatch: Option<Uuid>,
         build_request: F,
         on_dispatch: D,
     ) -> Result<
@@ -340,6 +345,7 @@ impl KubernetesSubstrate {
                             policy,
                             require_split_receipt_capability,
                             phase_deadline,
+                            restore_dispatch,
                         },
                         on_dispatch,
                     )
@@ -392,6 +398,7 @@ impl KubernetesSubstrate {
             policy,
             require_split_receipt_capability,
             phase_deadline,
+            mut restore_dispatch,
         } = settings;
         let probe = policy == WakeWaitPolicy::ResidentProbe;
         let deadline = if probe {
@@ -489,6 +496,23 @@ impl KubernetesSubstrate {
                         };
                     }
                     if let Some((_, client)) = connection.as_mut() {
+                        // The last point at which nothing can be running for
+                        // this restore on the node: a re-drive that took the
+                        // restore over from an owner it judged dead has
+                        // changed the token, and this Wake must not go out.
+                        if let Some(restore_lease_token) = restore_dispatch.take()
+                            && !self
+                                .store
+                                .confirm_user_restore_dispatch(sandbox_id, restore_lease_token)
+                                .await?
+                        {
+                            return Err(SubstrateError::RestoreInFlight {
+                                message: format!(
+                                    "sandbox {sandbox_id}'s restore was taken over before its Wake was sent"
+                                ),
+                                lease_remaining: None,
+                            });
+                        }
                         // Once the RPC future is polled, transport failure does
                         // not prove the server skipped the request. Preserve
                         // durable lifecycle/operation evidence on deadline.

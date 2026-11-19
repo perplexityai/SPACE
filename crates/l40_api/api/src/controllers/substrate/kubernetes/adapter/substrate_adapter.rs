@@ -1120,6 +1120,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     sandbox_id,
                     wake_action,
                     phase_deadline,
+                    // A pool adoption holds no restore lease.
+                    None,
                     |route_identity, activation_policy| {
                         pplx_space_sbx_mgr_client::proto::WakeRequest {
                             implicit_wake_source: 0,

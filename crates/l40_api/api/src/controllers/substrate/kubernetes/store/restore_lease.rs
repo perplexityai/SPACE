@@ -415,6 +415,15 @@ impl K8sStore {
             .await
         }
         .db_context("failed to begin sandbox restore")?;
+        // An owner that died before sending its Wake leaves the guards above
+        // closed for their whole window; its expired dispatch fence lets the
+        // user claim take the restore over.
+        let restore_claim = match restore_claim {
+            None if !require_evacuation_marker => {
+                self.take_over_unsent_user_restore(sandbox_id).await?
+            }
+            restore_claim => restore_claim,
+        };
 
         let Some(restore_claim) = restore_claim else {
             let (lifecycle, marker, ownership_remaining_secs) =
@@ -504,6 +513,10 @@ impl K8sStore {
         )
         .await
         .db_context("failed to claim restoring sandbox restore lease")?;
+        let restore_claim = match restore_claim {
+            None => self.take_over_unsent_user_restore(sandbox_id).await?,
+            restore_claim => restore_claim,
+        };
 
         if let Some(restore_claim) = restore_claim {
             return match restore_claim.lifecycle.trim().to_ascii_lowercase().as_str() {
