@@ -394,15 +394,19 @@ impl KubernetesSubstrate {
         deadline: Instant,
     ) -> Result<Option<PodIp>, SubstrateError> {
         let started_at = Instant::now();
-        loop {
-            if let Some(pod_ip) = self.resolve_pod_ip(sandbox_id).await? {
+        while Instant::now() < deadline {
+            if let Some(pod_ip) = self
+                .resolve_pod_ip_for_readiness(sandbox_id, deadline)
+                .await?
+            {
                 return Ok(Some(pod_ip));
             }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            sleep(start_wait_poll_interval(started_at)).await;
+            tokio::time::sleep_until(
+                deadline.min(Instant::now() + start_wait_poll_interval(started_at)),
+            )
+            .await;
         }
+        Ok(None)
     }
 
     async fn wait_for_pod_ip_assignment(
@@ -415,9 +419,15 @@ impl KubernetesSubstrate {
         phase: &'static str,
     ) -> Result<Option<PodIp>, SubstrateError> {
         let started_at = Instant::now();
-        if let Some(pod_ip) = self.resolve_pod_ip(sandbox_id).await? {
+        if let Some(pod_ip) = self
+            .resolve_pod_ip_for_readiness(sandbox_id, deadline)
+            .await?
+        {
             record_pod_ip_ready(metric_identity, sandbox_id, started_at, "cached");
             return Ok(Some(pod_ip));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
         }
 
         match timeout_at(

@@ -2,9 +2,9 @@
 //! readiness wait fails, and a create that joins an activation already in
 //! flight.
 //!
-//! The substrate's [`SubstrateBudgets`] are shortened so the outer readiness
-//! budget and the preserve decision expire within a second, while Postgres,
-//! the scripted apiserver and the scripted worker stay real.
+//! The substrate's [`SubstrateBudgets`] are shortened so the readiness waits
+//! and preserve decisions finish quickly without changing Postgres or the
+//! scripted apiserver and worker.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,8 +18,8 @@ use sqlx::{Postgres, Transaction};
 
 use super::super::scripted_test_doubles::{
     CallObserver, KubeReply, KubeRequest, ScriptedReply, ScriptedWorker, ScriptedWorkerConfig,
-    kube_status, pod_path, pod_reply, requests_matching, scripted_kube_client_async,
-    start_scripted_worker,
+    kube_status, pod_path, pod_reply, requests_matching, scripted_kube_client,
+    scripted_kube_client_async, start_scripted_worker,
 };
 use super::super::tests::{insert_test_sandbox_row, substrate_with_inventory_caches_and_pool};
 use super::*;
@@ -35,9 +35,8 @@ const TEST_PRESERVE_DECISION: Duration = Duration::from_millis(500);
 
 /// Shortened create budgets over the test substrate's `base`: the inner
 /// readiness phases get 300 ms and the outer budget fires 300 ms later. A
-/// readiness wait parked on a pod read that never answers reaches that read
-/// after the test substrate's short reflector wait, well inside the outer
-/// budget even on a loaded runner.
+/// readiness wait parked on node discovery reaches it after the test
+/// substrate's short reflector wait, well inside the outer budget.
 fn test_create_budgets(base: SubstrateBudgets) -> SubstrateBudgets {
     SubstrateBudgets {
         create_ready: Duration::from_millis(600),
@@ -127,14 +126,121 @@ async fn active_attempt(pool: &PgPool, sandbox_id: SandboxId) -> Result<Option<U
     .await?)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StalledGetOutcome {
+    ReadyOnWatch,
+    ReadyOnPoll,
+    PhaseElapsed,
+}
+
+#[rstest::rstest]
+#[case::watch_observes_the_running_pod(StalledGetOutcome::ReadyOnWatch)]
+#[case::polling_recovers_when_the_watch_ends(StalledGetOutcome::ReadyOnPoll)]
+#[case::the_phase_deadline_preempts_the_get(StalledGetOutcome::PhaseElapsed)]
+#[tokio::test(flavor = "current_thread")]
+async fn create_bounds_stalled_readiness_pod_gets(
+    #[case] expected: StalledGetOutcome,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([])).await?;
+    let pod_name = Arc::new(Mutex::new(String::new()));
+    let reply_pod_name = Arc::clone(&pod_name);
+    let pod_gets = AtomicUsize::new(0);
+    let stalled_gets = if expected == StalledGetOutcome::ReadyOnPoll {
+        2
+    } else {
+        1
+    };
+    let (client, log) = scripted_kube_client(move |request| {
+        let mut pod_name = reply_pod_name.lock().unwrap();
+        match request.method {
+            Method::POST if request.path == PODS_PATH => {
+                *pod_name = requested_pod_name(request);
+                pod_reply(&running_pod(&pod_name, sandbox_id, None))
+            }
+            Method::GET if request.path == pod_path(&pod_name) => {
+                if pod_gets.fetch_add(1, Ordering::Relaxed) < stalled_gets {
+                    KubeReply::Hang
+                } else if expected == StalledGetOutcome::PhaseElapsed {
+                    kube_status(StatusCode::NOT_FOUND, "NotFound")
+                } else {
+                    pod_reply(&running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)))
+                }
+            }
+            Method::GET
+                if request.path == PODS_PATH && expected == StalledGetOutcome::ReadyOnPoll =>
+            {
+                KubeReply::WatchEvents(vec![])
+            }
+            Method::GET if request.path == PODS_PATH => {
+                KubeReply::WatchEvents(vec![serde_json::json!({
+                    "type": "MODIFIED",
+                    "object": running_pod(&pod_name, sandbox_id, Some(WORKER_NODE)),
+                })])
+            }
+            _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+        }
+    });
+    let mut substrate = substrate_on(db.pool.clone(), client, &worker);
+    if expected == StalledGetOutcome::PhaseElapsed {
+        substrate.budgets.readiness_pod_get = Duration::from_secs(1);
+    } else {
+        substrate.budgets.create_ready = Duration::from_millis(1_300);
+        substrate.budgets.readiness_pod_get = Duration::from_millis(40);
+    }
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let mut request = inputs.create_request(sandbox_id, &template_ref);
+    request.wait_until_ready = false;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), substrate.create_execution(request))
+        .await
+        .map_err(|_| "create exceeded its readiness and cleanup budgets")?;
+    let gets = requests_matching(&log, &Method::GET);
+    let watched = gets.iter().any(|r| r.path == PODS_PATH);
+    if expected == StalledGetOutcome::PhaseElapsed {
+        let Err(error) = outcome else {
+            panic!("expected the IP readiness phase to expire, but create succeeded");
+        };
+        assert!(
+            matches!(
+                error,
+                SubstrateError::Timeout {
+                    phase: Some(WaitReadyTimeoutPhase::PodNeverReady),
+                    ..
+                }
+            ),
+            "expected the IP readiness phase to expire: {error:?}"
+        );
+        assert!(!watched, "the elapsed phase has no time left to watch");
+    } else {
+        let outcome = outcome?;
+        assert_eq!(outcome.active_node_id, Some(worker_node_id()));
+        assert!(
+            outcome.binding.is_some(),
+            "create must observe a reachable pod"
+        );
+        assert!(watched, "start the pod watch after the stalled GET");
+    }
+    assert!(requests_matching(&log, &Method::DELETE).is_empty());
+    let pod_name = pod_name.lock().unwrap();
+    let named_pod_path = pod_path(&pod_name);
+    assert!(gets.iter().filter(|r| r.path == named_pod_path).count() > stalled_gets);
+    Ok(())
+}
+
 // ── readiness failure ───────────────────────────────────────────────────────
 
 /// How the readiness wait of a create whose pod was accepted fails.
 #[derive(Debug, Clone, Copy)]
 enum ReadinessFailure {
-    /// Readiness's first pod read never answers. No readiness phase bounds
-    /// that read, so only the outer create budget ends the wait, with a
-    /// timeout that names no phase.
+    /// Discovering the assigned node on a cache miss never answers. Only
+    /// the outer create budget ends that wait, with no timeout phase.
     OuterBudget,
     /// Every guest probe answers gRPC `Unavailable` until the command-ready
     /// phase times out.
@@ -358,7 +464,11 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
                     match failure {
                         ReadinessFailure::OuterBudget if first_read => {
                             state.readiness_failed.store(true, Ordering::SeqCst);
-                            return KubeReply::Hang;
+                            return pod_reply(&running_pod(
+                                &pod_name,
+                                sandbox_id,
+                                Some(UNCACHED_NODE),
+                            ));
                         }
                         _ => {}
                     }
