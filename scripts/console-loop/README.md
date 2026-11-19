@@ -228,7 +228,12 @@ A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
 also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
 `--compare RUN`, `--headed`, `--loopback-hosts` (see below), and `--video`, which records the run as
-`run.webm` in its run directory. Run `npm run typecheck` and `npm test` (unit
+`run.webm` in its run directory and each step's place in it (`video` in
+`summary.json`). `npm run gifs -- <run> [--steps NAMES] [--width N] [--fps N]
+[--max-seconds N]` cuts that recording into one GIF per step,
+`<run>/gifs/<NNN>-<step>.gif`, with `ffmpeg`; a step longer than
+`--max-seconds` (40) plays faster so its GIF lasts that long, and
+`gifs/cuts.json` says by how much.  `npm run typecheck` and `npm test` (unit
 tests that need no stack) after changing the scripts; the SPACE Guide job of
 Pull CI runs both. The tool lives under `scripts/`, outside the paths that
 select the Kind smoke (`ci/kind-pull-paths.txt`) and outside `ui/`'s build.

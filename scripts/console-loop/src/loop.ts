@@ -76,6 +76,8 @@ async function main(): Promise<number> {
   const context = await newContext(browser, video ? { videoDir: path.join(runDir, '.video') } : {});
   if (flag(args, 'loopback-hosts')) await showLoopbackHostsOnly(context);
   const page = await context.newPage();
+  // The recording starts with the page.
+  const videoStartedAt = Date.now();
   const rec = new Recorder(page, { slowMs, prefix: config.prefix, outDir: runDir });
   const c: Ctx = {
     page, context, rec, config,
@@ -109,6 +111,7 @@ async function main(): Promise<number> {
         else rec.note(`toast ${toast.type}: ${toast.text}`);
       }
       const result = await rec.end(index, startedAt, failure);
+      if (video) result.video = { fromMs: startedAt - videoStartedAt, toMs: Date.now() - videoStartedAt };
       results.push(result);
       const bad = result.events.filter((e) => !NON_FAILING.includes(e.kind));
       console.log(`${result.ok ? 'ok  ' : 'FAIL'} ${String(index).padStart(3)} ${s.name} (${result.durationMs} ms)${bad.length ? ` — ${bad.length} event(s)` : ''}`);
