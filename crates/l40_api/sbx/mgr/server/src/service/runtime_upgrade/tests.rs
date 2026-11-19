@@ -5,7 +5,8 @@
 use super::*;
 use crate::db::fixture::insert_test_sandbox;
 use crate::db::{ActivationKind, ActivationRouteAdmission};
-use pplx_space_common_core::types::{LocalArtifactId, SandboxCleanupEpisodeId, SandboxId};
+use pplx_space_sandbox_model::{SandboxCleanupEpisodeId, SandboxId};
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +19,7 @@ struct Environments {
 
 fn environments() -> Environments {
     let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     let executions: Vec<_> = compiled
@@ -305,7 +306,7 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
     async fn stop(
         &self,
         sandbox_id: &str,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<(), Status> {
         self.called("stop");
         // Only ever the verified boot's own execution.
@@ -751,6 +752,92 @@ async fn a_failed_restore_keeps_the_fence_for_a_later_rollback() {
     h.assert_old_pair_restorable(SandboxState::Stopped);
 }
 
+impl Harness {
+    /// The execution the node publishes for the sandbox: the one the State
+    /// RPC reads.
+    fn published_execution(&self) -> Option<ExecutionMetadata> {
+        use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+        let mut budgets = crate::db::read::StateBudgets {
+            raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+            metadata: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+        };
+        let page = crate::db::read::state_page(
+            &self.db.lock().unwrap(),
+            std::slice::from_ref(&self.sandbox_id),
+            &mut budgets,
+        )
+        .unwrap();
+        match page.into_iter().next() {
+            Some(crate::db::read::StatePageRow::Decoded(decoded)) => decoded.published_execution,
+            _ => panic!("the sandbox's row didn't decode"),
+        }
+    }
+}
+
+/// A failed boot's cleanup stops the sandbox with the target still saved as
+/// its consumer, and the rollback restores the old one only once its disk is
+/// back. The node never publishes the sandbox under the target meanwhile,
+/// nor after the rollback: the control plane reads a stopped publication
+/// under the target as an upgrade that reached it.
+#[tokio::test]
+async fn a_rolled_back_upgrade_is_never_published_under_its_target() {
+    let h = harness(SandboxState::Stopped);
+    *h.fake.boot.lock().unwrap() = Boot::FailAfterWriting;
+    h.fake.fail_restore.store(true, Ordering::SeqCst);
+    let operation_id = operation();
+
+    h.upgrader
+        .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Stopped))
+        .await
+        .unwrap_err();
+
+    let row = h.row();
+    assert_eq!(
+        row.state,
+        crate::state::SandboxStatus::from(SandboxState::Stopped)
+    );
+    assert_eq!(row.execution_metadata, Some(h.envs.target.clone()));
+    assert_eq!(h.published_execution(), Some(h.envs.source.clone()));
+
+    h.fake.fail_restore.store(false, Ordering::SeqCst);
+    let record = h.record(operation_id).unwrap();
+    assert_eq!(
+        h.upgrader.settle(&record, false).await.unwrap(),
+        Settled::RolledBack
+    );
+    assert_eq!(h.published_execution(), Some(h.envs.source.clone()));
+}
+
+/// Once the boot is verified the sandbox runs under the target, and that's
+/// what the node publishes: while the upgrade waits in `verified` for its
+/// retirement, and after it retires.
+#[tokio::test]
+async fn a_verified_upgrade_is_published_under_its_target() {
+    let h = harness(SandboxState::Stopped);
+    h.fake.fail_retire.store(true, Ordering::SeqCst);
+    let operation_id = operation();
+
+    h.upgrader
+        .upgrade(h.request(operation_id, RuntimeUpgradeTargetState::Stopped))
+        .await
+        .unwrap_err();
+
+    let record = h.record(operation_id).unwrap();
+    assert_eq!(record.phase, RuntimeUpgradePhase::Verified);
+    assert_eq!(h.published_execution(), Some(h.envs.target.clone()));
+
+    h.fake.fail_retire.store(false, Ordering::SeqCst);
+    assert_eq!(
+        h.upgrader.settle(&record, true).await.unwrap(),
+        Settled::Retired
+    );
+    assert_eq!(
+        h.row().state,
+        crate::state::SandboxStatus::from(SandboxState::Stopped)
+    );
+    assert_eq!(h.published_execution(), Some(h.envs.target.clone()));
+}
+
 #[tokio::test]
 async fn retirement_waits_for_verification_across_a_crash() {
     // Crashed mid-boot: the sandbox came back to its old state, so the
@@ -841,6 +928,7 @@ async fn an_upgrade_interrupted_before_its_boot_rolls_back_on_settle() {
             &h.db.lock().unwrap(),
             &h.sandbox_id,
             reference(&h.envs.target),
+            crate::db::RuntimeUpgradeTargetState::Started,
             None,
         )
         .operation_id;
@@ -946,8 +1034,8 @@ async fn only_a_certified_upgrade_edge_is_followed() {
     // A historical contract no compiled environment describes has no edges.
     let h = harness(SandboxState::Stopped);
     let custom = ExecutionMetadata::new(
-        pplx_space_common_core::types::RuntimeIdentity {
-            kind: pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeIdentity {
+            kind: pplx_space_execution_spec::RuntimeKind::Firecracker,
             version: "1.14.0".parse().unwrap(),
         },
         h.envs.source.guest(),
@@ -1045,7 +1133,7 @@ async fn an_upgrade_never_stops_an_execution_it_did_not_boot() {
                 "UPDATE sandboxes SET state = 'started', node_execution_id = ?2 WHERE id = ?1",
                 crate::db::fixture::params![
                     h.sandbox_id,
-                    pplx_space_common_core::types::SandboxActivationAttemptId::new().to_string()
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new().to_string()
                 ],
             )
             .unwrap();
@@ -1202,7 +1290,7 @@ async fn a_failed_boot_auto_lifecycle_then_stops_still_rolls_back() {
 
 #[test]
 fn a_refused_stop_is_a_no_op_only_once_the_boot_is_at_rest_or_replaced() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let boot = SandboxActivationAttemptId::new();
     let refusal = Status::aborted("cleanup lifecycle changed from started to pausing");
     let other = Some(SandboxActivationAttemptId::new());
@@ -1354,6 +1442,7 @@ async fn a_second_upgrade_of_a_fenced_sandbox_is_refused() {
         &h.db.lock().unwrap(),
         &h.sandbox_id,
         reference(&h.envs.target),
+        crate::db::RuntimeUpgradeTargetState::Started,
         None,
     )
     .operation_id;
@@ -1432,6 +1521,7 @@ fn requests_are_parsed_strictly() {
         target_state: WakeTargetState::Stopped as i32,
         stage_from: None,
         checkpoint_local_artifact_id: None,
+        attempt_id: None,
     };
     let parsed = parse_request(valid()).unwrap();
     assert_eq!(parsed.target_state, RuntimeUpgradeTargetState::Stopped);
@@ -1619,7 +1709,7 @@ async fn a_verified_upgrade_that_must_end_stopped_retires_only_once_stopped() {
 mod service {
     use super::*;
     use crate::service::{SandboxManagerService, SandboxManagerServiceOptions};
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_uds_peer_auth::PeerIdentity;
 
     fn root<T>(message: T) -> tonic::Request<T> {
@@ -1641,6 +1731,7 @@ mod service {
             &conn,
             &sandbox_id,
             reference(&envs.target),
+            crate::db::RuntimeUpgradeTargetState::Started,
             None,
         )
         .operation_id;
@@ -1656,6 +1747,41 @@ mod service {
             error.message().contains(&operation_id.to_string()),
             "{error}"
         );
+    }
+
+    /// The State RPC publishes the execution a rollback restores while an
+    /// upgrade fences the sandbox, though the row has the target saved.
+    #[tokio::test]
+    async fn the_state_rpc_publishes_the_retained_execution_while_fenced() {
+        let envs = environments();
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+        crate::db::upsert_sandbox_execution_metadata(&conn, &sandbox_id, &envs.source).unwrap();
+        crate::db::test_fixtures::fence_runtime_upgrade(
+            &conn,
+            &sandbox_id,
+            reference(&envs.target),
+            crate::db::RuntimeUpgradeTargetState::Stopped,
+            None,
+        );
+        crate::db::upsert_sandbox_execution_metadata(&conn, &sandbox_id, &envs.target).unwrap();
+        let service =
+            SandboxManagerService::new_with_options(conn, SandboxManagerServiceOptions::for_test());
+
+        let response = service
+            .state(root(crate::proto::StateRequest {
+                sandbox_ids: vec![sandbox_id.clone()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let [info] = response.sandboxes.as_slice() else {
+            panic!("one sandbox: {response:?}");
+        };
+        assert_eq!(info.sandbox_id, sandbox_id);
+        assert_eq!(info.execution, Some((&envs.source).into()));
     }
 
     #[tokio::test]
@@ -1844,7 +1970,7 @@ mod service {
     #[test]
     fn the_upgrade_callers_may_also_start_and_stop() {
         let authorizer = crate::service::activation_support::sandbox_peer_authorizer();
-        let identity = |user: pplx_space_common_core::host::linux::identities::LinuxUser| {
+        let identity = |user: pplx_space_host_layout::identities::LinuxUser| {
             PeerIdentity::new(user.uid, user.primary_group.gid, None)
         };
         let allowed = [

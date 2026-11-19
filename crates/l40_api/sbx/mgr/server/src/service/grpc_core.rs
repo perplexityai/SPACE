@@ -17,7 +17,8 @@ use super::validation::{
 use super::*;
 
 use pplx_space_events::{
-    SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
+    SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+    emit_sandbox_event,
 };
 use pplx_space_node_mgr_client::proto::{
     GetDiskUsageRequest as NodeGetDiskUsageRequest,
@@ -48,7 +49,7 @@ fn sandbox_list_element(row: &crate::db::SandboxListRow) -> SandboxListElement {
 const MAX_LIST_PAGE_TOKEN_BYTES: usize = 256;
 
 /// List page size when the request leaves `page_size` unset (zero).
-const DEFAULT_LIST_PAGE_SIZE: usize = pplx_space_common_core::inventory::READ_BATCH_ITEMS;
+const DEFAULT_LIST_PAGE_SIZE: usize = pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS;
 
 /// Assemble one List page within the encoded budget. A page that fits
 /// continues where the store's page did; one the budget splits continues after
@@ -60,7 +61,7 @@ fn list_page_response(
     template_manager_peer: bool,
 ) -> Result<Response<ListResponse>, Status> {
     use crate::db::inventory_read::ListPageRow;
-    use pplx_space_common_core::inventory::{InventoryLimitExceeded, MAX_ENCODED_BYTES};
+    use pplx_space_rpc_contracts::inventory::{InventoryLimitExceeded, MAX_ENCODED_BYTES};
 
     // Leave room for the cursor field beside the elements.
     let element_budget = MAX_ENCODED_BYTES - (MAX_LIST_PAGE_TOKEN_BYTES + 8);
@@ -184,7 +185,7 @@ impl SandboxManagerService {
     /// Resolve and verify the exact environment within 30 seconds, including connect.
     async fn resolve_create_environment(
         &self,
-        reference: pplx_space_common_core::types::EnvironmentReference,
+        reference: pplx_space_execution_spec::EnvironmentReference,
     ) -> Result<pplx_space_node_mgr_client::environment_selection::SelectedEnvironment, Status>
     {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -204,13 +205,19 @@ impl SandboxManagerService {
         let peer = self.authorize_peer(&request, "Create", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
         let mut request = request;
         let environment = super::validation::normalize_environment_input(request.get_mut())?;
+        let required_environment =
+            super::validation::required_environment(request.get_ref(), environment)?;
         let span = tracing::info_span!("sbxmgr.create", template = %request.get_ref().template);
         let publish_node_state = !should_skip_node_publish(&request);
         let mut result = async move {
             let req = request.get_ref();
             let sandbox_owner = Self::authorize_create_sandbox_owner(&peer, req)?;
+            // A selected or required environment names the runtime, which
+            // the create fills in once it knows the environment's binding.
             let (requested_boot_mode, requested_id) = if environment.is_some() {
                 super::validation::validate_selected_create_fields(req)?;
+                validate_create_request_fields(req)?
+            } else if required_environment.is_some() {
                 validate_create_request_fields(req)?
             } else {
                 validate_create_request(req)?
@@ -230,13 +237,12 @@ impl SandboxManagerService {
             }
             let verified = if let Some(reference) = environment {
                 let selected = self.resolve_create_environment(reference).await?;
-                let pplx_space_common_core::types::RuntimeBinding::ManagedRelease(release) = &selected.definition.descriptor().spec().runtime;
+                let pplx_space_execution_spec::RuntimeBinding::ManagedRelease(release) = &selected.definition.descriptor().spec().runtime;
                 request.get_mut().runtime = release.runtime.kind.alias().to_owned();
                 Some(selected)
             } else { None };
             let req = request.get_ref();
             let template = &req.template;
-            let runtime = &req.runtime;
 
             use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
             let mut scope = template_lookup_scope(&sandbox_owner, req.sandbox_id.as_deref())?;
@@ -256,20 +262,35 @@ impl SandboxManagerService {
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
-            // A selected environment prefers its own build of the rootfs, so a
-            // twin bound to it boots instead of its sibling; otherwise any
-            // compatible build of the digest is checked below.
-            let mut resolved_template = resolve_template_paths(
+            // A selected or required environment prefers its own build of the
+            // rootfs, so a twin bound to it boots instead of its sibling;
+            // otherwise any compatible build of the digest is checked below.
+            let mut resolved_template = super::create_support::resolve_template_paths_requiring(
                 self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template.to_string(),
                     content_hash: req.content_hash.clone(),
                     tag: None,
-                    environment: environment.map(|reference| reference.to_string()),
+                    environment: environment
+                        .or(required_environment)
+                        .map(|reference| reference.to_string()),
                 },
                 scope,
+                required_environment.is_some(),
             )
             .await?;
+            if let Some(required) = required_environment {
+                super::validation::require_environment_partition(
+                    required,
+                    &resolved_template.execution,
+                )?;
+                let runtime = resolved_template.execution.runtime().kind;
+                require_lifecycle_adapter(runtime)?;
+                request.get_mut().runtime = runtime.alias().to_owned();
+            }
+            let req = request.get_ref();
+            let template = &req.template;
+            let runtime = &req.runtime;
             if let Some(selected) = &verified {
                 selected.definition.check_cold_boot_source(&resolved_template.execution)
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -424,6 +445,7 @@ impl SandboxManagerService {
                         volume_encryption: req.volume_encryption,
                         auto_lifecycle: &auto_lifecycle,
                         environment,
+                        required_environment,
                     };
                     let auto_lifecycle_changed =
                         requested_sandbox_create_auto_lifecycle_changed(&existing, &requested);
@@ -856,6 +878,25 @@ impl SandboxManagerService {
                 "auto-lifecycle delete requires a canonical sandbox id",
             ));
         }
+        let discard = match req.discard_retained_filesystem_reason.as_deref() {
+            Some(raw) => {
+                self.authorize_peer(
+                    &request,
+                    "Delete.discard_retained_filesystem",
+                    ALLOW_RETAINED_FILESYSTEM_DISCARD,
+                )?;
+                if expectation.is_some() || template_filter.is_some() {
+                    return Err(Status::invalid_argument(
+                        "a discard delete names one sandbox and takes no template filter",
+                    ));
+                }
+                Some(
+                    super::retained_filesystem_discard::DiscardReason::parse(raw)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                )
+            }
+            None => None,
+        };
 
         let to_delete = self
             .resolve_lifecycle_target(
@@ -866,6 +907,13 @@ impl SandboxManagerService {
             )
             .await?;
 
+        if discard.is_some() && to_delete.is_none() {
+            // A discard names the row the operator inspected; one that isn't
+            // here is the wrong target, not a delete that already happened.
+            return Err(Status::not_found(format!(
+                "no sandbox {requested_id} on this node to discard"
+            )));
+        }
         let mut deleted_ids: Vec<String> = Vec::new();
 
         for (id, runtime_label) in to_delete.iter() {
@@ -888,6 +936,12 @@ impl SandboxManagerService {
                         .is_some_and(|status| status.is_unowned(SandboxState::Quarantined));
                 (episode, quarantined)
             };
+            if discard.is_some() && clone_disposal.is_some() {
+                return Err(
+                    super::cleanup::CleanupAdmissionError::DiscardNotApplicable { sandbox_id }
+                        .into_status(),
+                );
+            }
             if let Some(episode) = clone_disposal {
                 if episode.requested_at.is_none() && !quarantined {
                     return Err(Status::failed_precondition(
@@ -949,12 +1003,27 @@ impl SandboxManagerService {
                 continue;
             }
             let completion = CleanupCompletion::DeleteRow;
-            let admission = match expectation {
-                Some(expectation) => {
+            if let Some(reason) = &discard {
+                // Logged before admission: admission commits the row's
+                // `deleting` state, which startup recovery finishes as a
+                // delete after a restart, so the reason is on record first.
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    discard_reason = %reason,
+                    "operator discard delete requested: erasing a retained filesystem that may \
+                     be the sandbox's only copy, if admitted"
+                );
+            }
+            let admission = match (expectation, &discard) {
+                (Some(expectation), _) => {
                     self.admit_auto_lifecycle_delete(sandbox_id, expectation)
                         .await
                 }
-                None => {
+                (None, Some(_)) => {
+                    self.admit_retained_filesystem_discard(sandbox_id, !blocking)
+                        .await
+                }
+                (None, None) => {
                     self.admit_selected_cleanup(
                         sandbox_id,
                         completion,
@@ -967,6 +1036,17 @@ impl SandboxManagerService {
                 }
             }
             .map_err(super::cleanup::CleanupAdmissionError::into_status)?;
+            if let Some(reason) = &discard {
+                emit_sandbox_event(
+                    id,
+                    SandboxEventType::DeleteRequested,
+                    SandboxEventSource::SbxManager,
+                    SandboxEventDetails::default()
+                        .trigger(SandboxEventTrigger::User)
+                        .operation(super::retained_filesystem_discard::DISCARD_OPERATION)
+                        .reason(reason.as_str()),
+                );
+            }
 
             // Admission owns the authoritative lifecycle row under the
             // per-sandbox cleanup lock. Monitoring is removed only after that
@@ -1051,7 +1131,7 @@ impl SandboxManagerService {
             0 => DEFAULT_LIST_PAGE_SIZE,
             size => usize::try_from(size)
                 .unwrap_or(usize::MAX)
-                .min(pplx_space_common_core::inventory::MAX_ITEMS),
+                .min(pplx_space_rpc_contracts::inventory::MAX_ITEMS),
         };
         let scope = if pool_members_only {
             crate::db::inventory_read::ListPageScope::PoolMembers
@@ -1115,7 +1195,7 @@ impl SandboxManagerService {
         }
 
         let mut response = GetDiskUsageResponse::default();
-        for batch in sandbox_ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+        for batch in sandbox_ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
             let batch = self.disk_usage_batch(batch.to_vec()).await?;
             response.usage_bytes.extend(batch.usage_bytes);
             response.missing_ids.extend(batch.missing_ids);
@@ -1256,7 +1336,7 @@ fn project_template_catalog(
         pplx_space_template_mgr_client::proto::TemplateFullInfo,
     >::new();
     for build in builds {
-        pplx_space_common_core::types::TemplateName::parse(&build.name).map_err(|error| {
+        pplx_space_template_model::TemplateName::parse(&build.name).map_err(|error| {
             Status::data_loss(format!("invalid template catalog name: {error}"))
         })?;
         let hash = build.content_hash.as_deref().ok_or_else(|| {
@@ -1265,7 +1345,7 @@ fn project_template_catalog(
                 build.name
             ))
         })?;
-        hash.parse::<pplx_space_common_core::types::ContentHash>()
+        hash.parse::<pplx_space_content_digest::ContentHash>()
             .map_err(|error| {
                 Status::data_loss(format!("invalid template catalog digest: {error}"))
             })?;
@@ -1289,7 +1369,7 @@ fn project_template_catalog(
             // sends none, and all its builds are legacy. The partition only
             // locates supplemental metadata, so an unreadable one reads the
             // legacy dir rather than failing the whole listing.
-            use pplx_space_common_core::types::TemplateCachePartition;
+            use pplx_space_template_model::TemplateCachePartition;
             let partition = match build.cache_partition.as_deref() {
                 None => TemplateCachePartition::Legacy,
                 Some(key) => TemplateCachePartition::from_key(key).unwrap_or_else(|error| {
@@ -1345,6 +1425,8 @@ fn project_template_catalog(
 mod create_after_lookup_tests;
 #[cfg(test)]
 mod create_environment_tests;
+#[cfg(test)]
+mod create_required_environment_tests;
 #[cfg(test)]
 mod create_template_lookup_tests;
 #[cfg(test)]

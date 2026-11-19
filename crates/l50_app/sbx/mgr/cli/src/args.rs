@@ -1,5 +1,40 @@
 use super::*;
 
+#[derive(Debug, Clone, Args)]
+pub(super) struct GuestMaintenanceArgs {
+    /// Print a structured maintenance receipt.
+    #[arg(long)]
+    pub json: bool,
+    pub id: SandboxSelector,
+    /// Kill in-flight API workloads instead of waiting for complete idleness.
+    #[arg(long)]
+    pub force: bool,
+    /// Operation UUID; defaults to a new UUIDv7. Reuse the printed value to retry.
+    #[arg(long)]
+    pub operation: Option<uuid::Uuid>,
+    /// Expected execution; defaults to the current execution discovered from status.
+    #[arg(long)]
+    pub expected_execution: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub(super) enum GuestUpdateCommand {
+    Status {
+        id: SandboxSelector,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        operation: Option<uuid::Uuid>,
+    },
+    Apply {
+        #[command(flatten)]
+        args: GuestMaintenanceArgs,
+        /// Local promotion document; the manager independently verifies its authority.
+        #[arg(long, default_value = "/etc/space/guest-update/policy.json")]
+        policy: std::path::PathBuf,
+    },
+}
+
 #[derive(Parser)]
 #[command(
     name = "space-sbxmgr",
@@ -26,7 +61,7 @@ pub(super) fn parse_env_vars(values: Vec<String>) -> BTreeMap<String, String> {
             exit_error(format!("duplicate env key '{key}'"));
         }
     }
-    let (env, issues) = pplx_space_common_core::types::EnvMap::sanitize(env);
+    let (env, issues) = pplx_space_guest_process::EnvMap::sanitize(env);
     for issue in issues {
         eprintln!("WARNING: env sanitized: {issue:?}");
     }
@@ -226,14 +261,24 @@ pub(super) fn print_network_policy(mode: NetworkPolicyMode, source: Option<&str>
 
 #[derive(clap::Subcommand)]
 pub(super) enum Commands {
+    /// Inspect or apply a manager-owned guest agent update; never wakes a VM.
+    GuestUpdate {
+        #[command(subcommand)]
+        command: GuestUpdateCommand,
+    },
+    /// Restart the guest agent. --force also terminates its API workloads.
+    GuestRestart {
+        #[command(flatten)]
+        args: GuestMaintenanceArgs,
+    },
     /// Create a new sandbox (copies rootfs, optionally starts it)
     Create {
         /// Exact published template content digest.
         #[arg(long)]
-        content_hash: Option<pplx_space_common_core::types::ContentHash>,
+        content_hash: Option<pplx_space_content_digest::ContentHash>,
         /// Exact environment; must match the template's immutable binding.
         #[arg(long)]
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         /// Legacy runtime selector; an environment determines its own runtime.
         #[arg(
             long,
@@ -328,6 +373,16 @@ pub(super) enum Commands {
         /// Wait until matching rows are deleted
         #[arg(long)]
         blocking: bool,
+        /// Delete a sandbox an interrupted suspend quarantined with no usable
+        /// capture, discarding its retained filesystem, which may be its only
+        /// copy. Refused for every other sandbox. Takes the sandbox's full UUID
+        /// and needs --reason.
+        #[arg(long, requires = "reason", conflicts_with_all = ["all", "template"])]
+        discard_retained_filesystem: bool,
+        /// Why the retained filesystem is discarded, recorded in the
+        /// sandbox's event and in sandbox-manager's log
+        #[arg(long, requires = "discard_retained_filesystem")]
+        reason: Option<String>,
     },
     /// List all sandboxes
     List,
@@ -461,6 +516,12 @@ pub(super) enum Commands {
         /// whose staleness reading may not have refreshed yet.
         #[arg(long)]
         min_age: Option<SimpleDuration>,
+        /// Hand each old gateway's listening sockets to its replacement, so
+        /// guest traffic sent during the cycle, DNS included, waits for the
+        /// new gateway instead of being dropped. A node whose node-manager or
+        /// runtime supervisor predates the handover cycles as without it.
+        #[arg(long)]
+        hand_over_sockets: bool,
     },
     /// Pause a running sandbox (freeze vCPUs, process stays alive)
     Pause {

@@ -19,17 +19,17 @@ use crate::guest_filesystem_flush::{
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::runtime_reconciliation::{mark_quarantined_best_effort, observe_vm_state};
 use crate::state::SandboxState;
-use pplx_space_common_core::types::{
-    ArtifactKind, LocalArtifactId, SandboxArtifactMetadata, SandboxId, SandboxQuarantineReasonCode,
-    SnapshotExecutionMetadata, SnapshotName,
-};
+use pplx_space_artifact_model::SandboxArtifactMetadata;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CaptureVmStateRequest, PauseSandboxRequest, ResumeSandboxRequest, SyncGuestRequest,
 };
 use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::{SandboxId, SandboxQuarantineReasonCode};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -139,16 +139,15 @@ fn write_snapshot_sidecar(
 /// `snapshot.json`, not `runtime.json`.
 fn checkpoint_sidecar_execution_metadata(
     metadata: SandboxArtifactMetadata,
-) -> Result<SnapshotExecutionMetadata, pplx_space_common_core::types::ExecutionMetadataError> {
+) -> Result<SnapshotExecutionMetadata, pplx_space_execution_spec::ExecutionMetadataError> {
     Ok(SnapshotExecutionMetadata::new(metadata.execution)?
         .with_cpu_budget(metadata.cpu_budget)
         .with_guest_memory(metadata.guest_memory)
-        .with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned()))
+        .with_host_cpu(pplx_space_execution_spec::HostCpu::current().cloned()))
 }
 
 fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapshot_name: &str) {
-    let sandbox_metadata_path =
-        pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
+    let sandbox_metadata_path = pplx_space_host_layout::paths::sandbox_metadata_path(sandbox_id);
     let bytes = match std::fs::read(&sandbox_metadata_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -211,7 +210,7 @@ fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapsh
     }
 }
 
-const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
 
 struct SandboxSnapshotState {
     tick_count: u64,
@@ -600,10 +599,8 @@ fn publish_named_artifact(
     let snapshot_name = SnapshotName::parse(snapshot_name.to_string())
         .map_err(|error| format!("generated scheduled snapshot name is invalid: {error}"))?;
     let local_artifact_id = LocalArtifactId::new();
-    let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-        sandbox_id,
-        snapshot_name.as_str(),
-    );
+    let local_path =
+        pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name.as_str());
     crate::local_artifacts::LocalArtifacts::new(ctx.db.clone())
         .publish_named_snapshot(
             sandbox_id,
@@ -710,6 +707,63 @@ fn finish_completed_checkpoint_after_resume_error(
     lifecycle_result
 }
 
+/// How many times [`discard_incomplete_checkpoint`] asks node-manager to
+/// delete the directory, and how long it waits between asks. Node-manager
+/// refuses a delete with `Unavailable` while another operation on the
+/// sandbox, such as the guest-network reconciler, holds its mutation claim,
+/// which it does only briefly.
+const INCOMPLETE_CHECKPOINT_DELETE_ATTEMPTS: usize = 3;
+const INCOMPLETE_CHECKPOINT_DELETE_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Delete the snapshot directory a checkpoint created before its VM state
+/// capture failed, returning `error` with any failure to delete appended. The
+/// directory holds the disk but no VM state, so it restores nothing, yet the
+/// listing still shows it, as incomplete, and with no row nothing removes it
+/// while the sandbox runs: retention spares a manual checkpoint's name. Only
+/// a directory this checkpoint created is deleted: a failed create may have
+/// met an existing snapshot of the same name. A delete refused as
+/// `Unavailable` is asked again, up to
+/// [`INCOMPLETE_CHECKPOINT_DELETE_ATTEMPTS`] times; the caller has already
+/// rolled the sandbox back, so the outcome changes nothing else.
+async fn discard_incomplete_checkpoint(
+    node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
+    sandbox_id: &str,
+    snapshot_name: &str,
+    error: String,
+) -> String {
+    let mut attempt = 1;
+    let status = loop {
+        match node_client
+            .delete_btrfs_snapshot(
+                pplx_space_node_mgr_client::proto::DeleteBtrfsSnapshotRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    snapshot_name: snapshot_name.to_string(),
+                },
+            )
+            .await
+        {
+            Ok(_) => return error,
+            Err(status) if status.code() == tonic::Code::NotFound => return error,
+            Err(status)
+                if status.code() == tonic::Code::Unavailable
+                    && attempt < INCOMPLETE_CHECKPOINT_DELETE_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(INCOMPLETE_CHECKPOINT_DELETE_BACKOFF).await;
+            }
+            Err(status) => break status,
+        }
+    };
+    tracing::warn!(
+        sandbox_id,
+        snapshot_name,
+        attempt,
+        error = %status,
+        "failed to delete an incomplete checkpoint's snapshot directory"
+    );
+    format!("{error}; delete the incomplete checkpoint {snapshot_name}: {status}")
+}
+
 async fn rollback_checkpoint_failure(
     ctx: &CheckpointContext,
     node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
@@ -752,14 +806,37 @@ async fn rollback_checkpoint_failure(
     } else {
         None
     };
-    finish_checkpoint_rollback(
+    let error = finish_checkpoint_rollback(
         ctx,
         sandbox_id,
         previous_state,
         checkpoint_error,
         resume_result,
         observation.as_ref().and_then(|value| value.state()),
-    )
+    );
+    resume_checkpoint_observation(ctx, sandbox_id).await;
+    error
+}
+
+/// Successful capture, failed capture and an ambiguous resume all converge on
+/// the reconciled lifecycle state. Never reconnect into a still-paused VM.
+async fn resume_checkpoint_observation(ctx: &CheckpointContext, sandbox_id: &str) {
+    let running = lock_db(ctx).is_ok_and(|db| {
+        crate::db::read::sandbox(&db, sandbox_id)
+            .is_ok_and(|row| row.is_some_and(|row| row.state.is_unowned(SandboxState::Started)))
+    });
+    if running
+        && let Err(error) = crate::service::notify_resume_clock_sync_best_effort(
+            sandbox_id,
+            pplx_space_spaced_host_client::proto::ResumeReason::SuspendResume,
+        )
+        .await
+    {
+        // Capable customer guests retry through the configuration observer
+        // under the artifact lock. Legacy/pool/builder guests have no such
+        // observer; metadata quiescence never owns customer admission.
+        tracing::warn!(sandbox_id, %error, "checkpoint resume notification awaits reconciliation");
+    }
 }
 
 fn finish_checkpoint_rollback(
@@ -914,6 +991,7 @@ pub async fn do_checkpoint(
         .await
     {
         restore_checkpoint_state_best_effort(ctx, sandbox_id, SandboxState::Started);
+        resume_checkpoint_observation(ctx, sandbox_id).await;
         return Err(format!(
             "guest snapshot preparation for checkpoint failed: {e}"
         ));
@@ -1014,13 +1092,20 @@ pub async fn do_checkpoint(
         ))
         .await
     {
-        return Err(rollback_checkpoint_failure(
+        let error = rollback_checkpoint_failure(
             ctx,
             &mut node_client,
             sandbox_id,
             execution_fence.clone(),
             previous_state,
             format!("checkpoint snapshot failed: {e}"),
+        )
+        .await;
+        return Err(discard_incomplete_checkpoint(
+            &mut node_client,
+            sandbox_id,
+            snapshot_name,
+            error,
         )
         .await);
     }
@@ -1063,6 +1148,9 @@ pub async fn do_checkpoint(
     // 6. Restore state — back to Started if we resumed, back to Paused if we didn't
     if !resume_state_reconciled {
         finish_checkpoint_success(ctx, sandbox_id, previous_state)?;
+    }
+    if previous_state == SandboxState::Started {
+        resume_checkpoint_observation(ctx, sandbox_id).await;
     }
 
     // 7. Write sidecar metadata for recovery

@@ -1,7 +1,7 @@
 use super::*;
-use pplx_space_common_core::types::{
-    NodeId, NodeManagedBy, NodeRole, admin::AdminNodeDrainability,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_admin_protocol::AdminNodeDrainability;
+use pplx_space_node_model::{NodeManagedBy, NodeRole};
 
 #[test]
 fn action_url_appends_colon_action() {

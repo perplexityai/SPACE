@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NODE_ROLE_WORKER, NodeGroupId, SubstrateKind};
+use pplx_space_node_model::{NODE_ROLE_WORKER, NodeGroupId, SubstrateKind};
+use pplx_space_sql_locator::sql;
 use sqlx::{Connection, Executor, PgConnection, PgExecutor, Postgres, SqlSafeStr, Transaction};
 
 /// `node_groups` as `name -> id`.

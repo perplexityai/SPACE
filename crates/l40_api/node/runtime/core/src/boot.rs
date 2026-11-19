@@ -1,7 +1,8 @@
 //! Guest boot configuration belongs to runtime adapters. Lifecycle callers
 //! provide resources and policy, not a provider's JSON keys or device model.
-use pplx_space_common_core::types::{
-    Arch, BalloonConfig, GuestOperatingSystem, GuestPlatform, RateLimiter, RuntimeKind, VcpuCount,
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    BalloonConfig, GuestOperatingSystem, GuestPlatform, RateLimiter, RuntimeKind, VcpuCount,
 };
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -85,14 +86,14 @@ pub fn configuration(
 // Changes apply only on cold boot. Rebuild templates and base snapshots to
 // roll out new boot arguments to workloads restored from memory state.
 fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
-    use pplx_space_common_core::guest::linux::network::PRIMARY_INTERFACE;
-    use pplx_space_common_core::guest::network::{
-        GATEWAY as GATEWAY_IPV4_ADDR, GUEST as IPV4_ADDR, NETMASK as IPV4_NETMASK,
+    use pplx_space_net_common::guest_link::PRIMARY_INTERFACE;
+    use pplx_space_net_common::guest_link::{
+        GATEWAY as GUEST_LINK_GATEWAY, GUEST as GUEST_LINK_GUEST, NETMASK as GUEST_LINK_NETMASK,
     };
     let build = if input.builder {
         format!(
             " {}",
-            pplx_space_common_core::types::TEMPLATE_RUNTIME_BUILD_MASK
+            pplx_space_template_runtime::TEMPLATE_RUNTIME_BUILD_MASK
         )
     } else {
         String::new()
@@ -108,7 +109,7 @@ fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str)
         String::new()
     };
     format!(
-        "reboot=k panic=1 {devices} rw root=/dev/vda{build}{clock} transparent_hugepage=never{uart}{console} ip={IPV4_ADDR}::{GATEWAY_IPV4_ADDR}:{IPV4_NETMASK}:instance:{PRIMARY_INTERFACE}:off"
+        "reboot=k panic=1 {devices} rw root=/dev/vda{build}{clock} transparent_hugepage=never{uart}{console} ip={GUEST_LINK_GUEST}::{GUEST_LINK_GATEWAY}:{GUEST_LINK_NETMASK}:instance:{PRIMARY_INTERFACE}:off"
     )
 }
 
@@ -118,7 +119,7 @@ pub(crate) mod tests;
 // The two REST protocols use the same token-bucket schema and millisecond units.
 // Queue topology remains an adapter policy, not part of this encoding.
 pub(crate) fn token_buckets(limiter: &RateLimiter) -> serde_json::Value {
-    use pplx_space_common_core::types::TokenBucket;
+    use pplx_space_execution_spec::TokenBucket;
     let bucket = |bucket: TokenBucket| serde_json::json!({ "size": bucket.size, "refill_time": bucket.refill_time_ms });
     serde_json::json!({ "bandwidth": bucket(limiter.bandwidth), "ops": bucket(limiter.operations) })
 }

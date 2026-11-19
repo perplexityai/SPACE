@@ -603,7 +603,7 @@ async fn ledger_update_outlives_caller_and_preserves_worker_loss() {
     assert!(futures_util::poll!(&mut stalled).is_pending());
     tokio::task::yield_now().await;
     tokio::time::advance(
-        pplx_space_common_core::operation_budget::RuntimeOperationBudget::FilesystemMetadata
+        pplx_space_rpc_contracts::operation_budget::RuntimeOperationBudget::FilesystemMetadata
             .timeout(),
     )
     .await;

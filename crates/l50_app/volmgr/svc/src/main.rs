@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use pplx_space_common_core::host::linux::paths::{
+use pplx_space_host_layout::paths::{
     VOLUME_MANAGER_DB, VOLUME_MANAGER_SOCKET, VOLUME_MANAGER_STAGING_DIR,
 };
 use pplx_space_volmgr::executor::{
@@ -114,8 +114,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SERVER_DRAIN_TIMEOUT_SECS)]
     server_drain_timeout_secs: u64,
 
-    /// How long to wait for outstanding transfers before the gRPC server stops, in seconds.
-    /// Interrupted transfers remain persisted and are re-queued on startup.
+    /// How long running transfers may take to finish after SIGTERM before the gRPC server
+    /// stops, in seconds. Transfers not started by then, and interrupted ones, remain
+    /// persisted and are re-queued on startup.
     #[arg(long, default_value_t = DEFAULT_TRANSFER_DRAIN_TIMEOUT_SECS)]
     drain_timeout_secs: u64,
 

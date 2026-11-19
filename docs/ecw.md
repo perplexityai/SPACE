@@ -125,6 +125,55 @@ The selected template must already be published. `seed` is the compatibility
 default when a create request omits `templateID`; a production deployment will
 usually publish and select a purpose-built runtime template instead.
 
+### Client attribution
+
+A client can identify itself with an `X-Client-ID` header. Create, fork and
+connect each take a slot under the per-client concurrency limit
+(`SPACE_API_CLIENT_CONCURRENCY_*` in [Configuration](configuration.md)), which
+gives each allowlisted id its own bucket and has every other request share
+one. Resume takes one too when `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` is
+on.
+
+With `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` on (it's off by default; see
+[Configuration](configuration.md)), the id is also recorded as the client whose
+activation created the sandbox's runtime. A value that is a Kubernetes label value is used as sent, after
+trimming. A missing or invalid value, or one of the reserved ids `unknown`,
+`native` and `overflow` in any case, becomes `unknown`. A native `/v1` create
+records `native`. On Direct, the record is written only when the sandbox is
+created.
+
+On Kubernetes, the pod an activation creates carries the id as its
+`space.pplx.net/client-id` label, and tracking that pod records it on the
+sandbox:
+
+- A create, fork, connect or resume labels its pod with the calling client,
+  and a native lifecycle operation that starts a runtime labels its pod
+  `native`.
+- An activation with no client of its own (an implicit wake from a command or
+  ingress, a reconciler, an evacuation) labels its pod with the recorded id,
+  and leaves it unlabeled when nothing is recorded.
+- A wake that reuses the resident runtime keeps its pod and label.
+- A warm-pool pod is labeled when it's adopted, before the create commits,
+  and no pod waiting in the pool carries one. If the label patch fails
+  transiently (throttling, a 408 or 5xx, a dropped connection, no answer
+  within 5 seconds), the pod isn't adopted and the create gets a retryable
+  503. A throttled patch never ran, so its slot goes back to the pool; after
+  any other failure the patch may still land, so the slot is taken out of the
+  pool and its label removal is attempted, and a label that can't be removed
+  stays until the pool deletes the pod. If the apiserver refuses the patch for
+  good, the pod isn't adopted and the create builds a cold pod instead.
+
+Ids are unbounded, since a client can send any value. Anything that needs a
+bounded set, such as a metric tag, has to map the id to one first.
+
+An operator can cap how many sandboxes with a live runtime each client holds
+(`SPACE_API_CLIENT_LIVE_CAP_*` in [Configuration](configuration.md)). A
+create, fork, connect or resume that would go over the cap gets a `429` with
+a `Retry-After`, and succeeds once the client pauses or kills one of
+its sandboxes. A connect to a sandbox that's already running is never refused.
+On the Direct substrate the cap always admits, since Direct keeps no
+per-client inventory.
+
 ## Sizing at create
 
 SPACE extends ECW create with the reserved metadata key `space.resources`. Its
@@ -148,10 +197,14 @@ not an upstream E2B create option. ECW already uses reserved metadata for
 [full network policies](ecw-network-policy.md). The current upstream E2B create
 schema and Python SDK 2.62.0 do not expose CPU, memory, or disk overrides.
 
-Provided values must be positive integers no larger than 2,147,483,647; actual
-allocation remains subject to runtime and available capacity. `disk_mib`
-overrides the template's disk size; it must be at least the template rootfs
-size, and a value above 128 GiB returns HTTP 400. Malformed JSON, unknown
+`vcpu` must be 1 to 32, `memory_mib` 512 to 65,536 and `disk_mib` 1 to
+131,072; a value outside them returns HTTP 400 before anything is created. These
+are admission bounds, the same as the native API's. A node gives the guest at
+most its own configured guest maximum, and allocation remains subject to
+available capacity. `disk_mib` overrides the template's disk size; it must be
+at least the template rootfs size. A smaller value fails the
+create with HTTP 400 naming the rootfs size once the node refuses to start it,
+usually within seconds. Malformed JSON, unknown
 fields, and invalid values return HTTP 400. Omitted fields retain the normal
 create defaults. ECW consumes `space.resources`, so it does not appear in the
 sandbox's stored metadata; other metadata is preserved.
@@ -162,9 +215,12 @@ sandbox, change a template, or alter fork, connect, or resume behavior. Requests
 without the extension retain their existing behavior.
 
 Deploy an API version supporting this extension before enabling callers. Older
-versions accept the key as ordinary metadata and do not apply its sizing.
-Callers should verify the allocation returned by `get_info()` and reject an
-undersized sandbox.
+versions accept the key as ordinary metadata and do not apply its sizing;
+`get_info()` then reports the default sizing instead of the requested values.
+`get_info()` reports the requested `memory_mb`, not the memory the node gave the
+guest, so it cannot show that a request above the node's guest maximum was
+capped. To check a guest's memory, read it inside the sandbox, for example
+`MemTotal` in `/proc/meminfo`, which sits slightly below the allocation.
 
 ## Compatibility contract
 

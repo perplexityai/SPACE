@@ -16,9 +16,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use futures_util::Stream;
-use pplx_space_common_core::types::{
-    Arch, ArtifactVersion, Digest, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-    RuntimeVersionParseError, StorageUri,
+use pplx_space_artifact_model::StorageUri;
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactVersion, RuntimeIdentity, RuntimeKind, RuntimeVersion, RuntimeVersionParseError,
 };
 
 /// Firecracker's public CI artifact bucket. Path-style, because the bucket's
@@ -55,7 +57,7 @@ impl FromStr for ReleaseLine {
         let invalid = || ReleaseLineParseError(value.to_string());
         let digits =
             |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-        let unprefixed = value.strip_prefix('v').unwrap_or(value);
+        let unprefixed = value.trim_prefix('v');
         let mut parts = unprefixed.split('.');
         let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
             return Err(invalid());
@@ -158,8 +160,7 @@ impl FromStr for KernelVersion {
             None => (value, None),
         };
         let numeric_parts = release
-            .strip_suffix('+')
-            .unwrap_or(release)
+            .trim_suffix('+')
             .split('.')
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
         let plain_variant = variant.is_none_or(|variant| {
@@ -356,7 +357,7 @@ pub enum KernelLocation {
 #[derive(Debug, thiserror::Error)]
 pub enum KernelLocationError {
     #[error(transparent)]
-    S3(#[from] pplx_space_common_core::types::StorageUriParseError),
+    S3(#[from] pplx_space_artifact_model::StorageUriParseError),
     #[error(transparent)]
     Https(#[from] super::release_source::ReleaseUrlParseError),
 }

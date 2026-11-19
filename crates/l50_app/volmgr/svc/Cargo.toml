@@ -35,8 +35,8 @@ tokio = { workspace = true, features = ["time"] }
 tonic = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-service-host = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-tokio-runtime = { workspace = true }

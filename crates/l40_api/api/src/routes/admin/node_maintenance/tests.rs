@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use super::*;
 use pplx_space_db_test_fixtures::try_pg_test_db;

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 
@@ -93,7 +93,7 @@ async fn import_rejects_reserved_owner_before_reserving_identity_or_waiting_for_
 async fn import_rejects_local_network_policy_from_forwarded_service_peer() {
     use crate::service::activation_support::sandbox_peer_authorizer;
     use crate::service::tests::service_tests::service_for_teardown_test;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_net_common::{NetworkPolicyV1, proto::PolicyAuthority};
 
     let service = service_for_teardown_test(crate::db::test_conn());
@@ -136,7 +136,7 @@ async fn import_rejects_local_network_policy_from_forwarded_service_peer() {
 async fn import_rejects_local_auto_lifecycle_from_forwarded_service_peer() {
     use crate::service::activation_support::sandbox_peer_authorizer;
     use crate::service::tests::service_tests::service_for_teardown_test;
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     use pplx_space_net_common::proto::PolicyAuthority;
 
     let service = service_for_teardown_test(crate::db::test_conn());
@@ -384,7 +384,7 @@ fn import_header_execution_metadata_backfills_legacy_firecracker_header() {
 
     assert_eq!(
         execution.runtime().kind,
-        pplx_space_common_core::types::RuntimeKind::Firecracker
+        pplx_space_execution_spec::RuntimeKind::Firecracker
     );
     assert_eq!(execution.runtime().version.as_str(), "1.15.1");
     assert_eq!(execution.state_format().unwrap().version.as_str(), "9.0.0");

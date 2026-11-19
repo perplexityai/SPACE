@@ -7,7 +7,7 @@ pub(super) struct GuestNetworks {
     entries: dashmap::DashMap<SandboxId, DhcpTask>,
 }
 struct DhcpTask {
-    execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+    execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for DhcpTask {

@@ -57,29 +57,31 @@ done
 # A cold build's outputs, including the uplifted copies, scratch space and
 # reports that must not be reused.
 t="${fixture}/t"
-mkdir -p "${t}/debug/.fingerprint/u0" "${t}/debug/deps" "${t}/debug/examples" \
-    "${t}/debug/build/b-0123456789abcdef/out" "${t}/debug/incremental" "${t}/tmp" "${t}/cargo-timings"
-echo out >"${t}/debug/.fingerprint/u0/lib"
-head -c 200000 /dev/urandom >"${t}/debug/deps/tool-0123456789abcdef"
-ln "${t}/debug/deps/tool-0123456789abcdef" "${t}/debug/tool"
-echo ex >"${t}/debug/examples/m1_openapi-0123456789abcdef"
-ln "${t}/debug/examples/m1_openapi-0123456789abcdef" "${t}/debug/examples/m1_openapi"
-echo script >"${t}/debug/build/b-0123456789abcdef/build_script_build-0123456789abcdef"
-ln "${t}/debug/build/b-0123456789abcdef/build_script_build-0123456789abcdef" \
-    "${t}/debug/build/b-0123456789abcdef/build-script-build"
+mkdir -p "${t}/debug/build/a-tool/0123456789abcdef/fingerprint" "${t}/debug/build/a-tool/0123456789abcdef/out" \
+    "${t}/debug/examples" "${t}/debug/build/m1_openapi/0123456789abcdef/out" \
+    "${t}/debug/build/b/0123456789abcdef/out" "${t}/debug/incremental" "${t}/tmp" "${t}/cargo-timings"
+echo out >"${t}/debug/build/a-tool/0123456789abcdef/fingerprint/lib"
+head -c 200000 /dev/urandom >"${t}/debug/build/a-tool/0123456789abcdef/out/tool"
+ln "${t}/debug/build/a-tool/0123456789abcdef/out/tool" "${t}/debug/tool"
+echo ex >"${t}/debug/build/m1_openapi/0123456789abcdef/out/m1_openapi"
+ln "${t}/debug/build/m1_openapi/0123456789abcdef/out/m1_openapi" "${t}/debug/examples/m1_openapi"
+echo stale >"${t}/debug/examples/removed-0123456789abcdef"
+echo script >"${t}/debug/build/b/0123456789abcdef/out/build_script_build"
+ln "${t}/debug/build/b/0123456789abcdef/out/build_script_build" \
+    "${t}/debug/build/b/0123456789abcdef/out/build-script-build"
 echo '{}' >"${t}/.rustc_info.json"
 echo scratch >"${t}/tmp/state"
 echo report >"${t}/cargo-timings/cargo-timing.html"
 echo log >"${t}/run.log"
 old="$(($(date +%s) - 600))"
 find "${t}" -exec touch -h -d "@${old}" {} +
-touch -d "@${old}.123456789" "${t}/debug/deps/tool-0123456789abcdef"
-old_ns="$(stat -c %.9Y "${t}/debug/deps/tool-0123456789abcdef")"
+touch -d "@${old}.123456789" "${t}/debug/build/a-tool/0123456789abcdef/out/tool"
+old_ns="$(stat -c %.9Y "${t}/debug/build/a-tool/0123456789abcdef/out/tool")"
 
 # prepare keeps Cargo's layout only, records HEAD's tree and packs.
 run prepare t "${parts}" >"${tmp_dir}/prepare.log"
 expect_output "${tmp_dir}/prepare.log" "save=true"
-for path in t/debug/tool t/debug/examples/m1_openapi t/tmp t/run.log t/cargo-timings; do
+for path in t/debug/tool t/debug/examples/m1_openapi t/debug/examples/removed-0123456789abcdef t/tmp t/run.log t/cargo-timings; do
     [ ! -e "${fixture}/${path}" ] || fail "prepare: ${path} was kept"
 done
 [ "$(find "${parts}" -name 'part-*.tar.zst' | wc -l)" -ge 2 ] || fail "prepare: expected several parts"
@@ -112,13 +114,13 @@ expect_output "${tmp_dir}/warm.log" "changed_paths=6"
 [ ! -e "${parts}" ] || fail "warm: the parts were kept after unpacking"
 # The transport restores content, sub-second mtimes, empty directories and
 # hard-linked build scripts; the uplifted copies stay gone.
-[ "$(stat -c %.9Y "${t}/debug/deps/tool-0123456789abcdef")" = "${old_ns}" ] ||
+[ "$(stat -c %.9Y "${t}/debug/build/a-tool/0123456789abcdef/out/tool")" = "${old_ns}" ] ||
     fail "warm: an output's mtime was not preserved"
 [ -d "${t}/debug/incremental" ] || fail "warm: an empty directory was not restored"
-[ "$(cat "${t}/debug/build/b-0123456789abcdef/build-script-build")" = script ] ||
+[ "$(cat "${t}/debug/build/b/0123456789abcdef/out/build-script-build")" = script ] ||
     fail "warm: a hard-linked build script was not restored"
 [ -s "${t}/.space-target-source/tree" ] || fail "warm: the source record was not restored"
-for path in t/debug/tool t/debug/examples/m1_openapi; do
+for path in t/debug/tool t/debug/examples/m1_openapi t/debug/examples/removed-0123456789abcdef; do
     [ ! -e "${fixture}/${path}" ] || fail "warm: ${path} came back"
 done
 for path in a/keep.rs b/stay.rs c/sub/x.rs ci/scripts proto/importer.proto; do
@@ -131,7 +133,7 @@ for path in a/change.rs c/sub/new.rs d/top.txt a b c c/sub d proto proto/x proto
 done
 
 # A stale uplifted copy that reaches hydrate by any route is deleted.
-ln "${t}/debug/deps/tool-0123456789abcdef" "${t}/debug/stale-tool"
+ln "${t}/debug/build/a-tool/0123456789abcdef/out/tool" "${t}/debug/stale-tool"
 run hydrate t >"${tmp_dir}/stale.log"
 [ ! -e "${t}/debug/stale-tool" ] || fail "stale: an uplifted copy survived"
 
@@ -161,7 +163,7 @@ expect_output "${tmp_dir}/corrupt.log" "restored=false"
 
 # A part that fails to pack must not be saved, even when zstd, the last
 # command in its pipeline, succeeds.
-mkdir -p "${t}/debug/.fingerprint/u0" "${tmp_dir}/failing-tar"
+mkdir -p "${t}/debug/build/a-tool/0123456789abcdef/fingerprint" "${tmp_dir}/failing-tar"
 printf '#!/bin/sh\nexit 2\n' >"${tmp_dir}/failing-tar/tar"
 chmod +x "${tmp_dir}/failing-tar/tar"
 if PATH="${tmp_dir}/failing-tar:${PATH}" run prepare t "${parts}" >"${tmp_dir}/failed-pack.log" 2>&1; then
@@ -171,7 +173,7 @@ fi
 ! grep -qxF save=true "${tmp_dir}/failed-pack.log" || fail "failed pack: prepare reported save=true"
 
 # A build that changed a tracked file must not be saved.
-mkdir -p "${t}/debug/.fingerprint/u0"
+mkdir -p "${t}/debug/build/a-tool/0123456789abcdef/fingerprint"
 echo dirty >>"${fixture}/a/keep.rs"
 run prepare t "${parts}" >"${tmp_dir}/dirty.log"
 expect_output "${tmp_dir}/dirty.log" "save=false"

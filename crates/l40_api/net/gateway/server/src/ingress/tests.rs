@@ -71,11 +71,12 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519VerificationGeneration,
     ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::{
-    types::ClusterId, types::ExecutionGeneration, types::NodeManagedBy, types::RouteGeneration,
-    types::SandboxActivationAttemptId, types::SandboxRouteIdentity,
-};
+use pplx_space_cluster_id::ClusterId;
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope};
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxRouteIdentity,
+};
 use tonic::metadata::MetadataMap;
 
 async fn ready_network_state() -> GatewayNetworkState {

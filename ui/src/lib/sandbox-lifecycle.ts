@@ -1,5 +1,5 @@
 // The lifecycle states the admin API reports (`SandboxLifecycle` in
-// crates/libs/common/core/src/types/sandbox.rs).
+// crates/l20_domain/sandbox/model/src/sandbox.rs).
 export const SANDBOX_LIFECYCLE_STATES = [
   'created', 'creating', 'starting', 'started',
   'pausing', 'paused', 'resuming',

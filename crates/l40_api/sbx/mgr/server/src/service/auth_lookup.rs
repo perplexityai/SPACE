@@ -22,9 +22,10 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Error,
     ed25519::SpaceApiRouteEd25519Verifier, ed25519::space_api_route_ed25519_token_from_metadata,
 };
-use pplx_space_common_core::types::{GuestPort, SandboxId, SpaceApiRouteIdentity};
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, NetworkPolicy};
+use pplx_space_network_roles::GuestPort;
 use pplx_space_sandbox_metrics::admission::AdmissionPermitOutcome;
+use pplx_space_sandbox_model::{SandboxId, SpaceApiRouteIdentity};
 use tonic::metadata::MetadataMap;
 
 mod resume_begin;
@@ -40,6 +41,10 @@ pub(super) const SPACE_API_BRIDGE_ROUTE_PURPOSES: &[SpaceApiRoutePurpose] =
     &[SpaceApiRoutePurpose::SpaceApiBridge];
 const SERVICE_PORT_INGRESS_ROUTE_PURPOSES: &[SpaceApiRoutePurpose] =
     &[SpaceApiRoutePurpose::ServicePortIngress];
+
+/// How often [`SandboxManagerService::lookup_started_sandbox_after_start`]
+/// re-reads a row whose transition did not signal its end.
+const STARTED_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[cfg(test)]
 mod wait_ready_policy_tests;
@@ -591,14 +596,36 @@ impl SandboxManagerService {
         &self,
         sandbox_id: &str,
     ) -> Result<crate::db::SandboxRow, Status> {
-        let sandbox = self.lookup_sandbox(sandbox_id)?;
-        if !sandbox.state.is_unowned(SandboxState::Started) {
-            return Err(Status::failed_precondition(format!(
-                "sandbox is {}, not started",
-                sandbox.state
-            )));
+        require_started(self.lookup_sandbox(sandbox_id)?)
+    }
+
+    /// [`Self::lookup_started_sandbox`], once a create or start in progress
+    /// has ended or `until` has passed. A start's commit ends the wait at
+    /// once; anything else is noticed on the next read of the row, at most
+    /// [`STARTED_WAIT_POLL_INTERVAL`] later. Nothing is started here.
+    pub(super) async fn lookup_started_sandbox_after_start(
+        &self,
+        sandbox_id: &str,
+        until: tokio::time::Instant,
+    ) -> Result<crate::db::SandboxRow, Status> {
+        loop {
+            // Created before the read, so a start that commits after it
+            // still ends the wait.
+            let committed = super::activation_support::start_succeeded_notify().notified();
+            let sandbox = self.lookup_sandbox(sandbox_id)?;
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if !matches!(
+                sandbox.state.unowned(),
+                Some(SandboxState::Creating | SandboxState::Starting)
+            ) || remaining.is_zero()
+            {
+                return require_started(sandbox);
+            }
+            tokio::select! {
+                () = tokio::time::sleep(remaining.min(STARTED_WAIT_POLL_INTERVAL)) => {}
+                () = committed => {}
+            }
         }
-        Ok(sandbox)
     }
 
     /// Look up a sandbox for in-guest loopback-bridge RPCs. The bridge lives
@@ -815,6 +842,7 @@ impl SandboxManagerService {
             .await?;
         self.begin_resident_resume(&sandbox.id, activation_policy)
             .await?;
+        self.guest_auto_updates.activation(&sandbox.id);
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
 
         let mut node_client = connect_node(&self.node_manager)
@@ -1110,13 +1138,12 @@ impl SandboxManagerService {
         pid: u32,
         uid: u32,
     ) -> Result<crate::db::SandboxRow, Status> {
-        let uid = pplx_space_common_core::host::linux::gateway::sandbox_uid(
-            pplx_space_common_core::types::LinuxUid::new(uid),
-        )
-        .map(|owner| owner.get())
-        // Local runtimes and legacy gateways retain their registered identity.
-        // The exact PID/owner lookup below remains mandatory in either case.
-        .unwrap_or(uid);
+        let uid =
+            pplx_space_host_layout::gateway::sandbox_uid(pplx_space_linux_ids::LinuxUid::new(uid))
+                .map(|owner| owner.get())
+                // Local runtimes and legacy gateways retain their registered identity.
+                // The exact PID/owner lookup below remains mandatory in either case.
+                .unwrap_or(uid);
         let db = self.db_conn()?;
         let mut matches = crate::db::scan::by_peer(
             &db,
@@ -1516,4 +1543,14 @@ fn verify_route_token_ed25519_from_metadata(
             Err(status)
         }
     }
+}
+
+fn require_started(sandbox: crate::db::SandboxRow) -> Result<crate::db::SandboxRow, Status> {
+    if !sandbox.state.is_unowned(SandboxState::Started) {
+        return Err(Status::failed_precondition(format!(
+            "sandbox is {}, not started",
+            sandbox.state
+        )));
+    }
+    Ok(sandbox)
 }

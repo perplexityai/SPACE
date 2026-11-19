@@ -14,5 +14,5 @@ workspace = true
 tonic = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }

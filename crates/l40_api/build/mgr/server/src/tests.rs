@@ -102,12 +102,12 @@ pub(super) fn initialize_schema(conn: &mut Connection) {
 struct MockBuildBackend {
     build_results: Mutex<VecDeque<Result<BuildOutcome, BuildError>>>,
     build_calls: Mutex<Vec<String>>,
-    environment_calls: Mutex<Vec<Option<pplx_space_common_core::types::EnvironmentReference>>>,
+    environment_calls: Mutex<Vec<Option<pplx_space_execution_spec::EnvironmentReference>>>,
     cluster_template_results: Mutex<VecDeque<Result<(), PublishError>>>,
     cluster_template_calls: Mutex<Vec<(String, TemplatePublication)>>,
     publish_results: Mutex<VecDeque<Result<(), PublishError>>>,
     publish_calls: Mutex<Vec<PublishCall>>,
-    publish_environments: Mutex<Vec<Option<pplx_space_common_core::types::EnvironmentReference>>>,
+    publish_environments: Mutex<Vec<Option<pplx_space_execution_spec::EnvironmentReference>>>,
     prune_calls: Mutex<Vec<(String, String)>>,
 }
 
@@ -191,7 +191,7 @@ impl BuildBackend for MockBuildBackend {
         template_id: &str,
         _job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         assert!(
             self.cluster_template_calls
@@ -221,7 +221,7 @@ impl BuildBackend for MockBuildBackend {
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -259,7 +259,7 @@ impl BuildBackend for BlockingBuildBackend {
         _template_id: &str,
         _job_id: &pplx_space_common_jobs::JobId,
         _template_org: Option<TemplateOrg>,
-        _environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        _environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         self.started.fetch_add(1, Ordering::SeqCst);
         while !self.released.load(Ordering::SeqCst) {
@@ -278,7 +278,7 @@ impl BuildBackend for BlockingBuildBackend {
         &self,
         _template_id: &str,
         _content_hash: &str,
-        _environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        _environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         _publish_tags: &[String],
         _publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -667,8 +667,8 @@ async fn build_publish_carries_publication_authority() -> TestResult {
 /// environment to `publish` unchanged.
 #[tokio::test(flavor = "current_thread")]
 async fn publish_receives_the_registered_build_s_environment() -> TestResult {
-    let environment = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([2; 32]),
+    let environment = pplx_space_execution_spec::EnvironmentReference::new(
+        pplx_space_content_digest::Digest::sha256([2; 32]),
     );
     let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
         content_hash: Some(

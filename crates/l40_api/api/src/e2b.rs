@@ -15,14 +15,15 @@ use axum::{
     http::{StatusCode, header},
     response::IntoResponse,
 };
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleActivitySource, AutoLifecycleConditionKind, AutoLifecycleConditionSet,
     AutoLifecycleConditionSetId, AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage,
-    AutoLifecycleWakePolicy, AutoLifecycleWakeSource, EcwCredentialEpoch, SandboxId,
+    AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
 use pplx_space_net_common::{EgressDestinationV1, IpCidr};
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
+use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -318,9 +319,9 @@ pub mod schema {
     pub enum SandboxOwnershipE2b {
         Local,
         FederatedIdentity {
-            issuer: pplx_space_common_core::types::UpstreamIssuer,
+            issuer: pplx_space_accounts::UpstreamIssuer,
             #[serde(rename = "orgID")]
-            org_id: pplx_space_common_core::types::UpstreamOrgId,
+            org_id: pplx_space_accounts::UpstreamOrgId,
         },
     }
 

@@ -10,10 +10,11 @@ use super::super::tests::{
     insert_test_sandbox_row, node_with_network_slots, sandbox_pod_on_node,
     substrate_with_inventory_caches_and_pool, substrate_with_store_and_client,
     substrate_with_store_client_proxy_port_and_pod,
+    substrate_with_store_client_proxy_port_and_pods,
 };
 use super::*;
 use crate::controllers::substrate::{PodIdentityFence, RecordedExecution};
-use pplx_space_common_core::types::{PodName, PodResourceVersion, PodUid};
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 
 // ── create_execution ────────────────────────────────────────────────────────
 
@@ -97,6 +98,46 @@ async fn create_execution_backpressure_refuses_before_claiming_an_execution(
     Ok(())
 }
 
+/// A cold create's pod carries the creating client's
+/// `space.pplx.net/client-id` label, and no label without one.
+#[rstest::rstest]
+#[case::labeled(Some("creator"))]
+#[case::unlabeled(None)]
+#[tokio::test(flavor = "current_thread")]
+async fn create_execution_labels_the_pod_with_the_creating_client(
+    #[case] creator: Option<&str>,
+) -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let (client, log) = scripted_kube_client(|request| match request.method {
+        Method::POST => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
+        _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+    });
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let creator = creator.map(|id| pplx_space_accounts::ClientId::parse(id).unwrap());
+    let mut request = inputs.create_request(sandbox_id, &template_ref);
+    request.client_id = creator.as_ref();
+
+    let _ = substrate.create_execution(request).await;
+
+    let posts = requests_matching(&log, &Method::POST);
+    let [post] = posts.as_slice() else {
+        panic!("expected one pod create, got {}", posts.len());
+    };
+    assert_eq!(
+        post.body
+            .as_ref()
+            .and_then(|pod| pod.pointer("/metadata/labels"))
+            .and_then(|labels| { labels.get(pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL) })
+            .and_then(serde_json::Value::as_str),
+        creator.as_ref().map(|id| id.as_str())
+    );
+    Ok(())
+}
+
 /// A pod create the apiserver rejects fails the create and releases the
 /// execution it had claimed, so the sandbox is not left bound to a pod that
 /// never existed.
@@ -176,12 +217,125 @@ async fn cold_create_seeds_the_network_policy_generation_on_the_sandbox_lineage(
         .as_ref()
         .and_then(|pod| pod.pointer("/metadata/annotations"))
         .and_then(|annotations| {
-            annotations.get(
-                pplx_space_common_core::kubernetes::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
-            )
+            annotations.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION)
         })
         .and_then(serde_json::Value::as_str);
     assert_eq!(annotation, Some(seeded_generation));
+    Ok(())
+}
+
+const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Seed template `seed` at `sha256:seed`, its release bound to `E1`, and a
+/// substrate with the gate on whose apiserver records the pod create and
+/// refuses it, so the create stops at the POST.
+async fn gated_create_fixture(pool: &PgPool) -> Result<(KubernetesSubstrate, KubeLog), BoxError> {
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id) VALUES ($1, 'seed', $2)
+         ON CONFLICT (name) DO NOTHING"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "DELETE FROM template_releases WHERE template_name = 'seed'"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('seed', 'fc', 'sha256:seed', $1)"
+    ))
+    .bind(sqlx::types::Json(
+        serde_json::json!({"environment": E1, "components": []}),
+    ))
+    .execute(pool)
+    .await?;
+    let (client, log) = scripted_kube_client(|request| match request.method {
+        Method::POST => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
+        _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+    });
+    let mut substrate = substrate_with_store_and_client(pool.clone(), client);
+    substrate.k8s.environment_placement =
+        crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+    Ok((substrate, log))
+}
+
+/// The one pod create `log` recorded.
+fn created_pod(log: &KubeLog) -> serde_json::Value {
+    let posts = requests_matching(log, &Method::POST);
+    let [pod_create] = posts.as_slice() else {
+        panic!("expected one pod create, got {posts:?}");
+    };
+    pod_create.body.clone().expect("a pod body")
+}
+
+/// A cold create boots the requested template build, so its pod records
+/// the release's environment and, with the gate on, requires its label.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_create_requires_the_release_environment_when_the_gate_is_on() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let (substrate, log) = gated_create_fixture(&db.pool).await?;
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+
+    let _ = substrate
+        .create_execution(inputs.create_request(sandbox_id, &template_ref))
+        .await;
+
+    assert_eq!(
+        super::super::tests::environment_placement::created_pod_environment(&created_pod(&log)),
+        (Some(E1.to_string()), true)
+    );
+    Ok(())
+}
+
+/// A fork boots its source's disk artifact, not the template build, so its
+/// pod requires the environment the source snapshot was produced under.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fork_requires_its_source_snapshot_environment_not_the_templates() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let source = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, source, "suspended").await?;
+    let snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id, execution_metadata)
+         VALUES ($1, $2, 'full', 'ready', NOW(), $3, $4)"
+    ))
+    .bind(snapshot_id)
+    .bind(source)
+    .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    .bind(sqlx::types::Json(
+        serde_json::json!({"environment": E0, "components": []}),
+    ))
+    .execute(&db.pool)
+    .await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    let (substrate, log) = gated_create_fixture(&db.pool).await?;
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let snapshot_id = snapshot_id.to_string();
+
+    let _ = substrate
+        .create_execution(CreateExecutionRequest {
+            restore_from: Some(crate::controllers::substrate::SnapshotRef {
+                snapshot_id: &snapshot_id,
+                storage_uri: Some("s3://synthetic-bucket/fork-source"),
+                source_sandbox_id: source,
+            }),
+            ..inputs.create_request(sandbox_id, &template_ref)
+        })
+        .await;
+
+    assert_eq!(
+        super::super::tests::environment_placement::created_pod_environment(&created_pod(&log)),
+        (Some(E0.to_string()), true)
+    );
     Ok(())
 }
 
@@ -212,20 +366,35 @@ async fn retire(
 enum TeardownCase {
     /// The pod worker cannot be dialed, so the in-VM stop cannot be sent.
     RetireWorkerUnreachable,
+    DeleteWorkerUnreachable,
+    DeleteFailsBeforeAdmission,
+    DeleteReplyLostWithMissingRow,
     RetireStopFails,
     RetireBackupFails,
     DeleteDefersToSuspendPublication,
     DeleteRefusesRetainedOnlyCopy,
+    /// The node-local delete outlasts the wait budget while the node still
+    /// reports the sandbox outside `deleting`: sbx-mgr has not yet run the
+    /// delete's refusals.
+    DeleteNotAdmittedWithinWaitBudget,
+    /// The node-local delete outlasts the wait budget and the node cannot say
+    /// whether it admitted it.
+    DeleteAdmissionUnconfirmed,
 }
 
 /// A teardown whose node-side preservation step fails or is refused keeps the
 /// execution tracked and the pod in place, so the retry owner can find both.
 #[rstest::rstest]
 #[case::retire_worker_unreachable(TeardownCase::RetireWorkerUnreachable)]
+#[case::delete_worker_unreachable(TeardownCase::DeleteWorkerUnreachable)]
+#[case::delete_fails_before_admission(TeardownCase::DeleteFailsBeforeAdmission)]
+#[case::delete_reply_lost_with_missing_row(TeardownCase::DeleteReplyLostWithMissingRow)]
 #[case::retire_stop_fails(TeardownCase::RetireStopFails)]
 #[case::retire_backup_fails(TeardownCase::RetireBackupFails)]
 #[case::delete_defers_to_suspend_publication(TeardownCase::DeleteDefersToSuspendPublication)]
 #[case::delete_refuses_retained_only_copy(TeardownCase::DeleteRefusesRetainedOnlyCopy)]
+#[case::delete_not_admitted_within_wait_budget(TeardownCase::DeleteNotAdmittedWithinWaitBudget)]
+#[case::delete_admission_unconfirmed(TeardownCase::DeleteAdmissionUnconfirmed)]
 #[tokio::test(flavor = "current_thread")]
 async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     #[case] case: TeardownCase,
@@ -239,7 +408,9 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     // The unreachable case's worker sits at an address nothing answers on;
     // every other case dials the scripted worker.
     let pod_ip = match case {
-        TeardownCase::RetireWorkerUnreachable => UNDIALED_POD_IP,
+        TeardownCase::RetireWorkerUnreachable | TeardownCase::DeleteWorkerUnreachable => {
+            UNDIALED_POD_IP
+        }
         _ => "127.0.0.1",
     };
     insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
@@ -253,7 +424,13 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     )
     .await?;
     let reply = match case {
-        TeardownCase::RetireWorkerUnreachable => None,
+        TeardownCase::RetireWorkerUnreachable | TeardownCase::DeleteWorkerUnreachable => None,
+        TeardownCase::DeleteFailsBeforeAdmission | TeardownCase::DeleteReplyLostWithMissingRow => {
+            Some((
+                "WorkerApi/DeleteSandbox",
+                ScriptedReply::Status(tonic::Status::internal("scripted admission failure")),
+            ))
+        }
         TeardownCase::RetireStopFails => Some((
             "WorkerApi/StopSandbox",
             ScriptedReply::Status(tonic::Status::internal("scripted stop failure")),
@@ -278,8 +455,29 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
                 ),
             ),
         )),
+        TeardownCase::DeleteNotAdmittedWithinWaitBudget
+        | TeardownCase::DeleteAdmissionUnconfirmed => {
+            Some(("WorkerApi/DeleteSandbox", ScriptedReply::Hang))
+        }
     };
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new(reply)).await?;
+    let state_reply = match case {
+        TeardownCase::DeleteAdmissionUnconfirmed => Some((
+            "WorkerApi/SandboxState",
+            ScriptedReply::Status(tonic::Status::unavailable("scripted state failure")),
+        )),
+        TeardownCase::DeleteReplyLostWithMissingRow => Some((
+            "WorkerApi/SandboxState",
+            ScriptedReply::message(&pplx_space_sbx_mgr_client::proto::StateResponse {
+                sandboxes: Vec::new(),
+                missing_ids: vec![sandbox_id.to_string()],
+            }),
+        )),
+        _ => None,
+    };
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new(
+        reply.into_iter().chain(state_reply),
+    ))
+    .await?;
     worker
         .sim
         .ensure_default_running(&sandbox_id.to_string())
@@ -298,7 +496,10 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
             Some(pod_ip),
         )),
     );
-    if let TeardownCase::RetireWorkerUnreachable = case {
+    if matches!(
+        case,
+        TeardownCase::RetireWorkerUnreachable | TeardownCase::DeleteWorkerUnreachable
+    ) {
         // The TEST-NET dial never connects. Where the host silently drops the
         // SYN, this budget ends it, and the bound below proves the substrate's
         // budget rather than the production constant is the one teardown
@@ -306,6 +507,7 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         // and the bound holds trivially.
         substrate.budgets.teardown_worker_connect = Duration::from_millis(300);
     }
+    substrate.budgets.teardown_node_delete_wait = Duration::from_millis(300);
 
     let started = Instant::now();
     let outcome = match case {
@@ -313,9 +515,12 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         | TeardownCase::RetireStopFails
         | TeardownCase::RetireBackupFails => retire(&substrate, sandbox_id).await.map(|_| ()),
         TeardownCase::DeleteDefersToSuspendPublication
-        | TeardownCase::DeleteRefusesRetainedOnlyCopy => {
-            substrate.delete_execution(sandbox_id).await
-        }
+        | TeardownCase::DeleteWorkerUnreachable
+        | TeardownCase::DeleteFailsBeforeAdmission
+        | TeardownCase::DeleteReplyLostWithMissingRow
+        | TeardownCase::DeleteRefusesRetainedOnlyCopy
+        | TeardownCase::DeleteNotAdmittedWithinWaitBudget
+        | TeardownCase::DeleteAdmissionUnconfirmed => substrate.delete_execution(sandbox_id).await,
     };
 
     match (case, &outcome) {
@@ -328,6 +533,14 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
         | (
             TeardownCase::DeleteDefersToSuspendPublication,
             Err(SubstrateError::SuspendInFlight { .. }),
+        )
+        | (
+            TeardownCase::DeleteNotAdmittedWithinWaitBudget
+            | TeardownCase::DeleteWorkerUnreachable
+            | TeardownCase::DeleteFailsBeforeAdmission
+            | TeardownCase::DeleteReplyLostWithMissingRow
+            | TeardownCase::DeleteAdmissionUnconfirmed,
+            Err(SubstrateError::NodeDeleteNotAdmitted { .. }),
         )
         | (
             TeardownCase::DeleteRefusesRetainedOnlyCopy,
@@ -353,10 +566,85 @@ async fn teardown_keeps_execution_tracked_when_the_node_cannot_finish(
     Ok(())
 }
 
+/// A dead VM can take its pod's network namespace with it while its node
+/// still answers: a runtime crash, or a quarantined sandbox an operator then
+/// discarded. A delete whose pod worker is unreachable reaches the same
+/// sbx-mgr through the node-api of the execution's node, so the delete is
+/// admitted and the teardown finishes instead of retrying it unadmitted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_reaches_the_node_api_when_its_pod_worker_is_gone() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let pod_name = "space-sbx-teardown-node-route-g1";
+    insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
+    // The execution names its node, and its pod sits at an address nothing
+    // answers on.
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed::running(pod_name, "teardown-node-route-uid"),
+    )
+    .await?;
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new(std::iter::empty())).await?;
+    worker
+        .sim
+        .ensure_default_running(&sandbox_id.to_string())
+        .await?;
+    let (client, log) = teardown_kube_client();
+    let mut substrate = substrate_with_store_client_proxy_port_and_pods(
+        db.pool.clone(),
+        client,
+        DEFAULT_SANDBOX_PROXY_PORT,
+        vec![
+            sandbox_pod(
+                pod_name,
+                "teardown-node-route-uid",
+                sandbox_id,
+                1,
+                "Running",
+                Some(UNDIALED_POD_IP),
+            ),
+            super::hydration_and_suspend::node_api_pod(worker.port),
+        ],
+    );
+    // Only the node-api pod's advertised port reaches the worker.
+    substrate.k8s.node_api_port = 1;
+    substrate.budgets.teardown_worker_connect = Duration::from_millis(300);
+    substrate.budgets.teardown_node_delete_wait = Duration::from_millis(300);
+
+    substrate.delete_execution(sandbox_id).await?;
+
+    assert_eq!(
+        worker.received("WorkerApi/DeleteSandbox").len(),
+        1,
+        "the delete reached sbx-mgr through the node-api"
+    );
+    assert_eq!(
+        requests_matching(&log, &Method::DELETE).len(),
+        1,
+        "the admitted delete removes the pod"
+    );
+    assert_eq!(
+        active_execution_count(&db.pool, sandbox_id).await?,
+        0,
+        "the admitted delete releases the execution"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BestEffortNodeFailure {
-    /// Delete's node-local delete fails for an ordinary reason.
+    /// Admission committed, but the node's reply was lost.
     DeleteFails,
+    /// The durable executor has accepted cleanup without waiting for it.
+    DeleteAcknowledged,
+    /// Delete's node-local delete never answers within the teardown's wait
+    /// budget after sbx-mgr admitted it, as a node still freeing a killed
+    /// guest's memory does.
+    DeleteOutlastsWaitBudget,
     /// Retire's stopped-disk backup is moot: the node has no sandbox row.
     RetireBackupMoot,
 }
@@ -365,6 +653,8 @@ enum BestEffortNodeFailure {
 /// it: the pod is deleted and tracking released.
 #[rstest::rstest]
 #[case::delete_fails(BestEffortNodeFailure::DeleteFails)]
+#[case::delete_acknowledged(BestEffortNodeFailure::DeleteAcknowledged)]
+#[case::delete_outlasts_wait_budget(BestEffortNodeFailure::DeleteOutlastsWaitBudget)]
 #[case::retire_backup_moot(BestEffortNodeFailure::RetireBackupMoot)]
 #[tokio::test(flavor = "current_thread")]
 async fn teardown_continues_past_a_best_effort_node_failure(
@@ -386,27 +676,50 @@ async fn teardown_continues_past_a_best_effort_node_failure(
         },
     )
     .await?;
-    let (failed_method, status) = match failure {
+    let (failed_method, reply) = match failure {
+        BestEffortNodeFailure::DeleteAcknowledged => (
+            "WorkerApi/DeleteSandbox",
+            ScriptedReply::message(&pplx_space_sbx_mgr_client::proto::DeleteResponse {
+                deleted_ids: vec![sandbox_id.to_string()],
+            }),
+        ),
         BestEffortNodeFailure::DeleteFails => (
             "WorkerApi/DeleteSandbox",
-            tonic::Status::internal("scripted delete failure"),
+            ScriptedReply::Status(tonic::Status::internal("scripted delete failure")),
         ),
+        BestEffortNodeFailure::DeleteOutlastsWaitBudget => {
+            ("WorkerApi/DeleteSandbox", ScriptedReply::Hang)
+        }
         BestEffortNodeFailure::RetireBackupMoot => (
             "WorkerApi/EnqueueSandboxArtifactBackup",
-            tonic::Status::not_found("scripted no sandbox"),
+            ScriptedReply::Status(tonic::Status::not_found("scripted no sandbox")),
         ),
     };
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
-        failed_method,
-        ScriptedReply::Status(status),
-    )]))
+    // sbx-mgr moved the row to `deleting` when it admitted the delete.
+    let admitted = (
+        "WorkerApi/SandboxState",
+        ScriptedReply::message(&pplx_space_sbx_mgr_client::proto::StateResponse {
+            sandboxes: vec![pplx_space_sbx_mgr_client::proto::SandboxInfo {
+                sandbox_id: sandbox_id.to_string(),
+                lifecycle: Some(
+                    pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Deleting as i32,
+                ),
+                ..Default::default()
+            }],
+            missing_ids: Vec::new(),
+        }),
+    );
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([
+        (failed_method, reply),
+        admitted,
+    ]))
     .await?;
     worker
         .sim
         .ensure_default_running(&sandbox_id.to_string())
         .await?;
     let (client, log) = teardown_kube_client();
-    let substrate = substrate_with_store_client_proxy_port_and_pod(
+    let mut substrate = substrate_with_store_client_proxy_port_and_pod(
         db.pool.clone(),
         client,
         worker.port,
@@ -420,8 +733,16 @@ async fn teardown_continues_past_a_best_effort_node_failure(
         )),
     );
 
+    let node_delete_wait = Duration::from_millis(300);
+    substrate.budgets.teardown_node_delete_wait = node_delete_wait;
+
+    let started = Instant::now();
     match failure {
-        BestEffortNodeFailure::DeleteFails => substrate.delete_execution(sandbox_id).await?,
+        BestEffortNodeFailure::DeleteFails
+        | BestEffortNodeFailure::DeleteOutlastsWaitBudget
+        | BestEffortNodeFailure::DeleteAcknowledged => {
+            substrate.delete_execution(sandbox_id).await?
+        }
         BestEffortNodeFailure::RetireBackupMoot => assert_eq!(
             retire(&substrate, sandbox_id).await?,
             RetireExecutionOutcome::Retired
@@ -432,6 +753,31 @@ async fn teardown_continues_past_a_best_effort_node_failure(
         !worker.received(failed_method).is_empty(),
         "{failure:?}: the failing step must have run"
     );
+    if matches!(failure, BestEffortNodeFailure::DeleteAcknowledged) {
+        use prost::Message;
+        let calls = worker.received("WorkerApi/DeleteSandbox");
+        let request = pplx_space_sbx_mgr_client::proto::DeleteRequest::decode(calls[0].clone())?;
+        assert!(
+            !request.blocking,
+            "teardown must request admission, not cleanup completion"
+        );
+        assert!(
+            worker.received("WorkerApi/SandboxState").is_empty(),
+            "an acknowledged delete needs no recovery probe"
+        );
+    }
+    if let BestEffortNodeFailure::DeleteOutlastsWaitBudget = failure {
+        // The substrate's wait budget, not the node RPC timeout, ends the
+        // wait, so the teardown frees its dispatcher slot.
+        assert!(
+            started.elapsed() < crate::controllers::substrate::NODE_RPC_TIMEOUT,
+            "the teardown wait budget must end the node-local delete wait"
+        );
+        assert!(
+            started.elapsed() >= node_delete_wait,
+            "the teardown must wait the budget for the node-local delete"
+        );
+    }
     let deletes = requests_matching(&log, &Method::DELETE);
     assert!(
         deletes

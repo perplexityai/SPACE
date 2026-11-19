@@ -2,12 +2,11 @@ use super::*;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use pplx_space_common_core::host::linux::gateway::LAUNCH_CAPABILITY_ENV;
-use pplx_space_common_core::types::{ExecutionGeneration, RouteGeneration};
 use pplx_space_credmgr::node_ca::NodeCa;
 use pplx_space_credmgr_client::proto::{
     IssueIntermediateCertificateRequest, IssueIntermediateCertificateResponse,
 };
+use pplx_space_host_layout::gateway::LAUNCH_CAPABILITY_ENV;
 use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope, NetworkPolicyV1, TlsInterception,
 };
@@ -22,7 +21,8 @@ use pplx_space_net_gateway::state::{
     GatewayNetworkState, NetworkCredentialSnapshot, PolicyLoader, PolicyNotReady,
     PulledNetworkPolicy, TrafficPolicy,
 };
-use pplx_space_spaced_common::proto::host_control::host_control_server::HostControlServer;
+use pplx_space_sandbox_model::{ExecutionGeneration, RouteGeneration};
+use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControlServer;
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, IsCa, KeyPair,

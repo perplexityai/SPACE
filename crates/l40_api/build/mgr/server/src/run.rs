@@ -93,7 +93,7 @@ pub async fn run(
         .http2_keepalive_timeout(Some(pplx_space_grpc_server::GRPC_HTTP2_KEEPALIVE_TIMEOUT));
     if let Some(parent) = std::path::Path::new(&config.db_path)
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+        .filter(|parent| !parent.is_empty())
     {
         std::fs::create_dir_all(parent).map_err(|source| RunBuildMgrError::CreateDbDirectory {
             path: parent.to_path_buf(),

@@ -8,7 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["sandboxes"]
+postgres = [
+  "node_local_backup_pending",
+  "sandbox_k8s_executions",
+  "sandbox_observed_states",
+  "sandbox_port_exposures",
+  "sandbox_snapshot_inventory",
+  "sandboxes",
+]
 
 [lints]
 workspace = true
@@ -29,15 +36,25 @@ time = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["sqlx", "serde"] }
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-cluster-pool = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["sqlx", "serde"] }
+pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
+pplx-space-node-model = { workspace = true, features = ["sqlx"] }
+pplx-space-durations = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-k8s-ids = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
 pplx-space-sandbox-routability = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
+pplx-space-semver = { workspace = true, features = ["sqlx"] }
+pplx-space-snapshot-model = { workspace = true, features = ["sqlx"] }
+pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-test-env = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+uuid = { workspace = true, features = ["serde"] }

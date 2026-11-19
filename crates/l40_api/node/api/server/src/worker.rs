@@ -3,7 +3,7 @@ use crate::node_ctl;
 use crate::proto::worker_api_internal_server::WorkerApiInternal;
 use crate::proto::worker_api_server::WorkerApi;
 use crate::proto::{TriggerStateReconciliationRequest, TriggerStateReconciliationResponse};
-use crate::restart_handoff::RpcReplaySafety;
+use crate::restart_handoff::{PEER_RESTART_RETRY_POLICY, RpcReplaySafety};
 use crate::uds_per_sandbox_limiter::{SandboxBudget, UdsPerSandboxLimiter, UdsPerSandboxPermit};
 use std::future::Future;
 use std::pin::Pin;
@@ -15,13 +15,13 @@ use pplx_space_api_route::{
     SpaceApiBridgeCallerPolicy, WaitReadyCallPurpose, set_space_api_bridge_caller_policy,
     space_api_route_capability_presence, take_wait_ready_call_purpose, wait_ready_call_purpose,
 };
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_grpc::fwd_retry;
+use pplx_space_common_grpc::{GrpcRetryContext, fwd_retry};
 use pplx_space_node_mgr_client::{CacheDiskSchedulingEffect, NodeResourceStatusReader};
 use pplx_space_rpc_auth::{
     NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
 };
 use pplx_space_sandbox_grpc::record_sandbox_id;
+use pplx_space_sandbox_model::SandboxId;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -32,6 +32,7 @@ pub struct WorkerApiService {
     service_port_ingress_limiter: UdsPerSandboxLimiter,
     resource_status_reader: NodeResourceStatusReader,
     shutdown_token: CancellationToken,
+    open_stream_drain_token: CancellationToken,
 }
 
 /// Reject policy-bearing requests from callers node-api did not classify as the
@@ -121,7 +122,15 @@ impl WorkerApiService {
             service_port_ingress_limiter: shared_service_port_ingress_limiter(),
             resource_status_reader,
             shutdown_token,
+            open_stream_drain_token: CancellationToken::new(),
         }
+    }
+
+    /// End the open-ended streams (file watches and process event streams)
+    /// once `token` is cancelled, so they cannot hold node-api's drain open.
+    pub fn with_open_stream_drain_token(mut self, token: CancellationToken) -> Self {
+        self.open_stream_drain_token = token;
+        self
     }
 
     /// The served `WorkerApi`. A reset `SpacedWrite` body is an interrupted
@@ -235,7 +244,7 @@ impl WorkerApiService {
             method,
             safety,
             request,
-            self.clients.sbx(),
+            &self.clients,
             call,
         )
         .await
@@ -244,6 +253,7 @@ impl WorkerApiService {
     async fn limited_sbx_unary<Req, Resp, F, Fut>(
         &self,
         budget: SandboxBudget,
+        safety: RpcReplaySafety,
         method: &'static str,
         request: Request<Req>,
         call: F,
@@ -262,9 +272,9 @@ impl WorkerApiService {
             .await?;
         crate::restart_handoff::call_with_restart_handoff(
             method,
-            RpcReplaySafety::RequiresProof,
+            safety,
             request,
-            self.clients.sbx(),
+            &self.clients,
             call,
         )
         .await
@@ -285,14 +295,71 @@ impl WorkerApiService {
     {
         let sandbox_id = request.get_ref().sandbox_id().to_owned();
         record_sandbox_id(&tracing::Span::current(), &sandbox_id);
-        let client = self.clients.sbx();
         let permit = self.acquire_sbx_permit(method, &sandbox_id).await?;
         let response = crate::restart_handoff::call_with_restart_handoff(
             method,
             RpcReplaySafety::RequiresProof,
             request,
-            client,
+            &self.clients,
             call,
+        )
+        .await?;
+        Ok(response.map(|stream| guard_stream(stream, permit)))
+    }
+
+    /// [`Self::limited_sbx_server_stream`] for a stream with no natural end.
+    /// Once the open-stream drain token is cancelled the stream ends with the
+    /// drain status, which callers answer by reconnecting.
+    async fn open_ended_sbx_server_stream<Req, Item, S, F, Fut>(
+        &self,
+        method: &'static str,
+        request: Request<Req>,
+        call: F,
+    ) -> Result<Response<PinnedResponseStream<Item>>, Status>
+    where
+        Req: SandboxScopedRequest + Clone + Send + Sync + 'static,
+        Item: Send + 'static,
+        S: Stream<Item = Result<Item, Status>> + Send + 'static,
+        F: Fn(pplx_space_sbx_mgr_client::SandboxManagerGrpcClient, Request<Req>) -> Fut + Send,
+        Fut: Future<Output = Result<Response<S>, Status>> + Send,
+    {
+        let drain = self.open_stream_drain_token.clone();
+        let response = self
+            .limited_sbx_server_stream(method, request, call)
+            .await?;
+        Ok(response.map(|stream| end_stream_on_drain(stream, drain)))
+    }
+
+    /// A guest read stream, replayed across a handoff until it delivers its
+    /// first item and never after.
+    async fn limited_sbx_read_stream<Req, Item, S, F, Fut>(
+        &self,
+        method: &'static str,
+        request: Request<Req>,
+        call: F,
+    ) -> Result<Response<PinnedResponseStream<Item>>, Status>
+    where
+        Req: SandboxScopedRequest + Clone + Send + Sync + 'static,
+        Item: Send + 'static,
+        S: Stream<Item = Result<Item, Status>> + Send + 'static,
+        F: Fn(pplx_space_sbx_mgr_client::SandboxManagerGrpcClient, Request<Req>) -> Fut
+            + Send
+            + Sync,
+        Fut: Future<Output = Result<Response<S>, Status>> + Send,
+    {
+        let sandbox_id = request.get_ref().sandbox_id().to_owned();
+        record_sandbox_id(&tracing::Span::current(), &sandbox_id);
+        let permit = self.acquire_sbx_permit(method, &sandbox_id).await?;
+        let call = &call;
+        let response = crate::restart_handoff::call_with_restart_handoff(
+            method,
+            RpcReplaySafety::ReadOnly,
+            request,
+            &self.clients,
+            |client, request| async move {
+                let response = call(client, request).await?;
+                crate::restart_handoff::hold_first_item(RpcReplaySafety::ReadOnly, response).await
+            },
         )
         .await?;
         Ok(response.map(|stream| guard_stream(stream, permit)))
@@ -327,6 +394,30 @@ where
         let _ = &held_permit;
         item
     }))
+}
+
+fn end_stream_on_drain<T: Send + 'static>(
+    stream: PinnedResponseStream<T>,
+    drain: CancellationToken,
+) -> PinnedResponseStream<T> {
+    pin_stream(futures_util::stream::unfold(
+        Some((stream, drain)),
+        |state| async move {
+            let (mut stream, drain) = state?;
+            tokio::select! {
+                // Checked first: a backend that always has another event
+                // ready would otherwise keep the stream open.
+                biased;
+                () = drain.cancelled() => Some((
+                    Err(Status::unavailable(
+                        pplx_space_node_api_client::NODE_API_DRAINING_MESSAGE,
+                    )),
+                    None,
+                )),
+                item = stream.next() => item.map(|item| (item, Some((stream, drain)))),
+            }
+        },
+    ))
 }
 
 fn pin_stream<T, S>(stream: S) -> PinnedResponseStream<T>
@@ -452,6 +543,7 @@ macro_rules! fwd_sbx {
         $service
             .limited_sbx_unary(
                 SandboxBudget::Shared,
+                RpcReplaySafety::RequiresProof,
                 $method,
                 $req,
                 |mut client, request| async move { client.$rpc(request).await },
@@ -460,14 +552,36 @@ macro_rules! fwd_sbx {
     };
 }
 
-// Only for SpacedKillProcess, SpacedSendSignal and SpacedListProcesses (which
-// also backs single-process reads): they stop or inspect a sandbox's processes,
-// so they take reserved permits that streams and other calls cannot use up.
+// For guest reads that sandbox-manager keeps serving while it drains: they
+// wake the sandbox if needed and read guest state, so a replay answers the
+// same question again. Sandbox-manager interrupts reads still in flight when
+// it hands the socket over, so these replay that interruption once on the
+// successor instead of failing the caller. They may wake the sandbox and
+// refresh its activity clock, as a client's retry would. Never use this for a
+// call that changes or consumes state its caller can observe.
+macro_rules! fwd_sbx_guest_read {
+    ($service:expr, $budget:expr, $method:literal, $rpc:ident, $req:expr) => {
+        $service
+            .limited_sbx_unary(
+                $budget,
+                RpcReplaySafety::ReadOnly,
+                $method,
+                $req,
+                |mut client, request| async move { client.$rpc(request).await },
+            )
+            .await
+    };
+}
+
+// Only for SpacedKillProcess and SpacedSendSignal: they stop a sandbox's
+// processes, so they take reserved permits that streams and other calls
+// cannot use up.
 macro_rules! fwd_sbx_reserved {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
             .limited_sbx_unary(
                 SandboxBudget::Reserved,
+                RpcReplaySafety::RequiresProof,
                 $method,
                 $req,
                 |mut client, request| async move { client.$rpc(request).await },
@@ -510,13 +624,28 @@ macro_rules! fwd_sbx_read {
     };
 }
 
+// Guest read streams that answer at once: a directory listing and a file
+// read. They are replayed like guest reads while they have delivered nothing,
+// so a handoff that ends one before its first item reaches the successor.
+// Never use this for a stream whose first item may take long to arrive, such
+// as a watch or a process's output: the caller would see nothing until then.
+macro_rules! fwd_sbx_read_stream {
+    ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
+        $service
+            .limited_sbx_read_stream($method, $req, |mut client, request| async move {
+                client.$rpc(request).await
+            })
+            .await
+    };
+}
+
 // Forward in the caller's task: a caller that disconnects then drops the
 // sandbox-manager call, which is how an abandoned process start is cancelled.
 // Spawning the forward into an owned task would break that chain.
-macro_rules! fwd_sbx_stream {
+macro_rules! fwd_sbx_open_stream {
     ($service:expr, $method:literal, $rpc:ident, $req:expr) => {
         $service
-            .limited_sbx_server_stream($method, $req, |mut client, request| async move {
+            .open_ended_sbx_server_stream($method, $req, |mut client, request| async move {
                 client.$rpc(request).await
             })
             .await
@@ -532,6 +661,70 @@ fn allow_port_request_params(req: &pplx_space_node_mgr_client::proto::AllowPortR
         ("port", req.port.to_string()),
         ("protocol", protocol),
     ])
+}
+
+/// True when `status` is what a restarting node-manager produces: the client
+/// failed to dial it or lost the connection mid-call, or the draining
+/// predecessor refused the call.
+fn is_node_manager_restart(status: &Status) -> bool {
+    pplx_space_common_grpc::is_client_transport_failure(status)
+        || (status.code() == tonic::Code::Unavailable
+            && status.message() == pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE)
+}
+
+/// Forward a port-exposure RPC to node-manager, waiting out its restart.
+///
+/// node-manager surges: on SIGTERM the predecessor stops accepting and
+/// drains, and it releases the service mutex only once its drain ends; only
+/// then does the successor finish starting and bind the socket, so dials in
+/// between are refused and calls on the old connection are cut.
+/// [`DEFAULT_DRAIN_TIMEOUT`] is when the predecessor escalates, not a bound:
+/// it can keep the mutex until it is killed. [`PEER_RESTART_RETRY_POLICY`]
+/// covers a drain that finishes within [`DEFAULT_DRAIN_TIMEOUT`], plus about
+/// 5 s for the successor to start. Its `max_elapsed` also bounds the attempt
+/// in flight, and a caller's `grpc-timeout` can only shorten the wait.
+///
+/// Only for `AllowPort` and `ExposePort`: each answers success when its rule
+/// is already installed, so replaying an attempt whose connection was cut
+/// after it may have run is safe. Any other answer, `Unavailable` included,
+/// goes back to the caller after one attempt.
+///
+/// [`DEFAULT_DRAIN_TIMEOUT`]: pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT
+async fn forward_port_rpc_through_node_manager_restart<Req, Resp, F, Fut>(
+    command: &'static str,
+    request: Request<Req>,
+    mut call: F,
+) -> Result<Response<Resp>, Status>
+where
+    Req: Clone,
+    F: FnMut(Request<Req>) -> Fut,
+    Fut: Future<Output = Result<Response<Resp>, Status>>,
+{
+    let metadata = request.metadata().clone();
+    let message = request.into_inner();
+    let context = GrpcRetryContext::with_timeout(PEER_RESTART_RETRY_POLICY.max_elapsed)
+        .with_grpc_timeout_metadata(&metadata);
+    // The helper retries its standard statuses whatever the predicate says,
+    // so an answer that must not be retried leaves it as `Ok`.
+    pplx_space_common_grpc::retry_grpc_status_with_context_if(
+        "node-manager",
+        command,
+        PEER_RESTART_RETRY_POLICY,
+        context,
+        is_node_manager_restart,
+        || {
+            let mut request = Request::new(message.clone());
+            *request.metadata_mut() = metadata.clone();
+            let response = call(request);
+            async move {
+                match response.await {
+                    Err(status) if is_node_manager_restart(&status) => Err(status),
+                    response => Ok(response),
+                }
+            }
+        },
+    )
+    .await?
 }
 
 fn reject_public_netns_path(rpc: &'static str, netns_path: &Option<String>) -> Result<(), Status> {
@@ -770,13 +963,12 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedGetStatusRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedGetStatusResponse>, Status> {
         let sandbox_id = r.get_ref().sandbox_id.clone();
-        let client = self.clients.sbx();
         self.limited_sbx_operation("SpacedGetStatus", &sandbox_id, move || {
             crate::restart_handoff::call_with_restart_handoff(
                 "SpacedGetStatus",
                 RpcReplaySafety::ReadOnly,
                 r,
-                client,
+                &self.clients,
                 |mut client, request| async move { client.spaced_get_status(request).await },
             )
         })
@@ -789,13 +981,12 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedWaitReadyResponse>, Status> {
         prepare_wait_ready_forward(&mut r);
         let sandbox_id = r.get_ref().sandbox_id.clone();
-        let client = self.clients.sbx();
         self.limited_sbx_operation("SpacedWaitReady", &sandbox_id, move || {
             crate::restart_handoff::call_with_restart_handoff(
                 "SpacedWaitReady",
                 RpcReplaySafety::ReadOnly,
                 r,
-                client,
+                &self.clients,
                 |mut client, request| async move { client.spaced_wait_ready(request).await },
             )
         })
@@ -806,26 +997,28 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedStatRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedStatResponse>, Status> {
-        fwd_sbx!(self, "SpacedStat", spaced_stat, r)
+        fwd_sbx_guest_read!(self, SandboxBudget::Shared, "SpacedStat", spaced_stat, r)
     }
 
     async fn spaced_list(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedListRequest>,
     ) -> Result<Response<Self::SpacedListStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedList", spaced_list, r)
+        fwd_sbx_read_stream!(self, "SpacedList", spaced_list, r)
     }
 
     async fn spaced_read(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedReadRequest>,
     ) -> Result<Response<Self::SpacedReadStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedRead", spaced_read, r)
+        fwd_sbx_read_stream!(self, "SpacedRead", spaced_read, r)
     }
 
     // Client-streaming: the request body is consumed as it streams and
     // cannot be rebuilt, so a restart-drain marker cannot be replayed here.
-    // It surfaces to the caller, which owns any retry of the whole stream.
+    // It surfaces to the caller, which owns any retry of the whole stream. A
+    // dial that failed before the call was sent carries the same marker, so
+    // the caller resends it as well.
     async fn spaced_write(
         &self,
         r: Request<tonic::Streaming<pplx_space_sbx_mgr_client::proto::SpacedWriteRequest>>,
@@ -862,7 +1055,10 @@ impl WorkerApi for WorkerApiService {
             move |stream| async move {
                 let mut request = Request::new(stream);
                 *request.metadata_mut() = metadata;
-                client.spaced_write(request).await
+                client
+                    .spaced_write(request)
+                    .await
+                    .map_err(crate::restart_handoff::mark_unsent_for_successor)
             },
         )
         .await
@@ -900,7 +1096,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedWatchRequest>,
     ) -> Result<Response<Self::SpacedWatchStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedWatch", spaced_watch, r)
+        fwd_sbx_open_stream!(self, "SpacedWatch", spaced_watch, r)
     }
 
     async fn spaced_create_watcher(
@@ -916,8 +1112,9 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedNormalizeWatchRootRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedNormalizeWatchRootResponse>, Status>
     {
-        fwd_sbx!(
+        fwd_sbx_guest_read!(
             self,
+            SandboxBudget::Shared,
             "SpacedNormalizeWatchRoot",
             spaced_normalize_watch_root,
             r
@@ -971,21 +1168,27 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedGetModifiedFilesRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedGetModifiedFilesResponse>, Status>
     {
-        fwd_sbx!(self, "SpacedGetModifiedFiles", spaced_get_modified_files, r)
+        fwd_sbx_guest_read!(
+            self,
+            SandboxBudget::Shared,
+            "SpacedGetModifiedFiles",
+            spaced_get_modified_files,
+            r
+        )
     }
 
     async fn spaced_start_process(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedStartProcessRequest>,
     ) -> Result<Response<Self::SpacedStartProcessStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedStartProcess", spaced_start_process, r)
+        fwd_sbx_open_stream!(self, "SpacedStartProcess", spaced_start_process, r)
     }
 
     async fn spaced_connect_process(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedConnectProcessRequest>,
     ) -> Result<Response<Self::SpacedConnectProcessStream>, Status> {
-        fwd_sbx_stream!(self, "SpacedConnectProcess", spaced_connect_process, r)
+        fwd_sbx_open_stream!(self, "SpacedConnectProcess", spaced_connect_process, r)
     }
 
     async fn spaced_list_processes(
@@ -993,7 +1196,13 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::SpacedListProcessesRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedListProcessesResponse>, Status>
     {
-        fwd_sbx_reserved!(self, "SpacedListProcesses", spaced_list_processes, r)
+        fwd_sbx_guest_read!(
+            self,
+            SandboxBudget::Reserved,
+            "SpacedListProcesses",
+            spaced_list_processes,
+            r
+        )
     }
 
     async fn spaced_send_signal(
@@ -1088,7 +1297,7 @@ impl WorkerApi for WorkerApiService {
                     .sandbox_id
                     .parse::<SandboxId>()
                     .map_err(|_| Status::invalid_argument("sandbox_id is invalid"))?,
-                pplx_space_common_core::types::GuestPort::try_from_u16(
+                pplx_space_network_roles::GuestPort::try_from_u16(
                     u16::try_from(start.port)
                         .map_err(|_| Status::invalid_argument("service port out of range"))?,
                 )
@@ -1165,7 +1374,12 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_node_mgr_client::proto::ExposePortRequest>,
     ) -> Result<Response<pplx_space_node_mgr_client::proto::ExposePortResponse>, Status> {
-        fwd!(self.clients.node(), expose_port, r)
+        let client = self.clients.node();
+        forward_port_rpc_through_node_manager_restart("expose_port", r, |request| {
+            let mut client = client.clone();
+            async move { client.expose_port(request).await }
+        })
+        .await
     }
 
     async fn allow_port(
@@ -1174,7 +1388,12 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_node_mgr_client::proto::AllowPortResponse>, Status> {
         let request_params = allow_port_request_params(r.get_ref());
         pplx_space_grpc_server::record_safe_grpc_request_params(&request_params);
-        let result = self.clients.node().allow_port(r).await;
+        let client = self.clients.node();
+        let result = forward_port_rpc_through_node_manager_restart("allow_port", r, |request| {
+            let mut client = client.clone();
+            async move { client.allow_port(request).await }
+        })
+        .await;
         if let Err(status) = &result {
             pplx_space_grpc_server::log_failed_grpc_request_params(status, &request_params);
         }

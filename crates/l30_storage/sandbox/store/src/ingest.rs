@@ -29,16 +29,19 @@
 //! Recordset inputs are the JSON rows the internal API builds; each function
 //! names the record columns its statement reads.
 
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, NodeId, PodUid, SandboxId,
-    SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceiptKind, SandboxTransitionTargetState, SubstrateKind,
+use pplx_space_accounts::NodeId;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxId, SandboxQuarantineHistoryAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::node_published_execution_identity_matches;
+use pplx_space_sql_locator::sql;
 use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
 
@@ -429,15 +432,28 @@ pub async fn converge_published_restoring_to_started(
 /// `rows` is a recordset of `{sandbox_id, last_used_at, last_access_at,
 /// last_command_at}`. A clock moves only forward and only when the published
 /// value is more than a minute past the stored one, so a publish that
-/// advances nothing writes nothing. The write re-checks only that the row is
-/// on `node_id`; it has no lifecycle or substrate predicate.
+/// advances nothing writes nothing. The one exception: `last_access_at` and
+/// `last_command_at` also move when a full snapshot falls between the stored
+/// value and the published one. Recovery restores a snapshot only if those
+/// clocks don't postdate it (`sn.timestamp >= last_command_at`), so a
+/// throttled value would let activity just after a snapshot read as having
+/// happened before it, and a restore would drop that activity's writes. The
+/// write re-checks only that the row is on `node_id`; it has no lifecycle or
+/// substrate predicate.
 pub async fn advance_published_activity(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
     rows: Json<JsonValue>,
 ) -> Result<(), sqlx::Error> {
-    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are absent.
-    // Keep publisher ownership on the updated row, avoiding a redundant self-join.
+    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are
+    // absent. `advance` decides once per clock whether the published value
+    // moves the stored one: past the one-minute throttle, or across a full
+    // snapshot taken since the stored value (the readers compare
+    // `sn.timestamp >= last_*_at`, so a throttled clock left behind such a
+    // snapshot would make the snapshot look newer than the sandbox's last
+    // activity). The `SET` re-checks only that the clock still moves
+    // forward, against the row the UPDATE locks, so a concurrent writer that
+    // advanced it further is never moved back.
     sqlx::query(sql!(
         "WITH input AS (
          SELECT *
@@ -454,62 +470,126 @@ pub async fn advance_published_activity(
                 input.last_command_at,
                 GREATEST(input.last_used_at, input.last_access_at, input.last_command_at) AS last_used_at
          FROM input
+     ),
+     advance AS (
+         SELECT activity.*,
+                (
+                    activity.last_access_at IS NOT NULL
+                    AND (
+                        s.last_access_at IS NULL
+                        OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
+                        OR (
+                            s.last_access_at < activity.last_access_at
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM snapshots sn
+                                 WHERE sn.sandbox_id = s.id
+                                   AND sn.type = 'full'
+                                   AND sn.timestamp >= s.last_access_at
+                                   AND sn.timestamp < activity.last_access_at
+                            )
+                        )
+                    )
+                ) AS move_access,
+                (
+                    activity.last_command_at IS NOT NULL
+                    AND (
+                        s.last_command_at IS NULL
+                        OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
+                        OR (
+                            s.last_command_at < activity.last_command_at
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM snapshots sn
+                                 WHERE sn.sandbox_id = s.id
+                                   AND sn.type = 'full'
+                                   AND sn.timestamp >= s.last_command_at
+                                   AND sn.timestamp < activity.last_command_at
+                            )
+                        )
+                    )
+                ) AS move_command,
+                (
+                    activity.last_used_at IS NOT NULL
+                    AND (
+                        s.last_used_at IS NULL
+                        OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
+                    )
+                ) AS move_used
+           FROM activity
+           JOIN sandboxes s ON s.id = activity.sandbox_id AND s.active_node_id = $1
+          WHERE activity.last_used_at IS NOT NULL
      )
      UPDATE sandboxes s
      SET last_access_at = CASE
-             WHEN activity.last_access_at IS NOT NULL
-              AND (
-                  s.last_access_at IS NULL
-                  OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_access_at
+             WHEN advance.move_access
+              AND (s.last_access_at IS NULL OR s.last_access_at < advance.last_access_at)
+             THEN advance.last_access_at
              ELSE s.last_access_at
          END,
          last_command_at = CASE
-             WHEN activity.last_command_at IS NOT NULL
-              AND (
-                  s.last_command_at IS NULL
-                  OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_command_at
+             WHEN advance.move_command
+              AND (s.last_command_at IS NULL OR s.last_command_at < advance.last_command_at)
+             THEN advance.last_command_at
              ELSE s.last_command_at
          END,
          last_used_at = CASE
-             WHEN activity.last_used_at IS NOT NULL
-              AND (
-                  s.last_used_at IS NULL
-                  OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_used_at
+             WHEN advance.move_used
+              AND (s.last_used_at IS NULL OR s.last_used_at < advance.last_used_at)
+             THEN advance.last_used_at
              ELSE s.last_used_at
          END
-     FROM activity
-     WHERE s.id = activity.sandbox_id
+     FROM advance
+     WHERE s.id = advance.sandbox_id
        AND s.active_node_id = $1
-       AND activity.last_used_at IS NOT NULL
-       AND (
-           (
-               activity.last_access_at IS NOT NULL
-               AND (
-                   s.last_access_at IS NULL
-                   OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
+       AND (advance.move_access OR advance.move_command OR advance.move_used)"
+    ))
+    .bind(node_id)
+    .bind(rows)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Record the idle deadline (`next_auto_event_at`, Unix seconds) the
+/// publisher reported for each of its rows. **Observed projection**: the node
+/// reported when it will next run an automatic lifecycle transition.
+///
+/// `rows` is a recordset of `{sandbox_id, next_auto_event_at}`, with a NULL
+/// deadline when none is scheduled. The deadline moves later each time the
+/// sandbox is used, so a later one is written only once it is a minute or more
+/// past the stored one. An earlier one is written at once, so the stored
+/// deadline is never later than the last one published. The
+/// `sandboxes_set_updated_at` trigger ignores this column. The write re-checks
+/// only that the row is on `node_id`.
+pub async fn record_published_idle_deadlines(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    rows: Json<JsonValue>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "WITH input AS (
+             SELECT *
+               FROM jsonb_to_recordset($2::jsonb) AS input(
+                   sandbox_id UUID,
+                   next_auto_event_at TIMESTAMPTZ
                )
-           )
-           OR (
-               activity.last_command_at IS NOT NULL
-               AND (
-                   s.last_command_at IS NULL
-                   OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               activity.last_used_at IS NOT NULL
-               AND (
-                   s.last_used_at IS NULL
-                   OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
-               )
-           )
-       )"
+         ),
+         deadline AS (
+             SELECT sandbox_id,
+                    FLOOR(EXTRACT(EPOCH FROM next_auto_event_at))::BIGINT AS next_auto_event_at
+               FROM input
+         )
+         UPDATE sandboxes s
+            SET next_auto_event_at = deadline.next_auto_event_at
+           FROM deadline
+          WHERE s.id = deadline.sandbox_id
+            AND s.active_node_id = $1
+            AND (
+                (s.next_auto_event_at IS NULL) <> (deadline.next_auto_event_at IS NULL)
+                OR deadline.next_auto_event_at < s.next_auto_event_at
+                OR deadline.next_auto_event_at >= s.next_auto_event_at + 60
+            )"
     ))
     .bind(node_id)
     .bind(rows)
@@ -598,6 +678,12 @@ pub async fn converge_published_stopped(
 /// projection re-checks only that the row is outside the suspend, hold and
 /// delete lifecycles: if a newer suspend owns the row, the attempt is still
 /// released but its stale target is not projected.
+///
+/// A projected `started` target also clears `command_ready_pending`. The node
+/// writes an activation-completed receipt only once the guest has passed its
+/// readiness gate, so the receipt for the attempt a create gave up waiting on
+/// is the evidence the marker was waiting for. A receipt that releases
+/// nothing leaves the marker to the data-plane confirmation.
 pub async fn release_completed_activations(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
@@ -643,6 +729,11 @@ pub async fn release_completed_activations(
                     WHEN released.transition_receipt_target_state IN ('started', 'paused')
                     THEN 'on_node'
                     ELSE sandbox.placement
+                END,
+                command_ready_pending = CASE
+                    WHEN released.transition_receipt_target_state = 'started'
+                    THEN FALSE
+                    ELSE sandbox.command_ready_pending
                 END
            FROM released
           WHERE sandbox.id = released.sandbox_id

@@ -9,23 +9,25 @@ pub(super) async fn handle(
             let sandbox = resolve_sandbox_state(client, &sandbox_id).await;
             let full_id = &sandbox.sandbox_id;
             let short_id = sandbox_label(full_id);
-            let lifecycle = sandbox
-                .observed_lifecycle()
+            let status = sandbox
+                .observed_status()
                 .unwrap_or_else(|error| exit_error(error));
-            println!("Doctor: {short_id}  ({})", lifecycle.label());
+            println!("Doctor: {short_id}  ({})", status.label());
             println!();
 
             if !matches!(
-                lifecycle,
-                pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
-                    | pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+                status.unowned(),
+                Some(
+                    pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
+                        | pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+                )
             ) {
                 println!("Sandbox is not running — nothing to diagnose.");
                 return;
             }
 
             // Collect PIDs from the sandbox info
-            let run_dir = pplx_space_common_core::host::linux::paths::sandbox_run_dir(full_id);
+            let run_dir = pplx_space_host_layout::paths::sandbox_run_dir(full_id);
             let processes: Vec<(&str, Option<u32>)> = vec![
                 ("firecracker", sandbox.pid),
                 (
@@ -171,7 +173,7 @@ pub(super) async fn handle(
             println!(
                 "Sandbox {} reached state: {}",
                 sandbox_label(&resp.sandbox_id),
-                resp.observed_lifecycle()
+                resp.observed_status()
                     .unwrap_or_else(|error| exit_error(error))
                     .label()
             );

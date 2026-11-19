@@ -8,12 +8,11 @@
 //! function runs on the executor its caller passes, so it composes into the
 //! caller's transaction when there is one.
 
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, LocalArtifactId, PodUid, SandboxId,
-    SandboxLifecycle,
-};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 /// **Operation step.** Claim the suspend of the execution at `generation`
 /// tracking `pod_uid`: flip the row from `previous` to `suspending` while

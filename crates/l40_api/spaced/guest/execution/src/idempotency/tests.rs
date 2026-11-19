@@ -187,7 +187,15 @@ async fn capacity_pressure_reclaims_an_expired_operation_after_its_reservation_i
         ));
     }
 
+    assert!(
+        store.has_live_records(),
+        "an expired running generation still owns effects"
+    );
     drop(reservation);
+    assert!(
+        !store.has_live_records(),
+        "an inert tombstone cannot block guest updates forever"
+    );
     {
         let mut state = store.state();
         assert!(matches!(

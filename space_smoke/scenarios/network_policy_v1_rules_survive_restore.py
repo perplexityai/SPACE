@@ -4,7 +4,8 @@ import space_smoke as smoke
 
 ALLOWED = "https://example.com/"
 DENIED = "http://1.0.0.1/"
-UNLISTED = "http://9.9.9.9/"
+# Domain allows implicitly admit the reserved resolvers, so use another IP.
+UNLISTED = "http://1.1.1.2/"
 
 
 @smoke.scenario(
@@ -31,4 +32,4 @@ def v1_rules_survive_restore(test: smoke.Ecw) -> None:
         test.reconnect_by_id()
 
     with test.phase("verify V1 policy after restore"):
-        test.network_policy.verify_egress(reachable=(ALLOWED,), blocked=(DENIED,))
+        test.network_policy.verify_egress(reachable=(ALLOWED,), blocked=(DENIED, UNLISTED))

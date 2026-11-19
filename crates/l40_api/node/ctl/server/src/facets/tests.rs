@@ -16,7 +16,7 @@ async fn sandbox_state_batches_preserve_the_census_or_fail_without_partial_outpu
         let mut calls = 0;
         let response = fetch_sandbox_state_batches(&ids, |batch| {
             calls += 1;
-            assert!(batch.len() <= pplx_space_common_core::inventory::READ_BATCH_ITEMS);
+            assert!(batch.len() <= pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS);
             std::future::ready(if fail_second && calls == 2 {
                 Err(tonic::Status::unavailable("injected middle-batch failure"))
             } else {
@@ -1148,8 +1148,8 @@ fn sandbox_policy_apply_filter_applies_on_stale_gateway_state() {
 #[test]
 fn published_sandbox_state_uses_batched_enrichment() {
     let execution: pplx_space_execution_common::proto::ExecutionMetadata =
-        (&pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::Aarch64,
+        (&pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+            pplx_space_cpu_arch::Arch::Aarch64,
             vec![],
         ))
             .into();
@@ -1190,6 +1190,10 @@ fn published_sandbox_state_uses_batched_enrichment() {
             }),
             last_command_at: Some(prost_types::Timestamp {
                 seconds: 20,
+                nanos: 0,
+            }),
+            next_auto_event_at: Some(prost_types::Timestamp {
+                seconds: 40,
                 nanos: 0,
             }),
             ..Default::default()
@@ -1271,6 +1275,13 @@ fn published_sandbox_state_uses_batched_enrichment() {
             nanos: 0,
         })
     );
+    assert_eq!(
+        state.next_auto_event_at,
+        Some(prost_types::Timestamp {
+            seconds: 40,
+            nanos: 0,
+        })
+    );
 }
 
 #[test]
@@ -1317,6 +1328,43 @@ fn missing_or_unknown_lifecycle_preserves_cluster_state() {
         );
         assert_eq!(publication.state_degraded, degraded);
         assert!(publication.present);
+    }
+}
+
+/// The control plane still reads a cleanup-owned row's status as
+/// `cleanup_required` or `cleanup_failed`, whichever teardown transition
+/// sandbox-manager publishes it under.
+#[test]
+fn a_cleanup_owned_row_publishes_its_cleanup_status() {
+    use pplx_space_sbx_mgr_client::proto::{
+        SandboxCleanup, SandboxCleanupState, SandboxLifecycleState,
+    };
+    for (cleanup, expected) in [
+        (SandboxCleanupState::Required, "cleanup_required"),
+        (SandboxCleanupState::Failed, "cleanup_failed"),
+    ] {
+        for lifecycle in [
+            SandboxLifecycleState::Stopping,
+            SandboxLifecycleState::Deleting,
+            SandboxLifecycleState::Suspending,
+        ] {
+            let sandbox = SandboxInfo {
+                sandbox_id: TEST_SANDBOX_ID.to_string(),
+                lifecycle: Some(lifecycle as i32),
+                cleanup: Some(SandboxCleanup {
+                    state: cleanup as i32,
+                    ..SandboxCleanup::default()
+                }),
+                ..Default::default()
+            };
+            let publication = published_sandbox_state(&sandbox, None, None, Vec::new());
+            assert_eq!(
+                publication.status.as_deref(),
+                Some(expected),
+                "{lifecycle:?}"
+            );
+            assert!(!publication.state_degraded);
+        }
     }
 }
 
@@ -1770,7 +1818,8 @@ async fn publish_statuses_from_a_real_channel_retry_only_transport_failures() {
 
 #[test]
 fn template_publication_prefers_each_name_s_legacy_build() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
     let initial =
         || Some(pplx_space_node_runtime_core::catalog::initial_environment_reference().to_string());
     let other = || Some(EnvironmentReference::new(Digest::sha256([2; 32])).to_string());

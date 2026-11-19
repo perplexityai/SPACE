@@ -1,4 +1,6 @@
-use pplx_space_common_core::types::{LocalArtifactId, OrgId, SandboxId, SnapshotId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use crate::fork_operations::{ForkRequest, ForkTargetConfig};
@@ -51,7 +53,7 @@ fn published_artifact_leader_is_not_a_capture_candidate() {
             vcpu: None,
             memory_mib: None,
             disk_mib: None,
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy: None,
         },
         None,
@@ -86,7 +88,7 @@ fn capture_candidate_must_match_the_frozen_source_lifecycle() {
             vcpu: None,
             memory_mib: None,
             disk_mib: None,
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy: None,
         },
         None,
@@ -125,7 +127,7 @@ fn capture_leader_must_still_match_the_followers_frozen_source() {
             vcpu: None,
             memory_mib: None,
             disk_mib: None,
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy: None,
         },
         None,
@@ -426,7 +428,7 @@ async fn capture_leader_election_spans_both_target_id_forms() {
                 vcpu: None,
                 memory_mib: None,
                 disk_mib: None,
-                auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+                auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
                 network_policy: None,
             },
             None,

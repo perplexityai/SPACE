@@ -1,7 +1,7 @@
 use clap::builder::TypedValueParser;
 use clap::{Parser, Subcommand, ValueEnum};
-use pplx_space_common_core::types::EnvironmentReference;
-use pplx_space_common_core::types::admin::AdminNodeSort;
+use pplx_space_admin_protocol::AdminNodeSort;
+use pplx_space_execution_spec::EnvironmentReference;
 use std::str::FromStr;
 
 /// Operator-facing SPACE CLI. The current command set is a thin wrapper over
@@ -141,6 +141,122 @@ pub(crate) enum RuntimeCommands {
         #[command(subcommand)]
         command: RuntimeEnvCommands,
     },
+    /// Start, pause, resume, abort and inspect runtime upgrade campaigns
+    /// (/admin/api/v1/runtime-upgrade-campaigns).
+    Campaign {
+        #[command(subcommand)]
+        command: RuntimeCampaignCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RuntimeCampaignCommands {
+    /// Start a campaign that moves one kind of subject from one environment
+    /// to another.
+    Start {
+        /// What the campaign upgrades.
+        #[arg(long, value_enum)]
+        kind: RuntimeCampaignKindArg,
+        /// The environment subjects move off.
+        #[arg(long = "from", value_name = "ENVIRONMENT")]
+        from: EnvironmentReference,
+        /// The environment subjects move to.
+        #[arg(long = "to", value_name = "ENVIRONMENT")]
+        to: EnvironmentReference,
+        /// Subjects upgraded before the campaign waits for a resume: 1 (the
+        /// server's default) or 0 to start rolling. Only 0 and 1 are
+        /// accepted, since a canary upgrades exactly one subject.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1))]
+        canary_size: Option<u64>,
+        /// Items in flight at once across the cluster: at least 1.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        wave_size: u64,
+        /// Items in flight at once on any one node, for kinds whose subjects
+        /// have a node: from 1 to the wave size (the server defaults to 1).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        per_node: Option<u64>,
+        /// Failed items at which the campaign pauses itself: at least 1.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        failure_budget: u64,
+        /// For a sandbox campaign, also take running and paused sandboxes, as
+        /// the sandbox driver defines it. The server refuses it for
+        /// templates.
+        #[arg(long)]
+        include_running: bool,
+        /// Why, recorded with you on the campaign.
+        #[arg(long)]
+        reason: String,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a canary or rolling campaign.
+    Pause(PhaseChange),
+    /// Resume a paused campaign, or move a canary whose item is done on to
+    /// rolling. A campaign with no done item goes back to canary.
+    Resume {
+        #[command(flatten)]
+        change: PhaseChange,
+        /// Return failed items to pending first, so a campaign at its
+        /// failure budget can resume.
+        #[arg(long)]
+        retry_failed: bool,
+    },
+    /// Abort a canary, rolling or paused campaign for good. Nothing already
+    /// upgraded is undone; items in flight stop at their next lease renewal
+    /// unless they finish first, and the source is free for a new campaign at
+    /// once.
+    Abort(PhaseChange),
+    /// Show one campaign: its settings, phase, generation and item counts.
+    Show {
+        id: uuid::Uuid,
+        /// Emit the raw JSON response instead of a formatted view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every campaign in creation order, following each page.
+    List {
+        /// Only canary, rolling and paused campaigns.
+        #[arg(long)]
+        unfinished: bool,
+        /// Emit JSON: every page's campaigns in one `campaigns` array.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// What a pause, resume or abort takes.
+#[derive(clap::Args)]
+pub(crate) struct PhaseChange {
+    pub(crate) id: uuid::Uuid,
+    /// Why, recorded with you in the audit log.
+    #[arg(long)]
+    pub(crate) reason: String,
+    /// Apply only if the campaign is still at this generation (the one
+    /// `runtime campaign show` showed).
+    #[arg(long, value_name = "GENERATION")]
+    pub(crate) if_generation: Option<u64>,
+    /// Emit the raw JSON response.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+/// The kinds `POST /runtime-upgrade-campaigns` accepts. The server owns the
+/// vocabulary; this copy lists them in `--help` and refuses a misspelled one
+/// before anything is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RuntimeCampaignKindArg {
+    Templates,
+    Sandboxes,
+}
+
+impl RuntimeCampaignKindArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Templates => "templates",
+            Self::Sandboxes => "sandboxes",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -263,24 +379,24 @@ pub(crate) struct LoginArgs {
 pub(crate) enum TemplateCommands {
     /// Build the deployed seed or code-runtime recipe and wait for publication.
     Build {
-        template: pplx_space_common_core::types::SystemTemplate,
+        template: pplx_space_template_model::SystemTemplate,
         /// Seed reference for code-runtime (default: seed:latest).
         #[arg(long)]
-        base: Option<pplx_space_common_core::types::TemplateReference>,
+        base: Option<pplx_space_template_model::TemplateReference>,
         /// Exact qualified runtime/kernel pair for the build.
         #[arg(long)]
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        environment: Option<pplx_space_execution_spec::EnvironmentReference>,
         /// Assign a release tag, such as latest, after a successful build.
         #[arg(long = "publish-tag")]
-        publish_tags: Vec<pplx_space_common_core::types::TemplateTag>,
+        publish_tags: Vec<pplx_space_template_model::TemplateTag>,
         /// Return the job ID immediately.
         #[arg(long = "async")]
         async_mode: bool,
     },
     /// Inspect a submitted build, including publication failures.
     Status {
-        template: pplx_space_common_core::types::SystemTemplate,
-        job_id: pplx_space_common_core::types::BuildRunId,
+        template: pplx_space_template_model::SystemTemplate,
+        job_id: pplx_space_template_model::BuildRunId,
     },
 }
 

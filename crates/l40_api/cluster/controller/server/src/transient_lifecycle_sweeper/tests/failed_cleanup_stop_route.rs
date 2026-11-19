@@ -17,11 +17,11 @@
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::pg_test_db;
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApiServer;
 use pplx_space_node_api_sim::state::status;
 use pplx_space_node_api_sim::{SimState, SimWorkerApiService};
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;

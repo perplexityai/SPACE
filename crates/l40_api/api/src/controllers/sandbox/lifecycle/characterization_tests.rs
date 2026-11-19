@@ -14,9 +14,11 @@
 
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, WakeCompletionAction};
 use axum::http::StatusCode;
-use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId, UserId};
+use pplx_space_accounts::{NodeId, UserId};
 use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::action_stamp::{ActionStamp, StartSubstrate};
 use pplx_space_sandbox_store::test_support::{known_defects, stored_lifecycle_matrix};
@@ -138,12 +140,7 @@ fn direct_controller(pool: &PgPool) -> SandboxController {
 fn controller_with_empty_cluster_admission(pool: &PgPool) -> SandboxController {
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         direct_substrate(pool),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     SandboxController::with_cluster_admission(direct_substrate(pool), admission)
@@ -169,6 +166,7 @@ async fn run_action(
             identity(action),
             action,
             activation,
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await
 }
@@ -786,7 +784,8 @@ async fn a_start_keeps_a_rewrite_that_landed_after_its_stamp() -> TestResult {
 /// `update_and_fetch_post_wake_sandbox`. The store's `action_stamp` tests
 /// cover each stamp's own states, and the stamps that keep `suspended`.
 /// Whether a row is written is read from `xmin`, so a stamp that rewrites the
-/// value the row already holds still counts as applied.
+/// value the row already holds still counts as applied. The post-wake
+/// update's returned row must show the row as it wrote it.
 #[tokio::test(flavor = "current_thread")]
 async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResult {
     const EXPECTED: &[&str] = &[
@@ -845,6 +844,7 @@ async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResu
 
             // The stamps are best-effort and report nothing; the post-wake
             // update reports a refusal as an error.
+            let mut responded = None;
             let (moved_to, reported) = match writer {
                 Writer::Stamp => {
                     maybe_update_sandbox_lifecycle(pool, sandbox_id, ActionStamp::Pause).await;
@@ -863,6 +863,10 @@ async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResu
                     let updated =
                         update_and_fetch_post_wake_sandbox(pool, sandbox_id, Some(NodeId::new()))
                             .await;
+                    responded = updated
+                        .as_ref()
+                        .ok()
+                        .map(|sandbox| Row::new(&sandbox.lifecycle, &sandbox.placement));
                     (Row::new("started", "on_node"), Some(updated.is_ok()))
                 }
             };
@@ -872,10 +876,12 @@ async fn post_action_stamps_write_only_over_an_in_flight_lifecycle() -> TestResu
             let expected = if expect.applies() { moved_to } else { before };
             if written != expect.applies()
                 || reported.is_some_and(|updated| updated != expect.applies())
+                || responded.as_ref().is_some_and(|row| *row != after)
                 || after != expected
             {
                 mismatches.push(format!(
-                    "{writer:?} from {stored:?} ({expect:?}): written {written}, row now {after:?}"
+                    "{writer:?} from {stored:?} ({expect:?}): written {written}, row now \
+                     {after:?}, returned {responded:?}"
                 ));
             }
         }

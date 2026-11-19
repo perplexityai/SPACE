@@ -8,7 +8,7 @@
 //! into vol-mgr, and persists those transfer handles before teardown. The worker
 //! performs the same idempotent Begin and staging calls as a restart/failure
 //! fallback; object upload and finalization remain asynchronous. A mid-flight
-//! restart resumes via [`BackgroundWorker::recover`] instead of orphaning the
+//! restart resumes via [`JobWorker::recover_and_log`] instead of orphaning the
 //! node's newest artifact.
 //!
 //! Each `execute` attempt:
@@ -32,12 +32,12 @@
 //!
 //! Every step is idempotent so re-runs after a retry / restart are safe.
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::time::{Duration, Instant};
 
+use crate::db::jobs::{Job, JobError, JobExecutor, JobWorker, WorkerConfig};
 use futures_util::future::join_all;
-use pplx_space_common_jobs::{BackgroundWorker, Job, JobError, JobExecutor, WorkerConfig};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
@@ -64,12 +64,12 @@ pub(crate) fn worker_config() -> WorkerConfig {
         .with_recovery_job_kind(SNAPSHOT_UPLOAD_JOB_KIND)
 }
 
-/// Build a `BackgroundWorker` for the snapshot-upload pipeline from `config`,
+/// Build a `JobWorker` for the snapshot-upload pipeline from `config`,
 /// [`worker_config`] in production.
 /// Caller owns the `crate::db::Connection` (it lives alongside the rest of
 /// sbx-mgr's SQLite state) and is responsible for calling
-/// [`BackgroundWorker::recover_and_log`] at startup and
-/// [`BackgroundWorker::yield_for_restart`] at exit.
+/// [`JobWorker::recover_and_log`] at startup and
+/// [`JobWorker::yield_for_restart`] at exit.
 ///
 /// This worker is intentionally scoped to [`SNAPSHOT_UPLOAD_JOB_KIND`]:
 /// sandbox-manager gives local finalization a bounded deploy-shutdown drain,
@@ -80,7 +80,7 @@ pub(crate) fn build_worker(
     node_manager: crate::node_manager_transport::NodeManagerConnector,
     volume_manager_socket: std::path::PathBuf,
     config: WorkerConfig,
-) -> BackgroundWorker<SnapshotUploadExecutor> {
+) -> JobWorker<SnapshotUploadExecutor> {
     let executor = SnapshotUploadExecutor {
         db: db.clone(),
         drain_state,
@@ -159,6 +159,7 @@ impl JobExecutor for SnapshotUploadExecutor {
             crate::metrics::snapshot::delivery_duration_ms(
                 "snapshot_queue",
                 origin,
+                None,
                 None,
                 "success",
                 duration_ms,
@@ -268,7 +269,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 .find_map(|(artifact, observation)| {
                     matches!(
                         artifact.kind,
-                        pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend
+                        pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend
                     )
                     .then_some(observation.bytes)
                 })
@@ -333,6 +334,7 @@ impl JobExecutor for SnapshotUploadExecutor {
             "cluster_finalize",
             origin,
             None,
+            Some(vm_total_bytes),
             if finalize_result.is_ok() {
                 "success"
             } else {
@@ -387,6 +389,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                     "artifact_queue",
                     origin,
                     Some(artifact_tag),
+                    Some(observation.bytes),
                     "success",
                     duration_ms,
                 );
@@ -396,6 +399,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                     "artifact_transfer",
                     origin,
                     Some(artifact_tag),
+                    Some(observation.bytes),
                     "success",
                     duration_ms,
                 );
@@ -413,6 +417,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 "remote_total",
                 origin,
                 None,
+                Some(vm_total_bytes),
                 "success",
                 duration_ms,
             );
@@ -611,7 +616,7 @@ pub(crate) fn prepared_upload_requires_begin(payload: &SnapshotUploadJobs) -> bo
 #[derive(Debug)]
 pub(crate) struct BeginRefusal {
     pub(crate) error: JobError,
-    pub(crate) superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    pub(crate) superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     /// See [`registration_refusal_is_final`].
     pub(crate) refuses_artifact: bool,
 }
@@ -662,7 +667,7 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
 /// starts after such a failure.
 fn registration_refusal_is_final(
     code: tonic::Code,
-    superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
 ) -> bool {
     code == tonic::Code::InvalidArgument || superseded_generation.is_some()
 }
@@ -682,7 +687,7 @@ pub(crate) fn record_failure_scope(
 pub(crate) enum RegistrationProbe {
     /// The control plane refused the registration because it superseded this
     /// generation.
-    Superseded(pplx_space_common_core::types::ExecutionGeneration),
+    Superseded(pplx_space_sandbox_model::ExecutionGeneration),
     /// The control plane ran the generation fence on the verdict-only
     /// registration and admitted it, so the fence would admit a fresh attempt
     /// too.
@@ -733,7 +738,7 @@ pub(crate) async fn prepared_begin_refused_as_superseded(
         Ok(Ok(reply)) if reply.generation_fence_admitted => RegistrationProbe::Admitted,
         Ok(Ok(_)) => RegistrationProbe::NotSuperseded,
         Ok(Err(refused)) => match classify_begin_error(refused).kind() {
-            pplx_space_common_jobs::JobFailureKind::Permanent => RegistrationProbe::NotSuperseded,
+            crate::db::jobs::JobFailureKind::Permanent => RegistrationProbe::NotSuperseded,
             _ => RegistrationProbe::Unanswered,
         },
         Err(_) => RegistrationProbe::NotSuperseded,
@@ -761,9 +766,28 @@ async fn send_prepared_begin(
     >,
     JobError,
 > {
-    let local_artifact_id = payload.meta.local_artifact_id.ok_or_else(|| {
-        JobError::permanent("prepared snapshot upload is missing local_artifact_id")
-    })?;
+    let local_artifact_id = payload
+        .meta
+        .local_artifact_id
+        .ok_or_else(|| {
+            JobError::permanent("prepared snapshot upload is missing local_artifact_id")
+        })?
+        .to_string();
+    Ok(begin_with_cluster_api(prepared_begin(
+        payload,
+        &local_artifact_id,
+        fence_verdict_only,
+    )?)
+    .await)
+}
+
+/// The registration `payload` asks for, with `local_artifact_id` its
+/// artifact's id as text.
+fn prepared_begin<'a>(
+    payload: &'a SnapshotUploadJobs,
+    local_artifact_id: &'a str,
+    fence_verdict_only: bool,
+) -> Result<BeginArtifactBackup<'a>, JobError> {
     let artifact_origin = payload.meta.artifact_origin.ok_or_else(|| {
         JobError::permanent("prepared snapshot upload is missing artifact_origin")
     })?;
@@ -775,11 +799,9 @@ async fn send_prepared_begin(
         .artifact_snapshot_name
         .as_ref()
         .map(|name| name.as_str());
-    let local_artifact_id = local_artifact_id.to_string();
-
-    Ok(begin_with_cluster_api(BeginArtifactBackup {
+    Ok(BeginArtifactBackup {
         sandbox_id: &payload.meta.sandbox_id,
-        local_artifact_id: &local_artifact_id,
+        local_artifact_id,
         artifact_kind: artifact_kind_from_meta(&payload.meta),
         artifact_origin,
         snapshot_name,
@@ -787,9 +809,9 @@ async fn send_prepared_begin(
         storage_uri: &payload.storage_uri,
         execution,
         execution_generation: payload.execution_generation,
+        execution_generation_names_capture: payload.execution_generation_names_capture,
         fence_verdict_only,
     })
-    .await)
 }
 
 fn classify_begin_error(error: BeginArtifactBackupError) -> JobError {
@@ -830,8 +852,8 @@ async fn converge_failed_upload(payload: &SnapshotUploadJobs, reason: &'static s
 /// prove the on-disk file is the uploaded bytes.
 fn stream_reclaim_applies(meta: &SnapshotMeta) -> bool {
     format_from_meta(meta) == SuspendSnapshotFormat::BtrfsSend
-        && artifact_kind_from_meta(meta) == pplx_space_common_core::types::ArtifactKind::Full
-        && meta.artifact_origin == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+        && artifact_kind_from_meta(meta) == pplx_space_snapshot_model::ArtifactKind::Full
+        && meta.artifact_origin == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
         && meta.local_artifact_id.is_some()
 }
 
@@ -1071,10 +1093,13 @@ struct ArtifactTransferObservation {
 }
 
 /// Observe a durable transfer until terminal, bounded by the worker's overall
-/// attempt deadline. Connect and individual read-only probes each have a
-/// ten-second budget; transport failures retry the upload job, while permanent
-/// transfer failure remains terminal. Cancellation yields without cancelling
-/// remote work, and re-polling terminal transfers is safe.
+/// attempt deadline. Each read-only probe has a ten-second budget. A
+/// volume-manager that refuses the connection or drops it, as it does while it
+/// restarts, is polled again for up to
+/// [`pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET`]; past that, or
+/// on a stalled probe, the upload job retries. Permanent transfer failure
+/// remains terminal. Cancellation yields without cancelling remote work, and
+/// re-polling terminal transfers is safe.
 async fn wait_for_artifact_job(
     volume_manager_socket: &std::path::Path,
     sandbox_id: &str,
@@ -1084,18 +1109,7 @@ async fn wait_for_artifact_job(
     // One reconnecting channel per artifact attempt, not a fresh connection
     // on every poll. These are observation-only requests: timing out does not
     // abandon the durable volume-manager transfer or cancel remote mutation.
-    let volume_manager_socket = volume_manager_socket.to_string_lossy();
-    let client = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
-        result = tokio::time::timeout(
-            TRANSFER_PROBE_TIMEOUT,
-            pplx_space_volmgr_client::connect(&volume_manager_socket),
-        ) => {
-            result.map_err(|_| JobError::retriable(format!("vol-mgr connect timed out ({job_id})")))?
-                .map_err(|e| JobError::retriable(format!("vol-mgr connect ({job_id}): {e}")))?
-        }
-    };
+    let client = pplx_space_volmgr_client::lazy(volume_manager_socket);
     poll_artifact_job(sandbox_id, *job_id, client, cancellation).await
 }
 
@@ -1111,23 +1125,80 @@ fn next_artifact_poll_interval(interval: Duration) -> Duration {
     (interval * 2).min(ARTIFACT_POLL_MAX)
 }
 
+/// Probe interval while volume-manager cannot be reached.
+const UNREACHABLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 async fn poll_artifact_job(
     sandbox_id: &str,
     job_id: JobId,
-    mut client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
+    client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<ArtifactTransferObservation, JobError> {
+    poll_artifact_job_with(
+        sandbox_id,
+        job_id,
+        move || {
+            let mut client = client.clone();
+            async move {
+                client
+                    .get_transfer_job(GetTransferJobRequest {
+                        job_id: job_id.to_string(),
+                    })
+                    .await
+                    .map(tonic::Response::into_inner)
+            }
+        },
+        cancellation,
+    )
+    .await
+}
+
+async fn poll_artifact_job_with<Probe, ProbeFuture>(
+    sandbox_id: &str,
+    job_id: JobId,
+    mut probe: Probe,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ArtifactTransferObservation, JobError>
+where
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: std::future::Future<
+            Output = Result<pplx_space_volmgr_client::proto::GetTransferJobResponse, tonic::Status>,
+        >,
+{
     let mut interval = ARTIFACT_POLL_INITIAL;
+    let mut unreachable_since: Option<tokio::time::Instant> = None;
     loop {
-        let resp = tokio::select! {
+        let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
-            response = tokio::time::timeout(TRANSFER_PROBE_TIMEOUT, client.get_transfer_job(GetTransferJobRequest {
-                job_id: job_id.to_string(),
-            })) => response
-                .map_err(|_| JobError::retriable(format!("get_transfer_job timed out ({job_id})")))?
-                .map_err(|e| JobError::retriable(format!("get_transfer_job ({job_id}): {e}")))?
-                .into_inner(),
+            response = tokio::time::timeout(TRANSFER_PROBE_TIMEOUT, probe()) => response
+                .map_err(|_| JobError::retriable(format!("get_transfer_job timed out ({job_id})")))?,
+        };
+        let resp = match response {
+            Ok(resp) => {
+                unreachable_since = None;
+                resp
+            }
+            Err(status) if pplx_space_common_grpc::should_reconnect_status(&status) => {
+                let since = *unreachable_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET {
+                    return Err(JobError::retriable(format!(
+                        "get_transfer_job ({job_id}): volume-manager unreachable for {}s: {status}",
+                        since.elapsed().as_secs()
+                    )));
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
+                    _ = tokio::time::sleep(UNREACHABLE_POLL_INTERVAL) => {}
+                }
+                continue;
+            }
+            Err(status) => {
+                return Err(JobError::retriable(format!(
+                    "get_transfer_job ({job_id}): {status}"
+                )));
+            }
         };
 
         let job = resp.job.ok_or_else(|| {
@@ -1287,13 +1358,15 @@ fn bytes_uploaded_i64(log_id: &str, bytes_uploaded: u64) -> i64 {
 pub(crate) struct BeginArtifactBackup<'a> {
     pub(crate) sandbox_id: &'a str,
     pub(crate) local_artifact_id: &'a str,
-    pub(crate) artifact_kind: pplx_space_common_core::types::ArtifactKind,
-    pub(crate) artifact_origin: pplx_space_common_core::types::ArtifactOrigin,
+    pub(crate) artifact_kind: pplx_space_snapshot_model::ArtifactKind,
+    pub(crate) artifact_origin: pplx_space_snapshot_model::ArtifactOrigin,
     pub(crate) snapshot_name: Option<&'a str>,
     pub(crate) backup_attempt_id: &'a str,
     pub(crate) storage_uri: &'a str,
-    pub(crate) execution: &'a pplx_space_common_core::types::SnapshotExecutionMetadata,
-    pub(crate) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    pub(crate) execution: &'a pplx_space_execution_spec::SnapshotExecutionMetadata,
+    pub(crate) execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    /// `execution_generation` is the capturing execution's by evidence.
+    pub(crate) execution_generation_names_capture: bool,
     /// Ask for the registration's verdict without persisting the attempt.
     pub(crate) fence_verdict_only: bool,
 }
@@ -1307,7 +1380,7 @@ pub(crate) enum BeginArtifactBackupError {
         code: tonic::Code,
         message: String,
         /// The generation a refusal says the control plane retired.
-        superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     },
 }
 
@@ -1340,26 +1413,26 @@ fn begin_artifact_backup_request(
         sandbox_id: request.sandbox_id.to_string(),
         local_artifact_id: request.local_artifact_id.to_string(),
         artifact_kind: match request.artifact_kind {
-            pplx_space_common_core::types::ArtifactKind::Disk => {
+            pplx_space_snapshot_model::ArtifactKind::Disk => {
                 pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32
             }
-            pplx_space_common_core::types::ArtifactKind::Full => {
+            pplx_space_snapshot_model::ArtifactKind::Full => {
                 pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
             }
         },
         backup_attempt_id: request.backup_attempt_id.to_string(),
         storage_uri: request.storage_uri.to_string(),
         artifact_origin: match request.artifact_origin {
-            pplx_space_common_core::types::ArtifactOrigin::Stop => {
+            pplx_space_snapshot_model::ArtifactOrigin::Stop => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop as i32
             }
-            pplx_space_common_core::types::ArtifactOrigin::Suspend => {
+            pplx_space_snapshot_model::ArtifactOrigin::Suspend => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend as i32
             }
-            pplx_space_common_core::types::ArtifactOrigin::Snapshot => {
+            pplx_space_snapshot_model::ArtifactOrigin::Snapshot => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Snapshot as i32
             }
-            pplx_space_common_core::types::ArtifactOrigin::Fork => {
+            pplx_space_snapshot_model::ArtifactOrigin::Fork => {
                 pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32
             }
         },
@@ -1371,7 +1444,8 @@ fn begin_artifact_backup_request(
             .map(|host_cpu| host_cpu.as_str().to_owned()),
         execution_generation: request
             .execution_generation
-            .map(pplx_space_common_core::types::ExecutionGeneration::get),
+            .map(pplx_space_sandbox_model::ExecutionGeneration::get),
+        execution_generation_names_capture: request.execution_generation_names_capture,
         fence_verdict_only: request.fence_verdict_only,
     }
 }
@@ -1410,7 +1484,7 @@ fn suspend_uncommitted(
 
     if meta
         .artifact_origin
-        .is_some_and(|origin| origin != pplx_space_common_core::types::ArtifactOrigin::Suspend)
+        .is_some_and(|origin| origin != pplx_space_snapshot_model::ArtifactOrigin::Suspend)
     {
         return Ok(false);
     }
@@ -1695,7 +1769,7 @@ pub fn backfill_backup_completed_markers(
 /// the daemon's task drain. The pruning trigger protects unvisited obligations.
 pub(crate) async fn run_maintenance(
     db: crate::db::SharedConnection,
-    worker: BackgroundWorker<SnapshotUploadExecutor>,
+    worker: JobWorker<SnapshotUploadExecutor>,
     drain: std::sync::Arc<crate::service::drain::DrainState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
@@ -1718,7 +1792,7 @@ pub(crate) async fn run_maintenance(
         let db = db.clone();
         let worker = worker.clone();
         let prune = last_prune.is_none_or(|last: tokio::time::Instant| {
-            last.elapsed() >= pplx_space_common_jobs::TERMINAL_JOB_PRUNE_INTERVAL
+            last.elapsed() >= crate::db::jobs::TERMINAL_JOB_PRUNE_INTERVAL
         });
         match tokio::task::spawn_blocking(move || {
             let _writer = writer;
@@ -1833,7 +1907,7 @@ pub(crate) fn rewrite_sidecar_for_reclaim(
     for artifact in
         crate::snapshot_upload::vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend)
     {
-        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+        if artifact.kind == pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend {
             continue;
         }
         let len = std::fs::metadata(snapshot_dir.join(artifact.local_name))?.len();

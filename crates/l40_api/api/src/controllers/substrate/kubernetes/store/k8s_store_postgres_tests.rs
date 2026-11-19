@@ -1,6 +1,7 @@
-use pplx_space_common_core::types::{
-    LocalArtifactId, NODE_DRAIN_MODE_GENTLE, NodeDrainPhase, NodeId, SandboxId, SnapshotId,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::{NODE_DRAIN_MODE_GENTLE, NodeDrainPhase};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ mod materialization_record_tests;
 mod node_registration_tests;
 mod owned_restore_completion_tests;
 mod restore_revert_tests;
+mod runtime_attribution_tests;
 mod runtime_upgrade_evidence_tests;
 mod started_recovery_observation_tests;
 mod stopped_evacuation_claim_tests;
@@ -150,7 +152,11 @@ async fn postgres_store_with_max_connections(max_connections: u32) -> TestResult
     let db = pg_test_db_with_max_connections(max_connections).await?;
     let pool = db.pool.clone();
     Ok(PostgresStore {
-        store: K8sStore::new(pool.clone(), "space".to_string()),
+        store: K8sStore::new(
+            pool.clone(),
+            "space".to_string(),
+            crate::controllers::substrate::ActivationClientAttribution::Enabled,
+        ),
         pool,
         _db: db,
     })
@@ -893,14 +899,15 @@ async fn missing_k8s_inventory_demotes_only_stale_ready_nodes() -> TestResult {
     ] {
         fixture
             .store
-            .persist_k8s_node_inventory(
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
                 node_name,
-                &format!("uid-{node_id}"),
-                NodeId::from_uuid(node_id),
-                NodeRole::Worker,
-                Some("10.0.0.20"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                node_uid: &format!("uid-{node_id}"),
+                node_id: NodeId::from_uuid(node_id),
+                role: NodeRole::Worker,
+                address: Some("10.0.0.20"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
     }
 
@@ -1006,28 +1013,30 @@ async fn inventory_listing_insert_only_does_not_downgrade_ready_node() -> TestRe
     let node_name = format!("space-test-inventory-node-{}", node_id.as_uuid().simple());
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-inv",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-inv",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.50"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.50"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
 
     // The inventory listing observes an unready node-api pod (rollout) and
     // writes with insert-only semantics.
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-inv",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-inv",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.50"),
-            NodeStateWrite::InsertOnly(NodeLifecycleState::from_ready(false)),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.50"),
+            state: NodeStateWrite::InsertOnly(NodeLifecycleState::from_ready(false)),
+            instance_id: None,
+        })
         .await?;
 
     let state: String = sqlx::query_scalar(sql!("SELECT state FROM nodes WHERE id = $1"))
@@ -1057,14 +1066,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     let node_name = format!("space-test-ready-node-{}", node_id.as_uuid().simple());
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-ready",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-ready",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.30"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.30"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
 
     let sandbox_id = SandboxId::new();
@@ -1073,14 +1083,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     // A pod lands on the node.
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "uid-ready",
+            node_name: &node_name,
+            node_uid: "uid-ready",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.30"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.30"),
+            instance_id: None,
+        })
         .await?;
 
     let state: String = sqlx::query_scalar(sql!("SELECT state FROM nodes WHERE id = $1"))
@@ -1098,14 +1109,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     // state.
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "uid-ready",
+            node_name: &node_name,
+            node_uid: "uid-ready",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.99"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.99"),
+            instance_id: None,
+        })
         .await?;
     let (state, address): (String, String) =
         sqlx::query_as(sql!("SELECT state, host(address) FROM nodes WHERE id = $1"))
@@ -1129,14 +1141,15 @@ async fn pod_placement_does_not_downgrade_ready_node_state() -> TestResult {
     insert_sandbox(&fixture.pool, fresh_sandbox, "started").await?;
     fixture
         .store
-        .persist_pod_node_placement(
-            fresh_sandbox,
-            &fresh_name,
-            "uid-fresh",
-            fresh_id,
-            NodeRole::Worker,
-            Some("10.0.0.31"),
-        )
+        .persist_pod_node_placement(PodNodePlacement {
+            sandbox_id: fresh_sandbox,
+            node_name: &fresh_name,
+            node_uid: "uid-fresh",
+            node_id: fresh_id,
+            role: NodeRole::Worker,
+            address: Some("10.0.0.31"),
+            instance_id: None,
+        })
         .await?;
     let fresh_state: String = sqlx::query_scalar(sql!("SELECT state FROM nodes WHERE id = $1"))
         .bind(fresh_id)
@@ -1238,6 +1251,7 @@ async fn split_operation_stopped_start_retry_preserves_route_proof() -> TestResu
             claim.row.generation,
             Some("pod-proof"),
             Some("100.64.0.7"),
+            None,
         )
         .await?;
     // Caller abandonment does not complete a stopped->started lifecycle; ownership
@@ -1362,6 +1376,76 @@ async fn selected_route_pod_ip_refresh_is_fenced_by_complete_route(
     Ok(())
 }
 
+/// A stopped sandbox's start learns its new pod's IP only through the
+/// selected route. The execution it leaves behind must be one suspend can
+/// claim, as a created sandbox's is.
+async fn selected_route_pod_ip_makes_a_started_execution_suspendable(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let route = SandboxActivationAttemptId::new();
+    let pod_uid = PodUid::parse("started-pod-uid")?;
+    let mut sandboxes = Vec::new();
+    for state in ["created", "recovering"] {
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("{state}-pod");
+        insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions (
+                 sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                 state, active, activation_attempt_id, route_activation_id
+             ) VALUES ($1, 4, $2, 'space', $3, $4, TRUE, $5, $5)"
+        ))
+        .bind(sandbox_id)
+        .bind(&pod_name)
+        .bind(pod_uid.as_str())
+        .bind(state)
+        .bind(route.as_uuid())
+        .execute(&fixture.pool)
+        .await?;
+        assert!(
+            fixture
+                .store
+                .persist_selected_route_pod_ip(
+                    sandbox_id,
+                    4,
+                    &pod_name,
+                    route,
+                    &pod_uid,
+                    PodIp::parse("10.90.0.10")?,
+                )
+                .await?
+        );
+        sandboxes.push((state, sandbox_id));
+    }
+
+    let generation = ExecutionGeneration::new(4)?;
+    for (state, sandbox_id) in sandboxes {
+        let claim = fixture
+            .store
+            .claim_suspend_execution(sandbox_id, generation, &pod_uid)
+            .await;
+        let stored: String = sqlx::query_scalar(sql!(
+            "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        if state == "created" {
+            assert!(
+                matches!(claim, Ok(SuspendExecutionClaim::Claimed)),
+                "a started execution with a pod IP must be claimable: {claim:?}"
+            );
+            assert_eq!(stored, "running");
+        } else {
+            // The recovery flow owns promoting its own execution.
+            assert!(claim.is_err(), "{claim:?}");
+            assert_eq!(stored, "recovering");
+        }
+    }
+
+    Ok(())
+}
+
 /// Each behavior runs against a store of its own, so none can depend on
 /// rows another left behind.
 mod k8s_store_postgres_behaviors {
@@ -1411,6 +1495,7 @@ mod k8s_store_postgres_behaviors {
         suspend_superseded_activation_abandons_only_the_canonical_attempt,
         stale_generation_cannot_complete_or_abandon_reused_attempt,
         selected_route_pod_ip_refresh_is_fenced_by_complete_route,
+        selected_route_pod_ip_makes_a_started_execution_suspendable,
         replacement_handler_claims_g7_after_lagging_g6_is_replaced,
         stale_generation_pod_metadata_does_not_update_new_active_execution,
         blank_pod_uid_decodes_as_absent_for_active_execution,
@@ -1867,14 +1952,15 @@ async fn concurrent_pod_placement_and_cleanup_do_not_deadlock() -> TestResult {
     let placement_store = fixture.store.clone();
     let placement = tokio::spawn(async move {
         placement_store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                "worker-node-placement-race",
-                "worker-node-placement-race-uid",
+                node_name: "worker-node-placement-race",
+                node_uid: "worker-node-placement-race-uid",
                 node_id,
-                NodeRole::Worker,
-                Some("10.90.0.11"),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.90.0.11"),
+                instance_id: None,
+            })
             .await
     });
     wait_for_blocked_query_count(
@@ -1956,14 +2042,15 @@ async fn pod_placement_survives_concurrent_insert_of_same_node() -> TestResult {
     let placement_name = node_name.clone();
     let placement = tokio::spawn(async move {
         placement_store
-            .persist_pod_node_placement(
+            .persist_pod_node_placement(PodNodePlacement {
                 sandbox_id,
-                &placement_name,
-                "uid-race",
+                node_name: &placement_name,
+                node_uid: "uid-race",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.40"),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.40"),
+                instance_id: None,
+            })
             .await
     });
     wait_until_blocked_by(&fixture.pool, inserter_pid).await?;
@@ -2067,7 +2154,7 @@ async fn wake_signal_classifies_post_wake_flip_by_recency_not_lease(
     fixture: &PostgresStore,
 ) -> TestResult {
     use crate::controllers::sandbox::{POST_WAKE_LISTENER_REBIND_GRACE, fetch_sandbox_wake_signal};
-    use pplx_space_common_core::types::SandboxLifecycle;
+    use pplx_space_sandbox_model::SandboxLifecycle;
 
     let sandbox_id = SandboxId::new();
     insert_sandbox(&fixture.pool, sandbox_id, "suspended").await?;
@@ -2296,6 +2383,7 @@ async fn ensure_active_execution_row_is_idempotent(fixture: &PostgresStore) -> T
             first.row.generation,
             Some("pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
     let (state, pod_ip): (String, Option<String>) = sqlx::query_as(sql!(
@@ -2324,6 +2412,7 @@ async fn pod_materialization_claim_publishes_fresh_lease(fixture: &PostgresStore
             claim.row.generation,
             Some("stale-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -2394,7 +2483,13 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
 
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pod-uid"), Some("10.90.0.8"))
+        .persist_pod_metadata(
+            sandbox_id,
+            generation,
+            Some("pod-uid"),
+            Some("10.90.0.8"),
+            None,
+        )
         .await?;
     let state: String = sqlx::query_scalar(sql!(
         "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
@@ -2437,7 +2532,13 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
     );
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pod-uid"), Some("10.90.0.8"))
+        .persist_pod_metadata(
+            sandbox_id,
+            generation,
+            Some("pod-uid"),
+            Some("10.90.0.8"),
+            None,
+        )
         .await?;
     let state: String = sqlx::query_scalar(sql!(
         "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
@@ -2470,6 +2571,7 @@ async fn started_recovery_claim_is_bounded_and_preserves_its_marker(
             generation,
             Some("replacement-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     assert_eq!(
@@ -2569,6 +2671,7 @@ async fn failed_started_recovery_converges_unplaced_sandbox_with_current_snapsho
                 generation,
                 Some("late-pod-uid"),
                 Some("10.90.0.9"),
+                None,
             )
             .await?,
         None,
@@ -2634,7 +2737,7 @@ async fn failed_started_recovery_converges_after_authoritative_pod_absence(
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None, None)
         .await?;
     fixture
         .store
@@ -2734,7 +2837,7 @@ async fn failed_started_recovery_after_pod_absence_refuses_stale_snapshot(
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("failed-pod-uid"), None, None)
         .await?;
     fixture
         .store
@@ -2860,7 +2963,7 @@ async fn failed_started_recovery_pod_absence_is_fenced_against_late_materializat
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("observed-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("observed-pod-uid"), None, None)
         .await?;
     fixture
         .store
@@ -3229,7 +3332,7 @@ async fn failed_started_recovery_with_materialized_pod_stays_started(
     };
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pending-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("pending-pod-uid"), None, None)
         .await?;
 
     fixture
@@ -3271,14 +3374,15 @@ async fn failed_started_recovery_with_node_placement_stays_started(
     };
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            "placed-recovery-node",
-            "placed-recovery-node-uid",
+            node_name: "placed-recovery-node",
+            node_uid: "placed-recovery-node-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.90.0.10"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.90.0.10"),
+            instance_id: None,
+        })
         .await?;
 
     fixture
@@ -3330,6 +3434,7 @@ async fn failed_started_recovery_with_routable_pod_stays_started(
             generation,
             Some("routable-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
 
@@ -3420,6 +3525,7 @@ async fn started_recovery_follows_superseding_execution(fixture: &PostgresStore)
             replacement.row.generation,
             Some("replacement-pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
 
@@ -3585,6 +3691,7 @@ async fn abandon_created_unmaterialized_create_claim_preserves_observed_or_mater
             materialized.row.generation,
             Some("materialized-pod-uid"),
             None,
+            None,
         )
         .await?;
 
@@ -3695,6 +3802,7 @@ async fn abandon_unmaterialized_create_claim_retires_foreign_creating_claim(
             materialized_sandbox_id,
             materialized.row.generation,
             Some("redrive-materialized-pod-uid"),
+            None,
             None,
         )
         .await?;
@@ -3811,7 +3919,7 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
     // the row to `created`.
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("pinned-pod-uid"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("pinned-pod-uid"), None, None)
         .await?;
     let state: String = sqlx::query_scalar(sql!(
         "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
@@ -3845,7 +3953,7 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
     assert!(
         fixture
             .store
-            .reset_active_execution_to_creating_if_generation(sandbox_id, generation, None, None,)
+            .reset_active_execution_to_creating_if_generation(sandbox_id, generation, None, None)
             .await?
     );
     assert!(
@@ -3884,7 +3992,13 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
     .await?;
     fixture
         .store
-        .persist_pod_metadata(fenced_id, fenced_generation, Some("pinned-pod-uid"), None)
+        .persist_pod_metadata(
+            fenced_id,
+            fenced_generation,
+            Some("pinned-pod-uid"),
+            None,
+            None,
+        )
         .await?;
     assert!(
         !fixture
@@ -3958,7 +4072,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         format!("space-sbx-{}-g6", sandbox_id.as_uuid().simple())
     );
 
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let initialized_claim = fixture
         .store
         .ensure_active_execution_claim_for_lifecycle(
@@ -3972,7 +4086,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         initialized_claim.row.generation,
         handler_a_claim.row.generation
     );
-    let attempt_b = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let attempt_b = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let concurrent_error = fixture
         .store
         .assign_activation_attempt(
@@ -3996,7 +4110,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         .assign_activation_attempt(
             sandbox_id,
             handler_a_claim.row.generation,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             SandboxTransitionTargetState::Paused,
         )
         .await
@@ -4137,7 +4251,7 @@ async fn concurrent_handler_does_not_claim_g7_while_g6_create_is_in_flight(
         .store
         .reconcile_activation_fence(
             sandbox_id,
-            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
             Some(attempt_b),
             SandboxTransitionTargetState::Started,
         )
@@ -4155,7 +4269,7 @@ async fn activation_attempt_assignment_is_monotonic_after_lease_expiry(
 ) -> TestResult {
     let sandbox_id = SandboxId::new();
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
-    let attempt_a = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_a = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019f8000-0000-7000-8000-000000000001")?,
     );
     let claim = fixture
@@ -4186,10 +4300,10 @@ async fn activation_attempt_assignment_is_monotonic_after_lease_expiry(
     .execute(&fixture.pool)
     .await?;
 
-    let attempt_b = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let attempt_b = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019f8000-0000-7000-8000-000000000003")?,
     );
-    let delayed_proposal = pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+    let delayed_proposal = pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019f8000-0000-7000-8000-000000000002")?,
     );
     let attempt_c = fixture
@@ -4283,9 +4397,9 @@ async fn activation_attempt_assignment_adopts_route_less_legacy_resident_after_a
 ) -> TestResult {
     let sandbox_id = SandboxId::new();
     insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
-    let stale_proposal = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let stale_proposal = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     let legacy_owner =
-        pplx_space_common_core::types::SandboxActivationAttemptId::new_after(stale_proposal)
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new_after(stale_proposal)
             .expect("test activation identity space must have a successor");
     let execution = fixture
         .store
@@ -4699,6 +4813,7 @@ async fn stale_generation_pod_metadata_does_not_update_new_active_execution(
             stale.row.generation,
             Some("stale-pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
     assert!(
@@ -4723,6 +4838,7 @@ async fn stale_generation_pod_metadata_does_not_update_new_active_execution(
             active.row.generation,
             Some("active-pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     assert_eq!(
@@ -4836,6 +4952,7 @@ async fn persist_pod_metadata_reports_recovering_state_unchanged(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.13"),
+            None,
         )
         .await?;
     assert_eq!(
@@ -4888,11 +5005,21 @@ async fn persist_pod_metadata_reports_noop_when_retirement_commits_mid_write(
     .await?;
 
     // Conn B: the persist, which must block behind A's row lock.
-    let store = K8sStore::new(fixture.pool.clone(), "space".to_string());
+    let store = K8sStore::new(
+        fixture.pool.clone(),
+        "space".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let generation = execution.generation;
     let persist = tokio::spawn(async move {
         store
-            .persist_pod_metadata(sandbox_id, generation, Some("pod-uid"), Some("10.90.0.12"))
+            .persist_pod_metadata(
+                sandbox_id,
+                generation,
+                Some("pod-uid"),
+                Some("10.90.0.12"),
+                None,
+            )
             .await
     });
     // Once the persist is blocked on the locked row, commit the retirement
@@ -4941,6 +5068,7 @@ async fn persist_pod_metadata_normalizes_blank_pod_uid_to_null(
             execution.generation,
             Some("   "),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
 
@@ -5012,8 +5140,8 @@ async fn forget_pod_tracking_if_generation_does_not_forget_successor_attempt(
         .store
         .ensure_active_execution_row(sandbox_id)
         .await?;
-    let stale_attempt = pplx_space_common_core::types::SandboxActivationAttemptId::new();
-    let successor_attempt = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let stale_attempt = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
+    let successor_attempt = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
             SET activation_attempt_id = $2,
@@ -5441,14 +5569,15 @@ async fn forget_pod_tracking_recovers_started_suspended_by_node_after_current_ba
         .await?;
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            "worker-node-a",
-            "worker-node-a-uid",
+            node_name: "worker-node-a",
+            node_uid: "worker-node-a-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.90.0.10"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.90.0.10"),
+            instance_id: None,
+        })
         .await?;
     sqlx::query(sql!(
         "UPDATE sandboxes
@@ -5612,6 +5741,7 @@ async fn unchanged_pod_metadata_does_not_touch_execution_row(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -5629,6 +5759,7 @@ async fn unchanged_pod_metadata_does_not_touch_execution_row(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.7"),
+            None,
         )
         .await?;
 
@@ -5649,6 +5780,7 @@ async fn unchanged_pod_metadata_does_not_touch_execution_row(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.8"),
+            None,
         )
         .await?;
     let (state, execution_ip, execution_touched): (String, Option<String>, bool) =
@@ -5682,14 +5814,15 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
 
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "node-uid",
+            node_name: &node_name,
+            node_uid: "node-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.9"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.9"),
+            instance_id: None,
+        })
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -5710,14 +5843,15 @@ async fn unchanged_pod_node_placement_does_not_touch_current_rows(
 
     fixture
         .store
-        .persist_pod_node_placement(
+        .persist_pod_node_placement(PodNodePlacement {
             sandbox_id,
-            &node_name,
-            "node-uid",
+            node_name: &node_name,
+            node_uid: "node-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.9"),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.9"),
+            instance_id: None,
+        })
         .await?;
 
     let (execution_unchanged, sandbox_unchanged): (bool, bool) = sqlx::query_as(sql!(
@@ -6044,7 +6178,13 @@ async fn finish_suspended_execution_rejects_uncommitted_running_execution(
     let pod_uid = PodUid::parse(Uuid::now_v7().to_string())?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, claim.generation, Some(pod_uid.as_str()), None)
+        .persist_pod_metadata(
+            sandbox_id,
+            claim.generation,
+            Some(pod_uid.as_str()),
+            None,
+            None,
+        )
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -6094,7 +6234,13 @@ async fn suspend_commit_rejects_artifact_claimed_for_prune(fixture: &PostgresSto
     let pod_uid = PodUid::parse(Uuid::now_v7().to_string())?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, claim.generation, Some(pod_uid.as_str()), None)
+        .persist_pod_metadata(
+            sandbox_id,
+            claim.generation,
+            Some(pod_uid.as_str()),
+            None,
+            None,
+        )
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -6171,7 +6317,13 @@ async fn finish_suspended_execution_rejects_mismatched_artifact(
     let pod_uid = PodUid::parse(Uuid::now_v7().to_string())?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, claim.generation, Some(pod_uid.as_str()), None)
+        .persist_pod_metadata(
+            sandbox_id,
+            claim.generation,
+            Some(pod_uid.as_str()),
+            None,
+            None,
+        )
         .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions
@@ -6429,6 +6581,7 @@ async fn seed_bound_claimed_pool_slot(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
 
@@ -6528,6 +6681,7 @@ async fn suspend_commit_finishes_after_exact_execution_is_forgotten(
             execution.generation,
             Some(pod_uid.as_str()),
             Some("100.64.101.40"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -6662,6 +6816,7 @@ async fn durable_suspend_snapshot_artifact_requires_this_suspends_snapshot(
                 execution.generation,
                 Some(pod_uid.as_str()),
                 Some("100.64.101.30"),
+                None,
             )
             .await?;
         let snapshot_id = Uuid::now_v7();
@@ -6787,6 +6942,7 @@ async fn committed_suspend_artifact_belongs_to_the_active_execution(
             prior_execution.generation,
             Some("prior-pod-uid"),
             Some("100.64.101.20"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -6823,6 +6979,7 @@ async fn committed_suspend_artifact_belongs_to_the_active_execution(
             current_execution.generation,
             Some(current_pod_uid.as_str()),
             Some("100.64.101.21"),
+            None,
         )
         .await?;
 
@@ -6879,6 +7036,7 @@ async fn stale_worker_suspend_result_cannot_retire_replacement() -> TestResult {
             stale_execution.generation,
             Some(stale_pod_uid.as_str()),
             Some("100.64.101.30"),
+            None,
         )
         .await?;
     sqlx::query(sql!(
@@ -6903,6 +7061,7 @@ async fn stale_worker_suspend_result_cannot_retire_replacement() -> TestResult {
             replacement_execution.generation,
             Some(replacement_pod_uid.as_str()),
             Some("100.64.101.31"),
+            None,
         )
         .await?;
 
@@ -7444,6 +7603,7 @@ async fn forget_pod_tracking_preserves_execution_history(fixture: &PostgresStore
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     fixture
@@ -7538,6 +7698,7 @@ async fn forget_pod_tracking_recovers_started_with_current_suspend_backup(
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7632,6 +7793,7 @@ async fn forget_pod_tracking_clears_stale_marker_for_newest_current_suspend_back
             execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7695,6 +7857,7 @@ async fn forget_pod_tracking_keeps_started_when_suspend_backup_is_unsafe(
             stale_activity_execution.generation,
             Some("pod-uid"),
             Some("10.90.0.9"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7728,6 +7891,7 @@ async fn forget_pod_tracking_keeps_started_when_suspend_backup_is_unsafe(
             newer_non_suspend_execution.generation,
             Some("pod-uid"),
             Some("10.90.0.10"),
+            None,
         )
         .await?;
     insert_ready_full_snapshot_relative_to_lifecycle(
@@ -7829,7 +7993,7 @@ async fn forget_pod_tracking_preserve_keeps_markerless_snapshot_selectable(
         .await?;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, 1, Some("pod-uid"), Some("10.90.0.9"))
+        .persist_pod_metadata(sandbox_id, 1, Some("pod-uid"), Some("10.90.0.9"), None)
         .await?;
 
     let fresh_query = format!(
@@ -8878,6 +9042,7 @@ async fn restored_generation_accepts_late_pod_metadata(fixture: &PostgresStore) 
             restored.generation,
             Some("restore-pod-uid"),
             Some("100.64.101.240"),
+            None,
         )
         .await?;
 
@@ -8919,14 +9084,15 @@ async fn persist_k8s_node_inventory_stores_canonical_role(fixture: &PostgresStor
         }
         fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-A",
-                space_k8s_node_id(&node_name, role.as_str()),
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-A",
+                node_id: space_k8s_node_id(&node_name, role.as_str()),
                 role,
-                Some("10.0.0.12"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                address: Some("10.0.0.12"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
     }
 
@@ -9086,14 +9252,15 @@ async fn upsert_clears_drain_state_when_k8s_node_uid_changes(
         ] {
             fixture
                 .store
-                .persist_k8s_node_inventory(
-                    name,
-                    uid,
-                    id,
-                    NodeRole::Worker,
-                    Some("10.0.0.1"),
-                    NodeStateWrite::Manage(NodeLifecycleState::Ready),
-                )
+                .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                    node_name: name,
+                    node_uid: uid,
+                    node_id: id,
+                    role: NodeRole::Worker,
+                    address: Some("10.0.0.1"),
+                    state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                    instance_id: None,
+                })
                 .await?;
         }
         set_drain_state(&fixture.pool, node_id, phase).await?;
@@ -9112,14 +9279,15 @@ async fn upsert_clears_drain_state_when_k8s_node_uid_changes(
         // is the inventory reflector's normal upsert path.
         let changed = fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-B",
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-B",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.1"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.1"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
         assert!(changed, "{phase:?}: a UID replacement must report changed");
 
@@ -9177,28 +9345,30 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
 
         fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-A",
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-A",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.2"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.2"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
         let drain = set_drain_state(&fixture.pool, node_id, phase).await?;
 
         // Re-observation with the same UID (every reflector tick).
         let changed = fixture
             .store
-            .persist_k8s_node_inventory(
-                &node_name,
-                "uid-A",
+            .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+                node_name: &node_name,
+                node_uid: "uid-A",
                 node_id,
-                NodeRole::Worker,
-                Some("10.0.0.2"),
-                NodeStateWrite::Manage(NodeLifecycleState::Ready),
-            )
+                role: NodeRole::Worker,
+                address: Some("10.0.0.2"),
+                state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+                instance_id: None,
+            })
             .await?;
         assert!(
             !changed,
@@ -9216,14 +9386,15 @@ async fn upsert_preserves_drain_state_when_k8s_node_uid_unchanged(
     let node_id = NodeId::new();
     let node_name = format!("space-test-node-{}", node_id.as_uuid().simple());
     let register = || {
-        fixture.store.persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        fixture.store.persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.2"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.2"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
     };
     register().await?;
     let seeded: NodeDrainColumns = sqlx::query_as(sql!(
@@ -9265,14 +9436,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            None,
-            NodeStateWrite::Manage(NodeLifecycleState::Registered),
-        )
+            role: NodeRole::Worker,
+            address: None,
+            state: NodeStateWrite::Manage(NodeLifecycleState::Registered),
+            instance_id: None,
+        })
         .await?;
     assert!(changed, "initial inventory insert must report changed");
 
@@ -9285,14 +9457,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.33"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.33"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     assert!(changed, "address and state backfill must report changed");
 
@@ -9315,14 +9488,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.33"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.33"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     assert!(
         !changed,
@@ -9341,14 +9515,15 @@ async fn persist_k8s_node_inventory_repairs_missing_and_stale_address(
 
     let changed = fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "uid-A",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "uid-A",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.44"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.44"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     assert!(changed, "stale address repair must report changed");
 
@@ -9383,14 +9558,15 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
 
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "instance-A-uid",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "instance-A-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.20"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.20"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
     sqlx::query(sql!(
         "UPDATE nodes
@@ -9405,14 +9581,15 @@ async fn azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain
 
     fixture
         .store
-        .persist_k8s_node_inventory(
-            &node_name,
-            "instance-B-uid",
+        .persist_k8s_node_inventory(K8sNodeRoleUpsert {
+            node_name: &node_name,
+            node_uid: "instance-B-uid",
             node_id,
-            NodeRole::Worker,
-            Some("10.0.0.20"),
-            NodeStateWrite::Manage(NodeLifecycleState::Ready),
-        )
+            role: NodeRole::Worker,
+            address: Some("10.0.0.20"),
+            state: NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            instance_id: None,
+        })
         .await?;
 
     let stored_uid: String =
@@ -9526,7 +9703,11 @@ async fn a_contended_execution_guard_answers_retryable_not_failed() -> TestResul
         })
         .connect(&db.database_url)
         .await?;
-    let store = K8sStore::new(store_pool, "space".to_string());
+    let store = K8sStore::new(
+        store_pool,
+        "space".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let typed = sandbox_id;
 
     let mut blocker = db.pool.begin().await?;
@@ -9668,7 +9849,11 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
         })
         .connect(&db.database_url)
         .await?;
-    let store = K8sStore::new(store_pool, "space".to_string());
+    let store = K8sStore::new(
+        store_pool,
+        "space".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let node_id = NodeId::new();
 
     // Hold the row `lock_sandbox_for_execution_mutation_in` takes.
@@ -9689,6 +9874,7 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
                 node_id,
                 role: NodeRole::Worker,
                 address: Some("10.0.0.1"),
+                instance_id: None,
             },
             retry,
         )
@@ -9767,11 +9953,11 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
     assert_eq!(claim.row.generation, 2);
     assert_eq!(
         claim.row.pod_name,
-        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 2)
+        pplx_space_sandbox_pod::sandbox_pod_name(sandbox_id, 2)
     );
     assert_ne!(
         claim.row.pod_name,
-        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 1)
+        pplx_space_sandbox_pod::sandbox_pod_name(sandbox_id, 1)
     );
 
     // Once the sandbox has executions, retiring is a no-op.
@@ -9809,7 +9995,70 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
     assert_eq!(next.row.generation, 3);
     assert_eq!(
         next.row.pod_name,
-        pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 3)
+        pplx_space_sandbox_pod::sandbox_pod_name(sandbox_id, 3)
+    );
+    Ok(())
+}
+
+/// The cancel-cleanup retirement probe reads only the execution that names the
+/// pod at its generation, and only an inactive one counts as retired. An active
+/// row (a newer activation attempt owns it), a different pod name, or a missing
+/// generation all read as not retired, so the cleanup leaves those pods alone.
+#[tokio::test]
+async fn execution_generation_retired_reads_only_an_inactive_row_naming_the_pod() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "creating").await?;
+    let pod_name = K8sStore::execution_pod_name(sandbox_id, 1);
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, active)
+         VALUES ($1, 1, $2, 'space', 'creating', TRUE)"
+    ))
+    .bind(sandbox_id)
+    .bind(&pod_name)
+    .execute(&fixture.pool)
+    .await?;
+
+    assert!(
+        !fixture
+            .store
+            .execution_generation_retired(sandbox_id, 1, &pod_name)
+            .await?,
+        "an active execution is not retired"
+    );
+
+    // The control plane's activation-rollback receipt retires the row as
+    // `replaced` without touching the pod.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE, state = 'replaced'
+          WHERE sandbox_id = $1 AND generation = 1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    assert!(
+        fixture
+            .store
+            .execution_generation_retired(sandbox_id, 1, &pod_name)
+            .await?,
+        "a retired execution naming the pod reads retired"
+    );
+    assert!(
+        !fixture
+            .store
+            .execution_generation_retired(sandbox_id, 1, "some-other-pod")
+            .await?,
+        "a retired row that names a different pod does not vouch for this one"
+    );
+    assert!(
+        !fixture
+            .store
+            .execution_generation_retired(sandbox_id, 2, &pod_name)
+            .await?,
+        "a generation with no execution row is not retired"
     );
     Ok(())
 }

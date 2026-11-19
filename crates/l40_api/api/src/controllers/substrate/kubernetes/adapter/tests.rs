@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 use pplx_space_sbx_mgr_client::proto::{PrepareTeardownSuspendResponse, TeardownSuspendOutcome};

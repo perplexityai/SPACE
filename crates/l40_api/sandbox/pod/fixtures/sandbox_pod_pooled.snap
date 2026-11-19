@@ -1,0 +1,97 @@
+---
+source: crates/l40_api/sandbox/pod/src/tests.rs
+expression: pod
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    space.pplx.net/auto-lifecycle: "{}"
+    space.pplx.net/auto-lifecycle-authority: cluster
+    space.pplx.net/content-hash: "sha256:969f3d03c5e44174169acb4fc5a8019590338e04aa48e5c11f0fd2e10716e254"
+    space.pplx.net/disk-io-max-bandwidth-mib-per-sec: "100"
+    space.pplx.net/disk-io-max-operations-per-sec: "10000"
+    space.pplx.net/execution-generation: "1"
+    space.pplx.net/memory-mib: "8192"
+    space.pplx.net/pool-config-id: 019e5f38-c76e-7e22-9b2f-e389cc9dc6b3
+    space.pplx.net/pool-slot-id: 019e5f38-c338-7c13-a8d4-587fd9fd8dd5
+    space.pplx.net/route-generation: "1"
+    space.pplx.net/sandbox-id: 019e5f38-cd2e-7400-b3c8-e33ae36692d7
+    space.pplx.net/sandbox-owner: root@local
+    space.pplx.net/sandbox-user: root@local
+    space.pplx.net/template: seed
+    space.pplx.net/vcpu: "2"
+  labels:
+    app.kubernetes.io/name: space-sandbox
+    space.pplx.net/execution-generation: "1"
+    space.pplx.net/managed-by: space-api
+    space.pplx.net/pool-config-id: 019e5f38-c76e-7e22-9b2f-e389cc9dc6b3
+    space.pplx.net/pool-role: warm
+    space.pplx.net/route-generation: "1"
+    space.pplx.net/sandbox-id: 019e5f38-cd2e-7400-b3c8-e33ae36692d7
+  name: space-sbx-019e5f38cd2e7400b3c8e33ae36692d7-g1
+  namespace: space
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/template-build-seed-5be19f0b8d84ffe93681a4c2
+                operator: In
+                values:
+                  - "true"
+          weight: 100
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/ssd-headroom-tier
+                operator: In
+                values:
+                  - "1"
+          weight: 5
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/ssd-headroom-tier
+                operator: In
+                values:
+                  - "2"
+          weight: 22
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/ssd-headroom-tier
+                operator: In
+                values:
+                  - "3"
+                  - "4"
+                  - "5"
+                  - "6"
+                  - "7"
+                  - "8"
+                  - "9"
+                  - "10"
+          weight: 50
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: space.pplx.net/ssd-placement-blocked
+                operator: NotIn
+                values:
+                  - "true"
+  automountServiceAccountToken: false
+  containers:
+    - image: "registry.k8s.io/pause:3.10"
+      imagePullPolicy: IfNotPresent
+      name: sandbox
+      resources:
+        limits:
+          space.pplx.net/network-slots: "1"
+        requests:
+          space.pplx.net/network-slots: "1"
+  nodeSelector:
+    node.kubernetes.io/space-enabled: "true"
+    space.pplx.net/node-pool: workers
+    space.pplx.net/subnet-tier: secondary
+    workload: workers
+  restartPolicy: Never
+  runtimeClassName: space
+  terminationGracePeriodSeconds: 10

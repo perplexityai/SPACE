@@ -9,7 +9,8 @@ from space_smoke.direct_node import DirectNodeRecoveryFixture
     sandbox=smoke.SandboxConfig(lifecycle=None),
     api_surfaces=("node",),
     required_tools=("ssh",),
-    ignored="requires an explicitly dedicated idle worker and permission to kill its owned runtime and restart managers",
+    tier="manual",
+    manual_reason="requires an explicitly dedicated idle worker and permission to kill its owned runtime and restart managers",
     rerun_environment=(
         "SPACE_SMOKE_NODE_RECOVERY",
         "SPACE_SMOKE_NODE_FAULT",

@@ -47,8 +47,9 @@ impl Meta for SpacedHostService {
             ready: status.is_some(),
             guest_uptime: status.as_ref().and_then(|status| status.guest_uptime),
             host_version: Some(proto::VersionInfo {
-                version: pplx_space_spaced_common::spaced_version().to_string(),
-                compatibility_family: pplx_space_spaced_common::spaced_compatibility_family(),
+                version: pplx_space_spaced_protocol::spaced_version().to_string(),
+                compatibility_family: pplx_space_spaced_guest_protocol::spaced_compatibility_family(
+                ),
             }),
             guest_version: status.map(|status| proto::VersionInfo {
                 version: status.version,
@@ -102,6 +103,7 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<NotifyResumeRequest>,
     ) -> Result<Response<NotifyResumeResponse>, Status> {
+        self.inner.update.resume_observation();
         let request = request.into_inner();
         self.clear_guest_ready();
         let response = self
@@ -120,7 +122,7 @@ impl Meta for SpacedHostService {
             )
             .await?;
         let clock_sync_status =
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::try_from(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::try_from(
                 response.clock_sync_status,
             )
             .map_err(|error| {
@@ -129,11 +131,11 @@ impl Meta for SpacedHostService {
                 ))
             })?;
         match clock_sync_status {
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Synced => {}
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Failed => {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Synced => {}
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Failed => {
                 return Err(Status::failed_precondition("guest clock sync failed"));
             }
-            pplx_space_spaced_common::proto::bridge_guest::ClockSyncStatus::Unspecified => {
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ClockSyncStatus::Unspecified => {
                 return Err(Status::internal(
                     "bridge guest returned unspecified clock sync status",
                 ));
@@ -175,6 +177,31 @@ impl Meta for SpacedHostService {
         &self,
         request: Request<PrepareSuspendRequest>,
     ) -> Result<Response<PrepareSuspendResponse>, Status> {
+        let _transition = self.inner.update.capture_transition()?;
+        // The manager capture lock excludes Arm/Restart/Commit; this local
+        // barrier drains Stage and observation. Fresh maintenance evidence is
+        // required: a cached stable phase cannot exclude an intervening trial.
+        // Consequently a maintenance read failure also prevents capture.
+        match self.read_guest_update_status(false).await {
+            Ok(status)
+                if matches!(
+                    pplx_space_spaced_guest_protocol::proto::update::Phase::try_from(status.phase),
+                    Ok(
+                        pplx_space_spaced_guest_protocol::proto::update::Phase::Armed
+                            | pplx_space_spaced_guest_protocol::proto::update::Phase::Trial
+                            | pplx_space_spaced_guest_protocol::proto::update::Phase::Restarting
+                    )
+                ) || status.running != status.committed =>
+            {
+                return Err(Status::failed_precondition(
+                    "manager must settle guest maintenance before capture",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.code() == tonic::Code::Unimplemented => {}
+            Err(error) => return Err(error),
+        }
+        let pause = self.inner.update.pause_observation().await?;
         let timeout = RetryContext::with_timeout(Duration::from_secs(180))
             .with_grpc_timeout_metadata(request.metadata())
             .remaining()
@@ -195,6 +222,7 @@ impl Meta for SpacedHostService {
             .await;
         self.clear_all_bridge_guest_clients().await;
         flush_result?;
+        pause.keep_paused();
         tracing::info!(
             command = "prepare_suspend",
             "guest filesystems flushed and spaced host bridge guest clients cleared before suspend"
@@ -244,7 +272,9 @@ impl BridgeHostMeta for SpacedHostService {
             .call_host_control("host_control_request_active_for", |mut client| async move {
                 client
                     .request_active_for(HostControlRequestActiveForRequest {
-                        hold_for: Some(pplx_space_spaced_common::duration_to_proto(hold_for)?),
+                        hold_for: Some(pplx_space_spaced_guest_protocol::duration_to_proto(
+                            hold_for,
+                        )?),
                     })
                     .await
             })

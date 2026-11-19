@@ -44,7 +44,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
-use pplx_space_common_core::types::{PodName, PodUid};
+use pplx_space_k8s_ids::{PodName, PodUid};
 use pplx_space_node_registration_store::registered_node;
 
 use crate::auth::{ClientService, K8sIdentity, K8sNodeIdentity};

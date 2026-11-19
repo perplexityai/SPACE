@@ -1,8 +1,8 @@
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::{BTreeSet, HashSet};
 
-use pplx_space_common_core::types::NodeId;
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole as SpaceNodeRole, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::{NodeManagedBy, NodeRole as SpaceNodeRole, SubstrateKind};
 use pplx_space_state_reconciliation::{
     RECONCILE_REASON_MAX_CHARS, ReconcileReason,
     normalize_reconcile_reason as normalize_shared_reconcile_reason,

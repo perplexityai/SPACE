@@ -1,0 +1,1288 @@
+//! Manual guest maintenance is owned here, behind the same execution and
+//! lifecycle fences as suspend/delete. A host socket executes a decision; it
+//! does not authorize one. Recovery never wakes a dormant execution.
+use super::*;
+use crate::db::guest_updates::{
+    self as store, Action, Admission, GuestIdentity, Intent, Outcome, Phase, Record,
+};
+use crate::service::cleanup_support::CleanupLockTryResult;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_spaced_guest_protocol::proto::update as wire;
+use pplx_space_spaced_host_client::RawSpacedHostGuestUpdateClient as Client;
+use pplx_space_spaced_update as model;
+
+pub(super) mod automatic;
+mod observation;
+mod policy;
+
+// End-to-end reconciliation bounds include transfer, stop/start and fallback.
+// The candidate itself has only model::TRIAL_CONFIRMATION_WINDOW from
+// selection to commit. These larger bounds do not extend that trial or lifecycle clocks.
+const OPERATION_BUDGET: Duration = Duration::from_secs(420);
+use pplx_space_spaced_guest_protocol::update::ACTIVATION_BUDGET;
+const LIFECYCLE_MARGIN: Duration = Duration::from_secs(30);
+const RPC_BUDGET: Duration = Duration::from_secs(5);
+
+fn internal(error: impl std::fmt::Display) -> Status {
+    Status::internal(error.to_string())
+}
+fn request<T>(value: T) -> Request<T> {
+    let mut request = Request::new(value);
+    request.set_timeout(RPC_BUDGET);
+    request
+}
+fn uuid(value: &str) -> Result<Uuid, Status> {
+    value
+        .parse::<Uuid>()
+        .ok()
+        .filter(|v| !v.is_nil())
+        .ok_or_else(|| Status::invalid_argument("non-nil UUID required"))
+}
+fn parse_execution(value: &str) -> Result<SandboxActivationAttemptId, Status> {
+    value
+        .parse()
+        .map_err(|_| Status::invalid_argument("invalid expected_execution_id"))
+}
+fn owner(record: &Record) -> wire::HoldRequest {
+    wire::HoldRequest {
+        operation_id: record.intent.operation.to_string(),
+        execution_id: record.intent.execution.to_string(),
+    }
+}
+fn identity(status: &wire::Status) -> Result<GuestIdentity, Status> {
+    Ok(GuestIdentity {
+        boot: uuid(&status.boot_id)?,
+        incarnation: uuid(&status.incarnation)?,
+        committed: status
+            .committed
+            .clone()
+            .ok_or_else(|| Status::data_loss("missing committed identity"))?
+            .try_into()?,
+        attempt: status.attempt.clone().map(TryInto::try_into).transpose()?,
+        forward_ports: status.forward_ports.clone(),
+    })
+}
+fn phase(status: &wire::Status) -> Result<wire::Phase, Status> {
+    match wire::Phase::try_from(status.phase) {
+        Ok(wire::Phase::Unspecified) | Err(_) => {
+            Err(Status::data_loss("unknown guest update phase"))
+        }
+        Ok(value) => Ok(value),
+    }
+}
+fn response(record: &Record, guest: Option<wire::Status>) -> crate::proto::GuestUpdateOperation {
+    use crate::proto::GuestUpdateOperationPhase as P;
+    crate::proto::GuestUpdateOperation {
+        sandbox_id: record.intent.sandbox.to_string(),
+        execution_id: record.intent.execution.to_string(),
+        operation_id: Some(record.intent.operation.to_string()),
+        phase: match record.phase {
+            Phase::Pending => P::Pending,
+            Phase::Staged => P::Staged,
+            Phase::Activating => P::Activating,
+            Phase::Settling => P::Settling,
+            Phase::Complete => P::Complete,
+        } as i32,
+        outcome: record.outcome.map(|v| v.to_string()),
+        automatic_deferral: None,
+        guest,
+    }
+}
+
+impl SandboxManagerService {
+    pub(super) async fn guest_update_status_rpc(
+        &self,
+        req: Request<crate::proto::GuestUpdateStatusRequest>,
+    ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
+        self.authorize_peer(&req, "GuestUpdateStatus", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
+        let req = req.into_inner();
+        let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
+        let record = if let Some(id) = req.operation_id {
+            crate::db::read::guest_update(&*self.db_conn()?, uuid(&id)?).map_err(internal)?
+        } else {
+            crate::db::read::active_guest_update(&*self.db_conn()?, &sandbox.id)
+                .map_err(internal)?
+                .filter(|record| Some(record.intent.execution) == sandbox.node_execution_id)
+        };
+        if record
+            .as_ref()
+            .is_some_and(|r| r.intent.sandbox.to_string() != sandbox.id)
+        {
+            return Err(Status::invalid_argument(
+                "operation belongs to another sandbox",
+            ));
+        }
+        let mut automatic_deferral = None;
+        let guest = if sandbox.state.is_unowned(SandboxState::Started) {
+            match async {
+                let mut client = self.connect_spaced_host(&sandbox).await?.guest_update();
+                client
+                    .get_status(request(wire::StatusRequest {}))
+                    .await
+                    .map(Response::into_inner)
+            }
+            .await
+            {
+                Ok(status) => Some(status),
+                Err(error) if record.is_some() => {
+                    tracing::debug!(%error, "guest maintenance receipt available without live guest status");
+                    None
+                }
+                Err(error) => {
+                    automatic_deferral = self.guest_auto_updates.status(&sandbox.id);
+                    if automatic_deferral.is_none() {
+                        return Err(error);
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Response::new(match record {
+            Some(record) => response(&record, guest),
+            None => crate::proto::GuestUpdateOperation {
+                sandbox_id: sandbox.id.clone(),
+                execution_id: sandbox
+                    .node_execution_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                automatic_deferral: automatic_deferral
+                    .or_else(|| self.guest_auto_updates.status(&sandbox.id)),
+                guest,
+                ..Default::default()
+            },
+        }))
+    }
+
+    pub(super) async fn apply_guest_update_rpc(
+        &self,
+        req: Request<crate::proto::ApplyGuestUpdateRequest>,
+    ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
+        self.authorize_peer(&req, "ApplyGuestUpdate", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
+        let req = req.into_inner();
+        let execution = parse_execution(&req.expected_execution_id)?;
+        pplx_space_spaced_guest_protocol::update::HoldOwner::validate_operation(
+            uuid(&req.operation_id)?,
+            uuid(&execution.to_string())?,
+        )?;
+        let requested = policy::promotion(
+            req.promotion
+                .ok_or_else(|| Status::invalid_argument("promotion is required"))?,
+        )?;
+        let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
+        if let Some(receipt) = self.replay_guest_update(
+            uuid(&req.operation_id)?,
+            &sandbox,
+            execution,
+            req.force,
+            Some(&requested),
+        )? {
+            return Ok(Response::new(receipt));
+        }
+        let bundle = policy::load(requested.target).await?;
+        if requested != bundle.policy.promotion {
+            return Err(Status::permission_denied(
+                "promotion is not the configured host authority",
+            ));
+        }
+        qualify(&sandbox, OPERATION_BUDGET)?;
+        let platform = self.probe_update_contract(&sandbox).await?;
+        if bundle.descriptor.recovery_platform().map_err(internal)? != platform {
+            return Err(Status::failed_precondition(
+                "target bundle does not support this guest recovery contract",
+            ));
+        }
+        self.admit_guest_update(
+            Intent {
+                operation: uuid(&req.operation_id)?,
+                sandbox: sandbox.id.parse().map_err(internal)?,
+                execution,
+                action: Action::Apply {
+                    promotion: Box::new(requested),
+                    authorization: bundle.policy.authorization,
+                },
+                force: req.force,
+                configuration_revision: 1,
+            },
+            false,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn restart_guest_rpc(
+        &self,
+        req: Request<crate::proto::RestartGuestRequest>,
+    ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
+        self.authorize_peer(&req, "RestartGuest", ALLOW_LOCAL_ARTIFACT_OPERATOR)?;
+        let req = req.into_inner();
+        let execution = parse_execution(&req.expected_execution_id)?;
+        pplx_space_spaced_guest_protocol::update::HoldOwner::validate_operation(
+            uuid(&req.operation_id)?,
+            uuid(&execution.to_string())?,
+        )?;
+        let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
+        if let Some(receipt) = self.replay_guest_update(
+            uuid(&req.operation_id)?,
+            &sandbox,
+            execution,
+            req.force,
+            None,
+        )? {
+            return Ok(Response::new(receipt));
+        }
+        qualify(&sandbox, ACTIVATION_BUDGET)?;
+        self.probe_update_contract(&sandbox).await?;
+        self.admit_guest_update(
+            Intent {
+                operation: uuid(&req.operation_id)?,
+                sandbox: sandbox.id.parse().map_err(internal)?,
+                execution,
+                action: Action::Restart,
+                force: req.force,
+                configuration_revision: 1,
+            },
+            false,
+            None,
+        )
+        .await
+    }
+
+    fn replay_guest_update(
+        &self,
+        operation: Uuid,
+        sandbox: &crate::db::SandboxRow,
+        execution: SandboxActivationAttemptId,
+        force: bool,
+        promotion: Option<&model::policy::Promotion>,
+    ) -> Result<Option<crate::proto::GuestUpdateOperation>, Status> {
+        let Some(record) =
+            crate::db::read::guest_update(&*self.db_conn()?, operation).map_err(internal)?
+        else {
+            return Ok(None);
+        };
+        let action_matches = match (promotion, &record.intent.action) {
+            (Some(requested), Action::Apply { promotion, .. }) => requested == promotion.as_ref(),
+            (None, Action::Restart) => true,
+            _ => false,
+        };
+        if record.intent.sandbox.to_string() != sandbox.id
+            || record.intent.execution != execution
+            || record.intent.force != force
+            || !action_matches
+        {
+            return Err(Status::failed_precondition(
+                "guest maintenance operation identity was reused",
+            ));
+        }
+        // A receipt reports an already-admitted intent; it does not grant new
+        // authority. Reconciliation still checks current policy and execution.
+        Ok(Some(response(&record, None)))
+    }
+
+    async fn admit_guest_update(
+        &self,
+        intent: Intent,
+        quiet: bool,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
+        // Admission and capture settlement must share the lock: otherwise a
+        // capture can observe no intent and then snapshot a newly admitted one.
+        // Brief observer/inventory reads should not turn a healthy admission
+        // into an error. A capture or another activation still bounds this wait.
+        let artifact = self
+            .auto_lifecycle
+            .artifact_lock(&intent.sandbox.to_string());
+        let _artifact = tokio::time::timeout(RPC_BUDGET, artifact.lock_owned())
+            .await
+            .map_err(|_| Status::aborted("guest maintenance yields to an artifact operation"))?;
+        let _writer = self.state_writer_lease("GuestUpdate")?;
+        self.retire_stale_guest_update(&intent.sandbox.to_string())?;
+        let operation = intent.operation;
+        let new_origin = self.guest_auto_updates.remember_origin(operation, quiet)?;
+        let result = self.db_conn().and_then(|db| {
+            store::admit(
+                &db,
+                intent,
+                jiff::Timestamp::now().as_second() + OPERATION_BUDGET.as_secs() as i64,
+            )
+            .map_err(internal)
+        });
+        let record = match result {
+            Ok(Admission::Accepted(value)) => *value,
+            other => {
+                if new_origin {
+                    self.guest_auto_updates.forget_origin(operation);
+                }
+                return Err(match other {
+                    Err(error) => error,
+                    Ok(Admission::Refused(reason)) => Status::failed_precondition(format!(
+                        "guest maintenance deferred: {reason:?}"
+                    )),
+                    Ok(Admission::Accepted(_)) => unreachable!(),
+                });
+            }
+        };
+        self.guest_auto_updates.admitted(operation);
+        // The receipt is durable. Release admission's locks before the driver
+        // can try to acquire them on another executor thread.
+        drop(_writer);
+        drop(_artifact);
+        if record.phase == Phase::Complete {
+            self.guest_auto_updates.forget_origin(operation);
+        } else if let Some(permit) =
+            permit.or_else(|| self.guest_update_sem.clone().try_acquire_owned().ok())
+        {
+            self.spawn_guest_update(
+                operation,
+                permit,
+                self.guest_auto_updates.requires_quiet(operation),
+            );
+        }
+        Ok(Response::new(response(&record, None)))
+    }
+
+    fn spawn_guest_update(
+        &self,
+        operation: Uuid,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        quiet: bool,
+    ) {
+        let service = self.clone();
+        self.task_tracker.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                biased;
+                _ = service.shutdown_token.cancelled() => {},
+                result = service.run_guest_update(operation, quiet) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%operation, %error, "guest update awaits reconciliation");
+                    }
+                }
+            }
+        });
+    }
+
+    async fn probe_update_contract(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+    ) -> Result<model::RecoveryPlatform, Status> {
+        let status = self
+            .connect_spaced_host(sandbox)
+            .await?
+            .guest_update()
+            .get_status(request(wire::StatusRequest {}))
+            .await?
+            .into_inner();
+        if !policy::supported_guest(policy::platform(sandbox), &status) {
+            return Err(Status::failed_precondition(format!(
+                "guest maintenance requires version {} or newer and a recovery contract matching the image",
+                model::MANAGED_GUEST_UPDATE_MINIMUM
+            )));
+        }
+        model::RecoveryPlatform::from_contract(&status.seed_contract)
+            .ok_or_else(|| Status::failed_precondition("guest recovery contract is unsupported"))
+    }
+
+    fn update_record(&self, operation: Uuid) -> Result<Record, Status> {
+        crate::db::read::guest_update(&*self.db_conn()?, operation)
+            .map_err(internal)?
+            .ok_or_else(|| Status::not_found("guest update receipt missing"))
+    }
+    fn update_execution(&self, record: &Record) -> Result<crate::db::SandboxRow, Status> {
+        let sandbox = self.lookup_sandbox(&record.intent.sandbox.to_string())?;
+        if sandbox.node_execution_id != Some(record.intent.execution)
+            || !sandbox.state.is_unowned(SandboxState::Started)
+            || sandbox.cleanup_completion.is_some()
+        {
+            return Err(Status::failed_precondition(
+                "guest update execution is no longer running",
+            ));
+        }
+        Ok(sandbox)
+    }
+    async fn update_client(&self, record: &Record) -> Result<Client, Status> {
+        let sandbox = self.update_execution(record)?;
+        let client = self.connect_spaced_host(&sandbox).await?.guest_update();
+        self.update_execution(record)?;
+        Ok(client)
+    }
+    fn update_advance(
+        &self,
+        record: &Record,
+        to: Phase,
+        seen: Option<&GuestIdentity>,
+    ) -> Result<Record, Status> {
+        if !store::advance(&*self.db_conn()?, record, to, seen).map_err(internal)? {
+            return Err(Status::aborted("guest update phase or execution changed"));
+        }
+        let advanced = self.update_record(record.intent.operation)?;
+        self.guest_auto_updates.observe(&advanced);
+        Ok(advanced)
+    }
+
+    fn retire_stale_guest_update(&self, sandbox: &str) -> Result<(), Status> {
+        let active =
+            crate::db::read::active_guest_update(&*self.db_conn()?, sandbox).map_err(internal)?;
+        if let Some(record) = active
+            && store::supersede(&*self.db_conn()?, record.intent.operation).map_err(internal)?
+        {
+            self.guest_auto_updates
+                .forget_origin(record.intent.operation);
+        }
+        Ok(())
+    }
+
+    async fn run_guest_update(&self, operation: Uuid, quiet: bool) -> Result<(), Status> {
+        let record = self.update_record(operation)?;
+        if record.phase == Phase::Complete {
+            self.guest_auto_updates.forget_origin(operation);
+            return Ok(());
+        }
+        if store::supersede(&*self.db_conn()?, operation).map_err(internal)? {
+            self.guest_auto_updates.forget_origin(operation);
+            return Ok(());
+        }
+        let id = record.intent.sandbox.to_string();
+        // Capture must not overlap selection, but timeout intent and activity
+        // touches remain writable throughout the trial. Stop/delete take the
+        // cleanup fence only around a bounded Arm/Restart/Commit RPC below;
+        // transfers and status polling never retain that fence.
+        let artifact = self.auto_lifecycle.artifact_lock(&id);
+        let priority = artifact.subscribe_capture_requests();
+        let Ok(_artifact) = artifact.try_lock_owned() else {
+            return Ok(());
+        };
+        let _writer = self.state_writer_lease("GuestUpdateRecovery")?;
+        self.drive_guest_update(record, false, quiet, priority)
+            .await
+    }
+
+    /// Called with the artifact lock before a lifecycle transition. Pending
+    /// maintenance yields; an already committed decision wins, otherwise the
+    /// local trial is cancelled and its running fallback is configured first.
+    pub(super) async fn settle_guest_update_for_lifecycle(
+        &self,
+        sandbox: &str,
+    ) -> Result<(), Status> {
+        self.retire_stale_guest_update(sandbox)?;
+        let Some(record) =
+            crate::db::read::active_guest_update(&*self.db_conn()?, sandbox).map_err(internal)?
+        else {
+            return Ok(());
+        };
+        if self
+            .lookup_sandbox(sandbox)?
+            .state
+            .is_unowned(SandboxState::Paused)
+        {
+            return Err(Status::failed_precondition(
+                "resume the paused execution to settle its pending guest maintenance before capture",
+            ));
+        }
+        let priority = self
+            .auto_lifecycle
+            .artifact_lock(sandbox)
+            .subscribe_capture_requests();
+        self.drive_guest_update(record, true, false, priority).await
+    }
+
+    fn guest_update_execution_fence(
+        &self,
+        record: &Record,
+    ) -> Result<cleanup_support::OwnedCleanupFenceGuard, Status> {
+        let fence = match self.try_cleanup_fence(&record.intent.sandbox.to_string()) {
+            CleanupLockTryResult::Acquired(fence) => fence,
+            CleanupLockTryResult::Busy => {
+                return Err(Status::aborted("cleanup supersedes guest maintenance"));
+            }
+        };
+        self.update_execution(record)?;
+        Ok(fence)
+    }
+
+    async fn drive_guest_update(
+        &self,
+        mut record: Record,
+        lifecycle: bool,
+        quiet: bool,
+        mut priority: tokio::sync::watch::Receiver<()>,
+    ) -> Result<(), Status> {
+        let operation = record.intent.operation;
+        let sandbox = self.update_execution(&record)?;
+        let mut client = self.update_client(&record).await?;
+        let mut observed = client
+            .get_status(request(wire::StatusRequest {}))
+            .await?
+            .into_inner();
+        if model::RecoveryPlatform::from_contract(&observed.seed_contract).is_none() {
+            return Err(Status::failed_precondition(
+                "guest selector contract is not qualified",
+            ));
+        }
+        if (lifecycle || jiff::Timestamp::now().as_second() >= record.deadline)
+            && matches!(record.phase, Phase::Pending | Phase::Staged)
+        {
+            return self
+                .finish_pending_guest_update(record, Outcome::Cancelled, observed, &mut client)
+                .await;
+        }
+        // A lost Stage reply leaves a durable guest receipt. Reuse that exact
+        // fence instead of changing its deadline and retransferring the bytes.
+        if record.phase == Phase::Pending
+            && phase(&observed)? == wire::Phase::Staged
+            && observed
+                .attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.operation_id == operation.to_string())
+        {
+            if maintenance_decision(&record, &observed)? != Decision::Arm {
+                return Err(Status::failed_precondition(
+                    "staging receipt conflicts with intent",
+                ));
+            }
+            record = self.update_advance(&record, Phase::Staged, None)?;
+        }
+        if record.phase == Phase::Pending
+            && let Action::Apply {
+                promotion,
+                authorization,
+            } = &record.intent.action
+        {
+            if !crate::db::read::guest_update_retry_ready(&*self.db_conn()?, &record)
+                .map_err(internal)?
+            {
+                if !observed.customer_admission_held {
+                    return Ok(());
+                }
+                // Backoff leaves admission open, including after a guest crash
+                // while waiting. The durable operation owns reconfiguration.
+                client.hold(request(owner(&record))).await?;
+                self.configure_update(&record, &observed, &mut client, false)
+                    .await?;
+                client
+                    .release(request(wire::ReleaseRequest {
+                        owner: Some(owner(&record)),
+                        expected_incarnation: observed.incarnation,
+                        configuration_revision: record.intent.configuration_revision,
+                    }))
+                    .await?;
+                return Ok(());
+            }
+            let bundle = match policy::load(promotion.target).await {
+                Ok(bundle)
+                    if &bundle.policy.promotion == promotion.as_ref()
+                        && &bundle.policy.authorization == authorization =>
+                {
+                    bundle
+                }
+                authority => {
+                    tracing::warn!(operation = %operation, error = ?authority.err(), "guest promotion authority withdrawn before staging");
+                    return self
+                        .finish_pending_guest_update(
+                            record,
+                            Outcome::Cancelled,
+                            observed,
+                            &mut client,
+                        )
+                        .await;
+                }
+            };
+            if qualify(&sandbox, OPERATION_BUDGET).is_err()
+                || !policy::supported_guest(policy::platform(&sandbox), &observed)
+                || !bundle
+                    .descriptor
+                    .seed_contracts
+                    .contains(&observed.seed_contract)
+                || (!record.intent.force
+                    && (!observed.defer_reasons.is_empty()
+                        || (quiet && automatic::quiet_remaining(&sandbox, now_secs()) > 0)))
+            {
+                return self
+                    .finish_pending_guest_update(record, Outcome::Deferred, observed, &mut client)
+                    .await;
+            }
+            let committed = identity(&observed)?.committed;
+            if committed.digest == promotion.target {
+                return self
+                    .finish_pending_guest_update(record, Outcome::Committed, observed, &mut client)
+                    .await;
+            }
+            let guest_version = observed
+                .committed_version
+                .parse::<semver::Version>()
+                .map_err(internal)?;
+            if !promotion
+                .should_install(&guest_version, committed.digest)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+            {
+                return self
+                    .finish_pending_guest_update(
+                        record,
+                        Outcome::NotRequired,
+                        observed,
+                        &mut client,
+                    )
+                    .await;
+            }
+            let attempt = model::Attempt {
+                operation,
+                execution: uuid(&record.intent.execution.to_string())?,
+                boot: uuid(&observed.boot_id)?,
+                incarnation: uuid(&observed.incarnation)?,
+                configuration_revision: record.intent.configuration_revision,
+                target: model::Selection {
+                    slot: committed.slot.other(),
+                    digest: promotion.target,
+                },
+                // This is the whole attempt expiry, including staging. The
+                // selector caps the trial to TRIAL_CONFIRMATION_WINDOW at start.
+                confirmation_deadline_ms: observed
+                    .boot_time_ms
+                    .saturating_add(OPERATION_BUDGET.as_millis() as u64),
+            };
+            observed = yield_staging_to_capture(&mut priority, stage(&mut client, bundle, attempt))
+                .await?;
+            self.update_execution(&record)?;
+            record = self.update_advance(&record, Phase::Staged, None)?;
+        }
+        if matches!(record.phase, Phase::Pending | Phase::Staged) {
+            let current = self.update_execution(&record)?;
+            if qualify(&current, ACTIVATION_BUDGET).is_err()
+                || (!record.intent.force
+                    && matches!(record.intent.action, Action::Apply { .. })
+                    && quiet
+                    && automatic::quiet_remaining(&current, now_secs()) > 0)
+            {
+                return self
+                    .finish_pending_guest_update(record, Outcome::Deferred, observed, &mut client)
+                    .await;
+            }
+            observed = client.hold(request(owner(&record))).await?.into_inner();
+            if !record.intent.force && !observed.defer_reasons.is_empty() {
+                return self
+                    .finish_guest_update(record, Outcome::Deferred, observed, &mut client)
+                    .await;
+            }
+            record =
+                self.update_advance(&record, Phase::Activating, Some(&identity(&observed)?))?;
+        } else {
+            // A new spaced-host process lost its in-memory hold. Re-establish
+            // ownership before configuration or a commit can proceed.
+            client.hold(request(owner(&record))).await?;
+        }
+        let mut confirmation_rejected = false;
+        let deadline = tokio::time::Instant::now() + ACTIVATION_BUDGET;
+        let finish_by = now_secs().saturating_add(ACTIVATION_BUDGET.as_secs());
+        loop {
+            let current = self.update_execution(&record)?;
+            let lifecycle = lifecycle
+                || priority.has_changed().unwrap_or(true)
+                || lifecycle_preempts(current.next_auto_event_at, finish_by);
+            if record.phase == Phase::Settling {
+                return self
+                    .finish_guest_update(
+                        record.clone(),
+                        record
+                            .outcome
+                            .ok_or_else(|| Status::data_loss("settlement lacks outcome"))?,
+                        observed,
+                        &mut client,
+                    )
+                    .await;
+            }
+            match maintenance_decision(&record, &observed)? {
+                Decision::Arm => {
+                    if !policy::permits(&record.intent.action).await
+                        || !policy::supported_guest(policy::platform(&current), &observed)
+                    {
+                        return self
+                            .finish_guest_update(record, Outcome::Cancelled, observed, &mut client)
+                            .await;
+                    }
+                    if lifecycle || jiff::Timestamp::now().as_second() >= record.deadline {
+                        return self
+                            .finish_guest_update(record, Outcome::Deferred, observed, &mut client)
+                            .await;
+                    }
+                    let attempt = observed
+                        .attempt
+                        .clone()
+                        .ok_or_else(|| Status::data_loss("staged attempt missing"))?;
+                    let _execution = self.guest_update_execution_fence(&record)?;
+                    match client
+                        .arm(request(wire::ArmRequest {
+                            attempt: Some(attempt),
+                            force: record.intent.force,
+                        }))
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+                            tracing::warn!(%operation, error = %e, "guest activation refused; settling without repeating the request");
+                            return self
+                                .finish_guest_update(
+                                    record,
+                                    Outcome::Deferred,
+                                    observed,
+                                    &mut client,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%operation, %error, "guest activation RPC awaits status reconciliation");
+                        }
+                    }
+                }
+                Decision::Restart => {
+                    if lifecycle || jiff::Timestamp::now().as_second() >= record.deadline {
+                        return self
+                            .finish_guest_update(record, Outcome::Deferred, observed, &mut client)
+                            .await;
+                    }
+                    let _execution = self.guest_update_execution_fence(&record)?;
+                    match client
+                        .restart(request(wire::RestartRequest {
+                            operation_id: operation.to_string(),
+                            execution_id: record.intent.execution.to_string(),
+                            expected_boot_id: observed.boot_id.clone(),
+                            expected_incarnation: observed.incarnation.clone(),
+                            force: record.intent.force,
+                        }))
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+                            tracing::warn!(%operation, error = %e, "guest activation refused; settling without repeating the request");
+                            return self
+                                .finish_guest_update(
+                                    record,
+                                    Outcome::Deferred,
+                                    observed,
+                                    &mut client,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%operation, %error, "guest activation RPC awaits status reconciliation");
+                        }
+                    }
+                }
+                Decision::Confirm => {
+                    if confirmation_rejected
+                        || lifecycle
+                        || jiff::Timestamp::now().as_second() >= record.deadline
+                        || !policy::permits(&record.intent.action).await
+                    {
+                        if let Err(error) = client
+                            .abort(request(wire::AbortRequest {
+                                attempt: observed.attempt.clone(),
+                            }))
+                            .await
+                        {
+                            tracing::warn!(%operation, %error, "trial cancellation awaits status reconciliation");
+                        }
+                    } else {
+                        let result = match self
+                            .configure_update(&record, &observed, &mut client, true)
+                            .await
+                        {
+                            Ok(()) => {
+                                // Configuration awaits host/guest RPCs; revocation during
+                                // that work must still prevent the following commit.
+                                self.update_execution(&record)?;
+                                if !policy::permits(&record.intent.action).await {
+                                    confirmation_rejected = true;
+                                    continue;
+                                }
+                                let _execution = self.guest_update_execution_fence(&record)?;
+                                client
+                                    .commit(request(wire::CommitRequest {
+                                        attempt: observed.attempt.clone(),
+                                    }))
+                                    .await
+                                    .map(|_| ())
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
+                            confirmation_rejected = confirmation_must_settle(error.code());
+                            // A deadline may precede delivery or hide a durable commit.
+                            // Fresh status decides whether to retry or complete.
+                            tracing::warn!(%operation, %error, confirmation_rejected, "trial confirmation failed; reconciling durable guest decision");
+                        }
+                    }
+                }
+                Decision::Settle(outcome) => {
+                    let outcome = if lifecycle
+                        && matches!(outcome, Outcome::AwaitingHost | Outcome::CandidateFailed)
+                    {
+                        Outcome::Cancelled
+                    } else {
+                        outcome
+                    };
+                    return self
+                        .finish_guest_update(record, outcome, observed, &mut client)
+                        .await;
+                }
+                Decision::Wait => {}
+            }
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "guest update requires recovery; hold remains owned",
+                ));
+            }
+            // Re-attest on a host restart; never use a channel that reconnects
+            // transparently to a new process while carrying the old fence.
+            match client.get_status(request(wire::StatusRequest {})).await {
+                Ok(value) => observed = value.into_inner(),
+                Err(_) => {
+                    client = self.update_client(&record).await?;
+                    // A new host may have lost its hold. Re-establish ownership
+                    // and observe the current guest before another decision.
+                    observed = client.hold(request(owner(&record))).await?.into_inner();
+                }
+            }
+        }
+    }
+
+    async fn configure_update(
+        &self,
+        record: &Record,
+        seen: &wire::Status,
+        client: &mut Client,
+        trial: bool,
+    ) -> Result<(), Status> {
+        let sandbox = self.update_execution(record)?;
+        client
+            .configure(request(wire::ConfigureRequest {
+                attempt: trial.then(|| seen.attempt.clone()).flatten(),
+                environment: sandbox.process_env.into_iter().collect(),
+                forward_ports: record
+                    .prior
+                    .as_ref()
+                    .map(|v| v.forward_ports.clone())
+                    .unwrap_or_else(|| seen.forward_ports.clone()),
+                owner: (!trial).then(|| owner(record)),
+                expected_incarnation: seen.incarnation.clone(),
+                configuration_revision: record.intent.configuration_revision,
+                expected_boot_id: seen.boot_id.clone(),
+            }))
+            .await?;
+        self.update_execution(record)?;
+        Ok(())
+    }
+
+    async fn finish_pending_guest_update(
+        &self,
+        record: Record,
+        outcome: Outcome,
+        seen: wire::Status,
+        client: &mut Client,
+    ) -> Result<(), Status> {
+        if pending_guest_untouched(&record, &seen) {
+            let _execution = self.guest_update_execution_fence(&record)?;
+            if !store::settle(&*self.db_conn()?, &record, outcome, Some(&identity(&seen)?))
+                .map_err(internal)?
+            {
+                return Err(Status::aborted("guest update settlement superseded"));
+            }
+            let record = self.update_record(record.intent.operation)?;
+            self.update_advance(&record, Phase::Complete, None)?;
+            return Ok(());
+        }
+        client.hold(request(owner(&record))).await?;
+        self.finish_guest_update(record, outcome, seen, client)
+            .await
+    }
+
+    async fn finish_guest_update(
+        &self,
+        mut record: Record,
+        outcome: Outcome,
+        mut seen: wire::Status,
+        client: &mut Client,
+    ) -> Result<(), Status> {
+        if outcome == Outcome::Committed
+            && seen
+                .attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.operation_id == record.intent.operation.to_string())
+        {
+            // A durable commit can precede link repair and READY. Repeating
+            // that decision finishes the guest side before reopening traffic.
+            let _execution = self.guest_update_execution_fence(&record)?;
+            seen = client
+                .commit(request(wire::CommitRequest {
+                    attempt: seen.attempt.clone(),
+                }))
+                .await?
+                .into_inner();
+        }
+        if matches!(outcome, Outcome::Deferred | Outcome::Cancelled)
+            && phase(&seen)? == wire::Phase::Staged
+            && seen
+                .attempt
+                .as_ref()
+                .is_some_and(|a| a.operation_id == record.intent.operation.to_string())
+        {
+            seen = client
+                .abort(request(wire::AbortRequest {
+                    attempt: seen.attempt.clone(),
+                }))
+                .await?
+                .into_inner();
+        }
+        self.configure_update(&record, &seen, client, false).await?;
+        if record.phase != Phase::Settling {
+            if !store::settle(&*self.db_conn()?, &record, outcome, Some(&identity(&seen)?))
+                .map_err(internal)?
+            {
+                return Err(Status::aborted("guest update settlement superseded"));
+            }
+            record = self.update_record(record.intent.operation)?;
+        }
+        client
+            .release(request(wire::ReleaseRequest {
+                owner: Some(owner(&record)),
+                expected_incarnation: seen.incarnation,
+                configuration_revision: record.intent.configuration_revision,
+            }))
+            .await?;
+        self.update_advance(&record, Phase::Complete, None)?;
+        if let Ok(current) = self.update_execution(&record)
+            && let Some(due) = current.next_auto_event_at
+            && now_secs() > due
+        {
+            tracing::warn!(operation = %record.intent.operation, lateness_seconds = now_secs().saturating_sub(due), "guest maintenance settled after the lifecycle deadline");
+        }
+        Ok(())
+    }
+
+    pub fn start_guest_update_recovery(&self, shutdown: CancellationToken, tracker: &TaskTracker) {
+        let service = self.clone();
+        tracker.spawn(async move {
+            loop {
+                let mut after = None;
+                let mut obsolete_origins = service.guest_auto_updates.origin_operations();
+                let mut complete_scan = false;
+                loop {
+                    let page = service.db_conn().and_then(|db| crate::db::scan::unfinished_guest_updates(&db, after).map_err(internal));
+                    let records = match page { Ok(value) => value, Err(error) => { tracing::warn!(%error, "cannot scan guest update recovery"); break; } };
+                    if records.is_empty() { complete_scan = true; break; }
+                    for record in &records { obsolete_origins.remove(&record.intent.operation); }
+                    use futures_util::StreamExt;
+                    after = records.last().map(|record| record.intent.operation);
+                    let work = futures_util::stream::iter(records).for_each_concurrent(1, |record| {
+                        let service = &service;
+                        async move {
+                            let Ok(_permit) = service.guest_update_sem.clone().try_acquire_owned() else { return; };
+                            if let Err(error) = service.run_guest_update(record.intent.operation, service.guest_auto_updates.requires_quiet(record.intent.operation)).await {
+                                tracing::warn!(operation = %record.intent.operation, %error, "guest update recovery deferred");
+                            }
+                        }
+                    });
+                    tokio::select! { _ = shutdown.cancelled() => return, _ = work => {} }
+                }
+                if complete_scan {
+                    for operation in obsolete_origins { service.guest_auto_updates.forget_origin(operation); }
+                }
+                tokio::select! { _ = shutdown.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
+            }
+        });
+    }
+}
+
+fn qualify(sandbox: &crate::db::SandboxRow, budget: Duration) -> Result<(), Status> {
+    if !sandbox.state.is_unowned(SandboxState::Started)
+        || sandbox.pool_template.is_some()
+        || matches!(
+            sandbox.user.kind(),
+            SandboxOwnerKind::TemplateManager
+                | SandboxOwnerKind::Builder
+                | SandboxOwnerKind::Orphaned
+        )
+    {
+        return Err(Status::failed_precondition(
+            "guest maintenance requires a running customer execution",
+        ));
+    }
+    if sandbox.next_auto_event_at.is_some_and(|deadline| {
+        deadline
+            <= now_secs()
+                .saturating_add(budget.as_secs())
+                .saturating_add(LIFECYCLE_MARGIN.as_secs())
+    }) {
+        return Err(Status::failed_precondition(
+            "insufficient lifecycle deadline headroom",
+        ));
+    }
+    Ok(())
+}
+
+fn lifecycle_preempts(due: Option<u64>, finish_by: u64) -> bool {
+    due.is_some_and(|due| due <= finish_by.saturating_add(LIFECYCLE_MARGIN.as_secs()))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Decision {
+    Arm,
+    Restart,
+    Confirm,
+    Settle(Outcome),
+    Wait,
+}
+fn maintenance_decision(record: &Record, seen: &wire::Status) -> Result<Decision, Status> {
+    let identity = identity(seen)?;
+    let running: model::Selection = seen
+        .running
+        .clone()
+        .ok_or_else(|| Status::data_loss("missing running executable identity"))?
+        .try_into()?;
+    if phase(seen)? == wire::Phase::RolledBack && running != identity.committed {
+        // Abort writes its decision while the candidate still serves. Only
+        // systemd's next selector/start establishes the running fallback.
+        return Ok(Decision::Wait);
+    }
+    let same = identity.attempt.as_ref().is_some_and(|a| {
+        a.operation == record.intent.operation
+            && a.execution.to_string() == record.intent.execution.to_string()
+    });
+    if same && let Action::Apply { promotion, .. } = &record.intent.action {
+        let attempt = identity
+            .attempt
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("missing trial identity"))?;
+        if attempt.target.digest != promotion.target
+            || attempt.configuration_revision != record.intent.configuration_revision
+        {
+            return Err(Status::failed_precondition(
+                "candidate identity conflicts with authorized attempt",
+            ));
+        }
+        if phase(seen)? == wire::Phase::Trial
+            && (attempt.boot != identity.boot || attempt.incarnation != identity.incarnation)
+        {
+            return Err(Status::failed_precondition(
+                "candidate generation conflicts with journal",
+            ));
+        }
+    }
+    match (&record.intent.action, phase(seen)?) {
+        (_, wire::Phase::RecoveryRequired) => Ok(Decision::Settle(Outcome::RecoveryRequired)),
+        (Action::Apply { promotion, .. }, wire::Phase::Committed)
+            if same && identity.committed.digest == promotion.target =>
+        {
+            Ok(Decision::Settle(Outcome::Committed))
+        }
+        (Action::Apply { .. }, wire::Phase::Staged) if same => Ok(Decision::Arm),
+        (Action::Apply { .. }, wire::Phase::Trial) if same => Ok(Decision::Confirm),
+        (Action::Apply { .. }, wire::Phase::Armed) if same => Ok(Decision::Wait),
+        (Action::Apply { .. }, wire::Phase::RolledBack) if same => Ok(Decision::Settle(
+            if record.unstarted_activation(&identity) {
+                // A durable abort before replacement is a deferral, including
+                // recovery after the manager lost the abort response.
+                Outcome::Deferred
+            } else if seen.progress == wire::TrialProgress::AwaitingHost as i32 {
+                Outcome::AwaitingHost
+            } else {
+                Outcome::CandidateFailed
+            },
+        )),
+        (Action::Restart, wire::Phase::Restarted)
+            if seen.restart.as_ref().is_some_and(|r| {
+                r.operation_id == record.intent.operation.to_string()
+                    && r.execution_id == record.intent.execution.to_string()
+                    && r.previous_incarnation != seen.incarnation
+            }) =>
+        {
+            Ok(Decision::Settle(Outcome::Restarted))
+        }
+        (
+            Action::Restart,
+            wire::Phase::Stable
+            | wire::Phase::Committed
+            | wire::Phase::RolledBack
+            | wire::Phase::Restarted
+            | wire::Phase::Staged,
+        ) if record.phase == Phase::Activating
+            && running == identity.committed
+            && record.prior.as_ref().is_some_and(|prior| {
+                prior.boot != identity.boot || prior.incarnation != identity.incarnation
+            }) =>
+        {
+            // A spontaneous restart can win before Restart reaches the guest.
+            // An earlier apply receipt does not negate the new generation.
+            Ok(Decision::Settle(Outcome::Restarted))
+        }
+        (Action::Restart, wire::Phase::Restarting)
+            if seen
+                .restart
+                .as_ref()
+                .is_some_and(|r| r.operation_id == record.intent.operation.to_string()) =>
+        {
+            Ok(Decision::Wait)
+        }
+        (
+            Action::Restart,
+            wire::Phase::Stable
+            | wire::Phase::Committed
+            | wire::Phase::RolledBack
+            | wire::Phase::Restarted
+            | wire::Phase::Staged,
+        ) if record
+            .prior
+            .as_ref()
+            .is_some_and(|p| p.boot == identity.boot && p.incarnation == identity.incarnation) =>
+        {
+            Ok(Decision::Restart)
+        }
+        (
+            _,
+            wire::Phase::Stable
+            | wire::Phase::Committed
+            | wire::Phase::RolledBack
+            | wire::Phase::Restarted,
+        ) if identity.attempt.is_none() && running == identity.committed => {
+            // Missing receipt authority cannot justify another mutation, but
+            // a stable committed executable is safe to configure and capture.
+            // Retire this operation and quarantine its target for inspection.
+            Ok(Decision::Settle(Outcome::RecoveryRequired))
+        }
+        _ => Err(Status::failed_precondition(
+            "guest journal no longer belongs to this operation",
+        )),
+    }
+}
+
+// Dropping a transfer cannot authorize a restart. Partial bytes remain in the
+// inactive slot; explicit lifecycle settlement observes/aborts a completed
+// Staged receipt. Scheduled capture instead requires stable guest selectors
+// through PrepareSuspend; an inactive staged slot is safe to capture. Once
+// armed, the driver waits for rollback.
+async fn yield_staging_to_capture<T>(
+    priority: &mut tokio::sync::watch::Receiver<()>,
+    transfer: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::select! {
+        biased;
+        _ = priority.changed() => Err(Status::aborted("guest staging yields to lifecycle capture")),
+        result = transfer => result,
+    }
+}
+
+async fn stage(
+    client: &mut Client,
+    bundle: policy::Bundle,
+    attempt: model::Attempt,
+) -> Result<wire::Status, Status> {
+    use tokio::io::AsyncReadExt;
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let descriptor = bundle.descriptor.clone();
+    let send = async move {
+        sender
+            .send(wire::StageRequest {
+                part: Some(wire::stage_request::Part::Header(Box::new(
+                    wire::StageHeader {
+                        descriptor: Some(descriptor.into()),
+                        attempt: Some(attempt.into()),
+                    },
+                ))),
+            })
+            .await
+            .map_err(internal)?;
+        for (binary, file) in [
+            (wire::Binary::Service, bundle.service),
+            (wire::Binary::Cli, bundle.cli),
+        ] {
+            let mut file = tokio::fs::File::from_std(file);
+            let mut offset = 0;
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).await.map_err(internal)?;
+                if read == 0 {
+                    break;
+                }
+                if offset + read as u64 > model::MAX_BINARY_BYTES {
+                    return Err(Status::resource_exhausted(
+                        "host agent payload exceeds bound",
+                    ));
+                }
+                sender
+                    .send(wire::StageRequest {
+                        part: Some(wire::stage_request::Part::Chunk(wire::Chunk {
+                            binary: binary as i32,
+                            offset,
+                            data: buffer
+                                .get(..read)
+                                .ok_or_else(|| Status::internal("invalid payload read length"))?
+                                .to_vec(),
+                        })),
+                    })
+                    .await
+                    .map_err(internal)?;
+                offset += read as u64;
+            }
+        }
+        Ok::<_, Status>(())
+    };
+    let transfer = async {
+        tokio::try_join!(
+            send,
+            client.stage(tokio_stream::wrappers::ReceiverStream::new(receiver))
+        )
+        .map(|(_, result)| result.into_inner())
+    };
+    // Allow the host's 150-second transfer/verification window to return its
+    // result before the manager abandons the RPC. Ambiguous results reconcile.
+    tokio::time::timeout(
+        pplx_space_spaced_guest_protocol::update::STAGE_MANAGER_BUDGET,
+        transfer,
+    )
+    .await
+    .map_err(|_| Status::deadline_exceeded("guest bundle transfer timed out"))?
+}
+
+#[cfg(test)]
+mod tests;
+
+fn pending_guest_untouched(record: &Record, seen: &wire::Status) -> bool {
+    record.phase == Phase::Pending
+        && !seen.customer_admission_held
+        && seen
+            .attempt
+            .as_ref()
+            .is_none_or(|attempt| attempt.operation_id != record.intent.operation.to_string())
+        && seen
+            .restart
+            .as_ref()
+            .is_none_or(|restart| restart.operation_id != record.intent.operation.to_string())
+}
+
+fn confirmation_must_settle(code: tonic::Code) -> bool {
+    // Enumerate even retryable statuses so a new gRPC code needs an explicit policy.
+    match code {
+        tonic::Code::FailedPrecondition
+        | tonic::Code::InvalidArgument
+        | tonic::Code::PermissionDenied
+        | tonic::Code::Unauthenticated => true,
+        tonic::Code::Ok
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::Cancelled
+        | tonic::Code::Unknown
+        | tonic::Code::NotFound
+        | tonic::Code::AlreadyExists
+        | tonic::Code::ResourceExhausted
+        | tonic::Code::Aborted
+        | tonic::Code::OutOfRange
+        | tonic::Code::Unimplemented
+        | tonic::Code::Internal
+        | tonic::Code::Unavailable
+        | tonic::Code::DataLoss => false,
+    }
+}

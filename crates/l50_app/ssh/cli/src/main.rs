@@ -4,11 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
 use clap::Parser;
-use pplx_space_common_core::ids::sandbox_label_or_id as sandbox_label;
-use pplx_space_common_core::types::{
-    DEFAULT_GUEST_USER, ExecutionMetadata, GuestOperatingSystem, OneOrMany, SandboxId,
-    SandboxSelector,
-};
+use pplx_space_execution_spec::{ExecutionMetadata, GuestOperatingSystem};
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
+use pplx_space_sandbox_model::ids::sandbox_label_or_id as sandbox_label;
+use pplx_space_sandbox_model::{OneOrMany, SandboxId, SandboxSelector};
 
 const SSH_KEY: &str = "/root/.ssh/sandbox_ed25519";
 const GUEST_IP: std::net::Ipv4Addr = pplx_space_net_common::guest_link::GUEST;
@@ -101,7 +100,7 @@ async fn main() {
         });
 
     let lifecycle = sandbox
-        .observed_lifecycle()
+        .observed_status()
         .unwrap_or_else(|error| pplx_space_common_cli::exit_error(error));
     if !sandbox.pid.is_some_and(is_alive) {
         eprintln!(
@@ -152,7 +151,7 @@ async fn main() {
         })
         .into_inner()
         .env;
-    let (sandbox_env, issues) = pplx_space_common_core::types::EnvMap::sanitize(sandbox_env);
+    let (sandbox_env, issues) = pplx_space_guest_process::EnvMap::sanitize(sandbox_env);
     for issue in issues {
         eprintln!("WARNING: sandbox env sanitized: {issue:?}");
     }

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 #[test]
 fn package_index_arguments_use_only_explicit_recipe_environment() {
-    let env = pplx_space_common_core::types::EnvMap::try_from(HashMap::from([
+    let env = pplx_space_guest_process::EnvMap::try_from(HashMap::from([
         ("PACKAGE_TOKEN".into(), "token$NOT_EXPANDED".into()),
         (
             "PACKAGE_INDEX_URL".into(),

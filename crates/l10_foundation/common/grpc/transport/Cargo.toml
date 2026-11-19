@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:tokio-util"]
+internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:tokio-util", "dep:pplx-space-env-vars"]
 test-support = []
 
 [dependencies]
@@ -36,7 +36,7 @@ uuid = { workspace = true, features = ["v7"] }
 
 # internal
 pplx-space-durations = { workspace = true }
-pplx-space-env-vars = { workspace = true }
+pplx-space-env-vars = { workspace = true, optional = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-guest-status = { workspace = true }
 pplx-space-observability = { workspace = true }
@@ -50,3 +50,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic-health = { workspace = true }
+tracing-subscriber = { workspace = true }

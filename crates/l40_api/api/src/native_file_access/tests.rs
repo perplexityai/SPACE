@@ -1,5 +1,5 @@
 use axum::{Router, body::Body, http::StatusCode};
-use pplx_space_common_core::{sql, types::UserId};
+use pplx_space_accounts::UserId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_native_files::RequestDigest;
 use pplx_space_node_api_client::proto::{
@@ -7,6 +7,7 @@ use pplx_space_node_api_client::proto::{
     prepare_native_file_call_response::Outcome as Prepared,
 };
 use pplx_space_public_api::{PublicErrorCode, PublicErrorEnvelope, PublicSandboxId};
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;

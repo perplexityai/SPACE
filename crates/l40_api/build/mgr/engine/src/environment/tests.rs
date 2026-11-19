@@ -1,6 +1,6 @@
 use super::*;
 use crate::recipe::{BuildConfig, NamedStep, Origin, RecipeMetadata};
-use pplx_space_common_core::types::MAX_ENV_VALUE_BYTES;
+use pplx_space_guest_process::MAX_ENV_VALUE_BYTES;
 
 fn recipe(refs: Vec<Vec<&str>>) -> Recipe {
     Recipe {
@@ -214,7 +214,7 @@ async fn programmatic_builder_preflights_before_connecting_to_services() {
             "synthetic",
             recipe(vec![vec!["MISSING_BUILD_TEST"]]),
             "example",
-            &pplx_space_common_core::types::JobId::new(),
+            &pplx_space_accounts::JobId::new(),
         )
         .await
         .err()

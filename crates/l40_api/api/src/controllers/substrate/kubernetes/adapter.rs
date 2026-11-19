@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::per_sandbox_setup::{NetworkPolicySetup, NodeFilesystemSetup, PerSandboxSetup};
 use super::pool::pooled_route_activation_id;
@@ -21,18 +21,20 @@ use crate::node_group_placement::{
     NodeGroupPlacementResolveError, PlacementSubject, ResolvePath as NodeGroupResolvePath,
     ResolvedPlacement,
 };
+use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_pool::{OpenPoolSlotDeleteLock, WarmPoolStore};
-use pplx_space_common_core::{
-    sql,
-    types::{
-        ArtifactKind, AutoLifecyclePolicy, BackupSource, ExecutionGeneration, NodeAddress, NodeId,
-        NodeManagedBy as SpaceNodeManagedBy, PodUid, PolicyAuthority, SandboxLifecycle,
-        SandboxTransitionTargetState,
-    },
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::{NodeAddress, NodeManagedBy as SpaceNodeManagedBy};
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxLifecycle, SandboxTransitionTargetState,
+};
+use pplx_space_snapshot_model::{ArtifactKind, BackupSource};
+use pplx_space_sql_locator::sql;
 use rand::RngExt;
 use sqlx::{Postgres, Transaction};
 
@@ -42,8 +44,9 @@ mod substrate_adapter;
 mod suspend;
 mod teardown;
 pub(super) use node_eligibility::{
-    NetworkSlotCapacityPreflight, network_slot_capacity_preflight, node_network_slot_available,
-    node_not_placement_blocked, node_schedulable, node_services_not_ready,
+    NetworkSlotCapacityPreflight, network_slot_capacity_preflight, network_slot_headroom,
+    node_network_slot_available, node_not_placement_blocked, node_schedulable,
+    node_services_not_ready,
 };
 #[cfg(test)]
 use pooled::pooled_metadata_update_error_is_reclaimable;
@@ -51,7 +54,6 @@ pub(super) use pooled::pooled_route_identity_adoption_request;
 use pooled::{pooled_wake_request, wait_for_pooled_split_receipt_capability};
 #[cfg(test)]
 use substrate_adapter::create_ready_timeout_error;
-use suspend::{GenerationSuspendOutcome, await_generation_suspend};
 pub use suspend::{GenerationTeardownEvidence, observe_generation_teardown_with_node_api};
 #[cfg(test)]
 use suspend::{await_suspend_continuation, poll_generation_suspend};
@@ -73,10 +75,26 @@ pub(super) const WARM_POOL_SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// answering, holds the create for the rest of its readiness budget before a
 /// fallthrough create starts its cold create.
 pub(super) const POOLED_COMMAND_READY_BUDGET: Duration = Duration::from_secs(10);
+/// Bound on one warm-pool adoption label write, throttling retries included.
+/// The kube client sets no read timeout and the create route has no request
+/// timeout, so without it an apiserver that stops answering would hold the
+/// create, and its claimed slot, until the stale-claim sweep. A write
+/// abandoned at the bound may still land later, so its slot is invalidated
+/// rather than given back to the pool.
+pub(super) const ADOPTION_LABEL_TIMEOUT: Duration = Duration::from_secs(5);
 // Planned teardown waits for the exact snapshot upload to become remotely
 // durable before retiring the pod. Full-codec artifacts can outlive the
 // generic node-RPC budget, so this path needs its own outer deadline.
 pub(super) const TEARDOWN_SUSPEND_DURABILITY_BUDGET: Duration = Duration::from_secs(300);
+/// Bound on acknowledging a nonblocking Delete, not on executing cleanup.
+/// sbx-mgr persists admission before replying and its durable executor owns
+/// cleanup independently of the request. A healthy node replies immediately
+/// after admission; an overloaded node must not hold a dispatcher slot while
+/// waiting for admission capacity or storage.
+pub(super) const TEARDOWN_NODE_DELETE_WAIT_BUDGET: Duration = Duration::from_secs(2);
+/// Bound on recovering an ambiguous admission reply. The state read takes no
+/// cleanup request permit; an unanswered probe cannot authorize teardown.
+pub(super) const TEARDOWN_NODE_DELETE_ADMISSION_PROBE: Duration = Duration::from_secs(2);
 const MAX_LOGGED_SUSPEND_PENDING_REASON_BYTES: usize = 512;
 const MAX_SUSPEND_PENDING_REASON_LOGS: u8 = 3;
 const SUSPEND_PENDING_REASON_LOG_INTERVAL: Duration = Duration::from_secs(30);

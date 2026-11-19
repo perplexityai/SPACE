@@ -4,7 +4,7 @@
 //! last-known-worker fallback. Kubernetes counts schedulable nodes from its
 //! node cache instead.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_test_env::TestResult;

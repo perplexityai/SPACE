@@ -12,12 +12,13 @@ workspace = true
 
 [features]
 default = []
-host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common", "dep:pplx-space-metrics-emit", "dep:pplx-space-uds-peer-auth"]
+host-runtime = ["pplx-space-sandbox-model/serde", "dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-transparent-proxy-socket", "dep:pplx-space-metrics-emit", "dep:pplx-space-uds-peer-auth", "dep:socket2"]
 # The node's root-owned store of runtime releases and guest kernels, which
 # node-manager publishes into.
 artifact-store = ["dep:rustix", "rustix/fs"]
 
 [dependencies]
+pplx-space-artifact-model = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }
 aws-lc-rs = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
@@ -26,6 +27,7 @@ libc = { workspace = true }
 rustix = { workspace = true, features = ["process", "thread"], optional = true }
 nix = { workspace = true, features = ["fs", "sched", "process", "resource", "signal", "user", "poll"], optional = true }
 serde = { workspace = true, features = ["derive"] }
+socket2 = { workspace = true, features = ["all"], optional = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
@@ -42,13 +44,25 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true }
+pplx-space-template-runtime = { workspace = true }
+pplx-space-host-layout = { workspace = true }
+pplx-space-host-linux = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-io = { workspace = true, features = ["reflink"] }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
+pplx-space-linux-ids = { workspace = true, features = ["serde"] }
+pplx-space-net-common = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, optional = true }
-pplx-space-net-common = { workspace = true, features = ["host-sockets"], optional = true }
+pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-uds-peer-auth = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pplx-space-file-io = { workspace = true, features = ["reflink"] }
+pplx-space-transparent-proxy-socket = { workspace = true, optional = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

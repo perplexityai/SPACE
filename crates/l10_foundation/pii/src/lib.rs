@@ -5,7 +5,7 @@
 //! the wrapped data by default.
 //!
 //! It is its own crate so that code can mark values as PII without depending
-//! on `pplx-space-common-core`, which re-exports it from `types::privacy`.
+//! on a SPACE model crate.
 
 use std::fmt;
 

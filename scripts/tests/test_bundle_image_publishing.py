@@ -185,6 +185,20 @@ class PublishingBuildTests(unittest.TestCase):
             self.assertEqual(builder.space_bundle_image_tag(), A)
             self.assertEqual(builder.build_git_sha(), A)
 
+    def test_unknown_worker_revision_skips_descriptor_time_lookup(self) -> None:
+        with mock.patch.dict(os.environ, github_main_env(), clear=True):
+            builder = bundle_builds.BundleBuilder(["worker"])
+            builder.buildx_builder_name = "test-builder"
+            with (
+                mock.patch.object(builder, "build_git_sha", return_value="unknown"),
+                mock.patch.object(bundle_builds, "registry_ref_exists", return_value=True),
+                mock.patch.object(bundle_builds, "run", side_effect=AssertionError("unexpected source lookup")),
+                mock.patch.object(bundle_builds, "run_buildx") as build,
+            ):
+                builder.build_space_bundle_image("worker")
+        self.assertIn("SPACE_GIT_SHA=unknown", build.call_args.args[0])
+        self.assertFalse(any(arg.startswith("SPACE_BUILD_TIME=") for arg in build.call_args.args[0]))
+
     def test_rust_artifacts_stay_out_of_the_registry(self) -> None:
         with mock.patch.dict(os.environ, github_main_env(), clear=True):
             builder = bundle_builds.BundleBuilder(["api"])

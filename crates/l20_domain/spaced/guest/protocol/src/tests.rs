@@ -19,3 +19,25 @@ fn process_stdin_zeroizes_on_drop() {
 
     assert_zeroize_on_drop::<proto::operations::SendInputRequest>();
 }
+
+#[test]
+fn configuration_owner_is_reserved_and_only_same_execution_can_take_over() {
+    use update::HoldOwner;
+    let execution = uuid::Uuid::now_v7();
+    let config = HoldOwner::try_from(&HoldOwner::configuration(execution)).unwrap();
+    assert!(HoldOwner::validate_operation(execution, execution).is_err());
+    let operation = HoldOwner {
+        operation: uuid::Uuid::now_v7(),
+        execution,
+    };
+    HoldOwner::validate_operation(operation.operation, execution).unwrap();
+    assert!(operation.may_replace(&config));
+    assert!(operation.may_replace(&operation));
+    assert!(!config.may_replace(&operation));
+    let other = HoldOwner {
+        operation: uuid::Uuid::now_v7(),
+        execution: uuid::Uuid::now_v7(),
+    };
+    assert!(!other.may_replace(&config));
+    assert!(!other.may_replace(&operation));
+}

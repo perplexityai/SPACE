@@ -116,20 +116,74 @@ fn classify_slot_validation_error(error: SlotValidationError) -> SlotResetError 
     }
 }
 
+/// Exclusive process-local ownership of one slot's `active_resets` entry.
+/// Dropping it only releases the entry; it never wakes the reset scheduler.
+/// A reset that collides with a held guard is not re-nudged on release. The
+/// scheduler's colliding attempt keeps that slot generation in its retry
+/// backoff (`POOL_FILL_RETRY_DELAY`, 30 s); only then can rediscovery, which
+/// scans a page at least every `REDISCOVERY_INTERVAL` (5 s) while reset
+/// capacity is free, pick it up, possibly after several pages to wrap back to
+/// it. A holder whose release latency matters must handle that itself.
+/// Not `Clone`: the one value that inserted the entry is the one that removes it.
+pub(super) struct SlotGuard {
+    pool: std::sync::Arc<NetworkPool>,
+    slot_id: u32,
+}
+
+impl std::fmt::Debug for SlotGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SlotGuard")
+            .field("slot_id", &self.slot_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SlotGuard {
+    /// Fails immediately, without touching the current owner, if the slot is held.
+    pub(super) fn try_acquire(pool: &std::sync::Arc<NetworkPool>, slot_id: u32) -> Option<Self> {
+        let mut active = pool
+            .active_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(slot_id) {
+            return None;
+        }
+        Some(Self {
+            pool: pool.clone(),
+            slot_id,
+        })
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.pool
+            .active_resets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.slot_id);
+    }
+}
+
+/// A `SlotGuard` whose final drop requests a reset retry unless disarmed.
 /// Process-local ownership complements the durable generation fence. Clones
 /// held by blocking work keep exclusion alive even if the async waiter drops.
 pub(super) struct ResetClaim {
-    pool: std::sync::Arc<NetworkPool>,
-    slot_id: u32,
+    // Always `Some` until `drop` takes it.
+    guard: Option<SlotGuard>,
     retry: AtomicBool,
+    // `schedule_reset_retry` outside tests.
+    notify: fn(std::sync::Arc<NetworkPool>, u32),
 }
 
 impl std::fmt::Debug for ResetClaim {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ResetClaim")
-            .field("slot_id", &self.slot_id)
-            .finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("ResetClaim");
+        if let Some(guard) = &self.guard {
+            debug.field("slot_id", &guard.slot_id);
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -144,32 +198,42 @@ impl ResetClaim {
         pool: &std::sync::Arc<NetworkPool>,
         slot_id: u32,
     ) -> Option<std::sync::Arc<Self>> {
-        let mut active = pool
-            .active_resets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !active.insert(slot_id) {
-            return None;
-        }
         Some(std::sync::Arc::new(Self {
-            pool: pool.clone(),
-            slot_id,
+            guard: Some(SlotGuard::try_acquire(pool, slot_id)?),
             retry: AtomicBool::new(true),
+            notify: schedule_reset_retry,
         }))
+    }
+
+    /// Lets a test observe the real final drop through `notify`.
+    #[cfg(test)]
+    pub(super) fn acquire_notifying(
+        pool: &std::sync::Arc<NetworkPool>,
+        slot_id: u32,
+        notify: fn(std::sync::Arc<NetworkPool>, u32),
+    ) -> Option<std::sync::Arc<Self>> {
+        let mut claim = Self::acquire(pool, slot_id)?;
+        // A new claim is unshared, so this always succeeds.
+        std::sync::Arc::get_mut(&mut claim)?.notify = notify;
+        Some(claim)
     }
 }
 
 impl Drop for ResetClaim {
     fn drop(&mut self) {
-        self.pool
-            .active_resets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.slot_id);
         // Covers early DB errors, cancellation and panics as well as normal
         // retries. A completed/nontransitional row makes the next probe a no-op.
-        if self.retry.load(Ordering::Relaxed) {
-            schedule_reset_retry(self.pool.clone(), self.slot_id);
+        if let Some(guard) = self.guard.take() {
+            // The retry only nudges the worker to rescan, so release the slot
+            // first: a scan that still sees it claimed would skip it. `drop`
+            // runs before field destruction, so this order must be explicit.
+            let armed = self.retry.load(Ordering::Relaxed);
+            let pool = guard.pool.clone();
+            let slot_id = guard.slot_id;
+            drop(guard);
+            if armed {
+                (self.notify)(pool, slot_id);
+            }
         }
     }
 }
@@ -183,10 +247,30 @@ pub(super) enum ResetAttempt {
     ClaimHeld { sandbox_id: String },
 }
 
+/// Expands to a teardown that refuses and the count of its calls, for tests
+/// whose reset must never reach host networking. Each expansion site owns its
+/// own static, so concurrently running tests never share a count; an expansion
+/// inside a loop shares one counter across iterations, which is fine because
+/// every assertion expects zero.
 #[cfg(test)]
-pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) -> ResetAttempt {
-    reset_slot_with(pool, slot_id, net::teardown_network).await
+macro_rules! refusing_teardown {
+    () => {{
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn refuse_teardown(
+            _: &str,
+            _: &crate::net::NetId,
+            _: Option<&str>,
+        ) -> Result<(), crate::net::NetworkTeardownError> {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::net::NetworkTeardownError::Remaining {
+                resource: "a slot this test does not own".into(),
+            })
+        }
+        (refuse_teardown, &CALLS)
+    }};
 }
+#[cfg(test)]
+pub(super) use refusing_teardown;
 
 pub(super) async fn reset_slot_with(
     pool: std::sync::Arc<NetworkPool>,
@@ -978,7 +1062,7 @@ pub(super) fn validate_config(config: &NetworkPoolConfig) -> Result<(), String> 
     if config.max_slots == 0 {
         return Err("max_slots must be non-zero".to_string());
     }
-    if config.max_slots > pplx_space_common_core::types::MAX_LINUX_NETWORK_SLOT + 1 {
+    if config.max_slots > pplx_space_linux_ids::MAX_LINUX_NETWORK_SLOT + 1 {
         return Err("max_slots exceeds the six-digit slot namespace".to_string());
     }
     if config.max_slots > net::MAX_IPV4_NETWORK_SLOTS {

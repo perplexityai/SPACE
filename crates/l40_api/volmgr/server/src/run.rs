@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::{LocalHealthLiveness, LocalHealthServer};
 use pplx_space_service_mutex::{
     AcquireError as ServiceMutexAcquireError, AcquireOutcome, SERVICE_MUTEX_POLL_INTERVAL,
@@ -257,8 +257,9 @@ pub struct VolmgrRunConfig {
     pub transfer_max_attempts: i32,
     /// How long to wait for in-flight RPCs after SIGTERM.
     pub server_drain_timeout: Duration,
-    /// How long to wait for outstanding transfers before the gRPC server stops.
-    /// Interrupted transfers remain persisted and are re-queued on startup.
+    /// How long running transfers may take to finish after SIGTERM before the
+    /// gRPC server stops. Transfers not started by then, and interrupted ones,
+    /// remain persisted and are re-queued on startup.
     pub transfer_drain_timeout: Duration,
     /// Compress snapshot files with zstd before uploading to S3.
     pub compress: bool,
@@ -411,7 +412,8 @@ async fn stop_production_server_or_hard_exit<E>(
 }
 
 /// Run the volume-manager service until `shutdown_token` is cancelled and
-/// every durable transfer has drained.
+/// its running transfers have finished; transfers it has not started are left
+/// persisted for the successor.
 ///
 /// The caller owns telemetry, the Tokio runtime, and the shutdown token. On
 /// an ownership-safety violation this never returns: it hard-exits the
@@ -533,7 +535,6 @@ pub async fn run(
     let worker = service.worker();
     let shadow_comparisons = service.shadow_comparison_controller();
     let transfer_admission = service.transfer_admission();
-    let service_for_drain = service.clone();
     worker.recover_and_log("vol-mgr.transfer");
     let source_cleanup_token = shutdown_token.child_token();
     let source_cleanup = tokio::spawn(
@@ -587,9 +588,10 @@ pub async fn run(
     health_server.activate(config.socket_path.clone());
     let mut service_mutex = Some(service_mutex);
 
-    // The production server owns a separate token. Process shutdown closes
-    // transfer admission and drains durable work while the production UDS
-    // remains available for polling/status RPCs. Only then is tonic stopped.
+    // The production server owns a separate token. Process shutdown stops
+    // starting transfers and lets running ones finish while the production UDS
+    // remains available for submissions, polling and status RPCs. Only then is
+    // tonic stopped.
     let production_shutdown_token = CancellationToken::new();
     let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
     let mut server_handle = tokio::spawn(
@@ -608,12 +610,33 @@ pub async fn run(
 
     wait_for_shutdown_or_hard_exit(&shutdown_token, &mut server_handle, &mut service_mutex).await;
 
-    transfer_admission.close();
+    // Stop starting transfers but keep persisting new submissions: the
+    // successor recovers every pending job, so a caller that submits during
+    // the drain gets a durable job instead of a refusal. Running transfers
+    // finish here, while the production UDS stays available for polling.
+    transfer_admission.hand_off();
+    worker.stop_starting_jobs();
     let transfer_drain_timeout = config.transfer_drain_timeout;
     let transfer_drain_deadline = tokio::time::Instant::now() + transfer_drain_timeout;
-    let transfer_admission_idle = transfer_admission
-        .wait_for_idle(config.server_drain_timeout.min(transfer_drain_timeout))
-        .await;
+    tracing::info!("finishing running transfers; new submissions are persisted for the successor");
+    let (executors_quiescent, shadow_comparisons_drained) = tokio::join!(
+        worker.wait_for_executors(transfer_drain_timeout),
+        shadow_comparisons.shutdown(transfer_drain_timeout),
+    );
+    if !shadow_comparisons_drained {
+        tracing::warn!(
+            drain_timeout_secs = config.transfer_drain_timeout.as_secs(),
+            "sparse shadow comparisons exceeded the service drain deadline"
+        );
+    }
+
+    transfer_admission.close();
+    let transfer_admission_idle =
+        transfer_admission
+            .wait_for_idle(config.server_drain_timeout.min(
+                transfer_drain_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ))
+            .await;
     if !transfer_admission_idle {
         tracing::warn!(
             timeout_secs = config.server_drain_timeout.as_secs(),
@@ -637,9 +660,8 @@ pub async fn run(
             .await
     {
         // An admitted handler may still be staging a push source before it
-        // durably inserts the job. Do not let the active-job query race ahead
-        // of that insert and release ownership while old-generation work can
-        // still start.
+        // durably inserts the job. Do not release ownership while it can
+        // still write state the successor would not see at recovery.
         tracing::error!(
             drain_timeout_secs = config.transfer_drain_timeout.as_secs(),
             "state-mutation admission exceeded the transfer drain deadline; exiting while holding ownership"
@@ -652,45 +674,15 @@ pub async fn run(
                 "state-mutation admission exceeded transfer drain deadline",
             );
     }
-
-    tracing::info!("draining outstanding transfer jobs while gRPC remains available");
-    let drain_timeout =
-        transfer_drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-    let (transfer_tasks_drained, shadow_comparisons_drained) = tokio::join!(
-        worker.shutdown(drain_timeout),
-        shadow_comparisons.shutdown(drain_timeout),
-    );
-    if !shadow_comparisons_drained {
-        tracing::warn!(
-            drain_timeout_secs = config.transfer_drain_timeout.as_secs(),
-            "sparse shadow comparisons exceeded the service drain deadline"
+    if !executors_quiescent {
+        tracing::error!(
+            inflight_transfers = worker.inflight(),
+            "transfer drain deadline left executor tasks; process will exit while holding ownership"
         );
     }
-    let transfer_drain_complete = match service_for_drain.active_transfer_count() {
-        Ok(0) if transfer_tasks_drained => true,
-        Ok(active_jobs) if !transfer_tasks_drained => {
-            tracing::error!(
-                active_jobs,
-                inflight_transfers = worker.inflight(),
-                "transfer drain deadline left executor tasks; process will exit while holding ownership"
-            );
-            false
-        }
-        Ok(active_jobs) => {
-            tracing::error!(
-                active_jobs,
-                "transfer drain deadline left active jobs; process will exit while holding ownership"
-            );
-            false
-        }
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "could not verify transfer drain; process will exit while holding ownership"
-            );
-            false
-        }
-    };
+    // Waits for transfers left to the successor would otherwise hold the RPC
+    // server open until its drain deadline; callers retry them there.
+    transfer_admission.end_waits();
 
     let server_drain_timeout = config.server_drain_timeout;
     stop_production_server_or_hard_exit(
@@ -700,7 +692,7 @@ pub async fn run(
         &mut service_mutex,
     )
     .await;
-    if !transfer_drain_complete {
+    if !executors_quiescent {
         // Do not drop the mutex while old executor tasks still exist. A hard
         // process boundary stops those tasks before the kernel releases flock;
         // the successor can then recover every persisted non-terminal row.

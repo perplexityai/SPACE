@@ -42,7 +42,8 @@
 //! sweep has its own outcome enum, and the [`OutcomeEvent`] constructors pin
 //! the triple together.
 
-use pplx_space_common_core::types::{SandboxId, SnapshotId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::fmt;
 use std::time::Instant;
@@ -60,6 +61,7 @@ pub enum Loop {
     WarmPoolOrphanGc,
     OrphanedRestorePodGc,
     LostStartedSandboxes,
+    RuntimeUpgrade,
 }
 
 impl Loop {
@@ -73,6 +75,7 @@ impl Loop {
             Self::WarmPoolOrphanGc => "warm_pool_orphan_gc",
             Self::OrphanedRestorePodGc => "orphaned_restore_pod_gc",
             Self::LostStartedSandboxes => "lost_started_sandboxes",
+            Self::RuntimeUpgrade => "runtime_upgrade",
         }
     }
 }

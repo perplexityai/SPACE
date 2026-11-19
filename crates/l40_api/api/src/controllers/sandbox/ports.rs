@@ -3,9 +3,9 @@ use crate::controllers::db_contention_error;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Authority, ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{MAX_SANDBOX_PORT_EXPOSURES, SandboxId};
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_sandbox_model::{MAX_SANDBOX_PORT_EXPOSURES, SandboxId};
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 
 impl SandboxController {
@@ -349,15 +349,18 @@ impl SandboxController {
         // which restores/recreates it — charge the cluster activation limiter
         // for that implicit wake (no-op for a live sandbox with a ready pod,
         // which returns early above).
-        super::lifecycle::charge_implicit_access_activation(
-            self.cluster_admission.as_ref(),
-            &sandbox,
-            ExecutionActivityKind::Access,
-        )
-        .await?;
+        let live = crate::client_live_cap::LiveHandoff::new(
+            super::lifecycle::charge_implicit_access_activation(
+                self.cluster_admission.as_ref(),
+                &sandbox,
+                ExecutionActivityKind::Access,
+            )
+            .await?,
+        );
 
-        match self.apply_open_sandbox_port(&sandbox, port).await {
+        match self.apply_open_sandbox_port(&sandbox, port, &live).await {
             Ok(observation) => {
+                live.keep();
                 let exposure = mark_sandbox_port_exposure_applied(
                     pool,
                     sandbox.id,
@@ -416,7 +419,7 @@ impl SandboxController {
                     SandboxEventSource::Api,
                 )
                 .emit_with(details);
-                Err(error.error)
+                Err(*error.error)
             }
         }
     }
@@ -614,10 +617,13 @@ impl SandboxController {
         }
     }
 
+    /// `live`: the live-cap reservation this request holds for waking a
+    /// dormant sandbox, if any.
     async fn apply_open_sandbox_port(
         &self,
         sandbox: &Sandbox,
         port: u16,
+        live: &crate::client_live_cap::LiveHandoff,
     ) -> Result<SandboxPortExposureApplyObservation, SandboxPortExposureApplyError> {
         let mut client = self
             .substrate
@@ -626,8 +632,10 @@ impl SandboxController {
                 sandbox,
                 ExecutionActivityKind::Access,
                 DEFAULT_BLOCKING_WAIT_TIMEOUT,
-                crate::controllers::substrate::RecoveryCharge::enforce(
+                super::lifecycle::implicit_activation_charge(
                     self.cluster_admission.as_ref(),
+                    sandbox,
+                    live,
                 ),
             )
             .await?;

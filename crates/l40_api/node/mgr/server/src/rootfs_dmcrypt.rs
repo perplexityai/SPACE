@@ -70,7 +70,7 @@ use crate::host_command::Command;
 use std::path::{Path, PathBuf};
 
 use crate::device_backing::{self, Backing, LoopDevice};
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 pub(crate) mod fork;
 
@@ -542,7 +542,7 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedRootfs, DmCryp
         })
         .await?
     };
-    pplx_space_common_core::sandbox_storage::validate_rootfs_bytes(origin_bytes)
+    pplx_space_sandbox_model::sandbox_storage::validate_rootfs_bytes(origin_bytes)
         .map_err(|error| DmCryptError::InvalidParams(error.to_string()))?;
 
     let composite = composite_name(&sandbox_id);
@@ -613,9 +613,9 @@ async fn stage_restore_cow(
     source: &Path,
     cow_path: &Path,
 ) -> Result<(), DmCryptError> {
-    let root = PathBuf::from(
-        pplx_space_common_core::host::linux::paths::sandbox_cache_dir(&sandbox_id.to_string()),
-    );
+    let root = PathBuf::from(pplx_space_host_layout::paths::sandbox_cache_dir(
+        &sandbox_id.to_string(),
+    ));
     let source = source.to_path_buf();
     let cow_path = cow_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -663,7 +663,7 @@ async fn build_stack(
     let origin_loop = device_backing::blocking(move || LoopDevice::attach(&origin, true)).await?;
     let origin_sectors = blockdev_sectors(origin_loop.path()).await?;
     let origin_bytes = origin_sectors.saturating_mul(SECTOR_BYTES);
-    pplx_space_common_core::sandbox_storage::validate_rootfs_bytes(origin_bytes)
+    pplx_space_sandbox_model::sandbox_storage::validate_rootfs_bytes(origin_bytes)
         .map_err(|error| DmCryptError::InvalidParams(error.to_string()))?;
 
     // `rootfs_size_bytes` is now only a sanity cross-check: the measured

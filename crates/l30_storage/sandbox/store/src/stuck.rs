@@ -6,11 +6,11 @@
 //! time, so that a wedged lifecycle is visible whether or not any of them is
 //! enabled.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 /// The census of one transient lifecycle.
 #[derive(Clone, Debug, PartialEq)]

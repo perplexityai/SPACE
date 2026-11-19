@@ -1,12 +1,12 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request};
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{
     TestDb, TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
 };
 use pplx_space_public_api::PublicSandboxId;
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -339,6 +339,64 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     let (status, body) = harness.get("/sandboxes?lifecycel=started").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.is_array(), "{body}");
+    harness.pool.close().await;
+    Ok(())
+}
+
+/// An unknown lifecycle answers 400 naming the item as the caller sent it,
+/// spaces and case included; a stored lifecycle is accepted in any case.
+#[tokio::test]
+async fn the_lifecycle_filter_refuses_an_unknown_value_by_name() -> TestDbResult<()> {
+    let Some(harness) = harness().await? else {
+        return Ok(());
+    };
+    for (query, item) in [
+        ("lifecycle=started,napping", "napping"),
+        ("lifecycle=%20Started%20,%20NAPPING%20", " NAPPING "),
+        (
+            "cursor=&lifecycle=deleted,cleanup-required",
+            "cleanup-required",
+        ),
+        ("lifecycle=started,", ""),
+    ] {
+        let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(
+            body,
+            json!({"error": format!("unknown lifecycle {item:?}")}),
+            "{query}"
+        );
+    }
+    let owner = seed_owner(&harness.pool).await?;
+    let mut matching = Vec::new();
+    for lifecycle in ["started", "stopped", "deleted", "suspended"] {
+        let id = seed_sandbox(
+            &harness.pool,
+            owner,
+            SeedSandbox {
+                lifecycle: Some(lifecycle),
+                ..SeedSandbox::default()
+            },
+        )
+        .await?;
+        if matches!(lifecycle, "started" | "deleted") {
+            matching.push(id.to_string());
+        }
+    }
+    matching.reverse();
+    for query in [
+        "lifecycle=%20STARTED%20,Deleted",
+        "cursor=&lifecycle=%20STARTED%20,Deleted",
+    ] {
+        let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        let listed = if query.starts_with("cursor=") {
+            ids(&body["sandboxes"])
+        } else {
+            ids(&body)
+        };
+        assert_eq!(listed, matching, "{query}");
+    }
     harness.pool.close().await;
     Ok(())
 }

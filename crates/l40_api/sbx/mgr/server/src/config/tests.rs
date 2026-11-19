@@ -10,7 +10,7 @@ fn only_an_absent_config_uses_defaults() {
     assert_eq!(defaults.balloon_hint_timeout_ms, None);
     assert_eq!(
         defaults.disk_io_burst_secs(),
-        pplx_space_common_core::types::DEFAULT_DISK_IO_BURST_SECS
+        pplx_space_execution_spec::DEFAULT_DISK_IO_BURST_SECS
     );
     // A directory is an unreadable config even when this test runs as root.
     assert!(matches!(

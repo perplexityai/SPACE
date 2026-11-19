@@ -324,7 +324,7 @@ fn default_db_system_for_target(target: &str) -> &'static str {
 const SPAN_NAME_WORDS: usize = 4;
 
 /// Derive the span name from the statement with any leading
-/// `/*module_path:line*/` locator comment (see `pplx_space_common_core::sql!`)
+/// `/*module_path:line*/` locator comment (see `pplx_space_sql_locator::sql!`)
 /// stripped. The locator varies per call site; leaving it in the name would
 /// fragment one query shape into per-call-site span names, while
 /// `db.statement` already carries the locator for attribution.

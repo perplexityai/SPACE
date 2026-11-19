@@ -285,7 +285,7 @@ impl LedgerFileKey {
 fn ledger_file_key(root: &Path, event: &WatchEvent) -> Option<LedgerFileKey> {
     let absolute_path = event.absolute_path();
     let relative = absolute_path.strip_prefix(root).ok()?;
-    let relative = if relative.as_os_str().is_empty() {
+    let relative = if relative.is_empty() {
         Path::new(".")
     } else {
         relative

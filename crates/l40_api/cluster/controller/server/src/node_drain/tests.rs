@@ -125,13 +125,15 @@
 //! - RP13 `rp13_backoff_disabled_schedules_no_retry` — base `0` disables the
 //!   backoff: no attempt state written, and the sweep bypasses stale windows
 
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::store::PodLessHold;
 use super::*;
 use crate::drained_node_terminator::InstanceLookupError;
 use pplx_space_api::controllers::substrate::WaitReadyTimeoutPhase;
-use pplx_space_common_core::kubernetes::EvacuationPlacement;
+use pplx_space_sandbox_pod::EvacuationPlacement;
 
 use std::collections::VecDeque;
 use std::sync::Mutex as StdMutex;
@@ -4768,10 +4770,10 @@ fn non_evacuatable_set_is_the_stale_abandon_sweep_set() {
 #[test]
 fn is_evacuable_lifecycle_accepts_only_started_paused_and_stopped() {
     // Every variant of SandboxLifecycle is tested explicitly so a new
-    // variant added to common-core forces an explicit "evacuable or
+    // variant added to pplx-space-sandbox-model forces an explicit "evacuable or
     // not" decision (the match below becomes non-exhaustive at
     // compile time).
-    use pplx_space_common_core::types::SandboxLifecycle as L;
+    use pplx_space_sandbox_model::SandboxLifecycle as L;
     let cases: &[(L, bool)] = &[
         (L::Created, false),
         (L::Creating, false),
@@ -4827,7 +4829,7 @@ fn sandbox_lifecycle_str_round_trip() {
     // lc.as_str())`; the read path is `text → SandboxLifecycle::from_str`.
     // This pins the round-trip for every variant the drain code can
     // see, so a typo in `as_str` or `from_str` fails loudly.
-    use pplx_space_common_core::types::SandboxLifecycle as L;
+    use pplx_space_sandbox_model::SandboxLifecycle as L;
     for variant in [
         L::Created,
         L::Creating,

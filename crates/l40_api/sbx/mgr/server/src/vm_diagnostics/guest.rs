@@ -3,13 +3,15 @@
 //! The guest sends callsite identity only (level, target, file, line, count),
 //! never message text. Its answer is still tenant-controlled: the probe's
 //! client bounds the bytes it decodes
-//! ([`pplx_space_spaced_common::BRIDGE_GUEST_PING_MAX_DECODE_BYTES`]), and this
+//! ([`pplx_space_spaced_client::BRIDGE_GUEST_PING_MAX_DECODE_BYTES`]), and this
 //! module bounds the work per drain, so strings are truncated and stripped of
 //! control characters, counts clamped
 //! and only a fixed number of entries read; nothing reaches a metric tag.
 
 use crate::metrics::sandbox::vm::{VmDiagnosticLevel, VmDiagnosticOutcome, VmDiagnosticSource};
-use pplx_space_spaced_common::proto::bridge_guest::{GuestDiagnosticCallsite, PingResponse};
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+    GuestDiagnosticCallsite, PingResponse,
+};
 
 use super::sanitized;
 

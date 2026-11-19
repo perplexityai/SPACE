@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::Arc;
 
-use pplx_space_common_core::types::GuestPath;
+use pplx_space_guest_process::GuestPath;
 use tokio::sync::Semaphore;
 
 #[test]

@@ -2,20 +2,18 @@
 //! tombstone checks.
 
 use super::*;
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_node_registration_store::{
     K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, register_k8s_node,
 };
 
 impl K8sStore {
+    /// `instance_id` is the EC2 instance the Node's `providerID` names.
+    /// `None` keeps the recorded instance while the Node's UID is unchanged;
+    /// on a UID change it clears it, since a new Node may be another machine.
     pub(in crate::controllers::substrate::kubernetes) async fn persist_k8s_node_inventory(
         &self,
-        node_name: &str,
-        node_uid: &str,
-        node_id: NodeId,
-        role: NodeRole,
-        address: Option<&str>,
-        state: NodeStateWrite,
+        upsert: K8sNodeRoleUpsert<'_>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -23,19 +21,7 @@ impl K8sStore {
             .await
             .db_context("failed to start Kubernetes node inventory transaction")?;
 
-        let changed = self
-            .upsert_k8s_node_role(
-                &mut tx,
-                K8sNodeRoleUpsert {
-                    node_name,
-                    node_uid,
-                    node_id,
-                    role,
-                    address,
-                    state,
-                },
-            )
-            .await?;
+        let changed = self.upsert_k8s_node_role(&mut tx, upsert).await?;
 
         tx.commit()
             .await
@@ -116,6 +102,7 @@ impl K8sStore {
             role,
             address,
             state,
+            instance_id,
         } = upsert;
 
         // `manage_state` decides whether a conflict-update writes `state`.
@@ -137,6 +124,7 @@ impl K8sStore {
                 address,
                 state,
                 manage_state,
+                instance_id,
             },
             || {
                 tracing::warn!(

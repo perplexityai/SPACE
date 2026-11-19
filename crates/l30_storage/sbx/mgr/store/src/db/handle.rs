@@ -186,11 +186,16 @@ impl Connection {
     /// statements a store operation runs.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trace_v2(
-        &self,
+        &mut self,
         mask: rusqlite::trace::TraceEventCodes,
         trace: Option<fn(rusqlite::trace::TraceEvent<'_>)>,
-    ) {
-        self.0.trace_v2(mask, trace);
+    ) -> Result<()> {
+        Ok(self.0.trace_v2(mask, trace)?)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn serialize_main_database(&mut self) -> Result<Vec<u8>> {
+        Ok(self.0.serialize(rusqlite::MAIN_DB)?.to_vec())
     }
 
     db_private_outside_tests! {
@@ -332,17 +337,32 @@ impl SharedConnection {
     }
 
     /// A jobs worker over this connection, sharing its mutex.
-    pub fn background_worker<E: pplx_space_common_jobs::JobExecutor>(
+    pub fn background_worker<E: super::jobs::JobExecutor>(
         &self,
         executor: E,
-        config: pplx_space_common_jobs::WorkerConfig,
-    ) -> pplx_space_common_jobs::BackgroundWorker<E> {
-        pplx_space_common_jobs::BackgroundWorker::new(Arc::clone(&self.0), executor, config)
+        config: super::jobs::WorkerConfig,
+    ) -> super::jobs::JobWorker<E> {
+        super::jobs::JobWorker::new(pplx_space_common_jobs::BackgroundWorker::new(
+            Arc::clone(&self.0),
+            executor,
+            config,
+        ))
     }
 }
 
 /// A held [`SharedConnection`] lock.
 pub struct ConnectionGuard<'a>(MutexGuard<'a, rusqlite::Connection>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl ConnectionGuard<'_> {
+    pub fn trace_v2(
+        &mut self,
+        mask: rusqlite::trace::TraceEventCodes,
+        trace: Option<fn(rusqlite::trace::TraceEvent<'_>)>,
+    ) -> Result<()> {
+        Ok(self.0.trace_v2(mask, trace)?)
+    }
+}
 
 impl Deref for ConnectionGuard<'_> {
     type Target = Connection;

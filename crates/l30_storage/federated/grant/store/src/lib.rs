@@ -1,9 +1,10 @@
 //! Owning store for sandbox-scoped federated service grants.
 
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::SandboxOwnerSource;
+use pplx_space_accounts::SandboxOwnerSource;
+use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, Postgres};
 use time::OffsetDateTime;
 use uuid::Uuid;

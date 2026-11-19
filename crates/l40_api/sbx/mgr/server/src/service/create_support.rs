@@ -8,18 +8,18 @@ use super::validation::{
     template_metadata_arch, template_metadata_spaced_compatibility, template_runtime_defaults,
 };
 use super::*;
-use pplx_space_common_core::types::{EnvMap, EnvSanitizationIssue};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, SandboxRestoreProvenance,
     emit_sandbox_event,
 };
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 pub(super) struct ResolvedTemplatePaths {
-    pub(super) guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub(super) guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub(super) template_dir: String,
     pub(super) snapshot_dir: Option<String>,
-    pub(super) snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
+    pub(super) snapshot_vcpu: Option<pplx_space_execution_spec::VcpuCount>,
     pub(super) content_hash: Option<String>,
     pub(super) default_auto_lifecycle: AutoLifecyclePolicy,
     pub(super) default_network_policy_authority: crate::db::PolicyAuthority,
@@ -28,14 +28,14 @@ pub(super) struct ResolvedTemplatePaths {
     pub(super) spaced_version: Option<String>,
     pub(super) spaced_compatibility_family: Option<String>,
     pub(super) runtime_defaults: TemplateRuntimeDefaults,
-    pub(super) execution: pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: pplx_space_execution_spec::ExecutionMetadata,
 }
 
 #[derive(Debug)]
 pub(super) struct SandboxPrepareSource {
     pub(super) template: Option<String>,
     pub(super) template_dir: Option<String>,
-    pub(super) execution: pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: pplx_space_execution_spec::ExecutionMetadata,
     pub(super) existing_artifact: bool,
 }
 
@@ -50,19 +50,22 @@ pub(super) struct RequestedSandboxCreateSpec<'a> {
     pub(super) auto_lifecycle: &'a AutoLifecyclePolicy,
     /// An explicit selection must match the row's saved binding. An
     /// unselected retry keeps the row's own binding.
-    pub(super) environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub(super) environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+    /// A required environment must name the partition of the row's saved
+    /// binding, which the build the row was created from is cached in.
+    pub(super) required_environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 pub(super) struct CreateWithIdArgs<'a> {
-    pub(super) guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    pub(super) guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub(super) req: &'a CreateRequest,
     pub(super) sandbox_owner: &'a SandboxOwner,
     pub(super) effective_mode: BootMode,
     pub(super) id: String,
     pub(super) template_dir: &'a str,
-    pub(super) execution: Option<&'a pplx_space_common_core::types::ExecutionMetadata>,
+    pub(super) execution: Option<&'a pplx_space_execution_spec::ExecutionMetadata>,
     pub(super) snapshot_dir_resolved: Option<&'a str>,
-    pub(super) snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
+    pub(super) snapshot_vcpu: Option<pplx_space_execution_spec::VcpuCount>,
     pub(super) content_hash_resolved: Option<&'a str>,
     pub(super) auto_lifecycle: &'a AutoLifecyclePolicy,
     pub(super) auto_lifecycle_authority: crate::db::PolicyAuthority,
@@ -81,20 +84,28 @@ pub(super) fn validate_create_request(
     if req.runtime.is_empty() {
         return Err(Status::invalid_argument("runtime is required"));
     }
-    let runtime: pplx_space_common_core::types::RuntimeKind = req
+    let runtime: pplx_space_execution_spec::RuntimeKind = req
         .runtime
         .parse()
         .map_err(|e| Status::invalid_argument(format!("runtime: {e}")))?;
+    require_lifecycle_adapter(runtime)?;
+    validate_create_request_fields(req)
+}
+
+/// Refuse a runtime sandbox-manager has no lifecycle adapter for.
+pub(super) fn require_lifecycle_adapter(
+    runtime: pplx_space_execution_spec::RuntimeKind,
+) -> Result<(), Status> {
     if !matches!(
         runtime,
-        pplx_space_common_core::types::RuntimeKind::Firecracker
-            | pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+        pplx_space_execution_spec::RuntimeKind::Firecracker
+            | pplx_space_execution_spec::RuntimeKind::CloudHypervisor
     ) {
         return Err(Status::unimplemented(
             "runtime has no sandbox lifecycle adapter",
         ));
     }
-    validate_create_request_fields(req)
+    Ok(())
 }
 
 /// Validate inputs independent of the runtime resolved from an environment.
@@ -105,7 +116,7 @@ pub(super) fn validate_create_request_fields(
         Status::invalid_argument(format!("unknown boot_mode value {}", req.boot_mode))
     })?;
     if let Some(size_mib) = req.rootfs_size_mb {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(|error| Status::invalid_argument(format!("rootfs_size_mb: {error}")))?;
     }
     let requested_id = req
@@ -116,7 +127,7 @@ pub(super) fn validate_create_request_fields(
             Uuid::parse_str(id).map_err(|_| Status::invalid_argument("sandbox_id must be a UUID"))
         })
         .transpose()?;
-    pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+    pplx_space_execution_spec::DiskIoLimits::try_from_optional(
         req.disk_io_max_operations_per_sec,
         req.disk_io_max_bandwidth_mib_per_sec,
     )
@@ -151,8 +162,12 @@ impl SandboxManagerService {
         // explicit environment selection never falls back, while a warm start
         // restores through whichever loader the node selects for the snapshot,
         // and donors are matched by build rather than binding; so a selected
-        // create always boots cold.
-        let eligible_mode = if req.rootfs_size_mb.is_some() || target.selected {
+        // create always boots cold. So does a create that requires an
+        // environment: a base snapshot or a donor could load under another.
+        let eligible_mode = if req.rootfs_size_mb.is_some()
+            || target.selected
+            || req.required_environment.is_some()
+        {
             BootMode::Cold
         } else if requested_mode == BootMode::Pool
             && (requested_id.is_some()
@@ -188,7 +203,7 @@ impl SandboxManagerService {
 #[derive(Clone, Copy)]
 pub(super) struct CreateTarget<'a> {
     pub(super) snapshot_dir: Option<&'a str>,
-    pub(super) execution: &'a pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: &'a pplx_space_execution_spec::ExecutionMetadata,
     /// The request selected its environment explicitly.
     pub(super) selected: bool,
 }
@@ -208,7 +223,7 @@ pub(super) struct RuntimeActivatedEvent<'a> {
     pub(super) vcpu: Option<u32>,
     pub(super) memory_mib: u32,
     pub(super) has_netns_path: bool,
-    pub(super) execution: &'a pplx_space_common_core::types::ExecutionMetadata,
+    pub(super) execution: &'a pplx_space_execution_spec::ExecutionMetadata,
     pub(super) execution_generation: Option<i64>,
     pub(super) restored_snapshot_storage_uri: Option<String>,
     pub(super) restored_snapshot_local_artifact_id: Option<String>,
@@ -534,6 +549,14 @@ pub(super) fn requested_sandbox_create_mismatches(
     {
         mismatches.push("environment");
     }
+    if let Some(required) = requested.required_environment
+        && !super::validation::is_in_environment_partition(
+            required,
+            existing.execution_metadata.as_ref(),
+        )
+    {
+        mismatches.push("required_environment");
+    }
     mismatches
 }
 
@@ -578,9 +601,8 @@ pub(super) fn update_existing_sandbox_create_auto_lifecycle(
 /// kernel cmdline (`ip=169.254.0.21::169.254.0.22:...` in `recovery.rs`). The
 /// guest always sees these, so response builders that describe an existing
 /// runtime reuse them rather than re-deriving per sandbox.
-pub(super) const GUEST_IP: &str = pplx_space_common_core::guest::linux::network::IPV4_ADDR;
-pub(super) const GUEST_GATEWAY: &str =
-    pplx_space_common_core::guest::linux::network::GATEWAY_IPV4_ADDR;
+pub(super) const GUEST_IP: &str = pplx_space_net_common::guest_link::IPV4_ADDR;
+pub(super) const GUEST_GATEWAY: &str = pplx_space_net_common::guest_link::GATEWAY_IPV4_ADDR;
 
 pub(super) fn create_response_for_existing_sandbox(
     existing: &crate::db::SandboxRow,
@@ -730,6 +752,21 @@ pub(super) async fn resolve_template_paths(
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
     scope: TemplateLookupScope,
 ) -> Result<ResolvedTemplatePaths, tonic::Status> {
+    resolve_template_paths_requiring(templates, template_ref, scope, false).await
+}
+
+/// [`resolve_template_paths`], asking template-manager to answer only with a
+/// build bound to `template_ref.environment` when `environment_required`
+/// (`GetTemplateRequest.environment_required`), and to pull that build when
+/// the node holds the digest only under another environment. A
+/// template-manager that predates the field answers with its preferred build,
+/// which the create's own partition check refuses.
+pub(super) async fn resolve_template_paths_requiring(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
+    scope: TemplateLookupScope,
+    environment_required: bool,
+) -> Result<ResolvedTemplatePaths, tonic::Status> {
     use crate::template_resolver::TemplateLookupError;
     let mut request =
         tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
@@ -738,6 +775,7 @@ pub(super) async fn resolve_template_paths(
             template: Some(template_ref),
             vcpu: None,
             memory_mib: None,
+            environment_required,
         });
     scope.attach(&mut request);
     let response = templates
@@ -761,7 +799,7 @@ pub(super) async fn resolve_template_paths(
     let guest_image = if inner.manifest_json.is_empty() {
         Default::default()
     } else {
-        let manifest: pplx_space_common_core::types::TemplateManifest =
+        let manifest: pplx_space_template_manifest::TemplateManifest =
             serde_json::from_str(&inner.manifest_json).map_err(|error| {
                 Status::failed_precondition(format!("invalid template manifest: {error}"))
             })?;
@@ -776,7 +814,7 @@ pub(super) async fn resolve_template_paths(
         snapshot_dir: inner.snapshot_dir,
         snapshot_vcpu: inner
             .snapshot_vcpu
-            .map(pplx_space_common_core::types::VcpuCount::try_from_u32)
+            .map(pplx_space_execution_spec::VcpuCount::try_from_u32)
             .transpose()
             .map_err(|error| {
                 Status::failed_precondition(format!(
@@ -810,8 +848,8 @@ pub(super) async fn resolve_template_paths(
 /// record were captured under the initial environment.
 pub(super) fn read_base_snapshot_execution_metadata(
     source_dir: &std::path::Path,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, Status> {
-    use pplx_space_common_core::types::{ExecutionMetadata, SnapshotExecutionMetadata};
+) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, Status> {
+    use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
 
     let metadata = match std::fs::read(source_dir.join("metadata.json")) {
         Ok(bytes) => {
@@ -823,7 +861,7 @@ pub(super) fn read_base_snapshot_execution_metadata(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let architecture = std::env::consts::ARCH.parse().map_err(
-                |error: pplx_space_common_core::types::ArchParseError| {
+                |error: pplx_space_cpu_arch::ArchParseError| {
                     Status::failed_precondition(error.to_string())
                 },
             )?;
@@ -848,7 +886,7 @@ pub(super) fn read_base_snapshot_execution_metadata(
 pub(super) fn stage_base_snapshot_runtime_metadata(
     source_dir: &std::path::Path,
     destination_dir: &std::path::Path,
-    snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
+    snapshot_vcpu: Option<pplx_space_execution_spec::VcpuCount>,
 ) -> Result<(), Status> {
     let metadata = read_base_snapshot_execution_metadata(source_dir)?;
     // Captured allocation wins; selected dimensions fill only legacy absence.
@@ -1095,21 +1133,21 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
 /// remain fixed. Snapshot producer evidence is read separately from its manifest.
 fn bind_saved_execution(
     sandbox: &crate::db::SandboxRow,
-    observed: pplx_space_common_core::types::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+    observed: pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, Status> {
     bind_disk_execution(sandbox.execution_metadata.as_ref(), observed)
 }
 
 pub(super) fn bind_disk_execution(
-    saved: Option<&pplx_space_common_core::types::ExecutionMetadata>,
-    observed: pplx_space_common_core::types::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+    saved: Option<&pplx_space_execution_spec::ExecutionMetadata>,
+    observed: pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, Status> {
     let Some(saved) = saved.filter(|saved| saved.environment().is_some()) else {
         return Ok(observed);
     };
     // Only the Firecracker adapter currently declares cross-consumer raw-disk
     // compatibility. Other adapters must supply their own disk contract.
-    if saved.runtime().kind != pplx_space_common_core::types::RuntimeKind::Firecracker
+    if saved.runtime().kind != pplx_space_execution_spec::RuntimeKind::Firecracker
         && saved != &observed
     {
         return Err(Status::failed_precondition(
@@ -1128,8 +1166,8 @@ pub(super) fn bind_disk_execution(
 }
 
 fn matching_execution_components(
-    saved: &pplx_space_common_core::types::ExecutionMetadata,
-    observed: &pplx_space_common_core::types::ExecutionMetadata,
+    saved: &pplx_space_execution_spec::ExecutionMetadata,
+    observed: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> bool {
     observed.components().len() == saved.components().len()
         && saved.components().iter().all(|expected| {

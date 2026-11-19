@@ -44,11 +44,10 @@ pub struct ControllerError {
     guest_path_not_found: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ControllerErrorKind {
     General,
     SandboxAlreadyExists,
-    RestoreContextUnavailable,
     /// A database statement lost a race for a lock. Carried so the public and
     /// ECW translators can keep the 503 attributed to this service's own
     /// database: they otherwise re-label every controller 503 as a fleet
@@ -65,11 +64,32 @@ enum ControllerErrorKind {
     /// Carried so the native delete executor can wait for the upload to
     /// finalize instead of failing the operation.
     SnapshotUploadInFlight(SnapshotUploadInFlight),
-    /// Cluster activation admission refused this request, whether the
-    /// limiter was out of tokens or the cluster had no eligible node. Carried
-    /// so request metrics can count the refusal without reading the retry
-    /// cause, which only the rate-limited case sets.
-    ClusterAdmissionRejection,
+    /// Cluster activation admission refused this request, and why: the
+    /// limiter was out of tokens, the cluster had no eligible node, or no
+    /// eligible node had a free slot. Set only by
+    /// [`substrate::ActivationRejectionKind::controller_error`]. Request
+    /// metrics count the refusal from it without reading the status or the
+    /// retry cause, and a caller with a fallback passes it through rather
+    /// than retrying under a weaker charge.
+    ClusterAdmissionRejection(substrate::ActivationRejectionKind),
+    /// The client's live-sandbox cap refused this activation. Carried so the
+    /// reconnect series records a per-client refusal as `rate_limited`, like
+    /// the concurrency limiter's, rather than as the cluster saturation a
+    /// bare 429 with a `Retry-After` would read as.
+    LiveCapRefusal,
+    /// Work refused because the sandbox is at rest and its wake policy does
+    /// not let this request wake it. Carried so the Native translators can
+    /// answer with the details `createCommand` gives the same refusal. Boxed
+    /// to keep `ControllerError` small: it rides in other errors' variants.
+    SandboxNotRunning(Box<SandboxNotRunning>),
+}
+
+/// The sandbox a [`ControllerError::sandbox_not_running`] refusal is about,
+/// in the lifecycle state it was refused in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SandboxNotRunning {
+    pub(crate) sandbox_id: pplx_space_sandbox_model::SandboxId,
+    pub(crate) lifecycle: pplx_space_sandbox_model::SandboxLifecycle,
 }
 
 /// Why a template the caller may use resolved to no release.
@@ -144,6 +164,24 @@ impl ControllerError {
             retry_after_cause: None,
             refused_before_start: false,
             guest_path_not_found: false,
+        }
+    }
+
+    /// Mark this error as an activation admission refusal of `kind`. Leaves
+    /// the status and every retry hint as they are.
+    pub(crate) fn with_activation_rejection(
+        mut self,
+        kind: substrate::ActivationRejectionKind,
+    ) -> Self {
+        self.kind = ControllerErrorKind::ClusterAdmissionRejection(kind);
+        self
+    }
+
+    /// The activation admission refusal this error carries, if it is one.
+    pub(crate) const fn activation_rejection(&self) -> Option<substrate::ActivationRejectionKind> {
+        match self.kind {
+            ControllerErrorKind::ClusterAdmissionRejection(kind) => Some(kind),
+            _ => None,
         }
     }
 
@@ -271,14 +309,8 @@ impl ControllerError {
         matches!(self.kind, ControllerErrorKind::LockContention)
     }
 
-    pub(crate) fn is_restore_context_unavailable(&self) -> bool {
-        matches!(self.kind, ControllerErrorKind::RestoreContextUnavailable)
-    }
-
     pub(crate) fn restore_context_unavailable(message: impl Into<String>) -> Self {
-        let mut error = Self::precondition_failed(message);
-        error.kind = ControllerErrorKind::RestoreContextUnavailable;
-        error
+        Self::precondition_failed(message)
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
@@ -307,17 +339,15 @@ impl ControllerError {
         // lock wait with a burst of round-trips against the row that is
         // already contended.
         //
-        // Be precise about what this does *not* rest on. Neither production
-        // reader of `retry_after()` can observe the difference for a
-        // contention error today: `sandbox::reconnect_controller_error_outcome`
-        // and `translate::controller_error` each return on
-        // `is_lock_contention()` before reaching their `retry_after` branch.
+        // Be precise about what this does *not* rest on. The production
+        // reader of `retry_after()` can't observe the difference for a
+        // contention error today: `translate::controller_error` returns on
+        // `is_lock_contention()` before reaching its `retry_after` branch.
         // So this is the semantically correct choice rather than a load-bearing
-        // one — and it is one deletion away from being load-bearing, since
-        // removing either guard would route every contention error into
-        // `reason:wait_budget` or
-        // into the SDK's `sandbox_timeout`. That is what the assertions in
-        // `controllers::tests` and `sandbox::reconnect_metrics_tests` pin.
+        // one — and it is one deletion away from being load-bearing: were this
+        // hint set with `with_retry_after` instead, removing that guard would
+        // route every contention error into the SDK's `sandbox_timeout`. That
+        // is what the assertions in `controllers::tests` pin.
         .with_retry_after_header(substrate::LOCK_CONTENTION_RETRY_AFTER);
         error.kind = ControllerErrorKind::LockContention;
         error
@@ -365,6 +395,27 @@ impl ControllerError {
         matches!(self.kind, ControllerErrorKind::SandboxAlreadyExists)
     }
 
+    /// A 409 for access the sandbox cannot serve until the caller wakes or
+    /// starts it: it is at rest and its wake policy does not let the request
+    /// wake it.
+    pub(crate) fn sandbox_not_running(
+        refusal: SandboxNotRunning,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut error = Self::conflict(message);
+        error.kind = ControllerErrorKind::SandboxNotRunning(Box::new(refusal));
+        error
+    }
+
+    /// The sandbox this error refused access to because it is not running,
+    /// if that is what it is.
+    pub(crate) fn sandbox_not_running_refusal(&self) -> Option<SandboxNotRunning> {
+        match &self.kind {
+            ControllerErrorKind::SandboxNotRunning(refusal) => Some(**refusal),
+            _ => None,
+        }
+    }
+
     pub(crate) fn snapshot_upload_in_flight(
         upload: SnapshotUploadInFlight,
         message: impl Into<String>,
@@ -387,31 +438,30 @@ impl ControllerError {
         Self::new(StatusCode::PRECONDITION_FAILED, message)
     }
 
-    /// A 429 from cluster activation admission, at request entry or charged
-    /// later by the substrate. Only `rate_limited` adds the
-    /// [`ControllerRetryAfterCause::ClusterActivationAdmission`] cause: an
-    /// empty cluster omits it, so the async dispatcher gives that refusal a
-    /// bounded retry rather than re-queueing it forever.
-    pub(crate) fn cluster_admission_rejected(
+    /// Whether cluster activation admission refused this request.
+    pub(crate) const fn is_cluster_admission_rejection(&self) -> bool {
+        self.activation_rejection().is_some()
+    }
+
+    /// A 429 from the client's live-sandbox cap, at request entry or where
+    /// the substrate creates a pod, with its header-only `Retry-After`. It
+    /// carries no retry cause: a cap lifts when the client releases a
+    /// sandbox, so the async dispatcher retries it against its budget.
+    pub(crate) fn live_cap_refused(
         message: impl Into<String>,
         retry_after: Option<Duration>,
-        rate_limited: bool,
     ) -> Self {
         let mut error = Self::rate_limited(message);
         if let Some(retry_after) = retry_after {
             error = error.with_retry_after_header(retry_after);
         }
-        if rate_limited {
-            error =
-                error.with_retry_after_cause(ControllerRetryAfterCause::ClusterActivationAdmission);
-        }
-        error.kind = ControllerErrorKind::ClusterAdmissionRejection;
+        error.kind = ControllerErrorKind::LiveCapRefusal;
         error
     }
 
-    /// Whether cluster activation admission refused this request.
-    pub(crate) const fn is_cluster_admission_rejection(&self) -> bool {
-        matches!(self.kind, ControllerErrorKind::ClusterAdmissionRejection)
+    /// Whether the client's live-sandbox cap refused this request.
+    pub(crate) const fn is_live_cap_refusal(&self) -> bool {
+        matches!(self.kind, ControllerErrorKind::LiveCapRefusal)
     }
 }
 

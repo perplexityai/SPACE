@@ -59,13 +59,13 @@ pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
 /// lapses, isn't an attempt's failure. The failed jobs it counts persist across
 /// restarts until the jobs retention pruner removes them.
 pub(in crate::service) fn teardown_keyed_upload_use(
-    status: pplx_space_common_jobs::JobStatus,
-    failure: Option<pplx_space_common_jobs::JobFailure>,
+    status: crate::db::jobs::JobStatus,
+    failure: Option<crate::db::jobs::JobFailure>,
     scope: crate::snapshot_upload::UploadFailureScope,
     permanently_failed: u64,
 ) -> KeyedUploadUse {
+    use crate::db::jobs::JobFailure;
     use crate::snapshot_upload::UploadFailureScope;
-    use pplx_space_common_jobs::JobFailure;
     if !status.is_terminal() {
         return KeyedUploadUse::Join;
     }
@@ -82,7 +82,7 @@ pub(in crate::service) fn teardown_keyed_upload_use(
 }
 
 fn teardown_suspend_event_details(
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     trigger: SandboxEventTrigger,
 ) -> SandboxEventDetails {
     SandboxEventDetails::default()
@@ -183,8 +183,8 @@ fn durable_teardown_suspend_prepare_response(
         Status::internal("durable teardown suspend is missing its published artifact")
     })?;
     let artifact_kind = match artifact.artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Disk => crate::proto::ArtifactKind::Disk,
-        pplx_space_common_core::types::ArtifactKind::Full => crate::proto::ArtifactKind::Full,
+        pplx_space_snapshot_model::ArtifactKind::Disk => crate::proto::ArtifactKind::Disk,
+        pplx_space_snapshot_model::ArtifactKind::Full => crate::proto::ArtifactKind::Full,
     };
     let mut response = teardown_suspend_prepare_response(
         TeardownSuspendOutcome::Durable,
@@ -224,7 +224,7 @@ impl SandboxManagerService {
         // Runtime attachment establishes this node-local lease from the route
         // identity already passed down with the execution.
         let execution_generation =
-            pplx_space_common_core::types::ExecutionGeneration::new(req.execution_generation)
+            pplx_space_sandbox_model::ExecutionGeneration::new(req.execution_generation)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let span = tracing::Span::current();
         span.record("sandbox_id", tracing::field::display(sandbox_id));
@@ -484,7 +484,7 @@ impl SandboxManagerService {
     pub(super) fn close_terminal_teardown_suspend(
         &self,
         sandbox_id: &str,
-        generation: pplx_space_common_core::types::ExecutionGeneration,
+        generation: pplx_space_sandbox_model::ExecutionGeneration,
     ) -> Result<TerminalTeardownSuspend, Status> {
         let db = self.db_conn()?;
         let state = crate::db::read::sandbox(&db, sandbox_id)
@@ -624,7 +624,7 @@ impl SandboxManagerService {
     pub(in crate::service) fn spawn_teardown_suspend_driver(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> TeardownSuspendDriverAdmission {
         let due = self.db_conn().and_then(|db| {
@@ -704,7 +704,7 @@ impl SandboxManagerService {
     pub(super) async fn drive_teardown_suspend(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> Result<(), Status> {
         self.drive_teardown_suspend_in(
@@ -721,7 +721,7 @@ impl SandboxManagerService {
     pub(super) async fn drive_teardown_suspend_in(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
         cache_dir: &std::path::Path,
     ) -> Result<(), Status> {
@@ -750,7 +750,7 @@ impl SandboxManagerService {
     /// idempotent registration.
     async fn teardown_drive_refusal_verdict(
         &self,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         error: &Status,
     ) -> crate::snapshot_upload_jobs::RegistrationProbe {
         use crate::snapshot_upload_jobs::RegistrationProbe;
@@ -776,7 +776,7 @@ impl SandboxManagerService {
     pub(super) async fn settle_teardown_suspend_drive(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         result: Result<(), Status>,
     ) -> Result<(), Status> {
         let Err(error) = &result else {
@@ -845,7 +845,7 @@ impl SandboxManagerService {
     pub(super) async fn settle_teardown_suspend_driver_failure(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         result: Result<(), Status>,
         backup_lookup: Option<&OrgSnapshotConfigResolution>,
         release: Option<LocalArtifactId>,
@@ -917,7 +917,7 @@ impl SandboxManagerService {
     pub(super) fn record_teardown_suspend_driver_failure(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         error: &Status,
         backup_lookup: Option<&OrgSnapshotConfigResolution>,
     ) -> Result<(), Status> {
@@ -970,7 +970,7 @@ impl SandboxManagerService {
     async fn drive_teardown_suspend_inner(
         &self,
         sandbox_id: SandboxId,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
         cache_dir: &std::path::Path,
     ) -> Result<(), Status> {
@@ -978,7 +978,7 @@ impl SandboxManagerService {
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox_id_string);
         let wake_guard = wake_lock.lock_owned().await;
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox_id_string);
-        let artifact_guard = artifact_lock.lock_owned().await;
+        let artifact_guard = artifact_lock.lock_for_capture().await;
         let status = {
             let db = self.db_conn()?;
             crate::db::read::sandbox_view(&db, &sandbox_id_string)
@@ -1162,7 +1162,7 @@ impl SandboxManagerService {
     fn ensure_teardown_suspend_owner(
         &self,
         sandbox_id: &str,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     ) -> Result<(), Status> {
         let status = {
             let db = self
@@ -1203,7 +1203,7 @@ impl SandboxManagerService {
     fn complete_teardown_suspend_operation(
         &self,
         sandbox_id: &str,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> Result<(), Status> {
         let completed = {
@@ -1307,6 +1307,14 @@ impl SandboxManagerService {
         // The verdict a rejoined refusal leaves with, so the settle needn't
         // ask the cluster again.
         let mut verdict = None;
+        // Beyond the capture's record, only an earlier upload of these bytes
+        // that marked the generation as the capture's own vouches for it; one
+        // the teardown merely supplies doesn't. Read before the match below
+        // takes the job.
+        let earlier_upload_vouches = super::artifact_backup::earlier_upload_vouches(
+            persisted_job.as_ref(),
+            backup.registration_generation(),
+        );
         let joined = match persisted_job {
             Some(job) => match self.teardown_use_of_upload(&backup, &job)? {
                 KeyedUploadUse::Join => {
@@ -1363,6 +1371,7 @@ impl SandboxManagerService {
                         &backup.artifact.local_path,
                         backup.format,
                         backup.registration_generation(),
+                        earlier_upload_vouches,
                     )
                     .await
                     .map_err(|error| {
@@ -1387,7 +1396,7 @@ impl SandboxManagerService {
             // lookup of that rule: the next drive rejoins and marks it then.
             if matches!(
                 job.failure,
-                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+                Some(crate::db::jobs::JobFailure::Permanent { .. })
             ) && self
                 .teardown_use_of_upload(&backup, &job)
                 .is_ok_and(|then| then == KeyedUploadUse::Join)
@@ -1403,7 +1412,7 @@ impl SandboxManagerService {
             );
             if matches!(
                 job.failure,
-                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+                Some(crate::db::jobs::JobFailure::Permanent { .. })
             ) {
                 error = teardown_backup_failure_status(error, backup.artifact.local_artifact_id);
                 if let Some(verdict) = verdict {
@@ -1430,7 +1439,7 @@ impl SandboxManagerService {
     pub(super) fn teardown_use_of_upload(
         &self,
         backup: &TeardownSuspendBackup<'_>,
-        job: &pplx_space_common_jobs::Job,
+        job: &crate::db::jobs::Job,
     ) -> Result<KeyedUploadUse, Status> {
         #[derive(serde::Deserialize)]
         struct RecordedScope {
@@ -1439,7 +1448,7 @@ impl SandboxManagerService {
         }
         let status = job
             .status
-            .parse::<pplx_space_common_jobs::JobStatus>()
+            .parse::<crate::db::jobs::JobStatus>()
             .map_err(|error| {
                 Status::internal(format!(
                     "persisted artifact backup status is invalid for {}: {error}",

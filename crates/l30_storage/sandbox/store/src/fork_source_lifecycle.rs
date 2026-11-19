@@ -1,9 +1,9 @@
 //! Transaction lock for operations that change or depend on a fork source
 //! sandbox's lifecycle and durable snapshot set.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Stable namespace for the per-source advisory transaction lock.

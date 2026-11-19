@@ -6,7 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use pplx_space_common_core::{sql, types::SubstrateKind};
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sql_locator::sql;
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;

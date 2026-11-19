@@ -1,18 +1,19 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::metrics::operations::ClaimAttempt;
-use pplx_space_common_core::types::{IdempotencyKey, SandboxId, SandboxLifecycle};
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicErrorCode,
     PublicOperationEvent, PublicOperationEventType, PublicOperationRecord, PublicOperationResult,
     RequestFingerprint,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, Postgres, Row, Transaction, types::Json};
@@ -214,7 +215,7 @@ impl PublicOperationStore {
         operation_id: OperationId,
         hard_deadline: Duration,
     ) -> Result<Option<Duration>, PublicOperationStoreError> {
-        let seconds = sqlx::query_scalar::<_, i64>(pplx_space_common_core::sql!(
+        let seconds = sqlx::query_scalar::<_, i64>(pplx_space_sql_locator::sql!(
             "SELECT GREATEST(
                  0,
                  FLOOR(EXTRACT(EPOCH FROM (
@@ -236,7 +237,7 @@ impl PublicOperationStore {
         &self,
         operation_id: OperationId,
     ) -> Result<Option<Duration>, PublicOperationStoreError> {
-        let seconds = sqlx::query_scalar::<_, Option<f64>>(pplx_space_common_core::sql!(
+        let seconds = sqlx::query_scalar::<_, Option<f64>>(pplx_space_sql_locator::sql!(
             "SELECT EXTRACT(EPOCH FROM NOW() - started_at)::DOUBLE PRECISION
              FROM public_operations
              WHERE operation_id = $1"

@@ -1,6 +1,6 @@
 //! Shared native recipe boundary. The core declaration owns validation.
 use crate::proto::recipe::{RuntimeApp, SetRuntime, runtime_app};
-use pplx_space_common_core::types::{
+use pplx_space_template_runtime::{
     RuntimeReadiness, RuntimeStartupPolicy, TemplateRuntime, TemplateRuntimeError,
 };
 

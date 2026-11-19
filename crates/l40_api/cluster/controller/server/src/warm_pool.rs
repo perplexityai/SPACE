@@ -20,6 +20,7 @@ use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
     runtime::reflector::Store,
 };
+use pplx_space_api::controllers::substrate::environment_placement::pool_pod_environment;
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_api::controllers::substrate::{
     ReflectorReady, Substrate, SubstrateAdapter, connect_worker,
@@ -33,17 +34,15 @@ use pplx_space_cluster_pool::{
     AutoscaleRun, InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolConfigRead, PoolSlot,
     PoolSlotCounts, PoolSlotState, WarmPoolStore,
 };
-use pplx_space_common_core::kubernetes::NodeGroupPlacement;
-use pplx_space_common_core::{
-    kubernetes::{
-        DEFAULT_SANDBOX_PROXY_PORT, SANDBOX_POOL_ROLE_WARM, SandboxPodConfigValues,
-        TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,
-        template_write_annotation_key_for,
-    },
-    types::{SandboxId, TemplateArtifactDigest, TemplateReference},
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_pod::{
+    DEFAULT_SANDBOX_PROXY_PORT, NodeGroupPlacement, PodEnvironment, SANDBOX_POOL_ROLE_WARM,
+    SandboxPodConfigValues, TEMPLATE_PRESENT_LABEL_VALUE, template_build_presence_label_key,
+    template_write_annotation_key_for,
 };
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
+use pplx_space_template_model::{TemplateArtifactDigest, TemplateReference};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
     sync::Semaphore,
@@ -65,7 +64,7 @@ use crate::pod::{build_pool_pod, pool_pod_name, ready_pod_metadata};
 #[derive(Debug, thiserror::Error)]
 pub enum WarmPoolError {
     #[error(transparent)]
-    PodConfig(#[from] pplx_space_common_core::kubernetes::NodeSelectorLabelsParseError),
+    PodConfig(#[from] pplx_space_sandbox_pod::NodeSelectorLabelsParseError),
     #[error("warm slot create semaphore closed")]
     CreatePermitsClosed(#[source] tokio::sync::AcquireError),
     #[error("warm pool config reconcile worker panicked: {0}")]
@@ -346,11 +345,11 @@ fn pool_pod_config_from_env() -> Result<SandboxPodConfigValues, WarmPoolError> {
 }
 
 fn sandbox_namespace_from_env() -> String {
-    sandbox_namespace_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    sandbox_namespace_from_environment(&pplx_space_env_vars::ProcessEnvironment)
 }
 
 pub(crate) fn sandbox_namespace_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> String {
     env.var(SANDBOX_NAMESPACE_ENV)
         .or_else(|_| env.var(POD_NAMESPACE_ENV))
@@ -1401,12 +1400,47 @@ impl Reconciler {
         // Zero when the candidate set could not be resolved: this config may
         // shrink but not grow until an operator fixes the template row or the
         // node groups.
-        let create_count = match node_group_placement.as_ref() {
+        let wanted = match node_group_placement.as_ref() {
             Some(_) => {
                 usize::try_from(slots_to_create(config, counts.warming, counts.open())).unwrap_or(0)
             }
             None => 0,
         };
+        // The environment the config's pods run under, which they record
+        // while the environment placement gate evaluates and require a node
+        // label for while it's on: the template build's binding. Read only
+        // for a tick that creates. With the gate on, a failed read creates
+        // nothing and books a failed required operation, so the config reports
+        // as failing as it does for an unresolved candidate set; in shadow it
+        // reads as unbound, as off would.
+        let environment = if wanted == 0 {
+            Ok(None)
+        } else {
+            pool_pod_environment(
+                self.substrate.environment_placement(),
+                self.store.pool(),
+                config.template_name.as_str(),
+                &config.content_hash.to_string(),
+            )
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    pool_config_id = %config.id,
+                    template_release_id = %config.template_release_id,
+                    %error,
+                    "warm pool: the template build's environment could not be read; \
+                     not creating slots for this config this tick"
+                );
+            })
+        };
+        let create_count = match environment {
+            Ok(_) => wanted,
+            Err(_) => {
+                summary.failed_required_operations += 1;
+                0
+            }
+        };
+        let environment = environment.ok().flatten();
 
         // Fan the per-tick refill out concurrently instead of awaiting each
         // create serially. `create_count` already bounds the work to the
@@ -1425,6 +1459,7 @@ impl Reconciler {
                 node_group_placement
                     .as_ref()
                     .and_then(ResolvedPlacement::placement),
+                environment,
             )
         })
         .await;
@@ -2100,6 +2135,7 @@ impl Reconciler {
         config: &PoolConfig,
         pods: &Api<Pod>,
         node_group_placement: Option<&NodeGroupPlacement>,
+        environment: Option<PodEnvironment>,
     ) -> Result<PoolSlot, WarmPoolError> {
         with_create_permit(&self.create_permits, async {
             let reserved_sandbox_id = SandboxId::new();
@@ -2121,7 +2157,7 @@ impl Reconciler {
                 )
                 .await?;
 
-            let pod = build_pool_pod(&self.pod_config, &slot, node_group_placement);
+            let pod = build_pool_pod(&self.pod_config, &slot, node_group_placement, environment);
             if let Err(err) = self
                 .timed_k8s(
                     "create-warming-slot-pod",

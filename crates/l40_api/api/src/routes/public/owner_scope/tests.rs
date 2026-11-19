@@ -4,10 +4,10 @@ use axum::{
     body::Body,
     http::{Method, StatusCode},
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_public_api::OperationId;
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use tower::ServiceExt;
@@ -317,7 +317,7 @@ async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation(
             Method::DELETE,
             format!(
                 "/v1/sandboxes/{}",
-                PublicSandboxId::from(pplx_space_common_core::types::SandboxId::new())
+                PublicSandboxId::from(pplx_space_sandbox_model::SandboxId::new())
             ),
             owner.clone(),
         ),
@@ -1512,7 +1512,7 @@ async fn a_same_key_retry_racing_an_early_delete_replays_it() -> TestDbResult<()
     use crate::routes::public::sandboxes::{
         lifecycle_method, lifecycle_path_template, lifecycle_request_fingerprint,
     };
-    use pplx_space_common_core::types::IdempotencyKey;
+    use pplx_space_guest_process::IdempotencyKey;
     use pplx_space_public_api::{OperationKind, OperationTargetType, SandboxLifecycleAction};
 
     let fixture = fixture().await?;

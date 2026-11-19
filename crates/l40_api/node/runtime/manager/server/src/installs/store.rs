@@ -4,8 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{Digest, JobId};
+use pplx_space_accounts::JobId;
+use pplx_space_content_digest::Digest;
+use pplx_space_sql_locator::sql;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator =

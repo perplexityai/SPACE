@@ -4,7 +4,7 @@
 use super::*;
 use crate::local_artifacts::{CheckoutError, NamedSnapshotDelete};
 use crate::snapshot_gc::delete_gc_staging;
-use pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in;
+use pplx_space_host_layout::paths::sandbox_snapshot_dir_in;
 
 /// [`crate::local_artifacts::LocalArtifacts::delete_named_snapshot`] with
 /// node-manager's DeleteCacheArtifact of `local_path` as the in-place delete of
@@ -76,8 +76,7 @@ impl SandboxManagerService {
                 .ok()
                 .flatten()
                 .filter(|artifact| {
-                    artifact.artifact_origin
-                        != pplx_space_common_core::types::ArtifactOrigin::Snapshot
+                    artifact.artifact_origin != pplx_space_snapshot_model::ArtifactOrigin::Snapshot
                 })
                 .map(|artifact| artifact.local_path)
         });

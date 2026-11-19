@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 pub(super) const ECW_SANDBOX_API_LOG_EVENT: &str = "ecw_sandbox_api_request";
 pub(super) const ECW_SANDBOX_ID_SPAN_FIELD: &str = "sandbox_id";

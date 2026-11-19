@@ -191,14 +191,33 @@ impl K8sStore {
     /// The attempt guard is there for the same reason the release CAS has one:
     /// a replacement can reuse the generation with a NULL UID, and writing the
     /// old pod's identity onto it would be worse than writing nothing.
+    ///
+    /// A filled UID is a pod the row didn't track before, so the sandbox's
+    /// record is set to `pod_client`, the pod's `space.pplx.net/client-id`
+    /// label, in the same transaction (see `runtime_attribution`).
     pub(in crate::controllers::substrate::kubernetes) async fn backfill_missing_pod_uid(
         &self,
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         pod_uid: &str,
+        pod_client: Option<&pplx_space_accounts::ClientId>,
     ) -> Result<bool, SubstrateError> {
         let (generation, activation_attempt_id, _, route_activation_id) =
             Self::identity_binds(identity);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start pod uid backfill transaction")?;
+        // `sandboxes` before the execution row, the order multi-row
+        // mutations take, since a fill also writes the record. With
+        // attribution off the fill writes only the execution row and takes
+        // no `sandboxes` lock.
+        if self.attribution.is_enabled()
+            && !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?
+        {
+            return Ok(false);
+        }
         let filled = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
                 SET pod_uid = $4,
@@ -219,10 +238,31 @@ impl K8sStore {
         .bind(activation_attempt_id)
         .bind(pod_uid)
         .bind(route_activation_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .db_context("failed to backfill pod uid")?;
-        Ok(filled.rows_affected() > 0)
+        .db_context("failed to backfill pod uid")?
+        .rows_affected()
+            > 0;
+        if filled
+            && self.attribution.is_enabled()
+            && let Some(generation) = generation
+            && let Some(tracked) = self.lock_tracked_pod_in(&mut tx, sandbox_id, generation).await?
+            && let Some(sandbox) = tracked.sandbox.as_ref()
+            // The row tracked no pod before this fill.
+            && let Some(record) = super::attribution_update(
+                &sandbox.lifecycle,
+                None,
+                Some(pod_uid),
+                pod_client,
+                sandbox.record.as_ref(),
+            )
+        {
+            Self::attribute_runtime_in(&mut tx, sandbox_id, record.as_ref()).await?;
+        }
+        tx.commit()
+            .await
+            .db_context("failed to commit pod uid backfill")?;
+        Ok(filled)
     }
 
     /// [`Self::forget_pod_tracking`] for a pod-identity-fenced teardown:
@@ -369,7 +409,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     ) -> Result<bool, SubstrateError> {
         self.finish_execution_and_clear_pod_tracking_if_generation(
             sandbox_id,
@@ -381,6 +421,38 @@ impl K8sStore {
             PlacementClock::Bump,
         )
         .await
+    }
+
+    /// Whether the execution that names `pod_name` at `generation` is already
+    /// retired (`active = FALSE`). A retired execution generation is final:
+    /// every activation assignment requires `active`, generations are
+    /// per-sandbox monotonic, and sandbox-manager refuses to start a retired
+    /// generation's runtime. So a pod whose execution row reads retired
+    /// belongs to no current or future runtime and is safe to delete under a
+    /// UID precondition. Returns `false` when no such row exists, so a pod the
+    /// store has no record of is never treated as retired.
+    pub(in crate::controllers::substrate::kubernetes) async fn execution_generation_retired(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        pod_name: &str,
+    ) -> Result<bool, SubstrateError> {
+        sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1
+                    AND generation = $2
+                    AND pod_name = $3
+                    AND NOT active
+             )"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(pod_name)
+        .fetch_one(&self.pool)
+        .await
+        .db_context("failed to read execution retirement")
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn cleanup_replaced_pod_tracking_if_generation(
@@ -405,7 +477,7 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
         state: &str,
         recovery_operation: StartedSuspendRecoveryOperation,
         cause: PodTrackingCleanupCause,

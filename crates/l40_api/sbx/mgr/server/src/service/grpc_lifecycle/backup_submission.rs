@@ -25,12 +25,12 @@ pub(super) fn suspend_artifact_metadata(
 /// The execution metadata an artifact backup records. A disk artifact carries
 /// no vCPU state, so it has no capture CPU, whatever its metadata says.
 pub(super) fn artifact_backup_execution(
-    execution: pplx_space_common_core::types::SnapshotExecutionMetadata,
-    artifact_kind: pplx_space_common_core::types::ArtifactKind,
-) -> pplx_space_common_core::types::SnapshotExecutionMetadata {
+    execution: pplx_space_execution_spec::SnapshotExecutionMetadata,
+    artifact_kind: pplx_space_snapshot_model::ArtifactKind,
+) -> pplx_space_execution_spec::SnapshotExecutionMetadata {
     match artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Full => execution,
-        pplx_space_common_core::types::ArtifactKind::Disk => execution.with_host_cpu(None),
+        pplx_space_snapshot_model::ArtifactKind::Full => execution,
+        pplx_space_snapshot_model::ArtifactKind::Disk => execution.with_host_cpu(None),
     }
 }
 
@@ -43,7 +43,7 @@ pub(super) fn captured_suspend_snapshot_metadata(
 ) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
     let mut metadata = suspend_snapshot_metadata(sandbox, format)?;
     metadata.execution = metadata.execution.map(|execution| {
-        execution.with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned())
+        execution.with_host_cpu(pplx_space_execution_spec::HostCpu::current().cloned())
     });
     Ok(metadata)
 }
@@ -105,15 +105,48 @@ pub(in crate::service) fn suspend_snapshot_metadata(
     })
 }
 
+fn suspend_upload_payload(
+    sandbox: &crate::db::SandboxRow,
+    local_artifact_id: LocalArtifactId,
+    job: &crate::db::jobs::Job,
+) -> Result<crate::snapshot_upload::SnapshotUploadJobs, ArtifactBackupSubmissionError> {
+    let payload = job
+        .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+        .map_err(|error| ArtifactBackupSubmissionError::Other(error.to_string()))?;
+    // Older payloads may omit the execution fence after completing handoff.
+    // Exact immutable artifact identity plus staged metadata/transfers proves
+    // that existing handoff; it never authorizes a new unfenced registration.
+    let completed_legacy_handoff = payload.execution_generation.is_none()
+        && payload.includes_metadata_job
+        && !payload.job_ids.is_empty();
+    if payload.meta.local_artifact_id != Some(local_artifact_id)
+        || payload.meta.sandbox_id != sandbox.id
+        || (payload.execution_generation != node_local_registration_generation(sandbox)
+            && !completed_legacy_handoff)
+    {
+        return Err(ArtifactBackupSubmissionError::TerminalHandoff(
+            "persisted upload has a different capture owner".to_owned(),
+        ));
+    }
+    // Do not create another attempt on every cleanup tick. The cleanup
+    // owner retains the artifact and ends a terminal handoff explicitly.
+    if job.is_terminal()
+        && (job.status != crate::db::jobs::JobStatus::Completed.as_str() || job.failure.is_some())
+    {
+        return Err(ArtifactBackupSubmissionError::TerminalHandoff(format!(
+            "persisted suspend upload requires resolution: {}",
+            job.error.as_deref().unwrap_or("upload failed")
+        )));
+    }
+    Ok(payload)
+}
+
 #[cfg(test)]
 impl SandboxManagerService {
     pub(in crate::service) async fn submit_artifact_backup_for_test(
         &self,
         sandbox: &crate::db::SandboxRow,
-        artifact_attempt: (
-            LocalArtifactId,
-            pplx_space_common_core::types::BackupAttemptId,
-        ),
+        artifact_attempt: (LocalArtifactId, pplx_space_snapshot_model::BackupAttemptId),
         snapshot_dir: &str,
         request_override: &crate::snapshot_upload::SnapshotUploadConfig,
         restore_visible: bool,
@@ -123,8 +156,8 @@ impl SandboxManagerService {
             sandbox,
             ArtifactBackupSubmission {
                 local_artifact_id,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                 snapshot_name: None,
                 backup_attempt_id,
                 snapshot_dir,
@@ -136,6 +169,7 @@ impl SandboxManagerService {
                     ArtifactBackupHandoff::DurableWorker
                 },
                 execution_generation: None,
+                capture_vouched: false,
             },
         )
         .await
@@ -144,30 +178,152 @@ impl SandboxManagerService {
 }
 
 impl SandboxManagerService {
-    pub(in crate::service) fn require_node_local_backup_handoff(
+    /// Retry handoff for at most fifteen minutes from durable cleanup admission.
+    /// Each remote attempt has thirty seconds; neither retries nor restarts renew
+    /// the clock. Terminal failure retains the capture and finishes cleanup.
+    pub(in crate::service) async fn ensure_suspend_backup_before_cleanup(
         &self,
         sandbox_id: &str,
-        local_artifact_id: LocalArtifactId,
-        result: Result<SubmitSuspendSnapshotOutcome, Status>,
-    ) -> Result<(), Status> {
-        match result {
-            Ok(SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. }) => {
-                tracing::info!(
-                    sandbox_id,
-                    local_artifact_id = %local_artifact_id,
-                    job_id = %job_id,
-                    "persisted suspend artifact backup before runtime teardown",
-                );
-                Ok(())
+        published: Option<&(LocalArtifactId, String)>,
+        job_id: Option<&JobId>,
+        now: impl Fn() -> jiff::Timestamp,
+    ) -> Result<Option<crate::db::cleanup_jobs::CleanupOutcome>, Status> {
+        let (row, artifact, path) = {
+            let db = self.db_conn()?;
+            let row = crate::db::read::sandbox(&db, sandbox_id)
+                .map_err(|error| {
+                    Status::internal(format!("read suspend cleanup evidence: {error}"))
+                })?
+                .ok_or_else(|| Status::aborted("suspend cleanup owner disappeared"))?;
+            // Restore retirement also uses MarkSuspended, but its persisted
+            // lifecycle is stopping. Only a newly published suspend owns handoff.
+            // Use durable state so rediscovery/restart preserves this distinction.
+            if row.state.lifecycle() != SandboxState::Suspending {
+                return Ok(None);
             }
-            Ok(SubmitSuspendSnapshotOutcome::NoUploadConfig) => Ok(()),
-            Err(status) => {
-                let reason =
-                    format!("persist suspend artifact backup before runtime teardown: {status}");
-                self.record_suspend_snapshot_publication_failure_after_begin(sandbox_id, &reason);
-                Err(status)
+            let artifact = match published {
+                Some(artifact) => Some(artifact.clone()),
+                None => match row.current_local_artifact_id {
+                    Some(id) => crate::db::read::local_artifact(
+                        &db,
+                        crate::db::read::LocalArtifactKey::Id(id),
+                    )
+                    .map_err(|error| {
+                        Status::internal(format!("read suspend cleanup evidence: {error}"))
+                    })?
+                    .map(|artifact| (artifact.local_artifact_id, artifact.local_path)),
+                    None => None,
+                },
+            };
+            // Missing publication is classified by the existing finalizer.
+            let Some((artifact, path)) = artifact else {
+                return Ok(None);
+            };
+            if let Some(status) = crate::db::read::sandbox_view(&db, sandbox_id)
+                .teardown()
+                .status()
+                .map_err(|error| {
+                    Status::internal(format!("read suspend cleanup evidence: {error}"))
+                })?
+            {
+                if status.backup_completed
+                    && status
+                        .artifact
+                        .as_ref()
+                        .is_some_and(|record| record.local_artifact_id == artifact)
+                {
+                    return Ok(None);
+                }
+                if status
+                    .operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.status.is_active())
+                {
+                    return Err(Status::unavailable(
+                        "teardown suspend awaits remote durability",
+                    ));
+                }
+            }
+            (row, artifact, path)
+        };
+        let created = if let Some(job_id) = job_id {
+            let created = crate::db::read::cleanup_job_created_at(&*self.db_conn()?, job_id)
+                .map_err(|error| Status::internal(format!("read handoff admission time: {error}")))?
+                .ok_or_else(|| Status::aborted("suspend cleanup job disappeared"))?;
+            Some(created.get())
+        } else {
+            // Foreground-only probes cannot renew or replace a durable job.
+            None
+        };
+        let age_at = |now: jiff::Timestamp| {
+            created.map_or(0, |created| now.as_second().saturating_sub(created).max(0))
+        };
+        let age = age_at(now());
+        // Even an expired retry must accept an already persisted handoff: a
+        // restart or scheduling delay cannot invalidate completed ownership.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs((15 * 60 - age).clamp(1, 30).cast_unsigned()),
+            self.enqueue_node_local_suspend_backup(&row, artifact, &path, None),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ArtifactBackupSubmissionError::Other(
+                "backup handoff attempt timed out".to_owned(),
+            ))
+        });
+        // Charge the awaited attempt against the same immutable admission.
+        let age = age_at(now());
+        match result {
+            Ok(_) => Ok(None),
+            Err(error) if error.handoff_is_terminal() || age >= 15 * 60 => {
+                let reason = format!(
+                    "suspend backup handoff ended at age {age}s; requires operator recovery: {error}"
+                );
+                self.settle_failed_suspend_handoff(&row, artifact, job_id, &reason)
+            }
+            Err(error) => {
+                if age >= 5 * 60 {
+                    tracing::error!(sandbox_id, %artifact, age_secs = age, %error,
+                        "suspend backup handoff pending over five minutes; capture retained for retry");
+                }
+                Err(artifact_backup_fence_status(error.to_string()))
             }
         }
+    }
+
+    pub(super) fn settle_failed_suspend_handoff(
+        &self,
+        row: &crate::db::SandboxRow,
+        artifact: LocalArtifactId,
+        job_id: Option<&JobId>,
+        reason: &str,
+    ) -> Result<Option<crate::db::cleanup_jobs::CleanupOutcome>, Status> {
+        use crate::db::cleanup_jobs::CleanupOutcome;
+        let applied = {
+            // The upload worker persists transfer IDs through this same mutex.
+            // Hold it from the final evidence read through quarantine so its
+            // successful handoff cannot land between those two decisions.
+            let db = self.db_conn()?;
+            if let Some(upload) = crate::db::read::local_artifact_upload(&db, artifact)
+                .map_err(|error| Status::internal(format!("re-read suspend handoff: {error}")))?
+                && let Ok(payload) = suspend_upload_payload(row, artifact, &upload)
+                && !payload.job_ids.is_empty()
+            {
+                return Ok(None);
+            }
+            crate::db::quarantine_refused_suspend_backup(&db, row, artifact, reason, job_id)
+                .map_err(|error| Status::internal(format!("settle suspend handoff: {error}")))?
+        };
+        if applied {
+            tracing::error!(sandbox_id = %row.id, %artifact, %reason,
+                "suspend backup handoff ended; capture retained");
+            mark_sandbox_dirty(&self.db, &row.id);
+        }
+        Ok(Some(if applied {
+            CleanupOutcome::Quarantined(reason.to_owned())
+        } else {
+            CleanupOutcome::Superseded
+        }))
     }
 
     /// Resolve the org-level S3 override for this sandbox. Returns one
@@ -271,6 +427,7 @@ impl SandboxManagerService {
             format,
             handoff,
             execution_generation,
+            capture_vouched,
         } = submission;
         let config: &crate::snapshot_upload::SnapshotUploadConfig = match request_override {
             Some(c) => c,
@@ -309,7 +466,7 @@ impl SandboxManagerService {
         meta.artifact_kind = Some(artifact_kind);
         meta.artifact_origin = Some(artifact_origin);
         meta.artifact_snapshot_name = snapshot_name
-            .map(pplx_space_common_core::types::SnapshotName::parse)
+            .map(pplx_space_snapshot_model::SnapshotName::parse)
             .transpose()
             .map_err(|error| format!("invalid artifact snapshot name: {error}"))?;
         // Normalize legacy metadata before persisting the durable intent. The
@@ -346,10 +503,28 @@ impl SandboxManagerService {
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         jobs.execution_generation = execution_generation;
+        // Ordered by only on evidence: the caller's, or the record the
+        // capturing teardown published beside the bytes, naming this
+        // generation for this artifact.
+        jobs.execution_generation_names_capture = execution_generation.is_some_and(|generation| {
+            capture_vouched
+                || crate::capture_record::read_capture_order(
+                    std::path::Path::new(snapshot_dir),
+                    local_artifact_id,
+                )
+                .ok()
+                .flatten()
+                    == Some(generation)
+        });
         let mut storage_uri = jobs.storage_uri.clone();
         let dedup_key = crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id);
         let local_artifact_id = local_artifact_id.to_string();
 
+        #[cfg(test)]
+        crate::auto_lifecycle::AutoLifecycleCoordinator::rendezvous(
+            &self.auto_lifecycle.backup_admission_barrier,
+        )
+        .await;
         let job_id = match self.snapshot_upload_worker.submit_json(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &jobs,
@@ -445,16 +620,32 @@ impl SandboxManagerService {
             .get_job(job_id)
             .map_err(|error| format!("read snapshot-upload job {job_id}: {error}"))?
             .ok_or_else(|| format!("snapshot-upload job {job_id} disappeared"))?;
+        let mut payload = persisted
+            .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+            .map_err(|error| format!("decode snapshot-upload job {job_id}: {error}"))?;
         if persisted.is_terminal() && persisted.failure.is_some() {
+            // The worker can refuse registration before this caller reads
+            // the job. Its persisted error has no typed generation; recover
+            // the fence verdict without restarting the failed upload.
+            if payload.execution_generation.is_some()
+                && crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload)
+                && let crate::snapshot_upload_jobs::RegistrationProbe::Superseded(generation) =
+                    crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload)
+                        .await
+            {
+                return Err(ArtifactBackupSubmissionError::Begin {
+                    error: crate::db::jobs::JobError::permanent(
+                        persisted.error.as_deref().unwrap_or("unknown error"),
+                    ),
+                    superseded_generation: Some(generation),
+                });
+            }
             return Err(format!(
                 "snapshot-upload job {job_id} terminated before restore-visible handoff: {}",
                 persisted.error.as_deref().unwrap_or("unknown error")
             )
             .into());
         }
-        let mut payload = persisted
-            .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
-            .map_err(|error| format!("decode snapshot-upload job {job_id}: {error}"))?;
         if crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload) {
             crate::snapshot_upload_jobs::begin_prepared_upload_naming_supersession(&payload)
                 .await
@@ -530,24 +721,54 @@ impl SandboxManagerService {
     /// Hand a node-local suspend's capture to a durable upload, registered
     /// under the sandbox's Kubernetes execution (see
     /// [`node_local_registration_generation`]). Any failure, a refusal of a
-    /// superseded execution included, is a backup-fence failure, which rolls
-    /// the suspend back and disarms auto-lifecycle.
+    /// superseded execution included, is a backup-fence failure. The caller
+    /// preserves the published capture for publication/backup reconciliation.
     pub(super) async fn enqueue_node_local_suspend_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
         local_artifact_id: LocalArtifactId,
         snapshot_dir: &str,
-        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
-    ) -> Result<SubmitSuspendSnapshotOutcome, Status> {
+        format: Option<pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat>,
+    ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
+        if let Some(job) = self
+            .snapshot_upload_worker
+            .find_job_by_dedup_key(
+                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                &crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id),
+            )
+            .map_err(|error| ArtifactBackupSubmissionError::Other(error.to_string()))?
+        {
+            let payload = suspend_upload_payload(sandbox, local_artifact_id, &job)?;
+            // Transfer IDs are the durable handoff; do not reintroduce a remote
+            // registration gate after they were persisted, including on restart.
+            let payload = if payload.job_ids.is_empty() {
+                self.establish_restore_visible_artifact_backup(&job.job_id)
+                    .await?
+            } else {
+                payload
+            };
+            return Ok(SubmitSuspendSnapshotOutcome::Enqueued {
+                job_id: job.job_id,
+                backup_attempt_id: payload.snapshot_id,
+            });
+        }
+        // Existing transfer ownership is independent of the local sidecar.
+        // Recovery reads its format only when it must create a new upload.
+        let format = match format {
+            Some(format) => format,
+            None => reupload_format_from_sidecar(snapshot_dir)
+                .map_err(|error| ArtifactBackupSubmissionError::Other(error.to_string()))?,
+        };
         self.enqueue_suspend_artifact_backup(
             sandbox,
             local_artifact_id,
             snapshot_dir,
             format,
             node_local_registration_generation(sandbox),
+            // The current execution just took this capture.
+            true,
         )
         .await
-        .map_err(|error| artifact_backup_fence_status(error.to_string()))
     }
 
     pub(super) async fn enqueue_suspend_artifact_backup(
@@ -556,7 +777,8 @@ impl SandboxManagerService {
         local_artifact_id: LocalArtifactId,
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
-        registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        registration_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+        capture_vouched: bool,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
             OrgSnapshotConfigResolution::Resolved(config) => Some(config),
@@ -575,15 +797,16 @@ impl SandboxManagerService {
             sandbox,
             ArtifactBackupSubmission {
                 local_artifact_id,
-                artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                 snapshot_name: None,
-                backup_attempt_id: pplx_space_common_core::types::BackupAttemptId::new(),
+                backup_attempt_id: pplx_space_snapshot_model::BackupAttemptId::new(),
                 snapshot_dir,
                 request_override: request_override.as_ref(),
                 format,
                 handoff: ArtifactBackupHandoff::TeardownFence,
                 execution_generation: registration_generation,
+                capture_vouched,
             },
         )
         .await

@@ -50,6 +50,9 @@ pub struct AppState {
     /// fresh replica does not receive traffic with a cold cache.
     pub readiness: crate::controllers::substrate::ReflectorReady,
     pub drain_signal: pplx_space_service_lifecycle::DrainSignal,
+    /// The API's task tracker: graceful shutdown waits for request work
+    /// spawned on it to finish, after its request is gone.
+    pub task_tracker: TaskTracker,
     /// Claimed operations this process executes itself instead of leaving
     /// them to the dispatcher. See [`crate::inline_operations`].
     pub inline_operations: crate::inline_operations::InlineOperations,
@@ -72,6 +75,11 @@ pub struct AppState {
     /// [`public::hidden_operations`].
     pub native_hidden_operations: public::hidden_operations::HiddenOperationsGate,
     pub ecw_credential_keyring: std::sync::Arc<pplx_space_ecw_credential::EcwCredentialKeyring>,
+    /// Campaign kinds the admin API starts runtime upgrade campaigns for:
+    /// those a cluster-controller driver moves. See
+    /// [`admin::RUNTIME_UPGRADE_DRIVEN_KINDS`].
+    pub runtime_upgrade_driven_kinds:
+        &'static [pplx_space_runtime_upgrade_campaign_store::CampaignKind],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -263,6 +271,7 @@ impl AppState {
             native_sandbox_limits,
             readiness,
             drain_signal,
+            task_tracker,
             inline_operations,
             inline_lifecycle,
             template_build_state,
@@ -273,6 +282,7 @@ impl AppState {
             feature_flags,
             native_hidden_operations,
             ecw_credential_keyring,
+            runtime_upgrade_driven_kinds: admin::RUNTIME_UPGRADE_DRIVEN_KINDS,
         })
     }
 

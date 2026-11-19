@@ -1,7 +1,7 @@
-use pplx_space_common_core::types::{OrgId, SandboxOwnerSource, UserId};
+use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
 
 use crate::api_surface::ApiSurface;
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use sqlx::types::time::OffsetDateTime;

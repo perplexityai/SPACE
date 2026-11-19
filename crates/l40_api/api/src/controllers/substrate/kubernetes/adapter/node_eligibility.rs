@@ -46,10 +46,8 @@ pub(in crate::controllers::substrate::kubernetes) fn node_not_placement_blocked(
     node.metadata
         .labels
         .as_ref()
-        .and_then(|labels| {
-            labels.get(pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_LABEL)
-        })
-        .map(|value| value != pplx_space_common_core::kubernetes::SSD_PLACEMENT_BLOCKED_VALUE)
+        .and_then(|labels| labels.get(pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_LABEL))
+        .map(|value| value != pplx_space_sandbox_pod::SSD_PLACEMENT_BLOCKED_VALUE)
         .unwrap_or(true)
 }
 
@@ -64,12 +62,8 @@ pub(in crate::controllers::substrate::kubernetes) fn node_services_not_ready(nod
     node.metadata
         .labels
         .as_ref()
-        .and_then(|labels| {
-            labels.get(pplx_space_common_core::kubernetes::NODE_SERVICES_READY_LABEL)
-        })
-        .is_some_and(|value| {
-            value == pplx_space_common_core::kubernetes::NODE_SERVICES_NOT_READY_VALUE
-        })
+        .and_then(|labels| labels.get(pplx_space_sandbox_pod::NODE_SERVICES_READY_LABEL))
+        .is_some_and(|value| value == pplx_space_sandbox_pod::NODE_SERVICES_NOT_READY_VALUE)
 }
 
 fn node_network_slot_capacity(node: &Node) -> Option<u64> {
@@ -77,9 +71,7 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
     let advertised = status
         .capacity
         .as_ref()
-        .and_then(|capacity| {
-            capacity.get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE)
-        })
+        .and_then(|capacity| capacity.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE))
         .and_then(quantity_as_u64)?;
     if advertised == 0 {
         return None;
@@ -89,7 +81,7 @@ fn node_network_slot_capacity(node: &Node) -> Option<u64> {
         .allocatable
         .as_ref()
         .and_then(|allocatable| {
-            allocatable.get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_SLOTS_RESOURCE)
+            allocatable.get(pplx_space_sandbox_pod::SANDBOX_NETWORK_SLOTS_RESOURCE)
         })
         .and_then(quantity_as_u64)
         .or(Some(advertised))
@@ -136,6 +128,32 @@ pub(in crate::controllers::substrate::kubernetes) fn network_slot_capacity_prefl
         NetworkSlotCapacityPreflight::Full
     } else {
         NetworkSlotCapacityPreflight::Unknown
+    }
+}
+
+/// Headroom over nodes the caller already filtered to the start-eligible set.
+///
+/// A node that doesn't advertise the slot resource, or advertises none, adds
+/// no headroom: every sandbox pod requests one slot, so kube-scheduler can't
+/// place one there. Such a node is still reported, because it usually means
+/// node-ctl isn't advertising the node-manager's slot capacity on the Node,
+/// which the metric should show
+/// whether or not the cluster is full.
+pub(in crate::controllers::substrate::kubernetes) fn network_slot_headroom(
+    eligible_nodes: &[std::sync::Arc<Node>],
+    network_slots: &NodeNetworkSlots,
+) -> crate::controllers::substrate::NetworkSlotHeadroom {
+    use crate::controllers::substrate::NetworkSlotHeadroom;
+    let slotless_nodes = eligible_nodes
+        .iter()
+        .any(|node| node_network_slot_capacity(node).is_none());
+    if eligible_nodes
+        .iter()
+        .any(|node| node_network_slot_available(node, network_slots))
+    {
+        NetworkSlotHeadroom::Available { slotless_nodes }
+    } else {
+        NetworkSlotHeadroom::Full { slotless_nodes }
     }
 }
 

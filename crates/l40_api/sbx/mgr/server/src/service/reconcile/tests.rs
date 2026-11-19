@@ -43,7 +43,7 @@ fn insert_due_suspended_sandbox(
     storage_id: &str,
     overdue_by_secs: u64,
 ) {
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
 
@@ -313,7 +313,8 @@ async fn auto_lifecycle_error_after_row_removal_does_not_scan_inventory() {
         .db
         .lock()
         .unwrap()
-        .trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace));
+        .trace_v2(TraceEventCodes::SQLITE_TRACE_PROFILE, Some(trace))
+        .unwrap();
     service
         .handle_auto_lifecycle_error(
             &removed_id.to_string(),
@@ -325,7 +326,8 @@ async fn auto_lifecycle_error_after_row_removal_does_not_scan_inventory() {
         .db
         .lock()
         .unwrap()
-        .trace_v2(TraceEventCodes::empty(), None);
+        .trace_v2(TraceEventCodes::empty(), None)
+        .unwrap();
     assert!(
         STEPS.load(Ordering::Relaxed) < 500,
         "error handling scanned unrelated sandboxes"
@@ -380,7 +382,8 @@ fn reconcile_entry_skips_states_that_cannot_authorize_a_gateway() {
 }
 #[tokio::test]
 async fn activation_reconcile_hydrates_policy_before_runtime_identity_publication() {
-    use pplx_space_common_core::types::{NodeId, RouteGeneration, SandboxActivationAttemptId};
+    use pplx_space_accounts::NodeId;
+    use pplx_space_sandbox_model::{RouteGeneration, SandboxActivationAttemptId};
     use tonic::Code;
 
     // Full suspend retains execution metadata, but clears the live route.
@@ -672,6 +675,72 @@ async fn persistent_route_identity_divergence_does_not_prevent_verification_key_
             .as_slice(),
         ["policy", "route_keys"]
     );
+}
+
+/// A gateway launched before route identity or verification keys answers
+/// their push UNIMPLEMENTED until it is cycled. The policy still converges and
+/// the queue row completes rather than retrying a push that cannot succeed;
+/// any other push failure keeps the row pending.
+#[tokio::test]
+async fn a_gateway_older_than_route_security_completes_the_queued_reconcile() {
+    for (identity_push, key_push, unsupported, expected_operations) in [
+        (
+            Err(Status::unimplemented("")),
+            Ok(()),
+            true,
+            &["policy"][..],
+        ),
+        (
+            Ok(NetGatewayRouteIdentityPushOutcome::Applied {
+                identity_profile_version: 1,
+            }),
+            Err(Status::unimplemented("")),
+            true,
+            &["policy", "route_keys"][..],
+        ),
+        (
+            Err(Status::unavailable("net-gateway restarting")),
+            Ok(()),
+            false,
+            &["policy"][..],
+        ),
+        (
+            Ok(NetGatewayRouteIdentityPushOutcome::Applied {
+                identity_profile_version: 1,
+            }),
+            Err(Status::internal("verification-key push failed")),
+            false,
+            &["policy", "route_keys"][..],
+        ),
+    ] {
+        let operations = std::sync::Mutex::new(Vec::new());
+        let result = reconcile_policy_and_route_security(
+            SandboxState::Started,
+            &SpaceApiRouteIdentity::default(),
+            async { identity_push },
+            async {
+                operations.lock().unwrap().push("policy");
+                Ok(ApplyDecisionKind::Apply)
+            },
+            async |_| {
+                operations.lock().unwrap().push("route_keys");
+                key_push
+            },
+        )
+        .await;
+
+        assert_eq!(*operations.lock().unwrap(), expected_operations);
+        let error = result.expect_err("every case fails a route-security push");
+        assert_eq!(
+            matches!(error, NetworkPolicyReconcileError::UnsupportedGateway(_)),
+            unsupported,
+            "{error}"
+        );
+        assert_eq!(
+            queued_network_policy_result("sandbox-id", Err(error)).is_ok(),
+            unsupported
+        );
+    }
 }
 
 #[test]

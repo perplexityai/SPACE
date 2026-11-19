@@ -1,11 +1,13 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    ContentHash, Digest, MemorySize, SandboxId, SandboxLifecycle, TemplateName, VcpuCount,
-};
+use pplx_space_byte_size::MemorySize;
+use pplx_space_content_digest::{ContentHash, Digest};
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -1898,14 +1900,14 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
         (None, true),
         (Some(131072), true),
     ] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE kubernetes_pool_configs SET disk_mib = $2 WHERE id = $1"
         ))
         .bind(config_id)
         .bind(disk_mib)
         .execute(&fixture.pool)
         .await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE kubernetes_pool_slots SET disk_mib = $2 WHERE id = $1"
         ))
         .bind(slot.id)
@@ -1940,7 +1942,7 @@ async fn store_claims_exclude_oversized_disks_without_consuming_slots() -> TestR
                 allowed,
                 "{disk_mib:?}, exact={exact_shape}"
             );
-            let state: String = sqlx::query_scalar(pplx_space_common_core::sql!(
+            let state: String = sqlx::query_scalar(pplx_space_sql_locator::sql!(
                 "SELECT state FROM kubernetes_pool_slots WHERE id = $1"
             ))
             .bind(slot.id)
@@ -2098,7 +2100,7 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
     let id = WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?;
     tx.commit().await?;
     let created = fixture.store.config_with_counts(id).await?.unwrap();
-    let defaults = pplx_space_common_core::types::DiskIoLimits::default();
+    let defaults = pplx_space_execution_spec::DiskIoLimits::default();
     assert_eq!(
         created.disk_io_max_operations_per_sec,
         i64::try_from(defaults.max_operations_per_sec())?
@@ -2108,7 +2110,7 @@ async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignme
         i64::try_from(defaults.max_bandwidth_mib_per_sec())?
     );
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE kubernetes_pool_configs
          SET disk_io_max_operations_per_sec = $2,
              disk_io_max_bandwidth_mib_per_sec = $3

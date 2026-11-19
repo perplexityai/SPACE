@@ -1,6 +1,6 @@
 use crate::guest_service::connect_uds;
-use pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
 use pplx_space_spaced_guest_client::proto::meta_client::MetaClient as SpacedGuestClient;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
 use std::time::Duration;
 
 pub(crate) fn duration_from_millis(milliseconds: u64) -> prost_types::Duration {

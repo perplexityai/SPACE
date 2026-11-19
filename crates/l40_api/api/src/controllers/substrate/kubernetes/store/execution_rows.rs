@@ -418,7 +418,7 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
         generation: i64,
-        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
         state: &str,
     ) -> Result<bool, SubstrateError> {
         let finished = sqlx::query(sql!(
@@ -491,7 +491,7 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn auto_lifecycle_policy_after_claim(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<pplx_space_common_core::types::AutoLifecyclePolicy, SubstrateError> {
+    ) -> Result<pplx_space_auto_lifecycle::AutoLifecyclePolicy, SubstrateError> {
         pplx_space_sandbox_store::auto_lifecycle_policy(&self.pool, sandbox_id)
             .await
             .map_err(sqlx::Error::from)
@@ -712,7 +712,7 @@ impl K8sStore {
         expected_lifecycle: SandboxLifecycle,
         restore_lease_token: Option<Uuid>,
         activation_attempt: Option<(
-            pplx_space_common_core::types::SandboxActivationAttemptId,
+            pplx_space_sandbox_model::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
@@ -770,7 +770,7 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
         activation_attempt: Option<(
-            pplx_space_common_core::types::SandboxActivationAttemptId,
+            pplx_space_sandbox_model::SandboxActivationAttemptId,
             SandboxTransitionTargetState,
         )>,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
@@ -982,7 +982,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
         restore_lease_token: Option<Uuid>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -1076,7 +1076,7 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
         restore_lease_token: Option<Uuid>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Result<bool, SubstrateError> {
         let mut tx = self
             .pool
@@ -1153,7 +1153,7 @@ impl K8sStore {
                     e.k8s_node_name, e.state, s.lifecycle,
                     e.updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
                     e.activation_attempt_id,
-                    e.route_activation_id
+                    e.route_activation_id, s.activating_client_id
              FROM sandbox_k8s_executions e
              JOIN sandboxes s ON s.id = e.sandbox_id
              WHERE e.sandbox_id = $1 AND e.active"

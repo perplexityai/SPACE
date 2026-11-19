@@ -7,13 +7,14 @@ use std::path::PathBuf;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::SandboxManagerServiceOptions;
 use crate::state::SandboxStatus;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxActivationAttemptId};
-use pplx_space_common_core::types::{
-    SandboxArtifactMetadata, SandboxId, SnapshotExecutionMetadata,
-};
+use pplx_space_artifact_model::SandboxArtifactMetadata;
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotResponse, RestoreInstanceSnapshotResponse,
 };
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use std::sync::{Arc, Mutex};
 
 pub(in crate::service::runtime_upgrade) struct Fixture {
@@ -29,7 +30,7 @@ pub(in crate::service::runtime_upgrade) struct Fixture {
 pub(in crate::service::runtime_upgrade) fn environments() -> (ExecutionMetadata, ExecutionMetadata)
 {
     let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     (
@@ -125,6 +126,7 @@ impl Fixture {
             &self.service.db.lock().unwrap(),
             &self.sandbox_id,
             self.target.environment().unwrap(),
+            crate::db::RuntimeUpgradeTargetState::Started,
             identity,
         )
     }
@@ -148,6 +150,15 @@ impl Fixture {
 
     pub(in crate::service::runtime_upgrade) fn adopt_checkpoint(&self) -> LocalArtifactId {
         let artifact = LocalArtifactId::new();
+        self.adopt_checkpoint_as(artifact);
+        artifact
+    }
+
+    /// Pin `artifact` as the suspended sandbox's checkpoint.
+    pub(in crate::service::runtime_upgrade) fn adopt_checkpoint_as(
+        &self,
+        artifact: LocalArtifactId,
+    ) {
         assert!(
             crate::db::adopt_suspended_local_artifact(
                 &self.service.db.lock().unwrap(),
@@ -157,7 +168,6 @@ impl Fixture {
             )
             .unwrap()
         );
-        artifact
     }
 
     fn staged(&self, id: impl std::fmt::Display) -> PathBuf {
@@ -638,7 +648,7 @@ async fn the_stop_is_admitted_only_for_the_boots_execution() {
         let f = fixture(state, false, FakeNodeManager::default());
         let boot = SandboxActivationAttemptId::new();
         set_execution(&f, boot);
-        let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+        let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
 
         let refused = f
             .service
@@ -672,7 +682,7 @@ async fn the_stop_leaves_the_boots_execution_alone_once_it_is_at_rest() {
         let f = fixture(state, false, FakeNodeManager::default());
         let boot = SandboxActivationAttemptId::new();
         set_execution(&f, boot);
-        let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+        let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
 
         let refused = f
             .service
@@ -702,7 +712,7 @@ async fn a_stop_that_cant_open_its_claim_is_refused() {
     let f = fixture(SandboxState::Started, false, FakeNodeManager::default());
     let boot = SandboxActivationAttemptId::new();
     set_execution(&f, boot);
-    let sandbox_id: pplx_space_common_core::types::SandboxId = f.sandbox_id.parse().unwrap();
+    let sandbox_id: pplx_space_sandbox_model::SandboxId = f.sandbox_id.parse().unwrap();
     // A transaction left open makes the claim's own BEGIN fail.
     f.service.db.lock().unwrap().execute_batch("BEGIN").unwrap();
 
@@ -754,7 +764,7 @@ pub(in crate::service::runtime_upgrade) fn certified_target(
 ) -> ExecutionMetadata {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let compiled =
-        CompiledEnvironment::for_architecture(pplx_space_common_core::types::Arch::X86_64).unwrap();
+        CompiledEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64).unwrap();
     let target = CompiledEnvironment::of_execution(&compiled, source)
         .unwrap()
         .upgrade_targets()[0];
@@ -976,7 +986,7 @@ fn every_caller_allowed_a_wake_start_context_may_also_upgrade() {
 /// A suspended Wake upgrade naming another node as the checkpoint's source
 /// and a backup to stage, as the control plane sends for a pod placed away
 /// from the checkpoint.
-fn remote_upgrade_wake(
+pub(in crate::service::runtime_upgrade) fn remote_upgrade_wake(
     f: &Fixture,
     checkpoint: Option<LocalArtifactId>,
 ) -> crate::proto::WakeRequest {

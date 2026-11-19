@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{OrgId, SnapshotId};
+use pplx_space_accounts::OrgId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::{
     future::Future,
@@ -7,16 +8,16 @@ use std::{
 };
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::types::{
-    ArtifactKind, BackupAttemptId, BackupSource, EcwCredentialEpoch, ExecutionGeneration,
-    SandboxId, SandboxLifecycle, SnapshotState,
-};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicForkOperationResult, PublicOperationResult,
 };
+use pplx_space_sandbox_model::{
+    EcwCredentialEpoch, ExecutionGeneration, SandboxId, SandboxLifecycle,
+};
+use pplx_space_snapshot_model::{ArtifactKind, BackupAttemptId, BackupSource, SnapshotState};
 use sqlx::PgPool;
 
 use crate::controllers::substrate::{
@@ -157,7 +158,7 @@ async fn failed_backup_attempt(
     pool: &PgPool,
     attempt_id: BackupAttemptId,
 ) -> Result<Option<String>, ForkExecutionError> {
-    let row = sqlx::query_as::<_, (String, Option<String>)>(pplx_space_common_core::sql!(
+    let row = sqlx::query_as::<_, (String, Option<String>)>(pplx_space_sql_locator::sql!(
         "SELECT state, failure_reason FROM snapshots WHERE id = $1"
     ))
     .bind(attempt_id.as_uuid())
@@ -1076,6 +1077,7 @@ impl ForkSandboxOperationExecutor {
                         &request,
                         SandboxApiMetricIdentity::ecw("fork"),
                         RestoreForkDiskAsNewContext {
+                            activating_client: payload.activating_client(),
                             volume_encryption: config.volume_encryption,
                             sandbox_id: target_id,
                             federated,
@@ -1610,6 +1612,7 @@ fn create_request(
             requested_timeout.get(),
         )),
         wait_until_ready: true,
+        command_ready_wait: None,
         network_policy: config.network_policy.clone(),
         node_pool: None,
     }
@@ -1618,7 +1621,7 @@ fn create_request(
 fn frozen_source_template_reference(
     source_template_id: &str,
     source_content_hash: Option<&str>,
-) -> Result<pplx_space_common_core::types::TemplateReference, ForkExecutionError> {
+) -> Result<pplx_space_template_model::TemplateReference, ForkExecutionError> {
     let source_content_hash = source_content_hash
         .ok_or_else(|| ForkExecutionError::terminal("source sandbox has no content hash"))?;
     format!("{source_template_id}@{source_content_hash}")

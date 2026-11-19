@@ -1,10 +1,11 @@
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_sql_locator::sql;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pplx_space_accounts::NodeId;
 use pplx_space_api::controllers::substrate::ActivationOptions;
 use pplx_space_api::controllers::substrate::kubernetes::{
     GenerationTeardownEvidence, KubernetesSubstrate, observe_generation_teardown_with_node_api,
@@ -16,19 +17,18 @@ use pplx_space_api::controllers::substrate::{
     enqueue_artifact_backup_with_node_api, sandbox_state_with_node_api,
 };
 use pplx_space_api::reconcile_queue::{ReconcileRef, enqueue_sandbox_reconcile};
-use pplx_space_common_core::kubernetes::EvacuationPlacement;
-use pplx_space_common_core::node_drain_signals::{
+use pplx_space_durations::PositiveDuration;
+use pplx_space_events::{
+    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+};
+use pplx_space_node_model::{NodeDrainMode, NodeManagedBy, NodeRole, SubstrateKind};
+use pplx_space_rpc_contracts::node_drain_signals::{
     EVACUATION_RESTORE_READY_CHANNEL, REUPLOAD_ARTIFACT_MISSING_MARKER,
     REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
     SUSPEND_SANDBOX_FAILED_MARKER,
 };
-use pplx_space_common_core::types::{
-    ArtifactKind, BackupSource, ExecutionGeneration, LocalArtifactId, NodeDrainMode, NodeId,
-    NodeManagedBy, NodeRole, PositiveDuration, SandboxId, SubstrateKind,
-};
-use pplx_space_events::{
-    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
-};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
+use pplx_space_sandbox_pod::EvacuationPlacement;
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, drain_gate_blockers_for_node,
     inflight_suspend_upload_exists, latest_full_snapshot_ready,
@@ -39,6 +39,7 @@ use pplx_space_sandbox_store::drain::{
     self, StoppedEvacuationClaim, claim_evacuation_suspend, claim_stopped_evacuation,
     gone_node_identity_guards, record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
 };
+use pplx_space_snapshot_model::{ArtifactKind, BackupSource, LocalArtifactId};
 
 use pplx_space_api::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::NodeApiClient;
@@ -55,7 +56,7 @@ use super::{
     SUSPEND_EVACUABLE_LIFECYCLES, TerminationBlockingResidents, enabled_evacuable_lifecycles,
     is_evacuable_lifecycle, is_suspend_evacuable_lifecycle,
 };
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 fn emit_node_drain_event(
     sandbox_id: SandboxId,
@@ -3304,7 +3305,7 @@ impl NodeDrainSink for SubstrateSink {
             // `FailedPrecondition` into `SubstrateError::Conflict` with
             // the message verbatim. Both producer and consumer
             // reference the shared constants in
-            // `pplx_space_common_core::node_drain_signals`, so a
+            // `pplx_space_rpc_contracts::node_drain_signals`, so a
             // reworded producer message cannot silently flip this
             // classifier from "terminal, mark sandbox failed" to "retry
             // forever".
@@ -3348,7 +3349,9 @@ impl NodeDrainSink for SubstrateSink {
             Err(
                 SubstrateError::Unavailable { message }
                 | SubstrateError::SandboxNoPod { message }
+                | SubstrateError::Unschedulable { message }
                 | SubstrateError::NotFound { message }
+                | SubstrateError::InvalidRequest { message }
                 | SubstrateError::Conflict { message }
                 | SubstrateError::FailedPrecondition { message }
                 | SubstrateError::Timeout { message, .. }
@@ -3357,6 +3360,7 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::RestoreInFlight { message, .. }
                 | SubstrateError::SuspendInFlight { message }
                 | SubstrateError::RetainedFilesystemOnlyCopy { message }
+                | SubstrateError::NodeDeleteNotAdmitted { message }
                 | SubstrateError::ActivationInFlight { message, .. }
                 | SubstrateError::AdmissionRejected { message, .. }
                 | SubstrateError::Cancelled { message }
@@ -5327,6 +5331,12 @@ mod residency_tests;
 #[cfg(test)]
 mod termination_gate_tests;
 
+/// Postgres-backed agreement between the admin holds read's gate terms and
+/// the counts node-drain's own resident, blocker and termination-blocking
+/// statements return, so a drift in either side fails a test.
+#[cfg(test)]
+mod node_holds_agreement_tests;
+
 /// Postgres-backed coverage for evacuating a `stopped` resident: the claim the
 /// marker-clearing trigger must not eat, the durability gate that authorizes
 /// destroying the user's rootfs, and the re-placement sweep's second arm.
@@ -5388,3 +5398,8 @@ mod stopped_replacement_tests;
 /// the one cluster pin a fresh evacuation may take, and each one it refuses.
 #[cfg(test)]
 mod stopped_re_drain_tests;
+
+/// The promotion's backup enqueue against a node that refuses a sandbox not
+/// yet stopped or suspended.
+#[cfg(test)]
+mod not_yet_stopped_backup_tests;

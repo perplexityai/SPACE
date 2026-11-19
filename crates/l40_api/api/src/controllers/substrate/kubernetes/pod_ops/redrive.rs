@@ -84,6 +84,15 @@ pub(super) enum PreconditionReread {
     Indeterminate,
 }
 
+/// Whether a re-drive leaves `pod` in place: it has bound, or it lacks the
+/// required pin because a concurrent re-drive already replaced it.
+pub(super) fn redrive_retains(pod: &SandboxPodView) -> bool {
+    matches!(
+        scheduling_outcome_of(pod),
+        Some(SchedulingOutcome::Scheduled { .. })
+    ) || !pod.has_required_source_pin()
+}
+
 pub(super) fn classify_precondition_reread(
     now_live: Option<&SandboxPodView>,
     caller_source_node: Option<&str>,
@@ -142,7 +151,7 @@ struct RedriveClaimGuard {
     pod_name: String,
     generation: i64,
     restore_lease_token: Option<Uuid>,
-    activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
 }
 
 impl RedriveClaimGuard {
@@ -157,7 +166,7 @@ impl RedriveClaimGuard {
         sandbox_id: SandboxId,
         claim: &SandboxExecutionClaim,
         restore_lease_token: Option<Uuid>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Self {
         Self {
             handles: Some((store.clone(), k8s.clone())),
@@ -296,7 +305,7 @@ impl KubernetesSubstrate {
     /// through here so the counter sees every attempt, including the ones
     /// that return before any placement sample is emitted.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn redrive_unschedulable_restore_cross_node_recorded(
+    pub(in crate::controllers::substrate::kubernetes) async fn redrive_unschedulable_restore_cross_node_recorded(
         &self,
         path: crate::metrics::sandbox::restore::RedrivePath,
         sandbox: &Sandbox,
@@ -305,6 +314,7 @@ impl KubernetesSubstrate {
         caller_source_node: Option<&str>,
         suspend_restore_storage_uri: Option<&str>,
         restore_lease_token: Option<Uuid>,
+        client_id: Option<&ClientId>,
     ) -> Result<RedriveOutcome, SubstrateError> {
         let mut metric = RedriveMetricGuard {
             path,
@@ -318,6 +328,7 @@ impl KubernetesSubstrate {
                 caller_source_node,
                 suspend_restore_storage_uri,
                 restore_lease_token,
+                client_id,
             )
             .await;
         metric.outcome = Some(redrive_metric_outcome(&result));
@@ -355,6 +366,7 @@ impl KubernetesSubstrate {
     ///
     /// The blocking delete confirms absence before the same-name re-POST so it
     /// can't 409.
+    #[allow(clippy::too_many_arguments)]
     async fn redrive_unschedulable_restore_cross_node(
         &self,
         sandbox: &Sandbox,
@@ -363,6 +375,9 @@ impl KubernetesSubstrate {
         caller_source_node: Option<&str>,
         suspend_restore_storage_uri: Option<&str>,
         restore_lease_token: Option<Uuid>,
+        // The label of the successor pod: the client of the activation that
+        // drives this re-drive.
+        client_id: Option<&ClientId>,
     ) -> Result<RedriveOutcome, SubstrateError> {
         let pod_name = &claim.row.pod_name;
         let activation_attempt_id = claim.row.activation_attempt_id;
@@ -376,12 +391,7 @@ impl KubernetesSubstrate {
         // (a concurrent re-drive already replaced it with a same-name
         // successor) is left alone.
         let live_identity = match live.as_ref() {
-            Some(pod)
-                if matches!(
-                    scheduling_outcome_of(pod),
-                    Some(SchedulingOutcome::Scheduled { .. })
-                ) || !pod.has_required_source_pin() =>
-            {
+            Some(pod) if redrive_retains(pod) => {
                 tracing::info!(
                     sandbox_id = %sandbox.id,
                     pod_name = %pod_name,
@@ -642,6 +652,9 @@ impl KubernetesSubstrate {
             let node_group_placement = self
                 .resolve_node_group_placement(sandbox, &cross_node_context)
                 .await?;
+            let environment = self
+                .resolve_pod_environment(sandbox, &cross_node_context)
+                .await?;
 
             let cross_node_pod = match create_sandbox_pod(
                 &self.k8s,
@@ -653,6 +666,8 @@ impl KubernetesSubstrate {
                         auto_lifecycle_json: &auto_lifecycle_json,
                         network_policy_json: &network_policy_json,
                         node_group_placement: node_group_placement.placement(),
+                        environment,
+                        client_id,
                     },
                     cross_node_context,
                 ),
@@ -689,6 +704,7 @@ impl KubernetesSubstrate {
                     claim_lifecycle,
                     cross_node_pod.uid(),
                     None,
+                    cross_node_pod.client_id().as_ref(),
                 )
                 .await
             {

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
-use pplx_space_common_core::env::valid_positive_f64;
+use pplx_space_env_vars::valid_positive_f64;
 use pplx_space_sandbox_metrics::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionPermitOutcome, AdmissionQueueOutcome,
     AdmissionRejectReason,

@@ -3,7 +3,7 @@ use crate::db::test_fixtures::state_write_fixtures::{admit_stop, complete_stop};
 
 #[test]
 fn snapshot_inventory_does_not_return_partial_success_for_oversized_sidecars() {
-    use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+    use pplx_space_rpc_contracts::inventory::MAX_ENCODED_BYTES;
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("f-large");
     std::fs::create_dir(&directory).unwrap();
@@ -30,7 +30,7 @@ fn snapshot_inventory_does_not_return_partial_success_for_oversized_sidecars() {
 #[tokio::test]
 async fn rollback_checkout_excludes_gc_and_rejects_existing_delete_owner() {
     use crate::service::tests::service_tests::service_for_teardown_test;
-    use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId};
+    use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
     let service = service_for_teardown_test(crate::db::test_conn());
     let sandbox = uuid::Uuid::now_v7().to_string();
     let name = "f-checkout";
@@ -48,7 +48,7 @@ async fn rollback_checkout_excludes_gc_and_rejects_existing_delete_owner() {
             artifact,
             ArtifactKind::Full,
             &name.parse().unwrap(),
-            &pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(&sandbox, name),
+            &pplx_space_host_layout::paths::sandbox_snapshot_dir(&sandbox, name),
         )
         .unwrap();
     let reader = service
@@ -81,7 +81,7 @@ async fn rollback_checkout_excludes_gc_and_rejects_existing_delete_owner() {
 #[test]
 fn transferred_disk_snapshot_inventory_requires_publication_and_valid_binding() {
     use crate::local_artifacts::{ArtifactState, NamedArtifactPublication};
-    use pplx_space_common_core::types::{ArtifactKind, SnapshotName};
+    use pplx_space_snapshot_model::{ArtifactKind, SnapshotName};
     let root = tempfile::tempdir().unwrap();
     let mut btrfs = Vec::new();
     let mut publications = Vec::new();
@@ -166,7 +166,7 @@ fn transferred_disk_snapshot_inventory_requires_publication_and_valid_binding() 
 #[test]
 fn snapshot_inventory_requires_publication_and_capture_files_and_never_invents_provenance() {
     use crate::local_artifacts::{ArtifactState, NamedArtifactPublication};
-    use pplx_space_common_core::types::{ArtifactKind, SnapshotName};
+    use pplx_space_snapshot_model::{ArtifactKind, SnapshotName};
     let root = tempfile::tempdir().unwrap();
     let cases = [
         ("f-ready", Some(ArtifactState::Ready), true, true, "ready"),
@@ -494,11 +494,11 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
 /// through for all.
 #[tokio::test]
 async fn delete_snapshots_answers_each_named_delete_outcome() {
-    use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
     use pplx_space_node_mgr_client::proto::{
         BtrfsSnapshotInfo, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
         ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
     };
+    use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
     use std::path::Path;
     use tonic::Code;
 
@@ -739,7 +739,7 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
 /// GC staging, in the fixed-length `.gc-pending-<id>` shape and in the earlier
 /// `<name>.gc-pending-<id>` one that keeps the snapshot's own name.
 fn gc_staging_names() -> [String; 2] {
-    let id = pplx_space_common_core::types::LocalArtifactId::new();
+    let id = pplx_space_snapshot_model::LocalArtifactId::new();
     [
         format!(".gc-pending-{id}"),
         format!("d-user-keep.gc-pending-{id}"),
@@ -756,7 +756,7 @@ const MARKER_IN_ORDINARY_NAMES: [&str; 2] = ["d-x.gc-pending-note", "run.gc-pend
 #[test]
 fn snapshot_inventory_omits_gc_staging() {
     let root = tempfile::tempdir().unwrap();
-    let id = pplx_space_common_core::types::LocalArtifactId::new();
+    let id = pplx_space_snapshot_model::LocalArtifactId::new();
     // Only on disk: the scan for full snapshots finds it.
     std::fs::create_dir(
         root.path()

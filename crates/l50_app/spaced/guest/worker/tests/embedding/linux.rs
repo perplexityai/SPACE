@@ -2,7 +2,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use pplx_space_common_core::types::{EnvMap, GuestUserName};
+use pplx_space_guest_process::{EnvMap, GuestUserName};
 use pplx_space_spaced_guest_execution::{
     ExecutionService, ExecutionServiceConfig, WorkerExecutable,
 };

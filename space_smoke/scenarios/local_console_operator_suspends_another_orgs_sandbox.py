@@ -5,10 +5,9 @@ import space_smoke as smoke
 
 @smoke.scenario(
     "local.console_operator_suspends_another_orgs_sandbox",
-    sandbox=smoke.SandboxConfig(timeout=900),
     browser="chromium",
 )
-def console_operator_suspends_another_orgs_sandbox(test: smoke.KindEcw) -> None:
+def console_operator_suspends_another_orgs_sandbox(test: smoke.KindAdmin) -> None:
     """For a running sandbox of an organization other than the one managing
     the cluster, the operator's console page names that organization, and its
     Suspend leaves the sandbox suspended in the admin API, still owned by that

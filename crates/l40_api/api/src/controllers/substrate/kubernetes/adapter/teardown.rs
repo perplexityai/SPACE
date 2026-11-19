@@ -36,6 +36,27 @@ fn fenced_runtime_pod_ip(
     assigned_pod_ip(live_pod).ok().flatten()
 }
 
+/// Whether the node reports an ambiguously acknowledged delete as admitted:
+/// the requested row is in `deleting`, which sbx-mgr enters
+/// only after the delete's refusals pass. A missing row is not proof of
+/// admission: node-local files can outlive it. Anything else,
+/// including a probe that fails or does not answer in time, means the refusals
+/// may not have run.
+async fn node_delete_admitted(client: &mut RuntimeClient, sandbox_id: SandboxId) -> bool {
+    use pplx_space_sbx_mgr_client::proto::{SandboxLifecycleState, StateRequest};
+    let probe = client.sandbox_state(StateRequest {
+        sandbox_ids: vec![sandbox_id.to_string()],
+    });
+    let Ok(Ok(response)) = tokio::time::timeout(TEARDOWN_NODE_DELETE_ADMISSION_PROBE, probe).await
+    else {
+        return false;
+    };
+    response.into_inner().sandboxes.iter().any(|sandbox| {
+        sandbox.sandbox_id == sandbox_id.to_string()
+            && sandbox.lifecycle() == SandboxLifecycleState::Deleting
+    })
+}
+
 /// Project the world as it is now into the same shape the fence carries, so
 /// the two can be compared as whole values rather than field by field. One
 /// constructor, so the comparison and every database guard read the same
@@ -307,6 +328,10 @@ impl KubernetesSubstrate {
                     sandbox_id,
                     &current_execution_identity(&active, live_pod.as_deref()),
                     observed_uid,
+                    live_pod
+                        .as_deref()
+                        .and_then(SandboxPodView::client_id)
+                        .as_ref(),
                 )
                 .await;
             }
@@ -384,10 +409,11 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         observed_uid: &str,
+        observed_client: Option<&pplx_space_accounts::ClientId>,
     ) {
         match self
             .store
-            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid)
+            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid, observed_client)
             .await
         {
             Ok(_) => tracing::info!(
@@ -501,7 +527,37 @@ impl KubernetesSubstrate {
             let node_name = fenced
                 .as_ref()
                 .and_then(|fenced| fenced.node_name.as_deref());
-            let worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+            let mut worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+            // A delete must reach sbx-mgr to be admitted. The pod's IP reaches
+            // it only through the pod's own network namespace, which a dead VM
+            // can take with it while the node itself answers (a runtime crash,
+            // or a quarantined sandbox an operator then discarded). The node's
+            // node-api, found by the execution's node name, still reaches the
+            // same sbx-mgr, which admits the delete or refuses it as before.
+            if worker.is_err()
+                && mode.sends_sandbox_delete()
+                && stop_route == RetireStopRoute::Execution
+            {
+                // A fenced teardown stays pinned to the node its fence read:
+                // asking what is active now could name a successor. Only an
+                // unfenced delete, which targets whatever execution backs the
+                // sandbox, reads the execution's node here.
+                let execution_node = match (&fenced, node_name) {
+                    (Some(_), node) => node.map(str::to_owned),
+                    (None, _) => self
+                        .store
+                        .active_execution_status(sandbox_id)
+                        .await?
+                        .and_then(|active| active.k8s_node_name),
+                };
+                if let Some(node) = execution_node.as_deref() {
+                    let unreachable = worker.as_ref().err().cloned().unwrap_or_default();
+                    worker = self
+                        .teardown_worker(pod_ip, RetireStopRoute::Node, Some(node))
+                        .await
+                        .map_err(|node_cause| format!("{unreachable}; {node_cause}"));
+                }
+            }
             if let Ok((endpoint_addr, mut client)) = worker {
                 if mode.sends_sandbox_stop() {
                     let stop_result = client
@@ -550,48 +606,77 @@ impl KubernetesSubstrate {
                         }
                     }
                 }
-                if mode.sends_sandbox_delete()
-                    && let Err(error) = client
-                        .delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
+                if mode.sends_sandbox_delete() {
+                    let node_delete_wait = self.budgets.teardown_node_delete_wait;
+                    let node_delete = tokio::time::timeout(
+                        node_delete_wait,
+                        client.delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
                             sandbox_id: sandbox_id.to_string(),
                             template_filter: None,
-                            blocking: true,
-                        })
-                        .await
-                {
-                    match classify_sandbox_delete_rpc_error(&error) {
-                        SandboxDeleteRpcErrorDisposition::DeferTeardown => {
-                            return Err(SubstrateError::SuspendInFlight {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
-                            return Err(SubstrateError::RetainedFilesystemOnlyCopy {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::ContinueTeardown => {
-                            tracing::warn!(
-                                sandbox_id = %sandbox_id,
-                                error = %error,
-                                "best-effort sandbox delete RPC failed during execution teardown"
-                            );
+                            blocking: false,
+                            discard_retained_filesystem_reason: None,
+                        }),
+                    )
+                    .await;
+                    let error = match node_delete {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_elapsed) => Some(tonic::Status::deadline_exceeded(
+                            "node-local delete admission did not answer within its wait budget",
+                        )),
+                    };
+                    if let Some(error) = error {
+                        match classify_sandbox_delete_rpc_error(&error) {
+                            SandboxDeleteRpcErrorDisposition::DeferTeardown => {
+                                return Err(SubstrateError::SuspendInFlight {
+                                    message: format!(
+                                        "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
+                                    ),
+                                });
+                            }
+                            SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
+                                return Err(SubstrateError::RetainedFilesystemOnlyCopy {
+                                    message: format!(
+                                        "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
+                                    ),
+                                });
+                            }
+                            SandboxDeleteRpcErrorDisposition::ProbeAdmission => {
+                                // A lost reply does not cancel durable cleanup.
+                                // Conversely, a transport or storage error is
+                                // not evidence that admission ever happened.
+                                if !node_delete_admitted(&mut client, sandbox_id).await {
+                                    return Err(SubstrateError::NodeDeleteNotAdmitted {
+                                        message: format!(
+                                            "sandbox {sandbox_id} node-local delete admission is unconfirmed; keeping execution tracked for retry: {error}"
+                                        ),
+                                    });
+                                }
+                                tracing::debug!(
+                                    sandbox_id = %sandbox_id,
+                                    error = %error,
+                                    "confirmed node-local delete admission after an ambiguous reply"
+                                );
+                            }
                         }
                     }
                 }
-            } else if let Err(cause) = worker
-                && mode.requires_stop_success()
-            {
-                return Err(SubstrateError::Failed {
-                    message: format!(
-                        "{cause} for in-VM stop during execution retire; \
-                         keeping execution tracked for retry"
-                    ),
-                });
+            } else if let Err(cause) = worker {
+                if mode.sends_sandbox_delete() {
+                    return Err(SubstrateError::NodeDeleteNotAdmitted {
+                        message: format!(
+                            "{cause} for node-local delete admission; keeping execution tracked for retry"
+                        ),
+                    });
+                }
+                if mode.requires_stop_success() {
+                    return Err(SubstrateError::Failed {
+                        message: format!(
+                            "{cause} for in-VM stop during execution retire; \
+                             keeping execution tracked for retry"
+                        ),
+                    });
+                }
             }
         }
 
@@ -624,8 +709,13 @@ impl KubernetesSubstrate {
                         })?
             {
                 if let Some(observed_uid) = materialized.uid() {
-                    self.hydrate_materialized_pod_uid(sandbox_id, &fenced.identity, observed_uid)
-                        .await;
+                    self.hydrate_materialized_pod_uid(
+                        sandbox_id,
+                        &fenced.identity,
+                        observed_uid,
+                        materialized.client_id().as_ref(),
+                    )
+                    .await;
                 }
                 return Ok(self.refuse_fenced_teardown(
                     sandbox_id,

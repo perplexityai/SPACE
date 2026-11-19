@@ -5,7 +5,8 @@ mod runtime_desired_state;
 mod substrate_scope;
 #[cfg(feature = "kubernetes")]
 mod template_node_identity;
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, OrgId, SnapshotId, UserId};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::metadata::*;
 use super::*;
@@ -24,17 +25,16 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Claims, ed25519::SpaceApiRouteEd25519Token,
     ed25519::decode_unverified_space_api_route_ed25519_claims,
 };
-use pplx_space_common_core::{
-    sql,
-    types::{EcwCredentialEpoch, ExecutionGeneration, GuestPort, SandboxId},
-};
 use pplx_space_common_grpc::SandboxServiceRouteNotReady;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID as SEEDED_ORG_ID, SEED_USER_ID as SEEDED_USER_ID, TestDb, insert_ready_worker_node,
     try_pg_test_db_with_max_connections,
 };
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind};
+use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_sim::SimWorkerHarness;
+use pplx_space_sandbox_model::{EcwCredentialEpoch, ExecutionGeneration, SandboxId};
+use pplx_space_sql_locator::sql;
 use sha2::{Digest, Sha256};
 use tonic::Code;
 use uuid::Uuid;
@@ -410,7 +410,7 @@ async fn register_release(
 async fn register_release_with_execution(
     service: &ClusterApiService,
     hash: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
@@ -1233,7 +1233,9 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
 /// metadata is backfilled by a later registration that has it.
 #[tokio::test(flavor = "current_thread")]
 async fn register_template_release_persists_execution_metadata_write_once() -> TestResult {
-    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -1333,7 +1335,8 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
 /// as they were, including a `NULL` metadata column.
 #[tokio::test(flavor = "current_thread")]
 async fn tags_only_republication_leaves_locations_and_metadata_unchanged() -> TestResult {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::ExecutionMetadata;
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -4726,31 +4729,27 @@ fn test_storage_uri(sandbox_id: SandboxId, snapshot_id: SnapshotId) -> String {
 }
 
 fn test_snapshot_execution_for_arch(
-    arch: pplx_space_common_core::types::Arch,
+    arch: pplx_space_cpu_arch::Arch,
 ) -> pplx_space_execution_common::proto::ExecutionMetadata {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+    let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
         arch,
-        vec![pplx_space_common_core::types::ArtifactComponentMetadata {
-            kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
-            role: Some(
-                pplx_space_common_core::types::ArtifactComponentRole::parse("boot").unwrap(),
-            ),
-            version: Some(
-                pplx_space_common_core::types::ArtifactVersion::parse("6.10.14").unwrap(),
-            ),
+        vec![pplx_space_execution_spec::ArtifactComponentMetadata {
+            kind: pplx_space_execution_spec::ArtifactComponentKind::Kernel,
+            role: Some(pplx_space_execution_spec::ArtifactComponentRole::parse("boot").unwrap()),
+            version: Some(pplx_space_execution_spec::ArtifactVersion::parse("6.10.14").unwrap()),
             digest: Some(
                 format!("sha256:{}", "c".repeat(64))
-                    .parse::<pplx_space_common_core::types::Digest>()
+                    .parse::<pplx_space_content_digest::Digest>()
                     .unwrap(),
             ),
-            format: Some(pplx_space_common_core::types::ArtifactFormat::parse("vmlinux").unwrap()),
+            format: Some(pplx_space_execution_spec::ArtifactFormat::parse("vmlinux").unwrap()),
         }],
     );
     (&execution).into()
 }
 
 fn test_snapshot_execution() -> pplx_space_execution_common::proto::ExecutionMetadata {
-    test_snapshot_execution_for_arch(pplx_space_common_core::types::Arch::Aarch64)
+    test_snapshot_execution_for_arch(pplx_space_cpu_arch::Arch::Aarch64)
 }
 
 /// Seed a `creating` suspend snapshot without artifact identity: the row
@@ -4912,7 +4911,7 @@ async fn suspend_snapshot_rejects_reused_id_with_different_identity() -> TestRes
         (
             "different execution",
             sandbox_id,
-            test_snapshot_execution_for_arch(pplx_space_common_core::types::Arch::X86_64),
+            test_snapshot_execution_for_arch(pplx_space_cpu_arch::Arch::X86_64),
         ),
     ] {
         let error = seed_suspend_snapshot_with_identity(
@@ -5033,6 +5032,7 @@ async fn begin_artifact_backup_from_node(
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: None,
                 execution_generation: None,
+                execution_generation_names_capture: false,
                 fence_verdict_only: false,
             },
             node_ip,
@@ -5068,6 +5068,7 @@ async fn begin_artifact_backup_with_storage_uri(
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: None,
                 execution_generation: None,
+                execution_generation_names_capture: false,
                 fence_verdict_only: false,
             },
             TEST_WORKER_IP,
@@ -5946,6 +5947,7 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
             execution: None,
             capture_host_cpu: None,
             execution_generation: None,
+            execution_generation_names_capture: false,
             fence_verdict_only: false,
         }))
         .await
@@ -5986,6 +5988,7 @@ async fn begin_artifact_backup_persists_capture_host_cpu() -> TestResult {
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: capture_host_cpu.map(str::to_owned),
                 execution_generation: None,
+                execution_generation_names_capture: false,
                 fence_verdict_only: false,
             },
             TEST_WORKER_IP,
@@ -7711,7 +7714,7 @@ async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult
     assert_eq!(invalid.code(), Code::Unauthenticated);
 
     for surfaces in [vec!["ecw"], vec!["native"], vec!["ecw", "native"]] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE api_keys SET allowed_surfaces = $1 WHERE key_hash = $2"
         ))
         .bind(&surfaces)
@@ -7734,7 +7737,7 @@ async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult
         }
     }
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE api_keys SET org_id = '00000000-0000-0000-0000-000000000002' WHERE key_hash = $1"
     ))
     .bind(&key_hash)

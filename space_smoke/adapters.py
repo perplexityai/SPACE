@@ -111,6 +111,7 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
+from space_smoke.execution_environment import ALLOWED_ENVIRONMENTS_ENV
 from space_smoke.leader_election import RECONCILER_TICK_ENV
 from space_smoke.reconcile_queue_gc import (
     GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
@@ -533,6 +534,7 @@ _LIVENESS_BUDGET_VALUE = re.compile(r"[1-9][0-9]{0,3}")
 # back, kubelets and the controller-manager take a minute or more to watch
 # new pods again, while a CRI exec needs neither.
 REFUSED_CONTENDER_NAME = "space-cluster-controller-refused"
+BUDGET_CONTENDER_NAME = "space-cluster-controller-budget"
 REFUSED_CONTENDER_SELECTOR = f"app.kubernetes.io/name={REFUSED_CONTENDER_NAME}"
 REFUSED_CONTENDER_SERVICE_ACCOUNT = "space-api"
 REFUSED_CONTENDER_GATE_CONTAINER = "space-smoke-gate"
@@ -564,6 +566,13 @@ NODE_API = "node-api"
 WORKER_NODE_CTL_DAEMONSET = f"space-{NODE_CTL}"
 UNANSWERED_TEMPLATE_EVICT_AFTER_ENV = "SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS"
 UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (10, 600)
+# The node-manager DaemonSets (worker and builder), on which the
+# execution-environment admission may set `ALLOWED_ENVIRONMENTS_ENV`
+# (`space_smoke/execution_environment.py`).
+NODE_MANAGER_DAEMONSETS = (f"space-{NODE_MANAGER}", f"space-builder-{NODE_MANAGER}")
+# Three hours: longer than the longest budget of a scenario that holds the
+# admission (150 minutes, its cleanup included).
+NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS = 3 * 3600
 NODE_TEMPLATE_PRESENCE_PREFIX = "space.pplx.net/template-build-"
 # The node services that read the object store, by DaemonSet and the
 # container that does: each holds the store's static keys in
@@ -879,7 +888,7 @@ done
 true
 """
 # The rootfs object each suspend codec publishes under the snapshot's storage
-# prefix (`SnapshotArtifact` in crates/libs/common/core/src/types/object_store.rs).
+# prefix (`SnapshotArtifact` in crates/l20_domain/artifact/model/src/object_store.rs).
 SUSPEND_ROOTFS_OBJECTS = {BTRFS_SEND_V1: ROOTFS_SEND_FILE, "full": "rootfs"}
 # The AWS CLI's refusal when nothing listens on the endpoint.
 _OBJECT_STORE_UNREACHABLE = "Could not connect to the endpoint URL"
@@ -940,7 +949,7 @@ ON CONFLICT (template_release_id, storage_connection_string) DO UPDATE
     SET org_id = COALESCE(template_release_storage_locations.org_id, EXCLUDED.org_id);
 """
 # sandbox-manager's per-sandbox cache root (`SANDBOX_CACHE_DIR` in
-# common-core's linux paths); cold eviction removes `<root>/<sandbox uuid>`.
+# host-layout's paths); cold eviction removes `<root>/<sandbox uuid>`.
 SANDBOX_CACHE_ROOT = "/space/cache/firecracker/sandboxes"
 _COLD_EVICTION_DEFAULT_ENGAGE = 0.75
 _COLD_EVICTION_DEFAULT_TARGET = 0.70
@@ -1171,6 +1180,7 @@ class KindHarness:
         self._public_api_lease_ownership: _LeaseOwnership | None = None
         self._drain_gate_lease_ownership: _LeaseOwnership | None = None
         self._node_ctl_lease_ownership: _LeaseOwnership | None = None
+        self._node_manager_lease_ownership: _LeaseOwnership | None = None
         # The public API autoscaler's bounds before `scale_public_api` pinned
         # them: (name, uid, minReplicas, maxReplicas).
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
@@ -1258,12 +1268,7 @@ class KindHarness:
             self._assert_retention_lease_owned()
 
         assert_lease()
-        if self.config.context != "kind-space-local" or urlsplit(
-            self.config.api_url
-        ).hostname not in {"localhost", "127.0.0.1"}:
-            raise SmokeConfigurationError(
-                "cold setup requires the isolated local Kind API"
-            )
+        self._require_isolated_kind("cold setup")
         token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
         receipts = self.environment.get("SPACE_SMOKE_KIND_COLD_RECEIPTS")
         if not token_file or not receipts:
@@ -1583,6 +1588,7 @@ class KindHarness:
         subject: str,
         *,
         repair: Callable[[Mapping[str, object], _LeaseOwnership], None] | None = None,
+        duration_seconds: int = RETENTION_MUTATION_LEASE_DURATION_SECONDS,
     ) -> _LeaseOwnership:
         """Create or take over `name`; refuse while another live holder exists.
 
@@ -1606,7 +1612,7 @@ class KindHarness:
         acquired_at = datetime.now(UTC)
         spec = {
             "holderIdentity": holder,
-            "leaseDurationSeconds": RETENTION_MUTATION_LEASE_DURATION_SECONDS,
+            "leaseDurationSeconds": duration_seconds,
             "acquireTime": _kube_timestamp(acquired_at),
             "renewTime": _kube_timestamp(acquired_at),
         }
@@ -2581,10 +2587,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         # A snapshots dir that does not exist is a legitimate "none". Any
         # other `ls` failure (it exits 2 for unreadable paths too) or an exec
         # failure must propagate rather than read as "reaped".
+        # Recheck absence after a failed listing: cleanup can remove the
+        # directory between the probe and ls. Existing-path failures propagate.
         # `-A`: GC staging, `.gc-pending-<id>`, is a dot entry.
         result = self._node_shell_exec(
             node_name,
-            f"if [ ! -e {path} ]; then exit 0; fi; ls -1A {path}",
+            f"if [ ! -e {path} ]; then exit 0; fi; "
+            f"if ls -1A {path}; then exit 0; else status=$?; fi; "
+            f'if [ ! -e {path} ]; then exit 0; fi; exit "$status"',
             timeout=30,
         )
         if result.returncode != 0:
@@ -2729,60 +2739,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             allocated_bytes=allocated_blocks * 512,
         )
 
-    def clear_completed_sandbox_pods(self, sandbox_id: str) -> tuple[str, ...]:
-        """Clear Kind pods stuck after a successful node-side suspend teardown."""
-
-        self._require_isolated_kind("completed sandbox pod cleanup")
-        canonical = _sql_uuid(sandbox_id)
-        deadline = time.monotonic() + 10
-        while True:
-            result = self.kubectl(
-                "get",
-                "pods",
-                "-l",
-                f"{SANDBOX_ID_LABEL}={canonical}",
-                "-o",
-                "json",
-                timeout=15,
-                namespace=KIND_SANDBOX_NAMESPACE,
-            )
-            payload = json.loads(_require_ok(result, "list completed sandbox pods"))
-            items = payload.get("items") if isinstance(payload, dict) else None
-            if not isinstance(items, list):
-                raise SmokeConfigurationError(
-                    "sandbox pod listing returned an invalid shape"
-                )
-
-            unsafe = [pod for pod in items if _completed_deleting_pod_name(pod) is None]
-            if not unsafe:
-                break
-            if time.monotonic() >= deadline:
-                raise SmokeConfigurationError(
-                    "refusing to force-clear sandbox pods that did not become deleting "
-                    "with every container terminated successfully"
-                )
-            time.sleep(0.25)
-
-        cleared: list[str] = []
-        for pod in items:
-            name = _completed_deleting_pod_name(pod)
-            assert name is not None
-            _require_ok(
-                self.kubectl(
-                    "delete",
-                    "pod",
-                    _kube_pod_name(name),
-                    "--grace-period=0",
-                    "--force",
-                    "--wait=false",
-                    timeout=15,
-                    namespace=KIND_SANDBOX_NAMESPACE,
-                ),
-                f"force-clear completed sandbox pod {name}",
-            )
-            cleared.append(name)
-        return tuple(cleared)
-
     def _require_isolated_kind(self, action: str) -> None:
         if urlsplit(self.config.api_url).hostname not in {"localhost", "127.0.0.1"}:
             raise SmokeConfigurationError(f"{action} require the isolated local Kind API")
@@ -2851,6 +2807,20 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return None
 
+    def template_rootfs_allocated_bytes(
+        self, node_name: str, template: str, content_hash: str
+    ) -> int:
+        name = _template_name(template)
+        digest = _template_digest(content_hash)
+        rootfs = shlex.quote(f"{TEMPLATE_CACHE_ROOT}/{name}/{digest}/rootfs.ext4")
+        output = _require_ok(
+            self._node_shell_exec(node_name, f"stat -c %b {rootfs}", timeout=30),
+            f"read allocated rootfs bytes for {name}@{digest}",
+        ).strip()
+        if not output.isdigit():
+            raise RuntimeError("rootfs allocation did not return a nonnegative block count")
+        return int(output) * 512
+
     def register_unpinned_template(
         self, node_name: str, template: str, size_bytes: int
     ) -> None:
@@ -2874,19 +2844,18 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"chown {TEMPLATE_CACHE_OWNER}:{TEMPLATE_CACHE_GROUP} {rootfs}",
                 f"chmod 0660 {rootfs}",
                 f"space-tmplmgr register --template {name}",
-                # `register` returns before the daemon's background job has
-                # written `rootfs.ext4.zst`, re-stat'd the rootfs, rewritten
-                # `manifest.json` and re-upserted the build row
-                # (`spawn_template_compressed_rootfs_generation`). Anything a
-                # scenario does to the plant before that lands — drop the row,
-                # truncate the rootfs — would be undone by it. The manifest
-                # listing the compressed sibling is the last file write; the
-                # row upsert follows within the same task, so give it a beat.
+                # The RPC's manifest comes from the committed build row.
+                # Seeing its compressed descriptor proves the compressor's
+                # final upsert, unlike the disk manifest written before it.
+                # This cached-only read still touches LRU and may initialize
+                # missing settings. It is setup only: callers establish their
+                # eviction grace or corrupt the plant after the final lookup.
                 f"d=$(ls -d {shlex.quote(directory)}/*:* | head -n1)",
                 "for _ in $(seq 1 360); do "
-                'if grep -q rootfs.ext4.zst "$d/manifest.json" 2>/dev/null; then sleep 2; exit 0; fi; '
+                f'if space-tmplmgr get --template {name} --content-hash "${{d##*/}}" --manifest '
+                '| grep -q rootfs.ext4.zst; then exit 0; fi; '
                 "sleep 0.5; done",
-                "echo 'register did not settle: manifest.json never listed rootfs.ext4.zst' >&2",
+                "echo 'register did not settle: committed manifest never listed rootfs.ext4.zst' >&2",
                 "exit 1",
             ]
         )
@@ -4155,8 +4124,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         _require_ok(result, "list the cluster's nodes")
         return _parse_nodes(result.stdout)
 
-    def nodes_carrying_label(self, key: str) -> list[str]:
-        result = self.kubectl("get", "nodes", "-l", _label_key(key), "-o", "name", timeout=15)
+    def nodes_carrying_label(self, key: str, value: str | None = None) -> list[str]:
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?", value):
+            raise ValueError(f"refusing label value {value!r}")
+        selector = _label_key(key) if value is None else f"{_label_key(key)}={value}"
+        result = self.kubectl("get", "nodes", "-l", selector, "-o", "name", timeout=15)
         _require_ok(result, f"list nodes carrying {key}")
         return sorted(_kube_node_name(line.split("/", 1)[-1]) for line in result.stdout.split() if line)
 
@@ -5166,6 +5138,25 @@ ON CONFLICT (key_hash) DO NOTHING;
         lifecycle, _, node = row.partition("|")
         return SandboxResidency(lifecycle=lifecycle.strip(), active_node_id=node.strip() or None)
 
+    def network_policy_state(self, sandbox_id: str) -> Mapping[str, str]:
+        node = self.sandbox_node_name(sandbox_id)
+        if node is None:
+            return {"error": "sandbox has no active node"}
+        result = self._node_shell_exec(
+            node,
+            f"timeout 10s space-sbxmgr network-state {shlex.quote(_sql_uuid(sandbox_id))}",
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return {"node": node, "error": result.stderr[-1000:], "exit_code": str(result.returncode)}
+        fields = dict(
+            (key.strip(), value.strip())
+            for line in result.stdout.splitlines()
+            for key, separator, value in [line.partition(":")]
+            if separator and key in {"state", "installed_policy_ref", "interception_readiness"}
+        )
+        return {"node": node, **fields}
+
     def sandbox_node_name(self, sandbox_id: str) -> str | None:
         sandbox = self._admin(
             "GET", f"sandboxes/sbx_{quote(_sql_uuid(sandbox_id), safe='')}", expect=(200,)
@@ -5518,17 +5509,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         return release
 
     def unanswered_template_evict_env(self) -> str | None:
-        result = self.kubectl(
-            "get", "daemonset", WORKER_NODE_CTL_DAEMONSET, "-o",
-            f"jsonpath={{.spec.template.spec.containers[?(@.name=='{NODE_CTL}')].env}}",
-            timeout=15,
+        return self._daemonset_env_literal(
+            WORKER_NODE_CTL_DAEMONSET, NODE_CTL, UNANSWERED_TEMPLATE_EVICT_AFTER_ENV
         )
-        _require_ok(result, f"read env of {WORKER_NODE_CTL_DAEMONSET}")
-        return _env_literals(
-            json.loads(result.stdout or "[]"), (UNANSWERED_TEMPLATE_EVICT_AFTER_ENV,),
-            owner=WORKER_NODE_CTL_DAEMONSET,
-            value_from_refusal="; refusing to override what a literal restore could not put back",
-        )[UNANSWERED_TEMPLATE_EVICT_AFTER_ENV]
 
     def set_unanswered_template_evict_after(self, seconds: int) -> None:
         low, high = UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS
@@ -5540,22 +5523,56 @@ ON CONFLICT (key_hash) DO NOTHING;
         self._apply_unanswered_template_evict_env(standing)
 
     def _apply_unanswered_template_evict_env(self, value: str | None) -> None:
-        self._require_isolated_kind("worker node-ctl env override")
-        ownership = self._node_ctl_lease_ownership
+        self._set_daemonset_env(
+            {WORKER_NODE_CTL_DAEMONSET: value},
+            NODE_CTL,
+            UNANSWERED_TEMPLATE_EVICT_AFTER_ENV,
+            ownership=self._node_ctl_lease_ownership,
+            what="worker node-ctl",
+        )
+
+    def _daemonset_env_literal(self, daemonset: str, container: str, key: str) -> str | None:
+        """The literal `key` holds on a DaemonSet's container, None if unset."""
+
+        result = self.kubectl(
+            "get", "daemonset", daemonset, "-o",
+            f"jsonpath={{.spec.template.spec.containers[?(@.name=='{container}')].env}}",
+            timeout=15,
+        )
+        _require_ok(result, f"read env of {daemonset}")
+        return _env_literals(
+            json.loads(result.stdout or "[]"), (key,),
+            owner=daemonset,
+            value_from_refusal="; refusing to override what a literal restore could not put back",
+        )[key]
+
+    def _set_daemonset_env(
+        self,
+        values: Mapping[str, str | None],
+        container: str,
+        key: str,
+        *,
+        ownership: _LeaseOwnership | None,
+        what: str,
+    ) -> None:
+        """Set `key` (None unsets) on each DaemonSet under the caller's Lease, then await every rollout."""
+
+        self._require_isolated_kind(f"{what} env override")
         if ownership is None:
             raise SmokeConfigurationError(
-                "refusing a worker node-ctl DaemonSet write without the caller's live mutation Lease"
+                f"refusing a {what} DaemonSet write without the caller's live mutation Lease"
             )
-        self._assert_lease_owned(ownership, "a worker node-ctl DaemonSet write")
-        key = UNANSWERED_TEMPLATE_EVICT_AFTER_ENV
-        _require_ok(
-            self.kubectl(
-                "set", "env", f"daemonset/{WORKER_NODE_CTL_DAEMONSET}", "-c", NODE_CTL,
-                f"{key}-" if value is None else f"{key}={value}", timeout=30,
-            ),
-            f"set env on {WORKER_NODE_CTL_DAEMONSET}",
-        )
-        self._await_daemonset_rollout(WORKER_NODE_CTL_DAEMONSET, timeout=300)
+        self._renew_lease(ownership, f"a {what} DaemonSet write")
+        for daemonset, value in values.items():
+            _require_ok(
+                self.kubectl(
+                    "set", "env", f"daemonset/{daemonset}", "-c", container,
+                    f"{key}-" if value is None else f"{key}={value}", timeout=30,
+                ),
+                f"set env on {daemonset}",
+            )
+        for daemonset in values:
+            self._await_daemonset_rollout(daemonset, timeout=300)
 
     def _await_daemonset_rollout(self, name: str, *, timeout: float) -> None:
         """`rollout status`, then until each node runs one pod and none is Terminating.
@@ -5596,6 +5613,70 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def running_unanswered_template_evict_env(self, node_name: str) -> str | None:
         return self._node_service_env(node_name, NODE_CTL).get(UNANSWERED_TEMPLATE_EVICT_AFTER_ENV)
+
+    # --- node-manager's execution allowlist ----------------------------------
+    #
+    # One key, `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS`, on the worker and the
+    # builder node-manager DaemonSets, under its own Lease
+    # (`space_smoke/execution_environment.py`). The captured literals go back
+    # verbatim.
+
+    def acquire_node_manager_mutation(self) -> Callable[[], None]:
+        context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
+        # Held from admission until the allowlist is back, which can be a
+        # whole scenario and its cleanup, so it outlasts the longest budget.
+        ownership = self._acquire_named_mutation_lease(
+            f"space-smoke-node-manager-{context_hash}",
+            "node-manager DaemonSet mutation",
+            duration_seconds=NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS,
+        )
+        self._node_manager_lease_ownership = ownership
+
+        def release() -> None:
+            self._release_lease(ownership)
+            if self._node_manager_lease_ownership is ownership:
+                self._node_manager_lease_ownership = None
+
+        return release
+
+    def node_manager_allowed_environments(self) -> dict[str, str | None]:
+        return {
+            daemonset: self._daemonset_env_literal(daemonset, NODE_MANAGER, ALLOWED_ENVIRONMENTS_ENV)
+            for daemonset in NODE_MANAGER_DAEMONSETS
+        }
+
+    def set_node_manager_allowed_environments(self, values: Mapping[str, str | None]) -> None:
+        unknown = set(values) - set(NODE_MANAGER_DAEMONSETS)
+        if unknown:
+            raise ValueError(f"refusing to write env on {sorted(unknown)}, not a node-manager DaemonSet")
+        for value in values.values():
+            if value is not None and (not value or "\n" in value):
+                raise ValueError(f"refusing allowlist literal {value!r}")
+        self._set_daemonset_env(
+            values,
+            NODE_MANAGER,
+            ALLOWED_ENVIRONMENTS_ENV,
+            ownership=self._node_manager_lease_ownership,
+            what="node-manager",
+        )
+
+    def node_manager_nodes(self) -> tuple[str, ...]:
+        nodes: set[str] = set()
+        for role in (KIND_WORKER_ROLE, KIND_BUILDER_ROLE):
+            result = self.kubectl(
+                "get", "pods", "-l", _node_service_selector(NODE_MANAGER, role=role),
+                "-o", "jsonpath={.items[*].spec.nodeName}", timeout=15,
+            )
+            nodes.update(_require_ok(result, f"list {role} node-manager pods").split())
+        return tuple(sorted(_kube_node_name(node) for node in nodes))
+
+    def install_runtime_release(self, node_name: str, release: str) -> str:
+        if not re.fullmatch(r"[a-z]+-[0-9]+\.[0-9]+\.[0-9]+", release):
+            raise ValueError(f"refusing runtime release {release!r}")
+        result = self._node_shell_exec(
+            node_name, f"space-rtmgr runtimes install {shlex.quote(release)}", timeout=600
+        )
+        return _require_ok(result, f"install runtime {release} on {node_name}")
 
     def local_template_names(self, node_name: str) -> frozenset[str]:
         result = self._node_shell_exec(node_name, "space-tmplmgr list", timeout=60)
@@ -5872,6 +5953,133 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return state
 
+    def pause_in_memory(self, sandbox_id: str) -> None:
+        """Native `:pause`: keep the VM resident, paused. Returns once accepted."""
+
+        self._require_isolated_kind("native pause")
+        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
+        request = Request(
+            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}:pause",
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + self._admin_token(),
+                "Content-Type": "application/json",
+                "Idempotency-Key": f"space-smoke-pause-{secrets.token_hex(8)}",
+            },
+            data=b"{}",
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                response.read()
+        except HTTPError as error:
+            raise RuntimeError(f"native :pause returned HTTP {error.code}") from None
+        except (URLError, OSError):
+            raise RuntimeError("native :pause failed") from None
+
+    def native_sandbox_state(self, sandbox_id: str) -> str:
+        """The sandbox's control-plane `state` from the native `/v1` read."""
+
+        payload = self._admin_v1("GET", f"sandboxes/sbx_{quote(_sql_uuid(sandbox_id), safe='')}")
+        state = payload.get("state") if isinstance(payload, dict) else None
+        return str(state) if isinstance(state, str) else ""
+
+    def native_sandbox_present(self, sandbox_id: str) -> bool:
+        """Whether the native `/v1` read still finds the sandbox (False on 404)."""
+
+        self._require_isolated_kind("native sandbox read")
+        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
+        request = Request(
+            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}",
+            method="GET",
+            headers={"Authorization": "Bearer " + self._admin_token()},
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                response.read()
+                return True
+        except HTTPError as error:
+            if error.code == 404:
+                return False
+            raise RuntimeError(f"native sandbox read returned HTTP {error.code}") from None
+        except (URLError, OSError):
+            raise RuntimeError("native sandbox read failed") from None
+
+    def api_delete(self, sandbox_id: str) -> str:
+        """The public delete (`DELETE /v1/sandboxes/{id}`); returns its operation id."""
+
+        self._require_isolated_kind("native delete")
+        public_id = f"sbx_{_sql_uuid(sandbox_id)}"
+        request = Request(
+            self.config.api_url.rstrip("/") + f"/v1/sandboxes/{quote(public_id, safe='')}",
+            method="DELETE",
+            headers={
+                "Authorization": "Bearer " + self._admin_token(),
+                "Idempotency-Key": f"space-smoke-delete-{secrets.token_hex(8)}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                payload = json.load(response)
+        except HTTPError as error:
+            raise RuntimeError(f"native delete returned HTTP {error.code}") from None
+        except (URLError, OSError, ValueError):
+            raise RuntimeError("native delete failed") from None
+        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
+        if not isinstance(operation_id, str) or not operation_id:
+            raise RuntimeError("native delete returned no operation_id")
+        return operation_id
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        """The public operation's record (`GET /v1/operations/{id}`)."""
+
+        payload = self._admin_v1("GET", f"operations/{quote(operation_id, safe='')}")
+        return payload if isinstance(payload, dict) else {}
+
+    def hold_node_manager(self, node_name: str) -> None:
+        """Stop node-manager on the node (SIGSTOP), so its RPCs wait."""
+
+        result = self._node_shell_exec(node_name, _HOLD_NODE_MANAGER_SCRIPT, timeout=30)
+        _require_ok(result, f"hold node-manager on {node_name}")
+
+    def release_node_manager(self, node_name: str) -> None:
+        """Continue every node-manager on the node (SIGCONT)."""
+
+        result = self._node_shell_exec(node_name, _RELEASE_NODE_MANAGER_SCRIPT, timeout=30)
+        _require_ok(result, f"release node-manager on {node_name}")
+
+    def kill_sandbox_runtime(self, node_name: str, sandbox_id: str) -> str:
+        """SIGKILL the sandbox's Firecracker, found through its own `fc.pid` link, and
+        wait until it is reaped. Returns the script's report (pid, parent, reap time)."""
+
+        script = _KILL_SANDBOX_RUNTIME_SCRIPT.replace("__SANDBOX__", _sql_uuid(sandbox_id))
+        result = self._node_shell_exec(node_name, script, timeout=30)
+        return _require_ok(result, f"kill sandbox {sandbox_id}'s runtime on {node_name}").strip()
+
+    def node_sandbox_delete(
+        self, node_name: str, sandbox_id: str, *, discard_reason: str | None
+    ) -> CommandResult:
+        """`space-sbxmgr delete --blocking`, as root on the node; a discard with a reason."""
+
+        command = f"space-sbxmgr delete --blocking {_sql_uuid(sandbox_id)}"
+        if discard_reason is not None:
+            command += f" --discard-retained-filesystem --reason {shlex.quote(discard_reason)}"
+        return self._node_shell_exec(node_name, command, timeout=180)
+
+    def discard_attempt_window_seconds(self, node_name: str) -> int:
+        """The window the node's discard refuses within (`SPACE_SBX_DISCARD_ATTEMPT_WINDOW_SECS`).
+
+        Unset or unparsable is the six-hour recovery window, which no smoke can
+        wait out.
+        """
+
+        raw = str(
+            self._node_service_env(node_name, NODE_SANDBOX_MANAGER).get(
+                "SPACE_SBX_DISCARD_ATTEMPT_WINDOW_SECS"
+            )
+            or ""
+        ).strip()
+        return int(raw) if raw.isdigit() else 6 * 60 * 60
+
     def startup_recovery_log(self, node_name: str) -> list[str]:
         pod = self._node_service_pod(node_name, NODE_TEMPLATE_MANAGER)
         # Oldest attempt first: a failed startup restarts the container, and
@@ -6086,8 +6294,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             ]
         )
 
-    def controller_pods(self, *, refused_contender: bool = False) -> list[ControllerPod]:
+    def controller_pods(
+        self, *, refused_contender: bool = False, budget_contender: bool = False
+    ) -> list[ControllerPod]:
         selector = REFUSED_CONTENDER_SELECTOR if refused_contender else KIND_CONTROLLER_SELECTOR
+        if budget_contender:
+            selector = f"app.kubernetes.io/name={BUDGET_CONTENDER_NAME}"
         result = self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15)
         pods = []
         for item in json.loads(_require_ok(result, "list cluster-controller pods") or "{}").get(
@@ -6102,7 +6314,10 @@ ON CONFLICT (key_hash) DO NOTHING;
                 ),
                 {},
             )
-            terminated = (container.get("lastState") or {}).get("terminated") or {}
+            terminated = (
+                (container.get("state") or {}).get("terminated")
+                or (container.get("lastState") or {}).get("terminated") or {}
+            )
             pods.append(
                 ControllerPod(
                     name=str(metadata.get("name", "")),
@@ -6122,6 +6337,48 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
             )
         return sorted(pods, key=lambda pod: pod.name)
+
+    def place_budget_contender(self) -> None:
+        """Run the same controller against an unreachable, pod-local API endpoint."""
+        self._require_isolated_kind("placing a leader-election budget control")
+        result = self.kubectl("get", "deploy", self._controller_deployment(), "-o", "json", timeout=15)
+        deployment = json.loads(_require_ok(result, "read the cluster-controller Deployment"))
+        nodes = sorted({pod.node for pod in self.controller_pods() if pod.node})
+        if not nodes:
+            raise SmokeConfigurationError("no controller node for the budget control")
+        document = refused_contender_pod(deployment, node=nodes[0])
+        document["metadata"]["name"] = BUDGET_CONTENDER_NAME
+        document["metadata"]["labels"]["app.kubernetes.io/name"] = BUDGET_CONTENDER_NAME
+        spec = document["spec"]
+        if spec.get("hostNetwork"):
+            raise SmokeConfigurationError("budget control requires a pod-local network namespace")
+        spec["restartPolicy"] = "Never"
+        spec["initContainers"] = [
+            container for container in spec["initContainers"]
+            if container["name"] != REFUSED_CONTENDER_GATE_CONTAINER
+        ]
+        spec["volumes"] = [volume for volume in spec["volumes"] if volume["name"] != REFUSED_CONTENDER_GATE_CONTAINER]
+        controller = next(container for container in spec["containers"] if container["name"] == CONTROLLER_CONTAINER)
+        # Config::infer builds its client lazily. The caches' bounded startup
+        # wait is shared with the refused contender; the election loop then
+        # classifies actual connection failures and must spend its budget.
+        overrides = {"KUBERNETES_SERVICE_HOST": "127.0.0.1", "KUBERNETES_SERVICE_PORT": "1"}
+        controller["env"] = [env for env in controller.get("env", []) if env["name"] not in overrides]
+        controller["env"].extend({"name": name, "value": value} for name, value in overrides.items())
+        self.remove_budget_contender(wait=True)
+        _require_ok(self.kubectl("create", "-f", "-", input_text=json.dumps(document), timeout=30),
+                    "create the leader-election budget control")
+
+    def remove_budget_contender(self, *, wait: bool = False) -> None:
+        _require_ok(self.kubectl("delete", "pod", BUDGET_CONTENDER_NAME,
+                                "--ignore-not-found", "--wait=false", timeout=CLEANUP_REQUEST_SECONDS),
+                    "delete the leader-election budget control")
+        if wait:
+            deadline = time.monotonic() + 120
+            while self.controller_pods(budget_contender=True):
+                if time.monotonic() >= deadline:
+                    raise SmokeConfigurationError("the old budget control outlived its deletion")
+                time.sleep(2)
 
     def place_refused_contender(self) -> None:
         self._require_isolated_kind("placing a refused leader-election contender")
@@ -7225,6 +7482,44 @@ row="$(printf '%s\n' "$sandboxes" | grep -F '__SHORT_ID__' || true)"
 printf '%s\n' "$row" | grep -oE '┆ *(__STATES__) *┆' | head -n 1 | tr -d '┆ '
 """
 
+# Stops the node's one node-manager. Its RPCs then wait, so a suspend that
+# reached `suspending` can't capture while the scenario faults its runtime.
+_HOLD_NODE_MANAGER_SCRIPT = r"""set -eu
+pids=""
+for d in /proc/[0-9]*; do
+  [ "$(cat "$d/comm" 2>/dev/null)" = space-nodemgr-s ] && pids="$pids ${d#/proc/}"
+done
+set -- $pids
+[ "$#" -eq 1 ] || { echo "expected one node-manager, found [$pids]" >&2; exit 3; }
+kill -STOP "$1"
+"""
+_RELEASE_NODE_MANAGER_SCRIPT = r"""set -eu
+for d in /proc/[0-9]*; do
+  [ "$(cat "$d/comm" 2>/dev/null)" = space-nodemgr-s ] && kill -CONT "${d#/proc/}"
+done
+true
+"""
+# Kills only the process the sandbox's own `fc.pid` link names, and only if it
+# is Firecracker.
+_KILL_SANDBOX_RUNTIME_SCRIPT = r"""set -eu
+target="$(readlink /space/run/firecracker/sandboxes/__SANDBOX__/fc.pid)"
+pid="${target#/proc/}"
+case "$pid" in ''|*[!0-9]*) echo "fc.pid isn't a /proc link: $target" >&2; exit 3 ;; esac
+exe="$(basename "$(readlink "/proc/$pid/exe")")"
+[ "$exe" = firecracker ] || { echo "pid $pid is $exe, not firecracker" >&2; exit 4; }
+ppid="$(awk '/^PPid/{print $2}' "/proc/$pid/status")"
+echo "pid=$pid parent=$ppid:$(cat "/proc/$ppid/comm" 2>/dev/null)"
+kill -KILL "$pid"
+# Wait for the process to be reaped: until then `/proc/$pid` exists and the
+# sandbox's `fc.pid` link still resolves, which reads as a live runtime.
+for i in $(seq 100); do
+  [ -e "/proc/$pid" ] || { echo "reaped_after_ms=$((i * 100))"; exit 0; }
+  sleep 0.1
+done
+echo "not reaped after 10s, state $(awk '/^State/{print $2}' "/proc/$pid/status" 2>/dev/null)" >&2
+exit 5
+"""
+
 _SANDBOX_MANAGER_ROW_STATES = (
     "cleanup_required",
     "cleanup_failed",
@@ -7433,27 +7728,6 @@ def _ecw_sandbox_id(value: str) -> str:
     if not value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value):
         raise ValueError(f"refusing ECW sandbox id {value!r}")
     return value
-
-
-def _completed_deleting_pod_name(pod: object) -> str | None:
-    metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
-    status = pod.get("status", {}) if isinstance(pod, dict) else {}
-    name = metadata.get("name")
-    statuses = status.get("containerStatuses")
-    completed = (
-        isinstance(name, str)
-        and bool(metadata.get("deletionTimestamp"))
-        and isinstance(statuses, list)
-        and bool(statuses)
-        and all(
-            isinstance(container, dict)
-            and isinstance(container.get("state"), dict)
-            and isinstance(container["state"].get("terminated"), dict)
-            and container["state"]["terminated"].get("exitCode") == 0
-            for container in statuses
-        )
-    )
-    return name if completed else None
 
 
 _PROBE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")

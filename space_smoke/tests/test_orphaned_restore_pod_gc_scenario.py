@@ -193,12 +193,9 @@ class Choreography(unittest.TestCase):
         self.assertNotIn("concurrent_restore", {n.split(".")[0] for n in names})
         reaps = [i for i, n in enumerate(names) if n == "orphaned_restore_pod_gc.expect_reaped"]
         # The two superseded plants are watched in one call, from their own creates.
-        self.assertEqual(len(reaps), 2)
+        self.assertEqual(len(reaps), 1)
         self.assertEqual(len(calls[reaps[0]].args), 2)
         self.assertLess(plants[1], reaps[0])
-        # The row-less control beside the own-row orphan is reaped before
-        # the own-row orphan's survival window starts.
-        self.assertEqual(calls[reaps[1]].args, (SimpleNamespace(generation=1),))
         # The own-row orphan at the suspend-retired generation is left alone
         # through the survival window before the final restore, and is gone
         # only after it, before the one live execution is checked.
@@ -207,8 +204,9 @@ class Choreography(unittest.TestCase):
         own = SimpleNamespace(sandbox_id=SANDBOX, generation=4)
         self.assertEqual(calls[left_alone].args[0], own)
         self.assertEqual(calls[gone].args[0], own)
-        self.assertLess(plants[3], reaps[1])
-        self.assertLess(reaps[1], left_alone)
+        # The row-less control is watched during the same survival window.
+        self.assertEqual(calls[left_alone].kwargs["while_reaping"], SimpleNamespace(generation=1))
+        self.assertLess(plants[3], left_alone)
         self.assertLess(left_alone, reconnects[-1])
         self.assertLess(reconnects[-1], gone)
         self.assertLess(gone, lives[-1])

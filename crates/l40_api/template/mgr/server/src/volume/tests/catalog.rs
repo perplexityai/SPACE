@@ -1,5 +1,5 @@
 use crate::volume::{PullFailure, PullOutcome, PullTrigger, VolumePuller};
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use pplx_space_internal_api_server::ClusterApiService;
 use pplx_space_node_api_client::proto::{
     RegisterTemplateReleaseRequest, RegisterTemplateRequest, TemplateVisibility,

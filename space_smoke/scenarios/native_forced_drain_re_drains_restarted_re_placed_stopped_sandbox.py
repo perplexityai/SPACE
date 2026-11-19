@@ -1,6 +1,11 @@
 """A re-placed stopped sandbox that was started and stopped again drains again."""
 
+import shlex
+
 import space_smoke as smoke
+
+PATH = "/home/user/data/forced-drain-stopped.txt"
+MARKER = "space-smoke-forced-drain-stopped-ok"
 
 # The rules are crate tests: the post-start pin clear
 # (`controllers/sandbox/lifecycle/start_pin_postgres_tests.rs`) and the drain's
@@ -36,12 +41,17 @@ def forced_drain_re_drains_restarted_re_placed_stopped_sandbox(
     every required node-affinity term."""
 
     replacement = test.stopped_replacement
+    marker = f"{MARKER}-{test.sandbox.sandbox_id}"
 
     with test.phase("preconditions: no node mid-drain, at least two workers"):
         replacement.require_preconditions()
 
     with test.phase("record the resident worker"):
-        test.run_command_when_ready("true")
+        written = test.run_command_when_ready(
+            f"mkdir -p {shlex.quote(PATH.rsplit('/', 1)[0])} && "
+            f"printf %s {shlex.quote(marker)} > {shlex.quote(PATH)}"
+        )
+        test.expect_command(written, stdout="")
         replacement.record_resident()
 
     with replacement.scoped_flags():
@@ -60,11 +70,20 @@ def forced_drain_re_drains_restarted_re_placed_stopped_sandbox(
         with test.phase("the destination was asked for a stopped materialization and holds it stopped"):
             replacement.expect_materialized_without_boot()
 
+        with test.phase("the emptied node reaches drained with the Kubernetes node present"):
+            replacement.expect_drained_node_present()
+
         with test.phase("undrain the first worker"):
             replacement.undrain()
 
+        with test.phase("never observed started before the user start"):
+            replacement.expect_never_started()
+
         with test.phase("a user start runs it on the destination, pre-bound there"):
             replacement.start_on_destination()
+            test.expect_command(
+                test.run_command_when_ready(f"cat {shlex.quote(PATH)}"), stdout=marker,
+            )
 
         with test.phase("stop it again on the destination"):
             replacement.stop_on_destination()

@@ -165,10 +165,10 @@ pub(super) fn artifact_backup_format(
     artifact: &crate::db::LocalArtifactRow,
 ) -> Result<pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat, Status> {
     match artifact.artifact_kind {
-        pplx_space_common_core::types::ArtifactKind::Full => {
+        pplx_space_snapshot_model::ArtifactKind::Full => {
             reupload_format_from_sidecar(&artifact.local_path)
         }
-        pplx_space_common_core::types::ArtifactKind::Disk => {
+        pplx_space_snapshot_model::ArtifactKind::Disk => {
             sidecarless_format_from_artifacts(&artifact.local_path)
         }
     }
@@ -176,9 +176,9 @@ pub(super) fn artifact_backup_format(
 
 pub(super) fn current_instance_backup_precondition(
     state: impl Into<SandboxStatus>,
-    expected_kind: pplx_space_common_core::types::ArtifactKind,
+    expected_kind: pplx_space_snapshot_model::ArtifactKind,
 ) -> Result<(), Status> {
-    use pplx_space_common_core::types::ArtifactKind;
+    use pplx_space_snapshot_model::ArtifactKind;
     let state = state.into();
     let current_kind = match state.unowned() {
         Some(SandboxState::Stopped) => ArtifactKind::Disk,
@@ -186,18 +186,49 @@ pub(super) fn current_instance_backup_precondition(
         Some(SandboxState::Restoring) if expected_kind == ArtifactKind::Full => {
             return Err(Status::failed_precondition(format!(
                 "cannot back up current instance: {}",
-                pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER
+                pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER
             )));
         }
         Some(SandboxState::Failed) => {
             return Err(Status::failed_precondition(format!(
                 "cannot back up current instance: {}",
-                pplx_space_common_core::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER
+                pplx_space_rpc_contracts::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER
             )));
         }
-        _ => {
+        // Being deleted, or quarantined, which only recovery or deletion moves
+        // on, not a step in flight: retrying the backup can't help until one
+        // of them does.
+        Some(SandboxState::Deleting | SandboxState::Quarantined) => {
             return Err(Status::failed_precondition(format!(
                 "cannot back up current instance: sandbox is {state}, must be stopped or suspended"
+            )));
+        }
+        // Every other state may still reach `stopped` or `suspended`: a
+        // lifecycle operation in flight, a sandbox a stop or suspend can
+        // bring to rest (a runtime upgrade's boot kubelet retried, say), or
+        // a cleanup (`None`) that may end `stopped` or `suspended`, a failed
+        // one only after recovery re-requests it. So it's `Aborted`, which a
+        // caller may retry, not `FailedPrecondition`, which callers take as
+        // no retry changing it. A cleanup over `deleting` answers it too,
+        // though it never stops. Listed in full, so a new state has to pick
+        // its answer here.
+        Some(
+            SandboxState::Creating
+            | SandboxState::Created
+            | SandboxState::Starting
+            | SandboxState::Started
+            | SandboxState::Stopping
+            | SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Resuming
+            | SandboxState::Checkpointing
+            | SandboxState::Suspending
+            | SandboxState::Restoring,
+        )
+        | None => {
+            return Err(Status::aborted(format!(
+                "cannot back up current instance: sandbox is {state}, not yet stopped or \
+                 suspended; retry"
             )));
         }
     };
@@ -207,7 +238,7 @@ pub(super) fn current_instance_backup_precondition(
     let message = if state.is_unowned(SandboxState::Suspended) {
         format!(
             "requested {expected_kind} backup but {}",
-            pplx_space_common_core::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER
+            pplx_space_rpc_contracts::artifact_backup_signals::CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER
         )
     } else {
         format!(
@@ -221,7 +252,7 @@ pub(super) fn artifact_backup_lookup_error(status: Status, full_current_instance
     if full_current_instance && status.code() == tonic::Code::NotFound {
         Status::failed_precondition(format!(
             "cannot back up current instance: {}",
-            pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER
+            pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER
         ))
     } else {
         status
@@ -242,7 +273,7 @@ pub(super) enum BackupFilesPolicy {
 
 impl BackupFilesPolicy {
     fn missing(self, path: &str) -> Status {
-        use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+        use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
         match self {
             Self::Backup {
                 full_current_instance: true,
@@ -266,7 +297,7 @@ impl BackupFilesPolicy {
     }
 
     fn unusable(self, detail: &str) -> Status {
-        use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+        use pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
         match self {
             Self::Backup {
                 full_current_instance: true,
@@ -300,7 +331,7 @@ pub(super) async fn require_artifact_backup_files(
     inspector: &dyn crate::retained_source::RetainedSourceInspector,
     sandbox_id: &str,
     local_path: &str,
-    kind: pplx_space_common_core::types::ArtifactKind,
+    kind: pplx_space_snapshot_model::ArtifactKind,
     format: crate::proto::SuspendSnapshotFormat,
     policy: BackupFilesPolicy,
 ) -> Result<(), Status> {
@@ -335,13 +366,13 @@ pub(super) async fn require_artifact_backup_files(
         }
     }
     for file in files {
-        if file.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+        if file.kind == pplx_space_artifact_model::SnapshotArtifact::RootfsBtrfsSend {
             // Disk artifacts never retain a source: they have no sidecar.
             let source_id = match kind {
-                pplx_space_common_core::types::ArtifactKind::Full => {
+                pplx_space_snapshot_model::ArtifactKind::Full => {
                     super::sidecar_rootfs_send_source_id(local_path)?
                 }
-                pplx_space_common_core::types::ArtifactKind::Disk => None,
+                pplx_space_snapshot_model::ArtifactKind::Disk => None,
             };
             match crate::retained_source::btrfs_send_rootfs_presence(
                 inspector,
@@ -499,9 +530,9 @@ impl SandboxManagerService {
             )
         })?;
         if sandbox.current_local_artifact_kind
-            != Some(pplx_space_common_core::types::ArtifactKind::Full)
+            != Some(pplx_space_snapshot_model::ArtifactKind::Full)
             || sandbox.current_local_artifact_origin
-                != Some(pplx_space_common_core::types::ArtifactOrigin::Suspend)
+                != Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend)
         {
             return Err(Status::failed_precondition(
                 "current suspended instance artifact is not a full suspend artifact",
@@ -542,10 +573,10 @@ impl SandboxManagerService {
             sandbox_id: artifact.sandbox_id.clone(),
             local_artifact_id: artifact.local_artifact_id.to_string(),
             artifact_kind: match artifact.artifact_kind {
-                pplx_space_common_core::types::ArtifactKind::Disk => {
+                pplx_space_snapshot_model::ArtifactKind::Disk => {
                     crate::proto::ArtifactKind::Disk as i32
                 }
-                pplx_space_common_core::types::ArtifactKind::Full => {
+                pplx_space_snapshot_model::ArtifactKind::Full => {
                     crate::proto::ArtifactKind::Full as i32
                 }
             },
@@ -586,7 +617,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn reusable_artifact_backup_attempt(
-        status: pplx_space_common_jobs::JobStatus,
+        status: crate::db::jobs::JobStatus,
         has_failure: bool,
         payload: &str,
     ) -> Result<Option<String>, serde_json::Error> {
@@ -597,8 +628,7 @@ impl SandboxManagerService {
         if has_failure
             || !matches!(
                 status,
-                pplx_space_common_jobs::JobStatus::Pending
-                    | pplx_space_common_jobs::JobStatus::Running
+                crate::db::jobs::JobStatus::Pending | crate::db::jobs::JobStatus::Running
             )
         {
             return Ok(None);
@@ -624,12 +654,8 @@ impl SandboxManagerService {
             return Err(Status::invalid_argument("sandbox_id is required"));
         }
         let expected_kind = match crate::proto::ArtifactKind::try_from(req.expected_artifact_kind) {
-            Ok(crate::proto::ArtifactKind::Disk) => {
-                pplx_space_common_core::types::ArtifactKind::Disk
-            }
-            Ok(crate::proto::ArtifactKind::Full) => {
-                pplx_space_common_core::types::ArtifactKind::Full
-            }
+            Ok(crate::proto::ArtifactKind::Disk) => pplx_space_snapshot_model::ArtifactKind::Disk,
+            Ok(crate::proto::ArtifactKind::Full) => pplx_space_snapshot_model::ArtifactKind::Full,
             _ => {
                 return Err(Status::invalid_argument(
                     "expected_artifact_kind is required",
@@ -643,8 +669,7 @@ impl SandboxManagerService {
             return Err(status);
         }
 
-        let full_current_instance = expected_kind
-            == pplx_space_common_core::types::ArtifactKind::Full
+        let full_current_instance = expected_kind == pplx_space_snapshot_model::ArtifactKind::Full
             && matches!(
                 req.source.as_ref(),
                 Some(crate::proto::enqueue_artifact_backup_request::Source::CurrentInstance(_))
@@ -654,6 +679,19 @@ impl SandboxManagerService {
             .lock_artifact_for_sandbox(sandbox_id)
             .await
             .map_err(|status| artifact_backup_lookup_error(status, full_current_instance))?;
+        // An eviction claims a row under this lock, so a backup that waited
+        // for it may find the row on its way out, its artifacts about to be
+        // deleted: nothing can be backed up from it.
+        if sandbox.state.is_unowned(SandboxState::Deleting)
+            || sandbox
+                .cleanup_completion
+                .is_some_and(crate::db::CleanupCompletion::deletes_row)
+        {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} is being deleted; its artifacts can't be backed up",
+                sandbox.id
+            )));
+        }
         // A runtime upgrade's failed boot leaves its disk in the instance until
         // the rollback restores the preserved copy; it must not be captured.
         self.refuse_runtime_upgrade_fence(&sandbox.id)?;
@@ -679,7 +717,7 @@ impl SandboxManagerService {
             }
             Some(crate::proto::enqueue_artifact_backup_request::Source::SnapshotName(value)) => {
                 let name =
-                    pplx_space_common_core::types::SnapshotName::parse(value).map_err(|err| {
+                    pplx_space_snapshot_model::SnapshotName::parse(value).map_err(|err| {
                         Status::invalid_argument(format!("invalid snapshot_name: {err}"))
                     })?;
                 if crate::service::grpc_spaced_process_snapshots::is_internal_snapshot_name(
@@ -697,9 +735,9 @@ impl SandboxManagerService {
                     (existing, false)
                 } else {
                     let adopted_kind = if name.as_str().starts_with("d-") {
-                        pplx_space_common_core::types::ArtifactKind::Disk
+                        pplx_space_snapshot_model::ArtifactKind::Disk
                     } else if name.as_str().starts_with("f-") {
-                        pplx_space_common_core::types::ArtifactKind::Full
+                        pplx_space_snapshot_model::ArtifactKind::Full
                     } else {
                         return Err(Status::failed_precondition(format!(
                             "snapshot {name} does not identify a disk or full artifact"
@@ -710,11 +748,10 @@ impl SandboxManagerService {
                             "requested {expected_kind} backup but snapshot {name} is {adopted_kind}"
                         )));
                     }
-                    let local_path =
-                        pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                            &sandbox.id,
-                            name.as_str(),
-                        );
+                    let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir(
+                        &sandbox.id,
+                        name.as_str(),
+                    );
                     if !std::path::Path::new(&local_path).is_dir() {
                         return Err(Status::failed_precondition(format!(
                             "snapshot {name} has no published local artifact"
@@ -794,14 +831,11 @@ impl SandboxManagerService {
                                 },
                             )
                             .await
-                            .map_err(|error| {
-                                Status::internal(format!("adopt stopped disk artifact: {error}"))
-                            })?;
-                        let local_path =
-                            pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                                &sandbox.id,
-                                &snapshot_name,
-                            );
+                            .map_err(stopped_disk_adoption_status)?;
+                        let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir(
+                            &sandbox.id,
+                            &snapshot_name,
+                        );
                         let sandbox_id = sandbox.id.parse().map_err(|error| {
                             Status::internal(format!("persisted sandbox id is invalid: {error}"))
                         })?;
@@ -896,7 +930,7 @@ impl SandboxManagerService {
         if let Some(job) = &previous_job {
             let job_status = job
                 .status
-                .parse::<pplx_space_common_jobs::JobStatus>()
+                .parse::<crate::db::jobs::JobStatus>()
                 .map_err(|error| {
                     Status::internal(format!(
                         "persisted artifact backup status is invalid for {}: {error}",
@@ -932,10 +966,10 @@ impl SandboxManagerService {
                 return Ok(Response::new(EnqueueArtifactBackupResponse {
                     local_artifact_id: artifact.local_artifact_id.to_string(),
                     artifact_kind: match artifact.artifact_kind {
-                        pplx_space_common_core::types::ArtifactKind::Disk => {
+                        pplx_space_snapshot_model::ArtifactKind::Disk => {
                             crate::proto::ArtifactKind::Disk as i32
                         }
-                        pplx_space_common_core::types::ArtifactKind::Full => {
+                        pplx_space_snapshot_model::ArtifactKind::Full => {
                             crate::proto::ArtifactKind::Full as i32
                         }
                     },
@@ -966,7 +1000,7 @@ impl SandboxManagerService {
         };
         let execution_generation =
             self.capture_execution_generation(&sandbox, &artifact, previous_job.as_ref())?;
-        let backup_attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
+        let backup_attempt_id = pplx_space_snapshot_model::BackupAttemptId::new();
         let backup_attempt_id = match self
             .submit_artifact_backup(
                 &sandbox,
@@ -981,6 +1015,10 @@ impl SandboxManagerService {
                     format,
                     handoff: ArtifactBackupHandoff::RestoreVisible,
                     execution_generation,
+                    capture_vouched: earlier_upload_vouches(
+                        previous_job.as_ref(),
+                        execution_generation,
+                    ),
                 },
             )
             .await
@@ -999,10 +1037,10 @@ impl SandboxManagerService {
         Ok(Response::new(EnqueueArtifactBackupResponse {
             local_artifact_id: artifact.local_artifact_id.to_string(),
             artifact_kind: match artifact.artifact_kind {
-                pplx_space_common_core::types::ArtifactKind::Disk => {
+                pplx_space_snapshot_model::ArtifactKind::Disk => {
                     crate::proto::ArtifactKind::Disk as i32
                 }
-                pplx_space_common_core::types::ArtifactKind::Full => {
+                pplx_space_snapshot_model::ArtifactKind::Full => {
                     crate::proto::ArtifactKind::Full as i32
                 }
             },
@@ -1038,6 +1076,16 @@ impl SandboxManagerService {
         Status,
     > {
         let id = self.lookup_sandbox(selector)?.id;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .auto_lifecycle
+            .artifact_lock_wait_hook
+            .lock()
+            .unwrap()
+            .clone()
+        {
+            hook.notify_one();
+        }
         let guard = super::restart_admission::wait_for_activation_admission(
             &id,
             self.auto_lifecycle.artifact_lock(&id).lock_owned(),
@@ -1086,7 +1134,7 @@ impl SandboxManagerService {
                     "cannot reupload snapshot: {marker} for sandbox_id={sandbox_id} \
                      — sbx-mgr has no record of this sandbox on this node",
                     marker =
-                        pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER,
+                        pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_UNKNOWN_MARKER,
                 ))
                     } else {
                         status
@@ -1110,7 +1158,7 @@ impl SandboxManagerService {
             let msg = if sandbox.state.is_unowned(SandboxState::Restoring) {
                 format!(
                     "cannot reupload snapshot: {}",
-                    pplx_space_common_core::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER,
+                    pplx_space_rpc_contracts::node_drain_signals::REUPLOAD_SANDBOX_RESTORING_MARKER,
                 )
             } else {
                 format!(
@@ -1138,7 +1186,7 @@ impl SandboxManagerService {
             self.retained_source_inspector.as_ref(),
             &sandbox.id,
             &snapshot_dir,
-            pplx_space_common_core::types::ArtifactKind::Full,
+            pplx_space_snapshot_model::ArtifactKind::Full,
             reupload_format,
             BackupFilesPolicy::Reupload,
         )
@@ -1194,14 +1242,14 @@ impl SandboxManagerService {
         )?;
         let execution_generation =
             self.capture_execution_generation(&sandbox, &artifact, previous_job.as_ref())?;
-        let backup_attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
+        let backup_attempt_id = pplx_space_snapshot_model::BackupAttemptId::new();
         let outcome = self
             .submit_artifact_backup(
                 &sandbox,
                 ArtifactBackupSubmission {
                     local_artifact_id,
-                    artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
-                    artifact_origin: pplx_space_common_core::types::ArtifactOrigin::Suspend,
+                    artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
+                    artifact_origin: pplx_space_snapshot_model::ArtifactOrigin::Suspend,
                     snapshot_name: None,
                     backup_attempt_id,
                     snapshot_dir: &snapshot_dir,
@@ -1209,6 +1257,10 @@ impl SandboxManagerService {
                     format: reupload_format,
                     handoff: ArtifactBackupHandoff::DurableWorker,
                     execution_generation,
+                    capture_vouched: earlier_upload_vouches(
+                        previous_job.as_ref(),
+                        execution_generation,
+                    ),
                 },
             )
             .await
@@ -1260,8 +1312,8 @@ impl SandboxManagerService {
         &self,
         sandbox: &crate::db::SandboxRow,
         artifact: &crate::db::LocalArtifactRow,
-        previous_job: Option<&pplx_space_common_jobs::Job>,
-    ) -> Result<Option<pplx_space_common_core::types::ExecutionGeneration>, Status> {
+        previous_job: Option<&crate::db::jobs::Job>,
+    ) -> Result<Option<pplx_space_sandbox_model::ExecutionGeneration>, Status> {
         if let Some(generation) = capture_generation_from_record(artifact)? {
             return Ok(Some(generation));
         }
@@ -1299,6 +1351,24 @@ impl SandboxManagerService {
     }
 }
 
+/// Whether `previous_job`, the bytes' earlier upload, recorded `generation`
+/// as the capturing execution's, so a re-upload under it may order captures.
+pub(super) fn earlier_upload_vouches(
+    previous_job: Option<&crate::db::jobs::Job>,
+    generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+) -> bool {
+    generation.is_some()
+        && previous_job
+            .and_then(|job| {
+                job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                    .ok()
+            })
+            .is_some_and(|payload| {
+                payload.execution_generation_names_capture
+                    && payload.execution_generation == generation
+            })
+}
+
 /// The execution generation the capture's record holds for the teardown
 /// suspend that captured `artifact`, if the record in its directory names it.
 /// A record that can't
@@ -1306,7 +1376,7 @@ impl SandboxManagerService {
 /// rather than registering unfenced.
 fn capture_generation_from_record(
     artifact: &crate::db::LocalArtifactRow,
-) -> Result<Option<pplx_space_common_core::types::ExecutionGeneration>, Status> {
+) -> Result<Option<pplx_space_sandbox_model::ExecutionGeneration>, Status> {
     let artifact_dir = &artifact.local_path;
     crate::capture_record::read(
         std::path::Path::new(artifact_dir),
@@ -1317,6 +1387,28 @@ fn capture_generation_from_record(
             "read the capture record in {artifact_dir}: {error}"
         ))
     })
+}
+
+/// The status a failed `CreateBtrfsSnapshot` of a stopped sandbox's disk
+/// answers `EnqueueArtifactBackup` with. node-manager refuses the snapshot,
+/// before taking it, while another artifact operation or host mutation holds
+/// the sandbox, such as the network-slot reset that follows its cleanup. That
+/// refusal carries
+/// [`NODE_MANAGER_SANDBOX_BUSY_MARKER`](pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER)
+/// and passes through as `Unavailable` for the caller to retry. Any other
+/// failure is internal, a transport `Unavailable` and node-manager's other
+/// `Unavailable` answers included.
+fn stopped_disk_adoption_status(error: Status) -> Status {
+    let message = format!("adopt stopped disk artifact: {error}");
+    let node_manager_refused = error.code() == tonic::Code::Unavailable
+        && error.message().contains(
+            pplx_space_rpc_contracts::artifact_backup_signals::NODE_MANAGER_SANDBOX_BUSY_MARKER,
+        );
+    if node_manager_refused {
+        Status::unavailable(message)
+    } else {
+        Status::internal(message)
+    }
 }
 
 /// The status an `EnqueueArtifactBackup` submission failure answers with. A

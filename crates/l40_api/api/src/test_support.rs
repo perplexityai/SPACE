@@ -15,7 +15,13 @@ const SIM_WORKER_CONTROL_TOKEN: &str = "sim-worker-test-control-token";
 
 /// Enter before awaiting fixtures: authenticated clients need process credentials.
 pub(crate) fn enter_sim_worker_process() -> bool {
-    enter_sim_worker_process_with_token_paths(None, None)
+    enter_sim_worker_process_with_token_paths(None, None, &[])
+}
+
+/// [`enter_sim_worker_process`], with `extra` set in the child as well.
+#[cfg(feature = "kubernetes")]
+pub(crate) fn enter_sim_worker_process_with(extra: &[(&str, Option<&std::ffi::OsStr>)]) -> bool {
+    enter_sim_worker_process_with_token_paths(None, None, extra)
 }
 
 /// [`enter_sim_worker_process`], but the node-api token paths name files this
@@ -26,6 +32,12 @@ pub(crate) fn enter_sim_worker_process() -> bool {
 /// The parent creates the files and keeps them until its child exits; the
 /// child's own copy of the directory is unused.
 pub(crate) fn enter_sim_worker_process_with_owned_token_files() -> bool {
+    enter_sim_worker_process_with_owned_token_files_and(&[])
+}
+
+pub(crate) fn enter_sim_worker_process_with_owned_token_files_and(
+    extra: &[(&str, Option<&std::ffi::OsStr>)],
+) -> bool {
     let tokens = tempfile::tempdir().expect("create test token directory");
     let node_api = tokens.path().join("node-api.token");
     let node_api_internal = tokens.path().join("node-api-internal.token");
@@ -35,14 +47,16 @@ pub(crate) fn enter_sim_worker_process_with_owned_token_files() -> bool {
     enter_sim_worker_process_with_token_paths(
         Some(node_api.as_os_str()),
         Some(node_api_internal.as_os_str()),
+        extra,
     )
 }
 
 fn enter_sim_worker_process_with_token_paths(
     node_api: Option<&std::ffi::OsStr>,
     node_api_internal: Option<&std::ffi::OsStr>,
+    extra: &[(&str, Option<&std::ffi::OsStr>)],
 ) -> bool {
-    pplx_space_test_env::enter_test_process(&[
+    let mut vars = vec![
         (
             "SPACE_INTERNAL_RPC_INSECURE_DEV",
             Some(std::ffi::OsStr::new("true")),
@@ -57,7 +71,9 @@ fn enter_sim_worker_process_with_token_paths(
         ),
         (SPACE_NODE_API_TOKEN_PATH_ENV, node_api),
         (SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, node_api_internal),
-    ])
+    ];
+    vars.extend_from_slice(extra);
+    pplx_space_test_env::enter_test_process(&vars)
 }
 
 /// A Direct substrate over the test database; it needs no apiserver.
@@ -73,6 +89,7 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
         refill_rps: 6.0,
         burst: 60.0,
         redis_url: None,
+        slot_check_enabled: false,
     }
 }
 
@@ -85,7 +102,7 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
     lock: &mut sqlx::PgConnection,
     request: impl std::future::Future<Output = T> + Send + 'static,
 ) -> pplx_space_db_test_fixtures::TestDbResult<tokio::task::JoinHandle<T>> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     sqlx::query(sql!(
         "LOCK TABLE public_operations IN ACCESS EXCLUSIVE MODE"
@@ -120,7 +137,7 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
 pub(crate) async fn wait_until_blocked_by(
     holder: &mut sqlx::PgConnection,
 ) -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -150,7 +167,7 @@ pub(crate) async fn record_the_row_and_succeed(
     create: pplx_space_public_api::OperationId,
     sandbox_id: pplx_space_public_api::PublicSandboxId,
 ) -> pplx_space_db_test_fixtures::TestDbResult<()> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
 
     sqlx::query(sql!(
         "INSERT INTO sandboxes (id, user_id, org_id, lifecycle, network_policy_override_json,

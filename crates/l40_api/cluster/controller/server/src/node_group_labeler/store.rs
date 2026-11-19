@@ -22,9 +22,9 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeGroupId;
-use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_node_model::NodeGroupId;
+use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use super::{DefaultNodeGroup, EnsureDefaultGroupError, EnsuredDefaultGroup, NodeGroupSink};

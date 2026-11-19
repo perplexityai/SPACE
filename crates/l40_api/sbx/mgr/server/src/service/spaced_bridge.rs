@@ -24,7 +24,7 @@ pub(super) async fn launch_spaced_host_via_node(
         .launch(LaunchRequest {
             execution_fence: Some(execution_fence.into()),
             sandbox_id: sandbox_id.to_string(),
-            program: pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN.to_string(),
+            program: pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN.to_string(),
             args: vec![
                 "--socket".to_string(),
                 spaced_host_socket_path(sandbox_id),
@@ -40,6 +40,7 @@ pub(super) async fn launch_spaced_host_via_node(
             uid,
             gid: uid,
             env: crate::sidecar_env::telemetry_env_for_service("space-spaced-host"),
+            replace_gateway_pid: None,
         })
         .instrument(tracing::info_span!(
             "sbxmgr.start.node.launch_spaced_host",
@@ -58,7 +59,7 @@ pub(super) async fn launch_spaced_host_via_node(
                 SandboxEventDetails::default()
                     .boot_type(boot_type)
                     .pid(response.pid.to_string())
-                    .program(pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN),
+                    .program(pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN),
             );
             Ok(response)
         }
@@ -69,7 +70,7 @@ pub(super) async fn launch_spaced_host_via_node(
                 SandboxEventSource::SbxManager,
                 SandboxEventDetails::default()
                     .boot_type(boot_type)
-                    .program(pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN)
+                    .program(pplx_space_host_layout::paths::SPACED_HOST_SVC_BIN)
                     .error(error.to_string()),
             );
             Err(Status::internal(format!(
@@ -146,6 +147,14 @@ impl SandboxManagerService {
             return Ok(client);
         }
 
+        if sandbox.spaced_endpoint_proof.is_none()
+            && sandbox.state.is_unowned(SandboxState::Starting)
+            && endpoint_proof_after_readiness(sandbox)?
+        {
+            return Err(Status::unavailable(
+                "activation has not published its ready endpoint proof",
+            ));
+        }
         let runtime = spaced_endpoint_runtime_identity(sandbox)?;
         let mut node_client = self.node_manager.lazy();
         let proof = match sandbox.spaced_endpoint_proof.clone() {
@@ -231,7 +240,7 @@ pub(super) enum ActivationEndpointProofRequirement {
 }
 
 pub(super) fn activation_endpoint_proof_requirement(
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     pool_template: Option<&str>,
 ) -> ActivationEndpointProofRequirement {
     if pool_template.is_some() && route_identity.is_absent() {
@@ -268,14 +277,14 @@ fn spaced_endpoint_runtime_identity(
 
 pub(super) fn endpoint_runtime_identity_for_activation(
     sandbox_id: &str,
-    route_identity: &pplx_space_common_core::types::SpaceApiRouteIdentity,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
     spaced_host_pid: u32,
     runtime_pid: u32,
     sandbox_uid: u32,
     guest_cid: u32,
     vsock_path: &str,
 ) -> Result<crate::endpoint_proof::SpacedEndpointRuntimeIdentity, Status> {
-    use pplx_space_common_core::types::{LinuxPid, LinuxUid, VsockCid};
+    use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
 
     Ok(crate::endpoint_proof::SpacedEndpointRuntimeIdentity {
         sandbox_id: sandbox_id.parse().map_err(|error| {
@@ -452,7 +461,7 @@ fn endpoint_proof_error_status(error: crate::endpoint_proof::SpacedEndpointProof
 }
 
 fn node_endpoint_proof_status(
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
     command: &'static str,
     error: Status,
 ) -> Status {
@@ -586,7 +595,7 @@ async fn connect_spaced_host_live(
         .with_socket_path(socket_path);
     match pplx_space_spaced_host_client::SpacedHostClient::new_with_config_and_expected_peer(
         config,
-        pplx_space_spaced_common::ExpectedUdsPeer::new(
+        pplx_space_spaced_client::ExpectedUdsPeer::new(
             i32::try_from(spaced_host_pid)
                 .map_err(|_| Status::failed_precondition("spaced-host pid is invalid"))?,
             uid,
@@ -1333,6 +1342,81 @@ where
         }
     });
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Only the qualified Windows viosock boot replaces the initial CH listener.
+/// Other profiles retain their existing activation ordering.
+pub(super) fn endpoint_proof_after_readiness(
+    sandbox: &crate::db::SandboxRow,
+) -> Result<bool, Status> {
+    endpoint_proof_after_readiness_for(sandbox, &sandbox.space_api_route_identity)
+}
+
+pub(super) fn endpoint_proof_after_readiness_for(
+    sandbox: &crate::db::SandboxRow,
+    route_identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity,
+) -> Result<bool, Status> {
+    use pplx_space_execution_spec::{RuntimeKind, guest_image::QualifiedGuestAgent};
+    Ok(sandbox
+        .execution_metadata
+        .as_ref()
+        .is_some_and(|execution| execution.runtime().kind == RuntimeKind::CloudHypervisor)
+        && super::guest_image::profile_for_sandbox(sandbox)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .agent_protocol()
+            == QualifiedGuestAgent::WindowsV1
+        && activation_endpoint_proof_requirement(route_identity, sandbox.pool_template.as_deref())
+            == ActivationEndpointProofRequirement::Required)
+}
+
+pub(super) async fn publish_ready_endpoint_proof(
+    db: &crate::db::SharedConnection,
+    sandbox_id: &str,
+    cleanup_id: Option<SandboxCleanupEpisodeId>,
+) -> Result<(), Status> {
+    let read = |conn: &crate::db::Connection| -> Result<crate::db::SandboxRow, Status> {
+        let row = crate::db::read::sandbox(conn, sandbox_id)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("activation sandbox disappeared"))?;
+        let episode = crate::db::read::sandbox_view(conn, sandbox_id)
+            .cleanup_episode()
+            .strict()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if !row.state.is_unowned(SandboxState::Starting)
+            || !matches!((cleanup_id, episode), (Some(id), Some(episode)) if episode.id == id && episode.requested_at.is_none())
+        {
+            return Err(Status::aborted("endpoint activation ownership changed"));
+        }
+        Ok(row)
+    };
+    let initial = {
+        let conn = crate::node_state_sync::connection_or_signal_failure(db)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        // Preserve ordinary and legacy activations, including test callers
+        // without an armed cleanup episode, before applying the Windows gate.
+        let row = crate::db::read::sandbox(&conn, sandbox_id)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("activation sandbox disappeared"))?;
+        if !endpoint_proof_after_readiness(&row)? || row.spaced_endpoint_proof.is_some() {
+            return Ok(());
+        }
+        read(&conn)?
+    };
+    let runtime = spaced_endpoint_runtime_identity(&initial)?;
+    let mut node = crate::node_manager_transport::NodeManagerConnector::host().lazy();
+    let proof = capture_spaced_endpoint_proof_for_activation(&mut node, runtime.clone()).await?;
+    let conn = crate::node_state_sync::connection_or_signal_failure(db)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let current = read(&conn)?;
+    if current.node_execution_id != initial.node_execution_id
+        || !crate::db::persist_spaced_endpoint_proof_if_missing(&conn, &runtime, &proof)
+            .map_err(|error| Status::internal(error.to_string()))?
+    {
+        return Err(Status::aborted(
+            "endpoint activation changed during proof capture",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

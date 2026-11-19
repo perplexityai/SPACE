@@ -18,11 +18,12 @@
 //! A view is not a snapshot: two accessors are two reads. Callers that compare
 //! their answers hold the connection guard, or a transaction, across both.
 
-use pplx_space_common_core::types::{
-    ExecutionGeneration, LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
-    SandboxId, SandboxRuntimeLabel, TransferScopeId,
-};
 use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxRuntimeLabel,
+};
+use pplx_space_snapshot_model::{LocalArtifactId, TransferScopeId};
 use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt;
@@ -475,7 +476,21 @@ impl ArtifactsFacet<'_> {
         self,
         staged_artifact: LocalArtifactId,
     ) -> Result<Vec<LocalArtifactRow>> {
-        crate::db::other_local_artifacts_awaiting_backup(self.0.conn, self.0.id, staged_artifact)
+        crate::db::other_local_artifacts_awaiting_backup(
+            self.0.conn,
+            self.0.id,
+            Some(staged_artifact),
+        )
+    }
+
+    /// The artifacts other than `pin`, or all of them for `None`, without a
+    /// backup-completed stamp: what a suspended eviction, which deletes every
+    /// local artifact of the sandbox, must prove before it claims the row.
+    pub fn awaiting_backup_besides(
+        self,
+        pin: Option<LocalArtifactId>,
+    ) -> Result<Vec<LocalArtifactRow>> {
+        crate::db::other_local_artifacts_awaiting_backup(self.0.conn, self.0.id, pin)
     }
 }
 

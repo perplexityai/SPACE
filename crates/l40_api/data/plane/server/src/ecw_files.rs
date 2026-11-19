@@ -14,11 +14,14 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt, stream};
 use http_body_util::BodyExt;
-use pplx_space_common_core::types::{GuestUserName, SandboxId, validate_linux_guest_path_input};
+use pplx_space_common_grpc::GrpcRetryPolicy;
 use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
+use pplx_space_guest_process::{GuestUserName, validate_linux_guest_path_input};
 use pplx_space_node_api_client::{
     NodeApiOperationBudget, proto::worker_api_client::WorkerApiClient,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sbx_mgr_client::is_restart_retry_on_successor;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     SpacedCreateWatcherRequest, SpacedFileEvent, SpacedFileEventKind, SpacedFileInfo,
@@ -54,6 +57,22 @@ const E2B_FILE_WRITE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 const E2B_PROTO_BODY_LIMIT: usize = 1024 * 1024;
 /// Stated as "1 MiB" in `json_file_write_body_too_large_error`.
 const E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+/// How long a held upload is resent while sandbox-manager's restart drain
+/// refuses it: the predecessor drains its state writers for up to
+/// [`DEFAULT_DRAIN_TIMEOUT`] before its successor serves, the budget node-api
+/// waits out for the calls it can replay itself.
+///
+/// [`DEFAULT_DRAIN_TIMEOUT`]: pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT
+const RESTART_HANDOFF_RESEND_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
+    max_retries: 64,
+    initial_delay: std::time::Duration::from_millis(100),
+    backoff_multiplier: 2.0,
+    max_delay: std::time::Duration::from_secs(1),
+    max_elapsed: pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT
+        .saturating_add(std::time::Duration::from_secs(5)),
+    jitter_factor: 0.2,
+    max_server_retry_after: std::time::Duration::from_secs(2),
+};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct FileReadQueryE2b {
@@ -784,16 +803,22 @@ async fn spaced_write_bytes(
                 let channel = ecw_backend_channel(state, &route)
                     .await
                     .map_err(EcwRouteAttemptError::Proxy)?;
-                let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                let stream = requests.stream();
-                client
-                    .spaced_write(node_api_request_with_route_token_state(
-                        stream,
+                resend_while_sandbox_manager_hands_over(|| {
+                    let mut client =
+                        WorkerApiClient::new(wrap_grpc_client_channel(channel.clone()));
+                    let request = node_api_request_with_route_token_state(
+                        requests.stream(),
                         route.space_api_route_token.as_ref(),
-                    )?)
-                    .await
-                    .map(|response| response.into_inner())
-                    .map_err(EcwRouteAttemptError::Status)
+                    );
+                    async move {
+                        client
+                            .spaced_write(request?)
+                            .await
+                            .map(|response| response.into_inner())
+                            .map_err(EcwRouteAttemptError::Status)
+                    }
+                })
+                .await
             }
         },
         raw_file_write_error,
@@ -876,22 +901,33 @@ async fn spaced_write_spooled(
         "filesystem_write",
         NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
         move |route, _remaining| {
-            let chunks = upload.chunks();
             let path = path.clone();
             let user = user.clone();
             async move {
                 let channel = ecw_backend_channel(state, &route)
                     .await
                     .map_err(EcwRouteAttemptError::Proxy)?;
-                let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                let (read_failed, read_failure) = tokio::sync::oneshot::channel();
-                let stream =
-                    spooled_write_requests(route.sandbox_id, path, chunks, user, read_failed);
-                let write = client.spaced_write(node_api_request_with_route_token_state(
-                    stream,
-                    route.space_api_route_token.as_ref(),
-                )?);
-                fail_on_spool_read_failure(write, read_failure).await
+                resend_while_sandbox_manager_hands_over(|| {
+                    let mut client =
+                        WorkerApiClient::new(wrap_grpc_client_channel(channel.clone()));
+                    let (read_failed, read_failure) = tokio::sync::oneshot::channel();
+                    let stream = spooled_write_requests(
+                        route.sandbox_id,
+                        path.clone(),
+                        upload.chunks(),
+                        user.clone(),
+                        read_failed,
+                    );
+                    let request = node_api_request_with_route_token_state(
+                        stream,
+                        route.space_api_route_token.as_ref(),
+                    );
+                    async move {
+                        fail_on_spool_read_failure(client.spaced_write(request?), read_failure)
+                            .await
+                    }
+                })
+                .await
             }
         },
         raw_file_write_error,
@@ -899,6 +935,47 @@ async fn spaced_write_spooled(
     .await?;
     check_spooled_write_len(response.bytes_written, upload.len())?;
     Ok(route)
+}
+
+/// Sends a write whose whole upload the data plane holds, and sends it again
+/// while node-api answers with the retry-on-successor marker. Sandbox-manager's
+/// restart drain sets it on a call it refuses before dispatch, and node-api
+/// sets it on a write whose dial to sandbox-manager failed before sending it,
+/// so either way the guest never saw the refused write. A resend reaches the
+/// successor once it owns sandbox-manager's socket, within the drain budget.
+/// Every other outcome, any other answered status included, is returned as
+/// the attempt's result: the write may have run. A caller that gives up drops
+/// the wait with its request.
+async fn resend_while_sandbox_manager_hands_over<T, SendWrite, Fut>(
+    mut send: SendWrite,
+) -> Result<T, EcwRouteAttemptError>
+where
+    SendWrite: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, EcwRouteAttemptError>>,
+{
+    let started_at = tokio::time::Instant::now();
+    let mut resends = 0;
+    loop {
+        let refusal = match send().await {
+            Err(EcwRouteAttemptError::Status(status)) if is_restart_retry_on_successor(&status) => {
+                status
+            }
+            outcome => return outcome,
+        };
+        let Some(delay) = RESTART_HANDOFF_RESEND_POLICY.backoff_delay(resends) else {
+            return Err(EcwRouteAttemptError::Status(refusal));
+        };
+        if started_at.elapsed() + delay >= RESTART_HANDOFF_RESEND_POLICY.max_elapsed {
+            return Err(EcwRouteAttemptError::Status(refusal));
+        }
+        tracing::debug!(
+            resends,
+            retry_in = ?delay,
+            "sandbox-manager's handoff refused a held upload; resending it to the successor"
+        );
+        tokio::time::sleep(delay).await;
+        resends += 1;
+    }
 }
 
 /// Runs the write call until it finishes or `spooled_write_requests` reports
@@ -1615,7 +1692,7 @@ fn e2b_event_name(root: &str, path: &str) -> Option<String> {
         return None;
     }
     if !path.starts_with('/') {
-        return Some(path.strip_prefix("./").unwrap_or(path).to_string());
+        return Some(path.trim_prefix("./").to_string());
     }
 
     let root = normalized_absolute_path(root);

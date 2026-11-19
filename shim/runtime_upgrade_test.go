@@ -301,7 +301,7 @@ func TestRuntimeUpgradeAnnotationsAreParsedStrictly(t *testing.T) {
 // control plane actually writes rather than a copy of its keys.
 func renderedPodAnnotations(t *testing.T, shape string) map[string]string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "crates", "libs", "common", "core", "src", "fixtures", shape+".snap"))
+	data, err := os.ReadFile(filepath.Join("..", "crates", "l40_api", "sandbox", "pod", "fixtures", shape+".snap"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use super::*;
 use pplx_space_db_test_fixtures::pg_test_db;
@@ -583,8 +583,9 @@ async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
     .await?;
     let mixed = NodeId::new();
     let unknown_only = NodeId::new();
+    let firewall_rules_beside_unknown = NodeId::new();
     let known = NodeId::new();
-    for node_id in [mixed, unknown_only, known] {
+    for node_id in [mixed, unknown_only, firewall_rules_beside_unknown, known] {
         insert_node(
             &db.pool,
             node_id,
@@ -608,6 +609,11 @@ async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
             unknown_only,
             "reason_from_a_newer_build",
             "{reason_from_a_newer_build}",
+        ),
+        (
+            firewall_rules_beside_unknown,
+            "reason_from_a_newer_build",
+            "{reason_from_a_newer_build,firewall_rules_changed}",
         ),
     ] {
         sqlx::query(sql!(
@@ -644,6 +650,13 @@ async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
         // Nothing known is left, so the trigger fires on its diagnostic text.
         (unknown_only, (vec![], "reason_from_a_newer_build")),
         (
+            firewall_rules_beside_unknown,
+            (
+                vec![ReconcileReason::FirewallRulesChanged],
+                "reason_from_a_newer_build",
+            ),
+        ),
+        (
             known,
             (vec![ReconcileReason::NodeRegistered], "node_registered"),
         ),
@@ -655,17 +668,116 @@ async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
     complete_claim(
         &db.pool,
         &claim.claim_token,
-        &[mixed, known],
+        &[mixed, firewall_rules_beside_unknown, known],
         &[(unknown_only, "node unreachable".to_string())],
     )
     .await?;
-    let [failed] = queued_triggers(&db.pool, &[mixed, unknown_only, known])
-        .await?
-        .try_into()
-        .unwrap();
+    let [failed] = queued_triggers(
+        &db.pool,
+        &[mixed, unknown_only, firewall_rules_beside_unknown, known],
+    )
+    .await?
+    .try_into()
+    .unwrap();
     assert_eq!(failed.node_id, unknown_only);
     assert_eq!(failed.attempts, 1);
     assert_eq!(failed.claimed_at, None);
     assert_eq!(failed.last_error.as_deref(), Some("node unreachable"));
+    Ok(())
+}
+
+/// The firewall rules reason binds through the real enqueue cast and claims
+/// back typed: beside an existing reason and a duplicate of itself, it is kept
+/// once, and a node that received only it claims only it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_firewall_rules_reason_enqueues_and_claims() -> TestResult {
+    use ReconcileReason::{FirewallRulesChanged as Firewall, NodeUpdated as Updated};
+
+    let db = pg_test_db().await?;
+    let mixed = NodeId::new();
+    let firewall_only = NodeId::new();
+    for node_id in [mixed, firewall_only] {
+        insert_node(
+            &db.pool,
+            node_id,
+            SpaceNodeRole::Worker.as_str(),
+            "space",
+            None,
+        )
+        .await?;
+    }
+    enqueue_triggers(&db.pool, [mixed, firewall_only], Firewall).await?;
+    enqueue_triggers(&db.pool, [mixed], Updated).await?;
+    enqueue_triggers(&db.pool, [mixed], Firewall).await?;
+
+    let claimed = claim_triggers(&db.pool, 10)
+        .await?
+        .triggers
+        .into_iter()
+        .map(|trigger| {
+            (
+                trigger.node_id,
+                (trigger.reasons, trigger.diagnostic_reason),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        claimed,
+        BTreeMap::from([
+            (
+                mixed,
+                (
+                    vec![Updated, Firewall],
+                    "firewall_rules_changed,node_updated,firewall_rules_changed".to_owned(),
+                ),
+            ),
+            (
+                firewall_only,
+                (vec![Firewall], "firewall_rules_changed".to_owned()),
+            ),
+        ])
+    );
+    Ok(())
+}
+
+/// Every [`ReconcileReason`] has a `state_reconciliation_reason` label, spelled
+/// the same whichever way the reason crosses: the derived sqlx encoding the
+/// enqueue binds, the derived decoding, and the text a claim parses. A Rust
+/// reason without a label would fail its enqueue with 22P02. A label without a
+/// Rust reason is not checked: a new label ships in a migration of its own
+/// before the build that adds its reason, and a claim skips it until then.
+#[tokio::test(flavor = "current_thread")]
+async fn every_rust_reason_has_a_postgres_label() -> TestResult {
+    let db = pg_test_db().await?;
+    let labels: Vec<String> = sqlx::query_scalar(sql!(
+        "SELECT UNNEST(enum_range(NULL::state_reconciliation_reason))::TEXT"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    let labels = labels.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let spellings = ReconcileReason::ALL
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        spellings.is_subset(&labels),
+        "reasons without a label: {:?}",
+        spellings.difference(&labels).collect::<Vec<_>>()
+    );
+    for &reason in ReconcileReason::ALL {
+        assert_eq!(ReconcileReason::parse(reason.as_str()), Some(reason));
+        let encoded: String =
+            sqlx::query_scalar(sql!("SELECT ($1::state_reconciliation_reason)::TEXT"))
+                .bind(reason)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(encoded, reason.as_str());
+        let decoded: ReconcileReason =
+            sqlx::query_scalar(sql!("SELECT $1::TEXT::state_reconciliation_reason"))
+                .bind(reason.as_str())
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(decoded, reason);
+    }
     Ok(())
 }

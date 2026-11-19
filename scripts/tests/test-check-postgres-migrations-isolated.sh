@@ -602,6 +602,64 @@ write_file "${work_repo}/docs/space/migration-note.md" "docs"
 commit_scenario "${work_repo}" "migration plus docs"
 expect_guard_success "${work_repo}" "migration-plus-docs"
 
+# A test fixture's schema variant travels with the migration it follows; the
+# fixture crate's code and a file below the variants directory do not.
+schema_variants_dir="crates/test_support/db/test/fixtures/schema-variants"
+git -C "${work_repo}" checkout --quiet -B migration-plus-schema-variant "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000007_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/example_variant.sql" "CREATE VIEW widgets_view AS SELECT name FROM widgets;"
+commit_scenario "${work_repo}" "migration plus schema variant"
+expect_guard_success "${work_repo}" "migration-plus-schema-variant"
+grep -F "without runtime app changes" \
+  "${tmp_dir}/migration-plus-schema-variant.stdout" >/dev/null
+
+git -C "${work_repo}" checkout --quiet -B migration-plus-nested-schema-variant "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000008_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/nested/example_variant.sql" "SELECT 1;"
+commit_scenario "${work_repo}" "migration plus nested schema variant"
+expect_guard_failure "${work_repo}" "migration-plus-nested-schema-variant"
+grep -F "${schema_variants_dir}/nested/example_variant.sql" \
+  "${tmp_dir}/migration-plus-nested-schema-variant.stderr" >/dev/null
+
+git -C "${work_repo}" checkout --quiet -B migration-plus-schema-variant-and-fixture-code "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000009_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/example_variant.sql" "SELECT 1;"
+write_file "${work_repo}/crates/test_support/db/test/fixtures/src/lib.rs" "pub fn fixture() {}"
+commit_scenario "${work_repo}" "migration plus schema variant and fixture code"
+expect_guard_failure "${work_repo}" "migration-plus-schema-variant-and-fixture-code"
+grep -F "crates/test_support/db/test/fixtures/src/lib.rs" \
+  "${tmp_dir}/migration-plus-schema-variant-and-fixture-code.stderr" >/dev/null
+if grep -F "${schema_variants_dir}/example_variant.sql" \
+  "${tmp_dir}/migration-plus-schema-variant-and-fixture-code.stderr" >/dev/null; then
+  echo "a schema variant must not be reported as a runtime change" >&2
+  exit 1
+fi
+
+# A file directly in the variants directory that is not .sql still counts as a runtime change.
+git -C "${work_repo}" checkout --quiet -B migration-plus-non-sql-schema-variant-file "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000030_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+write_file "${work_repo}/${schema_variants_dir}/loader.rs" "pub fn load() {}"
+commit_scenario "${work_repo}" "migration plus non-sql file in the variants directory"
+expect_guard_failure "${work_repo}" "migration-plus-non-sql-schema-variant-file"
+grep -F "${schema_variants_dir}/loader.rs" \
+  "${tmp_dir}/migration-plus-non-sql-schema-variant-file.stderr" >/dev/null
+
+# A runtime file moved into the variants directory beside a migration is still a
+# runtime change: its old path is a deletion.
+git -C "${work_repo}" checkout --quiet -B runtime-query-seed "${base_commit}"
+write_file "${work_repo}/crates/example/src/queries/widgets.sql" "SELECT name FROM widgets;"
+commit_scenario "${work_repo}" "runtime query seed"
+git -C "${work_repo}" update-ref refs/remotes/origin/main HEAD
+git -C "${work_repo}" checkout --quiet -B migration-plus-runtime-file-moved-into-variants
+mkdir -p "${work_repo}/${schema_variants_dir}"
+git -C "${work_repo}" mv crates/example/src/queries/widgets.sql "${schema_variants_dir}/widgets.sql"
+write_file "${work_repo}/db/postgres/20260623000031_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
+commit_scenario "${work_repo}" "migration plus runtime file moved into the variants directory"
+expect_guard_failure "${work_repo}" "migration-plus-runtime-file-moved-into-variants"
+grep -F "crates/example/src/queries/widgets.sql" \
+  "${tmp_dir}/migration-plus-runtime-file-moved-into-variants.stderr" >/dev/null
+git -C "${work_repo}" update-ref refs/remotes/origin/main "${base_commit}"
+
 git -C "${work_repo}" checkout --quiet -B migration-plus-guard-maintenance "${base_commit}"
 write_file "${work_repo}/db/postgres/20260623000005_add_column.up.sql" "ALTER TABLE widgets ADD COLUMN name TEXT;"
 write_file "${work_repo}/scripts/check-postgres-migrations-example.sh" "#!/usr/bin/env bash"

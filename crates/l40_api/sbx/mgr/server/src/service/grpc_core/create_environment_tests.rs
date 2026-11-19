@@ -9,24 +9,24 @@ use super::create_after_lookup_tests::{
 use super::*;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::template_resolver::fake::FakeTemplateResolver;
-use pplx_space_common_core::types::{ExecutionMetadata, SnapshotExecutionMetadata};
 use pplx_space_execution_common::environment::EnvironmentDefinition;
+use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
 use pplx_space_node_mgr_client::proto::{
     NetworkPoolStatusRequest, NetworkPoolStatusResponse, ResolveExecutionEnvironmentRequest,
     ResolveExecutionEnvironmentResponse,
 };
 use pplx_space_template_mgr_client::proto::GetTemplateResponse;
 
-const UPGRADE: &str = "fc-1.17.0-linux-6.1.155";
+pub(super) const UPGRADE: &str = "fc-1.17.0-linux-6.1.155";
 /// The 6.18 guest kernel: a different environment with the upgrade's runtime.
 const UPGRADE_WITH_NEW_KERNEL: &str = "fc-1.17.0-linux-6.18.44";
 const RESOLVE: &str = "ResolveExecutionEnvironment";
 
 /// A compiled environment, exactly as the catalog defines it, so its
 /// reference is the one sandbox-manager's qualification checks recognize.
-fn definition(name: &str) -> EnvironmentDefinition {
+pub(super) fn definition(name: &str) -> EnvironmentDefinition {
     pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .into_iter()
@@ -36,14 +36,14 @@ fn definition(name: &str) -> EnvironmentDefinition {
     .clone()
 }
 
-fn bound(definition: &EnvironmentDefinition) -> ExecutionMetadata {
+pub(super) fn bound(definition: &EnvironmentDefinition) -> ExecutionMetadata {
     definition
         .bind_execution(definition.execution_requirements().unwrap())
         .unwrap()
 }
 
 /// A template build whose stored metadata binds it to `execution`.
-fn bound_template(execution: &ExecutionMetadata) -> TemplateBuild {
+pub(super) fn bound_template(execution: &ExecutionMetadata) -> TemplateBuild {
     let build = TemplateBuild::new();
     let path = build.dir.path().join("metadata.json");
     let mut metadata: serde_json::Value =
@@ -56,7 +56,7 @@ fn bound_template(execution: &ExecutionMetadata) -> TemplateBuild {
 
 /// Whether the fake node executes the environment it's asked to admit.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Node {
+pub(super) enum Node {
     Executes,
     Refuses,
     /// Fails to answer, as an unreachable node-manager does.
@@ -66,7 +66,7 @@ enum Node {
 /// A node-manager answering exact resolution of `definition`, and the memory
 /// policy a base-snapshot create reads. Compatible selection fails the test:
 /// cluster, pool and warm paths keep the template's exact binding.
-fn node_manager(definition: &EnvironmentDefinition, node: Node) -> FakeNodeManager {
+pub(super) fn node_manager(definition: &EnvironmentDefinition, node: Node) -> FakeNodeManager {
     let reference = definition.reference().to_string();
     let response = ResolveExecutionEnvironmentResponse {
         accepted_selection: 0,
@@ -116,13 +116,13 @@ fn single_build(response: GetTemplateResponse) -> Arc<FakeTemplateResolver> {
 }
 
 /// A fixture whose creates complete: no insert fence, and a test-owned cache.
-struct Created {
-    fixture: Fixture,
+pub(super) struct Created {
+    pub(super) fixture: Fixture,
     cache: tempfile::TempDir,
 }
 
 impl Created {
-    fn new(
+    pub(super) fn new(
         conn: crate::db::Connection,
         templates: Arc<FakeTemplateResolver>,
         node: FakeNodeManager,
@@ -143,7 +143,7 @@ impl Created {
         resolutions(&self.fixture)
     }
 
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         self.fixture.service.shutdown_token.cancel();
         self.fixture.service.task_tracker.close();
         tokio::time::timeout(CREATE_WAIT, self.fixture.service.task_tracker.wait())
@@ -455,6 +455,17 @@ async fn an_upgrade_template_adopts_its_pool_donor_but_explicit_selection_does_n
     }
 }
 
+/// How a create names its environment.
+#[derive(Clone, Copy, Debug)]
+enum Input {
+    /// It doesn't: the template's binding.
+    Template,
+    /// `CreateRequest.environment`.
+    Selected,
+    /// `CreateRequest.required_environment`.
+    Required,
+}
+
 /// The producer a template's base snapshot records, if any.
 #[derive(Clone, Copy, Debug)]
 enum BaseSnapshot {
@@ -484,18 +495,20 @@ async fn an_upgrade_template_boots_warm_only_from_a_base_snapshot_captured_under
     }
     let upgrade = definition(UPGRADE);
     let execution = bound(&upgrade);
-    for (snapshot, selected, warm) in [
-        (BaseSnapshot::CapturedUnder(UPGRADE), false, true),
+    for (snapshot, input, warm) in [
+        (BaseSnapshot::CapturedUnder(UPGRADE), Input::Template, true),
         // Explicit selection never falls back, so it never restores through a
-        // loader the node picks for the snapshot.
-        (BaseSnapshot::CapturedUnder(UPGRADE), true, false),
-        (BaseSnapshot::CapturedUnder("e0"), false, false),
+        // loader the node picks for the snapshot. Nor does a required
+        // environment, as a Kubernetes pod sends it.
+        (BaseSnapshot::CapturedUnder(UPGRADE), Input::Selected, false),
+        (BaseSnapshot::CapturedUnder(UPGRADE), Input::Required, false),
+        (BaseSnapshot::CapturedUnder("e0"), Input::Template, false),
         (
             BaseSnapshot::CapturedUnder(UPGRADE_WITH_NEW_KERNEL),
-            false,
+            Input::Template,
             false,
         ),
-        (BaseSnapshot::WithoutProvenance, false, false),
+        (BaseSnapshot::WithoutProvenance, Input::Template, false),
     ] {
         let build = bound_template(&execution);
         let snapshot_dir = tempfile::tempdir().unwrap();
@@ -513,14 +526,22 @@ async fn an_upgrade_template_boots_warm_only_from_a_base_snapshot_captured_under
             sandbox_id: Some(id.clone()),
             ..create_request()
         };
-        if selected {
-            pplx_space_sbx_mgr_client::environment::bind(&mut request, upgrade.reference());
+        match input {
+            Input::Template => {}
+            Input::Selected => {
+                pplx_space_sbx_mgr_client::environment::bind(&mut request, upgrade.reference());
+            }
+            Input::Required => {
+                request.runtime.clear();
+                request.content_hash = Some(BUILD.into());
+                request.required_environment = Some(upgrade.reference().to_string());
+            }
         }
         let response = created
             .fixture
             .create(request)
             .await
-            .unwrap_or_else(|error| panic!("{snapshot:?}: {error}"));
+            .unwrap_or_else(|error| panic!("{snapshot:?} {input:?}: {error}"));
         let staged = created.cache.path().join(&id).join("snapshot");
         if warm {
             assert_eq!(response.boot_mode_used, BootMode::BaseSnapshot as i32);

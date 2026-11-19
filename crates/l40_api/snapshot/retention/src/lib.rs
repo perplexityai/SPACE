@@ -114,7 +114,7 @@
 //! scheduling, singleton authority, and shutdown. SPACE currently hosts it in
 //! `space-cluster-controller`; API servers do not start background loops.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -125,10 +125,10 @@ use futures_util::{
     StreamExt,
     stream::{self, FuturesUnordered},
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use backend::{DeletePrefixError, DeletePrefixOutcome, StorageBackendRegistry};
@@ -483,7 +483,7 @@ impl<S: RetentionSink> Reconciler<S> {
         let total_budget = usize::try_from(self.policy.max_per_tick).unwrap_or(usize::MAX);
         let recovery_budget =
             total_budget / 2 + usize::from(total_budget % 2 == 1 && self.recovery_gets_extra);
-        self.recovery_gets_extra = !self.recovery_gets_extra;
+        self.recovery_gets_extra.toggle();
 
         // Recovery and fresh claims share one hard work budget so the metric
         // and monitor ceiling describe the actual number of destructive

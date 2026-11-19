@@ -1,9 +1,9 @@
-use pplx_space_common_core::types::JobId;
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_accounts::JobId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 
-fn job_fixture(kind: &str, payload: String) -> Job {
+pub(crate) fn job_fixture(kind: &str, payload: String) -> Job {
     Job {
         job_id: JobId::new(),
         kind: kind.to_string(),
@@ -134,6 +134,93 @@ async fn stalled_transfer_probe_is_bounded_without_cancelling_remote_work() {
     );
 }
 
+fn completed_transfer(bytes: u64) -> pplx_space_volmgr_client::proto::GetTransferJobResponse {
+    pplx_space_volmgr_client::proto::GetTransferJobResponse {
+        job: Some(pplx_space_volmgr_client::proto::TransferJob {
+            status: TransferJobStatus::Completed as i32,
+            bytes_transferred: bytes,
+            ..Default::default()
+        }),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_poll_waits_through_a_volume_manager_restart() {
+    let started = tokio::time::Instant::now();
+    let restart = Duration::from_secs(120);
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let observation = poll_artifact_job_with(
+        "sandbox",
+        JobId::new(),
+        {
+            let probes = std::sync::Arc::clone(&probes);
+            move || {
+                probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let restarting = started.elapsed() < restart;
+                async move {
+                    if restarting {
+                        Err(tonic::Status::unavailable(
+                            "Connection refused (os error 111)",
+                        ))
+                    } else {
+                        Ok(completed_transfer(42))
+                    }
+                }
+            }
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("the transfer completes once volume-manager is back");
+
+    assert_eq!(observation.bytes, 42);
+    assert!(started.elapsed() >= restart);
+    assert!(probes.load(std::sync::atomic::Ordering::SeqCst) > 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_poll_retries_the_upload_once_volume_manager_stays_unreachable() {
+    let started = tokio::time::Instant::now();
+
+    let error = poll_artifact_job_with(
+        "sandbox",
+        JobId::new(),
+        || async {
+            Err(tonic::Status::unavailable(
+                "Connection refused (os error 111)",
+            ))
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, JobError::Retriable(_)), "{error:?}");
+    assert!(started.elapsed() >= pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET);
+    assert!(
+        started.elapsed()
+            < pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET + Duration::from_secs(5)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_poll_treats_a_missing_volume_manager_socket_as_a_restart() {
+    let started = tokio::time::Instant::now();
+
+    let error = wait_for_artifact_job(
+        &absent_volume_manager_socket(),
+        "sandbox",
+        &JobId::new(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, JobError::Retriable(_)), "{error:?}");
+    assert!(started.elapsed() >= pplx_space_volmgr_client::VOLUME_MANAGER_RESTART_BUDGET);
+}
+
 #[test]
 fn refund_interrupted_running_attempts_only_touches_running_snapshot_upload_jobs() {
     let conn = crate::db::Connection::open_in_memory();
@@ -230,8 +317,8 @@ async fn executor_requires_begin_before_volume_staging() {
     let artifact = "01939e3e-eeee-7000-8000-000000000022";
     let mut payload = reclaim_fixture_payload(artifact, "/space/cache/snapshot".into());
     payload.meta.execution = Some(
-        pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+            pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                 std::env::consts::ARCH.parse().unwrap(),
                 vec![],
             ),
@@ -644,8 +731,8 @@ fn payload_for(artifact_id: &str) -> String {
 
 fn reclaim_fixture_meta(
     rootfs_diff_format: Option<&str>,
-    artifact_kind: Option<pplx_space_common_core::types::ArtifactKind>,
-    artifact_origin: Option<pplx_space_common_core::types::ArtifactOrigin>,
+    artifact_kind: Option<pplx_space_snapshot_model::ArtifactKind>,
+    artifact_origin: Option<pplx_space_snapshot_model::ArtifactOrigin>,
     local_artifact_id: Option<LocalArtifactId>,
 ) -> SnapshotMeta {
     SnapshotMeta {
@@ -688,7 +775,7 @@ fn reclaim_fixture_meta(
 /// of scope.
 #[test]
 fn stream_reclaim_applies_only_to_pinned_btrfs_send_suspend_artifacts() {
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
     let id = LocalArtifactId::new();
     let btrfs = Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1);
 
@@ -763,8 +850,8 @@ pub(crate) fn reclaim_fixture_payload(
     SnapshotUploadJobs {
         meta: reclaim_fixture_meta(
             Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1),
-            Some(pplx_space_common_core::types::ArtifactKind::Full),
-            Some(pplx_space_common_core::types::ArtifactOrigin::Suspend),
+            Some(pplx_space_snapshot_model::ArtifactKind::Full),
+            Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend),
             Some(artifact_id.parse().unwrap()),
         ),
         snapshot_id: "01939e3e-ffff-7000-8000-000000000001".to_string(),
@@ -782,6 +869,7 @@ pub(crate) fn reclaim_fixture_payload(
         includes_metadata_job: true,
         deferred_metadata: false,
         execution_generation: None,
+        execution_generation_names_capture: false,
         failure_scope: Default::default(),
     }
 }
@@ -855,8 +943,8 @@ fn only_exact_prepared_intents_begin_in_the_worker() {
     let artifact = "01939e3e-eeee-7000-8000-000000000021";
     let mut prepared = reclaim_fixture_payload(artifact, "/space/cache/snapshot".into());
     prepared.meta.execution = Some(
-        pplx_space_common_core::types::SnapshotExecutionMetadata::new(
-            pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_execution_spec::SnapshotExecutionMetadata::new(
+            pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
                 std::env::consts::ARCH.parse().unwrap(),
                 vec![],
             ),
@@ -935,7 +1023,7 @@ fn disk_operation_backup_stamps_its_durability_marker() {
     let snapshot_dir = tmp.path().join("snapshot");
     write_snapshot_dir_fixture(&snapshot_dir);
     let mut payload = reclaim_fixture_payload(artifact, snapshot_dir.clone());
-    payload.meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Disk);
+    payload.meta.artifact_kind = Some(pplx_space_snapshot_model::ArtifactKind::Disk);
 
     stamp_backup_completed_and_reclaim_stream(&conn, &payload, "fork-backup-1", None).unwrap();
 
@@ -1188,9 +1276,9 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
 /// verbatim, and carry nothing when the capture host was unknown.
 #[test]
 fn begin_request_carries_the_recorded_capture_host_cpu() {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, HostCpu, SnapshotExecutionMetadata,
-    };
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, HostCpu, SnapshotExecutionMetadata};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,
@@ -1211,9 +1299,40 @@ fn begin_request_carries_the_recorded_capture_host_cpu() {
             storage_uri: "s3://space-test/suspend-snapshots/attempt?region=us-east-1",
             execution: &execution,
             execution_generation: None,
+            execution_generation_names_capture: false,
             fence_verdict_only: false,
         });
         assert_eq!(request.capture_host_cpu.as_deref(), host_cpu);
+    }
+}
+
+/// A persisted upload's mark that its execution generation is the capture's
+/// own reaches the registration, so cluster-api records the generation only
+/// for a marked capture.
+#[test]
+fn begin_request_carries_the_capture_generation_mark() {
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
+    use pplx_space_sandbox_model::ExecutionGeneration;
+
+    let artifact_id = "01939e3e-eeee-7000-8000-000000000051";
+    for names_capture in [false, true] {
+        let mut payload =
+            reclaim_fixture_payload(artifact_id, std::path::PathBuf::from("/space/cache/s"));
+        payload.meta.execution = Some(
+            SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+                Arch::X86_64,
+                vec![],
+            ))
+            .unwrap(),
+        );
+        payload.execution_generation = Some(ExecutionGeneration::new(7).unwrap());
+        payload.execution_generation_names_capture = names_capture;
+
+        let request =
+            begin_artifact_backup_request(&prepared_begin(&payload, artifact_id, false).unwrap());
+        assert_eq!(request.execution_generation, Some(7));
+        assert_eq!(request.execution_generation_names_capture, names_capture);
     }
 }
 
@@ -1222,9 +1341,9 @@ fn begin_request_carries_the_recorded_capture_host_cpu() {
 /// verdict-only requests, left a row for the probe to close.
 #[test]
 fn verdict_only_begin_is_requested_and_its_echo_read() {
-    use pplx_space_common_core::types::{
-        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, SnapshotExecutionMetadata,
-    };
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, SnapshotExecutionMetadata};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
         Arch::X86_64,
@@ -1242,6 +1361,7 @@ fn verdict_only_begin_is_requested_and_its_echo_read() {
             storage_uri: "s3://space-test/suspend-snapshots/attempt?region=us-east-1",
             execution: &execution,
             execution_generation: None,
+            execution_generation_names_capture: false,
             fence_verdict_only,
         });
         assert_eq!(request.fence_verdict_only, fence_verdict_only);
@@ -1271,7 +1391,7 @@ fn absent_volume_manager_socket() -> std::path::PathBuf {
 #[test]
 fn suspend_uncommitted_follows_the_row_state_and_its_pin() {
     use crate::state::{SandboxState, SandboxStatus};
-    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+    use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
     let capture = LocalArtifactId::new();
     let pinned = capture.to_string();

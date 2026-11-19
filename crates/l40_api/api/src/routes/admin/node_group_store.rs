@@ -7,13 +7,14 @@
 //! set-default, delete) lock the group row `FOR UPDATE` and run their residue
 //! checks inside the same transaction so two operators cannot race a guard.
 
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeGroupId;
-use pplx_space_common_core::types::{NodeGroupName, NodeGroupTemplatePolicy, TemplateVisibility};
+use pplx_space_node_model::NodeGroupId;
+use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
+use pplx_space_sql_locator::sql;
+use pplx_space_template_model::TemplateVisibility;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 

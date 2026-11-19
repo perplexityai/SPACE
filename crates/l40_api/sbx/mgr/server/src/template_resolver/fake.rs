@@ -7,8 +7,9 @@ use pplx_space_template_mgr_client::proto::{GetTemplateRequest, GetTemplateRespo
 
 use super::{TemplateLookupError, TemplateResolver};
 
-type Answer =
-    dyn Fn() -> Result<tonic::Response<GetTemplateResponse>, TemplateLookupError> + Send + Sync;
+type Answer = dyn Fn(&GetTemplateRequest) -> Result<tonic::Response<GetTemplateResponse>, TemplateLookupError>
+    + Send
+    + Sync;
 
 /// Which [`TemplateResolver`] method a lookup used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +39,19 @@ pub(crate) struct FakeTemplateResolver {
 impl FakeTemplateResolver {
     pub(crate) fn new(
         answer: impl Fn() -> Result<tonic::Response<GetTemplateResponse>, TemplateLookupError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self::answering(move |_| answer())
+    }
+
+    /// Answer each lookup from its request, as template-manager answers a
+    /// lookup's environment preference from the builds it holds.
+    pub(crate) fn answering(
+        answer: impl Fn(
+            &GetTemplateRequest,
+        ) -> Result<tonic::Response<GetTemplateResponse>, TemplateLookupError>
         + Send
         + Sync
         + 'static,
@@ -73,6 +87,7 @@ impl FakeTemplateResolver {
         request: tonic::Request<GetTemplateRequest>,
     ) -> Result<tonic::Response<GetTemplateResponse>, TemplateLookupError> {
         let (metadata, _, request) = request.into_parts();
+        let answer = (self.answer)(&request);
         self.lookups
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -81,7 +96,7 @@ impl FakeTemplateResolver {
                 metadata,
                 request,
             });
-        (self.answer)()
+        answer
     }
 }
 

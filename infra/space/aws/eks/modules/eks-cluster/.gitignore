@@ -1,0 +1,4 @@
+# `terraform test` initializes this module in place. A module does not pin
+# provider versions (the roots that call it do), so its lock file stays local.
+.terraform/
+.terraform.lock.hcl

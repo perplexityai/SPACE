@@ -1,5 +1,7 @@
 use super::*;
-use pplx_space_common_core::types::{PodUid, SandboxActivationAttemptId, TemplateId};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_template_model::TemplateId;
 
 mod activation_timeout_tests {
     use super::*;
@@ -200,10 +202,10 @@ mod touch_auto_lifecycle_tests {
 
 mod policy_tests {
 
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
     use std::collections::BTreeMap;
 
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionKind, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
         AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
     };
@@ -347,51 +349,21 @@ mod policy_tests {
     #[test]
     fn sandbox_port_exposure_admission_enforces_guest_listener_budget() {
         super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64 - 1,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64 - 1,
             false,
         )
         .unwrap();
         let error = super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64,
             false,
         )
         .unwrap_err();
         assert_eq!(error.status(), axum::http::StatusCode::CONFLICT);
         super::ports::enforce_sandbox_port_exposure_capacity(
-            pplx_space_common_core::types::MAX_SANDBOX_PORT_EXPOSURES as i64,
+            pplx_space_sandbox_model::MAX_SANDBOX_PORT_EXPOSURES as i64,
             true,
         )
         .expect("existing desired-open exposure remains idempotent above the new admission limit");
-    }
-
-    #[test]
-    fn validate_create_template_reference_accepts_tags_and_full_digest() {
-        let template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
-        validate_create_template_reference(&template).unwrap();
-        assert!(template.uses_default_selector());
-        assert_eq!(template.artifact_digest(), None);
-
-        let template = "seed:prod".parse::<TemplateReference>().unwrap();
-        validate_create_template_reference(&template).unwrap();
-        assert!(!template.uses_default_selector());
-
-        let hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        let template = format!("seed@{hash}").parse::<TemplateReference>().unwrap();
-        validate_create_template_reference(&template).unwrap();
-        assert_eq!(
-            template.artifact_digest().map(|digest| digest.to_string()),
-            Some(hash.to_string())
-        );
-    }
-
-    #[test]
-    fn validate_create_template_reference_rejects_digest_prefixes() {
-        let template = "seed@sha256:111111111111"
-            .parse::<TemplateReference>()
-            .unwrap();
-
-        let error = validate_create_template_reference(&template).unwrap_err();
-        assert!(error.to_string().contains("digest prefixes"));
     }
 }
 
@@ -1139,8 +1111,65 @@ mod template_release_resolution_postgres_tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn digest_prefix_shared_by_two_releases_is_rejected() -> TestResult {
+        let db = pg_test_db().await?;
+        sqlx::query(sql!(
+            "INSERT INTO templates (id, name, description, org_id, network_policy_generation)
+             VALUES ($1, 'custom-template', NULL, NULL, 1)"
+        ))
+        .bind(TemplateId::new().as_uuid())
+        .execute(&db.pool)
+        .await?;
+        let shared = "0123456789ab";
+        let first = format!("sha256:{shared}{}", "1".repeat(52));
+        let first_id = Uuid::now_v7();
+        for (id, hash) in [
+            (first_id, first.clone()),
+            (Uuid::now_v7(), format!("sha256:{shared}{}", "2".repeat(52))),
+        ] {
+            sqlx::query(sql!(
+                "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+                 VALUES ($1, 'custom-template', 'fc', $2, NULL)"
+            ))
+            .bind(id)
+            .bind(hash)
+            .execute(&db.pool)
+            .await?;
+        }
+        let caller_org = OrgId::new();
+        let ambiguous = format!("custom-template@sha256:{shared}").parse()?;
+        let error = resolve_template_release(
+            &db.pool,
+            &ambiguous,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            error.to_string().contains("more than one release"),
+            "{error}"
+        );
+
+        let longer = format!("custom-template@sha256:{shared}1").parse()?;
+        let resolved = resolve_template_release(
+            &db.pool,
+            &longer,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await?;
+        assert_eq!(resolved, (first_id, first));
+        Ok(())
+    }
+
     /// Characterization of sandbox-create release resolution (tag with
-    /// `latest` fallback, digest stored as given or with `sha256:` stripped)
+    /// `latest` fallback, full digest or unique digest prefix, stored as given
+    /// or with `sha256:` stripped)
     /// over the shared resolver world. A bare-hex request cannot reach this
     /// resolver: `TemplateReference` rejects `name@<hex>` without an algorithm.
     #[tokio::test(flavor = "current_thread")]
@@ -1153,6 +1182,8 @@ mod template_release_resolution_postgres_tests {
         let (fc, ch) = (RuntimeKind::Firecracker, RuntimeKind::CloudHypervisor);
         let sha = |c| format!("sha256:{}", hex(c));
         let blake = |c| format!("blake3:{}", hex(c));
+        let sha_prefix = |c: char| format!("sha256:{}", c.to_string().repeat(12));
+        let blake_prefix = |c: char| format!("blake3:{}", c.to_string().repeat(12));
         let hit = |id, hash: String| Some((id, hash));
 
         let cases = [
@@ -1177,6 +1208,51 @@ mod template_release_resolution_postgres_tests {
             ),
             (format!("resolver-fixture@{}", blake('a')), fc, OTHER, None),
             (format!("resolver-fixture@{}", sha('c')), fc, OTHER, None),
+            // A digest prefix resolves to the one release it starts, answered
+            // in canonical form like a full digest. A legacy bare row is a
+            // SHA-256 digest, and one stored in both forms is one release.
+            (
+                format!("resolver-fixture@{}", sha_prefix('a')),
+                fc,
+                OTHER,
+                hit(w.bare, sha('a')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('b')),
+                fc,
+                OTHER,
+                hit(w.prefixed, sha('b')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake_prefix('c')),
+                fc,
+                OTHER,
+                hit(w.blake3, blake('c')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('9')),
+                fc,
+                OTHER,
+                hit(w.dual_prefixed, sha('9')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake_prefix('a')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('c')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture@{}", sha_prefix('b')),
+                ch,
+                OTHER,
+                None,
+            ),
             // Both forms stored: the row stored in the requested form wins over
             // the newer bare row with the larger id, and over the older bare
             // row with the smaller id.
@@ -1246,6 +1322,24 @@ mod template_release_resolution_postgres_tests {
             ("resolver-fixture-private:latest".into(), fc, OTHER, None),
             (
                 format!("resolver-fixture-private@{}", sha('f')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture-private@{}", sha_prefix('f')),
+                fc,
+                OWNER,
+                hit(w.private, sha('f')),
+            ),
+            (
+                format!("resolver-fixture-private@{}", sha_prefix('f')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                format!("resolver-fixture-deleting@{}", sha_prefix('7')),
                 fc,
                 OTHER,
                 None,
@@ -1362,6 +1456,8 @@ mod template_release_resolution_postgres_tests {
 mod response_tests {
 
     use super::*;
+    use pplx_space_accounts::{NodeId, SandboxOwnerSource};
+    use pplx_space_accounts::{OrgId, UserId};
     use pplx_space_api_route::{
         ed25519::SPACE_API_ROUTE_ED25519_ISSUER_ENV,
         ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
@@ -1369,8 +1465,8 @@ mod response_tests {
         ed25519::SpaceApiRouteEd25519Authority,
         ed25519::decode_unverified_space_api_route_ed25519_claims,
     };
-    use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId, SandboxOwnerSource};
-    use pplx_space_common_core::types::{OrgId, UserId};
+    use pplx_space_node_model::NodeManagedBy;
+    use pplx_space_sandbox_model::SandboxId;
 
     use sqlx::types::Json;
 
@@ -1401,7 +1497,7 @@ mod response_tests {
             active_execution_generation: None,
             active_pod_uid: None,
             active_activation_attempt_id: None,
-            ecw_credential_epoch: pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+            ecw_credential_epoch: pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
                 .expect("credential epoch is valid"),
             target_node_id: None,
             placement_changed_at: None,
@@ -1430,6 +1526,7 @@ mod response_tests {
             last_command_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            activating_client_id: None,
         }
     }
 
@@ -1460,7 +1557,9 @@ mod response_tests {
             substrate_node_id: None,
             template: None,
             status: None,
-            spaced_version: None,
+            version: ObservedSpacedVersion {
+                spaced_version: None,
+            },
             pid: None,
             namespace: None,
             uptime: None,

@@ -29,7 +29,7 @@ use crate::proto::{
 use crate::state::SandboxState;
 
 #[cfg(test)]
-mod tests;
+pub(in crate::service::runtime_upgrade) mod tests;
 
 /// The staging `Start` for a suspended sandbox absent from the node: the
 /// upgrade's own start, as a restore from `stage_from`'s checkpoint. A blank
@@ -139,10 +139,21 @@ impl crate::service::SandboxManagerService {
             // An operation id names one upgrade of one sandbox. A request that
             // reuses one another sandbox's upgrade recorded stages nothing.
             upgrader.refuse_another_request(&upgrade)?;
+            // A backed-up suspended copy of another checkpoint makes way for
+            // the decided one; an unproven one stays, and the upgrade's
+            // checkpoint check refuses it.
+            let staging = staging_start(&upgrade.start, stage_from);
+            self.evict_stale_checkpoint_copy(
+                &upgrade.sandbox_id,
+                upgrade.operation_id,
+                upgrade.checkpoint_local_artifact_id,
+                upgrade.authorization.memory_loss,
+                &staging,
+            )
+            .await?;
             // Leaves a present sandbox alone, in any state; the upgrade's
             // checkpoint check decides whether its copy may be upgraded.
-            self.stage_missing_checkpoint(staging_start(&upgrade.start, stage_from))
-                .await?;
+            self.stage_missing_checkpoint(staging).await?;
         }
         let target_state = upgrade.target_state;
         let operation_id = upgrade.operation_id;
@@ -208,6 +219,7 @@ impl crate::service::SandboxManagerService {
         Ok(UpgradeRuntimeResponse {
             outcome: wire_outcome as i32,
             start,
+            attempt_id: None,
         })
     }
 
@@ -226,7 +238,7 @@ impl crate::service::SandboxManagerService {
         extensions: Extensions,
         operation_id: crate::db::RuntimeUpgradeOperationId,
         start: StartRequest,
-        decided_checkpoint: Option<pplx_space_common_core::types::LocalArtifactId>,
+        decided_checkpoint: Option<pplx_space_snapshot_model::LocalArtifactId>,
     ) -> Result<StartResponse, Status> {
         let claim = match crate::db::read::runtime_upgrade_report(&*self.db_conn()?, operation_id)
             .map_err(|error| {
@@ -361,7 +373,7 @@ impl crate::service::SandboxManagerService {
         extensions: Extensions,
         mut start: StartRequest,
         state: SandboxState,
-        from_execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+        from_execution: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     ) -> Result<StartResponse, Status> {
         if state == SandboxState::Suspended {
             start.checkpoint = Some(crate::service::create_support::SUSPEND_CHECKPOINT.to_string());

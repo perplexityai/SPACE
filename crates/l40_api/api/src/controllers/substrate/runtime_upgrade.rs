@@ -36,13 +36,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
+use pplx_space_execution_spec::{
     EnvironmentReference, INITIAL_FIRECRACKER_RUNTIME_VERSION,
-    INITIAL_FIRECRACKER_STATE_FORMAT_VERSION, LocalArtifactId, SandboxId,
+    INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
 };
 use pplx_space_runtime_environment_policy_store::{
     RuntimeEnvironmentPolicy, RuntimeEnvironmentState,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 #[cfg(test)]
 mod tests;
@@ -73,7 +75,7 @@ impl RuntimeUpgradeAtActivation {
     }
 
     pub fn from_env() -> Self {
-        Self::from_enabled(pplx_space_common_core::env::env_flag_var(Self::ENV, false))
+        Self::from_enabled(pplx_space_env_vars::env_flag_var(Self::ENV, false))
     }
 
     pub fn is_enabled(self) -> bool {

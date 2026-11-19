@@ -13,8 +13,8 @@
 //! writes. `nodes.node_group_id` is likewise never set here — the
 //! cluster-controller mirror reconciler copies it from the live node label.
 
-use pplx_space_common_core::types::NodeGroupId;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
+use pplx_space_node_model::NodeGroupId;
 
 use std::str::FromStr;
 
@@ -25,11 +25,12 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::admin::{
+use pplx_space_admin_protocol::{
     AdminNodeGroupResponse, AssignOrgRequest, CreateNodeGroupRequest, SetCompatRequest,
     SetTemplatePolicyRequest,
 };
-use pplx_space_common_core::types::{NodeGroupTemplatePolicy, TemplateVisibility};
+use pplx_space_node_model::NodeGroupTemplatePolicy;
+use pplx_space_template_model::TemplateVisibility;
 use uuid::Uuid;
 
 use super::audit::{self, AdminNodeGroupAuditEntry};

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig;
+use pplx_space_node_disk_admission::CacheDiskAdmissionConfig;
 use rstest::{fixture, rstest};
 use tempfile::TempDir;
 

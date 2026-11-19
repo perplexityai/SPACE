@@ -1,9 +1,11 @@
-use pplx_space_common_core::host::disk_admission::{
+use pplx_space_accounts::JobId;
+use pplx_space_artifact_model::SnapshotArtifact;
+use pplx_space_node_disk_admission::{
     CacheDiskMeasurement, CacheDiskProbeError, read_cache_disk_measurement,
 };
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, JobId, SandboxId, SnapshotArtifact, SubjectId,
-};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
+use pplx_space_subject_model::SubjectId;
 use pplx_space_volmgr_client::{
     VOLMGR_SOCKET,
     proto::{
@@ -512,7 +514,7 @@ async fn admit_copy_staging<Probe>(required_bytes: u64, measure_disk: Probe) -> 
 where
     Probe: FnOnce() -> Result<CacheDiskMeasurement, CacheDiskProbeError> + Send + 'static,
 {
-    use pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig;
+    use pplx_space_node_disk_admission::CacheDiskAdmissionConfig;
 
     let config = CacheDiskAdmissionConfig::from_env();
     if !config.enabled {
@@ -533,12 +535,12 @@ where
 }
 
 fn copy_disk_admission_decision(
-    config: pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig,
-    measurement: pplx_space_common_core::host::disk_admission::CacheDiskMeasurement,
+    config: pplx_space_node_disk_admission::CacheDiskAdmissionConfig,
+    measurement: pplx_space_node_disk_admission::CacheDiskMeasurement,
     required_bytes: u64,
-) -> pplx_space_common_core::host::disk_admission::CacheDiskAdmissionDecision {
+) -> pplx_space_node_disk_admission::CacheDiskAdmissionDecision {
     let reservation_bytes = required_bytes.max(config.allocation_reservation_bytes);
-    pplx_space_common_core::host::disk_admission::evaluate_cache_disk_measurement(
+    pplx_space_node_disk_admission::evaluate_cache_disk_measurement(
         config,
         measurement,
         reservation_bytes,
@@ -610,13 +612,11 @@ fn validate_disk_projection_source(
 }
 
 pub(crate) fn copy_staging_root_under(cache_root: &Path) -> PathBuf {
-    cache_root.join(pplx_space_common_core::host::linux::paths::FORK_COPY_STAGING_DIR_NAME)
+    cache_root.join(pplx_space_host_layout::paths::FORK_COPY_STAGING_DIR_NAME)
 }
 
 fn copy_staging_root() -> PathBuf {
-    copy_staging_root_under(Path::new(
-        pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR,
-    ))
+    copy_staging_root_under(Path::new(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR))
 }
 
 fn copy_staging_dir(operation_id: Uuid) -> std::path::PathBuf {

@@ -167,14 +167,37 @@ pub(super) fn compute_snapshot_hash(snap_dir: &str) -> std::io::Result<String> {
     Ok(result.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Which cache partition a `GetTemplate` request's environment selects
+/// its build from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PartitionChoice {
+    /// No environment: the legacy build first, then any other.
+    Any,
+    /// `TemplateRef.environment`: that partition's build first, then the
+    /// legacy one, then any other.
+    Prefer(crate::db::TemplateCachePartition),
+    /// `GetTemplateRequest.environment_required`: only a build bound to that
+    /// partition, for an exact digest.
+    Require(crate::db::TemplateCachePartition),
+}
+
+impl PartitionChoice {
+    /// The partition a pull must land its build in, if any.
+    pub(super) const fn required(self) -> Option<crate::db::TemplateCachePartition> {
+        match self {
+            Self::Require(partition) => Some(partition),
+            Self::Any | Self::Prefer(_) => None,
+        }
+    }
+}
+
 /// The build a `GetTemplate` request selects: a name plus an optional exact
-/// hash, preferring one environment's cache partition when `partition` is
-/// set.
+/// hash, from the partition `partition` chooses.
 #[derive(Clone)]
 pub(super) struct TemplateSelection {
     pub(super) name: String,
     pub(super) content_hash: String,
-    pub(super) partition: Option<crate::db::TemplateCachePartition>,
+    pub(super) partition: PartitionChoice,
 }
 
 /// Builds a `GetTemplateResponse` from a local SQLite lookup. Returns
@@ -193,7 +216,7 @@ pub(super) async fn build_get_template_response(
             .lock()
             .map_err(|e| Status::internal(format!("db mutex poisoned: {e}")))?;
 
-        let build = TemplateManagerService::resolve_template_build(
+        let build = TemplateManagerService::resolve_selected_build(
             &conn,
             &selection.name,
             &selection.content_hash,

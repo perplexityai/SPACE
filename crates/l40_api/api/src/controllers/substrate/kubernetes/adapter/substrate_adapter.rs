@@ -1,8 +1,9 @@
 //! `SubstrateAdapter` implementation for `KubernetesSubstrate`.
 
+use super::pooled::PooledPodEnvironment;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_node_model::{NodePoolName, SubstrateKind};
 
 impl SubstrateAdapter for KubernetesSubstrate {
     fn managed_by(&self) -> &'static str {
@@ -11,6 +12,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
     fn capabilities(&self) -> SubstrateCapabilities {
         SubstrateCapabilities::KUBERNETES
+    }
+
+    fn check_node_pool_placement(&self, _node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+        Ok(())
     }
 
     async fn create_execution<'a>(
@@ -111,7 +116,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             )
             .await?;
 
-        let requested_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let execution = match self
             .store
             .begin_activation_execution_row(
@@ -151,19 +156,32 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         phase_deadline,
                     )
                     .await?;
+                // A guest that does not answer within the create's wait leaves
+                // the joined create returning the owner's reachable pod as
+                // started, not command-ready, as a create that owns its pod
+                // does. An error here would make the caller delete its sandbox
+                // row, and with it the execution the owner is still starting.
                 let binding = if request.wait_until_ready {
-                    self.poll_until_command_ready(
-                        sandbox_id,
-                        request.metric_identity,
-                        self.k8s
-                            .create_command_ready_timeout
+                    match self
+                        .poll_until_command_ready(
+                            sandbox_id,
+                            request.metric_identity,
+                            command_ready_bound(
+                                self.k8s.create_command_ready_timeout,
+                                request.command_ready_wait,
+                            )
                             .min(remaining_ready_window(phase_deadline)),
-                        CommandReadyPod::PreResolved(pod_ip),
-                        Some(request.template_ref.template.as_str()),
-                    )
-                    .await?
+                            CommandReadyPod::PreResolved(pod_ip),
+                            Some(request.template_ref.template.as_str()),
+                        )
+                        .await
+                    {
+                        Ok(binding) => Some(binding),
+                        Err(SubstrateError::Timeout { .. }) => None,
+                        Err(error) => return Err(error),
+                    }
                 } else {
-                    binding
+                    Some(binding)
                 };
                 let joined_pod = match self.lookup_sandbox_pod(&execution.pod_name) {
                     Some(pod) => Some(pod),
@@ -189,11 +207,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 return Ok(CreateExecutionOutcome {
                     lease_completion: None,
                     sandbox_id,
-                    binding: Some(binding),
+                    command_ready: binding.is_some(),
+                    binding,
                     initial_lifecycle: "started",
                     initial_placement: "on_node",
                     active_node_id: Some(active_node_id),
-                    command_ready: true,
                 });
             }
             Err(error) => return Err(error),
@@ -270,10 +288,23 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         })
                 })
                 .transpose()?;
-            Ok::<_, SubstrateError>((cold_metadata, fork_restore))
+            // The pod boots the fork source's disk artifact, or else the
+            // requested template build.
+            let environment = match (&request.restore_from, request.template_ref.content_hash) {
+                (Some(restore), _) => self.fork_pod_environment(restore.snapshot_id).await?,
+                (None, Some(content_hash)) => {
+                    self.template_pod_environment(
+                        request.template_ref.template.as_str(),
+                        content_hash,
+                    )
+                    .await?
+                }
+                (None, None) => None,
+            };
+            Ok::<_, SubstrateError>((cold_metadata, fork_restore, environment))
         }
         .await;
-        let (cold_metadata, fork_restore) = match prepared {
+        let (cold_metadata, fork_restore, environment) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 cancel_guard.release_claim().await;
@@ -291,6 +322,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             content_hash: request.template_ref.content_hash,
             env: request.env,
             traceparent: pplx_space_observability::trace_propagation::current_traceparent(),
+            environment,
         };
         let runtime = cold_metadata.runtime_metadata(request.resources);
         let restore_source_sandbox_id: String;
@@ -299,7 +331,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 restore_source_sandbox_id = restore.source_sandbox_id.to_string();
                 SandboxPodRequest::Restore {
                     stopped_materialization: None,
-                    artifact_kind: pplx_space_common_core::types::ArtifactKind::Disk,
+                    artifact_kind: pplx_space_snapshot_model::ArtifactKind::Disk,
                     common,
                     runtime,
                     suspend_restore_storage_uri: Some(storage_uri),
@@ -420,6 +452,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 execution.generation,
                 pod_uid.as_deref(),
                 pod_ip_string.as_deref(),
+                pod.client_id().as_ref(),
             )
             .await
         {
@@ -485,9 +518,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 self.poll_until_command_ready(
                     sandbox_id,
                     request.metric_identity,
-                    self.k8s
-                        .create_command_ready_timeout
-                        .min(remaining_ready_window(phase_deadline)),
+                    command_ready_bound(
+                        self.k8s.create_command_ready_timeout,
+                        request.command_ready_wait,
+                    )
+                    .min(remaining_ready_window(phase_deadline)),
                     CommandReadyPod::PreResolved(pod_ip),
                     Some(request.template_ref.template.as_str()),
                 )
@@ -941,7 +976,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
         };
         // The controller may have deferred admission from a stale restore-
         // shaped snapshot. If the refreshed row now takes the cold-start path,
-        // spend that deferred charge before creating an execution.
+        // spend that deferred charge before creating an execution, after the
+        // live cap's pre-check: `ensure_pod_exists` checks the cap again
+        // where it creates the pod.
+        self.precheck_live_cap_before_cold_charge(&charge, &sandbox)
+            .await?;
         charge.charge_cold_activation().await?;
         // Only non-restore lifecycles (`stopped`, etc.) reach here — the
         // `suspended`/`restoring` cases delegated to the restore machinery
@@ -970,10 +1009,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // (capped at `CREATE_READY_BUDGET`), so the caller's effective
         // readiness wait is never shortened by the margin.
         let (wait_budget, phase_deadline) = ready_wait_bounds(options.ready_timeout);
-        let requested_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+        let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
+            charge.attribution().key().clone(),
         );
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future, and inlining it in
@@ -993,7 +1033,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         // Non-restore start path holds no restore lease.
                         None,
                         Some(activation_assignment.clone()),
-                    ),
+                    )
+                    .with_charge(&charge),
                 ),
             )
             .await
@@ -1236,7 +1277,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             options,
             RestoreIntent::user(
                 charge,
-                WakeTarget::Explicit(pplx_space_common_core::types::SandboxLifecycle::Started),
+                WakeTarget::Explicit(pplx_space_sandbox_model::SandboxLifecycle::Started),
             ),
         )
         .await
@@ -1262,225 +1303,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
-        let suspend_deadline = Instant::now() + self.budgets.suspend_durability;
-        SandboxEvent::new(
-            sandbox_id,
-            SandboxEventType::SuspendRequested,
-            SandboxEventSource::Substrate,
-        )
-        .emit_with(SandboxEventDetails::default());
-        let execution = self
-            .store
-            .active_execution_status(sandbox_id)
-            .await?
-            .ok_or_else(|| SubstrateError::SandboxNoPod {
-                message: "sandbox is not assigned to a pod".to_string(),
-            })?;
-        let expected_generation =
-            ExecutionGeneration::new(execution.generation).map_err(|error| {
-                SubstrateError::Failed {
-                    message: format!("invalid active Kubernetes execution generation: {error}"),
-                }
-            })?;
-        let expected_pod_uid =
-            execution
-                .pod_uid
-                .clone()
-                .ok_or_else(|| SubstrateError::SandboxNoPod {
-                    message: "sandbox pod has no Kubernetes UID for suspend retirement".to_string(),
-                })?;
-        let suspend_claim = self
-            .store
-            .claim_suspend_execution(sandbox_id, expected_generation, &expected_pod_uid)
-            .await?;
-        tracing::info!(
-            %sandbox_id,
-            generation = %expected_generation,
-            claim = %suspend_claim,
-            "claimed generation-bound Kubernetes suspend"
-        );
-        let committed_suspend_artifact = match suspend_claim {
-            SuspendExecutionClaim::Completed(artifact) => Some(artifact),
-            SuspendExecutionClaim::Claimed | SuspendExecutionClaim::Existing => {
-                self.store
-                    .committed_suspend_artifact(sandbox_id, expected_generation, &expected_pod_uid)
-                    .await?
-            }
-        };
-        let node_suspend_artifact = if committed_suspend_artifact.is_some() {
-            tracing::info!(
-                sandbox_id = %sandbox_id,
-                generation = %expected_generation,
-                "resuming pod retirement for a committed Kubernetes suspend"
-            );
-            None
-        } else {
-            let k8s_node_name =
-                execution
-                    .k8s_node_name
-                    .as_deref()
-                    .ok_or_else(|| SubstrateError::Unavailable {
-                        message: "sandbox pod is not assigned to a Kubernetes node".to_string(),
-                    })?;
-            let target = NodeApiTarget {
-                managed_by: SpaceNodeManagedBy::Kubernetes,
-                role: SpaceNodeRole::Worker,
-                direct_endpoint: None,
-                substrate_node_id: Some(k8s_node_name),
-            };
-            let suspend_path_started_at = Instant::now();
-            let endpoint_addr = match tokio::time::timeout_at(
-                suspend_deadline,
-                self.resolve_node_api_endpoint(&target),
-            )
-            .await
-            {
-                Err(_) => {
-                    return Err(SubstrateError::Timeout {
-                        message: format!(
-                            "timed out resolving node-api for generation-bound suspend of sandbox {sandbox_id}"
-                        ),
-                        phase: None,
-                    });
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        k8s_node_name,
-                        elapsed_ms = duration_millis_to_u64(suspend_path_started_at.elapsed()),
-                        error = %err,
-                        "failed to resolve node-api endpoint for Kubernetes sandbox suspend"
-                    );
-                    return Err(err);
-                }
-                Ok(Ok(endpoint_addr)) => endpoint_addr,
-            };
-            let endpoint = match node_api_endpoint(
-                &endpoint_addr,
-                POD_WORKER_CONNECT_TIMEOUT,
-                NODE_RPC_TIMEOUT,
-            ) {
-                Ok(endpoint) => endpoint,
-                Err(err) => {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        k8s_node_name,
-                        node_api_endpoint = %endpoint_addr,
-                        elapsed_ms = duration_millis_to_u64(suspend_path_started_at.elapsed()),
-                        error = %err,
-                        "invalid node-api endpoint for Kubernetes sandbox suspend"
-                    );
-                    return Err(err);
-                }
-            };
-            let mut client = match tokio::time::timeout_at(
-                suspend_deadline,
-                connect_worker(endpoint),
-            )
-            .await
-            {
-                Err(_) => {
-                    return Err(SubstrateError::Timeout {
-                        message: format!(
-                            "timed out connecting node-api for generation-bound suspend of sandbox {sandbox_id}"
-                        ),
-                        phase: None,
-                    });
-                }
-                Ok(Ok(client)) => client,
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        k8s_node_name,
-                        node_api_endpoint = %endpoint_addr,
-                        elapsed_ms = duration_millis_to_u64(suspend_path_started_at.elapsed()),
-                        error = %err,
-                        "failed to connect node-api for Kubernetes sandbox suspend"
-                    );
-                    return Err(SubstrateError::Unavailable {
-                        message: format!("node-api not reachable at {endpoint_addr}: {err}"),
-                    });
-                }
-            };
-
-            let suspend_rpc_started_at = Instant::now();
-            let published_artifact = match await_generation_suspend(
-                &mut client,
-                sandbox_id,
-                expected_generation,
-                &endpoint_addr,
-                suspend_deadline,
-                self.budgets.suspend_durability,
-            )
-            .await
-            {
-                Ok(GenerationSuspendOutcome::Durable(published_artifact)) => Ok(published_artifact),
-                // The node can delete the sandbox after its suspend backup
-                // finalized (a failed post-suspend cleanup takes the delete
-                // path), and then has no artifact to publish. The ready
-                // snapshot still proves the suspend durable; without it the
-                // suspend did not complete and the caller may retry.
-                Ok(GenerationSuspendOutcome::NodeDeleted) => self
-                    .store
-                    .durable_suspend_snapshot_artifact(
-                        sandbox_id,
-                        expected_generation,
-                        &expected_pod_uid,
-                    )
-                    .await?
-                    .ok_or_else(|| SubstrateError::Unavailable {
-                        message: format!(
-                            "sandbox {sandbox_id} was deleted on its node before suspend completed"
-                        ),
-                    }),
-                Err(error) => Err(error),
-            };
-            let published_artifact = match published_artifact {
-                Ok(published_artifact) => published_artifact,
-                Err(error) => {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        generation = %expected_generation,
-                        k8s_node_name,
-                        node_api_endpoint = %endpoint_addr,
-                        elapsed_ms = duration_millis_to_u64(suspend_rpc_started_at.elapsed()),
-                        error = %error,
-                        "generation-bound Kubernetes sandbox suspend did not become durable"
-                    );
-                    SandboxEvent::new(
-                        sandbox_id,
-                        SandboxEventType::SuspendFailed,
-                        SandboxEventSource::Substrate,
-                    )
-                    .emit_with(
-                        SandboxEventDetails::default()
-                            .error(error.to_string())
-                            .logged_by_caller(),
-                    );
-                    return Err(error);
-                }
-            };
-            tracing::info!(
-                sandbox_id = %sandbox_id,
-                generation = %expected_generation,
-                k8s_node_name,
-                node_api_endpoint = %endpoint_addr,
-                local_artifact_id = %published_artifact.id,
-                elapsed_ms = duration_millis_to_u64(suspend_rpc_started_at.elapsed()),
-                "generation-bound Kubernetes sandbox suspend became durable"
-            );
-            Some(published_artifact)
-        };
-
-        self.finish_suspend_handoff(
-            sandbox_id,
-            expected_generation,
-            expected_pod_uid,
-            execution.pod_name,
-            node_suspend_artifact,
-        )
-        .await
-        .map(Some)
+        self.suspend_execution_tracked(sandbox_id).await
     }
 
     async fn wake_execution(
@@ -1575,7 +1398,6 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     ),
                     Duration::from_secs(120),
                     charge,
-                    None,
                 )
                 .await?;
             return connect_worker(binding.runtime_endpoint).await;
@@ -1643,7 +1465,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     sandbox,
                     timeout,
                     metric_identity,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    // The access entrypoint already charged it.
+                    charge.after_charge(),
                 )
                 .await;
         }
@@ -1724,7 +1547,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 .await;
         }
         let binding = self
-            .ensure_execution_ready_for_access(&sandbox, metric_identity, timeout, charge, None)
+            .ensure_execution_ready_for_access(&sandbox, metric_identity, timeout, charge)
             .await?;
         connect_worker(binding.runtime_endpoint).await
     }
@@ -1888,6 +1711,52 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 );
                 pool::invalidate_claimed_pool_slot(self.store.pool(), &claim).await?;
                 continue;
+            }
+            // The environment gate, on, admits only a node that publishes
+            // the work's environment. A refused slot leaves the pool, so the
+            // reconciler replaces it with a pod that requires the label.
+            match self
+                .pooled_pod_environment(request.template, &claim.content_hash, pod.as_deref())
+                .await
+            {
+                Ok(PooledPodEnvironment::Admitted) => {}
+                Ok(PooledPodEnvironment::NotPublished) => {
+                    tracing::info!(
+                        claim_id = %claim.claim_id,
+                        sandbox_id = %claim.sandbox_id,
+                        pod_name = %claim.pod_name,
+                        attempt,
+                        "invalidating a warm-pool slot whose node doesn't publish the work's \
+                         environment"
+                    );
+                    pool::invalidate_claimed_pool_slot(self.store.pool(), &claim).await?;
+                    continue;
+                }
+                // Nothing shows the slot is unusable, so it goes back, as for
+                // a node group the cache can't answer.
+                unknown => {
+                    pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
+                    match unknown {
+                        Err(error) => tracing::warn!(
+                            claim_id = %claim.claim_id,
+                            pod_name = %claim.pod_name,
+                            attempt,
+                            %error,
+                            "failed to read the warm-pool pod's environment; released claim \
+                             and falling back"
+                        ),
+                        Ok(_) => tracing::info!(
+                            claim_id = %claim.claim_id,
+                            pod_name = %claim.pod_name,
+                            attempt,
+                            "could not read the claimed warm pod's node; released the claim \
+                             and falling back"
+                        ),
+                    }
+                    return Ok(PooledExecutionClaimAttempt::missed(
+                        claim_attempt.pool_shape,
+                    ));
+                }
             }
 
             let resolved = match placement.as_ref() {
@@ -2393,6 +2262,25 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     && self
                         .admitted_pool_pod_placement_admits(request, pod.as_deref())
                         .await
+                    && match self
+                        .pooled_pod_environment(
+                            request.template,
+                            &claim.content_hash,
+                            pod.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(environment) => environment == PooledPodEnvironment::Admitted,
+                        Err(error) => {
+                            tracing::warn!(
+                                claim_id = %claim.claim_id,
+                                %error,
+                                "failed to read the admitted warm-pool pod's environment; not \
+                                 adopting it"
+                            );
+                            false
+                        }
+                    }
             }
             Err(error) => {
                 tracing::warn!(
@@ -2456,14 +2344,99 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         claim: &PooledExecutionClaim,
     ) -> Result<(), ControllerError> {
-        pool::invalidate_claimed_pool_slot(self.store.pool(), claim)
+        // A label this adoption wrote must not outlive it, so the pod loses it
+        // once the slot is out of the inventory. A slot this call didn't take
+        // out (already bound, say, after a commit that reported failure but
+        // landed) keeps its pod's label.
+        if self.invalidate_pooled_execution_claim(claim).await? {
+            self.clear_adoption_label(claim).await;
+        }
+        Ok(())
+    }
+
+    /// Patch the adopter's `space.pplx.net/client-id` label onto the pool pod,
+    /// synchronously and before the adoption commits, so the label exists
+    /// before the client can use the sandbox. No `ready` slot's pod carries
+    /// the label: a pod that can't be labeled isn't adopted, a slot goes back
+    /// to the pool only when the write never ran, and an abandoned slot's
+    /// label is removed best-effort.
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_accounts::ClientId>,
+        on_transient: crate::controllers::substrate::AdoptionLabelTransient,
+    ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
+        use super::pooled::AdoptionLabelWrite;
+        use crate::controllers::substrate::{AdoptionLabelOutcome, AdoptionLabelTransient};
+
+        let Some(client_id) = self.k8s.activation_client_attribution.gate(client_id) else {
+            return Ok(AdoptionLabelOutcome::Labeled);
+        };
+        // Without the claimed UID the patch can't be fenced to the claimed
+        // pod, so a pod that can't be identified isn't adopted.
+        let Some(pod_uid) = &claim.pod_uid else {
+            tracing::warn!(
+                sandbox_id = %claim.sandbox_id,
+                pod_name = %claim.pod_name,
+                "adopted pool pod has no recorded UID; abandoning the adoption"
+            );
+            self.invalidate_pooled_execution_claim(claim).await?;
+            return Ok(AdoptionLabelOutcome::Invalidated);
+        };
+        match self
+            .write_adoption_label(claim, pod_uid.as_str(), Some(client_id))
             .await
-            .map_err(|error| {
-                ControllerError::internal(format!(
-                    "pool claim leaked for pod {}: failed to invalidate claimed pool slot: {error}",
-                    claim.pod_name
-                ))
-            })
+        {
+            AdoptionLabelWrite::Applied => Ok(AdoptionLabelOutcome::Labeled),
+            // Throttling says nothing about the pod, and a throttled write
+            // never ran, so the slot goes back unlabeled.
+            AdoptionLabelWrite::Throttled(error) => {
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    ?on_transient,
+                    "adopted pool pod label throttled; not adopting it now"
+                );
+                if on_transient == AdoptionLabelTransient::ReleaseSlot {
+                    pool::release_claimed_pool_slot(self.store.pool(), claim).await?;
+                }
+                Ok(AdoptionLabelOutcome::Transient)
+            }
+            // Nor does a 5xx or a lost answer, but that write may land, even
+            // after a later one, so the slot can't go back to the pool: a
+            // `ready` pod, or the next adopter's, would carry this label.
+            AdoptionLabelWrite::Transient(error) => {
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    ?on_transient,
+                    "adopted pool pod label failed transiently; not adopting it now"
+                );
+                if on_transient == AdoptionLabelTransient::ReleaseSlot {
+                    self.rollback_pooled_execution_claim(claim).await?;
+                }
+                Ok(AdoptionLabelOutcome::Transient)
+            }
+            AdoptionLabelWrite::Refused(error) => {
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    pod_name = %claim.pod_name,
+                    %error,
+                    "failed to label the adopted pool pod; abandoning the adoption"
+                );
+                // A refusal the apiserver answered didn't land, and a removal
+                // would be refused the same way. Any other error may follow a
+                // write that landed, such as a response that didn't decode.
+                if matches!(error, kube::Error::Api(_)) {
+                    self.invalidate_pooled_execution_claim(claim).await?;
+                } else {
+                    self.rollback_pooled_execution_claim(claim).await?;
+                }
+                Ok(AdoptionLabelOutcome::Invalidated)
+            }
+        }
     }
 
     async fn cleanup_failed_pooled_prepare(
@@ -2472,20 +2445,6 @@ impl SubstrateAdapter for KubernetesSubstrate {
     ) -> Result<PooledPrepareFailureCleanup, ControllerError> {
         pool::mark_claimed_pool_slot_cleanup_pending(self.store.pool(), claim).await?;
         Ok(PooledPrepareFailureCleanup::DeferredToReconciler)
-    }
-
-    async fn apply_pooled_execution_auto_lifecycle(
-        &self,
-        claim: &PooledExecutionClaim,
-        policy: &AutoLifecyclePolicy,
-    ) -> Result<(), ControllerError> {
-        let pod_ip = PodIp::parse(&claim.pod_ip).map_err(ControllerError::from)?;
-        let endpoint = Self::endpoint_for_pod_ip(pod_ip, self.k8s.sandbox_proxy_port)
-            .map_err(ControllerError::from)?;
-        let mut node_api = NodeApiClient::with_service_name("worker-node-api", endpoint);
-
-        let mut client = RetryingWorkerApiClient::new(&mut node_api);
-        Self::apply_pooled_execution_auto_lifecycle_with_client(&mut client, claim, policy).await
     }
 
     async fn prepare_pooled_execution(
@@ -2588,8 +2547,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             )
             .map_err(ControllerError::from)?;
         } else {
-            let requested_attempt_id =
-                pplx_space_common_core::types::SandboxActivationAttemptId::new();
+            let requested_attempt_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
             let execution_generation = i64::try_from(claim.execution_generation)
                 .map_err(|_| ControllerError::internal("pool execution generation exceeds i64"))?;
             let (activation_attempt_id, joined_attempt_id) = match self
@@ -2659,7 +2617,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     }
                     let mut wake_request = pooled_wake_request(
                         claim,
-                        pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid(
+                        pplx_space_sandbox_model::SandboxActivationAttemptId::from_uuid(
                             pooled_route_activation_id(claim)?,
                         ),
                         pplx_space_sbx_mgr_client::proto::WakeTargetState::Unspecified,
@@ -2724,6 +2682,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                             "pooled sandbox Wake did not complete within the readiness budget: {error}"
                                         )));
                                     }
+                                }
+                                WakeRpcErrorDisposition::CallerUnauthenticated => {
+                                    return Err(ControllerError::service_unavailable(format!(
+                                        "worker node-api did not accept this API process's credential: {error}"
+                                    )));
                                 }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(ControllerError::conflict(format!(
@@ -2931,16 +2894,18 @@ impl SubstrateAdapter for KubernetesSubstrate {
             // to `registered`. The returned entry still reports the observed
             // pod-readiness state.
             let observed_state = NodeLifecycleState::from_ready(caches::pod_is_ready(&pod));
+            let instance_id = k8s_node_instance_id(&k8s_node);
             match self
                 .store
-                .persist_k8s_node_inventory(
+                .persist_k8s_node_inventory(K8sNodeRoleUpsert {
                     node_name,
-                    uid_str,
-                    id,
+                    node_uid: uid_str,
+                    node_id: id,
                     role,
-                    Some(raw_address.as_str()),
-                    NodeStateWrite::InsertOnly(observed_state),
-                )
+                    address: Some(raw_address.as_str()),
+                    state: NodeStateWrite::InsertOnly(observed_state),
+                    instance_id: instance_id.as_ref(),
+                })
                 .await
             {
                 Ok(_) => {}

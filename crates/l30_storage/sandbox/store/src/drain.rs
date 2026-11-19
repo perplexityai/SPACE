@@ -30,20 +30,22 @@
 //! (`*_query`) are public only because the drain's Postgres tests run them
 //! directly. Production code calls the function here that binds each one.
 
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, NodeDrainMode, NodeDrainPhase, NodeId,
-    PositiveDuration, SandboxId, SandboxLifecycle,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
     current_disk_artifact_backup_ready, current_suspend_snapshot_ready,
     failed_repair_revert_eligibility, inflight_suspend_upload_exists, latest_full_snapshot_ready,
     newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
     recoverable_suspend_snapshot_exists, snapshot_durable_for_source_release,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Saturating seconds-as-`i64` for SQL binds; any value above `i64::MAX`
@@ -1102,6 +1104,12 @@ pub async fn adopt_remote_snapshot_for_drain(
     .rows_affected();
     Ok(flipped)
 }
+
+/// How long a sandbox may sit in a non-evacuable resident transient
+/// lifecycle before a forced drain's [`abandon_stale_resident_sandboxes`]
+/// fails it. The cluster-controller's stale-abandon default and the node holds
+/// read's [`crate::node_holds::STUCK_TRANSIENT_AFTER`] are both this constant.
+pub const STALE_ABANDON_AFTER: Duration = Duration::from_secs(600);
 
 /// `$1` = node id, `$2` = age seconds (BIGINT), `$3` = the non-evacuable
 /// resident transient lifecycle strings (the drain's

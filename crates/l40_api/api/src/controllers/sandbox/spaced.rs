@@ -4,11 +4,14 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Authority, ed25519::SpaceApiRouteEd25519Token,
     ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestUserName, NodeManagedBy, PodUid, ProcessId, RouteGeneration,
-    SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SubstrateKind,
-};
+use pplx_space_guest_process::{GuestUserName, ProcessId};
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_api_client::NodeApiOperationBudget;
+use pplx_space_node_model::{NodeManagedBy, SubstrateKind};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    SandboxRouteIdentity,
+};
 use std::future::Future;
 use tonic::Code;
 
@@ -49,23 +52,23 @@ impl SandboxController {
         // recreation is a real activation the fallback charge below never sees
         // (recovery makes the call succeed, so we never reach the `Err` arm).
         // A live pod that is merely reconnected to charges nothing.
-        match self
-            .substrate
-            .runtime_client(
-                sandbox.id,
-                crate::controllers::substrate::RecoveryCharge::enforce(
-                    self.cluster_admission.as_ref(),
-                ),
-            )
-            .await
-        {
+        let charge = crate::controllers::substrate::RecoveryCharge::enforce(
+            self.cluster_admission.as_ref(),
+            crate::controllers::substrate::CapPolicy::Check,
+            crate::controllers::substrate::ActivationAttribution::inherit(
+                sandbox.activating_client_id.as_ref(),
+            ),
+        );
+        // The fallback below charges the wake itself.
+        let paid = charge.after_charge();
+        match self.substrate.runtime_client(sandbox.id, charge).await {
             Ok(client) => Ok(client),
-            // A recovery admission rejection (429) from the first call must
-            // propagate — not fall into the dormant-wake fallback below, which
-            // no-ops the charge for a live lifecycle and then `wake_execution`s
-            // the pod back anyway, re-opening the lost-pod bypass. Only genuine
-            // "not assigned / unreachable" errors should reach the wake path.
-            Err(err) if err.status() == StatusCode::TOO_MANY_REQUESTS => Err(err),
+            // A recovery admission refusal from the first call must propagate,
+            // not fall into the dormant-wake fallback below, which no-ops the
+            // charge for a live lifecycle and then `wake_execution`s the pod
+            // back anyway, re-opening the lost-pod bypass. Only genuine "not
+            // assigned / unreachable" errors should reach the wake path.
+            Err(err) if control_fallback_passes_through(&err) => Err(err),
             // Any other failure wakes and reconnects only where a wake can
             // give the row a runtime; otherwise, including for a label that
             // does not parse, the last arm returns the error.
@@ -83,27 +86,26 @@ impl SandboxController {
                 // `runtime_client` path errored). `wake_execution` spends a real
                 // node slot for a suspended (Restore) or created (Cold) sandbox.
                 // Fails open on limiter errors.
-                super::lifecycle::charge_control_wake_activation(
-                    self.cluster_admission.as_ref(),
-                    sandbox,
-                )
-                .await?;
+                let live = crate::client_live_cap::LiveHandoff::new(
+                    super::lifecycle::charge_control_wake_activation(
+                        self.cluster_admission.as_ref(),
+                        sandbox,
+                    )
+                    .await?,
+                );
                 self.substrate
                     .wake_execution(
                         SandboxApiMetricIdentity::native("spaced"),
                         sandbox,
                         DEFAULT_BLOCKING_WAIT_TIMEOUT,
                         None,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        // Charged just above; it carries the reservation.
+                        paid.clone().with_live(&live),
                     )
                     .await
                     .map_err(ControllerError::from)?;
-                self.substrate
-                    .runtime_client(
-                        sandbox.id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
-                    )
-                    .await
+                live.keep();
+                self.substrate.runtime_client(sandbox.id, paid).await
             }
             Err(err) => Err(err),
         }
@@ -116,13 +118,14 @@ impl SandboxController {
         metric_identity: SandboxApiMetricIdentity,
         activity: Option<ExecutionActivityKind>,
     ) -> Result<SpacedSandboxClient, ControllerError> {
+        // Boxed: every spaced call awaits this, so inlining the grant future
+        // nests its whole layout into each caller's and can push the
+        // compiler's layout queries past the default recursion limit.
         let SpacedRuntimeGrant {
             client,
             sandbox,
             space_api_route_token,
-        } = self
-            .spaced_runtime_grant(pool, sandbox, metric_identity, activity)
-            .await?;
+        } = Box::pin(self.spaced_runtime_grant(pool, sandbox, metric_identity, activity)).await?;
         Ok(SpacedSandboxClient {
             client,
             substrate: self.substrate.clone(),
@@ -661,29 +664,41 @@ pub(crate) async fn connect_spaced_runtime_client(
     )
     .await?;
 
-    let charge = crate::controllers::substrate::RecoveryCharge::enforce(admission);
-
     // The dormant entrypoint charge covers created/stopped/suspended implicit
     // wakes on the initial connect; the non-dormant lost-pod recreate is charged
     // inside the substrate recovery branch via `charge`.
-    if charge_entrypoint && let Some(activity) = activity {
-        super::lifecycle::charge_implicit_access_activation(admission, sandbox, activity).await?;
-    }
-
-    match activity {
-        Some(activity) => {
-            substrate
-                .access_runtime_client(
-                    metric_identity,
-                    sandbox,
-                    activity,
-                    DEFAULT_BLOCKING_WAIT_TIMEOUT,
-                    charge,
-                )
-                .await
+    //
+    // Boxed: the live-cap reservation and the substrate's access path nest
+    // deep enough that computing the layout of every caller's future (the
+    // public process routes, among others) can overflow rustc's query depth.
+    let live = crate::client_live_cap::LiveHandoff::new(match activity {
+        Some(activity) if charge_entrypoint => {
+            Box::pin(super::lifecycle::charge_implicit_access_activation(
+                admission, sandbox, activity,
+            ))
+            .await?
         }
-        None => substrate.runtime_client(sandbox.id, charge).await,
+        _ => None,
+    });
+    let charge = super::lifecycle::implicit_activation_charge(admission, sandbox, &live);
+
+    let client = match activity {
+        Some(activity) => {
+            Box::pin(substrate.access_runtime_client(
+                metric_identity,
+                sandbox,
+                activity,
+                DEFAULT_BLOCKING_WAIT_TIMEOUT,
+                charge,
+            ))
+            .await
+        }
+        None => Box::pin(substrate.runtime_client(sandbox.id, charge)).await,
+    };
+    if client.is_ok() {
+        live.keep();
     }
+    client
 }
 
 pub(super) fn space_api_bridge_route_token(
@@ -1224,6 +1239,17 @@ impl SpacedSandboxClient {
         SpacedConnectProcessRequest,
         SpacedProcessEventStream
     );
+}
+
+/// Whether `control_runtime_client` returns its first, charged call's error
+/// rather than trying the uncharged fallback wake: any `429`, and any
+/// activation admission refusal whatever its status. Falling back on a
+/// refusal would rebuild the pod under a weaker charge than the one that was
+/// just refused. Today every refusal that charge can raise is a `429`; the
+/// marker keeps a refusal answered with another status, such as a `503`,
+/// from slipping past if that charge ever raises one.
+fn control_fallback_passes_through(err: &ControllerError) -> bool {
+    err.status() == StatusCode::TOO_MANY_REQUESTS || err.activation_rejection().is_some()
 }
 
 #[cfg(test)]

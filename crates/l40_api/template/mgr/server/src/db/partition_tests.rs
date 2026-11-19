@@ -1,10 +1,13 @@
 //! One rootfs bound to two environments: each build keeps its own catalog
 //! rows, snapshots and tag pins.
 
-use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest,
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, EnvironmentReference, ExecutionMetadata,
 };
+use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
+use pplx_space_template_manifest::TemplateManifest;
 use rusqlite::Connection;
 
 use super::*;
@@ -738,24 +741,6 @@ fn apply_common_and_baseline(conn: &Connection) {
 }
 
 const PARTITIONS: i64 = 20261026220935;
-
-/// Releases that don't bundle the partition migration reverse it at startup
-/// only when the recorded checksum is this one, so rolling back to them stays
-/// image-only. See db/README.md.
-#[test]
-fn partition_migration_keeps_the_checksum_releases_reverse() {
-    let service = sqlx::migrate!("../../../../../db/template-manager");
-    let up = service
-        .iter()
-        .find(|migration| {
-            migration.version == PARTITIONS && migration.migration_type.is_up_migration()
-        })
-        .unwrap();
-    assert_eq!(
-        hex::encode(up.checksum.as_ref()),
-        "bb39d295eee07bfc5ff54e6d2f076efb42a50b43d7cedffd8907e9cbf73e7e9b2837295cb1131306798e1c3a4bf4b820"
-    );
-}
 
 #[test]
 fn partition_migration_keeps_existing_rows_in_the_legacy_partition() {

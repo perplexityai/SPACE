@@ -16,6 +16,7 @@ s3 = ["dep:pplx-space-snapshot-storage", "pplx-space-snapshot-storage/s3"]
 
 [dependencies]
 futures-util = { workspace = true }
+pplx-space-artifact-model = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
@@ -23,13 +24,15 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+pplx-space-sandbox-model = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 pplx-space-snapshot-storage = { workspace = true, optional = true }
 pplx-space-snapshot-store = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]
 pplx-space-db-test-fixtures = { workspace = true }

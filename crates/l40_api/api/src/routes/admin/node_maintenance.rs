@@ -1,4 +1,4 @@
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::{collections::HashSet, time::Duration};
 
 use axum::{
@@ -8,18 +8,19 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{StreamExt, stream};
+use pplx_space_accounts::NodeId;
 use pplx_space_bearer_token::SpaceBearerToken;
-use pplx_space_common_core::types::NodeId;
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole, SubstrateKind, TemplateName};
 use pplx_space_node_api_client::proto::{
     GetNodeInfoRequest, NodeRole as ProtoNodeRole, NodeSource, PullTemplateRequest, TransferSource,
     node_info_client::NodeInfoClient, transfer_source::Source,
 };
 use pplx_space_node_api_client::{BuilderApiClient, NodeApiClient, WorkerApiClient};
+use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
 use pplx_space_state_reconciliation::{FACET_NETWORK_POLICY, ReconcileFacet, ReconcileReason};
 use pplx_space_template_mgr_client::proto::{
     DeleteTemplateBuildRequest, DeleteTemplateRequest, TemplateRef,
 };
+use pplx_space_template_model::TemplateName;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sqlx::FromRow;
 use time::OffsetDateTime;

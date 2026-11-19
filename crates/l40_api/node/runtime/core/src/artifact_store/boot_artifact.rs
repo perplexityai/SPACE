@@ -2,7 +2,7 @@
 //! kernels. Their directory names and transport never establish trust.
 use super::*;
 use crate::catalog::PinnedBootArtifact;
-use pplx_space_common_core::types::{ArtifactComponentKind, ComponentIdentity};
+use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
 
 pub use crate::catalog::BOOT_ARTIFACT_IMAGE;
 

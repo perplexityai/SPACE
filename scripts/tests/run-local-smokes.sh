@@ -267,7 +267,7 @@ run_ecw_identity() {
   local kind_cluster="${KCTX#kind-}"
   local scenarios=(
     ecw.process_identity
-    ecw.filesystem_write_identity
+    ecw.filesystem_ownership
     ecw.filesystem_read_identity
     ecw.filesystem_private_boundary
     ecw.watcher_identity

@@ -31,4 +31,6 @@ pub use run::{DEFAULT_NODE_CONFIG_PATH, NodeMgrRunConfig, RunNodeMgrError, SERVI
 pub use pplx_space_node_mgr_client::{SOCKET_PATH, connect, proto};
 pub use pplx_space_node_runtime_core::{cgroup, fc_api, gateway_launch, launch, reflink_copy};
 
+#[cfg(all(test, target_os = "linux"))]
+mod netns_tests;
 mod snapshot_request;

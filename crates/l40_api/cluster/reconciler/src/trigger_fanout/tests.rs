@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use super::*;
 use pplx_space_cluster_trigger_queue::enqueue_triggers;
@@ -65,7 +65,7 @@ async fn ghost_fanout_fixture() -> TestDbResult<GhostFanoutFixture> {
     let live_node_id = NodeId::new();
     let ghost_node_id = NodeId::new();
     for (node_id, node_name) in [(live_node_id, "live-node"), (ghost_node_id, "ghost-node")] {
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO nodes (id, role, managed_by, state)
              VALUES ($1, $2, $3, 'registered')"
         ))
@@ -74,7 +74,7 @@ async fn ghost_fanout_fixture() -> TestDbResult<GhostFanoutFixture> {
         .bind(NodeManagedBy::Kubernetes)
         .execute(&db.pool)
         .await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
         ))
         .bind(node_id)
@@ -144,7 +144,7 @@ async fn fanout_resolves_live_nodes_once_and_dead_letters_ghosts_without_resolvi
         *resolver.resolved_node_names.lock().await,
         vec!["live-node".to_string()]
     );
-    let states = sqlx::query_as::<_, (NodeId, bool, String)>(pplx_space_common_core::sql!(
+    let states = sqlx::query_as::<_, (NodeId, bool, String)>(pplx_space_sql_locator::sql!(
         "SELECT node_id, dead_at IS NOT NULL, dead_reason
          FROM node_reconcile_triggers
          WHERE node_id = ANY($1)"
@@ -162,6 +162,113 @@ async fn fanout_resolves_live_nodes_once_and_dead_letters_ghosts_without_resolvi
         states[ghost_node_id]
             .1
             .contains("live Kubernetes node cache")
+    );
+    Ok(())
+}
+
+/// Each reason's wire number, pinned here because no proto compatibility
+/// check runs in CI. A node decodes the number a controller of any version
+/// sends, so none may move or be reused.
+#[test]
+fn every_reason_encodes_to_its_wire_number() {
+    let wire_numbers = [
+        (ReconcileReason::NodeRegistered, 1),
+        (ReconcileReason::NodeUpdated, 2),
+        (ReconcileReason::ManualNodeStatusRefresh, 3),
+        (ReconcileReason::ManualNodeReconcile, 4),
+        (ReconcileReason::ManualNodeNetworkPolicyReconcile, 5),
+        (ReconcileReason::NodeTemplatePulled, 6),
+        (ReconcileReason::SandboxRegistered, 7),
+        (ReconcileReason::SandboxPortExposureUpdated, 8),
+        (ReconcileReason::SandboxNetworkPolicyUpdated, 9),
+        (ReconcileReason::SandboxDesiredStateUpdated, 10),
+        (ReconcileReason::TemplateNetworkPolicyUpdated, 11),
+        (ReconcileReason::TemplateDesiredStateUpdated, 12),
+        (ReconcileReason::TemplateBaseSnapshotPolicyUpdated, 13),
+        (ReconcileReason::TemplatePoolPolicyUpdated, 14),
+        (ReconcileReason::TemplatePoolPolicyDeleted, 15),
+        (ReconcileReason::NodeSandboxInventoryPublished, 16),
+        (ReconcileReason::NodeTemplateInventoryPublished, 17),
+        (ReconcileReason::FirewallRulesChanged, 18),
+    ];
+    assert_eq!(
+        wire_numbers.map(|(reason, _)| reason),
+        ReconcileReason::ALL,
+        "a reason without a row"
+    );
+    let numbers = wire_numbers.map(|(_, number)| number);
+    assert!(!numbers.contains(&0), "0 is unspecified");
+    assert_eq!(
+        BTreeSet::from(numbers).len(),
+        numbers.len(),
+        "a reused number"
+    );
+    for (reason, number) in wire_numbers {
+        assert_eq!(
+            i32::from(proto_reconcile_reason(reason)),
+            number,
+            "{reason}"
+        );
+    }
+}
+
+/// A claimed trigger holding the firewall rules reason, alone or beside
+/// another, becomes a request naming the claim's typed reasons and its
+/// diagnostic text, and nothing else: the request has no field that could
+/// carry rules, a revision or a report.
+#[tokio::test(flavor = "current_thread")]
+async fn a_claimed_firewall_rules_trigger_requests_only_a_wakeup() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let firewall_rules_only = NodeId::new();
+    let mixed = NodeId::new();
+    for node_id in [firewall_rules_only, mixed] {
+        sqlx::query(pplx_space_sql_locator::sql!(
+            "INSERT INTO nodes (id, role, managed_by, state)
+             VALUES ($1, $2, $3, 'registered')"
+        ))
+        .bind(node_id)
+        .bind(SpaceNodeRole::Worker)
+        .bind(NodeManagedBy::Kubernetes)
+        .execute(&db.pool)
+        .await?;
+    }
+    enqueue_triggers(&db.pool, [mixed], ReconcileReason::NodeUpdated).await?;
+    enqueue_triggers(
+        &db.pool,
+        [firewall_rules_only, mixed],
+        ReconcileReason::FirewallRulesChanged,
+    )
+    .await?;
+
+    let requests = claim_triggers(&db.pool, 10)
+        .await?
+        .triggers
+        .iter()
+        .map(|trigger| {
+            (
+                trigger.node_id,
+                trigger_request(&TriggerReasonPayload::from(trigger)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        requests,
+        BTreeMap::from([
+            (
+                firewall_rules_only,
+                TriggerStateReconciliationRequest {
+                    reasons: vec![18],
+                    diagnostic_reason: "firewall_rules_changed".to_string(),
+                },
+            ),
+            (
+                mixed,
+                TriggerStateReconciliationRequest {
+                    reasons: vec![18, 2],
+                    diagnostic_reason: "firewall_rules_changed,node_updated".to_string(),
+                },
+            ),
+        ])
     );
     Ok(())
 }

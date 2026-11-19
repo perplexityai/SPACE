@@ -16,7 +16,7 @@
 //! pass `true`.
 //!
 //! It is its own crate so that crates that know nothing about SPACE can parse
-//! their settings without depending on `pplx-space-common-core`.
+//! their settings without depending on a SPACE model crate.
 
 /// Interpret an env var's raw value as an on/off flag, falling back to
 /// `default` when the value is absent or not in the shared vocabulary.

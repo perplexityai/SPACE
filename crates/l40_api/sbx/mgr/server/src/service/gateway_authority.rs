@@ -5,7 +5,7 @@ use pplx_space_credmgr_client::proto::{
     IssueIntermediateCertificateRequest as NodeRequest,
     IssueIntermediateCertificateResponse as NodeResponse,
 };
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_spaced_protocol::proto::host_control::{
     IssueGatewayIntermediateCertificateRequest, IssueGatewayIntermediateCertificateResponse,
 };
 use tokio::sync::Semaphore;

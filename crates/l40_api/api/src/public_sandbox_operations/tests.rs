@@ -1,17 +1,19 @@
 use std::{collections::BTreeMap, fmt};
 use uuid::Uuid;
 
-use pplx_space_common_core::types::{
-    NodeId, OrgId, RuntimeKind, SnapshotId, TemplateReference, UpstreamIssuer, UpstreamOrgId,
-    UpstreamSubjectId, UserId,
+use pplx_space_accounts::{
+    NodeId, OrgId, UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId, UserId,
 };
 use pplx_space_db_test_fixtures::{
     insert_suspended_sandbox, insert_uploading_snapshot, pg_test_db,
 };
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_public_api::{
     OperationId, OperationTargetType, PublicSandboxMetadataValue,
     SandboxResources as PublicSandboxResources,
 };
+use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_template_model::TemplateReference;
 
 use super::*;
 
@@ -99,8 +101,9 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
     use crate::tls_interception_exemptions::TlsInterceptionExemptions;
     use pplx_space_net_common::NetworkPolicyV1;
 
-    // The fully instrumented native create path needs more than libtest's default stack.
-    if !pplx_space_test_env::enter_test_process(&[(
+    // The fully instrumented native create path needs more than libtest's
+    // default stack, and its readiness wait calls the sim worker.
+    if !crate::test_support::enter_sim_worker_process_with(&[(
         "RUST_MIN_STACK",
         Some(std::ffi::OsStr::new("16777216")),
     )]) {
@@ -160,13 +163,17 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
         time::OffsetDateTime::now_utc() + time::Duration::hours(1),
     )?;
     let captured_pods = Arc::new(Mutex::new(Vec::new()));
-    // Native create probes the pod's TCP listener even with command readiness disabled.
-    let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    // Native create waits for the guest, which the worker behind the pod's
+    // proxy port answers for.
+    let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(NodeId::new().to_string())
+        .with_internal_api()
+        .start()
+        .await?;
     let substrate = crate::controllers::substrate::Substrate::from_kubernetes(
         substrate_with_store_client_proxy_port_and_pod(
             db.pool.clone(),
             running_pod_kubernetes_client(Arc::clone(&captured_pods), "127.0.0.1"),
-            pod_listener.local_addr()?.port(),
+            worker.port(),
             None,
         ),
     );
@@ -812,6 +819,37 @@ fn cluster_admission_429_is_marked_backpressure() {
     );
 }
 
+/// Each activation-admission refusal requeues the create the way its kind
+/// says: only the shared bucket is backpressure, and the capacity refusals
+/// spend the transient-error budget. The hint is the admission's own.
+#[test]
+fn activation_rejection_kinds_requeue_as_their_kind_says() {
+    use crate::controllers::substrate::ActivationRejectionKind;
+    let op = claimed_create_operation();
+    let hint = std::time::Duration::from_secs(4);
+    for (kind, reason) in [
+        (
+            ActivationRejectionKind::RateLimited,
+            PublicOperationRequeueReason::ActivationBackpressure,
+        ),
+        (
+            ActivationRejectionKind::EmptyCluster,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+        (
+            ActivationRejectionKind::NoFreeSlot,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+    ] {
+        let result = controller_error_result(
+            &op,
+            kind.controller_error("refused".to_string(), Some(hint)),
+        );
+        assert_eq!(result.requeue_reason, reason, "{kind:?}");
+        assert_eq!(result.retry_after, Some(hint), "{kind:?}");
+    }
+}
+
 #[test]
 fn controller_create_request_uses_public_contract_defaults() {
     let controller = controller_create_request(public_create_request(), None);
@@ -819,7 +857,13 @@ fn controller_create_request_uses_public_contract_defaults() {
     assert_eq!(controller.name.as_deref(), Some("native-create"));
     assert_eq!(controller.runtime.as_deref(), Some("fc"));
     assert_eq!(controller.boot_mode, None);
-    assert!(!controller.wait_until_ready);
+    // The operation succeeds once the guest answers, or once it has waited
+    // the Native create's bound for it.
+    assert!(controller.wait_until_ready);
+    assert_eq!(
+        controller.command_ready_wait,
+        Some(NATIVE_CREATE_COMMAND_READY_WAIT)
+    );
     assert_eq!(controller.vcpu, Some(2));
     assert_eq!(controller.memory_mib, Some(1024));
     assert_eq!(controller.disk_mib, None);
@@ -1432,6 +1476,106 @@ fn claimed_delete_operation(
         traceparent: None,
         age_at_first_claim_secs: None,
     }
+}
+
+/// A pause of a sandbox without a resident runtime fails at once as a
+/// conflict naming the sandbox's state and the request that brings it back,
+/// rather than retrying until its attempts run out.
+#[tokio::test]
+async fn pause_of_a_sandbox_without_a_runtime_fails_as_a_conflict() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    for (lifecycle, state, wake) in [
+        (SandboxLifecycle::Suspended, "suspended", Some(":wake")),
+        (SandboxLifecycle::Stopped, "stopped", Some(":start")),
+        (SandboxLifecycle::Failed, "failed", None),
+    ] {
+        let sandbox_id = seed_sandbox(
+            &db.pool,
+            SandboxSeed {
+                org_id,
+                user_id,
+                lifecycle,
+                placement: SeedSandboxPlacement::Unplaced,
+            },
+        )
+        .await?;
+        let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+        let operation = ClaimedPublicOperation {
+            kind: OperationKind::PauseSandbox,
+            payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+                sandbox_id: public_sandbox_id,
+                action: SandboxLifecycleAction::Pause,
+                rollback: None,
+                wake_activity: None,
+            })?,
+            ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
+        };
+
+        let result = executor.execute(&operation).await;
+
+        assert_eq!(result.state, OperationState::Failed, "{state}");
+        assert_eq!(
+            result.terminal_error_code,
+            Some(PublicErrorCode::Conflict),
+            "{state}"
+        );
+        let error = result
+            .terminal_error_json
+            .ok_or("a failed operation records its error")?;
+        assert_eq!(error["reason"], "sandbox_not_running", "{state}: {error}");
+        assert_eq!(error["state"], state, "{error}");
+        match wake {
+            Some(action) => assert!(
+                error["wake"]
+                    .as_str()
+                    .is_some_and(|wake| wake.ends_with(&format!("{public_sandbox_id}{action}"))),
+                "{state}: {error}"
+            ),
+            None => assert!(error.get("wake").is_none(), "{state}: {error}"),
+        }
+        assert_eq!(
+            fetch_sandbox(&db.pool, sandbox_id)
+                .await?
+                .map(|sandbox| sandbox.lifecycle),
+            Some(lifecycle.as_str().to_string()),
+            "{state}: a refused pause leaves the sandbox as it was"
+        );
+    }
+
+    // A checkpoint returns the sandbox to the state it left, with its runtime,
+    // so a pause during one is not refused, though its public state reads as
+    // suspending.
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Checkpointing,
+            placement: SeedSandboxPlacement::Unplaced,
+        },
+    )
+    .await?;
+    let operation = ClaimedPublicOperation {
+        kind: OperationKind::PauseSandbox,
+        payload: serde_json::to_value(SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::from(sandbox_id),
+            action: SandboxLifecycleAction::Pause,
+            rollback: None,
+            wake_activity: None,
+        })?,
+        ..claimed_delete_operation(sandbox_id, org_id, Some(user_id), ApiProduct::Native)
+    };
+    let result = executor.execute(&operation).await;
+    // It goes on to dispatch, which waits for this unplaced sandbox's node.
+    assert_eq!(result.state, OperationState::Queued, "{result:?}");
+    assert_eq!(result.terminal_error_code, None, "{result:?}");
+    Ok(())
 }
 
 const UPLOAD_CONFLICT_MESSAGE: &str = "sandbox has a suspend-snapshot upload in flight; retry the DELETE after the snapshot finalizes";

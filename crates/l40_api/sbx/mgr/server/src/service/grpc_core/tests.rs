@@ -1,6 +1,6 @@
 use super::*;
 use crate::service::tests::service_tests::insert_test_sandbox;
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 use pplx_space_template_mgr_client::proto::TemplateFullInfo;
 use pplx_space_uds_peer_auth::PeerIdentity;
 
@@ -16,7 +16,7 @@ fn root_peer() -> PeerIdentity {
     PeerIdentity::new(0, 0, None)
 }
 
-fn service_peer(user: &pplx_space_common_core::host::linux::identities::LinuxUser) -> PeerIdentity {
+fn service_peer(user: &pplx_space_host_layout::identities::LinuxUser) -> PeerIdentity {
     PeerIdentity::new(user.uid, user.primary_group.gid, None)
 }
 
@@ -149,6 +149,7 @@ async fn delete_of_rowless_disk_sandbox_is_not_reported_deleted() {
                     sandbox_id: id.clone(),
                     template_filter: None,
                     blocking,
+                    discard_retained_filesystem_reason: None,
                 },
                 Some(root_peer()),
             ))
@@ -171,7 +172,7 @@ fn create_refused_before_template_lookup() -> CreateRequest {
     CreateRequest {
         template: "seed".into(),
         owner: "root@local".into(),
-        runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),
+        runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.into(),
         boot_mode: BootMode::Cold as i32,
         sandbox_id: Some(SandboxId::new().to_string()),
         auto_lifecycle: Some(Default::default()),
@@ -354,7 +355,7 @@ impl CleanupFixture {
             .map(|row| row.state)
     }
 
-    fn active_cleanup_job(&self, id: &str) -> Option<pplx_space_common_core::types::JobId> {
+    fn active_cleanup_job(&self, id: &str) -> Option<pplx_space_accounts::JobId> {
         pplx_space_common_jobs::db::find_active_job(
             self.service.db_conn().unwrap().raw(),
             crate::db::cleanup_jobs::KIND,
@@ -428,6 +429,7 @@ impl CleanupRpc {
                             sandbox_id: sandbox_id.to_owned(),
                             template_filter,
                             blocking,
+                            discard_retained_filesystem_reason: None,
                         },
                         peer,
                     ))
@@ -695,6 +697,7 @@ async fn nonblocking_cleanup_returns_once_admitted_and_honors_skip_node_publish(
                                     sandbox_id: id.clone(),
                                     template_filter: None,
                                     blocking: false,
+                                    discard_retained_filesystem_reason: None,
                                 },
                             ))
                             .await
@@ -818,7 +821,7 @@ fn auto_lifecycle_expectation(
 }
 
 fn access_idle_delete_policy(at: u64) -> AutoLifecyclePolicy {
-    use pplx_space_common_core::types::{
+    use pplx_space_auto_lifecycle::{
         AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleStage,
     };
     AutoLifecyclePolicy {
@@ -899,17 +902,15 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
         crate::db::update_space_api_route_identity(
             &conn,
             sandbox_id,
-            &pplx_space_common_core::types::SpaceApiRouteIdentity {
-                route_generation: Some(
-                    pplx_space_common_core::types::RouteGeneration::new(7).unwrap(),
-                ),
-                current_node_id: Some(pplx_space_common_core::types::NodeId::new()),
+            &pplx_space_sandbox_model::SpaceApiRouteIdentity {
+                route_generation: Some(pplx_space_sandbox_model::RouteGeneration::new(7).unwrap()),
+                current_node_id: Some(pplx_space_accounts::NodeId::new()),
                 execution_generation: Some(ExecutionGeneration::new(7).unwrap()),
                 activation_attempt_id: Some(
-                    pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                    pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                 ),
                 substrate_kind: Some(NodeManagedBy::Kubernetes),
-                pod_uid: Some(pplx_space_common_core::types::PodUid::parse("pod-uid-7").unwrap()),
+                pod_uid: Some(pplx_space_k8s_ids::PodUid::parse("pod-uid-7").unwrap()),
                 ..Default::default()
             },
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
@@ -929,6 +930,7 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
                     sandbox_id: selector,
                     template_filter: case.template_filter.map(str::to_owned),
                     blocking: true,
+                    discard_retained_filesystem_reason: None,
                 },
                 Some(root_peer()),
             ),
@@ -1124,10 +1126,10 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
                     &conn,
                     &id,
                     SandboxState::Creating,
-                    pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
+                    pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
                     SandboxQuarantineReasonCode::CreateInterrupted,
                     "operator hold during publication",
-                    pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
                 )
                 .unwrap()
             );
@@ -1159,6 +1161,7 @@ async fn delete_of_a_pool_clone_disposal_requires_an_operator_after_quarantine()
                     sandbox_id: id.clone(),
                     template_filter: None,
                     blocking: case.blocking,
+                    discard_retained_filesystem_reason: None,
                 },
                 Some(peer),
             ),
@@ -1235,7 +1238,9 @@ fn template_catalog_preserves_owner_identity_with_corrupt_supplemental_metadata(
 /// cache partition's dir.
 #[test]
 fn template_catalog_reads_a_twin_s_metadata_from_its_partition() {
-    use pplx_space_common_core::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::EnvironmentReference;
+    use pplx_space_template_model::TemplateCachePartition;
     let cache = tempfile::tempdir().unwrap();
     let hash = format!("sha256:{}", "a".repeat(64));
     let twin = EnvironmentReference::new(Digest::sha256([2; 32]));
@@ -1287,7 +1292,7 @@ fn template_catalog_reads_an_adopted_build_s_metadata_from_its_legacy_dir(
     )
     .unwrap();
     let e1 = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .iter()

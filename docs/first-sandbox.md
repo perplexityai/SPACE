@@ -27,7 +27,7 @@ The example follows this sequence:
 1. **Create:** Request a Firecracker sandbox from `seed:latest`. Save its sandbox ID and operation ID.
 2. **Wait:** Poll for operation success and a `running` sandbox, then check the guest process endpoint.
 3. **Execute:** Create a command session, then attach to its event stream to start the process.
-4. **Check:** Decode stdout and stderr from base64 and display them as they arrive. Require `process_exited` with exit code `0`, with no `error`, `resync_required`, or incomplete frame.
+4. **Check:** Decode stdout and stderr from base64 and display them as they arrive. Require `process_exited` with exit code `0` and `output_truncated` `false`, with no `error`, `resync_required`, or incomplete frame.
 5. **Inspect:** List sandboxes, inspect this sandbox and its operation, and list its currently running processes.
 6. **Choose cleanup:** After displaying the result, ask whether to delete the sandbox and remove its transcripts. Enter `y` to delete; Enter or any other answer keeps them.
 
@@ -85,7 +85,7 @@ Read `/openapi-m1.json` for exact request constraints and supported fields. This
 
 The example displays decoded stdout and stderr and saves the raw event stream in its run directory. Handle binary output separately rather than displaying it in a terminal.
 
-Command output is a live stream, not durable log storage. The sandbox retains a bounded amount of each process's recent output: reconnecting with `Last-Event-ID`, set to the last `id` received, exactly as received (only output and `resync_required` events carry one), resumes with the output after that event while it is retained, and otherwise produces `resync_required` first. After a process's first 2^33 - 1 output chunks, ids no longer carry its output position, and each reconnect replays the retained output behind `resync_required`. Keep the transcript when a stream fails; repeat a command only if repeating its effects is safe.
+Command output is a live stream, not durable log storage. The sandbox retains a bounded amount of each process's recent output: reconnecting with `Last-Event-ID`, set to the last `id` received, exactly as received (only output and `resync_required` events carry one), resumes with the output after that event while it is retained, and otherwise produces `resync_required` first. After a process's first 2^33 - 1 output chunks, ids no longer carry its output position, and each reconnect replays the retained output behind `resync_required`. A stream that skipped output reports `output_truncated` `true` on `process_exited`; sandboxes from older templates drop output a slow reader has not read once their retained window fills, and their streams report the gap the same way. Keep the transcript when a stream fails; repeat a command only if repeating its effects is safe.
 
 ## Inspect and manage the sandbox
 

@@ -201,6 +201,8 @@ jobs:
       contents: read
       packages: write
     uses: ./.github/workflows/kind-ci.yml
+    with:
+      smoke_tiers: routine,main
 
   # The only job that writes the Kind runtime images' and the seed builder's
   # tags in ghcr.io/perplexityai/space-kind-build-cache, which every Kind

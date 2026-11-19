@@ -3,6 +3,24 @@ use crate::proto::{CleanupTargetBatch, ScanCleanupTargetsRequest};
 
 #[tonic::async_trait]
 impl SandboxManager for SandboxManagerService {
+    async fn guest_update_status(
+        &self,
+        request: Request<crate::proto::GuestUpdateStatusRequest>,
+    ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
+        self.guest_update_status_rpc(request).await
+    }
+    async fn apply_guest_update(
+        &self,
+        request: Request<crate::proto::ApplyGuestUpdateRequest>,
+    ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
+        self.apply_guest_update_rpc(request).await
+    }
+    async fn restart_guest(
+        &self,
+        request: Request<crate::proto::RestartGuestRequest>,
+    ) -> Result<Response<crate::proto::GuestUpdateOperation>, Status> {
+        self.restart_guest_rpc(request).await
+    }
     async fn get_execution_capabilities(
         &self,
         request: Request<crate::proto::GetExecutionCapabilitiesRequest>,
@@ -227,6 +245,16 @@ impl SandboxManager for SandboxManagerService {
         request: Request<crate::proto::GetRuntimeUpgradeRequest>,
     ) -> Result<Response<crate::proto::GetRuntimeUpgradeResponse>, Status> {
         SandboxManagerService::get_runtime_upgrade(self, &request).map(Response::new)
+    }
+
+    async fn abandon_runtime_upgrade(
+        &self,
+        request: Request<crate::proto::AbandonRuntimeUpgradeRequest>,
+    ) -> Result<Response<crate::proto::AbandonRuntimeUpgradeResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
+        Err(Status::unimplemented(
+            "this sandbox-manager doesn't abandon runtime upgrades yet",
+        ))
     }
 
     async fn kill(&self, request: Request<KillRequest>) -> Result<Response<KillResponse>, Status> {

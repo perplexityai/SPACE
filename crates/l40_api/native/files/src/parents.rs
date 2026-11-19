@@ -1,8 +1,8 @@
 //! `parents` writes: create a write's missing directories only once the guest
 //! reports its path missing.
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_guest_process::{GuestUserName, IdempotencyKey};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_protocol::proto::SpacedMkdirRequest;
 
 use crate::{failure::FileCallFailure, worker::spaced_mkdir_request};

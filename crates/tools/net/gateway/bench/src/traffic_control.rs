@@ -12,10 +12,8 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
     ed25519::insert_space_api_route_ed25519_token,
 };
-use pplx_space_common_core::types::{
-    ClusterId, GuestPort, SandboxRouteIdentity, SpaceApiRouteIdentity,
-};
-use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
+use pplx_space_cluster_id::ClusterId;
+use pplx_space_credential_injection::proto::ResolvedNetworkCredential;
 use pplx_space_net_common::{
     CredentialHeaderBindingV1, EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope,
     EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, NetworkCredentialDestinationV1,
@@ -24,7 +22,9 @@ use pplx_space_net_common::{
 use pplx_space_net_gateway_client::proto::{
     self, net_gateway_control_client::NetGatewayControlClient,
 };
-use pplx_space_spaced_common::proto::{activity, host_control};
+use pplx_space_network_roles::GuestPort;
+use pplx_space_sandbox_model::{SandboxRouteIdentity, SpaceApiRouteIdentity};
+use pplx_space_spaced_protocol::proto::{activity, host_control};
 use serde::Deserialize;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -350,7 +350,7 @@ impl host_control::host_control_server::HostControl for HostControl {
 async fn client(
     socket: &Path,
 ) -> anyhow::Result<NetGatewayControlClient<tonic::transport::Channel>> {
-    let channel = pplx_space_spaced_common::connect_uds_channel("gateway-traffic", socket).await?;
+    let channel = pplx_space_spaced_client::connect_uds_channel("gateway-traffic", socket).await?;
     Ok(NetGatewayControlClient::new(channel))
 }
 
@@ -359,8 +359,8 @@ fn identity(generation: u64, sandbox: &str) -> anyhow::Result<SandboxRouteIdenti
         sandbox_id: Some(sandbox.parse()?),
         route_generation: Some(generation.try_into()?),
         current_node_id: Some(NODE.parse()?),
-        substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Space),
-        execution_generation: Some(pplx_space_common_core::types::ExecutionGeneration::new(1)?),
+        substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Space),
+        execution_generation: Some(pplx_space_sandbox_model::ExecutionGeneration::new(1)?),
         activation_attempt_id: Some(ATTEMPT.parse()?),
         pod_uid: None,
     }
@@ -386,8 +386,7 @@ async fn command(command: Command) -> anyhow::Result<()> {
             } else {
                 None
             };
-            let socket =
-                Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET);
+            let socket = Path::new(pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET);
             tokio::fs::create_dir_all(socket.parent().context("host-control socket parent")?)
                 .await?;
             let listener = UnixListener::bind(socket)?;

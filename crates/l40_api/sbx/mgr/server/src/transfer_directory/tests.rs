@@ -22,7 +22,7 @@ fn distinct_service_uids_can_exchange_downloads() {
     use std::time::Duration;
 
     use nix::unistd::{Uid, chown};
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
 
     const STAGE: &str = "SPACE_TEST_TRANSFER_STAGE";
     const ROOT: &str = "SPACE_TEST_TRANSFER_ROOT";

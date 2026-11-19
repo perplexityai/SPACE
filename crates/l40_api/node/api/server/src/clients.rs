@@ -16,6 +16,10 @@ pub struct BackendClients {
     node: NodeManagerGrpcClient,
     tmpl: TemplateManagerGrpcClient,
     build_mgr: BuildManagerGrpcClient,
+    /// Where a restart-handoff replay reaches sandbox-manager's successor in
+    /// tests, which have no sandbox-manager socket to dial.
+    #[cfg(test)]
+    sbx_successor: Option<SandboxManagerGrpcClient>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +43,8 @@ impl BackendClients {
             node: pplx_space_node_mgr_client::lazy(),
             tmpl: pplx_space_template_mgr_client::lazy(),
             build_mgr: build_mgr_lazy(),
+            #[cfg(test)]
+            sbx_successor: None,
         }
     }
 
@@ -53,6 +59,8 @@ impl BackendClients {
             node,
             tmpl,
             build_mgr: build_mgr_lazy(),
+            #[cfg(test)]
+            sbx_successor: None,
         })
     }
 
@@ -66,7 +74,24 @@ impl BackendClients {
             tmpl: TemplateManagerGrpcClient::new(wrap_grpc_client_channel(channel.clone())),
             build_mgr: pplx_space_build_mgr_client::client_with_token(channel, "test-token")
                 .expect("test build-manager client"),
+            sbx_successor: None,
         }
+    }
+
+    /// Serve restart-handoff replays from `channel`, as if a successor
+    /// sandbox-manager owned the socket.
+    #[cfg(test)]
+    pub(crate) fn with_sbx_successor(mut self, channel: tonic::transport::Channel) -> Self {
+        use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
+        self.sbx_successor = Some(SandboxManagerGrpcClient::new(wrap_grpc_client_channel(
+            channel,
+        )));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sbx_successor_for_tests(&self) -> Option<SandboxManagerGrpcClient> {
+        self.sbx_successor.clone()
     }
 
     pub fn sbx(&self) -> SandboxManagerGrpcClient {

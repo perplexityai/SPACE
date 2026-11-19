@@ -38,6 +38,7 @@ from space_smoke.capabilities import (
     ForkableSandbox,
     KindEnvironment,
     NetworkConfig,
+    NodeCtlFacetControl,
     ProcessSandbox,
     ResidentLifecycleSandbox,
     SandboxInfo,
@@ -54,7 +55,9 @@ from space_smoke.fixtures import (
     SANDBOX_CLEANUP_RETRY_SECONDS,
     CommandSandboxFixture,
     Ecw,
+    KindAdmin,
     KindEcw,
+    KindNetworkEcw,
     retry_sandbox_delete,
 )
 from space_smoke.native import NativeConfig, NativeSandboxFactory
@@ -66,6 +69,7 @@ from space_smoke.runtime import (
     SmokeConfigurationError,
     SubprocessExecutor,
 )
+from space_smoke.execution_environment import ExecutionEnvironmentAdmission
 from space_smoke.template_build import build_dedicated_template
 
 
@@ -185,6 +189,35 @@ class SmokeServices:
         sandbox: SandboxConfig,
         sandbox_count: int = 1,
     ) -> Fixture:
+        if fixture_type is KindAdmin:
+            if self.kind is None:
+                raise SmokeConfigurationError("KindAdmin requires the kind backend")
+            kind = self.kind
+            with context.phase("bootstrap kind stack"):
+                kind.bootstrap()
+            if self.owns_api_key:
+                context.scope.defer(
+                    "delete run-scoped ECW credential",
+                    lambda: kind.delete_api_key(self.api_key),
+                    critical=True,
+                )
+                with context.phase("seed run-scoped ECW credential"):
+                    kind.seed_api_key(self.api_key)
+            fixture = KindAdmin(context)
+            fixture._template_selector = self.template_override or sandbox.template
+            fixture._template_build_control = cast(Any, kind)
+            fixture._template_builder = cast(Any, self.ecw)
+            fixture._reconcile_queue_gc_control = cast(Any, kind)
+            fixture._leader_election_control = cast(Any, kind)
+            fixture._drain_gate_control = cast(Any, kind)
+            fixture._console_control = cast(Any, kind)
+            if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
+                from space_smoke.private_template_build import PrivateTemplateBuildAssertions
+
+                fixture._private_template_build_setup = partial(
+                    PrivateTemplateBuildAssertions, context, kind, self.ecw.config
+                )
+            return cast(Fixture, fixture)
         if fixture_type is DirectNodeRecoveryFixture:
             if self.direct_node is None:
                 raise SmokeConfigurationError("node recovery configuration is missing")
@@ -193,6 +226,7 @@ class SmokeServices:
             CommandSandboxFixture,
             Ecw,
             KindEcw,
+            KindNetworkEcw,
             NativeHardeningFixture,
             KindNativeHardeningFixture,
         ):
@@ -219,7 +253,7 @@ class SmokeServices:
                     ),
                 )
             fixture_type = cast(type[Fixture], Ecw)
-        if fixture_type is KindEcw and self.kind is None:
+        if fixture_type in (KindEcw, KindNetworkEcw) and self.kind is None:
             raise SmokeConfigurationError(
                 "this scenario's fixture carries privileged control-plane "
                 "operations and runs only on the kind backend "
@@ -293,6 +327,18 @@ class SmokeServices:
                     "dedicated_template",
                     {"alias": built.alias, "build_seconds": built.elapsed_seconds},
                 )
+        admission: ExecutionEnvironmentAdmission | None = None
+        if sandbox_config.kind_execution_environment is not None:
+            if kind is None or fixture_type is not KindEcw:
+                raise SmokeConfigurationError("an execution environment's seed requires KindEcw")
+            name = sandbox_config.kind_execution_environment
+            admission = ExecutionEnvironmentAdmission(
+                context, cast(Any, kind), context.scope, name
+            )
+            with context.phase(f"admit {name} on every node"):
+                admission.admit()
+            with context.phase(f"build seed bound to {name}"):
+                template = admission.build_seed()
         before_create = None
         warm_pool_candidate: WarmPoolCandidate | None = None
         if sandbox_config.kind_cold_create is not None:
@@ -382,6 +428,8 @@ class SmokeServices:
                 else None
             ),
         )
+        if isinstance(fixture, KindNetworkEcw):
+            fixture._network_policy_observer = cast(Any, kind)
         if isinstance(fixture, KindEcw):
             # `fixture` requires kind (enforced above); the harness provides
             # the named privileged operations.
@@ -395,6 +443,7 @@ class SmokeServices:
             fixture._node_fence_control = cast(Any, kind)
             fixture._pending_backup_control = cast(Any, kind)
             fixture._teardown_restart_control = cast(Any, kind)
+            fixture._retained_only_copy_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
             fixture._reconcile_queue_gc_control = cast(Any, kind)
             fixture._unanswered_template_control = cast(Any, kind)
@@ -414,6 +463,7 @@ class SmokeServices:
             fixture._sandbox_network_isolation_control = cast(Any, kind)
             fixture._storage_exchange_control = cast(Any, kind)
             fixture._template_selector = template
+            fixture._execution_environment = admission
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
@@ -487,6 +537,9 @@ class SmokeServices:
             _local_cleanup_control=(
                 cast(ColdEvictionControl, kind) if kind is not None else None
             ),
+            _node_ctl_facet_control=(
+                cast(NodeCtlFacetControl, kind) if kind is not None else None
+            ),
             _encrypted_resuspend_control=(
                 cast(EncryptedResuspendControl, kind) if kind is not None else None
             ),
@@ -526,7 +579,9 @@ class SmokeServices:
         if scenario.fixture_type not in (
             CommandSandboxFixture,
             Ecw,
+            KindAdmin,
             KindEcw,
+            KindNetworkEcw,
             NativeHardeningFixture,
             KindNativeHardeningFixture,
         ):
@@ -539,6 +594,8 @@ class SmokeServices:
             raise SmokeConfigurationError(
                 "SPACE_SMOKE_BACKEND must be 'kind' or 'deployed'"
             )
+        if scenario.fixture_type is KindNetworkEcw and backend != KIND_BACKEND:
+            raise SmokeConfigurationError("gateway observation requires the kind backend")
         if (
             scenario.fixture_type is KindNativeHardeningFixture
             and backend != KIND_BACKEND
@@ -807,7 +864,13 @@ class _ScenarioSandboxes:
     def items(self) -> tuple[EcwSandbox, ...]:
         return tuple(self._created)
 
-    def create(self, metadata: Mapping[str, str] | None = None) -> EcwSandbox:
+    def create(
+        self,
+        metadata: Mapping[str, str] | None = None,
+        *,
+        network: NetworkConfig | None = None,
+        allow_internet_access: bool | None = None,
+    ) -> EcwSandbox:
         if self._before_create is not None:
             self._before_create()
         create_metadata = self._create_metadata(metadata)
@@ -828,8 +891,8 @@ class _ScenarioSandboxes:
                     timeout=self._timeout,
                     metadata=create_metadata,
                     lifecycle=self._lifecycle,
-                    allow_internet_access=self._allow_internet_access,
-                    network=self._network,
+                    allow_internet_access=(self._allow_internet_access if allow_internet_access is None else allow_internet_access),
+                    network=self._network if network is None else network,
                     **({"envs": self._envs} if self._envs is not None else {}),
                 )
                 break

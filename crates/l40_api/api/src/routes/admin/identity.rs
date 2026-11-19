@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{OrgId, SandboxOwnerSource, UserId};
+use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
 
 use axum::{
     Extension, Json,
@@ -6,11 +6,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::{
-    sql,
-    types::{KekProvider, platform_default_kek_provider},
-};
+use pplx_space_byok_model::{KekProvider, platform_default_kek_provider};
 use pplx_space_sandbox_store::UserSandboxRows;
+use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 use uuid::Uuid;
 

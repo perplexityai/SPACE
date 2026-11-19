@@ -14,10 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
-use pplx_space_common_core::{
-    host::linux::identities::group_names, host::linux::identities::user_names,
-    host::linux::identities::users,
-};
+use pplx_space_host_layout::{identities::group_names, identities::user_names, identities::users};
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_node_api_client::node_status_freshness::{
     DEFAULT_NODE_CTL_POLL_INTERVAL, MAX_NODE_CTL_POLL_INTERVAL, NODE_STATUS_OUTBOUND_RECONCILER,
@@ -475,8 +472,8 @@ impl OutboundPublisher for ClusterApiPublisher {
 }
 
 /// The node's Kubernetes object reconciles: template-presence node metadata,
-/// network-slot status capacity, the SSD placement labels and the host-CPU
-/// label. They ride the template-inventory publication (see
+/// network-slot status capacity, the SSD placement labels, the host-CPU
+/// label and the environment labels. They ride the template-inventory publication (see
 /// `NodeCtlWorker::run_outbound_sync`). A trait so a test can stand in for the
 /// Kubernetes controller.
 #[tonic::async_trait]
@@ -514,6 +511,9 @@ impl NodeObjectReconciles for kubernetes_controller::Controller {
         }
         if let Err(error) = self.reconcile_host_cpu().await {
             tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
+        }
+        if let Err(error) = self.reconcile_environment_labels().await {
+            tracing::warn!(%error, "local Kubernetes environment-label reconcile failed");
         }
     }
 }
@@ -2220,7 +2220,7 @@ fn claimed_ref_sandbox_id(reference: &ProtoFacetRef) -> Option<String> {
         facet_ref::Element::Template(_) => return None,
     };
     sandbox_id
-        .parse::<pplx_space_common_core::types::SandboxId>()
+        .parse::<pplx_space_sandbox_model::SandboxId>()
         .ok()
         .map(|sandbox_id| sandbox_id.to_string())
 }

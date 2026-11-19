@@ -65,7 +65,7 @@ async fn runtime_candidates_require_fresh_positive_evidence() -> TestResult {
         );
         let pull = fixture
             .substrate
-            .pull_on_create_worker_candidates("ch")
+            .pull_on_create_worker_candidates("seed", Some("hash-seed"), "ch")
             .await?;
         assert_eq!(
             !pull.is_empty(),
@@ -119,7 +119,7 @@ async fn runtime_candidates_require_fresh_positive_evidence() -> TestResult {
     assert!(
         fixture
             .substrate
-            .pull_on_create_worker_candidates("ch")
+            .pull_on_create_worker_candidates("seed", Some("hash-seed"), "ch")
             .await?
             .is_empty()
     );

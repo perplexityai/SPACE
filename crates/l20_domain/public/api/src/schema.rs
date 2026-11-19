@@ -5,12 +5,15 @@ use crate::limits::{
     MAX_SANDBOX_VCPU, MIN_SANDBOX_DISK_MIB, MIN_SANDBOX_MEMORY_MIB, MIN_SANDBOX_VCPU,
 };
 use crate::routes::{MAX_AGGREGATE_UTF8_BYTES_EXTENSION, MAX_UTF8_BYTES_EXTENSION};
-use pplx_space_common_core::types::{
-    HashAlg, MAX_ENV_ENTRIES, MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES,
-    MAX_GUEST_PATH_BYTES, MAX_GUEST_USER_NAME_BYTES, MAX_PROCESS_COMMAND_ARGS,
-    MAX_PROCESS_COMMAND_BYTES, MAX_PROCESS_ID_BYTES, MIN_DIGEST_PREFIX_HEX_LEN,
+use pplx_space_content_digest::{HashAlg, MIN_DIGEST_PREFIX_HEX_LEN};
+use pplx_space_execution_spec::{
     RUNTIME_CLOUD_HYPERVISOR, RUNTIME_CLOUD_HYPERVISOR_ALIAS, RUNTIME_FIRECRACKER,
     RUNTIME_FIRECRACKER_ALIAS, RUNTIME_GVISOR, RUNTIME_GVISOR_ALIAS,
+};
+use pplx_space_guest_process::{
+    MAX_ENV_ENTRIES, MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES,
+    MAX_GUEST_PATH_BYTES, MAX_GUEST_USER_NAME_BYTES, MAX_PROCESS_COMMAND_ARGS,
+    MAX_PROCESS_COMMAND_BYTES, MAX_PROCESS_ID_BYTES,
 };
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 
@@ -35,6 +38,18 @@ pub(crate) fn optional_date_time(generator: &mut SchemaGenerator) -> Schema {
             { "type": "null" }
         ]
     })
+}
+
+/// `process_exited` always carries `output_truncated`, but a data plane
+/// older than the field omits it, and readers default it to `false`, so the
+/// published schema must not require it.
+pub(crate) fn output_truncated_not_required(schema: &mut Schema) {
+    if let Some(required) = schema
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.retain(|name| name != "output_truncated");
+    }
 }
 
 fn incubating(mut schema: Schema) -> Schema {
@@ -121,7 +136,7 @@ pub(crate) fn page_cursor(generator: &mut SchemaGenerator) -> Schema {
 pub(crate) fn template_reference(generator: &mut SchemaGenerator) -> Schema {
     // `name` is bounded at 255 bytes and a tag at 128 by the parser, so the
     // longest reference is `name:tag`. Those two bounds are literals in
-    // `pplx_space_common_core::types::template`, so
+    // `pplx_space_template_model`, so
     // `sandbox_create_schema_tracks_public_wire_parsing` is what keeps this
     // honest.
     const MAX_TEMPLATE_REFERENCE_BYTES: usize = 255 + 1 + 128;
@@ -186,11 +201,12 @@ pub(crate) fn optional_runtime_kind(generator: &mut SchemaGenerator) -> Schema {
 ///
 /// `network_policy` and `auto_lifecycle` are internal types today -
 /// `NetworkPolicyV1` from `pplx-space-net-common` and `AutoLifecyclePolicy`
-/// from `pplx-space-common-core`. Describing their trees here means restating
-/// validation this crate does not own, and review found three ways that goes
-/// wrong: destinations accepting `{"ip": "not-an-ip"}`, stage durations
-/// accepting `0s` and `1.5s`, and over-precise or overflowing durations. Each
-/// is a schema that tells an SDK to accept a request the server rejects.
+/// from `pplx-space-auto-lifecycle`. Describing their trees here means
+/// restating validation this crate does not own, and review found three ways
+/// that goes wrong: destinations accepting `{"ip": "not-an-ip"}`, stage
+/// durations accepting `0s` and `1.5s`, and over-precise or overflowing
+/// durations. Each is a schema that tells an SDK to accept a request the
+/// server rejects.
 ///
 /// Publishing an open object instead keeps the field usable without promising a
 /// structure this crate cannot validate. RFC decision 7 also holds that the

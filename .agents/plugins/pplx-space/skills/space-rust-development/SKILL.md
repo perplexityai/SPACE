@@ -1,6 +1,6 @@
 ---
 name: space-rust-development
-description: Develop, review, or diagnose SPACE Rust code under `crates/` and Rust-facing protobufs.
+description: Develop, review, or diagnose SPACE Rust code under `crates/` and Rust-facing protobufs, including substrate adapters, operations and capabilities, loops over sandbox or node state, and code that branches on the substrate.
 ---
 
 # Develop SPACE Rust
@@ -20,6 +20,12 @@ Read only the references that match the task:
   shutdown: [async and Tokio](references/async.md).
 - API handlers, controller placement, reconcilers, or Kubernetes substrate
   behavior: [API services](references/api-services.md).
+- Changing either substrate's adapter; adding a substrate operation, a
+  `SubstrateCapabilities` field, or a loop over sandbox or node state; or
+  writing code that branches on the substrate (`capabilities()`,
+  `as_kubernetes()`, `managed_by()`) or names a Direct-only table
+  (`node_direct`, `sandbox_direct_route_*`): read the substrate contract,
+  `crates/l40_api/api/src/controllers/substrate/AGENTS.md`, first.
 - Before a Rust PR, push, or self-review: [review discipline](references/review-discipline.md).
 
 ## Model the domain
@@ -28,8 +34,8 @@ Read only the references that match the task:
   boundary. Pass validated domain types through the interior call graph.
 - Reuse a noun from the crate that owns it before creating a local parallel
   type, and extend it there instead of forking it. Put a new shared type in the
-  crate that owns the concept or a new single-responsibility crate, never in
-  `pplx-space-common-core`.
+  crate that owns the concept or a new single-responsibility crate, never in a
+  catch-all shared crate (`pplx-space-common-core` was deleted for this reason).
 - Model closed vocabularies as exhaustive enums. Implement `as_str`, `Display`,
   and `FromStr`; put predicates on the enum; match variants rather than string
   literals. The types reference defines the complete pattern.

@@ -33,11 +33,13 @@ pub fn update_runtime_fields(
 }
 
 /// Fence a runtime upgrade of a stopped or suspended `sandbox_id` to
-/// `target`, under a test authorization that accepts memory loss.
+/// `target`, ending in `target_state`, under a test authorization that
+/// accepts memory loss.
 pub fn fence_runtime_upgrade(
     conn: &Connection,
     sandbox_id: &str,
-    target: pplx_space_common_core::types::EnvironmentReference,
+    target: pplx_space_execution_spec::EnvironmentReference,
+    target_state: RuntimeUpgradeTargetState,
     checkpoint_dir_identity: Option<&str>,
 ) -> RuntimeUpgradeRecord {
     let sandbox = get_sandbox(conn, sandbox_id).unwrap().unwrap();
@@ -48,7 +50,7 @@ pub fn fence_runtime_upgrade(
             sandbox_id,
             observed: ObservedSandbox::of(&sandbox),
             target_environment: target,
-            target_state: RuntimeUpgradeTargetState::Started,
+            target_state,
             authorization: &RuntimeUpgradeAuthorization {
                 id: "block-e0".into(),
                 reason: "runtime advisory".into(),
@@ -233,7 +235,7 @@ pub struct TestSandboxInsert {
     pub(crate) state: crate::state::SandboxStatus,
     pub(crate) user: String,
     pub(crate) rootfs_size_mb: Option<u32>,
-    pub(crate) disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub(crate) disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub(crate) pool_template: Option<String>,
     pub(crate) volume_encryption: bool,
     pub(crate) process_env: BTreeMap<String, String>,

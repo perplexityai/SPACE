@@ -1,5 +1,5 @@
 mod environment_selection;
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -10,24 +10,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwapOption;
+use pplx_space_accounts::{
+    LOCAL_OPERATOR_SANDBOX_OWNER_KINDS, ORPHANED_SANDBOX_OWNER, SandboxOwner, SandboxOwnerKind,
+    TEMPLATE_MANAGER_SANDBOX_OWNER, format_reserved_sandbox_owner_kind_labels,
+};
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519VerificationBundleUpdate,
     ed25519::SpaceApiRouteEd25519VerificationBundleUpdateError,
 };
-use pplx_space_common_core::host::linux::identities::user_names;
-use pplx_space_common_core::host::linux::paths::{
-    TEMPLATE_CACHE_DIR_MODE, normalize_template_cache_tree as normalize_template_cache_tree_io,
-    set_template_cache_permissions as set_template_cache_permissions_io,
-};
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleActivitySource, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-    AutoLifecycleRuntimeState, AutoLifecycleTransition, ExecutionGeneration, GuestUserName,
-    IncompleteSandboxRouteIdentityError, LOCAL_OPERATOR_SANDBOX_OWNER_KINDS, NodeManagedBy,
-    NodeRole, ORPHANED_SANDBOX_OWNER, ORPHANED_SANDBOX_TEMPLATE, RuntimeKind,
-    SandboxCleanupEpisodeId, SandboxId, SandboxOwner, SandboxOwnerKind,
-    SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
-    TEMPLATE_MANAGER_SANDBOX_OWNER, format_reserved_sandbox_owner_kind_labels, parse_grpc_timeout,
+    AutoLifecycleRuntimeState, AutoLifecycleTransition,
 };
+use pplx_space_durations::parse_grpc_timeout;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_guest_process::GuestUserName;
+use pplx_space_host_layout::identities::user_names;
+use pplx_space_host_layout::paths::TEMPLATE_CACHE_DIR_MODE;
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyApplyDecision};
 use pplx_space_net_gateway_client::proto::{ServicePortIngressFrame, service_port_ingress_frame};
 use pplx_space_node_mgr_client::NodeManagerGrpcClient;
@@ -37,8 +36,15 @@ use pplx_space_node_mgr_client::proto::{
     PrepareSandboxArtifactDirRequest, PrepareSandboxRequest, ReleaseRequest, RestoreVmStateRequest,
     ResumeSandboxRequest, StopProcessRequest, SyncGuestRequest,
 };
-use pplx_space_spaced_common::proto::host_control::host_control_server::HostControl;
-use pplx_space_spaced_common::proto::host_control::{
+use pplx_space_node_model::{NodeManagedBy, NodeRole};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, IncompleteSandboxRouteIdentityError, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineReasonCode, SandboxRouteIdentity, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+};
+use pplx_space_spaced_guest_protocol::{validate_duration, validate_optional_reason};
+use pplx_space_spaced_host_client::proto as host_proto;
+use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControl;
+use pplx_space_spaced_protocol::proto::host_control::{
     ActiveForAccepted as HostControlActiveForAccepted, ActivityState as HostControlActivityState,
     Denied as HostControlDenied, GetNetworkPolicyRequest as HostControlGetNetworkPolicyRequest,
     GetNetworkPolicyResponse as HostControlGetNetworkPolicyResponse,
@@ -52,9 +58,12 @@ use pplx_space_spaced_common::proto::host_control::{
     request_active_for_response::Outcome as HostControlActiveForOutcome,
     request_shutdown_response::Outcome as HostControlShutdownOutcome,
 };
-use pplx_space_spaced_common::{validate_duration, validate_optional_reason};
-use pplx_space_spaced_host_client::proto as host_proto;
 use pplx_space_state_reconciliation::{ApplyDecisionKind, FACET_NETWORK_POLICY};
+use pplx_space_template_cache_permissions::{
+    normalize_template_cache_tree as normalize_template_cache_tree_io,
+    set_template_cache_permissions as set_template_cache_permissions_io,
+};
+use pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
@@ -75,6 +84,7 @@ use crate::auto_lifecycle::{
 mod execution_startup;
 pub(crate) mod fork_artifact;
 mod gateway_authority;
+mod guest_update;
 pub(crate) mod network_policy;
 mod restart_admission;
 mod runtime_upgrade;
@@ -211,16 +221,16 @@ fn request_sandbox_ids(sandbox_ids: &[String]) -> Vec<String> {
     ids
 }
 
-const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
-const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+const RUN_DIR: &str = pplx_space_host_layout::paths::SANDBOX_RUN_DIR;
+const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;
 
 /// Answers whether a sandbox's rootfs is on this node's disk; an error means
 /// presence couldn't be verified.
 pub type RootfsPresenceProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send + Sync>;
-const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
+const TEMPLATE_DIR: &str = pplx_space_host_layout::paths::TEMPLATE_DIR;
 const NET_GATEWAY_SIDECAR_PID_NAME: &str = "space-netgtw-svc";
 
-const MAX_WRITE_BATCH_ENTRIES: usize = pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES;
+const MAX_WRITE_BATCH_ENTRIES: usize = pplx_space_guest_process::MAX_WRITE_BATCH_ENTRIES;
 const DEFAULT_BLOCKING_READY_TIMEOUT_SECS: u32 = 30;
 const DEFAULT_RESUME_READY_TIMEOUT_SECS: u32 = 5;
 const GRPC_TIMEOUT_METADATA_KEY: &str = "grpc-timeout";
@@ -251,6 +261,13 @@ const ALLOW_SANDBOX_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Operator),
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+];
+/// A discard delete erases what may be a sandbox's only copy, so only root
+/// and the local operator role may send one: no service principal is
+/// admitted. Nothing in the tree sends it but the CLI.
+const ALLOW_RETAINED_FILESYSTEM_DISCARD: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Operator),
 ];
 const ALLOW_SANDBOX_AUTO_LIFECYCLE_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
@@ -379,6 +396,11 @@ pub struct SandboxManagerService {
     /// Shared attempt capacity for foreground cleanup and durable retries.
     /// Excess work remains in SQLite until a slot is available.
     cleanup_sem: Arc<tokio::sync::Semaphore>,
+    /// Guest maintenance leaves excess intent durable instead of queueing
+    /// unbounded transfer/activation tasks alongside customer work.
+    guest_update_sem: Arc<tokio::sync::Semaphore>,
+    guest_auto_updates: Arc<guest_update::automatic::Automatic>,
+    automatic_guest_updates: bool,
     /// Shared blocking cleanup I/O budget, acquired before task allocation.
     cleanup_io: Arc<tokio::sync::Semaphore>,
     cleanup_target_streams: Arc<tokio::sync::Semaphore>,
@@ -440,14 +462,14 @@ pub struct SandboxManagerService {
     /// Durable worker that drives the poll → metadata → register tail of the
     /// suspend-snapshot pipeline. Persists in sbx-mgr's local SQLite so a
     /// mid-flight process restart resumes the upload instead of orphaning it.
-    snapshot_upload_worker: pplx_space_common_jobs::BackgroundWorker<
-        crate::snapshot_upload_jobs::SnapshotUploadExecutor,
-    >,
+    snapshot_upload_worker:
+        crate::db::jobs::JobWorker<crate::snapshot_upload_jobs::SnapshotUploadExecutor>,
     /// Probe for "does this sandbox have a live Firecracker runtime on this
     /// node right now". Injected so tests can drive the suspend-checkpoint
     /// reattach path without a real `fc.pid` symlink on disk. Production uses
     /// [`is_sandbox_running`].
     sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    capture_runtime_probe: Option<RuntimeLivenessProbe>,
     /// Probe for "is this sandbox's rootfs on this node's disk". The stopped
     /// materialization boundary checks it before vouching for a row, so a row
     /// whose bytes are gone is refused rather than reported as placed; an
@@ -533,6 +555,22 @@ fn execution_only_provenance(identity: &SpaceApiRouteIdentity) -> bool {
         && identity.activation_attempt_id.is_none()
 }
 
+/// The identity an ordinary stop retains as teardown proof
+/// (`apply_cleanup_state` in the store): the producing execution generation
+/// and, for a Kubernetes execution, its pod UID, which the row reads back as
+/// a Kubernetes substrate. Every routing dimension is cleared, so it names no
+/// attachable epoch. A suspend's retained provenance has the same shape, so a
+/// cold start from a suspended Kubernetes sandbox, such as an upgrade that
+/// discards its memory, matches too.
+fn stop_teardown_provenance(identity: &SpaceApiRouteIdentity) -> bool {
+    identity.execution_generation.is_some()
+        && identity.route_generation.is_none()
+        && identity.current_node_id.is_none()
+        && identity.activation_attempt_id.is_none()
+        && identity.substrate_kind
+            == SpaceApiRouteIdentity::effective_substrate_kind_for(None, identity.pod_uid.as_ref())
+}
+
 fn validate_cold_start_provenance(
     sandbox: &crate::db::SandboxRow,
     incoming: &RouteStreamEpochIdentity,
@@ -541,7 +579,7 @@ fn validate_cold_start_provenance(
     if sandbox
         .state
         .is_unowned(crate::state::SandboxState::Starting)
-        && execution_only_provenance(retained)
+        && stop_teardown_provenance(retained)
         && incoming.execution_generation() <= retained.execution_generation
     {
         return Err(Status::aborted(
@@ -559,9 +597,9 @@ fn persisted_route_stream_epoch(
     let identity = &sandbox.space_api_route_identity;
     let has_suspend_artifact = sandbox.current_local_artifact_id.is_some()
         && sandbox.current_local_artifact_kind
-            == Some(pplx_space_common_core::types::ArtifactKind::Full)
+            == Some(pplx_space_snapshot_model::ArtifactKind::Full)
         && sandbox.current_local_artifact_origin
-            == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+            == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
     // A completed full suspend keeps the producing execution generation and
     // pod UID as artifact provenance after its live routing fields are cleared.
     // That exact partial shape is not an attachable route epoch; a subsequent
@@ -572,8 +610,7 @@ fn persisted_route_stream_epoch(
     ) && has_suspend_artifact
         && identity.route_generation.is_none()
         && identity.current_node_id.is_none()
-        && identity.substrate_kind
-            == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+        && identity.substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
         && identity.execution_generation.is_some()
         && identity.pod_uid.is_some()
         && identity.activation_attempt_id.is_none();
@@ -591,13 +628,14 @@ fn persisted_route_stream_epoch(
             .is_unowned(crate::state::SandboxState::Restoring)
         && identity.route_generation.is_none()
         && identity.execution_generation.is_some()
-        && identity.substrate_kind
-            == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+        && identity.substrate_kind == Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
     if is_owned_legacy_restore_provenance {
         return Ok(None);
     }
     // Orphan recovery publishes a suspend artifact with only its producing
     // execution generation; it cannot recover the old pod or live route.
+    // Unlike a stop's provenance, this shape never carries a pod UID, so it
+    // stays the narrower execution-only check.
     // A complete replacement may supersede that exact provenance shape only
     // when it owns the persisted restore. The runtime write still checks the
     // producing execution generation, so this does not admit an older restore.
@@ -611,16 +649,19 @@ fn persisted_route_stream_epoch(
     if is_owned_recovered_execution_provenance {
         return Ok(None);
     }
-    // Stop clears the live route while retaining the producing execution as
-    // cleanup provenance. An owned cold activation may replace that exact
-    // partial identity after validate_cold_start_provenance requires a newer
-    // execution, independently of the process-local route cache.
+    // Stop clears the live route while retaining the producing execution,
+    // and a Kubernetes execution's pod UID, as cleanup provenance. An owned
+    // cold activation may replace that exact partial identity after
+    // validate_cold_start_provenance requires a newer execution,
+    // independently of the process-local route cache: every cold start of a
+    // stopped Kubernetes sandbox, a plain start as much as a runtime
+    // upgrade's boot, finds the pod UID there.
     let is_owned_cold_start_provenance = activation_replacement_authority
         == ActivationRouteReplacementAuthority::PersistedOwner
         && sandbox
             .state
             .is_unowned(crate::state::SandboxState::Starting)
-        && execution_only_provenance(identity);
+        && stop_teardown_provenance(identity);
     if is_owned_cold_start_provenance {
         return Ok(None);
     }
@@ -1026,11 +1067,17 @@ fn install_authoritative_route_epoch(
     }
 }
 
+pub type RuntimeLivenessProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct SandboxManagerServiceOptions {
+    pub automatic_guest_updates: bool,
     pub host_control_socket_path: PathBuf,
     pub credential_manager_socket_path: PathBuf,
     pub sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Preserve unknown filesystem evidence for encrypted capture recovery.
+    /// None delegates to the injected boolean probe used by legacy callers.
+    pub capture_runtime_probe: Option<RuntimeLivenessProbe>,
     pub sandbox_rootfs_present: RootfsPresenceProbe,
     pub shutdown_token: CancellationToken,
     pub task_tracker: TaskTracker,
@@ -1070,13 +1117,17 @@ pub struct SandboxManagerServiceOptions {
 impl Default for SandboxManagerServiceOptions {
     fn default() -> Self {
         Self {
+            automatic_guest_updates: true,
             host_control_socket_path: PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
+                pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET,
             ),
             credential_manager_socket_path: PathBuf::from(
                 pplx_space_credmgr_client::CREDMGR_SOCKET,
             ),
             sandbox_runtime_live: Arc::new(is_sandbox_running),
+            capture_runtime_probe: Some(Arc::new(|id| {
+                cache_cleanup::runtime_alive_in(Path::new(RUN_DIR), id)
+            })),
             sandbox_rootfs_present: Arc::new(|id: &str| {
                 create_support::sandbox_rootfs_exists_in(std::path::Path::new(CACHE_DIR), id)
             }),
@@ -1811,6 +1862,9 @@ impl SandboxManagerService {
                     .as_deref(),
             ),
             cleanup_sem: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CLEANUP_CONCURRENCY_CAP)),
+            guest_update_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            guest_auto_updates: Arc::default(),
+            automatic_guest_updates: options.automatic_guest_updates,
             cleanup_io: Arc::new(tokio::sync::Semaphore::new(CLEANUP_IO_CONCURRENCY_CAP)),
             cleanup_target_streams: Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_io: Arc::new(tokio::sync::Semaphore::new(
@@ -1845,7 +1899,7 @@ impl SandboxManagerService {
             host_control_socket_path: options.host_control_socket_path,
             credential_manager_endpoint,
             credential_manager_client,
-            network_credentials_enabled: pplx_space_common_core::env::env_flag(
+            network_credentials_enabled: pplx_space_env_vars::env_flag(
                 std::env::var(NETWORK_CREDENTIALS_ENABLED_ENV)
                     .ok()
                     .as_deref(),
@@ -1865,6 +1919,7 @@ impl SandboxManagerService {
             },
             snapshot_upload_worker,
             sandbox_runtime_live: options.sandbox_runtime_live,
+            capture_runtime_probe: options.capture_runtime_probe,
             sandbox_rootfs_present: options.sandbox_rootfs_present,
             retained_source_inspector: Arc::new(
                 crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),
@@ -1909,11 +1964,10 @@ impl SandboxManagerService {
     }
 
     /// Handle to the durable snapshot-upload worker, for the service binary
-    /// to call `recover_and_log` at startup and `shutdown` at exit.
+    /// to call `recover_and_log` at startup and `yield_for_restart` at exit.
     pub fn snapshot_upload_worker(
         &self,
-    ) -> pplx_space_common_jobs::BackgroundWorker<crate::snapshot_upload_jobs::SnapshotUploadExecutor>
-    {
+    ) -> crate::db::jobs::JobWorker<crate::snapshot_upload_jobs::SnapshotUploadExecutor> {
         self.snapshot_upload_worker.clone()
     }
 
@@ -2072,6 +2126,7 @@ async fn prune_local_artifact_metadata_once(
 mod activation;
 mod activation_support;
 pub(crate) use activation_support::NodeIdentitySource;
+pub(crate) use activation_support::notify_resume_clock_sync_best_effort;
 mod adapter;
 mod auth_lookup;
 #[cfg(test)]
@@ -2089,7 +2144,7 @@ pub(crate) use guest_image::profile_for_sandbox;
 pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
-pub(crate) use eviction::EvictionClaim;
+pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;
@@ -2112,6 +2167,7 @@ mod ingress_protection;
 mod reconcile;
 mod recovery;
 mod recovery_cross_node;
+mod retained_filesystem_discard;
 #[cfg(test)]
 mod route_identity_tests;
 mod spaced_bridge;

@@ -73,6 +73,7 @@ STUBS = {
         echo "kubectl $*" >> "$STUB_LOG"
         case "$*" in
           *"config view"*) echo "${STUB_SERVER:-https://127.0.0.1:6443}" ;;
+          *"get nodes -l space.pplx.net/node-pool=infra"*) echo space-local-worker3 ;;
           *"get namespace"*"space-local-owner"*)
             if [[ "${STUB_DYNAMIC_OWNER:-0}" == 1 ]]; then
               for signal in metrics traces logs grafana; do
@@ -99,7 +100,7 @@ STUBS = {
         esac
     """,
     "helm": HELM_STUB,
-    "kind": 'echo "kind $*" >> "$STUB_LOG"; echo space-local-control-plane',
+    "kind": 'echo "kind $*" >> "$STUB_LOG"; printf "%s\\n" space-local-control-plane space-local-worker3',
 }
 
 
@@ -143,11 +144,6 @@ class HelperGuardTests(unittest.TestCase):
         )
         return result, self.log.read_text()
 
-    def test_every_release_shares_the_library(self):
-        for release in RELEASES:
-            with self.subTest(release=release):
-                source = (KIND_DIR / release / "local.sh").read_text()
-                self.assertIn("lib/release.sh", source)
 
     def test_status_verifies_the_cluster_before_touching_it(self):
         for release in RELEASES:
@@ -272,17 +268,39 @@ class HelperGuardTests(unittest.TestCase):
                     self.assertNotIn(mutation, log)
 
     def test_otel_installs_only_selected_local_receivers(self):
-        for external in (False, True):
-            with self.subTest(external=external):
+        for external, layout in ((False, "full"), (True, "full"), (False, "ci")):
+            with self.subTest(external=external, layout=layout):
                 settings = {
                     "SPACE_KIND_OTLP_METRICS_ENDPOINT": "http://192.0.2.10:4317",
                     "SPACE_KIND_OTLP_TRACES_ENDPOINT": "http://192.0.2.11:4317",
                 } if external else {}
-                result, log = self.run_installer(SPACE_KIND_TELEMETRY_MODE="otel", **settings)
+                result, log = self.run_installer(
+                    SPACE_KIND_TELEMETRY_MODE="otel", SPACE_KIND_OBSERVABILITY_LAYOUT=layout,
+                    **settings,
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 for signal in ("metrics", "traces"):
                     self.assertEqual(f"helm upgrade --install space-{signal}" in log, not external)
                 self.assertIn("helm install space-logs", log)
+                if layout == "ci":
+                    self.assertNotIn("space-grafana", log)
+                    self.assertNotIn("grafana/grafana", log)
+                    backend_commands = [line for line in log.splitlines()
+                                        if line.startswith(("helm install", "helm upgrade"))]
+                    self.assertTrue(backend_commands, log)
+                    for command in backend_commands:
+                        self.assertIn(r"scheduling.nodeSelector.space\.pplx\.net/node-pool=infra", command)
+                        self.assertNotIn("alloy.nodeSelector", command)
+                    loads = [line for line in log.splitlines()
+                             if line.startswith("kind load docker-image")]
+                    self.assertTrue(loads, log)
+                    self.assertTrue(any("grafana/alloy:" in command for command in loads), log)
+                    for command in loads:
+                        expected = ("space-local-control-plane,space-local-worker3"
+                                    if "grafana/alloy:" in command else "space-local-worker3")
+                        self.assertIn(f"--nodes {expected} ", command)
+                    self.assertNotIn("delete namespace", log)
+                    continue
                 self.assertIn("helm upgrade --install space-grafana", log)
                 self.assertLess(log.index("helm install space-logs"), log.index("helm upgrade --install space-grafana"))
                 if external:

@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use std::sync::{Arc, Mutex};

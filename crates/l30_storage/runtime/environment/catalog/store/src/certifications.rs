@@ -24,8 +24,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{EnvironmentReference, NodeId, VersionSortKey};
+use pplx_space_accounts::NodeId;
+use pplx_space_execution_spec::{EnvironmentReference, VersionSortKey};
+use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 
 /// Separates this lock from every other advisory lock on the database.

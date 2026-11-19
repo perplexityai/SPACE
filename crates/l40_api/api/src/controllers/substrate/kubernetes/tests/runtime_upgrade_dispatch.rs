@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sql_locator::sql;
 
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::RuntimeUpgradeAtActivation;
@@ -136,7 +136,7 @@ async fn restore(
                 blocking: true,
                 ready_timeout: Duration::from_secs(2),
             },
-            RecoveryCharge::Exempt,
+            RecoveryCharge::exempt_for_tests(),
         )
         .await
 }
@@ -338,7 +338,7 @@ async fn a_stopped_start_off_a_blocked_environment_wakes_by_the_upgrade(
                 blocking: true,
                 ready_timeout: Duration::from_secs(2),
             },
-            RecoveryCharge::Exempt,
+            RecoveryCharge::exempt_for_tests(),
         )
         .await;
 

@@ -23,10 +23,10 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::host::btrfs::{
+use pplx_space_btrfs::{
     FilesystemUsage, balance_running, read_filesystem_usage, start_data_balance,
 };
-use pplx_space_common_core::host::linux::paths::SPACE_CACHE_DIR;
+use pplx_space_host_layout::paths::SPACE_CACHE_DIR;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;

@@ -58,6 +58,7 @@ async fn takeover_wait_keeps_liveness_and_withholds_readiness() {
         let shutdown = CancellationToken::new();
         let _guard = shutdown.clone().drop_guard();
         let config = SbxMgrRunConfig {
+            automatic_guest_updates: false,
             socket_path: root.path().join("production.sock"),
             host_control_socket_path: root.path().join("control.sock"),
             health_socket_path: Some(health_socket.clone()),
@@ -206,7 +207,7 @@ async fn recovery_wait_does_not_hold_the_dependency_work_gate() {
 
 #[test]
 fn host_ownership_configuration_is_explicit_and_fails_closed() {
-    use pplx_space_common_core::types::NodeManagedBy;
+    use pplx_space_node_model::NodeManagedBy;
     assert_eq!(
         parse_node_managed_by(Err(std::env::VarError::NotPresent)).unwrap(),
         None
@@ -1389,20 +1390,26 @@ async fn a_database_holding_a_recorded_capture_reopens_at_startup() {
     let path = dir.path().join("sandbox-manager.db");
     crate::db::migrate_at(&path).await.unwrap();
     let conn = crate::db::Connection::open_at(&path).unwrap();
-    let sandbox_id = pplx_space_common_core::types::SandboxId::new();
-    let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
+    let sandbox_id = pplx_space_sandbox_model::SandboxId::new();
+    let generation = pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap();
     let staged = crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox(
         &conn, sandbox_id, generation,
     );
     let artifact_dir = dir.path().join("suspend");
     std::fs::create_dir_all(&artifact_dir).unwrap();
-    crate::capture_record::write(&artifact_dir, staged, generation).unwrap();
+    crate::capture_record::write(
+        &artifact_dir,
+        staged,
+        generation,
+        crate::capture_record::RecordWriter::CapturingTeardown,
+    )
+    .unwrap();
     conn.execute(
         "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
         crate::db::fixture::params![artifact_dir.to_str().unwrap(), staged.to_string()],
     )
     .unwrap();
-    let upload: pplx_space_common_core::types::JobId =
+    let upload: pplx_space_accounts::JobId =
         "019d84bd-280d-7331-99c6-000000000003".parse().unwrap();
     jobs::insert_job(
         conn.raw(),

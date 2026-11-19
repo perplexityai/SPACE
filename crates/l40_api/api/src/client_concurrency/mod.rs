@@ -1,6 +1,6 @@
 //! Per-client concurrency limiter for control-plane-touching API operations.
 //!
-//! Caps how many sandbox *create* and *reconnect* operations a single client
+//! Caps how many sandbox create, fork, reconnect and resume operations a single client
 //! (identified by the `X-Client-ID` header) may have in flight at once. One
 //! misbehaving client — a cron reconnect storm, a runaway create loop — must
 //! not saturate the Kubernetes control-plane API and starve every other client
@@ -88,17 +88,17 @@ use std::time::Duration;
 
 use crate::metrics::sandbox::api::ClientIdTag;
 use crate::metrics::sandbox::api::client_limit::{self, Decision, Operation, Reason};
-use pplx_space_common_core::types::LabelValue;
 use pplx_space_feature_flags::{
     FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
     SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
 };
+use pplx_space_k8s_ids::LabelValue;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod redis_limiter;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use redis_limiter::RedisConcurrencyStore;
 
@@ -463,6 +463,23 @@ fn is_reserved_client_id(id: &str) -> bool {
     RESERVED_CLIENT_IDS
         .iter()
         .any(|reserved| id.eq_ignore_ascii_case(reserved))
+}
+
+/// The client ids the quotas flag's `overrides` map lists, decoded exactly as
+/// the limiter decodes the flag, so the live cap and the limiter agree on
+/// which override keys are listed while the flag resolves: `None` when the
+/// flag doesn't decode as
+/// [`QuotaOverrides`] (the limiter then applies no override), and otherwise
+/// only the keys that may name a client.
+pub(crate) fn override_ids(value: &serde_json::Value) -> Option<BTreeSet<String>> {
+    let overrides = serde_json::from_value::<QuotaOverrides>(value.clone()).ok()?;
+    Some(
+        overrides
+            .overrides
+            .into_keys()
+            .filter(|id| check_client_id(id).is_ok())
+            .collect(),
+    )
 }
 
 /// Why a key-set entry can't name a client of its own.

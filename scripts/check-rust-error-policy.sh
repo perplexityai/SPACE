@@ -10,7 +10,7 @@ status=0
 
 # Library crates, and every crate root. The layer directories under crates/
 # fill as crates move into them, so a root that doesn't exist yet is skipped.
-library_roots=(crates/libs crates/l10_foundation crates/l20_domain crates/l30_storage crates/l40_api)
+library_roots=(crates/l10_foundation crates/l20_domain crates/l30_storage crates/l40_api)
 all_roots=("${library_roots[@]}" crates/apps crates/l50_app crates/test_support crates/tools)
 
 production_rust_files() {

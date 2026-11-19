@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pplx_space_common_core::host::disk::DiskStatus;
+use pplx_space_host_linux::disk::DiskStatus;
 use pplx_space_object_store::{
     ObjectCredentials, ObjectMeta, ObjectStore, ObjectStoreError, ObjectTarget,
 };

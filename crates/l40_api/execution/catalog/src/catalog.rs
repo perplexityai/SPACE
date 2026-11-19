@@ -20,9 +20,9 @@
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::{
-    Arch, ArtifactVersion, Digest, DigestPrefix, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-};
+use pplx_space_content_digest::{Digest, DigestPrefix};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{ArtifactVersion, RuntimeIdentity, RuntimeKind, RuntimeVersion};
 use sha2::{Digest as _, Sha256};
 
 use crate::layout::ReleaseLayout;
@@ -518,7 +518,7 @@ impl InitialEnvironment {
     }
 
     pub fn for_architecture(architecture: Arch) -> Result<Self, CatalogError> {
-        use pplx_space_common_core::types::{
+        use pplx_space_execution_spec::{
             INITIAL_FIRECRACKER_KERNEL_VERSION, INITIAL_FIRECRACKER_RUNTIME_VERSION,
         };
         let catalog = RuntimeCatalog::compiled()?;
@@ -890,7 +890,7 @@ impl RuntimeCatalog {
 
     pub fn boot_artifact(
         &self,
-        identity: &pplx_space_common_core::types::ComponentIdentity,
+        identity: &pplx_space_execution_spec::ComponentIdentity,
         architecture: Arch,
     ) -> Option<&PinnedBootArtifact> {
         self.boot_artifacts

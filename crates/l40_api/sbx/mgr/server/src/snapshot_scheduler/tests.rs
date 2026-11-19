@@ -1,7 +1,7 @@
 use super::retention::{
     KEEP_D_1M, KEEP_D_5M, KEEP_F_1H, KEEP_F_6H, KEEP_F_10M, retention_candidate,
 };
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::state::SandboxStatus;
@@ -509,7 +509,9 @@ fn retention_keeps_newest_per_tier_without_waiting_for_the_whole_census() {
 /// test rather than letting it compare `None` with `None`.
 #[test]
 fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata, HostCpu, TemplateName};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, HostCpu};
+    use pplx_space_template_model::TemplateName;
 
     #[cfg(target_os = "linux")]
     assert!(
@@ -523,9 +525,7 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
         TemplateName::parse("seed").unwrap(),
         None,
     )
-    .with_guest_memory(Some(
-        pplx_space_common_core::types::MemorySize::mib(2048).unwrap(),
-    ));
+    .with_guest_memory(Some(pplx_space_byte_size::MemorySize::mib(2048).unwrap()));
     let execution = checkpoint_sidecar_execution_metadata(metadata).unwrap();
 
     assert_eq!(execution.host_cpu(), HostCpu::current());
@@ -620,7 +620,7 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         for (name, setup) in names.iter().zip(candidates) {
             let id = LocalArtifactId::new();
             ids.push(id);
-            let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+            let local_path = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
                 &cache_root,
                 &sandbox_id,
                 name,
@@ -1652,3 +1652,5 @@ fn gc_staging_ids_are_canonical() {
         );
     }
 }
+
+mod incomplete_checkpoint;

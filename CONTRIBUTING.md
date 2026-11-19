@@ -121,13 +121,17 @@ can see only this repository:
 - Before you mark the pull request ready for review, check each claim, commit,
   and result in the description against the current head.
 
-Pull CI runs the Kind/Firecracker smoke only when a pull request changes a
-path in [ci/kind-pull-paths.txt](ci/kind-pull-paths.txt). On a draft it is
+Without the `kind-smoke` label, Pull CI runs the Kind/Firecracker smoke only
+when a pull request changes a path in
+[ci/kind-pull-paths.txt](ci/kind-pull-paths.txt) or
+[ci/kind-placement-paths.txt](ci/kind-placement-paths.txt). On a draft it is
 deferred, and the required `space-pull-ci` check fails until it runs. It runs
 when you mark the pull request ready for review, and on every push while it
 stays ready; converting it back to a draft defers it again. To run it on a
-draft, someone with triage access adds the `kind-smoke` label, and it runs
-from the next push.
+draft, or on a pull request whose paths do not select it, someone with triage
+access adds the `kind-smoke` label, and it runs from the next push. A run that
+starts with the label requires the smoke to pass, and a re-run keeps the
+labels its run started with: after removing the label, push again.
 
 Pull CI and the merge queue also skip any other check the change cannot
 affect: a console-only change runs no Rust or Python checks, and a

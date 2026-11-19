@@ -340,3 +340,111 @@ async fn suspend_auto_pause_writes_only_over_the_state_it_expects(
         check_suspend(exit, state).await;
     }
 }
+
+#[tokio::test]
+async fn cancelled_suspend_keeps_preparation_owned_but_never_detaches_lock_waiters() {
+    for blocking in [false, true] {
+        let scratch = tempfile::tempdir().unwrap();
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        crate::service::tests::service_tests::insert_test_sandbox(
+            &conn,
+            &id,
+            SandboxState::Started,
+        );
+        conn.execute(
+            "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+        let node = FakeNodeManager::default().serve();
+        let gate = Arc::new(GatedConnect {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            client: node.connector().lazy(),
+        });
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: NodeManagerConnector::new(gate.clone()),
+                ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+            },
+        );
+        let preparation_calls = Arc::new(AtomicUsize::new(0));
+        let prepare: GuestPreparation = {
+            let preparation_calls = Arc::clone(&preparation_calls);
+            Arc::new(move |_| {
+                preparation_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(GuestFlushError::Guest(Status::unavailable(
+                        "synthetic preparation refusal",
+                    )))
+                })
+            })
+        };
+        let call = || {
+            let (service, id, prepare) = (service.clone(), id.clone(), prepare.clone());
+            tokio::spawn(GUEST_PREPARATION.scope(prepare, async move {
+                service
+                    .suspend(internal_request(SuspendRequest {
+                        sandbox_id: id,
+                        blocking,
+                        format: 0,
+                    }))
+                    .await
+            }))
+        };
+        let initial_tasks = service.task_tracker.len();
+        let waiting = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
+        let request = call();
+        tokio::task::yield_now().await;
+        request.abort();
+        let _ = request.await;
+        drop(waiting);
+        assert_eq!(
+            service.task_tracker.len(),
+            initial_tasks,
+            "cancelled lock wait must not spawn work"
+        );
+        assert_eq!(preparation_calls.load(Ordering::SeqCst), 0);
+
+        let request = call();
+        tokio::time::timeout(WAIT, gate.entered.notified())
+            .await
+            .unwrap();
+        request.abort();
+        let _ = request.await;
+        service
+            .auto_lifecycle
+            .wake_lock(&id)
+            .try_lock_owned()
+            .unwrap_err();
+        service
+            .auto_lifecycle
+            .artifact_lock(&id)
+            .try_lock_owned()
+            .unwrap_err();
+        gate.release.add_permits(1);
+        // Preparation still completes its rollback after the response is gone.
+        let _settled =
+            tokio::time::timeout(WAIT, service.auto_lifecycle.wake_lock(&id).lock_owned())
+                .await
+                .unwrap();
+        assert_eq!(
+            preparation_calls.load(Ordering::SeqCst),
+            1,
+            "owned work must reach guest preparation before settling its rollback"
+        );
+        assert!(
+            service
+                .lookup_sandbox(&id)
+                .unwrap()
+                .state
+                .is_unowned(SandboxState::Started)
+        );
+        assert!(
+            node.calls().is_empty(),
+            "preparation refusal must precede capture"
+        );
+    }
+}

@@ -8,9 +8,25 @@ pub(crate) async fn attach_session(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
+    upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
     uri: axum::http::Uri,
 ) -> Result<Response, AttachError> {
+    // Taken as a `Result` so a request that is not a WebSocket upgrade is
+    // refused in the data-plane envelope, with axum's status (400, 405 or
+    // 426), rather than in axum's plain text.
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => {
+            return Ok(data_plane_http_error(
+                rejection.status(),
+                DataPlaneHttpErrorCode::InvalidRequest,
+                "attach must be a WebSocket upgrade request",
+                false,
+                ResponseOrigin::Client,
+                ResponseKind::Validation,
+            ));
+        }
+    };
     reject_query_tokens(uri.query())?;
     let session_id = session_id
         .parse::<DataPlaneSessionId>()
@@ -545,6 +561,9 @@ pub(crate) async fn bridge_process_session(
     let mut process_bound = attached.backend_process_id.is_some();
     let mut binding: Option<PendingProcessBinding> = None;
     let mut revocation_tick = revocation_check_interval(&state);
+    // A backend reopened at the live tail can skip output the process wrote
+    // meanwhile, which `process_exited` then reports as `output_truncated`.
+    let mut output_skipped = false;
 
     // Raced as a whole, as in `bridge_raw_service_session`, so a stalled
     // revocation check, route refresh, backend reopen or control RPC doesn't
@@ -607,7 +626,13 @@ pub(crate) async fn bridge_process_session(
                                 settle_process_binding(&mut binding).await?;
                             }
                             record_process_output_bytes(attached.kind.as_str(), &batch);
-                            for frame in batch.frames {
+                            for mut frame in batch.frames {
+                                if let DataPlaneServerFrame::ProcessExited {
+                                    output_truncated, ..
+                                } = &mut frame
+                                {
+                                    *output_truncated = output_skipped;
+                                }
                                 if send_server_frame(&mut sink, &frame).await.is_err() {
                                     return Ok(BridgeEnd::Completed);
                                 }
@@ -678,6 +703,7 @@ pub(crate) async fn bridge_process_session(
                                 )
                                 .await
                                 .map_err(|_| StreamBridgeError::ClientClosed)?;
+                                output_skipped = true;
                                 send_server_frame(
                                     &mut sink,
                                     &resync_required_frame(
@@ -766,6 +792,7 @@ pub(crate) async fn bridge_process_session(
                                     )
                                     .await
                                     .map_err(|_| StreamBridgeError::ClientClosed)?;
+                                    output_skipped = true;
                                     send_server_frame(
                                         &mut sink,
                                         &resync_required_frame(

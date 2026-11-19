@@ -6,17 +6,18 @@
 //! generic one, and that an empty `node_groups` table is distinguishable from
 //! an absent `templates` row. A fake store would assert neither.
 
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::BTreeSet;
 
 use k8s_openapi::api::core::v1::Node;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use pplx_space_common_core::kubernetes::SANDBOX_NODE_GROUP_LABEL;
-use pplx_space_common_core::types::{
+use pplx_space_node_model::{
     NodeGroupId, NodeGroupName, NodeGroupPolicy, NodeGroupTemplatePolicy, TemplateCompatSpec,
-    TemplateName,
 };
+use pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_LABEL;
+use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
 use uuid::Uuid;
 

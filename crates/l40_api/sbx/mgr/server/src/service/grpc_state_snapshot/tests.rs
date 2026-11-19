@@ -1,7 +1,8 @@
 use super::*;
 use crate::service::activation_support::internal_request;
-use pplx_space_common_core::types::{
-    ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxId, SandboxRuntimeLabel,
+use pplx_space_node_model::NodeManagedBy;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxId, SandboxRuntimeLabel,
 };
 use tokio::sync::oneshot;
 
@@ -106,10 +107,7 @@ async fn full_snapshot_capture_serializes_resume_on_wake_lock() {
     let coordinator = AutoLifecycleCoordinator::default();
     let sandbox_id = "sandbox-full-snapshot-race";
     let (_wake_guard, _artifact_guard) = coordinator
-        .artifact_publication_locks(
-            sandbox_id,
-            pplx_space_common_core::types::ArtifactKind::Full,
-        )
+        .artifact_publication_locks(sandbox_id, pplx_space_snapshot_model::ArtifactKind::Full)
         .await;
 
     let (resumed_tx, mut resumed_rx) = oneshot::channel();
@@ -137,9 +135,11 @@ async fn full_snapshot_capture_serializes_resume_on_wake_lock() {
 #[tokio::test]
 async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointing() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::{
-        Arch, Digest, EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
-        SandboxOwnerKind,
+    use pplx_space_accounts::SandboxOwnerKind;
+    use pplx_space_content_digest::Digest;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{
+        EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
     };
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
@@ -194,9 +194,9 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
 #[tokio::test]
 async fn template_snapshot_refuses_its_partition_before_checkpointing() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    use pplx_space_common_core::types::{
-        Arch, ExecutionMetadata, RuntimeIdentity, RuntimeKind, SandboxOwnerKind,
-    };
+    use pplx_space_accounts::SandboxOwnerKind;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{ExecutionMetadata, RuntimeIdentity, RuntimeKind};
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);

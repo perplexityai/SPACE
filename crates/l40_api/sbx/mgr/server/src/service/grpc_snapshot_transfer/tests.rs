@@ -1,7 +1,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId};
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
 
 use crate::db::transfer::{
     ReserveImportError, SnapshotPublication, TransferBinding, publish_snapshot,
@@ -342,7 +342,7 @@ fn snapshot_retry_handles_either_retained_half_without_replacing_published_files
                 &db,
                 &id,
                 LocalArtifactId::new(),
-                pplx_space_common_core::types::ArtifactKind::Disk,
+                pplx_space_snapshot_model::ArtifactKind::Disk,
                 &"d-imported".parse().unwrap(),
                 destination.to_str().unwrap(),
             )

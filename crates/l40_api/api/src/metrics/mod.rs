@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod auth;
 pub mod egress_profile;
+pub mod environment_placement;
 pub mod internal_api;
 pub mod node_drain;
 pub mod node_group_placement;

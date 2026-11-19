@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
 use std::time::Duration;
 
@@ -7,11 +7,12 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use pplx_space_common_core::types::{IdempotencyKey, SandboxId};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::PublicErrorCode;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::{AppState, E2bApiError, MatchedEcwHost, acquire_client_slot, request_client_id};
 use crate::controllers::sandbox::lifecycle::user_admission::{
@@ -234,6 +235,9 @@ pub(super) async fn fork_sandbox(
                                 federated_owner,
                                 federated_service_grant: federated_service_grant.as_ref(),
                                 idempotency_key: &idempotency_key,
+                                client_id: &pplx_space_accounts::ClientId::from_header(
+                                    client_id.as_deref(),
+                                ),
                             },
                         )
                         .await
@@ -583,12 +587,12 @@ fn resolve_replay_probes(probes: Vec<(OrgId, ObservePublicOperationIdempotency)>
 
 fn fork_owner_for_source(
     federated_owner: Option<&crate::federated_identity::FederatedOwner>,
-    source_owner_source: pplx_space_common_core::types::SandboxOwnerSource,
+    source_owner_source: pplx_space_accounts::SandboxOwnerSource,
 ) -> Option<&crate::federated_identity::FederatedOwner> {
     federated_owner.filter(|_| {
         matches!(
             source_owner_source,
-            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity
+            pplx_space_accounts::SandboxOwnerSource::FederatedIdentity
         )
     })
 }
@@ -615,7 +619,7 @@ async fn resolve_fork_replay_org_id(
         return Ok(Some(api_key_org_id));
     };
 
-    sqlx::query_scalar(pplx_space_common_core::sql!(
+    sqlx::query_scalar(pplx_space_sql_locator::sql!(
         "SELECT id
          FROM organizations
          WHERE owner_source = 'federated_identity'

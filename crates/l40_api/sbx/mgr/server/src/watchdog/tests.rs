@@ -1,8 +1,11 @@
 use super::*;
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ExecutionGeneration, NodeId, PodUid, RouteGeneration, SandboxId,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxRuntimeLabel, SpaceApiRouteIdentity,
+use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxId, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel,
+    SpaceApiRouteIdentity,
 };
 
 #[tokio::test]
@@ -31,8 +34,7 @@ fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: crate::sta
         .unwrap_or_else(|_| {
             SandboxRuntimeLabel::parse(id).expect("test sandbox id must parse as runtime label")
         });
-    let user =
-        pplx_space_common_core::types::SandboxOwner::parse("user").expect("test owner must parse");
+    let user = pplx_space_accounts::SandboxOwner::parse("user").expect("test owner must parse");
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
@@ -98,7 +100,7 @@ fn test_route_identity() -> SpaceApiRouteIdentity {
     SpaceApiRouteIdentity {
         route_generation: Some(RouteGeneration::new(42).expect("route generation parses")),
         current_node_id: Some(NodeId::new()),
-        substrate_kind: Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes),
+        substrate_kind: Some(pplx_space_node_model::NodeManagedBy::Kubernetes),
         execution_generation: Some(ExecutionGeneration::new(7).expect("generation parses")),
         pod_uid: Some(PodUid::parse("pod-uid-42").expect("pod uid parses")),
         ..Default::default()
@@ -144,6 +146,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn restart_test_info(sandbox_id: &str) -> SidecarInfo {
     SidecarInfo {
+        template: "seed".to_string(),
         guest_image: Default::default(),
         node_execution_id: None,
         sandbox_id: sandbox_id.to_string(),
@@ -290,6 +293,7 @@ async fn clear_netgtw_probe_state_drops_cached_process_observations() {
     );
     watchdog
         .add_sandbox(SidecarInfo {
+            template: "seed".to_string(),
             guest_image: Default::default(),
             node_execution_id: None,
             sandbox_id: "0199c1e0-0000-7000-8000-000000000001".to_string(),
@@ -1305,7 +1309,7 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
     let conn = crate::db::test_conn();
     let db = crate::db::SharedConnection::new(conn);
     let observations = std::array::from_fn(|_| sample(HealthProbeOutcome::Success));
-    apply_composed_health_result(
+    let accepted = apply_composed_health_result(
         &state,
         &db,
         Some(Ok((
@@ -1313,12 +1317,18 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
             Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
+                template: "seed".to_string(),
                 observations,
                 guest_status: None,
+                memory_used_bytes: None,
             },
         ))),
     )
     .await;
+    assert!(
+        accepted.is_none(),
+        "a probe from an older lifecycle epoch is discarded"
+    );
 
     let map = state.lock().await;
     let health = map.get(&sandbox_id).expect("sandbox health exists");
@@ -1353,6 +1363,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
             Some(crate::state::SandboxState::Started),
             0,
             ComposedProbeResult {
+                template: "seed".to_string(),
                 observations: std::array::from_fn(|_| sample(HealthProbeOutcome::Success)),
                 guest_status: Some(pplx_space_spaced_host_client::proto::GetStatusResponse {
                     ready: false,
@@ -1360,6 +1371,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
                     host_version: None,
                     guest_version: None,
                 }),
+                memory_used_bytes: None,
             },
         ))),
     )
@@ -1417,7 +1429,7 @@ fn inapplicable_guest_components_do_not_block_composed_health() {
 
 #[test]
 fn spaced_host_restart_args_preserve_control_socket_and_only_notify_qualified_guests() {
-    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use pplx_space_execution_spec::guest_image::QualifiedGuestAgent;
     let sandbox_id = "sbx-123";
     let vsock_uds_path = format!("{RUN_DIR}/{sandbox_id}/root/v.sock");
 
@@ -1432,13 +1444,13 @@ fn spaced_host_restart_args_preserve_control_socket_and_only_notify_qualified_gu
             args,
             vec![
                 "--socket".to_string(),
-                pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+                pplx_space_host_layout::paths::spaced_host_socket(sandbox_id),
                 "--sandbox-id".to_string(),
                 sandbox_id.to_string(),
                 "--vsock-uds".to_string(),
                 format!("{RUN_DIR}/{sandbox_id}/root/v.sock"),
                 "--host-control-socket".to_string(),
-                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+                pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
                 "--boot-type".to_string(),
                 boot_type.to_string(),
             ]
@@ -1475,6 +1487,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                 Some(crate::state::SandboxState::Failed),
                 0,
                 ComposedProbeResult {
+                    template: "seed".to_string(),
                     observations: [
                         firecracker,
                         sample(HealthProbeOutcome::Success),
@@ -1487,6 +1500,7 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
                         host_version: None,
                         guest_version: None,
                     }),
+                    memory_used_bytes: None,
                 },
             ))),
         )
@@ -1537,7 +1551,10 @@ impl DeadGatewayFixture {
             .unary(
                 "Launch",
                 move |_: pplx_space_node_mgr_client::proto::LaunchRequest| {
-                    launch().map(|pid| pplx_space_node_mgr_client::proto::LaunchResponse { pid })
+                    launch().map(|pid| pplx_space_node_mgr_client::proto::LaunchResponse {
+                        pid,
+                        inherited_gateway_sockets: 0,
+                    })
                 },
             )
             .serve();
@@ -1643,6 +1660,7 @@ impl DeadGatewayFixture {
                 Some(crate::state::SandboxState::Started),
                 0,
                 ComposedProbeResult {
+                    template: "seed".to_string(),
                     observations: [
                         firecracker,
                         sample(HealthProbeOutcome::Success),
@@ -1650,6 +1668,7 @@ impl DeadGatewayFixture {
                         net_gateway,
                     ],
                     guest_status: None,
+                    memory_used_bytes: None,
                 },
             ))),
         )
@@ -2015,4 +2034,58 @@ fn firecracker_probe_outcome_extends_next_probe_only_while_timeouts_repeat() {
 
     record_firecracker_probe_outcome(&mut health, "sbx", HealthProbeOutcome::Success);
     assert_eq!(health.firecracker_timeout_streak, 0);
+}
+
+#[tokio::test]
+async fn gateway_replacement_names_the_old_gateway_and_commits_only_a_new_one() {
+    // A node that hands sockets over answers with the new gateway; one that
+    // predates the handover answers with the live one, which must stay
+    // committed so the cycle can fall back to stopping it.
+    for (answered_pid, inherited_sockets, replaced) in [(40_003, 2, true), (30_003, 0, false)] {
+        let sandbox_id = "0199c1e0-0000-7000-8000-000000000006";
+        let (mut watchdog, _tracker) = watchdog_with_committed_gateway(sandbox_id).await;
+        let requested = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::clone(&requested);
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary(
+                "Launch",
+                move |request: pplx_space_node_mgr_client::proto::LaunchRequest| {
+                    *seen.lock().unwrap() = request.replace_gateway_pid;
+                    Ok(pplx_space_node_mgr_client::proto::LaunchResponse {
+                        pid: answered_pid,
+                        inherited_gateway_sockets: inherited_sockets,
+                    })
+                },
+            )
+            .serve();
+        watchdog.node_manager = node_manager.connector();
+
+        let relaunch = watchdog
+            .replace_netgtw(sandbox_id, 20_001, 30_003)
+            .await
+            .expect("replace net-gateway");
+
+        assert_eq!(*requested.lock().unwrap(), Some(30_003));
+        assert_eq!(
+            relaunch,
+            NetGatewayRelaunch {
+                pid: answered_pid,
+                inherited_sockets,
+            }
+        );
+        let row = crate::db::get_sandbox(&watchdog.db.lock().unwrap(), sandbox_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.netgtw_pid, Some(answered_pid));
+        let sha = watchdog
+            .get_health(sandbox_id)
+            .await
+            .unwrap()
+            .netgtw_git_sha;
+        assert_eq!(
+            sha.is_none(),
+            replaced,
+            "probe state clears only on a new gateway"
+        );
+    }
 }

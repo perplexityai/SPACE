@@ -8,22 +8,49 @@ struct Environments {
     target_reference: EnvironmentReference,
 }
 
+/// Two Firecracker bindings shaped like a catalog upgrade edge: the target
+/// has a newer runtime, state format and kernel, and its own environment
+/// reference, which is what bind_runtime_upgrade_consumer checks against the
+/// upgrade's target.
 fn environments() -> Environments {
-    let compiled = pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
-    )
-    .unwrap();
-    let source = compiled[0].definition().execution_requirements().unwrap();
-    let target_definition = compiled
-        .iter()
-        .map(|environment| environment.definition())
-        .find(|definition| definition.reference() != compiled[0].definition().reference())
-        .unwrap();
-    let target = target_definition.execution_requirements().unwrap();
-    assert_eq!(target.environment(), Some(target_definition.reference()));
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{
+        ArtifactComponentKind, ArtifactComponentMetadata, GuestOperatingSystem, GuestPlatform,
+        RuntimeIdentity, RuntimeKind, StateFormatIdentity,
+    };
+    use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
+    let bound = |hex: &str, runtime: &str, state_format: &str, kernel: &str, kernel_hex: &str| {
+        let reference: EnvironmentReference = format!("sha256:{}", hex.repeat(64)).parse().unwrap();
+        let execution = ExecutionMetadata::new(
+            RuntimeIdentity {
+                kind: RuntimeKind::Firecracker,
+                version: runtime.parse().unwrap(),
+            },
+            GuestPlatform {
+                os: GuestOperatingSystem::Linux,
+                architecture: Arch::X86_64,
+            },
+            Some(StateFormatIdentity {
+                format: "firecracker-snapshot".parse().unwrap(),
+                version: state_format.parse().unwrap(),
+            }),
+            vec![ArtifactComponentMetadata {
+                kind: ArtifactComponentKind::Kernel,
+                role: Some("boot".parse().unwrap()),
+                version: Some(ArtifactVersion::parse(kernel).unwrap()),
+                digest: Some(format!("sha256:{}", kernel_hex.repeat(64)).parse().unwrap()),
+                format: Some(ArtifactFormat::parse("vmlinux").unwrap()),
+            }],
+        )
+        .unwrap()
+        .with_environment(reference);
+        (execution, reference)
+    };
+    let (source, _) = bound("a", "1.15.1", "9.0.0", "6.1.155", "c");
+    let (target, target_reference) = bound("b", "1.17.0", "12.0.0", "6.18.44", "d");
     Environments {
         source,
-        target_reference: target_definition.reference(),
+        target_reference,
         target,
     }
 }
@@ -155,6 +182,121 @@ fn begin_fences_a_stopped_sandbox_without_memory_loss_consent() {
 
     assert_eq!(record.source_state, SandboxState::Stopped);
     assert_eq!(record.checkpoint_artifact_id, None);
+}
+
+/// A stay-stopped upgrade awaits its stop from its fence, whatever the
+/// sandbox's state, and once verified only while its boot's execution is the
+/// sandbox's current one and runs: a stop, which keeps the execution's id but
+/// retires it, ends it. An older unretired upgrade of the sandbox to another
+/// target state never hides it.
+#[test]
+fn a_stay_stopped_upgrade_awaits_its_stop_only_while_its_boot_runs() {
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let stay_stopped = fenced(begin(&conn, operation(), &id, envs.target_reference, false));
+    let operation_id = stay_stopped.operation_id;
+    let boot = uuid::Uuid::now_v7().to_string();
+    // Created at the same instant, so the operation id breaks the tie and
+    // the smallest one is the oldest.
+    let older = RuntimeUpgradeOperationId::from_uuid(uuid::Uuid::from_u128(1));
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE older_upgrade AS
+             SELECT * FROM sandbox_runtime_upgrades WHERE operation_id = '{operation_id}';
+         UPDATE older_upgrade
+            SET operation_id = '{older}', target_state = 'started', phase = 'verified',
+                boot_execution_id = '{boot}';
+         INSERT INTO sandbox_runtime_upgrades SELECT * FROM older_upgrade;
+         DROP TABLE older_upgrade;",
+    ))
+    .unwrap();
+    let awaiting = |conn: &Connection| {
+        crate::db::read::stay_stopped_runtime_upgrade_awaiting_its_stop(conn, &id).unwrap()
+    };
+    let set = |conn: &Connection, sql: &str| conn.execute_batch(sql).unwrap();
+    assert_eq!(
+        crate::db::read::unretired_runtime_upgrade(&conn, &id).unwrap(),
+        Some(older),
+        "the older upgrade is the sandbox's oldest unretired one"
+    );
+
+    for phase in ["fenced", "preserved", "booting"] {
+        set(
+            &conn,
+            &format!(
+                "UPDATE sandbox_runtime_upgrades SET phase = '{phase}'
+                  WHERE operation_id = '{operation_id}'"
+            ),
+        );
+        assert_eq!(
+            awaiting(&conn),
+            Some(operation_id),
+            "{phase}: its boot may start before a suspend's capture"
+        );
+    }
+
+    // The boot started and verified: its execution runs the sandbox.
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'verified', boot_execution_id = '{boot}'
+              WHERE operation_id = '{operation_id}';
+             UPDATE sandboxes SET state = 'started', node_execution_id = '{boot}',
+                                  node_execution_retired = 0
+              WHERE id = '{id}';"
+        ),
+    );
+    assert_eq!(awaiting(&conn), Some(operation_id));
+    set(
+        &conn,
+        &format!("UPDATE sandboxes SET state = 'paused' WHERE id = '{id}'"),
+    );
+    assert_eq!(
+        awaiting(&conn),
+        Some(operation_id),
+        "a paused boot is still the upgrade's to stop"
+    );
+
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'retired'
+              WHERE operation_id = '{operation_id}'"
+        ),
+    );
+    assert_eq!(awaiting(&conn), None, "a retired upgrade owes nothing");
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandbox_runtime_upgrades SET phase = 'verified'
+              WHERE operation_id = '{operation_id}'"
+        ),
+    );
+
+    // A later execution runs the sandbox.
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandboxes SET state = 'started', node_execution_id = '{later}' WHERE id = '{id}'",
+            later = uuid::Uuid::now_v7(),
+        ),
+    );
+    assert_eq!(
+        awaiting(&conn),
+        None,
+        "a later execution is never the upgrade's to stop"
+    );
+
+    // A stop keeps the boot's execution id and retires it.
+    set(
+        &conn,
+        &format!(
+            "UPDATE sandboxes SET state = 'stopped', node_execution_id = '{boot}',
+                                  node_execution_retired = 1
+              WHERE id = '{id}'"
+        ),
+    );
+    assert_eq!(awaiting(&conn), None, "a stopped boot owes no stop");
 }
 
 #[test]
@@ -1130,4 +1272,311 @@ fn an_activation_decided_on_an_execution_refuses_a_sandbox_moved_off_it() {
         get_sandbox(&conn, &id).unwrap().unwrap().state,
         SandboxStatus::from(SandboxState::Starting)
     );
+}
+
+/// A suspended sandbox's eviction claim waits for every upgrade that still
+/// owns its disk, fencing it or owing the old checkpoint's retirement, and
+/// leaves the row unchanged while it does. A rolled-back or retired upgrade
+/// owns nothing. The claim spells its phases out, so this also holds it to
+/// `unretired_runtime_upgrade`'s.
+#[test]
+fn a_suspended_eviction_claim_waits_for_an_unretired_upgrade() {
+    use RuntimeUpgradePhase::*;
+    for (phase, claimable) in [
+        (Fenced, false),
+        (Preserved, false),
+        (Booting, false),
+        (Verified, false),
+        (RolledBack, true),
+        (Retired, true),
+    ] {
+        let conn = test_conn();
+        let envs = environments();
+        let id = sandbox(&conn, SandboxState::Suspended, &envs.source);
+        let pin = pin_suspend_artifact(&conn, &id).to_string();
+        fenced(begin(&conn, operation(), &id, envs.target_reference, true));
+        conn.execute(
+            "UPDATE sandbox_runtime_upgrades SET phase = ?1",
+            params![phase.as_str()],
+        )
+        .unwrap();
+        let before = get_sandbox(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            claimable,
+            unretired_runtime_upgrade(&conn, &id).unwrap().is_none(),
+            "{phase}: the claim and the unretired-upgrade reader disagree"
+        );
+
+        for expected_updated_at in [None, Some(before.updated_at.as_str())] {
+            if claimable {
+                break;
+            }
+            assert!(
+                !claim_suspended_sandbox_for_eviction(&conn, &id, Some(&pin), expected_updated_at)
+                    .unwrap(),
+                "{phase}"
+            );
+        }
+        if !claimable {
+            // So does the claim of a copy a runtime upgrade replaces.
+            let generations = activation_generations(&conn, &id).unwrap().unwrap();
+            assert!(
+                !claim_stale_upgrade_copy_for_eviction(&conn, &id, &pin, &generations).unwrap(),
+                "{phase}"
+            );
+        }
+        let after = get_sandbox(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            (after.state, &after.updated_at),
+            (
+                SandboxStatus::Unowned(SandboxState::Suspended),
+                &before.updated_at
+            ),
+            "{phase}"
+        );
+        if claimable {
+            assert!(
+                claim_suspended_sandbox_for_eviction(&conn, &id, Some(&pin), None).unwrap(),
+                "{phase}"
+            );
+        }
+    }
+}
+
+/// [`UNRETIRED_UPGRADE_PHASES_SQL`] spells out the fencing phases by hand,
+/// alongside `verified`. It names exactly those, so a fencing phase added to
+/// [`FENCING_PHASES`] alone can't read as retired to the queries that use it.
+#[test]
+fn the_unretired_phase_list_is_the_fencing_phases_and_verified() {
+    let listed: std::collections::BTreeSet<&str> = UNRETIRED_UPGRADE_PHASES_SQL
+        .trim_matches(|c| c == '(' || c == ')')
+        .split(',')
+        .map(|phase| phase.trim().trim_matches('\''))
+        .collect();
+    let expected: std::collections::BTreeSet<&str> = FENCING_PHASES
+        .into_iter()
+        .chain([RuntimeUpgradePhase::Verified])
+        .map(RuntimeUpgradePhase::as_str)
+        .collect();
+    assert_eq!(listed, expected);
+}
+
+/// A fencing upgrade's retained execution, which the State page publishes in
+/// place of the target the boot saved, is charged to the page's byte budget
+/// whether or not it decodes: one larger than the whole budget fails the page
+/// as an oversized row does.
+#[test]
+fn a_fencing_upgrades_retained_execution_is_charged_to_the_page_budget() {
+    use crate::db::inventory_read::InventoryReadError;
+    use crate::db::read::{StateBudgets, StatePageError, state_page};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    fenced(begin(&conn, operation(), &id, envs.target_reference, true));
+    let ids = vec![id];
+    let budgets = || StateBudgets {
+        raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+        metadata: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+    };
+    state_page(&conn, &ids, &mut budgets()).unwrap();
+
+    let retained: String = conn
+        .query_row(
+            "SELECT previous_execution_metadata_json FROM sandbox_runtime_upgrades",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // The same execution padded past the budget still decodes; the other
+    // value doesn't.
+    for oversized in [
+        format!("{retained}{}", " ".repeat(MAX_RAW_BYTES)),
+        "x".repeat(MAX_RAW_BYTES + 1),
+    ] {
+        conn.execute(
+            "UPDATE sandbox_runtime_upgrades SET previous_execution_metadata_json = ?1",
+            params![oversized],
+        )
+        .unwrap();
+
+        let result = state_page(&conn, &ids, &mut budgets());
+        assert!(
+            matches!(
+                result,
+                Err(StatePageError::Row(InventoryReadError::Limit(_)))
+            ),
+            "{:?}",
+            result.err()
+        );
+    }
+}
+
+/// Only one upgrade fences a sandbox, but should a second fencing row ever
+/// appear, the State page publishes the earliest one's retained execution,
+/// the upgrade `fencing_runtime_upgrade` names, not the saved target and not
+/// whichever row SQLite returns first.
+#[test]
+fn the_earliest_fencing_upgrade_is_the_one_published() {
+    use crate::db::read::{StateBudgets, StatePageRow, state_page};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    fenced(begin(&conn, operation(), &id, envs.target_reference, true));
+    // The boot saved the target, and the row inserted first is the later
+    // one: it retains the target too, while an earlier row inserted after it
+    // retains the source.
+    upsert_sandbox_execution_metadata(&conn, &id, &envs.target).unwrap();
+    conn.execute(
+        "INSERT INTO sandbox_runtime_upgrades (
+             operation_id, sandbox_id, target_environment, target_state,
+             authorization_id, authorization_reason, memory_loss_authorized,
+             source_state, previous_execution_metadata_json, checkpoint_artifact_id,
+             checkpoint_dir_identity, boot_execution_id, phase, failure, created_at,
+             updated_at
+         )
+         SELECT ?1, sandbox_id, target_environment, target_state, authorization_id,
+                authorization_reason, memory_loss_authorized, source_state,
+                previous_execution_metadata_json, checkpoint_artifact_id,
+                checkpoint_dir_identity, boot_execution_id, 'booting', failure,
+                created_at, updated_at
+           FROM sandbox_runtime_upgrades",
+        params![operation().to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sandbox_runtime_upgrades
+            SET previous_execution_metadata_json = ?1, created_at = created_at || 'z'
+          WHERE phase = 'fenced'",
+        params![serde_json::to_string(&envs.target).unwrap()],
+    )
+    .unwrap();
+    let mut budgets = StateBudgets {
+        raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+        metadata: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+    };
+
+    let page = state_page(&conn, std::slice::from_ref(&id), &mut budgets).unwrap();
+
+    let [StatePageRow::Decoded(row)] = page.as_slice() else {
+        panic!("one decoded row");
+    };
+    assert_eq!(row.published_execution.as_ref(), Some(&envs.source));
+}
+
+/// The substitution starts at the fence, not at the boot: an unbound
+/// sandbox, which published no execution, publishes the execution its disk
+/// records, the one a rollback writes, in `fenced` and `preserved` alike.
+#[test]
+fn an_unbound_sandbox_publishes_its_disks_execution_from_the_fence() {
+    use crate::db::read::{StateBudgets, StatePageRow, state_page};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+
+    let conn = test_conn();
+    let envs = environments();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let published = |conn: &Connection| {
+        let mut budgets = StateBudgets {
+            raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+            metadata: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+        };
+        match state_page(conn, std::slice::from_ref(&id), &mut budgets)
+            .unwrap()
+            .as_slice()
+        {
+            [StatePageRow::Decoded(row)] => row.published_execution.clone(),
+            _ => panic!("one decoded row"),
+        }
+    };
+    assert_eq!(published(&conn), None);
+
+    let operation_id = operation();
+    fenced(begin(&conn, operation_id, &id, envs.target_reference, true));
+    assert_eq!(published(&conn).as_ref(), Some(&envs.source), "fenced");
+    assert!(
+        advance_runtime_upgrade(
+            &conn,
+            operation_id,
+            RuntimeUpgradePhase::Fenced,
+            RuntimeUpgradePhase::Preserved,
+        )
+        .unwrap()
+    );
+    assert_eq!(published(&conn).as_ref(), Some(&envs.source), "preserved");
+}
+
+/// A fencing upgrade whose retained execution doesn't decode costs only its
+/// own sandbox's execution: the State page publishes that sandbox without one,
+/// as it does a sandbox whose own saved execution isn't valid JSON, never
+/// under the target the boot saved, and answers for the rest unchanged. That
+/// holds for malformed JSON and for a value that isn't valid text at all,
+/// which SQLite's non-strict column accepts.
+#[test]
+fn an_undecodable_retained_execution_degrades_only_its_own_sandbox() {
+    use crate::db::read::{StateBudgets, StatePageRow, state_page};
+    use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+
+    let budgets = || StateBudgets {
+        raw: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+        metadata: InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+    };
+    let decoded = |row: &StatePageRow| match row {
+        StatePageRow::Decoded(decoded) => Some((
+            decoded.row.id.clone(),
+            decoded.row.state,
+            decoded.published_execution.clone(),
+        )),
+        _ => None,
+    };
+    for retained in ["'not json'", "x'00ff'", "CAST(x'ff' AS TEXT)"] {
+        let conn = test_conn();
+        let envs = environments();
+        let fenced_id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+        fenced(begin(
+            &conn,
+            operation(),
+            &fenced_id,
+            envs.target_reference,
+            true,
+        ));
+        let others = [
+            sandbox(&conn, SandboxState::Stopped, &envs.source),
+            sandbox(&conn, SandboxState::Suspended, &envs.source),
+        ];
+        conn.execute(
+            &format!(
+                "UPDATE sandbox_runtime_upgrades SET previous_execution_metadata_json = {retained}"
+            ),
+            [],
+        )
+        .unwrap();
+        let alone: Vec<_> = state_page(&conn, &others, &mut budgets())
+            .unwrap()
+            .iter()
+            .map(|row| decoded(row).expect("a good row decodes"))
+            .collect();
+
+        let ids = vec![others[0].clone(), fenced_id.clone(), others[1].clone()];
+        let page = state_page(&conn, &ids, &mut budgets()).unwrap();
+
+        assert_eq!(page.len(), 3, "{retained}");
+        assert_eq!(
+            decoded(&page[1]),
+            Some((
+                fenced_id.clone(),
+                SandboxStatus::Unowned(SandboxState::Stopped),
+                None
+            )),
+            "{retained}: the fenced sandbox is published without an execution"
+        );
+        assert_eq!(
+            [decoded(&page[0]), decoded(&page[2])],
+            [Some(alone[0].clone()), Some(alone[1].clone())],
+            "{retained}: the other sandboxes are published as without it"
+        );
+    }
 }

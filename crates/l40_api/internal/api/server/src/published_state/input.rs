@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use uuid::Uuid;
 
@@ -39,6 +39,7 @@ pub(super) struct PublishedSandboxRow {
     pub(super) last_used_at: Option<String>,
     pub(super) last_access_at: Option<String>,
     pub(super) last_command_at: Option<String>,
+    pub(super) next_auto_event_at: Option<String>,
     pub(super) network_tx_bytes: Option<i64>,
     pub(super) network_rx_bytes: Option<i64>,
     pub(super) disk_usage_bytes: Option<i64>,
@@ -103,6 +104,23 @@ impl PublishedSandboxRow {
             last_used_at: self.last_used_at.as_deref(),
             last_access_at: self.last_access_at.as_deref(),
             last_command_at: self.last_command_at.as_deref(),
+        }
+    }
+}
+
+/// The published idle deadline, in its serialized RFC3339 spelling for the
+/// PostgreSQL timestamp cast.
+#[derive(serde::Serialize)]
+pub(super) struct PublishedIdleDeadlineRow<'a> {
+    sandbox_id: SandboxId,
+    next_auto_event_at: Option<&'a str>,
+}
+
+impl PublishedSandboxRow {
+    pub(super) fn idle_deadline_projection(&self) -> PublishedIdleDeadlineRow<'_> {
+        PublishedIdleDeadlineRow {
+            sandbox_id: self.sandbox_id,
+            next_auto_event_at: self.next_auto_event_at.as_deref(),
         }
     }
 }

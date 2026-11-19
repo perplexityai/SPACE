@@ -33,6 +33,7 @@ def suspend_snapshot_rows_are_per_attempt(test: smoke.KindEcw) -> None:
     brings back the second suspend's bytes."""
 
     codec = test.suspend_codec
+    restore = test.cross_node_restore
 
     with test.phase("write v1 state and suspend"):
         written = test.run_command_when_ready(f"printf %s {MARKER_A} > {shlex.quote(PATH)}")
@@ -56,6 +57,7 @@ def suspend_snapshot_rows_are_per_attempt(test: smoke.KindEcw) -> None:
         test.reconnect_by_id()
         written = test.run_command_when_ready(f"printf %s {MARKER_B} > {shlex.quote(PATH)}")
         test.verify(written.exit_code == 0, "failed to write v2 state", command_stderr=written.stderr)
+        source = restore.current_placement()
         test.pause()
         codec.expect_suspend_codec()
 
@@ -81,7 +83,13 @@ def suspend_snapshot_rows_are_per_attempt(test: smoke.KindEcw) -> None:
         )
         test.record("snapshot_rows", [f.snapshot_id for f in facts])
 
-    with test.phase("the restore brings back the second suspend's bytes"):
-        test.reconnect_by_id()
-        observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")
-        test.expect_command(observed, stdout=MARKER_B)
+    with test.phase("a remote restore selects the second suspend's bytes"):
+        # The source still has local bytes; restoring there cannot prove which
+        # durable snapshot row the planner selected.
+        restore.wait_until_restore_portable()
+        with restore.cordoned(source.node_name):
+            test.reconnect_by_id()
+            landed = restore.current_placement()
+            restore.expect_restored_from_object_storage(source=source, landed=landed)
+            observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")
+            test.expect_command(observed, stdout=MARKER_B)

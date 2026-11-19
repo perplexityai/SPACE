@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 
 use crate::env_config;
 
@@ -46,6 +46,12 @@ pub struct ReconcilerConfig {
     /// Master enable gate. Off by default everywhere; each environment opts in
     /// via `SPACE_ORPHANED_RESTORE_POD_GC_ENABLED=true`.
     pub enabled: bool,
+    /// Also classify terminal pods (phase `Succeeded` or `Failed`) that aren't
+    /// restore pods, and reap the ones nothing owns (see
+    /// [`super::classify::classify_terminal_pod`]). Off by default; turned on
+    /// with `SPACE_ORPHANED_RESTORE_POD_GC_TERMINAL_PODS=true`, and subject
+    /// to [`Self::enabled`] and [`Self::dry_run`] like every other reap.
+    pub terminal_pods: bool,
     /// When true (the default), orphans are classified and reported via logs,
     /// metrics, and `cluster_reconciler.outcome` (`mode:dry_run`), but nothing
     /// is deleted and no `space.sandbox` cleanup event is emitted.
@@ -78,6 +84,7 @@ impl Default for ReconcilerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            terminal_pods: false,
             dry_run: true,
             interval: DEFAULT_INTERVAL,
             threshold: PositiveDuration::new_panic(DEFAULT_THRESHOLD),
@@ -94,15 +101,19 @@ impl ReconcilerConfig {
     /// missing or unparseable. Durations are whole seconds; a zero duration or
     /// count keeps the default too, and a value above its ceiling clamps to it.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {
             enabled: config
                 .truthy_default("SPACE_ORPHANED_RESTORE_POD_GC_ENABLED", default.enabled),
+            terminal_pods: config.truthy_default(
+                "SPACE_ORPHANED_RESTORE_POD_GC_TERMINAL_PODS",
+                default.terminal_pods,
+            ),
             dry_run: config
                 .truthy_default("SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN", default.dry_run),
             interval: config.bounded_duration_secs(

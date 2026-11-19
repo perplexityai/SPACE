@@ -1,9 +1,10 @@
-use pplx_space_common_core::types::{
+use pplx_space_accounts::NodeId;
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
     AutoLifecycleStage,
 };
-use pplx_space_common_core::types::{NodeId, SandboxId};
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use super::*;
@@ -579,6 +580,7 @@ async fn hold_org_quota_lock(
 
 /// Wait until some backend waits on an advisory lock, as a create queued
 /// on a held quota lock does.
+#[cfg(feature = "kubernetes")]
 async fn wait_for_advisory_lock_waiter(pool: &PgPool) -> TestDbResult<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -639,6 +641,46 @@ fn sandbox_idle_deadline_is_nullable_and_serialized_as_rfc3339() {
         assert_eq!(
             serde_json::to_value(sandbox).unwrap()["expires_at"],
             expected
+        );
+    }
+}
+
+#[test]
+fn only_a_resident_sandbox_reports_its_idle_deadline() {
+    use pplx_space_sandbox_model::SandboxLifecycle;
+    // Only a started or paused sandbox is held by the node that publishes its
+    // deadline; every other lifecycle, transitions included, reports none.
+    let cases = [
+        (SandboxLifecycle::Created, false),
+        (SandboxLifecycle::Creating, false),
+        (SandboxLifecycle::Starting, false),
+        (SandboxLifecycle::Started, true),
+        (SandboxLifecycle::Restoring, false),
+        (SandboxLifecycle::Pausing, false),
+        (SandboxLifecycle::Paused, true),
+        (SandboxLifecycle::Resuming, false),
+        (SandboxLifecycle::Suspending, false),
+        (SandboxLifecycle::Suspended, false),
+        (SandboxLifecycle::Stopping, false),
+        (SandboxLifecycle::Stopped, false),
+        (SandboxLifecycle::Deleting, false),
+        (SandboxLifecycle::Checkpointing, false),
+        (SandboxLifecycle::Quarantined, false),
+        (SandboxLifecycle::Failed, false),
+    ];
+    assert_eq!(
+        cases.map(|(lifecycle, _)| lifecycle).as_slice(),
+        SandboxLifecycle::all()
+    );
+    for (lifecycle, reported) in cases {
+        let mut row = public_sandbox_row(OffsetDateTime::UNIX_EPOCH, SandboxId::new());
+        row.lifecycle = lifecycle.as_str().to_string();
+        row.next_auto_event_at = Some(1_700_000_000);
+        let sandbox = public_sandbox_from_row(row).unwrap();
+        assert_eq!(
+            sandbox.expires_at.map(|time| time.unix_timestamp()),
+            reported.then_some(1_700_000_000),
+            "{lifecycle}"
         );
     }
 }
@@ -992,7 +1034,7 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
         let policy = with_native_create_defaults(create_request_with_auto_lifecycle(None))
             .auto_lifecycle
             .unwrap();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO sandboxes (
                  id, user_id, org_id, lifecycle, created_at,
                  network_policy_override_json, network_policy_generation,
@@ -1025,9 +1067,10 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
             let row = row.expect("visible sandbox");
             assert_eq!(row.lifecycle, lifecycle);
             let sandbox = public_sandbox_from_row(row).unwrap();
+            // Only a resident sandbox reports its node's idle deadline.
             assert_eq!(
                 sandbox.expires_at.map(|time| time.unix_timestamp()),
-                deadline
+                deadline.filter(|_| lifecycle == "started")
             );
             assert_eq!(sandbox.idle_timeout.as_deref(), Some("21600s"));
             assert_eq!(sandbox.idle_action, Some(SandboxIdleAction::Suspend));
@@ -1053,8 +1096,8 @@ async fn sandbox_reads_exclude_deleted_tombstones_before_pagination() -> TestDbR
     let page = sandboxes_page(rows, 1).expect("visible lifecycles project normally");
     assert_eq!(page.data.len(), 1);
     assert_eq!(
-        page.data[0].expires_at.unwrap().unix_timestamp(),
-        1_800_021_602
+        page.data[0].expires_at, None,
+        "a quarantined sandbox reports no idle deadline"
     );
     assert_eq!(page.data[0].idle_timeout.as_deref(), Some("21600s"));
     assert_eq!(page.data[0].idle_action, Some(SandboxIdleAction::Suspend));
@@ -1084,7 +1127,7 @@ async fn native_reads_never_show_the_owners_email() -> TestDbResult<()> {
         const KEY: &str = "owner-email-read-test-key";
         const EMAIL: &str = "root@local";
         let db = pg_test_db().await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
              VALUES ($1, $2, 'owner-email-read-test', $3, ARRAY['native'])"
         ))
@@ -1093,7 +1136,7 @@ async fn native_reads_never_show_the_owners_email() -> TestDbResult<()> {
         .bind(crate::auth::hash_token(KEY))
         .execute(&db.pool)
         .await?;
-        let owner_email: String = sqlx::query_scalar(pplx_space_common_core::sql!(
+        let owner_email: String = sqlx::query_scalar(pplx_space_sql_locator::sql!(
             "SELECT email FROM users WHERE id = $1"
         ))
         .bind(SEED_USER_ID)
@@ -1101,7 +1144,7 @@ async fn native_reads_never_show_the_owners_email() -> TestDbResult<()> {
         .await?;
         assert_eq!(owner_email, EMAIL);
         let id = SandboxId::new();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO sandboxes (
                  id, user_id, org_id, lifecycle, network_policy_override_json,
                  network_policy_generation
@@ -1158,7 +1201,7 @@ async fn reads_answer_a_deleted_tombstone_as_not_found() -> TestDbResult<()> {
     Box::pin(async {
         const KEY: &str = "tombstone-read-test-key";
         let db = pg_test_db().await?;
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
              VALUES ($1, $2, 'tombstone-read-test', $3, ARRAY['native'])"
         ))
@@ -1174,7 +1217,7 @@ async fn reads_answer_a_deleted_tombstone_as_not_found() -> TestDbResult<()> {
 
         let id = SandboxId::new();
         let public_id = PublicSandboxId::from(id).to_string();
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "INSERT INTO sandboxes (
                  id, user_id, org_id, lifecycle, network_policy_override_json,
                  network_policy_generation
@@ -1226,7 +1269,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     let node_id = NodeId::new();
     let route_activation_id = Uuid::now_v7();
     insert_ready_worker_node(&db.pool, node_id).await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandboxes (
              id, user_id, org_id, lifecycle, placement, managed_by, active_node_id,
              network_policy_override_json, network_policy_generation
@@ -1241,7 +1284,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     ))
     .execute(&db.pool)
     .await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active,
              route_activation_id
@@ -1256,7 +1299,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .bind(route_activation_id)
     .execute(&db.pool)
     .await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandbox_observed_states (
              sandbox_id, node_id, status, failure_reason
          ) VALUES ($1, $2, 'failed', $3)"
@@ -1266,7 +1309,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .bind(INTERNAL_FAILURE_REASON)
     .execute(&db.pool)
     .await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO node_facet_observed_status (
              node_id, facet, element, observed_payload, observed_at
          ) VALUES (
@@ -1304,7 +1347,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     let stale_generation = public_sandbox_from_row(stale_generation).expect("valid public sandbox");
     assert!(stale_generation.failure_code.is_none());
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE node_facet_observed_status
          SET observed_payload = jsonb_build_object(
                  $4::TEXT,
@@ -1337,7 +1380,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
         Some(SandboxFailureCode::RuntimeFailure)
     );
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE node_facet_observed_status
          SET observed_payload = jsonb_set(
              observed_payload,
@@ -1358,7 +1401,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
         .expect("sandbox");
     let missing_attempt = public_sandbox_from_row(missing_attempt).expect("valid public sandbox");
     assert!(missing_attempt.failure_code.is_none());
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE node_facet_observed_status
          SET observed_payload = jsonb_set(
              observed_payload,
@@ -1378,7 +1421,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .await?;
 
     let replacement_route_activation_id = Uuid::now_v7();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_k8s_executions
          SET route_activation_id = $2
          WHERE sandbox_id = $1 AND active"
@@ -1394,7 +1437,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     let replacement_route =
         public_sandbox_from_row(replacement_route).expect("valid public sandbox");
     assert!(replacement_route.failure_code.is_none());
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_k8s_executions
          SET route_activation_id = NULL
          WHERE sandbox_id = $1 AND active"
@@ -1407,7 +1450,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
         .expect("sandbox");
     let missing_route = public_sandbox_from_row(missing_route).expect("valid public sandbox");
     assert!(missing_route.failure_code.is_none());
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_k8s_executions
          SET route_activation_id = $2
          WHERE sandbox_id = $1 AND active"
@@ -1417,7 +1460,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .execute(&db.pool)
     .await?;
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_k8s_executions
          SET pod_uid = $2
          WHERE sandbox_id = $1 AND active"
@@ -1431,7 +1474,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
         .expect("sandbox");
     let replacement_pod = public_sandbox_from_row(replacement_pod).expect("valid public sandbox");
     assert!(replacement_pod.failure_code.is_none());
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_k8s_executions
          SET pod_uid = $2
          WHERE sandbox_id = $1 AND active"
@@ -1484,7 +1527,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     );
 
     let direct_attempt_id = Uuid::now_v7();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandbox_direct_route_identities (
              sandbox_id, route_generation, current_node_id, substrate_kind,
              execution_generation, activation_attempt_id
@@ -1496,13 +1539,13 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .bind(direct_attempt_id)
     .execute(&db.pool)
     .await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandboxes SET managed_by = 'space' WHERE id = $1"
     ))
     .bind(sandbox_id)
     .execute(&db.pool)
     .await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE node_facet_observed_status
          SET observed_payload = jsonb_build_object(
                  $4::TEXT,
@@ -1533,7 +1576,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     );
 
     let replacement_attempt_id = Uuid::now_v7();
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_direct_route_identities
          SET activation_attempt_id = $2
          WHERE sandbox_id = $1"
@@ -1549,7 +1592,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     let replacement_attempt =
         public_sandbox_from_row(replacement_attempt).expect("valid public sandbox");
     assert!(replacement_attempt.failure_code.is_none());
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_direct_route_identities
          SET activation_attempt_id = $2
          WHERE sandbox_id = $1"
@@ -1559,7 +1602,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .execute(&db.pool)
     .await?;
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_direct_route_identities
          SET execution_generation = $2
          WHERE sandbox_id = $1"
@@ -1574,7 +1617,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     let stale_direct = public_sandbox_from_row(stale_direct).expect("valid public sandbox");
     assert!(stale_direct.failure_code.is_none());
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_direct_route_identities
          SET execution_generation = $2
          WHERE sandbox_id = $1"
@@ -1584,7 +1627,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
     .execute(&db.pool)
     .await?;
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_observed_states SET status = 'started' WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
@@ -1600,13 +1643,13 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
 
     let replacement_node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, replacement_node_id).await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandbox_observed_states SET status = 'failed' WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
     .execute(&db.pool)
     .await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
     ))
     .bind(sandbox_id)
@@ -1624,7 +1667,7 @@ async fn sandbox_reads_expose_only_the_current_failure_episode() -> TestDbResult
         Some(SandboxFailureCode::RuntimeFailure)
     );
 
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "UPDATE sandboxes
          SET lifecycle = 'started', active_node_id = $2
          WHERE id = $1"
@@ -2140,7 +2183,7 @@ mod admission_pool_claim {
 
         let pinned = crate::public_sandbox_operations::controller_create_request(
             fixture.request(),
-            Some(pplx_space_common_core::types::NodePoolName::parse("isolated-test-pool").unwrap()),
+            Some(pplx_space_node_model::NodePoolName::parse("isolated-test-pool").unwrap()),
         );
         assert_eq!(
             controller
@@ -2353,7 +2396,7 @@ async fn insert_legacy_sandbox(
 ) -> TestDbResult<SandboxId> {
     let id = SandboxId::new();
     let metadata = serde_json::json!({ "legacy": "m".repeat(metadata_bytes) });
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO sandboxes (
              id, user_id, org_id, lifecycle, created_at, metadata,
              network_policy_override_json, network_policy_generation
@@ -2451,7 +2494,7 @@ async fn sandbox_list_budget_ignores_env() -> TestDbResult<()> {
         let created_at = newest - time::Duration::seconds(offset);
         let id = insert_legacy_sandbox(&db.pool, created_at, 16).await?;
         // Were env counted, the three would pass the budget.
-        sqlx::query(pplx_space_common_core::sql!(
+        sqlx::query(pplx_space_sql_locator::sql!(
             "UPDATE sandboxes SET env = $2 WHERE id = $1"
         ))
         .bind(id)

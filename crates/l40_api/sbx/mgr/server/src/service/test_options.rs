@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use super::{SandboxManagerService, SandboxManagerServiceOptions};
 
@@ -60,6 +60,8 @@ impl SandboxManagerServiceOptions {
     pub(crate) fn for_test_in(scratch: &Path) -> Self {
         let run_dir = scratch.to_owned();
         Self {
+            automatic_guest_updates: false,
+            capture_runtime_probe: None,
             host_control_socket_path: scratch.join("absent-host-control.sock"),
             credential_manager_socket_path: scratch.join("absent-credential-manager.sock"),
             sandbox_runtime_live: Arc::new(move |id| {

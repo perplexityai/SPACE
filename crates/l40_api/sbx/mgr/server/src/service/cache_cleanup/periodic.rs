@@ -95,6 +95,17 @@ impl PeriodicInventoryScan {
                             continue;
                         }
                     }
+                    match super::reclaim_abandoned_upload_metadata_staging(
+                        &entry.path(),
+                        &service.db,
+                    ) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(path = %entry.path().display(), %error, "failed to reclaim upload metadata staging");
+                            continue;
+                        }
+                    }
                     if let Some(id) =
                         crate::snapshot_restore::remote_restore_metadata_staging_sandbox_id(&name)
                         && let Some(_guard) =

@@ -7,6 +7,7 @@ use pplx_space_runtime_environment_policy_store::PolicyChangeReason;
 use serde_json::{Map, Value, json};
 
 mod cross_org;
+mod runtime_upgrade_campaigns;
 
 const ADMIN_LLMS_TXT: &str = "SPACE Admin API\n\n\
 - Admin OpenAPI: /openapi.json on admin.api.space hosts, /admin/api/openapi.json on shared hosts\n\
@@ -362,6 +363,7 @@ fn admin_openapi_value() -> Value {
     insert_audit_event_paths(paths);
     insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
+    runtime_upgrade_campaigns::insert_runtime_upgrade_campaign_paths(paths);
     cross_org::insert_admin_sandbox_session_paths(paths);
     spec
 }
@@ -436,14 +438,33 @@ fn insert_node_maintenance_paths(paths: &mut Map<String, Value>) {
     paths.insert("/nodes/{node_id}/sandboxes".to_string(), json!({
                 "get": {
                     "summary": "List active and target sandbox placements for one node",
-                    "description": "At most 100 placement rows, ordered by sandbox UUID and deduplicated across active and target associations. No durability accounting or live census. Use next_after as the after cursor; null means the last page. Concurrent placement changes may affect pagination.",
+                    "description": "At most 100 placement rows, in every lifecycle, deduplicated across active and target associations. No durability accounting or live census; GET /nodes/{node_id}/holds lists what holds the node. Ordered by sandbox UUID unless order=lifecycle_changed_desc. In id order, use next_after as the after cursor; with order=lifecycle_changed_desc, rows are newest lifecycle_changed_at first, then id descending, each carries lifecycle_changed_at, and the response has next_cursor instead of next_after, passed back as cursor. after and cursor each answer 400 with the other order. null means the last page. Keep the filters unchanged between pages. Concurrent placement changes may affect pagination.",
                     "parameters": [
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
-                        { "name": "after", "in": "query", "schema": { "type": "string", "format": "uuid" } }
+                        { "name": "after", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "lifecycle", "in": "query", "description": "Stored lifecycle to keep: a sandbox lifecycle or deleted. Repeat it, or separate values with commas, to keep any of several. An unknown value answers 400", "schema": { "type": "string" } },
+                        { "name": "changed_since", "in": "query", "description": "RFC 3339 timestamp; keeps rows whose lifecycle_changed_at is at or after it, for example failed rows since a drain started", "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "order", "in": "query", "schema": { "type": "string", "enum": ["id", "lifecycle_changed_desc"], "default": "id" } },
+                        { "name": "cursor", "in": "query", "description": "next_cursor from the previous order=lifecycle_changed_desc page", "schema": { "type": "string" } }
                     ],
                     "responses": {
-                        "200": { "description": "Object containing sandboxes (id, lifecycle, active_node_id, target_node_id) and nullable next_after cursor" },
-                        "400": { "description": "Invalid UUID or cursor" },
+                        "200": { "description": "Object containing sandboxes (id, lifecycle, active_node_id, target_node_id, and lifecycle_changed_at with order=lifecycle_changed_desc) and a nullable next_after, or with order=lifecycle_changed_desc next_cursor" },
+                        "400": { "description": "Invalid UUID, cursor, lifecycle, timestamp or order, or a cursor for the other order" },
+                        "403": { "description": "Managing organization administrator required" },
+                        "404": { "description": "Node not found" }
+                    }
+                }
+            }));
+    paths.insert("/nodes/{node_id}/holds".to_string(), json!({
+                "get": {
+                    "summary": "List the sandboxes that hold one node, and why",
+                    "description": "The rows the node-release gates count against the node: those whose active_node_id names it in a lifecycle the :terminate guard counts, and the drain gate's blockers (target-pinned suspending, non-evacuation restoring and non-durable suspended rows, and rows with a full snapshot upload in flight from the node and no durable snapshot). A row the node census discounts is listed too. Each row has a reason, one of census_absent (active_node_id names the node, its fresh census omits the sandbox, and it is not a drain-gate blocker; under node_census_aware evidence no term counts it), evacuating (evacuation_restore_target is set; a forced drain still fails a marked suspending row older than stuck_transient_after_secs unless its suspend snapshot is recoverable), upload_in_flight, stuck_transient and transient (a resident transient lifecycle older or younger than stuck_transient_after_secs, the drain's stale-abandon age), local_only_snapshot (suspended with no durable snapshot), resident (started or paused) and termination_blocking (created, stopped, deleting, quarantined or an unmodelled value). terms has the gate terms that count it, under the residency_evidence the response reports: resident is the drain's resident scan (drainability live_residents), drain_blocker the drain gate's blocker set (drainability drain_blockers and the :terminate 409's sandboxes_drain_blockers), and active_resident the occupancy scope (drainability terminate_blockers and the 409's sandboxes_active). counted_by has three flags computed from those terms: terminate (active_resident or drain_blocker, what :terminate refuses on), drain (resident or drain_blocker), and drain_with_termination_blocking_gate (what the drain counts when the cluster-controller's termination-blocking gate is on: resident, drain_blocker or active_resident, the same rows as terminate). The API does not read that gate's setting, and the drain's own in-flight evacuations are not visible here. Rows any term counts come first and rows no term counts last, each group ordered by reason in that order, then oldest lifecycle_changed_at first; at most 500 are listed, with truncated set when more exist, and total, reason_counts and term_counts cover every row. Only the drain gate and the :terminate guard are covered; the drained-node terminator refuses on the same rows as :terminate. The sweeps that delete a node's row outside a drain also count rows this list omits, such as suspended rows with a durable snapshot, and a drained node can wait on its drain-keep annotation rather than on any sandbox.",
+                    "parameters": [
+                        { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Object with node_id, residency_evidence, stuck_transient_after_secs, total, truncated, reason_counts, term_counts (resident, drain_blocker, active_resident) and holds, each with sandbox_id, lifecycle, lifecycle_changed_at, placement (active, target, both, or upload_source when only an upload from the node holds it), reason, counted_by (terminate, drain, drain_with_termination_blocking_gate), terms (resident, drain_blocker, active_resident) and facts (census_absent, durable_snapshot, upload_in_flight, upload_started_at, evacuation_restore_target, restore_attempt_count and next_restore_attempt_at when a cohort restore has failed, past_stuck_threshold)" },
+                        "400": { "description": "Invalid UUID" },
                         "403": { "description": "Managing organization administrator required" },
                         "404": { "description": "Node not found" }
                     }
@@ -845,7 +866,7 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
                     { "name": "limit", "in": "query", "required": false, "description": "1 to 5000, default 1000", "schema": { "type": "integer" } },
                     { "name": "cursor", "in": "query", "required": false, "description": "Opaque; empty for the first page, then the previous page's next_cursor", "schema": { "type": "string" } },
                     { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string" } },
-                    { "name": "lifecycle", "in": "query", "required": false, "description": "Comma-separated values of the stored lifecycle, including deleted. The retired cleanup_required is still accepted and matches no sandbox. No response field shows the stored lifecycle: lifecycle and status report the node's observed status when there is one, so a row can show another value.", "schema": { "type": "string" } },
+                    { "name": "lifecycle", "in": "query", "required": false, "description": "Comma-separated values of the stored lifecycle, including deleted. No response field shows the stored lifecycle: lifecycle and status report the node's observed status when there is one, so a row can show another value.", "schema": { "type": "string" } },
                     { "name": "template", "in": "query", "required": false, "description": "The sandbox row's own template. A row without one does not match, although the response's template, like the spaced-version count, falls back to the template its node reports.", "schema": { "type": "string" } },
                     { "name": "node_id", "in": "query", "required": false, "description": "The node the response reports as active_node_id: a sandbox's current Direct route node when it has a route, whatever its row records, else the node its row records", "schema": { "type": "string", "format": "uuid" } },
                     { "name": "assigned", "in": "query", "required": false, "description": "true for sandboxes the response reports with an active_node_id, false for those without; false cannot be combined with node_id. Like every filter, it lists sandbox rows only, so false leaves out the node-reported pool slots and observed-local sandboxes that the unfiltered list appends, although they report no active_node_id", "schema": { "type": "boolean" } },
@@ -996,25 +1017,38 @@ fn insert_audit_event_paths(paths: &mut Map<String, Value>) {
     );
 }
 
-fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
-    let environment_ref = json!({
+/// An execution environment reference, as a schema.
+fn environment_ref_schema() -> Value {
+    json!({
         "type": "string",
         "pattern": "^(sha256|blake3):[0-9a-f]{64}$",
         "description": "Execution environment reference"
-    });
+    })
+}
+
+/// An optional `If-Match` header carrying a generation, optionally quoted,
+/// described by `description`.
+fn if_match_param(description: &str) -> Value {
+    json!({
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string", "pattern": "^\"?[0-9]+\"?$" },
+        "description": description
+    })
+}
+
+fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
+    let environment_ref = environment_ref_schema();
     let reason = json!({
         "type": "string",
         "minLength": 1,
         "maxLength": PolicyChangeReason::MAX_CHARS,
         "description": "Why the policy changed. Recorded with the caller on the policy row, and on the environment's state row when the write changes it."
     });
-    let if_match = json!({
-        "name": "If-Match",
-        "in": "header",
-        "required": false,
-        "schema": { "type": "string", "pattern": "^\"?[0-9]+\"?$" },
-        "description": "The policy generation the caller last read, optionally quoted. The write applies only at that generation, compared under the policy row lock; absent, it's unconditional."
-    });
+    let if_match = if_match_param(
+        "The policy generation the caller last read, optionally quoted. The write applies only at that generation, compared under the policy row lock; absent, it's unconditional.",
+    );
     paths.insert(
         "/runtime-environments".to_string(),
         json!({
@@ -1035,7 +1069,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
             "put": {
                 "summary": "Set the cluster default execution environment",
                 "parameters": [if_match.clone()],
-                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified.",
+                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified. No check yet for an unfinished template runtime upgrade campaign moving releases off an environment the first default stops; only a block checks campaigns.",
                 "requestBody": {
                     "required": true,
                     "content": {
@@ -1072,7 +1106,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
         json!({
             "put": {
                 "summary": "Set an execution environment's state",
-                "description": "allowed and deprecated execute; blocked never executes. Increments the generation in the same transaction. The default must stay allowed, and blocking requires a cluster default. Blocking an environment that still has sandboxes, or template releases in use (a tag points to it or an enabled pool config pins it), bound to it, or while any sandbox has no environment binding, an unreadable one, or no binding record, needs strand: true: unbound legacy work executes as the environment it matches, which the server can't resolve, and a sandbox with no observation from its node may be bound to this one. In-use releases with no or an unreadable binding gate too, since new creates from them may run on the environment that stops. Other template releases, and sandboxes that can't run again (deleting, or failed with no live evidence and nothing the repair loop could revert to), are reported in at_risk but don't require strand. Blocking an environment that already doesn't execute (blocked, or with no state under a default) normally needs no strand; if another policy write lands while the block waits, the check runs in full. The counts are read just before the write and sandboxes keep changing, so strand is an acknowledgement, not a guarantee.",
+                "description": "allowed and deprecated execute; blocked never executes. Increments the generation in the same transaction. The default must stay allowed, and blocking requires a cluster default. Blocking an environment that still has sandboxes, or template releases in use (a tag points to it or an enabled pool config pins it), bound to it, or while any sandbox has no environment binding, an unreadable one, or no binding record, needs strand: true: unbound legacy work executes as the environment it matches, which the server can't resolve, and a sandbox with no observation from its node may be bound to this one. In-use releases with no or an unreadable binding gate too, since new creates from them may run on the environment that stops. Other template releases, and sandboxes that can't run again (deleting, or failed with no live evidence and nothing the repair loop could revert to), are reported in at_risk but don't require strand. Blocking an environment that already doesn't execute (blocked, or with no state under a default) normally needs no strand; if another policy write lands while the block waits, the check runs in full. The counts are read just before the write and sandboxes keep changing, so strand is an acknowledgement, not a guarantee. Blocking also needs strand: true while an unfinished template runtime upgrade campaign moves the environment's releases, since a block mid-campaign stops the releases the campaign hasn't given a twin on its target yet; as for bound work, not when the environment already doesn't execute.",
                 "parameters": [
                     { "name": "environment_ref", "in": "path", "required": true, "schema": environment_ref },
                     if_match
@@ -1091,7 +1125,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                                     "strand": {
                                         "type": "boolean",
                                         "default": false,
-                                        "description": "Block even though work may still depend on the environment: work bound to it, or a sandbox whose environment can't be told. Only accepted with state blocked."
+                                        "description": "Block even though work may still depend on the environment: work bound to it, a sandbox whose environment can't be told, or an unfinished template runtime upgrade campaign moving it. Only accepted with state blocked."
                                     }
                                 }
                             }
@@ -1102,7 +1136,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                     "200": { "description": "Object with the new generation, environment_ref and state" },
                     "400": { "description": "Invalid body, environment reference, state or reason, or strand without blocked" },
                     "403": { "description": "Managing organization administrator required" },
-                    "409": { "description": "The environment is the default, blocking needs a default first, or work may still be bound to it (at_risk carries the environments and counts)" },
+                    "409": { "description": "The environment is the default, blocking needs a default first, work may still be bound to it (at_risk carries the environments and counts), or an unfinished template runtime upgrade campaign still moves it (with at_risk when work is bound to it too, since strand: true waives both)" },
                     "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" }
                 }
             }

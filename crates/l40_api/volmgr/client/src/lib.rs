@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 pub mod proto {
     tonic::include_proto!("space.volume.manager.v1");
@@ -6,9 +6,9 @@ pub mod proto {
 
 /// Convert the domain snapshot identity to its volume-manager wire value.
 pub const fn snapshot_artifact_to_proto(
-    artifact: pplx_space_common_core::types::SnapshotArtifact,
+    artifact: pplx_space_artifact_model::SnapshotArtifact,
 ) -> proto::SnapshotArtifact {
-    use pplx_space_common_core::types::SnapshotArtifact as CoreArtifact;
+    use pplx_space_artifact_model::SnapshotArtifact as CoreArtifact;
 
     match artifact {
         CoreArtifact::Rootfs => proto::SnapshotArtifact::Rootfs,
@@ -25,8 +25,8 @@ pub const fn snapshot_artifact_to_proto(
 /// `UNSPECIFIED` represents legacy callers or non-snapshot transfers.
 pub const fn snapshot_artifact_from_proto(
     artifact: proto::SnapshotArtifact,
-) -> Option<pplx_space_common_core::types::SnapshotArtifact> {
-    use pplx_space_common_core::types::SnapshotArtifact as CoreArtifact;
+) -> Option<pplx_space_artifact_model::SnapshotArtifact> {
+    use pplx_space_artifact_model::SnapshotArtifact as CoreArtifact;
 
     match artifact {
         proto::SnapshotArtifact::Unspecified => None,
@@ -86,7 +86,34 @@ pub async fn connect(socket_path: &str) -> Result<ConnectedVolumeManagerClient, 
     Ok(VolumeManagerClient::new(wrap_grpc_client_channel(channel)))
 }
 
-pub const VOLMGR_SOCKET: &str = pplx_space_common_core::host::linux::paths::VOLUME_MANAGER_SOCKET;
+/// A cached, reconnecting channel for callers that bound their own RPCs.
+/// Dialing happens on the first RPC, so a socket that is missing while
+/// volume-manager restarts fails that RPC instead of a separate connect budget.
+pub fn lazy(socket_path: &Path) -> ConnectedVolumeManagerClient {
+    let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
+        socket_path,
+        tonic::transport::Endpoint::from_static("http://tonic"),
+    );
+    VolumeManagerClient::new(wrap_grpc_client_channel(channel))
+}
+
+/// How long a caller keeps waiting for a node's volume-manager that it cannot
+/// reach before treating the outage as a failure. Volume-manager restarts
+/// delete-first: the predecessor drains transfers for up to 100 s and its RPC
+/// server for 10 s before the successor starts and recovers every persisted
+/// transfer, so a deploy leaves the socket refused or missing for a while.
+pub const VOLUME_MANAGER_RESTART_BUDGET: Duration = Duration::from_secs(180);
+const VOLUME_MANAGER_RESTART_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
+    max_retries: usize::MAX,
+    initial_delay: Duration::from_millis(100),
+    backoff_multiplier: 2.0,
+    max_delay: Duration::from_secs(2),
+    max_elapsed: VOLUME_MANAGER_RESTART_BUDGET,
+    jitter_factor: 0.2,
+    max_server_retry_after: Duration::ZERO,
+};
+
+pub const VOLMGR_SOCKET: &str = pplx_space_host_layout::paths::VOLUME_MANAGER_SOCKET;
 pub const RESTORE_PRIORITY: i32 = 100;
 pub const VERIFIED_REPLICA_PROVENANCE_VERSION: u32 = 1;
 const ENSURE_FILE_REPLICA_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
@@ -131,7 +158,7 @@ pub struct VerifiedReplicaProvenance {
     pub raw: bool,
     pub file_mode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_artifact: Option<pplx_space_common_core::types::SnapshotArtifact>,
+    pub snapshot_artifact: Option<pplx_space_artifact_model::SnapshotArtifact>,
     pub object_size: u64,
     pub object_etag: Option<String>,
     pub local_size: u64,
@@ -140,8 +167,8 @@ pub struct VerifiedReplicaProvenance {
 /// Typed source identity recovered from a verified-replica sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedReplicaSource {
-    pub subject_id: pplx_space_common_core::types::SubjectId,
-    pub storage_uri: pplx_space_common_core::types::ExactStorageUri,
+    pub subject_id: pplx_space_subject_model::SubjectId,
+    pub storage_uri: pplx_space_artifact_model::ExactStorageUri,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,13 +191,13 @@ pub enum ReadVerifiedReplicaProvenanceError {
     Subject {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_core::types::SubjectIdParseError,
+        source: pplx_space_subject_model::SubjectIdParseError,
     },
     #[error("verified replica provenance {path} has invalid storage URI: {source}")]
     StorageUri {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_core::types::StorageUriParseError,
+        source: pplx_space_artifact_model::StorageUriParseError,
     },
 }
 
@@ -213,7 +240,7 @@ pub fn read_verified_replica_provenance(
             source,
         }
     })?;
-    let storage_uri = pplx_space_common_core::types::ExactStorageUri::parse(&provenance.s3_uri)
+    let storage_uri = pplx_space_artifact_model::ExactStorageUri::parse(&provenance.s3_uri)
         .map_err(|source| ReadVerifiedReplicaProvenanceError::StorageUri {
             path: provenance_path,
             source,
@@ -246,7 +273,7 @@ pub struct EnsureFileReplicaOutput {
 #[derive(Debug, thiserror::Error)]
 pub enum EnsureFileReplicaError {
     #[error("invalid job identity in volume-manager response: {0}")]
-    InvalidJobId(#[from] pplx_space_common_core::types::AuthIdParseError),
+    InvalidJobId(#[from] pplx_space_accounts::AuthIdParseError),
     #[error("submit ensure-file-replica job: {0}")]
     Submit(#[source] tonic::Status),
     #[error("wait for ensure-file-replica job: {0}")]
@@ -281,7 +308,8 @@ impl Future for EnsureFileReplicaFuture {
 }
 
 /// Submit an ensure-file-replica job and wait for its terminal status.
-/// Queue-admission rejection is retried within the configured total wait.
+/// Queue-admission rejection is retried within the configured total wait, and
+/// a volume-manager restart for up to [`VOLUME_MANAGER_RESTART_BUDGET`].
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -327,7 +355,7 @@ pub fn ensure_file_replica_with_config(
 #[derive(Debug, thiserror::Error)]
 pub enum CancelTransferScopeError {
     #[error("invalid job identity in volume-manager response: {0}")]
-    InvalidJobId(#[from] pplx_space_common_core::types::AuthIdParseError),
+    InvalidJobId(#[from] pplx_space_accounts::AuthIdParseError),
     #[error("cancel transfer scope RPC failed: {0}")]
     Rpc(#[from] tonic::Status),
     #[error("transfer job {job_id} remained non-terminal with status {status}")]
@@ -337,19 +365,44 @@ pub enum CancelTransferScopeError {
 /// Cancel currently-submitted pulls for `scope` and await their writer barrier.
 ///
 /// The producer must be quiesced before calling this function. Cancellation
-/// does not permanently close the scope against future submissions.
+/// does not permanently close the scope against future submissions, so it is
+/// repeated while volume-manager restarts. The whole call, including an
+/// attempt that gets no answer, is bounded by [`VOLUME_MANAGER_RESTART_BUDGET`].
 pub async fn cancel_transfer_scope(
-    mut client: ConnectedVolumeManagerClient,
-    scope: pplx_space_common_core::types::TransferScopeId,
+    client: ConnectedVolumeManagerClient,
+    scope: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<Vec<proto::TransferJob>, CancelTransferScopeError> {
-    let response = client
-        .cancel_transfer(proto::CancelTransferRequest {
-            selector: Some(proto::cancel_transfer_request::Selector::TransferScopeId(
-                scope.to_string(),
-            )),
-        })
-        .await?
-        .into_inner();
+    cancel_transfer_scope_with(scope, move |request| {
+        let mut client = client.clone();
+        async move { client.cancel_transfer(request).await }
+    })
+    .await
+}
+
+async fn cancel_transfer_scope_with<F, Fut>(
+    scope: pplx_space_snapshot_model::TransferScopeId,
+    mut cancel: F,
+) -> Result<Vec<proto::TransferJob>, CancelTransferScopeError>
+where
+    F: FnMut(proto::CancelTransferRequest) -> Fut,
+    Fut: Future<Output = Result<tonic::Response<proto::CancelTransferResponse>, tonic::Status>>,
+{
+    let request = proto::CancelTransferRequest {
+        selector: Some(proto::cancel_transfer_request::Selector::TransferScopeId(
+            scope.to_string(),
+        )),
+    };
+    let response = pplx_space_common_grpc::retry_grpc_status_with_context(
+        "volume-manager",
+        "CancelTransfer",
+        VOLUME_MANAGER_RESTART_RETRY_POLICY,
+        // Bounds an unanswered attempt too. A cancellation still waiting for
+        // its writers at the deadline fails, and the caller cancels again.
+        pplx_space_common_grpc::GrpcRetryContext::with_timeout(VOLUME_MANAGER_RESTART_BUDGET),
+        || cancel(request.clone()),
+    )
+    .await?
+    .into_inner();
     for job in &response.jobs {
         let terminal = matches!(
             proto::TransferJobStatus::try_from(job.status).ok(),
@@ -456,28 +509,47 @@ where
     Fut: Future<Output = Result<tonic::Response<SubmitTransferResponse>, tonic::Status>>,
 {
     let mut retry_index = 0;
+    let mut unreachable_since: Option<tokio::time::Instant> = None;
     loop {
-        match submit(request.clone()).await {
-            Ok(response) => return Ok(response.into_inner()),
-            Err(status)
-                if matches!(
-                    status.code(),
-                    tonic::Code::ResourceExhausted | tonic::Code::Unavailable
-                ) =>
-            {
-                let Some(delay) = ENSURE_FILE_REPLICA_RETRY_POLICY.backoff_delay(retry_index)
-                else {
-                    return Err(status);
-                };
-                let remaining = max_total.saturating_sub(started_at.elapsed());
-                if delay >= remaining {
-                    return Err(status);
-                }
-                retry_index += 1;
-                tokio::time::sleep(delay).await;
-            }
-            Err(status) => return Err(status),
+        // An attempt that gets no answer counts towards the outage from when
+        // it started, so a volume-manager that accepts connections and never
+        // answers is given up on at the restart budget too.
+        let attempt_started = tokio::time::Instant::now();
+        let attempt_budget = VOLUME_MANAGER_RESTART_BUDGET
+            .saturating_sub(unreachable_since.map_or(Duration::ZERO, |since| since.elapsed()))
+            .min(max_total.saturating_sub(started_at.elapsed()));
+        let status = match tokio::time::timeout(attempt_budget, submit(request.clone())).await {
+            Ok(Ok(response)) => return Ok(response.into_inner()),
+            Ok(Err(status)) => status,
+            Err(_) => tonic::Status::deadline_exceeded(
+                "volume-manager did not answer the transfer submission",
+            ),
+        };
+        // Admission refusals wait within the total budget. A refused, dropped
+        // or unanswered connection, or a handoff refusal, is volume-manager
+        // restarting; the submission is deduplicated, so it is replayed for up
+        // to the restart budget.
+        let retry = if status.code() == tonic::Code::ResourceExhausted {
+            unreachable_since = None;
+            true
+        } else if pplx_space_common_grpc::should_reconnect_status(&status) {
+            unreachable_since.get_or_insert(attempt_started).elapsed()
+                < VOLUME_MANAGER_RESTART_BUDGET
+        } else {
+            false
+        };
+        if !retry {
+            return Err(status);
         }
+        let Some(delay) = ENSURE_FILE_REPLICA_RETRY_POLICY.backoff_delay(retry_index) else {
+            return Err(status);
+        };
+        let remaining = max_total.saturating_sub(started_at.elapsed());
+        if delay >= remaining {
+            return Err(status);
+        }
+        retry_index += 1;
+        tokio::time::sleep(delay).await;
     }
 }
 

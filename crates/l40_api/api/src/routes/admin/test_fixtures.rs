@@ -27,8 +27,8 @@ pub(super) struct AdminRouterHarness {
     app: axum::Router,
     pub(super) operator: crate::models::User,
     pub(super) operator_token: String,
-    pub(super) tenant_org: pplx_space_common_core::types::OrgId,
-    pub(super) tenant_admin: pplx_space_common_core::types::UserId,
+    pub(super) tenant_org: pplx_space_accounts::OrgId,
+    pub(super) tenant_admin: pplx_space_accounts::UserId,
     pub(super) tenant_admin_token: String,
     pub(super) state: crate::routes::AppState,
 }
@@ -44,10 +44,8 @@ pub(super) async fn admin_router_harness() -> TestResult<Option<AdminRouterHarne
 pub(super) async fn admin_router_harness_with(
     configure: impl FnOnce(&mut crate::routes::AppState),
 ) -> TestResult<Option<AdminRouterHarness>> {
-    use pplx_space_common_core::{
-        sql,
-        types::{OrgId, UserId},
-    };
+    use pplx_space_accounts::{OrgId, UserId};
+    use pplx_space_sql_locator::sql;
 
     let Some(db) = postgres_fixture().await? else {
         return Ok(None);
@@ -214,4 +212,11 @@ impl AdminRouterHarness {
             .cloned()
             .collect()
     }
+}
+
+/// Assert that an admin error body's `error` message contains `needle`.
+#[track_caller]
+pub(super) fn assert_error_contains(body: &serde_json::Value, needle: &str) {
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(needle), "expected {needle:?} in {body}");
 }

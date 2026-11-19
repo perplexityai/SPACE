@@ -88,7 +88,7 @@ fn openapi_identifier(value: &str) -> String {
 
 pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
     let response = json!({
-        "description": "### Read the stream\n\n- Each SSE event carries one `DataPlaneServerFrame` JSON object. Ignore comment heartbeats.\n- Decode stdout and stderr's `data_base64` using standard base64.\n- Success requires `process_exited` with exit code zero and no error or missing output. HTTP 200 or a closed stream alone is not success.\n\n### Example output\n\nExcerpt, not a complete stream:\n\n```text\nid: 4503599627632640\nevent: stdout\ndata: {\"type\":\"stdout\",\"seq\":1,\"data_base64\":\"SGVsbG8gZnJvbSBTUEFDRQo=\"}\n\nevent: process_exited\ndata: {\"type\":\"process_exited\",\"process_id\":\"proc_00000000-0000-0000-0000-000000000000\",\"exit_code\":0,\"status\":\"exited\"}\n\n```",
+        "description": "### Read the stream\n\n- Each SSE event carries one `DataPlaneServerFrame` JSON object. Ignore comment heartbeats.\n- Decode stdout and stderr's `data_base64` using standard base64.\n- Success requires `process_exited` with exit code zero and `output_truncated` false, and no error or missing output. HTTP 200 or a closed stream alone is not success.\n\n### Example output\n\nExcerpt, not a complete stream:\n\n```text\nid: 4503599627632640\nevent: stdout\ndata: {\"type\":\"stdout\",\"seq\":1,\"data_base64\":\"SGVsbG8gZnJvbSBTUEFDRQo=\"}\n\nevent: process_exited\ndata: {\"type\":\"process_exited\",\"process_id\":\"proc_00000000-0000-0000-0000-000000000000\",\"exit_code\":0,\"status\":\"exited\",\"output_truncated\":false}\n\n```",
         "content": {
             "text/event-stream": {
                 "schema": { "type": "string" },
@@ -117,7 +117,7 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
             "name": "Last-Event-ID",
             "in": "header",
             "required": false,
-            "description": "SSE `id` of the last frame received.\n\n- Echo the `id` exactly as received, on the same session's stream.\n- A process stream resumes with the output after that frame while it is retained; otherwise `resync_required` precedes the output it continues with: `cursor_out_of_window` when the output is evicted or the `id` is past it, `cursor_replay_unavailable` when the `id` does not resume exactly.\n- A file-watch stream resumes live; its first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum, and process stream values too high to number a later frame above, return 400.",
+            "description": "SSE `id` of the last frame received.\n\n- Echo the `id` exactly as received, on the same session's stream.\n- A process stream resumes with the output after that frame while it is retained; otherwise `resync_required` precedes the output it continues with: `cursor_out_of_window` when the output is evicted or the `id` is past it, `cursor_replay_unavailable` when the `id` does not resume exactly.\n- A file-watch stream resumes live; its first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum return 400.",
             "schema": {
                 "type": "integer",
                 "format": "int64",
@@ -131,8 +131,8 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
         json!({
             "200": response,
             "400": data_plane_error_response("Invalid session id, session kind, token transport, or Last-Event-ID, or a pty process session that has not started"),
-            "401": data_plane_error_response("Missing, invalid, or expired data-plane token"),
-            "403": data_plane_error_response("Token does not authorize this session"),
+            "401": data_plane_error_response("Missing, malformed, invalid, or expired data-plane token, including a token issued for another session. The `Bearer` scheme is case-insensitive"),
+            "403": data_plane_error_response("The token was issued for this session but does not grant this access"),
             "404": data_plane_error_response("Session not found"),
             "409": data_plane_error_response("Process session is already attached (retryable), or the sandbox is not running and this command cannot wake it (not retryable; `details` as on createCommand's conflict). The same 409 answers whether the node refused to start the command or the sandbox has no node and nothing is about to wake it. Over WebSocket the same refusal is an `error` frame with code `backend_stream_error` and the same `details`: branch on `details` `reason` (`sandbox_not_running`), not on the code"),
             "429": data_plane_error_response("Attached-stream limit exceeded"),

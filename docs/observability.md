@@ -352,8 +352,11 @@ on that one call with `ExpectedGrpcStatus`. A marked call records the code in
 pulls PERMISSION_DENIED until sandbox-manager has registered it: a pull sent
 before the owner's first control call, within ten seconds of launch, and short
 of the last pending attempt. A marked pull's refusal is always retried; the
-refusal that ends the wait is still an ERROR span. Platform codes such as
-UNAVAILABLE and INTERNAL stay errors even when marked.
+refusal that ends the wait is still an ERROR span. sandbox-manager marks its
+route identity and verification-key pushes UNIMPLEMENTED, the answer of a
+net-gateway launched from a binary older than those RPCs, and counts that
+answer as the push's `unsupported` outcome. Platform codes such as UNAVAILABLE
+and INTERNAL stay errors even when marked.
 
 ## S3 client spans
 
@@ -428,7 +431,10 @@ unknown outcome, or a deadline before any `PENDING`. The
 `step:prepare_teardown_suspend`, so it counts every retried release. Watch a
 prolonged suspend through how long one sandbox's teardown spans keep recording
 `teardown.release=pending`, or through pods stuck `Terminating`, rather than
-through span errors.
+through span errors. A pod held because its sandbox was quarantined after an
+interrupted suspend doesn't recover by waiting; see
+[A sandbox quarantined after an interrupted suspend](troubleshooting.md#a-sandbox-quarantined-after-an-interrupted-suspend)
+for the alert and the operator's discard delete.
 
 A root that links to the context that caused it records that context's trace
 id as `origin_trace_id`, since a link is not searchable, and whether it was
@@ -1126,8 +1132,7 @@ A process names at most 64 override-only callers over its lifetime; past that,
 a new override-only caller keeps its own limiter bucket but reports
 `client_id:overflow`. Which callers fit is first-come per process, so replicas
 can disagree once the cap fills. While the limiter is off it resolves against
-the static list only. Reconnects through the data-plane entrypoint aren't
-attributed and report `unknown`.
+the static list only.
 
 Every other `sandbox.api.*` metric built from an API metric identity also
 carries `client_id`: route latency and errors (`sandbox.api.latency_ms`,
@@ -1195,13 +1200,15 @@ fell back to the platform default shape; those events omit `vcpu` and
 ## Requested sandbox size
 
 The API records the vCPU and guest memory each sandbox will run with, after
-template and warm-pool defaults are applied, as two distributions with the same
-tags:
+template and warm-pool defaults are applied, and its configured disk size, as
+distributions with shared call-context tags. Only vCPU and memory samples on
+creates carry the additional `defaulted` tag:
 
 | Metric | Value |
 | --- | --- |
 | `sandbox.api.requested.vcpu` | vCPUs |
 | `sandbox.api.requested.memory_bytes` | Guest memory in bytes (`memory_mib * 1048576`) |
+| `sandbox.api.requested.disk_bytes` | Configured rootfs size in bytes (`disk_mib * 1048576`) |
 
 | Tag | Values |
 | --- | --- |
@@ -1209,12 +1216,14 @@ tags:
 | `surface` | `native` or `ecw`, the API the call arrived on |
 | `admission` | `accepted`, or `rejected` when cluster activation admission refused the call, whether at request entry or when the substrate charged a restore claim |
 | `template` | The resolved template for a create; otherwise the sandbox's template (`unknown` if the row names none) |
-| `defaulted` | Creates only. `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
+| `defaulted` | vCPU and memory samples on creates only. `false` when the request set both vCPU and memory; `true` when a build shape, the platform default, a warm-pool config or a warm-pool policy supplied either. Warm-pool claims are always `true` |
 | `client_id` | The request's bounded caller, as described above |
 
 Each eligible recorded create, activation or resume contributes one sample to
-each distribution. Retries that reach a recording point add another sample;
-the distribution count is not the total number of incoming calls.
+the vCPU and memory distributions when both values are known and positive,
+and independently to the disk distribution when its value is known and positive.
+Retries that reach a recording point add another sample; the distribution
+count is not the total number of incoming calls.
 
 Native creates (`/v1` and admin) are re-queued by the dispatcher when cluster
 admission refuses them, and each retry that reaches admission adds another
@@ -1231,24 +1240,84 @@ Resident resumes need no admission; recovering a missing runtime can require
 admission and be rejected. Eligible implicit wakes routed through the lifecycle
 action controller are included; data-plane paths that bypass it are not.
 
-Nothing is recorded for a fork; a create whose size the API did not resolve (a
-Direct create, or a Kubernetes create left to the node's default shape); a
-wake of a running sandbox; a lifecycle action on a `restoring` sandbox,
-including a restore-lease takeover the substrate charges. Disk size is not
-recorded.
+Nothing is recorded for a fork; a wake of a running sandbox; a lifecycle action
+on a `restoring` sandbox, including a restore-lease takeover the substrate
+charges; or a create for which neither compute nor disk size is known.
+Direct cold creates omit compute samples because the API does not resolve their
+compute shape, but record a disk sample when `disk_mib` is known and positive.
+
+The disk size is the sandbox's `disk_mib`: the request's, or one a warm-pool
+config or policy supplied. It is the size the rootfs is configured to, not disk
+usage or host allocation. A sandbox that leaves `disk_mib` unset runs on its
+template's own rootfs size, which the API does not resolve, so it records no
+disk sample and the disk distribution can count fewer calls than the vCPU and
+memory ones. A known disk size is recorded even when the vCPU and memory are
+not.
+
+## Guest memory in use
+
+Sandbox-manager records the memory each running sandbox's guest is using as
+the distribution `sandbox.guest.mem_used_bytes`: the guest's
+`MemTotal - MemAvailable` from one `/proc/meminfo` read, in bytes. The guest
+reports it on the bridge `Ping` the health probe already sends about every 25
+to 40 seconds, including scheduler rounding, so there is no separate schedule.
+
+Each sample carries the sandbox's `template` name, cached when the watchdog
+loads the sandbox's metadata from its database row. Recording the sample
+performs no additional database read or template lookup. Deployment dimensions
+such as `cluster_id` and `env` come from the metrics sink; no sandbox ID, host
+or `client_id` is attached explicitly.
+
+A sample is recorded once per probe whose result sandbox-manager accepts: a
+probe that crossed a lifecycle edge, or whose sandbox was removed, is
+discarded. Only `started` sandboxes contribute. Unclaimed, ready warm-pool
+members are normally paused and therefore excluded, as are other paused,
+quarantined and non-started sandboxes. This is a lifecycle filter, not a
+pool-membership filter: a pool-marked sandbox that is actually `started` can
+contribute, without a separate pool tag. A guest that predates the field,
+the Windows guest, a guest that cannot read or make sense of `/proc/meminfo`,
+and a failed `Ping` report nothing, and nothing is recorded for that probe;
+zero is a valid sample. A reading is never kept or repeated.
+
+Only diagnostic-draining Pings read memory; readiness and connection checks
+do not. The guest waits up to 100 ms for memory and skips it if another read
+is still outstanding. A timeout omits the sample without accumulating blocked
+readers. The value is telemetry, not health: a missing reading leaves the `Ping`
+successful, and high usage changes no health status. The guest is
+tenant-controlled, so the value is whatever it reports. The count of samples
+grows with running sandboxes and time, not with distinct sandboxes.
 
 ## Worker-local lifecycle populations
 
-Sandbox-manager emits `sandbox.worker.lifecycle.count` every 60 seconds from
-its durable SQLite rows, grouped by `state`, `runtime`, and `runtime_version`.
-Runtime identity comes from the sandbox's recorded execution metadata, not the
-node's default, installed-binary inventory, or a mutable template tag. Runtime
-aliases are normalized to full names such as `firecracker` and
-`cloud-hypervisor`. Legacy rows without a valid recorded identity keep their
-known runtime kind and use `runtime_version:unknown`; an unrecognized kind is
-also `unknown`, never an assumed legacy version.
+Sandbox-manager emits `sandbox.worker.lifecycle.status_count` every 60 seconds
+from its durable SQLite rows, grouped by `state`, `cleanup_state`, `runtime`,
+and `runtime_version`. `state` is always a lifecycle state. `cleanup_state` is
+`required` or `failed` for rows a node-local cleanup owns, whose `state` is
+`stopping`, `deleting` or `suspending`, and `none` otherwise. It replaces
+`sandbox.worker.lifecycle.count`, which folded those rows into
+`state:cleanup_required` and `state:cleanup_failed`. Renaming the metric alone
+doesn't translate a query: `status_count{state:stopping}` also counts stops a
+cleanup owns. `lifecycle.count{state:stopping}` becomes
+`status_count{state:stopping,cleanup_state:none}`, and
+`lifecycle.count{state:cleanup_failed}` becomes
+`status_count{cleanup_state:failed}`. Runtime identity comes from the sandbox's
+recorded execution metadata, not the node's default, installed-binary inventory,
+or a mutable template tag. Runtime aliases are normalized to full names such as
+`firecracker` and `cloud-hypervisor`. Legacy rows without a valid recorded
+identity keep their known runtime kind and use `runtime_version:unknown`; an
+unrecognized kind is also `unknown`, never an assumed legacy version.
 
 With the default metric namespace, the running-state population by version is:
+
+```text
+sum:space.sandbox.worker.lifecycle.status_count{state:started} by {runtime,runtime_version}
+```
+
+A worker on a release that still emits `sandbox.worker.lifecycle.count` emits
+`status_count` with only `state` and `cleanup_state`, so its `runtime` and
+`runtime_version` breakdown is only on the old metric. During a rollout to the
+release that retired it, keep the old per-version query beside the new one
+until every worker has upgraded, then remove it:
 
 ```text
 sum:space.sandbox.worker.lifecycle.count{state:started} by {runtime,runtime_version}
@@ -1257,16 +1326,17 @@ sum:space.sandbox.worker.lifecycle.count{state:started} by {runtime,runtime_vers
 Placement identity comes from telemetry context. No sandbox, template, or
 execution identifier is a metric dimension. Summing the version buckets
 preserves the existing per-state total. The sampler emits zero once when a
-previously reported state/runtime/version bucket disappears, including when
-only the version changes. Database read failures skip the sample rather than
+previously reported state/cleanup/runtime/version bucket disappears, including
+when only the version changes. Database read failures skip the sample rather than
 reporting a false zero.
 
 These are locally recorded lifecycle populations, not an independent
 process-liveness census. `started`, `paused`, and `suspended` are distinct
 states; a suspended row describes retained state, not a resident VM. A
 missing or stale sample does not establish that a node has zero sandboxes.
-Metric backends with explicit tag-retention allowlists must retain `runtime`
-and `runtime_version` alongside `state` to support the version breakdown.
+Metric backends with explicit tag-retention allowlists must retain
+`cleanup_state`, `runtime` and `runtime_version` alongside `state` to support
+the cleanup and version breakdowns.
 
 ## Sandboxes in a transient lifecycle
 
@@ -1317,6 +1387,76 @@ of two.
 The census is independent of the loops that act on such rows. It runs on
 both substrates whether or not the transient-lifecycle sweeper or node-drain
 is enabled, and it counts `deleting`, which the sweeper never ages out.
+
+## Environment placement shadow
+
+While `SPACE_ENVIRONMENT_PLACEMENT_GATE` is `shadow`, each substrate reports
+what `on` would refuse (see "Placing work by environment" in
+[execution-environments.md](execution-environments.md)). Nothing is emitted
+while it's `off`.
+
+| Metric | Tags | Value |
+| --- | --- | --- |
+| `environment_placement.would_refuse` | `path`, `reason` | Counter, Direct: one per candidate node a placement statement returned that `on` would leave out |
+| `environment_placement.running_pods` | `placement` | Gauge, Kubernetes: bound sandbox pods on a node, by how the node's labels compare with the environment they record |
+| `environment_placement.pending_pods` | `reason` | Gauge, Kubernetes: bound sandbox pods the gate, `on`, holds back, unschedulable because no node carries the environment label they require |
+
+On Direct, `path` names the statement (`cached_create`, `last_known_create`,
+`pull_create`, `pool_adoption`, `restore_source` or `restore_remote`) and
+`reason` is `no_evidence`, `incomplete`, `stale` or
+`environment_not_usable`, except that a restore candidate whose evidence
+doesn't list the checkpoint's environment counts as
+`restore_not_cold_bootable`: a node lists an environment as usable when it
+can cold boot it, which a restore doesn't need, so that count is the restores
+`on` would hold back that the node might have loaded. Each statement adds the
+number of candidates the gate would refuse for each reason, so the counter
+measures refused candidates, not refused requests. Each statement also logs
+`environment placement gate would refuse these candidates` at `info`, once
+per reason, with the count and the nodes.
+
+The counter covers only the candidates `on` would take away, not the ones it
+would add: those the environment match admits in place of a legacy check, and
+the last-known and pull-on-create candidates a create reaches once `on`
+refuses every ready holder. When shadow
+can't read a build's environment binding it logs `environment placement gate
+couldn't read the build's environment` at `warn` and places the work as
+unbound, as `off` does, so that work counts nothing.
+
+On Kubernetes the scheduler picks the node, so the cluster controller's
+elected leader compares, once a minute, the recorded environment of every
+bound pod on a node, running or still starting, with that node's environment
+labels, from its pod and Node
+reflectors. `placement` is `admitted`, `no_evidence` (the node has no
+environment label at all) or `environment_not_usable` (the node is labeled
+with other environments). Labels carry no receipt time, so a stale or
+incomplete node reads as whatever node-ctl last wrote. Every `placement` is
+emitted on every tick, zeros included, and a tick whose reflectors aren't
+ready emits nothing. The census also runs while the gate is `on`, which
+Kubernetes doesn't support yet (see "Not covered" in
+[execution-environments.md](execution-environments.md)); there, a non-zero
+value is a pod placed before the switch, or one whose node lost the
+label after it was placed: node affinity isn't checked once a pod runs.
+The census counts only pods that record an environment, so it leaves out
+pods created while the gate was `off`, which carry no annotation, pods whose
+node isn't in the controller's Node cache, and pods whose annotation doesn't
+parse, which it logs at `warn`. A zero during a shadow rollout therefore says
+nothing about pods created before the switch to `shadow`. Combine replicas with
+`max`, as for the transient-lifecycle census.
+
+The same tick counts `environment_placement.pending_pods`: bound pods built
+with the gate `on` that have no node, that the scheduler has ruled
+unschedulable, and whose environment label no node carries. `reason` is
+`no_evidence` when no node carries any environment label, as on a new cluster
+or after a fleet-wide node-manager rollout whose observation node-ctl can't
+decode, and `environment_not_usable` when nodes carry only other
+environments' labels. A pod whose label some node carries isn't counted, since
+something other than its environment keeps it off that node. Shadow pods
+require no label, so the gauge stays at zero until the gate is `on`. A
+non-zero `no_evidence` means `on` is holding back all bound work. Switching
+the gate to `shadow` lets new pods place without the label; a held pod keeps
+the requirement it was built with. A restore pinned to its source node that
+kubelet refuses fails, and the census counts no failed pod, so neither gauge
+shows it.
 
 ## Reserved DNS upstream connections
 

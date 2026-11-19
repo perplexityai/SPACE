@@ -470,7 +470,8 @@ edge_table! {
     /// `complete_row_intent_cleanup_for_job(MarkSuspended)` with a published
     /// suspend artifact.
     SUSPEND_COMPLETE: Completion, of(&[Suspending]) => Suspended;
-    /// `rollback_suspending_to_paused` from the suspend snapshot path.
+    /// `rollback_suspending_to_paused` and `rollback_published_suspend_to_paused`
+    /// from the suspend snapshot path.
     SUSPEND_ROLLBACK: Compensation, of(&[Suspending]) => Paused;
     /// `restage_rolled_back_full_snapshot`: the full process-snapshot rollback
     /// restages its stopped row, so `start_from_checkpoint` can restore the
@@ -508,6 +509,8 @@ edge_table! {
     DELETE_ADMISSION: Request, ALL.without(Deleting) => Deleting;
     /// The eviction claims: `claim_stopped_sandbox_for_eviction`,
     /// `claim_suspended_sandbox_for_eviction`,
+    /// `claim_deleted_suspended_sandbox_for_eviction`,
+    /// `claim_stale_upgrade_copy_for_eviction`,
     /// `claim_failed_restoring_sandbox_for_eviction`,
     /// `claim_teardown_suspend_failed_sandbox_for_eviction`,
     /// `claim_retired_teardown_execution_for_release` and
@@ -528,7 +531,8 @@ edge_table! {
     CLEANUP_COMPLETE_STOPPED: Recovery, OWNED => Stopped;
     /// As above for `mark_suspended`.
     CLEANUP_COMPLETE_SUSPENDED: Recovery, OWNED => Suspended;
-    /// `quarantine_cleanup_episode_for_job`, and `apply_cleanup_state` for a
+    /// `quarantine_cleanup_episode_for_job`, `quarantine_refused_suspend_backup`,
+    /// and `apply_cleanup_state` for a
     /// `quarantine` completion or a `mark_suspended` completion without a
     /// suspend artifact.
     CLEANUP_QUARANTINE: Recovery, OWNED => Quarantined;

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 use tokio_util::sync::CancellationToken;
 
 mod fixtures;

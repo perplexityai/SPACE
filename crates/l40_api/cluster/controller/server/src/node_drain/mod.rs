@@ -175,8 +175,8 @@
 //! `SandboxState` respectively, validated at the proto boundary, no
 //! new 2-variant enums introduced.
 
-use pplx_space_common_core::types::NodeId;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -184,8 +184,10 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::node_drain as node_drain_metrics;
 use pplx_space_api::controllers::substrate::NODE_RPC_BLOCKING_BUDGET;
-use pplx_space_common_core::kubernetes::EvacuationPlacement;
-use pplx_space_common_core::types::{NodeDrainMode, PositiveDuration, SandboxLifecycle};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::NodeDrainMode;
+use pplx_space_sandbox_model::SandboxLifecycle;
+use pplx_space_sandbox_pod::EvacuationPlacement;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -507,8 +509,10 @@ pub(crate) const DEFAULT_EVACUATE_TIMEOUT_SECS: u64 = 600;
 /// by the `evacuation_restore_target IS NOT NULL` marker, so this never
 /// aborts the pipeline's own work. Wrapped in `Option<PositiveDuration>`
 /// at the config layer so tests can disable the policy; the reconciler always
-/// uses this default.
-pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 = 600;
+/// uses this default. Defined in sandbox-store beside the sweep that applies
+/// it; the admin holds read's stuck threshold is the same constant.
+pub(crate) const DEFAULT_STALE_ABANDON_SECS: u64 =
+    pplx_space_sandbox_store::drain::STALE_ABANDON_AFTER.as_secs();
 /// How long a `suspended` sandbox whose local-snapshot backup is permanently
 /// refused (not `Suspended` on the node — a stuck on-node `restoring`) must
 /// have been settled before the node-drain give-up adopts an existing ready
@@ -534,7 +538,7 @@ pub(crate) const DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS: u64 = 600;
 /// window is how long the substrate itself lets a pod-less generation be
 /// materializing.
 pub(crate) const MIN_POD_LESS_GIVEUP_STALE: Duration =
-    pplx_space_common_core::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL;
+    pplx_space_rpc_contracts::restore_ownership::RESTORE_EXECUTION_OWNERSHIP_TTL;
 /// The longest window the environment may set; a larger value clamps down to
 /// it, so a typo can't overflow the SQL interval and fail every tick.
 pub(crate) const MAX_POD_LESS_GIVEUP_STALE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -872,10 +876,10 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders these under
     /// `clusterController.reconcilers.node_drain.*`.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {
@@ -944,7 +948,7 @@ impl ReconcilerConfig {
 /// whitespace-only — the two-MNG rollout is opt-in and never required for
 /// the reconciler to make forward progress.
 fn env_evacuation_placement(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
     value_var: &str,
 ) -> Option<EvacuationPlacement> {
     let value = env.var(value_var).ok().unwrap_or_default();

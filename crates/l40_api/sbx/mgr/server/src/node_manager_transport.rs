@@ -16,7 +16,8 @@ pub use pplx_space_node_mgr_client::{ConnectError, NodeManagerGrpcClient};
 /// constructors; a caller picks the one whose dial timing it needs.
 #[async_trait::async_trait]
 pub trait NodeManagerTransport: Send + Sync {
-    /// A connected client, dialing under the default connect-retry policy.
+    /// A connected client, dialing under the default connect-retry policy on
+    /// its first dial and on every redial after its connection drops.
     async fn connect(&self) -> Result<NodeManagerGrpcClient, ConnectError>;
 
     /// A connected client after a single dial, for callers that own their

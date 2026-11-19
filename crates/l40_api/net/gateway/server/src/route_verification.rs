@@ -9,7 +9,7 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519VerificationGeneration,
     ed25519::SpaceApiRouteEd25519VerificationKey,
 };
-use pplx_space_common_core::types::ClusterId;
+use pplx_space_cluster_id::ClusterId;
 
 #[derive(Clone, Debug, Default)]
 pub struct RouteVerificationState {

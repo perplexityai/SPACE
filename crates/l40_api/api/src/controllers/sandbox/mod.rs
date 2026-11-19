@@ -3,16 +3,19 @@ use crate::metrics::sandbox::api::{
     ReconnectTerminalPhase, SandboxApiMetricIdentity, SandboxApiSurface,
 };
 use futures_core::Stream;
-use pplx_space_common_core::sql;
+use pplx_space_accounts::{Email, NodeId, OrgId};
 #[cfg(test)]
-use pplx_space_common_core::types::AutoLifecycleRuntimeState;
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_TEMPLATE_TAG, Email, EnvMap, EnvSanitizationIssue, NodeId, OrgId,
-    PolicyAuthority, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId, SandboxLifecycle, SemVer,
-    TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
-};
+use pplx_space_auto_lifecycle::AutoLifecycleRuntimeState;
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
+use pplx_space_content_digest::DigestPrefixResolveError;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_guest_process::{EnvMap, EnvSanitizationIssue};
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1, proto::NetworkPolicySource};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, ExposePortRequest, NetworkProtocol};
+use pplx_space_node_model::NodePoolName;
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_store::ObservedSpacedVersion;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     AutoLifecycleTouchResult, CreateSnapshotRequest, KillRequest, ListSnapshotsRequest,
@@ -32,7 +35,13 @@ use pplx_space_sbx_mgr_client::proto::{
     SpacedWriteRequest, SpacedWriteResponse, StatsRequest, StopRequest, TouchAutoLifecycleRequest,
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
+use pplx_space_semver::SemVer;
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
+use pplx_space_template_model::{
+    DEFAULT_TEMPLATE_TAG, TemplateDesiredState, TemplateName, TemplateReference, TemplateTag,
+    TemplateVisibility,
+};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
@@ -69,7 +78,8 @@ struct SandboxObservedState {
     substrate_node_id: Option<String>,
     template: Option<String>,
     status: Option<String>,
-    spaced_version: Option<SemVer>,
+    #[sqlx(flatten)]
+    version: ObservedSpacedVersion,
     pid: Option<i32>,
     namespace: Option<String>,
     uptime: Option<String>,
@@ -140,15 +150,6 @@ struct CreateTemplateDefaults {
     default_auto_lifecycle: Option<sqlx::types::Json<AutoLifecyclePolicy>>,
 }
 
-fn validate_create_template_reference(template: &TemplateReference) -> Result<(), ControllerError> {
-    if template.artifact_digest_prefix().is_some() {
-        return Err(ControllerError::bad_request(
-            "template digest prefixes are not supported yet; use a full sha256 digest",
-        ));
-    }
-    Ok(())
-}
-
 /// Builds the not-found error for an unresolvable template reference.
 ///
 /// The create-time authorization gate reuses this for cross-org denials so a
@@ -162,6 +163,12 @@ fn template_release_not_found(
     if let Some(digest) = template.artifact_digest() {
         return ControllerError::not_found(format!(
             "no release found for template '{template_name}' runtime '{}' hash '{digest}'",
+            runtime.alias(),
+        ));
+    }
+    if let Some(prefix) = template.artifact_digest_prefix() {
+        return ControllerError::not_found(format!(
+            "no release found for template '{template_name}' runtime '{}' hash prefix '{prefix}'",
             runtime.alias(),
         ));
     }
@@ -263,7 +270,6 @@ async fn resolve_template_release(
     caller_org: OrgId,
     miss_report: ReleaseMissReport,
 ) -> Result<(Uuid, String), ControllerError> {
-    validate_create_template_reference(template)?;
     let template_name = template.name().as_str();
 
     let access = gate_template_access(pool, template.name(), caller_org).await?;
@@ -275,7 +281,43 @@ async fn resolve_template_release(
     // the gate and the lookups are separate READ COMMITTED statements, so a
     // template published or flipped to org_specific in between must still
     // not resolve cross-org at read time.
-    if let Some(digest) = template.artifact_digest() {
+    let digest = match template.artifact_digest_prefix() {
+        Some(prefix) => {
+            let candidates = crate::template_releases_store::template_release_digests_with_prefix(
+                pool,
+                template.name(),
+                prefix,
+                runtime,
+                caller_org,
+            )
+            .await
+            .map_err(|err| {
+                db_contention_error("failed to resolve template release by hash prefix", &err)
+            })?;
+            match prefix.resolve_unique(candidates) {
+                Ok(digest) => Some(digest),
+                Err(DigestPrefixResolveError::NoMatch(_)) => {
+                    return Err(release_miss(
+                        pool,
+                        template,
+                        runtime,
+                        caller_org,
+                        access,
+                        miss_report,
+                    )
+                    .await?);
+                }
+                Err(DigestPrefixResolveError::Ambiguous(_)) => {
+                    return Err(ControllerError::bad_request(format!(
+                        "template digest prefix '{prefix}' matches more than one release of \
+                         template '{template_name}'; use a longer prefix or the full digest"
+                    )));
+                }
+            }
+        }
+        None => template.artifact_digest(),
+    };
+    if let Some(digest) = digest {
         let resolved = crate::template_releases_store::resolve_template_release_by_digest(
             pool,
             template.name(),
@@ -467,7 +509,6 @@ fn create_auto_lifecycle_policy(
 fn reconnect_entrypoint(identity: SandboxApiMetricIdentity) -> Option<ReconnectEntrypoint> {
     match (identity.surface, identity.op) {
         (SandboxApiSurface::Ecw, "connect") => Some(ReconnectEntrypoint::Connect),
-        (_, "access") => Some(ReconnectEntrypoint::Dataplane),
         _ => None,
     }
 }
@@ -528,44 +569,6 @@ fn wait_ready_reason(phase: WaitReadyTimeoutPhase) -> ReconnectReason {
     }
 }
 
-fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> ReconnectTerminalPhase {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectTerminalPhase::Restore,
-        ControllerRetryAfterCause::PodNeverReady => ReconnectTerminalPhase::PodNeverReady,
-        ControllerRetryAfterCause::ProxyUnreachable => ReconnectTerminalPhase::ProxyUnreachable,
-        ControllerRetryAfterCause::GuestNotReady => ReconnectTerminalPhase::GuestNotReady,
-        // Cluster-admission backpressure is a front-door 429, not a reconnect
-        // outcome; it shouldn't reach the reconnect terminal path. Map it to the
-        // API phase defensively.
-        ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectTerminalPhase::Api,
-    }
-}
-
-fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectReason::RestoreInFlight,
-        ControllerRetryAfterCause::PodNeverReady => ReconnectReason::PodNeverReady,
-        ControllerRetryAfterCause::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
-        ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
-        // See note above: not a reconnect cause. Treat as a retryable wait.
-        ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectReason::WaitBudget,
-    }
-}
-
-fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutcome {
-    match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectOutcome::WakeInProgress,
-        ControllerRetryAfterCause::PodNeverReady
-        | ControllerRetryAfterCause::ProxyUnreachable
-        | ControllerRetryAfterCause::GuestNotReady
-        // See note above: not a reconnect cause. Treat as retryable (exhausted).
-        | ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectOutcome::Exhausted,
-    }
-}
-
 fn reconnect_timeout_phase_and_reason(
     initial_lifecycle: &str,
     err: &SubstrateError,
@@ -603,6 +606,7 @@ fn reconnect_error_outcome(
         }
         SubstrateError::Conflict { .. }
         | SubstrateError::FailedPrecondition { .. }
+        | SubstrateError::InvalidRequest { .. }
         | SubstrateError::RetainedFilesystemOnlyCopy { .. }
         | SubstrateError::EvacuationClaimLost { .. } => (
             ReconnectOutcome::Rejected,
@@ -620,14 +624,25 @@ fn reconnect_error_outcome(
         // wait_budget) so restore-path and direct-wake admission rejections land
         // on one outcome/reason series instead of being split across
         // `rejected/unavailable` vs `exhausted/wait_budget`.
+        // A client at its live cap is a per-client refusal, recorded like the
+        // concurrency limiter's rather than as cluster saturation.
+        SubstrateError::AdmissionRejected { live_cap: true, .. } => (
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::RateLimited,
+        ),
         SubstrateError::AdmissionRejected { .. } => (
             ReconnectOutcome::Exhausted,
             ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         ),
-        // Only suspend returns `SandboxNoPod`, so a wake never sees it; it
-        // shares `Unavailable`'s arm, as it shares its 503.
-        SubstrateError::Unavailable { .. } | SubstrateError::SandboxNoPod { .. } => (
+        // Only suspend returns `SandboxNoPod` and only a Delete teardown
+        // returns `NodeDeleteNotAdmitted`, so a wake never sees either; they
+        // share `Unavailable`'s arm, as they share its 503.
+        SubstrateError::Unavailable { .. }
+        | SubstrateError::SandboxNoPod { .. }
+        | SubstrateError::Unschedulable { .. }
+        | SubstrateError::NodeDeleteNotAdmitted { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::Unavailable,
@@ -663,91 +678,41 @@ fn reconnect_error_outcome(
     }
 }
 
-fn reconnect_controller_error_outcome(
-    initial_lifecycle: &str,
+/// Classify a wake that activation admission refused. The only caller, the
+/// `Wake` / `ImplicitWake` admission check in `SandboxController::action`,
+/// passes what `admit_action_cluster_activation` returns: a live-cap refusal,
+/// or a cluster-activation 429. That check never runs the slot check, so a
+/// `NoFreeSlot` 503 doesn't arrive here.
+fn reconnect_admission_refusal_outcome(
     err: &ControllerError,
 ) -> (ReconnectOutcome, ReconnectTerminalPhase, ReconnectReason) {
-    if err.is_restore_context_unavailable() {
+    // A client at its live cap is a per-client refusal, recorded like the
+    // concurrency limiter's. Without this its bare 429 and `Retry-After` read
+    // as `wait_budget`, the cluster-saturation tag.
+    if err.is_live_cap_refusal() {
         return (
-            ReconnectOutcome::WakeFailed,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::RestoreContextUnavailable,
+            ReconnectOutcome::Rejected,
+            ReconnectTerminalPhase::Api,
+            ReconnectReason::RateLimited,
         );
     }
-    // Mirroring `reconnect_error_outcome`'s `LockContention` arm.
-    // A contention error is a 503 carrying neither a cause nor a `retry_after`,
-    // so without this it falls to the `SERVICE_UNAVAILABLE` arm below and is
-    // labelled `wake_failed` / `unavailable` — the wake-fault series a lost
-    // race must never enter, and with no `lock_contention` reason for the
-    // `lock_timeout` rollout to watch.
-    //
-    // Pre-emptive today. The only production caller, the `Wake` /
-    // `ImplicitWake` admission check in `SandboxController::action`, passes a
-    // cluster-admission rejection (a 429), which never carries the
-    // lock-contention marker. The arm is for a caller that forwards a
-    // substrate error: `From<SubstrateError>` turns `LockContention` into
-    // `ControllerError::lock_contention`, which would otherwise be labelled
-    // `wake_failed` / `unavailable` here. `reconnect_metrics_tests` pins it.
-    if err.is_lock_contention() {
+    // Cluster-activation backpressure: the rate-limited case carries a
+    // `ClusterActivationAdmission` cause, and the empty-cluster (zero-capacity)
+    // case is a bare 429 with only a Retry-After header. Both are admission
+    // exhaustion, not a substrate failure — classify them the same so a
+    // capacity outage isn't misattributed on the retry-storm dashboard.
+    if err.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
         return (
             ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::LockContention,
-        );
-    }
-    if let Some(cause) = err.retry_after_cause() {
-        return (
-            retry_after_cause_outcome(cause),
-            retry_after_cause_terminal_phase(cause),
-            retry_after_cause_reason(cause),
-        );
-    }
-    if err.retry_after().is_some() {
-        return (
-            ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
+            ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         );
     }
-
-    match err.status() {
-        axum::http::StatusCode::CONFLICT | axum::http::StatusCode::PRECONDITION_FAILED => (
-            ReconnectOutcome::Rejected,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::Conflict,
-        ),
-        axum::http::StatusCode::NOT_FOUND => (
-            ReconnectOutcome::Rejected,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::NotFound,
-        ),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE => (
-            ReconnectOutcome::WakeFailed,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::Unavailable,
-        ),
-        axum::http::StatusCode::REQUEST_TIMEOUT | axum::http::StatusCode::GATEWAY_TIMEOUT => (
-            ReconnectOutcome::Exhausted,
-            initial_lifecycle_terminal_phase(initial_lifecycle),
-            ReconnectReason::Timeout,
-        ),
-        // Cluster-activation backpressure. The rate-limited case carries a
-        // `ClusterActivationAdmission` cause and is classified above; the
-        // empty-cluster (zero-capacity) case is a bare 429 with only a
-        // Retry-After header and no cause, so it lands here. Both are admission
-        // exhaustion, not a substrate failure — classify them the same so a
-        // capacity outage isn't misattributed on the retry-storm dashboard.
-        axum::http::StatusCode::TOO_MANY_REQUESTS => (
-            ReconnectOutcome::Exhausted,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::WaitBudget,
-        ),
-        _ => (
-            ReconnectOutcome::WakeFailed,
-            ReconnectTerminalPhase::Api,
-            ReconnectReason::Substrate,
-        ),
-    }
+    (
+        ReconnectOutcome::WakeFailed,
+        ReconnectTerminalPhase::Api,
+        ReconnectReason::Substrate,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1000,7 +965,9 @@ struct SandboxPortExposureApplyObservation {
 
 #[derive(Debug, Clone)]
 struct SandboxPortExposureApplyError {
-    error: ControllerError,
+    // Boxed: with the observation beside it, an inline `ControllerError`
+    // makes this the large `Err` that `clippy::result_large_err` refuses.
+    error: Box<ControllerError>,
     observation: Option<SandboxPortExposureApplyObservation>,
 }
 
@@ -1009,7 +976,10 @@ impl SandboxPortExposureApplyError {
         error: ControllerError,
         observation: Option<SandboxPortExposureApplyObservation>,
     ) -> Self {
-        Self { error, observation }
+        Self {
+            error: Box::new(error),
+            observation,
+        }
     }
 }
 
@@ -1066,7 +1036,7 @@ pub struct SandboxController {
     pub(crate) egress_profiles: crate::egress_profiles::EgressProfiles,
     tls_interception_exemptions:
         Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
-    federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+    federated_grant_audience: pplx_space_accounts::FederatedGrantAudience,
     substrate: Substrate,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
@@ -1112,7 +1082,7 @@ impl SandboxController {
 
     pub fn with_federated_grant_audience(
         mut self,
-        audience: pplx_space_common_core::types::FederatedGrantAudience,
+        audience: pplx_space_accounts::FederatedGrantAudience,
     ) -> Self {
         self.federated_grant_audience = audience;
         self
@@ -1175,6 +1145,21 @@ impl SandboxController {
         self.substrate.capabilities()
     }
 
+    /// Whether the substrate accepts a create pinned to a node pool (see
+    /// [`SubstrateAdapter::check_node_pool_placement`]).
+    pub fn check_node_pool_placement(
+        &self,
+        node_pool: &NodePoolName,
+    ) -> Result<(), SubstrateError> {
+        self.substrate.check_node_pool_placement(node_pool)
+    }
+
+    /// Whether this deployment records activating clients (see
+    /// [`super::substrate::ActivationClientAttribution`]).
+    pub fn activation_client_attribution(&self) -> super::substrate::ActivationClientAttribution {
+        self.substrate.activation_client_attribution()
+    }
+
     pub async fn set_node_schedulability(
         &self,
         request: super::substrate::NodeSchedulabilityRequest<'_>,
@@ -1208,8 +1193,8 @@ impl SandboxController {
         self.substrate
             .enqueue_artifact_backup(
                 sandbox_id,
-                pplx_space_common_core::types::ArtifactKind::Full,
-                pplx_space_common_core::types::BackupSource::CurrentInstance,
+                pplx_space_snapshot_model::ArtifactKind::Full,
+                pplx_space_snapshot_model::BackupSource::CurrentInstance,
                 target,
             )
             .await
@@ -1382,7 +1367,7 @@ use responses::*;
 pub(crate) use org::sandbox_matches_federated_owner;
 pub use org::{SandboxAccessScope, SandboxPageCursor};
 pub(crate) use queries::org_byok_enabled;
-#[cfg(test)]
+#[cfg(all(test, feature = "kubernetes"))]
 pub(crate) use queries::pooled_prepare_error_is_reclaimable;
 pub use queries::{FederatedSandboxCreateContext, RestoreForkDiskAsNewContext};
 pub use responses::{

@@ -263,7 +263,7 @@ where
     Fut: Future<Output = Result<SbxStateResponse, tonic::Status>>,
 {
     let mut response = SbxStateResponse::default();
-    for ids in ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+    for ids in ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
         let batch = fetch(ids.to_vec())
             .await
             .map_err(|error| format!("get sandbox state: {error}"))?;
@@ -360,7 +360,7 @@ pub(super) async fn fetch_sandbox_disk_usage(
         return BTreeMap::new();
     }
     let mut usage = BTreeMap::new();
-    for sandbox_ids in sandbox_ids.chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS) {
+    for sandbox_ids in sandbox_ids.chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS) {
         match client
             .get_disk_usage(Request::new(SbxGetDiskUsageRequest {
                 sandbox_ids: sandbox_ids.to_vec(),
@@ -383,18 +383,18 @@ pub(super) fn published_sandbox_state(
     policy: Option<&NetworkPolicyDetail>,
     snapshots: Vec<SnapshotDetail>,
 ) -> PublishedSandboxState {
-    let lifecycle = sandbox.observed_lifecycle();
-    if let Err(error) = &lifecycle {
+    let observed = sandbox.observed_status();
+    if let Err(error) = &observed {
         tracing::warn!(sandbox_id = %sandbox.sandbox_id, %error, "preserving cluster lifecycle after unknown node observation");
     }
     PublishedSandboxState {
         sandbox_id: sandbox.sandbox_id.clone(),
         present: true,
         template: sandbox.template.clone(),
-        status: lifecycle
+        status: observed
             .as_ref()
             .ok()
-            .map(|state| state.label().to_string()),
+            .map(|status| status.label().to_string()),
         content_hash: sandbox.image_hash.clone(),
         runtime: sandbox.runtime.clone(),
         created_at: sandbox.created_at.clone(),
@@ -412,11 +412,11 @@ pub(super) fn published_sandbox_state(
         failure_reason: sandbox.failure_reason.clone(),
         quarantine_reason_code: sandbox.quarantine_reason_code.clone(),
         transition_receipt: sandbox.transition_receipt.clone(),
-        state_degraded: sandbox.state_degraded || lifecycle.is_err(),
+        state_degraded: sandbox.state_degraded || observed.is_err(),
         current_local_artifact_id: sandbox.current_local_artifact_id.clone(),
         current_local_artifact_kind: sandbox.current_local_artifact_kind,
         current_local_artifact_origin: sandbox.current_local_artifact_origin,
-        state_changed_at: lifecycle.as_ref().ok().and(sandbox.state_changed_at),
+        state_changed_at: observed.as_ref().ok().and(sandbox.state_changed_at),
         quarantine_recovery: sandbox.quarantine_recovery.clone(),
         execution_generation: sandbox.execution_generation,
         pod_uid: sandbox.pod_uid.clone(),
@@ -429,6 +429,10 @@ pub(super) fn published_sandbox_state(
         last_used_at: sandbox_last_used_at(sandbox),
         last_access_at: sandbox_last_access_at(sandbox),
         last_command_at: sandbox_last_command_at(sandbox),
+        next_auto_event_at: sandbox
+            .auto_lifecycle_status
+            .as_ref()
+            .and_then(|status| status.next_auto_event_at),
         spaced_version: sandbox_spaced_version(sandbox),
     }
 }
@@ -528,9 +532,9 @@ fn is_legacy_template_build(
     // doesn't parse keeps the pre-partition behavior: publish.
     match template.cache_partition.as_deref() {
         None => true,
-        Some(key) => pplx_space_common_core::types::TemplateCachePartition::from_key(key)
+        Some(key) => pplx_space_template_model::TemplateCachePartition::from_key(key)
             .map_or(true, |partition| {
-                partition == pplx_space_common_core::types::TemplateCachePartition::Legacy
+                partition == pplx_space_template_model::TemplateCachePartition::Legacy
             }),
     }
 }

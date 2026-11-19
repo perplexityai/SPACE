@@ -248,7 +248,7 @@ impl TemplateManagerService {
                 entries
                     .flatten()
                     .map(|entry| entry.path())
-                    .filter(|path| pplx_space_common_core::host::btrfs::is_subvolume(path))
+                    .filter(|path| pplx_space_btrfs::is_subvolume(path))
                     .collect()
             }
         })
@@ -378,49 +378,27 @@ impl TemplateManagerService {
         let sbx_sandboxes = self
             .pool_count_sandboxes(request.get_ref().omit_sandbox_counts)
             .await;
-        let mut effective_snapshot_memory_by_requested = HashMap::new();
-        for build in &builds {
-            let settings = template_settings.get(&build.name);
-            let runtime_defaults =
-                template_runtime_defaults(&build.name, &build.content_hash, build.cache_partition);
-            let requested_memory_mib = settings
-                .map(|settings| settings.snapshot_memory_mib)
-                .or(runtime_defaults.memory_mib)
-                .unwrap_or(1024);
-            if effective_snapshot_memory_by_requested.contains_key(&requested_memory_mib) {
-                continue;
-            }
-            let effective_memory_mib =
-                match resolve_sandbox_memory(requested_memory_mib, self.sbx_connect_retry_policy)
-                    .await
-                {
-                    Ok(resolved) => {
-                        if resolved.effective_memory_mib < resolved.requested_memory_mib {
-                            tracing::info!(
-                                requested_snapshot_memory_mib = resolved.requested_memory_mib,
-                                effective_snapshot_memory_mib = resolved.effective_memory_mib,
-                                sandbox_guest_memory_max_mib = resolved.guest_memory_max_mib,
-                                sandbox_cgroup_memory_mib = resolved.cgroup_memory_mib,
-                                sandbox_cgroup_memory_max_mib = resolved.cgroup_memory_max_mib,
-                                sandbox_memory_headroom_mib = resolved.memory_headroom_mib,
-                                "clamped template list snapshot memory to sandbox policy"
-                            );
-                        }
-                        resolved.effective_memory_mib
-                    }
-                    Err(status) => {
-                        tracing::warn!(
-                            code = ?status.code(),
-                            error = %status.message(),
-                            requested_snapshot_memory_mib = requested_memory_mib,
-                            "could not resolve sandbox memory policy for template listing"
-                        );
-                        requested_memory_mib
-                    }
-                };
-            effective_snapshot_memory_by_requested
-                .insert(requested_memory_mib, effective_memory_mib);
-        }
+        let requested_snapshot_memory: std::collections::BTreeSet<u32> = builds
+            .iter()
+            .map(|build| {
+                template_settings
+                    .get(&build.name)
+                    .map(|settings| settings.snapshot_memory_mib)
+                    .or_else(|| {
+                        template_runtime_defaults(
+                            &build.name,
+                            &build.content_hash,
+                            build.cache_partition,
+                        )
+                        .memory_mib
+                    })
+                    .unwrap_or(1024)
+            })
+            .collect();
+        let effective_snapshot_memory_by_requested = self
+            .sandbox_memory_policy
+            .effective_memory_mib(&requested_snapshot_memory, self.sbx_connect_retry_policy)
+            .await;
 
         let effective_snapshot_memory = |requested_memory_mib: u32| {
             effective_snapshot_memory_by_requested
@@ -431,7 +409,7 @@ impl TemplateManagerService {
 
         for sandbox in &sbx_sandboxes {
             sandbox
-                .observed_lifecycle()
+                .observed_status()
                 .map_err(|error| Status::internal(error.to_string()))?;
         }
 
@@ -477,7 +455,7 @@ impl TemplateManagerService {
                         .iter()
                         .filter(|s| {
                             s.pool_template.as_deref() == Some(build.name.as_str())
-                                && s.observed_lifecycle().is_ok_and(|state| state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused)
+                                && s.observed_status().is_ok_and(|state| state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused))
                         })
                         .count(),
                 )
@@ -714,7 +692,7 @@ impl TemplateManagerService {
         let build_date = metadata.built_at.clone();
         // No manifest on disk yet during register — the empty default is
         // the equivalent of the previous `serde_json::Value::Null`.
-        let empty_manifest = pplx_space_common_core::types::TemplateManifest::default();
+        let empty_manifest = pplx_space_template_manifest::TemplateManifest::default();
         let arch = template_arch(&metadata, &empty_manifest);
 
         expand_template_rootfs(template_id, "pending", &staging_dir, "register").await?;
@@ -772,12 +750,12 @@ impl TemplateManagerService {
                 .await;
         }
 
-        let seed_manifest = pplx_space_common_core::types::TemplateManifest {
+        let seed_manifest = pplx_space_template_manifest::TemplateManifest {
             name: template_id.clone(),
             content_hash: content_hash.clone(),
             build_date: build_date.clone(),
             arch: arch.clone(),
-            ..pplx_space_common_core::types::TemplateManifest::default()
+            ..pplx_space_template_manifest::TemplateManifest::default()
         };
         let manifest = normalize_template_manifest(
             seed_manifest,
@@ -1013,7 +991,7 @@ pub(super) struct ExistingDigestRegistration<'a> {
 /// carries the build-manager staging prefix. Keeps digest dirs (`sha256:*`)
 /// and template-manager's own transient dirs unreachable through this field.
 pub(super) fn validate_build_staging_dir_name(name: &str) -> Result<String, Status> {
-    let component = pplx_space_common_core::types::SafePathComponent::parse(name)
+    let component = pplx_space_guest_process::SafePathComponent::parse(name)
         .map_err(|e| Status::invalid_argument(format!("invalid staging_dir: {e}")))?;
     if !is_build_staging_dir(component.as_str()) {
         return Err(Status::invalid_argument(format!(

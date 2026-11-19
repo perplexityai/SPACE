@@ -1,6 +1,6 @@
 use super::*;
 mod retry_backoff;
-use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+use pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
 pub(super) use retry_backoff::RetryBackoff;
 
 pub(super) struct BuildBaseSnapshotArgs<'a> {
@@ -55,7 +55,7 @@ pub(super) fn base_snapshot_create_request(
     content_hash: &str,
     partition: crate::db::TemplateCachePartition,
     snapshot_rootfs_size_mb: Option<u32>,
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
 ) -> pplx_space_sbx_mgr_client::proto::CreateRequest {
     let (environment, template, runtime) = match partition.environment() {
         None => (None, template_name.to_string(), runtime.alias().to_string()),
@@ -86,6 +86,7 @@ pub(super) fn base_snapshot_create_request(
         rootfs_size_mb: snapshot_rootfs_size_mb,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        required_environment: None,
         network_policy: None,
         network_policy_generation: 0,
         network_policy_authority: crate::db::PolicyAuthority::Cluster.as_proto_i32(),
@@ -138,6 +139,48 @@ impl TemplateManagerService {
                     Status::not_found(format!("build not found: {name}@{content_hash}"))
                 })?
         };
+        Self::serve_resolved_build(conn, build)
+    }
+
+    /// [`Self::resolve_template_build`] for the partition a request chooses
+    /// ([`super::support::PartitionChoice`]). A required partition is
+    /// answered only by a ready build bound to it
+    /// ([`crate::db::find_ready_build_bound_to`]), never by another
+    /// environment's build of the digest.
+    pub(super) fn resolve_selected_build(
+        conn: &rusqlite::Connection,
+        name: &str,
+        content_hash: &str,
+        choice: super::support::PartitionChoice,
+    ) -> Result<crate::db::BuildRow, Status> {
+        use super::support::PartitionChoice;
+        let partition = match choice {
+            PartitionChoice::Any => None,
+            PartitionChoice::Prefer(partition) => Some(partition),
+            PartitionChoice::Require(partition) => {
+                let build =
+                    crate::db::find_ready_build_bound_to(conn, name, content_hash, partition)
+                        .map_err(|e| {
+                            Status::internal(format!("db find_ready_build_bound_to: {e}"))
+                        })?
+                        .ok_or_else(|| {
+                            Status::not_found(format!(
+                                "build not found: {name}@{content_hash} bound to cache partition \
+                                 {partition}"
+                            ))
+                        })?;
+                return Self::serve_resolved_build(conn, build);
+            }
+        };
+        Self::resolve_template_build(conn, name, content_hash, partition)
+    }
+
+    /// The step every resolution ends with: the build's digest is checked,
+    /// and its LRU recency touched (see [`Self::resolve_template_build`]).
+    fn serve_resolved_build(
+        conn: &rusqlite::Connection,
+        build: crate::db::BuildRow,
+    ) -> Result<crate::db::BuildRow, Status> {
         validate_content_hash(&build.content_hash)?;
         touch_lru(
             conn,
@@ -323,6 +366,7 @@ impl TemplateManagerService {
                             sandbox_id,
                             template_filter: None,
                             blocking: true,
+                            discard_retained_filesystem_reason: None,
                         })
                         .await;
                 }
@@ -552,7 +596,7 @@ impl TemplateManagerService {
                     .ok_or_else(|| Status::not_found("base snapshot template build disappeared"))?;
                 build
                     .runtime
-                    .parse::<pplx_space_common_core::types::RuntimeKind>()
+                    .parse::<pplx_space_execution_spec::RuntimeKind>()
                     .map_err(|error| Status::failed_precondition(error.to_string()))
             })
             .await
@@ -642,6 +686,7 @@ impl TemplateManagerService {
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             }),
         )
         .await
@@ -1259,7 +1304,7 @@ pub(super) fn snapshot_invalidates_pool_sandbox(
 pub(super) fn pool_sandbox_partition(
     execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> Option<crate::db::TemplateCachePartition> {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(execution?).ok()?;
+    let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(execution?).ok()?;
     Some(pplx_space_node_runtime_core::catalog::template_cache_partition(execution.environment()))
 }
 

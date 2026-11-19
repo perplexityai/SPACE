@@ -14,11 +14,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, ExecutionGeneration, RouteGeneration, SandboxId, SandboxOwner,
-    SandboxRuntimeLabel, SpaceApiRouteIdentity,
-};
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_node_mgr_client::proto::{ResumeSandboxRequest, ResumeSandboxResponse};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxId, SandboxRuntimeLabel, SpaceApiRouteIdentity,
+};
 use tonic::{Code, Status};
 
 use super::BEGIN_BARRIER;

@@ -11,13 +11,13 @@
 //! rows whose source-of-truth row is either gone or old enough that local-node
 //! observation is no longer part of the wake contract.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

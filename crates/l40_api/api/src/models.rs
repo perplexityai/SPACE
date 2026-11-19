@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::api_surface::ApiSurface;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -7,13 +8,18 @@ use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use pplx_space_common_core::types::{
-    ArtifactVersion, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, Digest,
-    EcwCredentialEpoch, NodeAddress, NodeId, NodeManagedBy, NodePoolName, NodeRole, PodUid,
-    SandboxActivationAttemptId, SandboxAutoLifecyclePatch, SandboxOwnerSource, SemVer,
-    TemplateReference,
+use pplx_space_accounts::{NodeId, SandboxOwnerSource};
+use pplx_space_auto_lifecycle::{
+    AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, SandboxAutoLifecyclePatch,
 };
+use pplx_space_content_digest::Digest;
+use pplx_space_execution_spec::ArtifactVersion;
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
+use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
+use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxActivationAttemptId};
+use pplx_space_semver::SemVer;
+use pplx_space_template_model::TemplateReference;
 
 use crate::user_role::UserRole;
 use pplx_space_cluster_pool::PoolConfigOwner;
@@ -171,6 +177,9 @@ pub struct Sandbox {
     pub managed_by: String,
     pub lifecycle: String,
     pub placement: String,
+    /// The client id whose activation created the current runtime; `None`
+    /// when nothing is recorded.
+    pub activating_client_id: Option<pplx_space_accounts::ClientId>,
     pub active_node_id: Option<NodeId>,
     pub active_node_name: Option<String>,
     pub active_node_role: Option<NodeRole>,
@@ -648,6 +657,13 @@ pub struct CreateSandboxRequest {
     pub auto_lifecycle: Option<AutoLifecyclePolicy>,
     #[serde(default)]
     pub wait_until_ready: bool,
+    /// How long a `wait_until_ready` create on the Kubernetes substrate waits
+    /// for its guest to answer before it returns the sandbox started but not
+    /// yet command-ready, at most the substrate's own bound
+    /// (`SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS`). `None` waits that bound.
+    /// Set by the caller; never read from a request body.
+    #[serde(skip)]
+    pub command_ready_wait: Option<std::time::Duration>,
     #[serde(default)]
     pub network_policy: Option<NetworkPolicyV1>,
     /// Internal-only: pin this sandbox to a named isolation node pool at create
@@ -858,9 +874,9 @@ pub struct TemplateBuildRequest {
 pub struct SystemTemplateBuildRequest {
     /// Exact qualified runtime/kernel pair. Omitted: retain the bundled recipe's behavior.
     #[serde(default)]
-    pub environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     #[serde(default)]
-    pub base: Option<pplx_space_common_core::types::TemplateReference>,
+    pub base: Option<pplx_space_template_model::TemplateReference>,
     #[serde(default)]
     pub force: bool,
     #[serde(default)]
@@ -906,7 +922,7 @@ pub struct TemplateBuildConfig {
     #[serde(default)]
     pub disk_bytes: Option<u64>,
     #[serde(default)]
-    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
+    pub balloon: Option<pplx_space_execution_spec::BalloonConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -958,7 +974,7 @@ pub struct TemplateBuildUbuntuMinimalCloudSquashfs {
 #[serde(deny_unknown_fields)]
 pub struct TemplateBuildStep {
     #[serde(default)]
-    pub set_runtime: Option<pplx_space_common_core::types::TemplateRuntime>,
+    pub set_runtime: Option<pplx_space_template_runtime::TemplateRuntime>,
     #[serde(default)]
     pub clear_runtime: Option<TemplateBuildClearRuntime>,
     #[serde(default)]
@@ -1041,7 +1057,7 @@ pub struct TemplateBuildStartResponse {
     pub template_name: String,
 }
 
-pub use pplx_space_common_core::types::TemplateBuildJobState as TemplateBuildStateResponse;
+pub use pplx_space_template_model::TemplateBuildJobState as TemplateBuildStateResponse;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TemplateBuildStatusResponse {

@@ -1,7 +1,9 @@
 use super::store::{ActivationFenceOwnership, ActiveExecutionStatusRow};
 use super::*;
 use crate::controllers::substrate::PooledExecutionClaim;
-use pplx_space_common_core::types::{NodeId, PodUid, SandboxActivationAttemptId, SandboxLifecycle};
+use pplx_space_accounts::NodeId;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxLifecycle};
 use uuid::Uuid;
 
 pub(super) fn k8s_execution_route_identity(
@@ -302,6 +304,15 @@ pub(super) fn activation_wake_action(
         require_split_receipt_capability,
         publish_legacy_route_after_ack,
     })
+}
+
+/// The EC2 instance a Node's AWS `providerID` names. Kind's `kind://…` and
+/// other providers name none.
+pub(super) fn k8s_node_instance_id(node: &Node) -> Option<Ec2InstanceId> {
+    node.spec
+        .as_ref()
+        .and_then(|spec| spec.provider_id.as_deref())
+        .and_then(Ec2InstanceId::from_provider_id)
 }
 
 pub(super) fn k8s_node_internal_ip(node: &Node) -> Option<String> {
@@ -856,14 +867,22 @@ pub(super) fn stale_existing_pod_reason(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WakeRpcErrorDisposition {
     ReadinessPoll(&'static str),
+    /// node-api did not accept this process's own credential. That is no
+    /// verdict on the sandbox: a Pod-bound token stops validating the moment
+    /// its Pod is deleted, while the process still runs out its termination.
+    /// The wake is retried as an operation, by whichever executor claims it.
+    CallerUnauthenticated,
     Fail,
 }
 
 pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisposition {
+    if error.code() == Code::Unauthenticated {
+        return WakeRpcErrorDisposition::CallerUnauthenticated;
+    }
     if error.code() == Code::FailedPrecondition
         && error
             .message()
-            .contains(pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
+            .contains(pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
     {
         return WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context");
     }
@@ -891,7 +910,10 @@ pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisp
 /// failure, malformed pod IP — is a genuine infra fault that the pod-delete
 /// loop would hit too, so it must propagate.
 pub(super) fn delete_can_skip_runtime_cleanup(err: &SubstrateError) -> bool {
-    matches!(err, SubstrateError::Unavailable { .. })
+    matches!(
+        err,
+        SubstrateError::Unavailable { .. } | SubstrateError::Unschedulable { .. }
+    )
 }
 
 /// Whether an execution teardown destroys node-local sandbox state or
@@ -912,14 +934,14 @@ pub(super) enum ExecutionTeardown {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SandboxDeleteRpcErrorDisposition {
-    ContinueTeardown,
+    ProbeAdmission,
     DeferTeardown,
     RetainedFilesystemOnlyCopy,
 }
 
-/// Preserve the pod and execution tracking only when sbx-mgr explicitly says
-/// an unpublished suspend owns the sandbox. Other `Aborted` cleanup failures
-/// keep the historical best-effort delete behavior.
+/// Explicit safety refusals retain their meaning. Any other failed reply is
+/// ambiguous: admission may have committed before the reply was lost, or the
+/// node may have rejected the request without admitting it.
 pub(super) fn classify_sandbox_delete_rpc_error(
     error: &tonic::Status,
 ) -> SandboxDeleteRpcErrorDisposition {
@@ -928,7 +950,7 @@ pub(super) fn classify_sandbox_delete_rpc_error(
     } else if pplx_space_sbx_mgr_client::is_suspend_publication_pending_status(error) {
         SandboxDeleteRpcErrorDisposition::DeferTeardown
     } else {
-        SandboxDeleteRpcErrorDisposition::ContinueTeardown
+        SandboxDeleteRpcErrorDisposition::ProbeAdmission
     }
 }
 
@@ -969,8 +991,8 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
         // No sbx-mgr sandbox row: there is no node-local source left to
         // salvage, so the backup is moot.
         SubstrateError::NotFound { .. } => true,
-        // sbx-mgr's `FailedPrecondition` surfaces as `Conflict` with the
-        // message passed through. Two refusals are terminal for retire's
+        // sbx-mgr's `FailedPrecondition` and `Aborted` surface as `Conflict`
+        // with the message passed through. Two refusals are terminal for retire's
         // fixed current-instance/disk request and can never resolve by
         // retrying: a `failed` local state (nothing moves it to
         // stopped/suspended without external action) and a suspended
@@ -980,10 +1002,10 @@ pub(super) fn retire_can_skip_backup_enqueue_error(err: &SubstrateError) -> bool
         // while the leftover pod keeps feeding kubelet CreatePodSandbox
         // retries; node-local state stays salvageable either way because
         // retire never sends the sbx-mgr delete. Any other `Conflict`
-        // (e.g. a still-stopping row that can converge to a backupable
-        // state) keeps the execution tracked for retry.
+        // (e.g. a still-stopping row, which sbx-mgr answers `Aborted`)
+        // keeps the execution tracked for retry.
         SubstrateError::Conflict { message } => {
-            use pplx_space_common_core::artifact_backup_signals::{
+            use pplx_space_rpc_contracts::artifact_backup_signals::{
                 CURRENT_INSTANCE_BACKUP_PUBLISHES_FULL_MARKER,
                 CURRENT_INSTANCE_BACKUP_SANDBOX_FAILED_MARKER,
             };
@@ -1284,8 +1306,49 @@ impl Drop for CancelGuard {
                         return;
                     }
                 };
+                // The fenced retire matches nothing when another writer has
+                // already retired this execution — for example the control
+                // plane applying a node's activation-rollback receipt, which
+                // retires the row as `replaced` without deleting the pod. The
+                // pod is still this attempt's (its UID was recorded above), and
+                // a retired generation never runs again, so delete it here;
+                // otherwise kubelet retries its sandbox create against the
+                // retired execution indefinitely. When the row is still active
+                // (a newer attempt owns it), leave the pod alone.
                 if !retired {
-                    return;
+                    let already_retired = match store
+                        .execution_generation_retired(sandbox_id, generation, &pod_name)
+                        .await
+                    {
+                        Ok(already_retired) => already_retired,
+                        Err(err) => {
+                            tracing::error!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %pod_name,
+                                generation,
+                                error = %err,
+                                "cancel cleanup: failed to read execution retirement; \
+                                 leaving the pod for reconciliation"
+                            );
+                            return;
+                        }
+                    };
+                    if !already_retired {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            generation,
+                            "cancel cleanup: execution is owned by a newer activation; \
+                             leaving the pod"
+                        );
+                        return;
+                    }
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        generation,
+                        "cancel cleanup: execution was already retired; deleting its pod"
+                    );
                 }
                 match delete_sandbox_pod_if_uid(&k8s, &pod_name, &pod_uid).await {
                     Ok(()) => {
@@ -1365,6 +1428,12 @@ pub(super) fn ready_wait_bounds(requested: Duration) -> (Duration, Instant) {
 /// runs inside a budget-bounded wait.
 pub(super) fn remaining_ready_window(phase_deadline: Instant) -> Duration {
     phase_deadline.saturating_duration_since(Instant::now())
+}
+
+/// How long a create waits for its guest to answer: the substrate's
+/// `create_command_ready_timeout`, or the caller's shorter `requested` cap.
+pub(super) fn command_ready_bound(substrate: Duration, requested: Option<Duration>) -> Duration {
+    requested.map_or(substrate, |requested| requested.min(substrate))
 }
 
 /// Build the [`SubstrateError::Timeout`] for a command-readiness wait that

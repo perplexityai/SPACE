@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 #[tokio::test]
 async fn returns_ok_without_side_effects() {

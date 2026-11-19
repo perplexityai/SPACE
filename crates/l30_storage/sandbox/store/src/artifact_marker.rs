@@ -7,8 +7,9 @@
 //! takes the sandbox row lock (`SELECT ... FOR UPDATE`) first and refuses an
 //! artifact already claimed for snapshot deletion before calling here.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+use pplx_space_sql_locator::sql;
 
 /// **Observed projection.** Set the current local artifact marker to the
 /// artifact a node reported publishing, with `origin` as the operation that

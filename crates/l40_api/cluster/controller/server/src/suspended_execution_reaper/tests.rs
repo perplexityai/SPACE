@@ -32,7 +32,8 @@
 //! - R10 `r10_newer_non_suspend_snapshot_blocks_marker_clear`
 //! - R11 `r11_direct_rows_do_not_bound_the_sweep_or_get_listed`
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
@@ -43,11 +44,11 @@ use k8s_openapi::api::core::v1::{
     PodStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 use uuid::Uuid;
 
 use super::*;
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL,
 };
 
@@ -573,8 +574,10 @@ mod postgres_backed {
 
     use super::*;
     use crate::suspended_execution_reaper::store::ExecutionDbStore;
-    use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SnapshotId};
+    use pplx_space_accounts::NodeId;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;

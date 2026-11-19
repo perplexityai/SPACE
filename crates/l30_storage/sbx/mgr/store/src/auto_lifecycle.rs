@@ -3,12 +3,13 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use pplx_space_common_core::types::{
-    ArtifactKind, AutoLifecycleActivitySource, AutoLifecycleConditionKind,
-    AutoLifecycleConditionRuntimeState, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus,
-    AutoLifecycleTransition, AutoLifecycleWakeSource,
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleActivitySource, AutoLifecycleConditionKind, AutoLifecycleConditionRuntimeState,
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, AutoLifecycleTransition,
+    AutoLifecycleWakeSource,
 };
+use pplx_space_snapshot_model::ArtifactKind;
 use tonic::Status;
 
 use pplx_space_sbx_mgr_protocol::proto;
@@ -26,7 +27,7 @@ pub const TEST_GUEST_ACTIVITY_HOLD_CAP: std::time::Duration =
 
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::unwrap_used)]
-pub fn test_guest_activity_hold_cap() -> pplx_space_common_core::types::SimpleDuration {
+pub fn test_guest_activity_hold_cap() -> pplx_space_durations::SimpleDuration {
     TEST_GUEST_ACTIVITY_HOLD_CAP.try_into().unwrap()
 }
 
@@ -38,6 +39,7 @@ pub struct LifecycleMutex {
     sandbox_id: String,
     registry: Weak<LifecycleLockRegistry>,
     mutex: Arc<tokio::sync::Mutex<()>>,
+    waiters: tokio::sync::watch::Sender<()>,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,19 @@ impl LifecycleMutex {
             _guard: guard,
             _owner: self,
         }
+    }
+
+    /// Request priority over optional maintenance before waiting for capture.
+    pub async fn lock_for_capture(self: &Arc<Self>) -> LifecycleMutexGuard {
+        self.waiters.send_replace(());
+        self.lock().await
+    }
+
+    /// Subscribe before try_lock to observe subsequent capture requests.
+    /// Optional maintenance can yield to capture without racing registration.
+    /// Cancellation of a capture does not undo its request for priority.
+    pub fn subscribe_capture_requests(&self) -> tokio::sync::watch::Receiver<()> {
+        self.waiters.subscribe()
     }
 
     pub fn try_lock(self: &Arc<Self>) -> Result<LifecycleMutexGuard, tokio::sync::TryLockError> {
@@ -105,6 +120,7 @@ fn lifecycle_lock(registry: &Arc<LifecycleLockRegistry>, sandbox_id: &str) -> Ar
         sandbox_id: sandbox_id.to_owned(),
         registry: Arc::downgrade(registry),
         mutex: Arc::new(tokio::sync::Mutex::new(())),
+        waiters: tokio::sync::watch::channel(()).0,
     });
     locks.insert(sandbox_id.to_owned(), Arc::downgrade(&lock));
     lock
@@ -136,9 +152,36 @@ pub struct AutoLifecycleCoordinator {
     /// `suspended` row, so the test can move the row in between.
     #[cfg(any(test, feature = "test-support"))]
     pub suspended_stop_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    /// A test's two-phase rendezvous in backup admission, with the
+    /// sandbox's artifact lock held, just before the upload job is persisted.
+    #[cfg(any(test, feature = "test-support"))]
+    pub backup_admission_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    /// A test's two-phase rendezvous in a suspended row's eviction, with the
+    /// sandbox's artifact lock held, just before the claim.
+    #[cfg(any(test, feature = "test-support"))]
+    pub eviction_claim_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    /// Notified when a backup's admission is about to wait for the
+    /// sandbox's artifact lock, so a test knows the admission reached it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub artifact_lock_wait_hook: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 impl AutoLifecycleCoordinator {
+    /// A test's two-phase rendezvous at one of the barriers above: when
+    /// `slot` holds a barrier, wait on it twice, once to tell the test the
+    /// caller arrived and once for the test to let it go on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn rendezvous(slot: &std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>) {
+        let barrier = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+    }
+
     pub fn wake_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
         lifecycle_lock(&self.wake_locks, sandbox_id)
     }
@@ -167,7 +210,12 @@ impl AutoLifecycleCoordinator {
         } else {
             None
         };
-        let artifact_guard = self.artifact_lock(sandbox_id).lock_owned().await;
+        let artifact = self.artifact_lock(sandbox_id);
+        let artifact_guard = if artifact_kind == ArtifactKind::Full {
+            artifact.lock_for_capture().await
+        } else {
+            artifact.lock_owned().await
+        };
         (wake_guard, artifact_guard)
     }
 

@@ -84,7 +84,8 @@ delete_path_readable_outputs() {
   local state_dir="$1" profile
   rm -rf "${state_dir}/target/tmp"
   for profile in "${state_dir}"/target/*/; do
-    [[ -d "${profile}.fingerprint" ]] || continue
+    # Cargo 1.100 keeps fingerprints inside build/<crate>/<hash>.
+    [[ -d "${profile}build" ]] || continue
     find "${profile}" -maxdepth 1 \( -type f -o -type l \) -delete
   done
 }

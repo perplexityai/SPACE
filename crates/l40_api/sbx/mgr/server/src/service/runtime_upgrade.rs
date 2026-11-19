@@ -27,9 +27,9 @@
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    EnvironmentReference, ExecutionMetadata, LocalArtifactId, SandboxActivationAttemptId,
-};
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
 
 use crate::db::{
@@ -42,6 +42,7 @@ use crate::state::{SandboxState, SandboxStatus};
 
 mod node_effects;
 mod rpc;
+mod stale_copy;
 #[cfg(test)]
 mod tests;
 
@@ -50,7 +51,7 @@ pub(super) use node_effects::NodeRuntimeUpgradeEffects;
 /// The preserved instance copy's name. The internal operation prefix keeps it
 /// out of users' snapshot listing, deletion and rollback.
 pub(super) fn preserved_disk_name(operation_id: RuntimeUpgradeOperationId) -> String {
-    let prefix = pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
+    let prefix = pplx_space_host_layout::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
     format!("{prefix}runtime-upgrade-{operation_id}")
 }
 
@@ -69,6 +70,41 @@ pub(super) fn refuse_runtime_upgrade_fence_in(
         )),
         None => Ok(()),
     }
+}
+
+/// [`super::SandboxManagerService::refuse_unretired_runtime_upgrade`] on a
+/// held connection.
+pub(super) fn refuse_unretired_runtime_upgrade_in(
+    db: &crate::db::Connection,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    match crate::db::read::unretired_runtime_upgrade(db, sandbox_id)
+        .map_err(|error| Status::unavailable(format!("read runtime upgrade: {error}")))?
+    {
+        Some(operation_id) => Err(Status::unavailable(format!(
+            "runtime upgrade {operation_id} is retiring this sandbox's old checkpoint; retry"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The runtime upgrade of `sandbox_id` that must leave it `stopped`, while
+/// its boot's execution may yet run it: a fencing one, or a verified one
+/// whose boot is the sandbox's current execution, while the sandbox is started
+/// or paused on it. Once verified, until the
+/// upgrade stops that execution, the sandbox runs unfenced; a suspend in that window
+/// would leave it `suspended`, which the upgrade never reports and the stopped
+/// disk backup that follows it refuses. Once the execution is gone, by the
+/// upgrade's stop or any other, the upgrade never stops a later one, so a
+/// later execution suspends as usual even while the upgrade stays unretired.
+pub(super) fn stay_stopped_upgrade_awaiting_its_stop(
+    db: &crate::db::Connection,
+    sandbox_id: &str,
+) -> Result<Option<RuntimeUpgradeOperationId>, Status> {
+    let read_failed =
+        |error: crate::db::Error| Status::unavailable(format!("read runtime upgrade: {error}"));
+    crate::db::read::stay_stopped_runtime_upgrade_awaiting_its_stop(db, sandbox_id)
+        .map_err(read_failed)
 }
 
 /// The status an activation returns when it can't claim the sandbox.
@@ -923,7 +959,7 @@ fn required_text(value: &str, field: &str, max_bytes: usize) -> Result<String, S
 
 fn parse_sandbox_id(sandbox_id: &str) -> Result<String, Status> {
     sandbox_id
-        .parse::<pplx_space_common_core::types::SandboxId>()
+        .parse::<pplx_space_sandbox_model::SandboxId>()
         .map(|id| id.to_string())
         .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))
 }
@@ -1098,6 +1134,27 @@ impl WakeRuntimeUpgrade {
 }
 
 impl super::SandboxManagerService {
+    /// Refuse a suspend of `sandbox_id`, retryably, while an upgrade that must
+    /// leave it `stopped` may run it on its boot's execution; see
+    /// [`stay_stopped_upgrade_awaiting_its_stop`]. Every suspend takes this
+    /// under its wake and artifact locks, before it captures anything.
+    pub(super) fn refuse_suspend_during_stay_stopped_upgrade(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<(), Status> {
+        let stay_stopped_upgrade = {
+            let db = self.db_conn()?;
+            stay_stopped_upgrade_awaiting_its_stop(&db, sandbox_id)?
+        };
+        match stay_stopped_upgrade {
+            Some(operation_id) => Err(Status::unavailable(format!(
+                "runtime upgrade {operation_id} must stop this sandbox first; retry the suspend \
+                 once it has"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Run the upgrade a Wake carries, booting `start`: the cold start the
     /// Wake built for this sandbox. The caller holds the Wake's lock.
     pub(super) async fn wake_runtime_upgrade(
@@ -1172,14 +1229,7 @@ impl super::SandboxManagerService {
     /// retirement of the one it superseded: until then the canonical
     /// checkpoint may be the old runtime's, over a disk the new boot wrote.
     pub(super) fn refuse_unretired_runtime_upgrade(&self, sandbox_id: &str) -> Result<(), Status> {
-        match crate::db::read::unretired_runtime_upgrade(&*self.db_conn()?, sandbox_id)
-            .map_err(|error| Status::unavailable(format!("read runtime upgrade: {error}")))?
-        {
-            Some(operation_id) => Err(Status::unavailable(format!(
-                "runtime upgrade {operation_id} is retiring this sandbox's old checkpoint; retry"
-            ))),
-            None => Ok(()),
-        }
+        refuse_unretired_runtime_upgrade_in(&*self.db_conn()?, sandbox_id)
     }
 
     /// Gracefully stop `sandbox_id` and wait for it, but only while it runs the

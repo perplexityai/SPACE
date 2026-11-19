@@ -32,11 +32,12 @@ http = { workspace = true }
 http-body = { workspace = true }
 hyper-util = { workspace = true }
 kube = { workspace = true, default-features = false, features = ["client", "config", "rustls-tls"], optional = true }
+pplx-space-node-model = { workspace = true }
+pplx-space-template-model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true, features = ["macros", "net", "sync", "rt", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
@@ -48,15 +49,19 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-api-route = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
+pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-net-gateway-client = { workspace = true }
@@ -72,6 +77,7 @@ pplx-space-unix-socket-bind = { workspace = true }
 prost = { workspace = true }
 rstest = { workspace = true }
 axum = { workspace = true }
+pplx-space-env-vars = { workspace = true }
 pplx-space-rpc-auth = { workspace = true, features = ["test-hooks", "test-support"] }
 pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }

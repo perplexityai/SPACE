@@ -429,6 +429,19 @@ for git_sha_file in /space/etc/build-git-sha /etc/space/build-git-sha; do
   fi
 done
 
+# An updater-capable release supplies its immutable descriptor with the binary
+# pair. Legacy/local binary-only builds retain their existing regular-file ABI.
+if [[ -f /guest-bin/artifact.json ]]; then
+  mkdir -p "${CHROOT}/var/lib/spaced/slots/a" "${CHROOT}/var/lib/spaced/slots/b" "${CHROOT}/etc/spaced"
+  for bin in spaced-svc spaced; do
+    mv "${CHROOT}/usr/local/bin/$bin" "${CHROOT}/var/lib/spaced/slots/a/$bin"
+    ln -s "/var/lib/spaced/current/$bin" "${CHROOT}/usr/local/bin/$bin"
+  done
+  cp /guest-bin/artifact.json "${CHROOT}/var/lib/spaced/slots/a/artifact.json"
+  /guest-bin/spaced-svc --initialize-update "${CHROOT}/var/lib/spaced"
+  printf '%s\n' linux-systemd-selector-v1 > "${CHROOT}/etc/spaced/update-contract"
+fi
+
 # ── Chroot: configure seed ───────────────────────────────────────────────────
 echo "=== Configuring seed in chroot ==="
 chroot "${CHROOT}" /bin/bash -c "
@@ -457,8 +470,7 @@ rm -rf /etc/cloud /var/lib/cloud
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   -o Dpkg::Options::=--force-confdef \
   -o Dpkg::Options::=--force-confold \
-  openssh-server sudo curl ca-certificates procps iproute2 \
-  || dpkg --configure -a
+  openssh-server sudo curl ca-certificates procps iproute2 coreutils
 apt-get autoremove -y 2>/dev/null || true
 
 # user account (UID 2000) — rename existing 'ubuntu' user if present,
@@ -639,11 +651,19 @@ if [ -f /usr/local/bin/spaced-svc ]; then
   # restarts, including the automatic restart after a crash, and its KillMode
   # ends every workload it holds. spaced orders itself after this unit, so the
   # unit's fresh cgroup exists when spaced builds the leaf.
-  cat > /etc/systemd/system/space-workloads.service <<'WORKLOADSEOF'
+  # Resolve packaging from the recipe while building the seed, never at boot.
+  holder_sleep=/usr/bin/sleep
+  if dpkg --compare-versions '${UBUNTU_VERSION}' ge 26.04; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gnu-coreutils
+    holder_sleep=/usr/bin/gnusleep
+  fi
+  \"\$holder_sleep\" --version | grep -q 'GNU coreutils'
+  cat > /etc/systemd/system/space-workloads.service <<WORKLOADSEOF
 [Unit]
 Description=SPACE API workloads (started by spaced)
 DefaultDependencies=no
 PartOf=spaced.service
+StartLimitIntervalSec=0
 Before=shutdown.target
 Conflicts=shutdown.target
 
@@ -651,9 +671,9 @@ Conflicts=shutdown.target
 Slice=space.slice
 # systemd removes an empty cgroup, so a process holds this one open, in a
 # subgroup of its own: the unit's root must hold no processes for spaced to
-# enable controllers on it. spaced-svc itself is the holder: it is in every
-# guest bundle, where an OCI image may have no sleep.
-ExecStart=/usr/local/bin/spaced-svc --hold-cgroup
+# enable controllers on it. GNU sleep is shipped by the guest bundle; keeping
+# it independent of both agent slots allows either obsolete slot to be reused.
+ExecStart=\${holder_sleep} infinity
 Delegate=yes
 DelegateSubgroup=holder
 Restart=always
@@ -684,9 +704,9 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 NotifyAccess=main
-# READY=1 comes once the bridge listener is bound, well under a second after
-# start; a start that hangs is killed and restarted rather than left waiting
-# for the 90 s default.
+# READY=1 follows initialization and listener binding. A trial additionally
+# waits for host confirmation; its selector drop-in supplies the startup budget.
+# A hung start is killed and restarted rather than waiting for the 90 s default.
 TimeoutStartSec=30
 # Prefer workloads over spaced when the guest runs out of memory: losing spaced
 # makes the sandbox unreachable and, through space-workloads.service, ends
@@ -747,6 +767,22 @@ StandardError=journal+console
 [Install]
 WantedBy=space.target
 SVCEOF
+  if [ -f /etc/spaced/update-contract ]; then
+    mkdir -p /etc/systemd/system/spaced.service.d
+    cat > /etc/systemd/system/spaced.service.d/10-update-selector.conf <<'SELECTOREOF'
+[Service]
+# Permanent seed ABI: short selector from the last committed release. PID 1
+# reaps a failed/unready candidate before this selector chooses the fallback.
+ExecStartPre=/var/lib/spaced/committed/spaced-svc --select
+# selector-v1 allows 30 seconds for confirmation; reserve 15 for selector work.
+TimeoutStartSec=45
+# A trial that never becomes ready must not add the normal stop grace.
+TimeoutStartFailureMode=kill
+# Restore snapshot readiness without replacing a pending lifecycle stop job.
+# A target notification failure must not restart a healthy daemon/workload.
+ExecStartPost=-/usr/bin/systemctl --no-block --job-mode=fail start space.target
+SELECTOREOF
+  fi
   systemctl enable spaced.service 2>/dev/null || true
 fi
 

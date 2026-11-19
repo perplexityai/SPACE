@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Instant;
 
@@ -251,14 +251,12 @@ pub struct DormantActivation<'a> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ReconnectEntrypoint {
     Connect,
-    Dataplane,
 }
 
 impl ReconnectEntrypoint {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Connect => "connect",
-            Self::Dataplane => "dataplane",
         }
     }
 }
@@ -348,7 +346,6 @@ pub enum ReconnectReason {
     Conflict,
     Unavailable,
     Failed,
-    Timeout,
     Cancelled,
     NotFound,
     Unsupported,
@@ -374,7 +371,6 @@ impl ReconnectReason {
             Self::Conflict => "conflict",
             Self::Unavailable => "unavailable",
             Self::Failed => "failed",
-            Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::NotFound => "not_found",
             Self::Unsupported => "unsupported",
@@ -768,25 +764,40 @@ metric_vocabulary!(
     }
 );
 
-/// One create, activation or resume's requested size.
+/// One create, activation or resume's requested size. Each part is `None`
+/// when the API does not know it, and its distributions get no sample.
 pub struct RequestedSize<'a> {
     pub kind: RequestedKind,
     pub surface: SandboxApiSurface,
     pub admission: AdmissionDecision,
     pub template: &'a str,
+    pub compute: Option<RequestedCompute>,
+    pub disk_mib: Option<u32>,
+}
+
+/// The vCPU and guest memory part of a requested size.
+pub struct RequestedCompute {
     pub vcpu: u32,
     pub memory_mib: u32,
     /// `None` for an activation or resume, which omits the tag.
     pub defaulted: Option<bool>,
 }
 
-/// Record the vCPU and guest memory one create, activation or resume requested,
-/// after defaults, as one sample in each of `sandbox.api.requested.vcpu` and
-/// `sandbox.api.requested.memory_bytes` (memory in bytes).
+/// Record the size one create, activation or resume requested, after
+/// defaults: one sample in each of `sandbox.api.requested.vcpu` and
+/// `sandbox.api.requested.memory_bytes` (memory in bytes) when the compute
+/// size is known, and one in `sandbox.api.requested.disk_bytes` when the disk
+/// size is known.
 ///
 /// Tags: `kind`, `surface`, `admission`, `template` and request-scoped
-/// `client_id`. Creates also carry `defaulted`, false only when the request
-/// supplied both sizes; warm-pool claims are always true.
+/// `client_id`. Compute samples on creates also carry `defaulted`, false only
+/// when the request supplied both vCPU and memory; warm-pool claims are always
+/// true. Disk samples never carry it.
+///
+/// The disk size is the configured rootfs size: the request's or an inherited
+/// warm-pool config's or policy's `disk_mib`. A sandbox left at its template's
+/// own rootfs size has none, so the disk distribution does not cover every
+/// sandbox. It is not disk usage or host allocation.
 ///
 /// Callers record cold creates at admission, and activations/resumes on success
 /// or admission rejection. Skip forks, unknown sizes and joined activations.
@@ -800,13 +811,23 @@ pub fn requested_size(sample: RequestedSize<'_>) {
         tag("template", sample.template),
         tag("client_id", request_client_id().as_str()),
     ];
-    if let Some(defaulted) = sample.defaulted {
+    if let Some(disk_mib) = sample.disk_mib {
+        distribution(
+            "sandbox.api.requested.disk_bytes",
+            (u64::from(disk_mib) * BYTES_PER_MIB) as f64,
+            &tags,
+        );
+    }
+    let Some(compute) = sample.compute else {
+        return;
+    };
+    if let Some(defaulted) = compute.defaulted {
         tags.push(tag("defaulted", defaulted));
     }
-    distribution("sandbox.api.requested.vcpu", f64::from(sample.vcpu), &tags);
+    distribution("sandbox.api.requested.vcpu", f64::from(compute.vcpu), &tags);
     distribution(
         "sandbox.api.requested.memory_bytes",
-        (u64::from(sample.memory_mib) * BYTES_PER_MIB) as f64,
+        (u64::from(compute.memory_mib) * BYTES_PER_MIB) as f64,
         &tags,
     );
 }
@@ -1131,9 +1152,109 @@ fn dormant_activation_tags(
     tags
 }
 
+/// The per-client live cap: how many sandboxes with a live runtime one
+/// client key may hold at once.
+pub mod client_live_cap {
+    use pplx_space_metrics_emit::{counter, tag};
+
+    /// The cap's verdict for one check.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub enum Decision {
+        Admitted,
+        Rejected,
+    }
+
+    impl Decision {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Admitted => "admitted",
+                Self::Rejected => "rejected",
+            }
+        }
+    }
+
+    /// Why the cap reached its decision. Every fail-open reason accompanies
+    /// an `admitted` decision.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub enum Reason {
+        /// Counted, and under the cap.
+        UnderCap,
+        /// Counted, and at the cap.
+        AtCap,
+        /// The activation's own sandbox was already pending: renewed.
+        AlreadyPending,
+        /// The pending set kept moving under the check; refused after the
+        /// last pass.
+        Contended,
+        /// The shared Redis store failed; the cap fails open.
+        StoreUnavailable,
+        /// A cap is configured but there's no usable Redis store.
+        Misconfigured,
+        /// The substrate has no per-client inventory.
+        Unsupported,
+        /// The pod reflector hasn't finished its initial list.
+        PodCacheCold,
+        /// The pod reflector can't be trusted, so the check counted the
+        /// pending set alone and admitted. A refusal there is `at_cap`.
+        PodCacheStale,
+        /// A cap is configured but activation client attribution is off, so
+        /// no pod carries a client label to count.
+        AttributionDisabled,
+    }
+
+    impl Reason {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::UnderCap => "under_cap",
+                Self::AtCap => "at_cap",
+                Self::AlreadyPending => "already_pending",
+                Self::Contended => "contended",
+                Self::StoreUnavailable => "store_unavailable",
+                Self::Misconfigured => "misconfigured",
+                Self::Unsupported => "unsupported",
+                Self::PodCacheCold => "pod_cache_cold",
+                Self::PodCacheStale => "pod_cache_stale",
+                Self::AttributionDisabled => "attribution_disabled",
+            }
+        }
+    }
+
+    /// Where the check ran: reserved before any token was spent, or a
+    /// read-only pre-check before a deferred charge.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub enum Check {
+        Reserve,
+        Precheck,
+    }
+
+    impl Check {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Reserve => "reserve",
+                Self::Precheck => "precheck",
+            }
+        }
+    }
+
+    /// One cap decision. `client_key` is the resolved key, which the key set
+    /// bounds; never pass a raw client id.
+    pub fn decision(check: Check, decision: Decision, reason: Reason, client_key: &str) {
+        counter(
+            "sandbox.api.client_live_cap.decision",
+            1,
+            &[
+                tag("check", check.as_str()),
+                tag("decision", decision.as_str()),
+                tag("reason", reason.as_str()),
+                tag("client_key", client_key),
+            ],
+        );
+    }
+}
+
 /// Metrics for the space-api per-client concurrency limiter, which caps how
-/// many sandbox create/reconnect operations a single client (identified by the
-/// `X-Client-ID` header) may have in flight at once.
+/// many sandbox create, fork, reconnect and resume operations a single client
+/// (identified by the `X-Client-ID` header) may have in flight at once.
 pub mod client_limit {
     use super::ClientIdTag;
     use pplx_space_metrics_emit::{counter, gauge, tag};
@@ -1144,6 +1265,8 @@ pub mod client_limit {
         Create,
         Fork,
         Reconnect,
+        /// ECW resume: a restore of a paused (SPACE-suspended) sandbox.
+        Resume,
     }
 
     impl Operation {
@@ -1152,6 +1275,7 @@ pub mod client_limit {
                 Self::Create => "create",
                 Self::Fork => "fork",
                 Self::Reconnect => "reconnect",
+                Self::Resume => "resume",
             }
         }
     }

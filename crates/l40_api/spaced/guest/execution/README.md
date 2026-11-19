@@ -8,9 +8,8 @@ representation. The daemon owns guest readiness, listeners, host communication,
 cgroup initialization and the overall shutdown deadline.
 
 The guest bridge and worker schemas live in `pplx-space-spaced-guest-protocol`.
-`spaced-common` re-exports those types for existing callers. This service is
-distinct from `execution/common`, which describes portable sandbox runtimes and
-execution metadata.
+This service is distinct from `execution/common`, which describes portable
+sandbox runtimes and execution metadata.
 
 ## Rust API compatibility
 
@@ -117,9 +116,11 @@ and error evolution, requires a separate crate-level policy before stabilization
   retries for the same user and key. Each admitted retry holds its own payload
   slot while waiting, for up to the retention window.
 - `configure_process_env(EnvMap)` replaces defaults for future process starts;
-  request entries override them and `clean_env` skips them. Running processes
-  retain their environment. `EnvMap` already enforces the shared key/value,
-  entry-count and total-byte [limits](../../../../l20_domain/guest/process/src/env/contract.rs).
+  request entries override them and `clean_env` skips them. Below both, a
+  pty-backed process starts with `TERM=xterm-256color` and `LANG=C.UTF-8`,
+  which `clean_env` keeps, as it keeps `PATH`, `HOME` and the account's names.
+  Running processes retain their environment. `EnvMap` already enforces the
+  shared key/value, entry-count and total-byte [limits](../../../../l20_domain/guest/process/src/env/contract.rs).
   Native callers can use `EnvMap::try_from` to reject invalid maps. The daemon
   retains its wire adapter's sanitization of invalid entries before configuration.
   Native `StartRequest.env` still uses `parse_env`: invalid entries are dropped

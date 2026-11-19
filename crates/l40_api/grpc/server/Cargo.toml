@@ -11,10 +11,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+futures-core = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
+tokio = { workspace = true, features = ["net", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true }
+tower = { workspace = true }
 tower-http = { workspace = true, features = ["trace"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
@@ -26,7 +31,7 @@ pplx-space-request-id = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
-tokio-stream = { workspace = true, features = ["net"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time", "test-util"] }
 tonic-prost = { workspace = true }
 tower = { workspace = true }

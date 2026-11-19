@@ -1,4 +1,4 @@
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use sqlx::FromRow;
@@ -8,6 +8,7 @@ use tonic::{Code, Request, Status};
 use uuid::Uuid;
 
 use crate::metrics::internal_api::EcwCredentialVerificationResult;
+use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_api_route::SpaceApiRoutePurpose;
 use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519Authority, ed25519::SpaceApiRouteEd25519Token,
@@ -16,16 +17,19 @@ use pplx_space_api_route::{
 use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_tx, queue_node_reconcile_refs,
 };
-use pplx_space_common_core::types::{
-    EcwCredentialEpoch, ExecutionGeneration, GuestPort, NodeId, NodeManagedBy, OrgId, PodUid,
-    RouteGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-};
-use pplx_space_common_grpc::sandbox_service_route_not_ready_status;
+use pplx_space_common_grpc::{RetryableNotReady, sandbox_service_route_not_ready_status};
 use pplx_space_ecw_credential::{EcwCredentialKeyring, EcwCredentialKind, EcwCredentialMatch};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::WorkerApiClient;
 use pplx_space_node_api_client::proto::ImplicitWakeActivity;
+use pplx_space_node_model::NodeManagedBy;
 use pplx_space_public_api::SessionKind;
 use pplx_space_rpc_auth::DataPlaneSessionRefreshAuthority;
+use pplx_space_sandbox_model::{
+    EcwCredentialEpoch, ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId,
+    SandboxId, SandboxLifecycle,
+};
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use pplx_space_state_reconciliation::{ReconcileReason, ReconcileRef};
@@ -102,13 +106,16 @@ fn activation_may_repair(ingress: bool, error: &Status) -> bool {
 /// execution and deletes its pod, discarding whatever it served. The
 /// resolvers turn this refusal into a wait on the restore through the
 /// activation owner, then retry, and return it (retryable `Unavailable`)
-/// when the restore didn't reach `started` in their budget.
+/// when the restore didn't reach `started` in their budget. That answer is
+/// by design while a restore runs, so it is marked [`RetryableNotReady`] and
+/// the gRPC trace layers on both sides log it below error.
 fn refuse_restoring_route(lifecycle: SandboxLifecycle) -> Result<(), Status> {
     if lifecycle == SandboxLifecycle::Restoring {
-        Err(sandbox_service_route_not_ready_status(
+        let refusal = sandbox_service_route_not_ready_status(
             Code::Unavailable,
             "sandbox is restoring; retry once the restore completes",
-        ))
+        );
+        Err(RetryableNotReady.mark(refusal))
     } else {
         Ok(())
     }

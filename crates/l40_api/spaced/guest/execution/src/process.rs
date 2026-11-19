@@ -6,7 +6,8 @@ use crate::idempotency::{
 };
 use crate::identity::GuestAccount;
 use dashmap::DashMap;
-use pplx_space_common_core::types::{GuestUserName, Pii, ProcessCommand, ProcessId, ProcessSignal};
+use pplx_space_guest_process::{GuestUserName, ProcessCommand, ProcessId, ProcessSignal};
+use pplx_space_pii::Pii;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,7 +114,7 @@ struct ProcessSupervision {
     child: tokio::process::Child,
     exit_observer: ExitObserver,
     output_tasks: VecDeque<ProcessOutputTask>,
-    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    timeout: Option<pplx_space_guest_process::ReadyTimeout>,
     shutdown: tokio_util::sync::CancellationToken,
     record: Arc<ProcessRecord>,
     process_id: ProcessId,
@@ -239,7 +240,7 @@ struct ProcessLaunch {
     stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
     info: ProcessInfo,
-    timeout: Option<pplx_space_common_core::types::ReadyTimeout>,
+    timeout: Option<pplx_space_guest_process::ReadyTimeout>,
     process_id: ProcessId,
     spawn_thread: SpawnThread,
     claim: ProcessIdClaim,
@@ -699,6 +700,10 @@ impl Default for ProcessRegistry {
 }
 
 impl ProcessRegistry {
+    pub(super) fn has_records(&self) -> bool {
+        !self.records.is_empty()
+    }
+
     pub(super) fn new(output_budget: ProcessOutputBudget) -> Self {
         Self {
             records: Arc::new(DashMap::new()),
@@ -897,6 +902,10 @@ struct PreparedPty {
 #[cfg(not(target_os = "linux"))]
 static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The environment a pty-backed process starts with unless the sandbox or the
+/// request sets these: the values E2B-compatible terminal clients send.
+const PTY_DEFAULT_ENV: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("LANG", "C.UTF-8")];
+
 fn spawn_child(command: &mut Command) -> io::Result<tokio::process::Child> {
     #[cfg(not(target_os = "linux"))]
     let _inheritance_guard = PTY_INHERITANCE_LOCK
@@ -1064,7 +1073,7 @@ impl ProcessSignalHandle {
     fn signal(&self, signal: ProcessSignal) -> Result<(), Status> {
         #[cfg(target_os = "linux")]
         {
-            match pplx_space_common_core::host::linux::signal_pidfd(&self.pidfd, signal) {
+            match pplx_space_host_linux::signal_pidfd(&self.pidfd, signal.as_i32()) {
                 Ok(()) => Ok(()),
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
                     Err(Status::not_found("process not found"))
@@ -1847,9 +1856,9 @@ fn process_event_stream_with_prefix(
 fn process_output_cursor_ahead_status() -> Status {
     let mut status = Status::out_of_range(PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE);
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD,
         ),
     );
     status
@@ -1860,17 +1869,17 @@ fn process_output_cursor_ahead_status() -> Status {
 /// can continue from there. `None` once the journal itself is gone.
 fn process_output_lagged_status(first_sequence: Option<u64>) -> Status {
     let mut status =
-        Status::resource_exhausted(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE);
+        Status::resource_exhausted(pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE);
     let metadata = status.metadata_mut();
     metadata.insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED,
         ),
     );
     if let Some(first_sequence) = first_sequence {
         metadata.insert(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
             tonic::metadata::MetadataValue::from(first_sequence),
         );
     }
@@ -2328,6 +2337,14 @@ impl Process for ExecutionService {
         command.env("USER", account.name().as_str());
         command.env("LOGNAME", account.name().as_str());
         command.env("SHELL", account.shell());
+        // A terminal needs a terminal type and a character set, as an
+        // interactive login has. The sandbox's environment and the request's,
+        // applied below, override them.
+        if pty_config.is_some() {
+            for (key, value) in PTY_DEFAULT_ENV {
+                command.env(key, value);
+            }
+        }
         if !clean_env {
             let process_env = self.inner.process_env.read().await.clone();
             if !process_env.as_map().is_empty() {

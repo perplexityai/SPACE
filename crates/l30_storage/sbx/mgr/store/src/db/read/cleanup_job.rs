@@ -1,6 +1,6 @@
 //! One sandbox-cleanup job record.
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use crate::db::{Connection, Result};
 

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pplx_space_common_core::types::RelativeGlobPattern;
+use pplx_space_guest_process::RelativeGlobPattern;
 
 use super::super::paths::consumer_accepts_event;
 use super::*;

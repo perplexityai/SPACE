@@ -25,13 +25,15 @@
 //!   `managed_by = 'space'` is not listed and its apply refuses.
 //! - T2 `t2_live_tick_repairs`
 
-use pplx_space_common_core::types::LocalArtifactId;
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::time::Duration;
 
-use pplx_space_common_core::types::PositiveDuration;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db, try_pg_test_db};
+use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use sqlx::PgPool;

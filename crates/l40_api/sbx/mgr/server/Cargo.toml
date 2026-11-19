@@ -24,9 +24,14 @@ datadog = [
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks"]
+test-hooks = [
+    "pplx-space-node-disk-admission/test-hooks",
+    "pplx-space-test-hooks/test-hooks",
+]
 
 [dependencies]
+pplx-space-artifact-model = { workspace = true, features = ["serde"] }
+pplx-space-subject-model = { workspace = true, features = ["serde"] }
 rustix = { workspace = true, features = ["fs"] }
 nix = { workspace = true, features = ["dir", "fs", "user"] }
 arc-swap = { workspace = true }
@@ -58,15 +63,37 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-api-route = { workspace = true }
+pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-byte-size = { workspace = true, features = ["serde"] }
+pplx-space-cluster-id = { workspace = true, features = ["serde"] }
+pplx-space-sandbox-model = { workspace = true }
+pplx-space-node-model = { workspace = true }
+pplx-space-rpc-contracts = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
+pplx-space-template-runtime = { workspace = true }
+pplx-space-template-model = { workspace = true }
+pplx-space-btrfs = { workspace = true }
+pplx-space-host-layout = { workspace = true }
+pplx-space-host-linux = { workspace = true }
+pplx-space-node-disk-admission = { workspace = true }
+pplx-space-template-cache-permissions = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-io = { workspace = true }
-pplx-space-common-jobs = { workspace = true }
-pplx-space-common-lru-reaper = { workspace = true }
+pplx-space-file-io = { workspace = true }
+pplx-space-lru-reaper = { workspace = true }
+pplx-space-env-vars = { workspace = true }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
+pplx-space-durations = { workspace = true, features = ["serde"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-guest-process = { workspace = true, features = ["serde"] }
+pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
+pplx-space-linux-ids = { workspace = true, features = ["serde"] }
+pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-grpc = { workspace = true }
-pplx-space-credential-injection-core = { workspace = true }
+pplx-space-credential-injection = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-events = { workspace = true }
@@ -78,9 +105,11 @@ pplx-space-grpc-server = { workspace = true }
 pplx-space-ingress-admission = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-local-health = { workspace = true }
+pplx-space-semver = { workspace = true, features = ["serde"] }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
+pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
@@ -92,17 +121,22 @@ pplx-space-metrics-emit = { workspace = true }
 pplx-space-reconcile-metrics = { workspace = true }
 pplx-space-sandbox-metrics = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime"] }
-pplx-space-spaced-common = { workspace = true }
+pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-spaced-protocol = { workspace = true }
+pplx-space-spaced-client = { workspace = true }
+pplx-space-spaced-update = { workspace = true }
+semver = { workspace = true }
 pplx-space-spaced-host-client = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-sbx-mgr-store = { workspace = true }
+pplx-space-template-manifest = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+pplx-space-sql-locator = { workspace = true }
 rstest = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
-pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
 pplx-space-sbx-mgr-store = { workspace = true, features = ["test-support"] }
 pplx-space-common-jobs = { workspace = true, features = ["test-support"] }
 pplx-space-net-gateway = { workspace = true, features = ["test-support"] }
@@ -124,5 +158,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tracing-subscriber = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
+pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
+pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }

@@ -8,7 +8,26 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-sqlite.template-manager = ["node_dirty_ref_revision"]
+sqlite.template-manager = [
+  "jobs",
+  "node_dirty_ref_revision",
+  "node_dirty_refs",
+  "pools",
+  "template_build_components",
+  "template_builds",
+  "template_local_policy_sequence",
+  "template_network_policy_notifications",
+  "template_pinned_releases",
+  "template_pinned_tags",
+  "template_settings",
+  "template_snapshots",
+]
 
 [lints]
 workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+
+# internal
+pplx-space-sql-locator = { workspace = true }

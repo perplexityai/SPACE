@@ -5,9 +5,11 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-    ArtifactVersion, Digest, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
+    ArtifactVersion, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
     FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
     RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion, VersionSortKey,
 };
@@ -334,7 +336,7 @@ pub enum RuntimeInventoryError {
     #[error("kernel read returned {read} bytes for a {len}-byte buffer")]
     InvalidKernelReadBuffer { read: usize, len: usize },
     #[error("compiled environment has no auxiliary boot-file pin for {0:?}")]
-    MissingBootArtifactPin(pplx_space_common_core::types::ComponentIdentity),
+    MissingBootArtifactPin(pplx_space_execution_spec::ComponentIdentity),
     #[error("no installed artifact component matches {0:?}")]
     NoCompatibleComponent(ArtifactComponentMetadata),
     #[error("no {selection} {kind} component is installed")]
@@ -368,7 +370,7 @@ impl RuntimeInventoryError {
     /// The exceptions are the variants that report a *read* failing rather than
     /// an inventory verdict, and then only when the read itself is the kind a
     /// later attempt can win — see
-    /// [`host_path_io_error_is_transient`](pplx_space_common_core::host::path_errors::host_path_io_error_is_transient).
+    /// [`host_path_io_error_is_transient`](pplx_space_host_linux::path_errors::host_path_io_error_is_transient).
     ///
     /// This distinction is load-bearing in two directions. A non-transient
     /// error becomes a terminal `FailedPrecondition`, which sandbox-manager
@@ -391,7 +393,7 @@ impl RuntimeInventoryError {
             Self::ReadDir { source, .. }
             | Self::InspectKernel { source, .. }
             | Self::ProbeInventoryPath { source, .. } => {
-                pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source)
+                pplx_space_host_linux::path_errors::host_path_io_error_is_transient(source)
             }
             // A short read of a kernel image carries no error kind to judge.
             // It is most often a file the prefetch is still writing, so it
@@ -488,9 +490,7 @@ fn canonicalize_inventory_path(path: &Path) -> Result<Option<PathBuf>, RuntimeIn
     match std::fs::canonicalize(path) {
         Ok(resolved) => Ok(Some(resolved)),
         Err(source)
-            if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(
-                &source,
-            ) =>
+            if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(&source) =>
         {
             Err(RuntimeInventoryError::ProbeInventoryPath {
                 path: path.to_path_buf(),
@@ -518,9 +518,7 @@ fn probe_inventory_path(path: &Path) -> Result<Option<std::fs::Metadata>, Runtim
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(source)
-            if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(
-                &source,
-            ) =>
+            if pplx_space_host_linux::path_errors::host_path_io_error_is_transient(&source) =>
         {
             Err(RuntimeInventoryError::ProbeInventoryPath {
                 path: path.to_path_buf(),
@@ -587,15 +585,11 @@ impl FirecrackerDriver {
         &self,
         version: &RuntimeVersion,
     ) -> Result<semver::Version, RuntimeInventoryError> {
-        semver::Version::parse(
-            version
-                .as_str()
-                .strip_prefix('v')
-                .unwrap_or(version.as_str()),
-        )
-        .map_err(|source| RuntimeInventoryError::InvalidVersionOutput {
-            path: PathBuf::from("firecracker"),
-            output: format!("{version}: {source}"),
+        semver::Version::parse(version.as_str().trim_prefix('v')).map_err(|source| {
+            RuntimeInventoryError::InvalidVersionOutput {
+                path: PathBuf::from("firecracker"),
+                output: format!("{version}: {source}"),
+            }
         })
     }
 
@@ -603,15 +597,11 @@ impl FirecrackerDriver {
         &self,
         version: &StateFormatVersion,
     ) -> Result<semver::Version, RuntimeInventoryError> {
-        semver::Version::parse(
-            version
-                .as_str()
-                .strip_prefix('v')
-                .unwrap_or(version.as_str()),
-        )
-        .map_err(|source| RuntimeInventoryError::InvalidVersionOutput {
-            path: PathBuf::from("firecracker --snapshot-version"),
-            output: format!("{version}: {source}"),
+        semver::Version::parse(version.as_str().trim_prefix('v')).map_err(|source| {
+            RuntimeInventoryError::InvalidVersionOutput {
+                path: PathBuf::from("firecracker --snapshot-version"),
+                output: format!("{version}: {source}"),
+            }
         })
     }
 
@@ -619,10 +609,7 @@ impl FirecrackerDriver {
         &self,
         runtime_version: &RuntimeVersion,
     ) -> Result<StateFormatVersion, RuntimeInventoryError> {
-        let release = runtime_version
-            .as_str()
-            .strip_prefix('v')
-            .unwrap_or(runtime_version.as_str());
+        let release = runtime_version.as_str().trim_prefix('v');
         let state_format_version = FIRECRACKER_STATE_FORMAT_RELEASES
             .iter()
             .find(|entry| entry.runtime_version == release)
@@ -1409,7 +1396,7 @@ fn component_metadata_identity(
 fn version_from_dir(path: &Path) -> Option<RuntimeVersion> {
     path.file_name()
         .and_then(|value| value.to_str())
-        .and_then(|value| RuntimeVersion::parse(value.strip_prefix('v').unwrap_or(value)).ok())
+        .and_then(|value| RuntimeVersion::parse(value.trim_prefix('v')).ok())
 }
 
 /// Architecture of the host running execution inventory and launch admission.

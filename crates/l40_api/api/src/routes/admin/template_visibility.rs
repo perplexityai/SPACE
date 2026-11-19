@@ -15,12 +15,10 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::TemplateName;
-use pplx_space_common_core::types::TemplateVisibility;
-use pplx_space_common_core::types::admin::{
-    AdminTemplateVisibilityResponse, SetTemplateVisibilityRequest,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_admin_protocol::{AdminTemplateVisibilityResponse, SetTemplateVisibilityRequest};
+use pplx_space_template_model::TemplateName;
+use pplx_space_template_model::TemplateVisibility;
 
 use super::audit::{self, AdminTemplateAuditEntry};
 use super::node_group_store::org_exists_in_tx;

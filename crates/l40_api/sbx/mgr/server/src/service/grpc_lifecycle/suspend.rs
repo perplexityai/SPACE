@@ -86,7 +86,7 @@ const ENV_SUSPEND_WAKE_ARBITRATION: &str = "SPACE_SUSPEND_WAKE_ARBITRATION";
 /// values fail toward the fixed behavior; only an explicit falsy value
 /// disables it.
 pub(in crate::service) fn suspend_wake_arbitration_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(ENV_SUSPEND_WAKE_ARBITRATION, true)
+    pplx_space_env_vars::env_flag_var(ENV_SUSPEND_WAKE_ARBITRATION, true)
 }
 
 /// A suspend is superseded when its request arrived at this process before
@@ -192,7 +192,7 @@ impl SandboxManagerService {
             ));
         }
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let artifact_guard = artifact_lock.lock_owned().await;
+        let artifact_guard = artifact_lock.lock_for_capture().await;
         // A blocking suspend commits the full artifact before replying. If the
         // caller loses the response or its control-plane marker write fails,
         // retrying must return that exact committed artifact instead of trying
@@ -203,46 +203,68 @@ impl SandboxManagerService {
         {
             return Ok(Response::new(response));
         }
-        let (blocking_local_artifact_id, publication) = self
-            .prepare_suspend_snapshot_publication_after_locks(
-                &context,
-                &wake_guard,
-                &artifact_guard,
-            )
-            .await?;
-        if !context.blocking {
-            let service = self.clone();
-            let background_sandbox_id = publication.sandbox.id.clone();
-            let span_sandbox_id = background_sandbox_id.clone();
-            self.spawn_detached_state_writer("SuspendPublication", &span_sandbox_id, async move {
-                let _wake_guard = wake_guard;
-                let _artifact_guard = artifact_guard;
-                if let Err(error) = service
-                    .complete_suspend_snapshot_publication(publication)
-                    .await
-                {
-                    tracing::warn!(
-                        sandbox_id = %background_sandbox_id,
-                        code = %error.code(),
-                        error = %error.message(),
-                        "asynchronous suspend publication failed"
-                    );
-                    super::super::drain::record_detached_failure(error.message());
+        // Waiting for lifecycle locks belongs to the request. Once acquired,
+        // preparation and publication share one tracked owner, including when
+        // either caller or server deadline drops the response waiter.
+        let blocking = context.blocking;
+        let service = self.clone();
+        let task_sandbox_id = context.sandbox_id.clone();
+        let (admitted, admission) = tokio::sync::oneshot::channel();
+        let work = async move {
+            let prepared = service
+                .prepare_suspend_snapshot_publication_after_locks(
+                    &context,
+                    &wake_guard,
+                    &artifact_guard,
+                )
+                .await;
+            let (local_artifact_id, publication) = match prepared {
+                Ok(prepared) => {
+                    let _ = admitted.send(Ok(()));
+                    prepared
                 }
-            })?;
+                Err(error) => {
+                    super::super::drain::record_detached_failure(error.message());
+                    if admitted.send(Err(error.clone())).is_err() {
+                        tracing::warn!(sandbox_id = %context.sandbox_id,
+                            code = %error.code(), error = %error.message(),
+                            "owned suspend preparation failed without a waiting caller");
+                    }
+                    return Err(error);
+                }
+            };
+            let result = service
+                .complete_suspend_snapshot_publication(publication)
+                .await;
+            // Keep both guards through completion, not just preparation.
+            drop(artifact_guard);
+            drop(wake_guard);
+            if let Err(error) = &result {
+                tracing::warn!(sandbox_id = %context.sandbox_id,
+                        code = %error.code(), error = %error.message(),
+                        "owned suspend publication failed");
+                super::super::drain::record_detached_failure(error.message());
+            }
+            result.map(|()| local_artifact_id)
+        };
+        #[cfg(test)]
+        let work = super::pause_resume::inherit_guest_preparation(work);
+        let publication =
+            self.spawn_detached_state_writer("SuspendPublication", &task_sandbox_id, work)?;
+        if !blocking {
+            admission
+                .await
+                .map_err(|_| Status::internal("suspend preparation task ended"))??;
             return Ok(Response::new(SuspendResponse {
                 published_artifact: None,
             }));
         }
-
-        self.complete_suspend_snapshot_publication(publication)
-            .await?;
-        drop(artifact_guard);
-        drop(wake_guard);
-
+        let local_artifact_id = publication.await.map_err(|error| {
+            Status::internal(format!("suspend publication task ended: {error}"))
+        })??;
         Ok(Response::new(SuspendResponse {
             published_artifact: Some(crate::proto::PublishedArtifact {
-                local_artifact_id: blocking_local_artifact_id,
+                local_artifact_id,
                 artifact_kind: crate::proto::ArtifactKind::Full as i32,
                 origin: crate::proto::ArtifactOrigin::Suspend as i32,
                 snapshot_name: None,
@@ -257,6 +279,8 @@ impl SandboxManagerService {
         _artifact_guard: &crate::auto_lifecycle::LifecycleMutexGuard,
     ) -> Result<(String, SuspendSnapshotPublicationContext), Status> {
         self.ensure_snapshot_restore_supported("suspend")?;
+        self.settle_guest_update_for_lifecycle(&context.sandbox_id)
+            .await?;
         // Cleanup takes its fence before any artifact lock. Never wait for it
         // while holding the wake/artifact locks: an admitted delete must win,
         // and retrying avoids an inverted lock-order cycle.
@@ -267,6 +291,13 @@ impl SandboxManagerService {
                 "sandbox cleanup is active; retry suspend",
             ));
         };
+        // A runtime upgrade that must leave the sandbox stopped runs it on its
+        // boot's execution until it stops it: suspended there, it would never
+        // reach the state it reports. Checked under the artifact lock every
+        // suspend holds here, which a runtime upgrade's fence takes too: an
+        // upgrade whose boot could start before the capture already fences
+        // the sandbox, and the check holds the suspend for it.
+        self.refuse_suspend_during_stay_stopped_upgrade(&context.sandbox_id)?;
         let sandbox = self.lookup_sandbox(&context.sandbox_id)?;
         self.ensure_memory_state_supported(&sandbox, "suspend")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "suspend")?;
@@ -485,7 +516,7 @@ impl SandboxManagerService {
             let error = if sandbox.state.is_unowned(SandboxState::Failed) {
                 format!(
                     "cannot suspend: {}",
-                    pplx_space_common_core::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER
+                    pplx_space_rpc_contracts::node_drain_signals::SUSPEND_SANDBOX_FAILED_MARKER
                 )
             } else {
                 format!(
@@ -509,7 +540,7 @@ impl SandboxManagerService {
             let db = self.db_conn()?;
             match context.durability {
                 SuspendDurability::NodeLocal => {
-                    let applied = crate::db::begin_suspend(&db, &sandbox.id)
+                    let applied = crate::db::begin_suspend(&db, &sandbox.id, local_artifact_id)
                         .map_err(|e| Status::internal(format!("db error: {e}")))?;
                     if !applied {
                         return Err(Status::aborted("suspend admission superseded"));
@@ -518,8 +549,13 @@ impl SandboxManagerService {
                 }
                 SuspendDurability::RemoteBeforeTeardown {
                     execution_generation,
-                } => crate::db::begin_teardown_suspend(&db, &sandbox.id, execution_generation)
-                    .map(|_| ()),
+                } => crate::db::begin_teardown_suspend(
+                    &db,
+                    &sandbox.id,
+                    execution_generation,
+                    local_artifact_id,
+                )
+                .map(|_| ()),
             }
             .map_err(|e| Status::internal(format!("db error: {e}")))?;
         }

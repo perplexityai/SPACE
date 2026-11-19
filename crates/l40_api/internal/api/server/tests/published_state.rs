@@ -3,22 +3,18 @@
 
 #![cfg(test)]
 
-use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_common_core::types::{LocalArtifactId, NodeId, SnapshotId};
-use pplx_space_common_core::{
-    sql,
-    types::{
-        AbandonedRestoreRetirement, Arch, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
-        AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
-        AutoLifecycleStage, ExecutionMetadata, PolicyAuthority, SandboxActivationAttemptId,
-        SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
-        SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    },
+use pplx_space_accounts::NodeId;
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+    AutoLifecyclePolicy, AutoLifecycleStage,
 };
+use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
+use pplx_space_cpu_arch::Arch;
 use pplx_space_db_test_fixtures::{
     insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
     publish_ready_disk_artifact, try_pg_test_db, try_pg_test_db_with_max_connections,
 };
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_internal_api_server::{
     ClusterApiService,
     proto::{
@@ -28,6 +24,14 @@ use pplx_space_internal_api_server::{
     publish_sandbox_states, publish_sandbox_states_with_retirement,
 };
 use pplx_space_net_common::proto::NetworkPolicySource;
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    AbandonedRestoreRetirement, AutoLifecycleDeleteReceiptId, SandboxActivationAttemptId,
+    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource,
+};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, NetworkPolicyTarget,
     SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
@@ -976,10 +980,9 @@ async fn quarantine_recovery_observation_persists_and_clears_without_central_san
 
 #[tokio::test(flavor = "current_thread")]
 async fn publish_updates_observed_state_without_writing_component_rows() -> TestResult {
-    use pplx_space_common_core::types::{
-        ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-        ArtifactVersion, Digest,
-    };
+    use pplx_space_content_digest::Digest;
+    use pplx_space_execution_spec::{ArtifactComponentKind, ArtifactComponentMetadata};
+    use pplx_space_execution_spec::{ArtifactComponentRole, ArtifactFormat, ArtifactVersion};
 
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
@@ -2542,6 +2545,90 @@ async fn publish_sandbox_state_updates_activity_clocks_without_touching_updated_
         updated_at.unix_timestamp(),
         original_updated_at.unix_timestamp(),
         "publishing activity clocks must not make the sandbox look structurally updated"
+    );
+    Ok(())
+}
+
+async fn sandbox_idle_deadline(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT next_auto_event_at FROM sandboxes WHERE id = $1")
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// The publisher's idle deadline is recorded for `getSandbox`'s `expires_at`.
+/// A later deadline is recorded only once it has moved a minute, an earlier
+/// one at once, a cleared one is cleared, and none of it reads as a change to
+/// the sandbox or is taken from another node.
+#[tokio::test(flavor = "current_thread")]
+async fn publish_sandbox_state_records_the_idle_deadline_without_touching_updated_at() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let original_updated_at = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+    set_sandbox_updated_at_for_test(&db.pool, sandbox_id, original_updated_at).await?;
+
+    for (published, recorded, reason) in [
+        (
+            Some(1_800_000_000),
+            Some(1_800_000_000),
+            "a first deadline is recorded",
+        ),
+        (
+            Some(1_800_000_059),
+            Some(1_800_000_000),
+            "use within the minute is not rewritten",
+        ),
+        (
+            Some(1_800_000_060),
+            Some(1_800_000_060),
+            "a deadline a minute later is recorded",
+        ),
+        (
+            Some(1_800_000_010),
+            Some(1_800_000_010),
+            "an earlier deadline is recorded at once",
+        ),
+        (None, None, "a cleared deadline is cleared"),
+    ] {
+        let mut state = published_sandbox_state(sandbox_id, "started");
+        state.next_auto_event_at = published.map(timestamp);
+        let mut conn = db.pool.acquire().await?;
+        publish_sandbox_states(&mut conn, node_id, &[state]).await?;
+        drop(conn);
+        assert_eq!(
+            sandbox_idle_deadline(&db.pool, sandbox_id).await?,
+            recorded,
+            "{reason}"
+        );
+    }
+
+    let foreign_node = NodeId::new();
+    insert_ready_worker_node(&db.pool, foreign_node).await?;
+    let mut foreign_state = published_sandbox_state(sandbox_id, "started");
+    foreign_state.next_auto_event_at = Some(timestamp(1_900_000_000));
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, foreign_node, &[foreign_state]).await?;
+    drop(conn);
+    assert_eq!(
+        sandbox_idle_deadline(&db.pool, sandbox_id).await?,
+        None,
+        "a foreign publisher cannot set the sandbox's idle deadline"
+    );
+
+    assert_eq!(
+        sandbox_updated_at(&db.pool, sandbox_id)
+            .await?
+            .unix_timestamp(),
+        original_updated_at.unix_timestamp(),
+        "publishing an idle deadline must not make the sandbox look updated"
     );
     Ok(())
 }

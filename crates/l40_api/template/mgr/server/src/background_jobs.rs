@@ -64,14 +64,14 @@ pub struct StampPayload {
     /// Environment of the build's cache partition. Absent for the legacy
     /// partition, including every job enqueued before partitions existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    pub partition_environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 }
 
 impl StampPayload {
     pub fn new(
         name: &str,
         content_hash: &str,
-        partition: pplx_space_common_core::types::TemplateCachePartition,
+        partition: pplx_space_template_model::TemplateCachePartition,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -80,8 +80,8 @@ impl StampPayload {
         }
     }
 
-    pub fn partition(&self) -> pplx_space_common_core::types::TemplateCachePartition {
-        use pplx_space_common_core::types::TemplateCachePartition;
+    pub fn partition(&self) -> pplx_space_template_model::TemplateCachePartition {
+        use pplx_space_template_model::TemplateCachePartition;
         self.partition_environment.map_or(
             TemplateCachePartition::Legacy,
             TemplateCachePartition::Environment,

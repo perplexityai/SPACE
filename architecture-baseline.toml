@@ -29,7 +29,7 @@
 [pattern_ratchet.rootfs_copy]
 # Privileged builder copies are deferred; builders stay CoW.
 "crates/l40_api/build/mgr/engine/src/lib.rs" = 1
-# Non-Linux fallbacks; Linux paths use common-io's reflink helper.
+# Non-Linux fallbacks; Linux paths use file-io's reflink helper.
 "crates/l40_api/node/runtime/core/src/lib.rs" = 2
 "crates/l40_api/template/mgr/server/src/service.rs" = 3
 "crates/l40_api/volmgr/server/src/staging.rs" = 2
@@ -46,8 +46,6 @@
 # Writers of the control-plane Postgres `sandboxes` row outside sandbox-store.
 # They move into the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
-"crates/l40_api/api/src/controllers/sandbox/responses.rs" = 1
-"crates/l40_api/api/src/controllers/substrate/direct.rs" = 1
 
 # No code outside the store names sbx-mgr's migrations or database path; the
 # database migrator takes them from the store.
@@ -60,72 +58,16 @@
 # namespace to its live tables that no store declares. Only remove entries:
 # a pull request that adds one is reported.
 [layers.codec_features]
-pplx-space-api = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-cluster-controller-server = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-common-core = [
-  "pplx-space-accounts/rusqlite",
-  "pplx-space-accounts/sqlx",
-  "pplx-space-k8s-ids/sqlx",
-  "pplx-space-semver/sqlx",
-]
-pplx-space-credmgr = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-internal-api-server = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-node-runtime-manager = [
-  "pplx-space-common-core/rusqlite",
-]
-pplx-space-snapshot-retention = [
-  "pplx-space-common-core/sqlx",
-]
-pplx-space-volmgr = [
-  "pplx-space-common-core/rusqlite",
-]
 
 [layers.dev_direction]
-pplx-space-sbx-mgr-store = [
-  "pplx-space-node-runtime-core",
-]
 
 [layers.direction]
 
 [layers.domain_dependencies]
-pplx-space-common-core = [
-  "k8s-openapi",
-]
-pplx-space-net-common = [
-  "tokio",
-]
-pplx-space-spaced-common = [
-  "hyper-util",
-  "tokio",
-  "tokio-stream",
-  "tokio-util",
-  "tokio-vsock",
-]
-pplx-space-spaced-guest-protocol = [
-  "tokio",
-]
 
 [layers.model_protocol]
-pplx-space-common-core = [
-  "pplx-space-rpc-contracts",
-]
-pplx-space-spaced-common = [
-  "pplx-space-spaced-guest-protocol",
-]
 
 [layers.storage_access]
-pplx-space-accounts = [
-  "rusqlite",
-  "sqlx",
-]
 pplx-space-api = [
   "deadpool-redis",
   "redis",
@@ -142,10 +84,6 @@ pplx-space-cluster-controller-server = [
   "sqlx",
 ]
 pplx-space-cluster-reconciler = [
-  "sqlx",
-]
-pplx-space-common-core = [
-  "rusqlite",
   "sqlx",
 ]
 pplx-space-credmgr = [
@@ -171,9 +109,6 @@ pplx-space-node-runtime-manager = [
   "pplx-space-sqlite",
   "rusqlite",
   "sqlx",
-]
-pplx-space-sbx-mgr = [
-  "pplx-space-common-jobs",
 ]
 pplx-space-snapshot-retention = [
   "sqlx",
@@ -208,21 +143,14 @@ postgres = [
   "data_plane_sessions",
   "node_artifact_components",
   "node_direct",
-  "node_facet_conditions",
-  "node_facet_observed_status",
   "node_group_template_compat",
   "node_groups",
-  "node_k8s",
   "node_k8s_tombstones",
-  "node_local_backup_pending",
-  "node_reconcile_queue",
   "node_runtime_guests",
   "node_runtime_installations",
   "node_runtime_state_formats",
-  "node_status_snapshots",
   "node_template_components",
   "node_template_inventory",
-  "nodes",
   "org_branching_keys",
   "org_credentials",
   "org_master_keys",
@@ -231,23 +159,13 @@ postgres = [
   "public_idempotency_records",
   "public_operation_events",
   "public_operations",
-  "runtime_environments",
-  "runtime_upgrade_campaigns",
-  "runtime_upgrade_items",
   "sandbox_archives",
   "sandbox_direct_route_identities",
   "sandbox_direct_route_provenance",
   "sandbox_ecw_credential_epochs",
   "sandbox_encrypted_fields",
-  "sandbox_k8s_executions",
-  "sandbox_observed_states",
-  "sandbox_port_exposures",
-  "sandbox_quarantine_history",
-  "sandbox_quarantine_state",
-  "sandbox_snapshot_inventory",
   "sandbox_volume_encryption",
   "sessions",
-  "snapshot_storage_location_encrypted_fields",
   "template_base_snapshot_policies",
   "template_build_base_grants",
   "template_build_blobs",
@@ -264,7 +182,6 @@ postgres = [
   "templates",
   "user_credentials",
   "users",
-  "warm_pool_policies",
 ]
 "sqlite.build-manager" = [
   "build_job_results",
@@ -285,22 +202,6 @@ postgres = [
   "jobs",
   "operation_results",
 ]
-"sqlite.sandbox-manager" = [
-  "network_policy_reconcile_queue",
-]
-"sqlite.template-manager" = [
-  "jobs",
-  "node_dirty_refs",
-  "pools",
-  "template_build_components",
-  "template_builds",
-  "template_local_policy_sequence",
-  "template_network_policy_notifications",
-  "template_pinned_releases",
-  "template_pinned_tags",
-  "template_settings",
-  "template_snapshots",
-]
 "sqlite.volume-manager" = [
   "jobs",
   "volume_attachments",
@@ -311,17 +212,9 @@ postgres = [
 # request that adds one is reported, and fails the check.
 [crate_names]
 pplx-space-common-cli = "crates/l10_foundation/common/cli"
-pplx-space-common-connection-admission = "crates/l10_foundation/common/connection/admission"
-pplx-space-common-core = "crates/libs/common/core"
 pplx-space-common-grpc = "crates/l10_foundation/common/grpc/transport"
-pplx-space-common-grpc-lb = "crates/l10_foundation/common/grpc/lb"
-pplx-space-common-io = "crates/l10_foundation/common/io"
 pplx-space-common-jobs = "crates/l10_foundation/common/jobs"
-pplx-space-common-lru-reaper = "crates/l10_foundation/common/lru/reaper"
 pplx-space-common-proto-build = "crates/l10_foundation/common/proto/build"
-pplx-space-common-work-coalescer = "crates/l10_foundation/common/work/coalescer"
-pplx-space-credential-injection-core = "crates/l20_domain/credential/injection/core"
 pplx-space-execution-common = "crates/l20_domain/execution/common"
 pplx-space-net-common = "crates/l20_domain/net/common"
 pplx-space-node-runtime-core = "crates/l40_api/node/runtime/core"
-pplx-space-spaced-common = "crates/l20_domain/spaced/common"

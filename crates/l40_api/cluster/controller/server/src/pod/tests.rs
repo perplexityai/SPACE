@@ -1,5 +1,6 @@
-use pplx_space_common_core::types::UserId;
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,8 +8,16 @@ use std::str::FromStr;
 
 use k8s_openapi::api::core::v1::{NodeSelectorRequirement, PodCondition, PodSpec, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_byte_size::MemorySize;
 use pplx_space_cluster_pool::{PoolSlot, PoolSlotState};
-use pplx_space_common_core::kubernetes::{
+use pplx_space_content_digest::{ContentHash, Digest};
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_node_model::{
+    NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy, TemplateCompatSpec,
+};
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_pod::{
     DEFAULT_SANDBOX_INTERNAL_CONTROL_TOKEN_KEY, DEFAULT_SANDBOX_INTERNAL_SECRET_NAME,
     DEFAULT_SANDBOX_INTERNAL_TOKEN_KEY, DEFAULT_SANDBOX_POD_IMAGE, DEFAULT_SANDBOX_RUNTIME_CLASS,
     PodToleration, SANDBOX_ACTIVATION_ATTEMPT_ID_ANNOTATION, SANDBOX_AUTO_LIFECYCLE_ANNOTATION,
@@ -18,10 +27,7 @@ use pplx_space_common_core::kubernetes::{
     SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_ROLE_WARM, SANDBOX_POOL_SLOT_ID_KEY,
     SANDBOX_TEMPLATE_ANNOTATION, SANDBOX_VCPU_ANNOTATION, SandboxRuntimePodMetadata,
 };
-use pplx_space_common_core::types::{
-    ContentHash, Digest, MemorySize, NodeGroup, NodeGroupId, NodeGroupName, NodeGroupPolicy,
-    PolicyAuthority, SandboxOwner, TemplateCompatSpec, TemplateName, TemplateVisibility, VcpuCount,
-};
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use time::OffsetDateTime;
 
 use super::*;
@@ -31,7 +37,7 @@ fn build_pool_pod_sets_sandbox_and_pool_metadata() {
     let slot = pool_slot();
     let config = pool_pod_config();
 
-    let pod = build_pool_pod(&config, &slot, None);
+    let pod = build_pool_pod(&config, &slot, None, None);
 
     assert_eq!(pod.metadata.name.as_deref(), Some("space-sbx-test-g1"));
     assert_eq!(pod.metadata.namespace.as_deref(), Some("space"));
@@ -125,7 +131,7 @@ fn build_pool_pod_renders_the_node_group_boundary_only_when_resolved() {
     let slot = pool_slot();
     let config = pool_pod_config();
 
-    let ungated = build_pool_pod(&config, &slot, None);
+    let ungated = build_pool_pod(&config, &slot, None, None);
     assert!(
         node_group_expressions(&ungated).is_empty(),
         "a pool pod with no resolved set must carry no node-group constraint"
@@ -147,7 +153,7 @@ fn build_pool_pod_renders_the_node_group_boundary_only_when_resolved() {
         .expect("a generic group admits a generic template");
     assert!(!placement.targets_dedicated_capacity());
 
-    let placed = build_pool_pod(&config, &slot, Some(&placement));
+    let placed = build_pool_pod(&config, &slot, Some(&placement), None);
     let expressions = node_group_expressions(&placed);
     assert_eq!(expressions.len(), 1, "expected one node-group term");
     let expression = &expressions[0];
@@ -183,7 +189,7 @@ fn build_pool_pod_sets_explicit_disk_capacity() {
     let mut slot = pool_slot();
     slot.disk_mib = Some(32768);
 
-    let pod = build_pool_pod(&pool_pod_config(), &slot, None);
+    let pod = build_pool_pod(&pool_pod_config(), &slot, None, None);
 
     assert_eq!(
         pod.metadata
@@ -207,7 +213,7 @@ fn build_pool_pod_requires_all_worker_labels_from_config() {
     let slot = pool_slot();
     let config = pool_pod_config();
 
-    let pod = build_pool_pod(&config, &slot, None);
+    let pod = build_pool_pod(&config, &slot, None, None);
 
     let selector = pod.spec.as_ref().unwrap().node_selector.as_ref().unwrap();
     assert_eq!(
@@ -243,7 +249,7 @@ fn cluster_controller_built_restore_drops_source_node_pin_and_omits_tolerations(
         &pool_pod_config().for_namespace("space"),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: evacuation_common("space-sbx-evac-1", &env),
             runtime,
             fork_disk_restore: None,
@@ -309,7 +315,7 @@ fn cluster_controller_built_restore_renders_configured_placement() {
         &pool_pod_config().for_namespace("space"),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: evacuation_common("space-sbx-evac-2", &env),
             runtime,
             fork_disk_restore: None,
@@ -505,6 +511,7 @@ fn evacuation_runtime(_sandbox_owner: &SandboxOwner) -> SandboxRuntimePodMetadat
         memory_mib: None,
         disk_mib: None,
         disk_io_limits: Default::default(),
+        client_id: None,
     }
 }
 
@@ -521,6 +528,7 @@ fn evacuation_common<'a>(
         content_hash: Some(EVAC_TEST_CONTENT_HASH),
         env,
         traceparent: None,
+        environment: None,
     }
 }
 
@@ -528,7 +536,7 @@ fn evacuation_common<'a>(
 /// so the selector it composes must equal the `nodeSelector` this module
 /// actually renders. Both sides now go through `base_node_selector`, so the
 /// composition itself cannot drift — that half is covered by
-/// `common/core/src/k8s/node_selector/tests.rs`.
+/// `crates/l40_api/sandbox/pod/src/node_selector/tests.rs`.
 ///
 /// This is not therefore tautological. `build_sandbox_pod` seeds its map from
 /// `base_node_selector().into_labels()` and then keeps writing to it, so the
@@ -553,7 +561,7 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
         &values.for_namespace("space"),
         SandboxPodRequest::Restore {
             stopped_materialization: None,
-            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            artifact_kind: pplx_space_snapshot_model::ArtifactKind::Full,
             common: evacuation_common("space-sbx-selector-diff", &env),
             runtime,
             fork_disk_restore: None,
@@ -584,4 +592,56 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
         "the node-group labeler's worker selector has drifted from the sandbox pod's \
          rendered nodeSelector"
     );
+}
+
+#[test]
+fn build_pool_pod_records_its_environment_and_requires_it_only_when_on() {
+    use pplx_space_sandbox_pod::{
+        PodEnvironment, SANDBOX_ENVIRONMENT_ANNOTATION, environment_label_key,
+    };
+    let slot = pool_slot();
+    let config = pool_pod_config();
+    let reference = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        .parse()
+        .unwrap();
+    let key = environment_label_key(&reference);
+    let render = |environment| build_pool_pod(&config, &slot, None, environment);
+    let annotation = |pod: &Pod| {
+        pod.metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_ENVIRONMENT_ANNOTATION))
+            .cloned()
+    };
+    let requires = |pod: &Pod| {
+        pod.spec
+            .as_ref()
+            .and_then(|spec| spec.affinity.as_ref())
+            .and_then(|affinity| affinity.node_affinity.as_ref())
+            .and_then(|node_affinity| {
+                node_affinity
+                    .required_during_scheduling_ignored_during_execution
+                    .as_ref()
+            })
+            .is_some_and(|selector| {
+                selector.node_selector_terms.iter().all(|term| {
+                    term.match_expressions
+                        .iter()
+                        .flatten()
+                        .any(|expression| expression.key == key)
+                })
+            })
+    };
+
+    let unbound = render(None);
+    assert_eq!(annotation(&unbound), None);
+    assert!(!requires(&unbound));
+    for required in [false, true] {
+        let pod = render(Some(PodEnvironment {
+            reference,
+            required,
+        }));
+        assert_eq!(annotation(&pod), Some(reference.to_string()));
+        assert_eq!(requires(&pod), required, "required: {required}");
+    }
 }

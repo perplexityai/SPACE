@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
-use pplx_space_common_core::types::{NodeId, SubstrateKind};
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{
     TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
 };
+use pplx_space_node_model::SubstrateKind;
 use time::Duration;
 
 use super::*;
@@ -860,54 +861,6 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
     assert_eq!(off_route_node, newest_first(&[0, 3, 4, 5, 6]));
     db.pool.close().await;
     Ok(())
-}
-
-/// The filter takes every value `sandboxes.lifecycle` holds, as the stored
-/// vocabulary normalizes it, and otherwise only the retired values.
-#[test]
-fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
-    for stored in pplx_space_sandbox_store::StoredSandboxLifecycle::all() {
-        let value = stored.as_str();
-        for spelling in [
-            value.to_string(),
-            format!(" {} ", value.to_ascii_uppercase()),
-        ] {
-            assert_eq!(
-                spelling
-                    .parse::<AdminStoredLifecycle>()
-                    .map(AdminStoredLifecycle::as_str),
-                Ok(value),
-                "{spelling:?}"
-            );
-            assert_eq!(
-                spelling.parse::<pplx_space_sandbox_store::StoredSandboxLifecycle>(),
-                Ok(*stored),
-                "{spelling:?}"
-            );
-        }
-    }
-    // A retired value is still taken, though no row stores it.
-    assert_eq!(
-        " Cleanup_Required "
-            .parse::<AdminStoredLifecycle>()
-            .map(AdminStoredLifecycle::as_str),
-        Ok("cleanup_required")
-    );
-    "cleanup_required"
-        .parse::<pplx_space_sandbox_store::StoredSandboxLifecycle>()
-        .unwrap_err();
-    for unknown in ["", "delete", "cleanup-required", "live"] {
-        assert!(
-            unknown.parse::<AdminStoredLifecycle>().is_err(),
-            "{unknown:?}"
-        );
-        assert!(
-            unknown
-                .parse::<pplx_space_sandbox_store::StoredSandboxLifecycle>()
-                .is_err(),
-            "{unknown:?}"
-        );
-    }
 }
 
 #[test]

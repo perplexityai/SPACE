@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::{
+use pplx_space_template_manifest::{
     TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
 };
 use sha2::{Digest as _, Sha256};
@@ -1107,11 +1107,14 @@ async fn the_gc_tick_enqueues_the_inventory_of_a_build_it_restores() {
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
             .unwrap();
     let dirty = || {
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.element_value)
-            .collect::<Vec<_>>()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.element_value)
+        .collect::<Vec<_>>()
     };
     assert!(!dirty().contains(&"seed".to_string()));
 
@@ -1438,9 +1441,12 @@ async fn the_gc_tick_skips_a_dir_removed_after_its_scan() {
     );
 
     assert!(
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .is_empty()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100
+        )
+        .unwrap()
+        .is_empty()
     );
 }
 
@@ -1657,15 +1663,15 @@ async fn a_dir_skipped_for_want_of_a_permit_comes_first_next_tick() {
 
 fn twin_partition() -> crate::db::TemplateCachePartition {
     crate::db::TemplateCachePartition::Environment(
-        pplx_space_common_core::types::EnvironmentReference::new(
-            pplx_space_common_core::types::Digest::sha256([2; 32]),
+        pplx_space_execution_spec::EnvironmentReference::new(
+            pplx_space_content_digest::Digest::sha256([2; 32]),
         ),
     )
 }
 
 fn bind_manifest(manifest: &mut TemplateManifest, partition: crate::db::TemplateCachePartition) {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-        pplx_space_common_core::types::Arch::X86_64,
+    let execution = pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+        pplx_space_cpu_arch::Arch::X86_64,
         vec![],
     );
     // Name the architecture the binding is for, or registration takes the
@@ -1711,8 +1717,8 @@ fn partition_binding_rejects_a_dir_bound_elsewhere() {
     assert!(unbound.execution.is_none());
     let mut metadata = TemplateMetadata::default();
     metadata.set_execution_metadata(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_execution_spec::ExecutionMetadata::initial_firecracker(
+            pplx_space_cpu_arch::Arch::X86_64,
             vec![],
         )
         .with_environment(twin_partition().environment().unwrap()),
@@ -1846,7 +1852,7 @@ async fn recovery_registers_a_twin_dir_in_its_own_partition(#[case] in_metadata:
 #[tokio::test]
 async fn a_recovered_twin_bound_only_in_its_metadata_refreshes_in_place() {
     let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap();
     let execution = catalog
@@ -2190,11 +2196,14 @@ async fn a_restored_build_s_snapshots_that_fail_to_register_are_retried() {
         hashes
     };
     let dirty = || {
-        crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.element_value)
-            .collect::<Vec<_>>()
+        pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+            &service.db.lock().unwrap(),
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.element_value)
+        .collect::<Vec<_>>()
     };
 
     assert_eq!(service.reconcile_rowless_build_dirs(4, CHECK_WAIT).await, 1);
@@ -2202,7 +2211,9 @@ async fn a_restored_build_s_snapshots_that_fail_to_register_are_retried() {
     assert_eq!(snapshots(), ["sibling-hash"]);
     {
         let conn = service.db.lock().unwrap();
-        let published = crate::db::list_node_dirty_refs(&conn, 100).unwrap();
+        let published =
+            pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(&conn, 100)
+                .unwrap();
         crate::db::delete_node_dirty_refs(&conn, &published).unwrap();
     }
 
@@ -2419,11 +2430,14 @@ async fn a_partial_snapshot_repair_is_published() {
     service.reconcile_rowless_build_dirs(4, CHECK_WAIT).await;
 
     assert_eq!(snapshot_count(&service, "seed", &hashes[0]), 1);
-    let dirty: Vec<_> = crate::db::list_node_dirty_refs(&service.db.lock().unwrap(), 100)
-        .unwrap()
-        .into_iter()
-        .map(|row| row.element_value)
-        .collect();
+    let dirty: Vec<_> = pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs(
+        &service.db.lock().unwrap(),
+        100,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|row| row.element_value)
+    .collect();
     assert!(dirty.contains(&"seed".to_string()), "{dirty:?}");
 }
 
@@ -2561,17 +2575,30 @@ async fn recovery_asks_for_dependent_sandboxes_once_per_pass() {
 /// A dir held during the startup scan is checked against a dependent-sandbox
 /// answer taken once its holder lets go, not the scan's: a sandbox that came
 /// to depend on the build during that unbounded wait keeps its dir.
+#[rstest::rstest]
+#[case::first_build_held(0)]
+#[case::second_build_held(1)]
 #[tokio::test]
-async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer() {
+async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer(
+    #[case] held_index: usize,
+) {
     let root = tempfile::tempdir().unwrap();
-    let builds = place_invalid_build_dirs(root.path(), 2);
-    let (scanned_hash, scanned_dir) = builds[0].clone();
-    let (held_hash, held_dir) = builds[1].clone();
+    let mut builds = place_invalid_build_dirs(root.path(), 2);
+    let (held_hash, held_dir) = builds.remove(held_index);
+    let (scanned_hash, scanned_dir) = builds.pop().unwrap();
     let depended = Arc::new(std::sync::Mutex::new(Vec::new()));
     let service =
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
             .unwrap()
             .with_dependent_sandboxes(dependent_sandboxes_of(Arc::clone(&depended), true));
+    // This build has a catalog row but no dir under the service's root.
+    // Its row is pruned only after the entire directory scan.
+    let scan_marker = write_digest_fixture(b"scan-marker-rootfs", b"zst-bytes");
+    insert_row(
+        &service.db.lock().unwrap(),
+        &scan_marker,
+        &canonical_manifest(&scan_marker),
+    );
     *service.pool_handle.lock().unwrap() = Some(tokio::spawn(async {}));
     let held = service
         .volume_puller
@@ -2582,14 +2609,16 @@ async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer() {
         let service = service.clone();
         async move { service.run_startup_recovery().await }
     });
-    // The scan asks for dependents when it rejects the dir it can claim.
+    // Removing scanned_dir alone doesn't mean the scan has reached held_dir:
+    // releasing its claim then can send it through the scan's cached answer.
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while scanned_dir.exists() {
+        while registered(&service, &scan_marker) {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the scan removes the invalid build nothing depends on");
+    .expect("catalog cleanup follows the complete directory scan");
+    assert!(!scanned_dir.exists());
     assert!(!recovery.is_finished());
     depended
         .lock()
@@ -2608,9 +2637,9 @@ async fn a_held_invalid_build_is_checked_against_a_fresh_dependent_answer() {
 
 /// A real non-initial catalog environment: Firecracker 1.17.0 / Linux
 /// 6.1.155, the one nodes ran before partitions existed.
-fn e1_execution() -> pplx_space_common_core::types::ExecutionMetadata {
+fn e1_execution() -> pplx_space_execution_spec::ExecutionMetadata {
     pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
-        pplx_space_common_core::types::Arch::X86_64,
+        pplx_space_cpu_arch::Arch::X86_64,
     )
     .unwrap()
     .iter()

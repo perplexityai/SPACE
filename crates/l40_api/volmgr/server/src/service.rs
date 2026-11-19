@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -7,20 +7,22 @@ use std::time::Duration;
 
 use crate::artifact::{ArtifactEntryRole, ArtifactId};
 use crate::crypto::wrap_aad;
-use pplx_space_common_core::types::{
-    MaterializationMode, SnapshotArtifact, StorageUri, SubjectId, TransferScopeId,
-    parse_snapshot_object_key,
-};
-use pplx_space_common_core::{host::linux::identities::user_names, host::linux::identities::users};
-use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier, types::OrgId};
+use crate::materialization::MaterializationMode;
+use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::{SnapshotArtifact, StorageUri, parse_snapshot_object_key};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
 use pplx_space_common_jobs::{
     BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
     WorkerConfig,
 };
+use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_sandbox_grpc::record_sandbox_id;
+use pplx_space_snapshot_model::TransferScopeId;
+use pplx_space_subject_model::SubjectId;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::executor::{
@@ -95,38 +97,60 @@ pub struct VolumeManagerService {
 pub struct TransferAdmission {
     state: Arc<Mutex<TransferAdmissionState>>,
     idle: Arc<tokio::sync::Notify>,
+    waits_ended: CancellationToken,
 }
 
 #[derive(Default)]
 struct TransferAdmissionState {
-    accepting: bool,
+    phase: AdmissionPhase,
     admitted: usize,
+}
+
+/// Which state mutations volume-manager admits during its lifetime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AdmissionPhase {
+    #[default]
+    Open,
+    /// Shutting down: queued submissions are persisted for the successor,
+    /// which recovers them, and everything else is refused.
+    HandingOff,
+    Closed,
 }
 
 struct TransferAdmissionLease {
     admission: TransferAdmission,
 }
 
+const HANDOFF_REFUSAL: &str = "volume-manager is handing off; retry transfer submission";
+
 impl TransferAdmission {
     pub fn open() -> Self {
         Self {
-            state: Arc::new(Mutex::new(TransferAdmissionState {
-                accepting: true,
-                admitted: 0,
-            })),
+            state: Arc::new(Mutex::new(TransferAdmissionState::default())),
             idle: Arc::new(tokio::sync::Notify::new()),
+            waits_ended: CancellationToken::new(),
         }
     }
 
+    /// Admit a mutation that needs this process to act on it: a transfer the
+    /// caller waits for, an attachment, or a cancellation.
     fn enter(&self) -> Result<TransferAdmissionLease, Status> {
+        self.enter_in(&[AdmissionPhase::Open])
+    }
+
+    /// Admit a submission that only persists a transfer. While handing off,
+    /// the job stays pending and the successor runs it.
+    fn enter_queued(&self) -> Result<TransferAdmissionLease, Status> {
+        self.enter_in(&[AdmissionPhase::Open, AdmissionPhase::HandingOff])
+    }
+
+    fn enter_in(&self, phases: &[AdmissionPhase]) -> Result<TransferAdmissionLease, Status> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| Status::internal("volume-manager transfer admission mutex poisoned"))?;
-        if !state.accepting {
-            return Err(Status::unavailable(
-                "volume-manager is handing off; retry transfer submission",
-            ));
+        if !phases.contains(&state.phase) {
+            return Err(Status::unavailable(HANDOFF_REFUSAL));
         }
         state.admitted += 1;
         Ok(TransferAdmissionLease {
@@ -134,14 +158,45 @@ impl TransferAdmission {
         })
     }
 
+    /// Refuses every mutation except queued transfer submissions, which keep
+    /// being persisted for the successor while running transfers finish.
+    pub fn hand_off(&self) {
+        match self.state.lock() {
+            Ok(mut state) if state.phase == AdmissionPhase::Open => {
+                state.phase = AdmissionPhase::HandingOff;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "volume-manager transfer admission mutex poisoned")
+            }
+        }
+    }
+
     /// Atomically rejects new state mutations. Existing polling remains
     /// available while admitted mutations reach a durable boundary.
     pub fn close(&self) {
         match self.state.lock() {
-            Ok(mut state) => state.accepting = false,
+            Ok(mut state) => state.phase = AdmissionPhase::Closed,
             Err(error) => {
                 tracing::error!(%error, "volume-manager transfer admission mutex poisoned")
             }
+        }
+    }
+
+    /// Answers every wait for a transfer this process will not finish with a
+    /// retryable refusal, so callers ask the successor instead of holding the
+    /// server open.
+    pub fn end_waits(&self) {
+        self.waits_ended.cancel();
+    }
+
+    async fn until_waits_end<T>(
+        &self,
+        wait: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        tokio::select! {
+            result = wait => result,
+            _ = self.waits_ended.cancelled() => Err(Status::unavailable(HANDOFF_REFUSAL)),
         }
     }
 
@@ -396,10 +451,10 @@ impl VolumeManagerService {
         Ok(crate::staging::cleanup_orphans(self.staging.root(), &keep))
     }
 
-    /// Collect every `staged_path` referenced by a push job currently in
-    /// `pending` or `running`. Goes through the worker's SQLite connection
-    /// directly (rather than `worker.list_jobs`, which is bounded by a
-    /// caller-supplied limit) because the keep-set **must be complete**:
+    /// Collect every `staged_path` referenced by a push or artifact push job
+    /// currently in `pending` or `running`. Goes through the worker's SQLite
+    /// connection directly (rather than `worker.list_jobs`, which is bounded
+    /// by a caller-supplied limit) because the keep-set **must be complete**:
     /// if a single staged_path were missing, `cleanup_orphans` would
     /// delete a file the worker is about to re-execute, reproducing the
     /// exact "entity not found" failure this module exists to prevent.
@@ -407,19 +462,31 @@ impl VolumeManagerService {
         let conn = self.lock_db()?;
         let mut stmt = conn
             .prepare(
-                "SELECT payload FROM jobs
-                 WHERE kind = 'push' AND status IN ('pending', 'running')",
+                "SELECT kind, payload FROM jobs
+                 WHERE kind IN (?1, ?2) AND status IN ('pending', 'running')",
             )
             .map_err(|e| Status::internal(format!("prepare staged-paths query: {e}")))?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([PUSH_KIND, PUSH_ARTIFACT_KIND], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| Status::internal(format!("execute staged-paths query: {e}")))?;
 
         let mut out = HashSet::new();
         for row in rows {
-            let payload =
+            let (kind, payload) =
                 row.map_err(|e| Status::internal(format!("read staged-paths row: {e}")))?;
-            if let Ok(p) = serde_json::from_str::<TransferPayload>(&payload)
+            if kind == PUSH_ARTIFACT_KIND {
+                if let Ok(artifact) = serde_json::from_str::<ArtifactPayload>(&payload) {
+                    out.extend(
+                        artifact
+                            .entries
+                            .into_iter()
+                            .filter_map(|entry| entry.staged_path)
+                            .map(PathBuf::from),
+                    );
+                }
+            } else if let Ok(p) = serde_json::from_str::<TransferPayload>(&payload)
                 && let Some(staged) = p.staged_path
             {
                 out.insert(PathBuf::from(staged));
@@ -1158,15 +1225,15 @@ impl VolumeManager for VolumeManagerService {
         self.authorize_sandbox_subject(&peer, &subject, "push_file")?;
         parse_uri(&req.s3_uri)?;
         let job = self
-            .worker
-            .submit_and_wait(
+            .transfer_admission
+            .until_waits_end(self.worker.submit_and_wait(
                 async {
                     let job_id = submit_push(&self.worker, &self.staging, &req).await;
                     drop(admission);
                     job_id
                 },
                 self.worker.worst_case_runtime(),
-            )
+            ))
             .await?;
         if job.status == "completed" {
             Ok(Response::new(PushFileResponse {
@@ -1197,15 +1264,15 @@ impl VolumeManager for VolumeManagerService {
         let artifact = effective_pull_snapshot_artifact(&req)?;
         let assignment = self.materialization_assignment(&subject, [artifact]);
         let job = self
-            .worker
-            .submit_and_wait(
+            .transfer_admission
+            .until_waits_end(self.worker.submit_and_wait(
                 async {
                     let job_id = submit_pull(&self.worker, &req, assignment);
                     drop(admission);
                     job_id
                 },
                 self.worker.worst_case_runtime(),
-            )
+            ))
             .await?;
         if job.status == "completed" {
             Ok(Response::new(PullFileResponse {
@@ -1225,7 +1292,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_push_file",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_sandbox_subject(&peer, &subject, "submit_push_file")?;
@@ -1278,7 +1345,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_push_btrfs_send",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         let subject = parse_request_subject(&format!("sandbox:{}", req.sandbox_id))?;
         self.authorize_sandbox_subject(&peer, &subject, "submit_push_btrfs_send")?;
@@ -1296,7 +1363,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_pull_file",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         let subject = parse_request_subject(&req.subject_id)?;
         self.authorize_transfer_subject(&peer, &subject, "submit_pull_file")?;
@@ -1318,7 +1385,7 @@ impl VolumeManager for VolumeManagerService {
             "submit_copy_object",
             SANDBOX_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let payload = crate::executor::copy::CopyPayload::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.authorize_sandbox_subject(&peer, payload.subject(), "submit_copy_object")?;
@@ -1373,7 +1440,9 @@ impl VolumeManager for VolumeManagerService {
         })?;
         self.authorize_job(&peer, &job, "wait_transfer_job")?;
         Ok(Response::new(
-            wait_for_transfer_job(&self.worker, &job_id).await?,
+            self.transfer_admission
+                .until_waits_end(wait_for_transfer_job(&self.worker, &job_id))
+                .await?,
         ))
     }
 
@@ -1501,7 +1570,7 @@ impl VolumeManager for VolumeManagerService {
             "push_files_async",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         if req.files.is_empty() {
             return Err(Status::invalid_argument("files must not be empty"));
@@ -1699,7 +1768,7 @@ impl VolumeManager for VolumeManagerService {
             "pull_files_async",
             TRANSFER_MANAGER_PEERS,
         )?;
-        let _admission = self.transfer_admission.enter()?;
+        let _admission = self.transfer_admission.enter_queued()?;
         let req = request.into_inner();
         if req.files.is_empty() {
             return Err(Status::invalid_argument("files must not be empty"));

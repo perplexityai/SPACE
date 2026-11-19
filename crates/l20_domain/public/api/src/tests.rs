@@ -26,6 +26,35 @@ fn generated_id_patterns_follow_the_typed_id_contract() {
     assert!(process_pattern.is_match(&ProcessSessionId::new().to_string()));
 }
 
+/// Data planes older than `output_truncated` send `process_exited` without
+/// it, so a client that validates frames against the published schema must
+/// still accept those frames.
+#[cfg(feature = "schema")]
+#[test]
+fn published_process_exited_schema_does_not_require_output_truncated() {
+    let schema = schemars::generate::SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<DataPlaneServerFrame>();
+    let schema = serde_json::to_value(schema).expect("schema should serialize");
+    let variants = schema["oneOf"]
+        .as_array()
+        .expect("frame schema should be a oneOf");
+    let exited = variants
+        .iter()
+        .find(|variant| variant["properties"]["type"]["const"] == "process_exited")
+        .expect("frame schema should have process_exited");
+
+    assert!(exited["properties"].get("output_truncated").is_some());
+    let required: Vec<&str> = exited["required"]
+        .as_array()
+        .expect("process_exited should list required fields")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(required, ["type", "process_id", "exit_code", "status"]);
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn a_process_request_without_a_user_serializes_to_its_pre_user_shape() {

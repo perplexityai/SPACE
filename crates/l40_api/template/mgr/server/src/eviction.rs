@@ -1,7 +1,7 @@
 //! LRU eviction loop for the on-node template cache.
 //!
 //! The pure planner — the `(items, pinned, active, cfg) → candidates`
-//! decision — lives in [`pplx_space_common_lru_reaper`] and is shared
+//! decision — lives in [`pplx_space_lru_reaper`] and is shared
 //! with the snapshot-artifact reaper in sandbox-manager. This module
 //! owns the *template-specific* wrapper: reading `template_builds`,
 //! the UNION of `template_pinned_tags` and `template_pinned_releases`,
@@ -43,7 +43,7 @@
 //!   handed out via `GetTemplate` before sandbox-manager's row
 //!   becomes visible to `sbx-mgr.List()`.
 //!
-//! See the crate-level docs of `pplx-space-common-lru-reaper` for the
+//! See the crate-level docs of `pplx-space-lru-reaper` for the
 //! full rationale on protected sets, headroom semantics, and the
 //! deterministic LRU tiebreak.
 
@@ -51,12 +51,12 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_lru_reaper::{self as lru_reaper, EvictionInput};
+use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
 use rusqlite::{Connection, params};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-pub(crate) use pplx_space_common_lru_reaper::EvictionConfig;
+pub(crate) use pplx_space_lru_reaper::EvictionConfig;
 
 use crate::db::TemplateCachePartition;
 
@@ -1037,7 +1037,7 @@ pub struct GcConfig {
 
 impl GcConfig {
     pub(crate) const ENV_BUDGET: &'static str = "SPACE_TEMPLATE_CACHE_BUDGET_BYTES";
-    /// Test hooks (`pplx_space_common_core::env::test_hook`): compiled in only
+    /// Test hooks (`pplx_space_test_hooks::test_hook`): compiled in only
     /// with the `test-hooks` feature, so release binaries cannot shrink the
     /// GC timers. Smoke benches use them to make eviction observable.
     pub(crate) const ENV_INTERVAL_SECS: &'static str = "SPACE_TEMPLATE_GC_INTERVAL_SECS";
@@ -1066,10 +1066,10 @@ impl GcConfig {
     const HEADROOM_FRACTION: f64 = 0.9;
 
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let budget = match env.var(Self::ENV_BUDGET).ok() {
             None => Some(Self::DEFAULT_BUDGET_BYTES),
             Some(raw) => match raw.trim().parse::<u64>() {
@@ -1089,11 +1089,11 @@ impl GcConfig {
             },
         };
         let enabled = budget.is_some();
-        let interval_secs = pplx_space_common_core::env::test_hook(env, Self::ENV_INTERVAL_SECS)
+        let interval_secs = pplx_space_test_hooks::test_hook(env, Self::ENV_INTERVAL_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS);
-        let grace_secs = pplx_space_common_core::env::test_hook(env, Self::ENV_GRACE_SECS)
+        let grace_secs = pplx_space_test_hooks::test_hook(env, Self::ENV_GRACE_SECS)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(Self::DEFAULT_GRACE_SECS);
         if enabled && grace_secs < Self::SAFETY_GRACE_FLOOR_SECS {

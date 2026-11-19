@@ -1,13 +1,14 @@
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::{ApiKeyId, NodeGroupId, NodeId, OrgId, UserId};
+use pplx_space_accounts::{ApiKeyId, NodeId, OrgId, UserId};
+use pplx_space_node_model::NodeGroupId;
 
 use axum::{
     Json,
     extract::{Query, State},
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeDrainMode;
+use pplx_space_node_model::NodeDrainMode;
 use pplx_space_public_api::{OperationId, PublicSandboxId};
+use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
@@ -541,6 +542,34 @@ pub(super) fn record_runtime_environment(entry: AdminRuntimeEnvironmentAuditEntr
         requested_state = entry.requested_state,
         reason = entry.reason,
         strand = entry.strand,
+        generation = entry.generation,
+        success = entry.success,
+        error = entry.error.unwrap_or(""),
+    );
+}
+
+/// Parameters for a runtime upgrade campaign write's audit entry.
+pub(super) struct AdminRuntimeUpgradeCampaignAuditEntry<'a> {
+    pub actor: &'a User,
+    pub action: &'a str,
+    /// Empty for a start that was refused before a campaign existed.
+    pub campaign_id: &'a str,
+    pub reason: &'a str,
+    /// The generation the write left; `None` when it was refused.
+    pub generation: Option<u64>,
+    pub success: bool,
+    pub error: Option<&'a str>,
+}
+
+pub(super) fn record_runtime_upgrade_campaign(entry: AdminRuntimeUpgradeCampaignAuditEntry<'_>) {
+    tracing::info!(
+        target: "space.admin.audit",
+        event = "admin_audit",
+        actor_user_id = %entry.actor.id,
+        actor_email = %entry.actor.email,
+        action = entry.action,
+        campaign_id = entry.campaign_id,
+        reason = entry.reason,
         generation = entry.generation,
         success = entry.success,
         error = entry.error.unwrap_or(""),

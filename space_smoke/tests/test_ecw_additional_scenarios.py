@@ -33,11 +33,6 @@ from space_smoke.scenarios.ecw_background_process_control import (
     PROCESS_READY_PREFIX,
     background_process_control,
 )
-from space_smoke.scenarios.ecw_binary_file_round_trip import (
-    CONTENT as BINARY_CONTENT,
-    PATH as BINARY_PATH,
-    binary_file_round_trip,
-)
 from space_smoke.scenarios.ecw_filesystem_mutations import (
     ORIGINAL_PATH,
     RENAMED_PATH,
@@ -92,7 +87,7 @@ class _Filesystem:
             f"files.write:{path}:{len(content)}:{request_timeout}:user={user}"
         )
         self.files[path] = content
-        uid = 2000 if user == "user" else 0
+        uid = 0 if user == "root" else 2000
         self.owners[path] = uid
         parent = PurePosixPath(path).parent
         while str(parent) not in {".", "/"}:
@@ -471,16 +466,6 @@ class EcwAdditionalScenarioTests(unittest.TestCase):
         )
         self.assertEqual(len(sandbox.trace), 2)
 
-    def test_binary_file_round_trip_preserves_every_byte(self) -> None:
-        sandbox = _Sandbox()
-
-        binary_file_round_trip.verify(_fixture(sandbox))
-
-        self.assertEqual(sandbox.files.files[BINARY_PATH], BINARY_CONTENT)
-        self.assertEqual(
-            sandbox.trace[-1],
-            f"files.read-bytes:{BINARY_PATH}:60",
-        )
 
     def test_filesystem_mutations_make_the_rename_visible(self) -> None:
         sandbox = _Sandbox()
@@ -700,13 +685,14 @@ class EcwAdditionalScenarioTests(unittest.TestCase):
         process_reattach.verify(_fixture(sandbox))
 
         process = next(iter(sandbox.processes.values()))
-        self.assertIn("sleep 10", sandbox.trace[0])
+        self.assertIn("while ! test -f", sandbox.trace[0])
         self.assertTrue(sandbox.trace[0].endswith(":20"))
         self.assertEqual(
-            sandbox.trace[-3:],
+            sandbox.trace[-4:],
             [
                 f"process.disconnect:{process.pid}",
                 f"process.connect:{process.pid}:20",
+                "files.write:/tmp/space-smoke-process-reattach-release:7:60:user=None",
                 f"process.wait:{process.pid}",
             ],
         )

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use pplx_space_common_core::host::disk_admission::DEFAULT_MIN_AVAILABLE_BYTES;
+use pplx_space_node_disk_admission::DEFAULT_MIN_AVAILABLE_BYTES;
 
 use crate::storage::{
     StatvfsStorageProbe, StorageAdmissionError, StorageCheck, StorageProbe, check_available,

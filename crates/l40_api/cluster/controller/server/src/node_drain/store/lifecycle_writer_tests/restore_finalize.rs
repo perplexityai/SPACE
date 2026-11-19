@@ -30,7 +30,7 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
-use pplx_space_common_core::kubernetes::{
+use pplx_space_sandbox_pod::{
     SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION,
     SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION, STOPPED_MATERIALIZATION_CHECKPOINT,
 };
@@ -401,7 +401,7 @@ async fn restore_finalize_moves_only_a_row_still_restoring(
 /// network namespace. And the node answering with no route identity, as a real
 /// stopped materialization does, must still count as success. The shim's half
 /// runs in neither double; its own tests and the kind scenario
-/// `native.forced_drain_re_places_stopped_sandbox` cover it.
+/// `native.forced_drain_re_drains_restarted_re_placed_stopped_sandbox` cover it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_released_stopped_evacuation_is_re_placed_stopped() -> TestResult {
     if !enter_node_api_client_process()? {

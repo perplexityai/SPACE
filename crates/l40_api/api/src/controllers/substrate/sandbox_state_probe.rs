@@ -93,7 +93,7 @@ pub(super) fn observed_sandbox_states(
             // map so the caller classifies the requested id as inconclusive.
             continue;
         };
-        let node_status = match info.observed_lifecycle() {
+        let node_status = match info.observed_status() {
             Ok(status) => status.label().parse::<SandboxLifecycle>().ok(),
             Err(error) => {
                 tracing::warn!(

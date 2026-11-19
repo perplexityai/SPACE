@@ -155,6 +155,10 @@ pub struct Crate {
     /// The name of its library target, which Cargo derives from the package
     /// name unless `[lib] name` sets it; `None` without a library.
     pub lib: Option<String>,
+    /// Its library target's root source file, repository-relative and
+    /// `/`-separated, such as `crates/x/src/lib.rs`; `None` without a
+    /// library.
+    pub lib_path: Option<String>,
     /// The member's directory relative to the workspace root, `/`-separated;
     /// empty for a root package.
     pub member: String,
@@ -389,7 +393,7 @@ pub fn is_test_directory(name: &OsStr) -> bool {
 /// so a CR-only file is one line. A leading byte order mark is not part of the
 /// first line.
 pub fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = text.trim_prefix('\u{feff}');
     text.lines()
         .enumerate()
         .map(|(index, line)| (index + 1, line))
@@ -464,6 +468,7 @@ fn enabled() -> bool {
 struct MetadataTarget {
     name: String,
     kind: Vec<String>,
+    src_path: PathBuf,
 }
 
 /// Every workspace member as Cargo sees it: the root manifest's `members`,
@@ -561,16 +566,17 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
     let (name, metadata) = parsed
         .package
         .map_or((None, None), |package| (package.name, package.metadata));
-    let lib = package
-        .targets
-        .into_iter()
-        .find(|target| {
-            target
-                .kind
-                .iter()
-                .any(|kind| LIB_KINDS.contains(&kind.as_str()))
-        })
-        .map(|target| target.name);
+    let lib_target = package.targets.into_iter().find(|target| {
+        target
+            .kind
+            .iter()
+            .any(|kind| LIB_KINDS.contains(&kind.as_str()))
+    });
+    let lib_path = match &lib_target {
+        Some(target) => Some(relative_path(workspace_root, &target.src_path)?),
+        None => None,
+    };
+    let lib = lib_target.map(|target| target.name);
     let dependencies = package
         .dependencies
         .into_iter()
@@ -591,6 +597,7 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
     Ok(Crate {
         name: package.name,
         lib,
+        lib_path,
         member,
         name_line: line(name).unwrap_or(1),
         lib_name_line: line(parsed.lib.and_then(|lib| lib.name)),
@@ -700,7 +707,7 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadErro
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String, LoadError> {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+    let relative = path.trim_prefix(root);
     let parts: Option<Vec<&str>> = relative
         .components()
         .map(|component| component.as_os_str().to_str())

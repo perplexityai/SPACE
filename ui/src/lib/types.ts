@@ -329,7 +329,7 @@ export interface NetworkPolicyV1 {
 export type NodeRole = 'worker' | 'builder' | 'cluster';
 
 /// How aggressively the reconciler empties a draining node. Mirrors
-/// `NodeDrainMode` in `crates/libs/common/core/src/types/node.rs`.
+/// `NodeDrainMode` in `crates/l20_domain/node/model/src/node.rs`.
 export type DrainMode = 'gentle' | 'forced';
 
 export interface ServiceHealth {

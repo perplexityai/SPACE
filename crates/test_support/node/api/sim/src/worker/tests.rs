@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::MAX_ENV_VALUE_BYTES;
+use pplx_space_guest_process::MAX_ENV_VALUE_BYTES;
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApi;
 use pplx_space_sbx_mgr_client::operations as ops;
@@ -53,6 +53,7 @@ fn test_create_request(sandbox_id: &str) -> sbx::CreateRequest {
         route_identity: None,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+        required_environment: None,
     }
 }
 
@@ -108,8 +109,10 @@ async fn create_then_state_then_start() {
         .into_inner();
     assert_eq!(state_resp.sandboxes.len(), 1);
     assert_eq!(
-        state_resp.sandboxes[0].observed_lifecycle().unwrap(),
-        sbx::SandboxLifecycleState::Creating
+        state_resp.sandboxes[0].observed_status().unwrap(),
+        pplx_space_sbx_mgr_client::lifecycle::ObservedStatus::Unowned(
+            sbx::SandboxLifecycleState::Creating
+        )
     );
     assert_eq!(state_resp.missing_ids, vec!["missing".to_string()]);
 
@@ -176,8 +179,10 @@ async fn stop_and_kill_reach_stopped() {
     assert_eq!(state_resp.sandboxes.len(), 2);
     for sandbox in state_resp.sandboxes {
         assert_eq!(
-            sandbox.observed_lifecycle().unwrap(),
-            sbx::SandboxLifecycleState::Stopped
+            sandbox.observed_status().unwrap(),
+            pplx_space_sbx_mgr_client::lifecycle::ObservedStatus::Unowned(
+                sbx::SandboxLifecycleState::Stopped
+            )
         );
     }
 }
@@ -1053,9 +1058,8 @@ async fn wake_policy_fences_only_resident_resume() {
                 blocking: true,
                 start_context: Some(sbx::WakeStartContext {
                     expected_execution_generation: expected,
-                    activation_auto_lifecycle: policy.then(|| {
-                        pplx_space_common_core::types::AutoLifecyclePolicy::disabled().into()
-                    }),
+                    activation_auto_lifecycle: policy
+                        .then(|| pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled().into()),
                     ..Default::default()
                 }),
                 ..Default::default()

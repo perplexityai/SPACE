@@ -1,5 +1,5 @@
 use clap::Parser;
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_host_client::StartProcessOptions;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -146,9 +146,9 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut config = pplx_space_spaced_host_client::SpacedHostClientConfig::default();
     if let Some(sandbox_id) = cli.sandbox {
-        config = config.with_socket_path(
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(&sandbox_id),
-        );
+        config = config.with_socket_path(pplx_space_host_layout::paths::spaced_host_socket(
+            &sandbox_id,
+        ));
     }
     if let Some(socket) = cli.socket {
         config = config.with_socket_path(socket);
@@ -271,10 +271,10 @@ async fn run() -> anyhow::Result<()> {
                 .start_process_stream_with_options(StartProcessOptions {
                     background,
                     idempotency_key: idempotency_key
-                        .map(pplx_space_common_core::types::IdempotencyKey::parse)
+                        .map(pplx_space_guest_process::IdempotencyKey::parse)
                         .transpose()?,
                     user,
-                    ..StartProcessOptions::new(pplx_space_common_core::types::ProcessCommand::new(
+                    ..StartProcessOptions::new(pplx_space_guest_process::ProcessCommand::new(
                         command,
                     )?)
                 })

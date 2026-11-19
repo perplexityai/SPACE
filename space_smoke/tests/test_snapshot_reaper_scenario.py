@@ -11,6 +11,9 @@ policy actually retrying it), and an unreadable snapshots dir not reading as
 from __future__ import annotations
 
 import io
+import subprocess
+import tempfile
+from pathlib import Path
 import types
 import unittest
 from email.message import Message
@@ -52,6 +55,32 @@ class _RecordingKubectl:
 
 
 class SnapshotDirProbeFailsClosed(unittest.TestCase):
+    def test_directory_removed_between_probe_and_listing_is_reaped(self) -> None:
+        sid = "01a0b0c9-b8a3-7473-9c12-3821a701bc28"
+        for disappears in (False, True):
+            with self.subTest(disappears=disappears), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / sid / "snapshots"
+                path.mkdir(parents=True)
+                harness = KindHarness(_RecordingKubectl(), KindConfig())
+
+                def execute(node, script, **options):
+                    # Reproduce the race deterministically at the actual ls call.
+                    action = 'rmdir "$2";' if disappears else ""
+                    completed = subprocess.run(
+                        ["sh", "-c", f"ls() {{ {action} return 2; }}; {script}"],
+                        capture_output=True, text=True, check=False,
+                    )
+                    return CommandResult(("sh",), completed.returncode, completed.stdout, completed.stderr)
+
+                with mock.patch("space_smoke.adapters.SANDBOX_CACHE_ROOT", root), mock.patch.object(
+                    harness, "_node_shell_exec", side_effect=execute,
+                ):
+                    if disappears:
+                        self.assertEqual(harness.sandbox_snapshot_dirs("worker", sid), ())
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            harness.sandbox_snapshot_dirs("worker", sid)
+
     def test_entries_none_unreadable_and_exec_failure(self) -> None:
         argv = ("kubectl",)
         kubectl = _RecordingKubectl(

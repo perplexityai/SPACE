@@ -1,18 +1,19 @@
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::BTreeMap;
 
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
 };
-use pplx_space_common_core::types::{RuntimeKind, TemplateName, TemplateVisibility};
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_public_api::{
     PageCursor, PublicPage, PublicTemplate, PublicTemplateSnapshot, PublicTemplateVariant,
     SandboxResources,
 };
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use serde::Deserialize;
 use sqlx::{FromRow, PgPool, types::Json as SqlJson};
 use time::OffsetDateTime;

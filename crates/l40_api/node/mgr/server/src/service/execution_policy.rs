@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use pplx_space_common_core::types::{
+use pplx_space_execution_spec::{
     EXECUTION_POLICY_APPLIED_SCHEMA_VERSION, EXECUTION_POLICY_SCHEMA_VERSION, EnvironmentReference,
     ExecutionPolicyObservation, ExecutionPolicyObservationError,
 };
@@ -23,7 +23,7 @@ use crate::proto::{ApplyExecutionPolicyRequest, ApplyExecutionPolicyResponse};
 const ALLOW_POLICY_WRITER: &[pplx_space_uds_peer_auth::UdsPeerPrincipal] = &[
     pplx_space_uds_peer_auth::UdsPeerPrincipal::Root,
     pplx_space_uds_peer_auth::UdsPeerPrincipal::Service(
-        pplx_space_common_core::host::linux::identities::user_names::SPACE_NODECTL,
+        pplx_space_host_layout::identities::user_names::SPACE_NODECTL,
     ),
 ];
 /// Twice the 4 MiB request bound of node-manager's gRPC server (tonic's

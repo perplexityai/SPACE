@@ -1,5 +1,8 @@
 use super::*;
-use pplx_space_common_core::types::{Arch, RuntimeKind, SandboxId, TemplateName};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_template_model::TemplateName;
 
 #[test]
 fn runtime_dispatch_preserves_absence_and_refuses_corrupt_or_foreign_metadata() {
@@ -57,7 +60,7 @@ fn runtime_dispatch_preserves_absence_and_refuses_corrupt_or_foreign_metadata() 
 
 #[test]
 fn gateway_network_intent_does_not_require_a_retained_environment_catalog_entry() {
-    use pplx_space_common_core::types::guest_image::GuestNetwork;
+    use pplx_space_execution_spec::guest_image::GuestNetwork;
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().canonicalize().unwrap();
     let id = SandboxId::new();

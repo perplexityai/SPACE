@@ -40,9 +40,9 @@ const SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED_ENV: &str =
     "SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED";
 
 /// Node role for an auth surface. Reuses the shared registry vocabulary from
-/// `pplx-space-common-core` (with its `FromStr`/`Display`) rather than forking a
+/// `pplx-space-node-model` (with its `FromStr`/`Display`) rather than forking a
 /// parallel enum; parse inbound role strings at the boundary via `FromStr`.
-pub use pplx_space_common_core::types::NodeRole;
+pub use pplx_space_node_model::NodeRole;
 
 #[derive(Clone)]
 pub struct NodeApiAuthLayer {
@@ -200,7 +200,7 @@ impl NodeApiAuthConfig {
         static_control_token: Option<String>,
     ) -> Result<Self, AuthConfigError> {
         Self::from_environment_impl(
-            &pplx_space_common_core::env::ProcessEnvironment,
+            &pplx_space_env_vars::ProcessEnvironment,
             role,
             static_token,
             static_control_token,
@@ -208,7 +208,7 @@ impl NodeApiAuthConfig {
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
         role: NodeRole,
         static_token: String,
         static_control_token: Option<String>,
@@ -217,7 +217,7 @@ impl NodeApiAuthConfig {
     }
 
     fn from_environment_impl(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
         role: NodeRole,
         static_token: String,
         static_control_token: Option<String>,
@@ -711,20 +711,13 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn env_bool_default(name: &str, default: bool) -> bool {
-    env_bool_default_from_environment(
-        &pplx_space_common_core::env::ProcessEnvironment,
-        name,
-        default,
-    )
+    env_bool_default_from_environment(&pplx_space_env_vars::ProcessEnvironment, name, default)
 }
-fn env_bool_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
-    name: &str,
-) -> bool {
+fn env_bool_from_environment(env: &dyn pplx_space_env_vars::Environment, name: &str) -> bool {
     env_bool_default_from_environment(env, name, false)
 }
 fn env_bool_default_from_environment(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
     name: &str,
     default: bool,
 ) -> bool {

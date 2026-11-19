@@ -185,8 +185,8 @@ mode = "required"
 # (`pplx-space-sbx-mgr-store` and `pplx-space-sbx-mgr-migrations`;
 # `layers.storage_access` keeps database drivers out of sbx-mgr's other
 # crates), so its crates are allowed whole: `crates/l*/sbx/**` matches every
-# directory named `sbx` directly below `crates/libs` or an `l*` layer
-# directory, and any other glob in the list adds sbx crates that are
+# directory named `sbx` directly below an `l*` layer directory, and any
+# other glob in the list adds sbx crates that are
 # elsewhere. A narrower glob would make this required rule fire on moves
 # within sbx-mgr. Test files are
 # filename-based, so `allow` adds the `#[cfg(test)]` support modules and
@@ -230,7 +230,7 @@ mode = "required"
 [rules.pattern_ratchet.sandbox_writes.stale_entries]     # entries with fewer matches, none, or gone
 mode = "required"
 
-# Rootfs copies must preserve NoCoW and sparse extents through common-io's
+# Rootfs copies must preserve NoCoW and sparse extents through file-io's
 # reflink helper. A line matcher cannot infer a path variable's contents, so
 # conservatively fence all new plain filesystem copies and cp launches.
 # Existing non-rootfs, non-Linux and deferred builder paths are counted
@@ -242,7 +242,7 @@ patterns = [
   '\bfs\s*::\s*copy\s*\(',
   '\buse\s+(?:std|tokio)\s*::\s*fs\s*::[^;]*\bcopy\b',
 ]
-allow = ["crates/l10_foundation/common/io/src/reflink.rs"]
+allow = ["crates/l10_foundation/file/io/src/reflink.rs"]
 
 [rules.pattern_ratchet.rootfs_copy.no_crossing]
 mode = "required"
@@ -296,7 +296,7 @@ mode = "required"
 # migrations, its path and file name, and a default-path helper for it belong
 # to the store; the database migrator takes them from the store's
 # `db::migration::target()`. The migrations crate defines the migrators and
-# common-core the path. These names are specific enough to check
+# host-layout the path. These names are specific enough to check
 # workspace-wide. The layers rule does not see these uses: its storage checks
 # read only dependency edges, skip stores and helpers, and tolerate baselined
 # edges, and `state.writes` scans only stores' and helpers' write statements.
@@ -316,7 +316,7 @@ patterns = [
 allow = [
   "crates/l30_storage/sbx/mgr/store/src/**",
   "crates/l30_storage/sbx/mgr/migrations/src/**",
-  "crates/libs/common/core/src/host/linux.rs",
+  "crates/l20_domain/host/layout/src/lib.rs",
 ]
 
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.no_crossing]
@@ -352,22 +352,13 @@ mode = "advisory"
 
 # Every workspace crate belongs to a layer: l10_foundation, l20_domain,
 # l30_storage, l40_api and l50_app, bottom-up, or test_support and tools beside
-# them. A crate in crates/<layer>/ takes its layer from the directory; the
-# crates that predate the layer directories are listed in `unmoved` until they
-# move. A new crate goes in a layer directory. What belongs in each layer, the
-# dependency matrix and how to fix a finding: crates/tools/archcheck/README.md
-# (Layers).
-[rules.layers.unmoved]
-l10_foundation = [
-]
-l20_domain = [
-  "pplx-space-common-core",
-]
-
+# them. A crate in crates/<layer>/ takes its layer from the directory. Every
+# crate is in one now, so there is no `[rules.layers.unmoved]` table; a new
+# crate goes in a layer directory. What belongs in each layer, the dependency
+# matrix and how to fix a finding: crates/tools/archcheck/README.md (Layers).
 
 # Each store's users: the l40_api and l30_storage crates that own its state
-# and use the store today, directly or through a legacy crate's re-exports
-# (see `legacy` below).
+# and use the store today.
 [rules.layers.store_users]
 pplx-space-cluster-pool = [
   "pplx-space-api",
@@ -383,6 +374,10 @@ pplx-space-cluster-trigger-queue = [
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-node-status-store = [
+  "pplx-space-api",
+  "pplx-space-runtime-upgrade-campaign-store",
+]
 pplx-space-postgres-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
@@ -390,12 +385,17 @@ pplx-space-postgres-pool = [
   "pplx-space-internal-api-server",
 ]
 pplx-space-runtime-environment-catalog-store = [
+  "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
 pplx-space-runtime-environment-policy-store = [
   "pplx-space-api",
   "pplx-space-internal-api-server",
+]
+pplx-space-runtime-upgrade-campaign-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
 ]
 pplx-space-sandbox-portability = [
   "pplx-space-api",
@@ -441,6 +441,7 @@ pplx-space-snapshot-store = [
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
+pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]
@@ -448,14 +449,14 @@ pplx-space-snapshot-store = [
 pplx-space-db-migrator = ["pplx-space-db-migrate"]
 
 # Nothing above l30_storage reaches a database or object storage directly,
-# l20_domain never does, and l10_foundation does only in a storage helper,
-# which names nothing SPACE-specific. `helpers` lists every helper: an
+# l10_foundation does only in a storage helper, which names nothing
+# SPACE-specific, and l20_domain and other l10_foundation crates hold at most
+# a codec, behind an optional dependency on a codec facade (`codec_facades`).
+# `helpers` lists every helper: an
 # l10_foundation crate with a required dependency on a driver that the list
 # lacks is a storage_access finding until it is added. The sqlx and SQLite
 # sub-crates are listed so that depending on one instead of the umbrella crate
-# is no way around the checks. A legacy l10_foundation crate (see `legacy`
-# below) is no helper even with a driver dependency: it is checked like every
-# other crate, with today's edges baselined.
+# is no way around the checks.
 [rules.layers.storage]
 drivers = [
   "aws-sdk-s3",
@@ -484,18 +485,51 @@ helpers = [
   "pplx-space-valkey",
 ]
 
-[rules.layers]
-# The crates being dissolved: they predate the layers and mix SPACE-specific
-# code in until they are split up. Every check covers them, with today's edges
-# baselined.
-legacy = ["pplx-space-common-core"]
+# The codec facades: l10_foundation crates that re-export only a driver's
+# codec items, the traits and types that encode a value and decode it back,
+# behind features. Storage helpers aside, an l10_foundation or l20_domain
+# crate may reach a driver only through an optional normal dependency on one,
+# under [dependencies] or a [target.'cfg(…)'.dependencies] table, with
+# today's exceptions baselined, so a facade's exports are what every
+# codec may use. Each facade's `exports` lists, by driver, the
+# paths below the driver's root that its `pub use` items may name, each
+# exactly; storage_access reads the facade's source with syn, a Rust parser,
+# and reports anything else in it, with no baseline entry to tolerate it. A listed path no file
+# re-exports, an empty list and a key for no driver the facade depends on are
+# stale_entries findings, so the lists only shrink. `policy_changed` reports a
+# facade or an export added or removed: list only what encoding and decoding
+# a value needs, never a query, pool, connection, executor, transaction or
+# row.
+[rules.layers.storage.codec_facades."pplx-space-sql-codec".exports]
+rusqlite = [
+  "Result",
+  "types::FromSql",
+  "types::FromSqlError",
+  "types::FromSqlResult",
+  "types::ToSql",
+  "types::ToSqlOutput",
+  "types::ValueRef",
+]
+sqlx = [
+  "Decode",
+  "Encode",
+  "Postgres",
+  "Type",
+  "encode::IsNull",
+  "error::BoxDynError",
+  "postgres::PgArgumentBuffer",
+  "postgres::PgHasArrayType",
+  "postgres::PgTypeInfo",
+  "postgres::PgValueRef",
+]
 
+[rules.layers]
 # An l20_domain crate is a protocol (wire schemas and the conversions between
 # them and the models) if its name ends in -protocol or -proto, or `protocols`
 # lists it; every other one is a model, which never depends on a protocol.
 # These five are protocols without such a name. The mixed crates, which hold
 # model and wire code until they are split, count as models: api-route,
-# credential-injection-core, net-common and spaced-common.
+# credential-injection and net-common.
 protocols = [
   "pplx-space-auto-lifecycle-receipt",
   "pplx-space-events",
@@ -611,9 +645,13 @@ mode = "required"
 [rules.layers.dev_direction.stale_entries]
 mode = "required"
 
-# Only stores and storage helpers depend on a driver or a helper; an optional
-# dependency counts too, except a codec behind a feature in l10_foundation.
-# Today's exceptions are baselined in [layers.storage_access].
+# Only stores and storage helpers depend on a driver, a helper or a codec
+# facade; an optional dependency counts too, with two exceptions, each an
+# optional normal dependency (under [dependencies] or a
+# [target.'cfg(…)'.dependencies] table): an l10_foundation or l20_domain
+# crate's on a facade, and a facade's own on a driver. Today's exceptions are baselined in
+# [layers.storage_access]; what a facade's source holds beyond its exports
+# gets no entry.
 [rules.layers.storage_access.no_crossing]
 mode = "required"
 
@@ -625,7 +663,9 @@ mode = "required"
 
 # Only stores and storage helpers turn on another crate's driver feature, one
 # that enables its optional dependency on a driver or helper, such as a codec
-# for its types. Today's exceptions are baselined in [layers.codec_features].
+# for its types, and l10_foundation and l20_domain crates only behind a
+# feature of their own, itself a driver feature. Today's exceptions are
+# baselined in [layers.codec_features].
 [rules.layers.codec_features.no_crossing]
 mode = "required"
 
@@ -647,9 +687,7 @@ mode = "required"
 [rules.layers.domain_dependencies.stale_entries]
 mode = "required"
 
-# No model depends on a protocol. Today's exceptions are baselined in
-# [layers.model_protocol]: common-core, which is legacy, and spaced-common, a
-# mixed crate, until they are deleted and split.
+# No model depends on a protocol.
 [rules.layers.model_protocol.no_crossing]
 mode = "required"
 
@@ -693,6 +731,21 @@ common = [
 # writes the table and whether that is permanent or temporary; a temporary
 # grant names the work that removes it.
 [rules.layers.state.co_writers.postgres]
+# Pruning a node's absent sandboxes deletes their facet rows in one statement.
+# Temporary: the prune calls sandbox-teardown for those rows.
+node_facet_conditions = ["pplx-space-sandbox-store"]
+# Pruning a node's absent sandboxes deletes their facet rows in one statement.
+# Temporary: the prune calls sandbox-teardown for those rows.
+node_facet_observed_status = ["pplx-space-sandbox-store"]
+# Teardown deletes an element's queued refs in the caller's transaction.
+# Temporary: the delete moves into cluster-trigger-queue and teardown calls it.
+node_reconcile_queue = ["pplx-space-sandbox-teardown"]
+# Pause-failed recovery retires the quarantine in its sandboxes update.
+# Temporary: the recovery calls sandbox-quarantine-store for the quarantine.
+sandbox_quarantine_history = ["pplx-space-sandbox-store"]
+# Pause-failed recovery retires the quarantine in its sandboxes update.
+# Temporary: the recovery calls sandbox-quarantine-store for the quarantine.
+sandbox_quarantine_state = ["pplx-space-sandbox-store"]
 # Deleting a sandbox orphans its snapshots' storage locations for cleanup.
 # Temporary: the write folds into snapshot-store.
 snapshot_storage_locations = ["pplx-space-sandbox-store"]

@@ -6,7 +6,7 @@
 //! the plan rather than naming an index or timing the statement: which linear
 //! plan the planner takes is its business.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 

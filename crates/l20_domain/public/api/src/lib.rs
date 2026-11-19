@@ -4,16 +4,18 @@
 //! plane. It depends on common domain nouns, but common domain crates do not
 //! depend on these wire contracts.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, EnvMap, RuntimeKind, SandboxAutoLifecyclePatch, SandboxId,
-    SandboxLifecycle, SimpleDuration, TemplateReference,
-};
-pub use pplx_space_common_core::types::{IdempotencyKey, ProcessId};
+use pplx_space_auto_lifecycle::{AutoLifecyclePolicy, SandboxAutoLifecyclePatch};
+use pplx_space_durations::SimpleDuration;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_guest_process::EnvMap;
+pub use pplx_space_guest_process::{IdempotencyKey, ProcessId};
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_template_model::TemplateReference;
 use uuid::Uuid;
 
 #[cfg(feature = "serde")]
@@ -956,10 +958,24 @@ pub enum DataPlaneServerFrame {
     InputAccepted {
         seq: u64,
     },
+    #[cfg_attr(
+        feature = "schema",
+        schemars(transform = schema::output_truncated_not_required)
+    )]
     ProcessExited {
         process_id: String,
         exit_code: i32,
         status: DataPlaneProcessExitStatus,
+        /// Whether this stream moved past output the process wrote without
+        /// sending it: after a `resync_required` with reason
+        /// `cursor_out_of_window` that continued at a later position or the
+        /// live tail, or one with reason `process_stream_reconnected`. A
+        /// `cursor_out_of_window` that replays the output from its start
+        /// repeats output and leaves this `false`. It covers only this
+        /// stream, not earlier streams of the session. The exit result alone
+        /// does not say the output is whole. Older data planes omit it.
+        #[cfg_attr(feature = "serde", serde(default))]
+        output_truncated: bool,
     },
     FileEvent {
         seq: u64,
@@ -1689,7 +1705,9 @@ pub struct CreateCommandRequest {
     /// `Accept: text/event-stream`, even one that never reads input, and
     /// `/sessions/{session_id}/events` refuses to start it. Only a WebSocket
     /// attach can start it; after the WebSocket detaches, `/events` can
-    /// reconnect and read its output.
+    /// reconnect and read its output. It starts with `TERM=xterm-256color`
+    /// and `LANG=C.UTF-8` unless the sandbox's environment or `env` sets
+    /// them; sandboxes from older templates set neither.
     pub pty: Option<TerminalSize>,
     /// Keeps standard input open for a WebSocket attach to write. Server-sent
     /// events carry no input, so when `/sessions/{session_id}/events` starts
@@ -2121,7 +2139,8 @@ pub struct PublicErrorEnvelope {
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
     /// carries `{"key": "reason", "value": "session_ended"}`. A `conflict`
-    /// refusing a command because the sandbox is not running carries `reason`
+    /// refusing a command, or a file or process request, because the sandbox
+    /// is not running carries `reason`
     /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
     /// unless the sandbox is deleting or failed, `wake` (the request that
     /// returns it to running). An `invalid_request` for a command streamed

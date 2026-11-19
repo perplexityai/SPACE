@@ -1,13 +1,13 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use k8s_openapi::api::core::v1::Pod;
 use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
 use pplx_space_cluster_pool::PoolSlot;
-use pplx_space_common_core::kubernetes::{
-    NodeGroupPlacement, SandboxPodCommon, SandboxPodConfigValues, SandboxPodRequest,
-    SandboxPoolPodMetadata, build_sandbox_pod, sandbox_pod_name,
+use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sandbox_pod::{
+    NodeGroupPlacement, PodEnvironment, SandboxPodCommon, SandboxPodConfigValues,
+    SandboxPodRequest, SandboxPoolPodMetadata, build_sandbox_pod, sandbox_pod_name,
 };
-use pplx_space_common_core::types::SandboxActivationAttemptId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyPodMetadata {
@@ -24,6 +24,7 @@ pub fn build_pool_pod(
     config: &SandboxPodConfigValues,
     slot: &PoolSlot,
     node_group_placement: Option<&NodeGroupPlacement>,
+    environment: Option<PodEnvironment>,
 ) -> Pod {
     let env = std::collections::BTreeMap::new();
     let content_hash = slot.content_hash.to_string();
@@ -43,6 +44,7 @@ pub fn build_pool_pod(
                 content_hash: Some(&content_hash),
                 env: &env,
                 traceparent: None,
+                environment,
             },
             pool: SandboxPoolPodMetadata {
                 slot_id: slot.id,

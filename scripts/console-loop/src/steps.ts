@@ -1480,7 +1480,7 @@ step('node-drain-section', ['nodes'], async (c) => {
   const card = drainCard(c.page);
   c.rec.check(await card.count() === 1, "the node page has a Drain section");
   const t = (await card.innerText()).replace(/\s+/g, ' ');
-  for (const label of ['Phase', 'Mode', 'Started', 'Last error', 'Heartbeat', 'Kubernetes Node', 'Sandboxes on the node', 'History']) {
+  for (const label of ['Phase', 'Mode', 'Started', 'Last error', 'Heartbeat', 'Kubernetes Node', 'Holding the node', 'History']) {
     c.rec.check(t.includes(label), `the Drain section shows ${label}`);
   }
   c.rec.check(/\d+(s|m \d+s|h \d+m|d \d+h) ago|never/.test(t), 'the heartbeat age is shown');
@@ -1489,24 +1489,166 @@ step('node-drain-section', ['nodes'], async (c) => {
   c.rec.check(/updated \S+/.test(t), 'the section says when it was last read');
 });
 
-step('node-remaining-sandboxes', ['nodes'], async (c) => {
-  const nodes = await adminNodes(c);
-  const node = nodes.filter((n) => n.role === 'worker').sort((a, b) => (b.sandboxes_active ?? 0) - (a.sandboxes_active ?? 0))[0];
-  if (!node) return c.rec.check(false, 'a worker node exists');
-  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
-  const summary = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
-  const listed = c.page.locator('#node-sandboxes a[href^="/dashboard/sandboxes/"]');
-  const count = await listed.count();
-  if ((node.sandboxes_active ?? 0) > 0) {
-    c.rec.check(count > 0, `the node's sandboxes are listed (${count})`);
-    c.rec.check(/listed below/.test(summary), 'the Drain section counts them by lifecycle');
-    const first = await listed.first().getAttribute('href');
-    await listed.first().click();
-    await c.page.waitForURL(/\/dashboard\/sandboxes\//, { timeout: 15_000 }).catch(() => {});
-    c.rec.check(c.page.url().endsWith(first ?? '-'), "a listed sandbox links to the sandbox's page");
-  } else {
-    c.rec.check(/none placed on this node/.test(summary) || count > 0, 'an empty node says so');
+// The holds read for every worker, the most held first: a node in a drain
+// phase leads, since that is where an operator reads the panel.
+async function workersByHolds(c: Ctx): Promise<{ node: AdminNode; holds: Holds }[]> {
+  const workers = (await adminNodes(c)).filter((n) => n.role === 'worker');
+  const read: { node: AdminNode; holds: Holds }[] = [];
+  for (const node of workers) {
+    const res = await adminFetch(c.page, 'GET', `/admin/api/v1/nodes/${node.id}/holds`, undefined, { timeoutMs: 30_000 });
+    if (res.status !== 200) throw new Error(`reading what holds ${node.id} answered ${res.status}`);
+    read.push({ node, holds: res.json as Holds });
   }
+  return read.sort((a, b) => Number(b.node.drain_phase !== null) - Number(a.node.drain_phase !== null) || b.holds.total - a.holds.total);
+}
+
+interface Holds {
+  residency_evidence: string;
+  total: number;
+  term_counts: { resident: number; drain_blocker: number; active_resident: number };
+  holds: { sandbox_id: string; reason: string; counted_by: { terminate: boolean; drain: boolean; drain_with_termination_blocking_gate: boolean } }[];
+}
+
+// The panel's Counted by label for a row: `holdGatesLabel` in the UI's
+// `lib/node-drain.ts`.
+function holdGatesLabel({ terminate, drain, drain_with_termination_blocking_gate: gated }: Holds['holds'][number]['counted_by']): string {
+  if (drain && terminate) return 'drain and terminate';
+  if (drain) return 'drain';
+  if (terminate && gated) return 'terminate; drain only with the termination-blocking gate on';
+  if (terminate) return 'terminate';
+  return 'neither';
+}
+
+const holdsCard = (page: Page) => page.locator('#node-holds');
+const historyPanel = (page: Page) => page.locator('#node-sandboxes');
+
+async function openHistory(c: Ctx): Promise<void> {
+  const header = historyPanel(c.page).locator('.ant-collapse-header');
+  if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
+  await historyPanel(c.page).locator('.ant-collapse-panel-active').waitFor({ timeout: 5000 });
+  await settle(c.page, 800);
+}
+
+// The panel lists every row the holds read returns, each linked, with its
+// reason in a sentence and the gates that count it, grouped under the five
+// headings; the header says which residency evidence the gates use. The rows
+// expected are the ones in the holds answer the page itself received.
+step('node-holds-panel', ['nodes'], async (c) => {
+  const [first] = await workersByHolds(c);
+  if (!first) return c.rec.check(false, 'a worker node exists');
+  const { node } = first;
+  const pageRead = c.page.waitForResponse((res) => new URL(res.url()).pathname.endsWith(`/nodes/${node.id}/holds`), { timeout: 30_000 }).catch(() => null);
+  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
+  const holds = (await jsonOf(await pageRead)) as Holds | null;
+  if (!holds) return c.rec.check(false, 'the node page read what holds the node');
+  c.rec.note(`node ${node.name ?? node.id} (${node.drain_phase ?? 'not draining'}): ${holds.total} holds, ${JSON.stringify(holds.term_counts)}`);
+  const card = holdsCard(c.page);
+  c.rec.check(await card.count() === 1, 'the node page has a "What holds this node" panel');
+  const panel = (await card.innerText()).replace(/\s+/g, ' ');
+  const mode = holds.residency_evidence === 'node_census_aware' ? 'node census' : 'rows only';
+  c.rec.check(panel.includes(`residency: ${mode}`), `the header shows the residency evidence once (${mode})`);
+  await card.locator('.ant-card-extra .ant-tag', { hasText: 'residency:' }).hover();
+  c.rec.check(/census absent/.test(await c.page.locator('.ant-tooltip:visible').innerText().catch(() => '')), 'its tooltip says what the mode means for rows the node does not report');
+  // The page's `heldByTerms`: rows no term counts do not hold the node.
+  const counted = holds.term_counts.resident + holds.term_counts.drain_blocker + holds.term_counts.active_resident > 0;
+  const summary = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
+  if (!counted) {
+    c.rec.check(/Nothing holds this node/.test(panel) && /Nothing holds this node/.test(summary), 'a node no term counts reads "Nothing holds this node" in the panel and the Drain section');
+  }
+  if (!holds.total) {
+    c.rec.note('no worker is held: the groups are not exercised');
+    return;
+  }
+  const order = ['Needs you', 'Handled automatically', 'Waiting on users', 'Blocks terminate', 'Listed, not counted'];
+  const shown = (await card.locator('[data-hold-group] h5').allInnerTexts()).map((t) => t.trim());
+  c.rec.check(shown.length > 0 && shown.every((t, i) => order.indexOf(t) >= 0 && (i === 0 || order.indexOf(t) > order.indexOf(shown[i - 1]))), `the groups come in order (${shown.join(', ')})`);
+  const rows = card.locator('[data-hold-group] tbody tr.ant-table-row');
+  c.rec.check(await rows.count() === holds.holds.length, `every listed hold is a row (${await rows.count()} of ${holds.holds.length})`);
+  for (const hold of holds.holds) {
+    // The link carries the sandbox's public ID, which ends in the UUID's hex.
+    const row = rows.filter({ has: c.page.locator(`a[href*="${hold.sandbox_id.slice(-8).toLowerCase()}"]`) }).first();
+    const cells = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ');
+    const gates = holdGatesLabel(hold.counted_by);
+    c.rec.check(cells.length > 40 && cells.includes(gates), `${hold.reason} row reads as a sentence counted by ${gates}`);
+    const why = (await row.locator('td:nth-child(3)').innerText().catch(() => '')).trim();
+    c.rec.check(why.length > 0 && why.endsWith('.'), `${hold.reason} row's Why is a sentence (${why.slice(0, 60)})`);
+    const countedBy = (await row.locator('td').last().innerText().catch(() => '')).trim();
+    c.rec.check(countedBy === gates, `${hold.reason} row's Counted by is exactly "${gates}" (${countedBy})`);
+  }
+  if (counted) c.rec.check(/Holding the node .*what holds it/.test(summary), 'the Drain section summarizes the groups and links to the panel');
+  const needsUpload = holds.holds.some((h) => h.reason === 'local_only_snapshot');
+  const uploadOffered = await card.getByRole('button', { name: 'Upload local snapshots' }).count();
+  const uploadOpen = node.drain_phase === 'drained' || node.drain_phase === 'terminating' || (node.drain_phase === 'draining' && node.drain_mode === 'forced');
+  c.rec.check(uploadOffered === Number(needsUpload && uploadOpen), `Upload local snapshots sits by the local-only rows exactly when the API accepts it (${uploadOffered})`);
+  await card.screenshot({ path: `${c.rec.outDir}/${c.rec.stepName()}-panel.png` }).catch(() => {});
+  // The href, not a click: a held row need not have a sandbox the public API
+  // can read (a census-absent row has nothing behind it).
+  const href = await rows.first().locator('a[href^="/dashboard/sandboxes/sbx_"]').getAttribute('href');
+  c.rec.check(href !== null && holds.holds.some((h) => href.endsWith(h.sandbox_id)), "a held sandbox links to the sandbox's page");
+});
+
+// The collapsed History lists every row naming the node, newest change
+// first, filtered by lifecycle, and by "Failed during this drain" while the
+// node drains; each filter is checked against the request the page sends.
+step('node-history-filters', ['nodes'], async (c) => {
+  const [first] = await workersByHolds(c);
+  if (!first) return c.rec.check(false, 'a worker node exists');
+  const { node } = first;
+  await visit(c, `/dashboard/nodes/${node.id}`, 4000);
+  c.rec.check(await historyPanel(c.page).locator('.ant-collapse-panel-active').count() === 0, 'the History starts collapsed');
+  const historyRead = (want: (params: URLSearchParams) => boolean) => c.page.waitForResponse((res) => {
+    const url = new URL(res.url());
+    return url.pathname.endsWith(`/nodes/${node.id}/sandboxes`) && want(url.searchParams);
+  }, { timeout: 20_000 }).catch(() => null);
+  const newestFirst = (rows: { lifecycle_changed_at: string }[]) => rows.every((r, i) => i === 0 || Date.parse(rows[i - 1].lifecycle_changed_at) >= Date.parse(r.lifecycle_changed_at));
+  const bareId = (id: string) => id.replace(/^sbx_/, '').replaceAll('-', '').toLowerCase();
+  // The History's rows, in order, are the answer the page just received, and
+  // read newest change first through their ids.
+  const showsAnswer = async (answer: any, what: string) => {
+    await settle(c.page, 800);
+    const shown = (await historyPanel(c.page).locator('tbody tr.ant-table-row td:first-child code').allInnerTexts()).map((t) => bareId(t.trim()));
+    const rows: { id: string; lifecycle_changed_at: string }[] = Array.isArray(answer?.sandboxes) ? answer.sandboxes : [];
+    c.rec.check(answer !== null && shown.join(',') === rows.map((r) => bareId(r.id)).join(','), `${what}: the History shows the answer's sandboxes in its order (${shown.length} of ${rows.length})`);
+    const byId = new Map(rows.map((r) => [bareId(r.id), r]));
+    const ordered = shown.map((id) => byId.get(id));
+    c.rec.check(ordered.every((r) => r !== undefined) && newestFirst(ordered as typeof rows), `${what}: the shown rows run newest change first`);
+  };
+  await openHistory(c);
+  const all = historyRead((p) => p.get('order') === 'lifecycle_changed_desc');
+  await c.page.getByRole('button', { name: 'Reload' }).last().click();
+  const allJson = await jsonOf(await all);
+  c.rec.check(Array.isArray(allJson?.sandboxes) && newestFirst(allJson.sandboxes), `the history is read newest change first (${allJson?.sandboxes?.length ?? 'no'} rows)`);
+  await showsAnswer(allJson, 'after Reload');
+
+  const filter = historyPanel(c.page).locator('.ant-select', { has: c.page.getByLabel('Lifecycle filter') });
+  const failed = historyRead((p) => p.getAll('lifecycle').join(',') === 'failed');
+  // The option list is virtual: type to bring `failed` into it.
+  await filter.click();
+  await c.page.keyboard.type('failed');
+  await c.page.locator('.ant-select-dropdown:visible .ant-select-item-option', { hasText: /^failed$/ }).first().click({ timeout: 5000 });
+  await c.page.keyboard.press('Escape');
+  const failedJson = await jsonOf(await failed);
+  await settle(c.page, 800);
+  const tags = await historyPanel(c.page).locator('tbody tr.ant-table-row td:nth-child(2)').allInnerTexts();
+  c.rec.check(failedJson !== null && tags.length === failedJson.sandboxes.length && tags.every((t) => t.trim() === 'failed'), `the lifecycle filter keeps only failed rows (${tags.length} of ${failedJson?.sandboxes?.length ?? 'no'})`);
+  await shot(c, 'failed-filter');
+  await filter.locator('.ant-select-clear').click({ force: true }).catch(() => {});
+
+  const toggle = historyPanel(c.page).getByLabel('Failed during this drain');
+  if (!node.drain_started_at) {
+    c.rec.check(await toggle.isDisabled(), '"Failed during this drain" is off while the node is not draining');
+    return;
+  }
+  const during = historyRead((p) => p.get('changed_since') === node.drain_started_at && p.getAll('lifecycle').join(',') === 'failed');
+  await toggle.click();
+  const duringJson = await jsonOf(await during);
+  c.rec.check(duringJson !== null, 'the toggle asks for failed rows changed since the drain started');
+  const started = Date.parse(node.drain_started_at);
+  c.rec.check(Array.isArray(duringJson?.sandboxes) && duringJson.sandboxes.every((r: any) => r.lifecycle === 'failed' && Date.parse(r.lifecycle_changed_at) >= started), `every row failed during the drain (${duringJson?.sandboxes?.length ?? 0})`);
+  c.rec.check(await filter.locator('.ant-select-disabled').count() + Number(await filter.evaluate((el) => el.classList.contains('ant-select-disabled'))) > 0, 'the lifecycle filter is replaced while the toggle is on');
+  await showsAnswer(duringJson, 'with the toggle on');
+  await shot(c, 'failed-during-drain');
+  await toggle.click();
 });
 
 step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {

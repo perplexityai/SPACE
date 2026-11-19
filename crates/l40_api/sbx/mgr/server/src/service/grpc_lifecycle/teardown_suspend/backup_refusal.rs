@@ -19,7 +19,7 @@ pub(in crate::service::grpc_lifecycle) fn teardown_artifact_backup_status(
             error,
             superseded_generation,
         } => (
-            error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent,
+            error.kind() == crate::db::jobs::JobFailureKind::Permanent,
             *superseded_generation,
         ),
         _ => (false, None),
@@ -40,7 +40,7 @@ pub(in crate::service::grpc_lifecycle) fn teardown_artifact_backup_status(
 /// backup's registration for as superseded.
 pub(super) fn teardown_backup_superseded_status(
     mut status: Status,
-    generation: pplx_space_common_core::types::ExecutionGeneration,
+    generation: pplx_space_sandbox_model::ExecutionGeneration,
 ) -> Status {
     status.metadata_mut().insert(
         TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA,
@@ -53,7 +53,7 @@ pub(super) fn teardown_backup_superseded_status(
 /// superseded, when that refusal reached the drive directly.
 pub(super) fn teardown_backup_superseded_generation(
     status: &Status,
-) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+) -> Option<pplx_space_sandbox_model::ExecutionGeneration> {
     status
         .metadata()
         .get(TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA)?
@@ -158,8 +158,8 @@ pub(super) fn teardown_failed_backup_artifact(status: &Status) -> Option<LocalAr
 /// `execution_generation` and never admitted, or `None`. Only that payload's
 /// registration can carry the cluster's verdict about this execution.
 pub(super) fn teardown_backup_payload_of(
-    job: &pplx_space_common_jobs::Job,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    job: &crate::db::jobs::Job,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
 ) -> Option<crate::snapshot_upload::SnapshotUploadJobs> {
     match job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>() {
         // Transfer IDs mean the registration was admitted, so a re-sent
@@ -187,7 +187,7 @@ impl SandboxManagerService {
     /// this execution.
     pub(in crate::service::grpc_lifecycle) fn teardown_backup_payload_bound_to(
         &self,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
         staged_artifact: LocalArtifactId,
     ) -> Option<crate::snapshot_upload::SnapshotUploadJobs> {
         let job = match self.snapshot_upload_worker.find_job_by_dedup_key(
@@ -315,11 +315,11 @@ impl SandboxManagerService {
     pub(super) async fn teardown_backup_refusal_verdict(
         &self,
         backup: &TeardownSuspendBackup<'_>,
-        job: &pplx_space_common_jobs::Job,
+        job: &crate::db::jobs::Job,
     ) -> Option<crate::snapshot_upload_jobs::RegistrationProbe> {
         if !matches!(
             job.failure,
-            Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+            Some(crate::db::jobs::JobFailure::Permanent { .. })
         ) {
             return None;
         }

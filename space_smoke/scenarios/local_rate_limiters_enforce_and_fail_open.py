@@ -28,7 +28,7 @@ def rate_limiters_enforce_and_fail_open(test: smoke.KindEcw) -> None:
     `Server rate limit:` with Retry-After; twenty concurrent creates and twenty
     concurrent connects for one client id each draw at least one 429
     `Per-client rate limit:` with Retry-After; once Redis is unreachable
-    neither limiter rejects; and once it is back the per-client limiter
+    every create admits a sandbox; and once it is back the per-client limiter
     rejects again."""
 
     limiters = test.rate_limiters
@@ -57,7 +57,7 @@ def rate_limiters_enforce_and_fail_open(test: smoke.KindEcw) -> None:
         outcomes = limiters.burst_connects(target, CALLERS)
         limiters.expect_per_client_limited(outcomes, label="per_client_connect")
 
-    with test.phase("fail open: Redis unreachable, no limiter rejects"):
+    with test.phase("fail open: Redis unreachable, every create admits a sandbox"):
         limiters.take_redis_down()
         outcomes = limiters.burst_creates(FAIL_OPEN_CALLERS)
         limiters.expect_fail_open(outcomes)

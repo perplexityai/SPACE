@@ -21,20 +21,20 @@
 //! Local file names match [`crate::snapshot_upload::VM_ARTIFACTS`].
 //! Sqlite row repopulation is performed by the caller, not here.
 
-use pplx_space_common_core::types::{JobId, SnapshotId};
+use pplx_space_accounts::JobId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::future::{BoxFuture, join_all};
-use pplx_space_common_core::host::linux::paths;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, LocalArtifactId, SandboxCleanupEpisodeId,
-    SandboxId, SnapshotArtifact,
-};
+use pplx_space_artifact_model::{ExactStorageUri, SnapshotArtifact};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_host_layout::paths;
+use pplx_space_sandbox_model::{SandboxCleanupEpisodeId, SandboxId};
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_volmgr_client::{
     EnsureFileReplicaError, EnsureFileReplicaWaitConfig, RESTORE_PRIORITY, VOLMGR_SOCKET,
     ensure_file_replica_with_config, proto::PullFileRequest, read_verified_replica_provenance,
@@ -92,12 +92,12 @@ pub struct RestoreMetadataStaged {
     pub storage_uri: String,
     pub meta: crate::snapshot_upload::SnapshotMeta,
     pub codec: RestoreCodec,
-    pub transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    pub transfer_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
     /// Sandbox identity that owns the durable object path. Restore-as-new
     /// stages into the target sandbox's filesystem while credentials remain
     /// scoped to the source artifact owner.
     credential_subject_id: String,
-    filesystem_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    filesystem_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
 }
 
 #[derive(Clone, Copy)]
@@ -115,15 +115,15 @@ pub(crate) struct PublishedRemoteRestore {
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveredSandboxRowFieldsError {
     #[error("invalid template in snapshot metadata: {0}")]
-    Template(#[from] pplx_space_common_core::types::TemplateParseError),
+    Template(#[from] pplx_space_template_model::TemplateParseError),
     #[error("invalid runtime in snapshot metadata: {0}")]
-    Runtime(#[from] pplx_space_common_core::types::RuntimeKindParseError),
+    Runtime(#[from] pplx_space_execution_spec::RuntimeKindParseError),
     #[error("invalid template content hash in snapshot metadata: {0}")]
-    ContentHash(#[from] pplx_space_common_core::types::DigestParseError),
+    ContentHash(#[from] pplx_space_content_digest::DigestParseError),
     #[error("invalid sandbox owner in snapshot metadata: {0}")]
-    Owner(#[from] pplx_space_common_core::types::AuthParseError),
+    Owner(#[from] pplx_space_accounts::AuthParseError),
     #[error("invalid disk I/O limits in snapshot metadata: {0}")]
-    DiskIoLimits(#[from] pplx_space_common_core::types::DiskIoLimitsError),
+    DiskIoLimits(#[from] pplx_space_execution_spec::DiskIoLimitsError),
 }
 
 /// Errors returned from [`prepare_restore_dir`].
@@ -150,13 +150,13 @@ pub enum RestoreError {
     InvalidSandboxId {
         value: String,
         #[source]
-        source: pplx_space_common_core::types::SandboxIdParseError,
+        source: pplx_space_sandbox_model::SandboxIdParseError,
     },
     #[error("invalid restore source URI {uri}: {source}")]
     InvalidRestoreSource {
         uri: String,
         #[source]
-        source: pplx_space_common_core::types::StorageUriParseError,
+        source: pplx_space_artifact_model::StorageUriParseError,
     },
     #[error("artifact snapshot {expected} does not match storage URI {storage_uri}")]
     ArtifactSnapshotUriMismatch {
@@ -199,7 +199,7 @@ pub enum RestoreError {
     #[error("artifact snapshot is missing sandbox ownership metadata")]
     MissingSandboxOwnershipMetadata,
     #[error("restored rootfs capacity is not permitted: {0}")]
-    RootfsPolicy(#[source] pplx_space_common_core::sandbox_storage::RootfsSizeError),
+    RootfsPolicy(#[source] pplx_space_sandbox_model::sandbox_storage::RootfsSizeError),
     #[error("create directory {path}: {source}")]
     CreateDirectory {
         path: PathBuf,
@@ -548,7 +548,7 @@ pub(crate) enum RestoreArtifactLocationError {
     InvalidBase {
         uri: String,
         #[source]
-        source: pplx_space_common_core::types::StorageUriParseError,
+        source: pplx_space_artifact_model::StorageUriParseError,
     },
 }
 
@@ -560,8 +560,8 @@ struct LatestReadySnapshot {
 
 #[derive(Clone, Copy, Debug)]
 enum RestoreMetadataDestination {
-    InPlace(pplx_space_common_core::types::TransferScopeId),
-    Scoped(pplx_space_common_core::types::TransferScopeId),
+    InPlace(pplx_space_snapshot_model::TransferScopeId),
+    Scoped(pplx_space_snapshot_model::TransferScopeId),
 }
 
 #[derive(Clone, Debug)]
@@ -570,8 +570,8 @@ pub(crate) struct QuarantineRecoveryPlan {
     pub(crate) snapshot_id: SnapshotId,
     pub(crate) local_artifact_id: Option<LocalArtifactId>,
     pub(crate) storage_uri: String,
-    pub(crate) execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    pub(crate) reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode,
+    pub(crate) execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    pub(crate) reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode,
 }
 
 fn parse_recovery_local_artifact_id(value: &str) -> Result<Option<LocalArtifactId>, RestoreError> {
@@ -593,7 +593,7 @@ pub(crate) struct SandboxCacheDirGuard {
 impl SandboxCacheDirGuard {
     pub(crate) fn for_restore_staging(
         path: &Path,
-        transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+        transfer_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
     ) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -638,7 +638,7 @@ pub(crate) fn remote_restore_metadata_staging_sandbox_id(
 
 pub(crate) fn remote_restore_metadata_staging_dir(
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> PathBuf {
     PathBuf::from(paths::sandbox_restore_staging_dir(
         sandbox_id,
@@ -675,9 +675,9 @@ pub(crate) fn exchange_remote_restore_metadata(
 pub(crate) fn write_canonical_restore_exchange_receipt(
     stage: &RestoreMetadataStaged,
     sandbox_id: SandboxId,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     old_source: &ExactStorageUri,
     replacement_source: &ExactStorageUri,
 ) -> Result<(), RestoreError> {
@@ -710,9 +710,9 @@ pub(crate) fn write_canonical_restore_exchange_receipt(
 pub(crate) fn canonical_restore_exchange_old_source_at(
     canonical_sandbox_dir: &Path,
     sandbox_id: SandboxId,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
+    activation_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     replacement_source: &ExactStorageUri,
 ) -> Result<Option<ExactStorageUri>, RestoreError> {
     let path = canonical_sandbox_dir.join(CANONICAL_RESTORE_EXCHANGE_RECEIPT_FILENAME);
@@ -734,13 +734,13 @@ pub(crate) fn canonical_restore_exchange_old_source_at(
             ))
         })?;
     let receipt_generation =
-        pplx_space_common_core::types::ExecutionGeneration::try_from(receipt.execution_generation)
+        pplx_space_sandbox_model::ExecutionGeneration::try_from(receipt.execution_generation)
             .map_err(|source| {
                 RestoreError::Other(format!(
                     "canonical-root exchange receipt has an invalid execution generation for {sandbox_id}: {source}"
                 ))
             })?;
-    let receipt_attempt: pplx_space_common_core::types::SandboxActivationAttemptId = receipt
+    let receipt_attempt: pplx_space_sandbox_model::SandboxActivationAttemptId = receipt
         .activation_attempt_id
         .parse()
         .map_err(|source| {
@@ -1000,7 +1000,7 @@ pub(crate) fn published_remote_restore_source_at(
             )));
         }
     };
-    let expected_subject = pplx_space_common_core::types::SubjectId::Sandbox(sandbox_id);
+    let expected_subject = pplx_space_subject_model::SubjectId::Sandbox(sandbox_id);
     if provenance.subject_id != expected_subject {
         return Err(RestoreError::Other(format!(
             "published restore provenance names subject {} instead of {expected_subject}",
@@ -1061,7 +1061,7 @@ fn published_remote_restore_artifacts_complete(
     let Ok(config) = SnapshotUploadConfig::from_uri(expected_storage_uri.as_wire()) else {
         return false;
     };
-    let expected_subject = pplx_space_common_core::types::SubjectId::Sandbox(sandbox_id);
+    let expected_subject = pplx_space_subject_model::SubjectId::Sandbox(sandbox_id);
     let snapshot_dir = canonical_sandbox_dir.join("snapshot");
     let artifacts = if meta.encrypted {
         crate::snapshot_upload::encrypted_artifacts(artifact_kind)
@@ -1093,8 +1093,7 @@ fn pull_replacement_prefix(local_path: &Path) -> Option<String> {
 }
 
 fn replacement_artifact_basename(name: &str) -> &str {
-    name.strip_prefix('.')
-        .and_then(|name| name.strip_suffix(".volmgr-replica.json"))
+    name.strip_circumfix('.', ".volmgr-replica.json")
         .unwrap_or(name)
 }
 
@@ -1354,9 +1353,9 @@ fn replacement_for_pull(local_path: &Path, s3_uri: &str, adopted: bool) -> PullR
 /// `Restoring` row and publishes that directory before the slow rootfs phase.
 pub async fn prepare_restore_dir(
     sandbox_id: &str,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<RestorePrepared, RestoreError> {
@@ -1386,10 +1385,10 @@ pub async fn prepare_restore_dir(
 
 pub async fn prepare_restore_dir_from_uri(
     sandbox_id: &str,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     storage_uri: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<RestorePrepared, RestoreError> {
@@ -1642,7 +1641,7 @@ pub(crate) fn resolve_quarantine_recovery_plan_response(
         }
     };
     let execution_generation =
-        match pplx_space_common_core::types::ExecutionGeneration::new(plan.execution_generation) {
+        match pplx_space_sandbox_model::ExecutionGeneration::new(plan.execution_generation) {
             Ok(value) => value,
             Err(error) => {
                 return Ok(malformed(&format!(
@@ -1651,7 +1650,7 @@ pub(crate) fn resolve_quarantine_recovery_plan_response(
                 )));
             }
         };
-    let reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode =
+    let reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode =
         match plan.reason_code.parse() {
             Ok(value) => value,
             Err(error) => {
@@ -1691,7 +1690,7 @@ async fn latest_ready_snapshot(sandbox_id: &str) -> Result<LatestReadySnapshot, 
 
 pub async fn restore_pull_metadata_scoped(
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<RestoreMetadataStaged, RestoreError> {
     let latest = latest_ready_snapshot(sandbox_id).await?;
     restore_pull_metadata_from_source(
@@ -1705,7 +1704,7 @@ pub async fn restore_pull_metadata_scoped(
 pub async fn restore_pull_metadata_from_uri_scoped(
     sandbox_id: &str,
     storage_uri: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<RestoreMetadataStaged, RestoreError> {
     let config = SnapshotUploadConfig::from_uri(storage_uri)
         .map_err(|e| RestoreError::Other(format!("parse storage_uri: {e}")))?;
@@ -1724,7 +1723,7 @@ pub async fn restore_pull_metadata_from_uri_as_new(
     target_sandbox_id: &str,
     source_sandbox_id: &str,
     storage_uri: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<RestoreMetadataStaged, RestoreError> {
     restore_pull_metadata_from_uri_as_new_at_destination(
         target_sandbox_id,
@@ -1739,7 +1738,7 @@ pub async fn restore_pull_metadata_from_uri_as_new_in_place(
     target_sandbox_id: &str,
     source_sandbox_id: &str,
     storage_uri: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<RestoreMetadataStaged, RestoreError> {
     restore_pull_metadata_from_uri_as_new_at_destination(
         target_sandbox_id,
@@ -1777,6 +1776,33 @@ async fn restore_pull_metadata_from_source(
 ) -> Result<RestoreMetadataStaged, RestoreError> {
     restore_pull_metadata_from_source_for_identity(sandbox_id, sandbox_id, latest, destination)
         .await
+}
+
+/// Create `sandbox_dir`, the directory `destination` restores into.
+/// Volume-manager only traverses it, to write the pulls into `snapshot/`,
+/// which each pull shares itself. A scoped staging root is this service's
+/// own, so it is shared through `group` whatever the umask and whether the
+/// cache directory passes its group on, including when an earlier attempt or
+/// an older version left it private. An in-place destination is the
+/// sandbox's canonical directory; an existing one keeps its owner and mode.
+/// Production passes the shared cache group.
+fn create_restore_root(
+    sandbox_dir: &Path,
+    destination: RestoreMetadataDestination,
+    group: nix::unistd::Gid,
+) -> std::io::Result<()> {
+    match destination {
+        RestoreMetadataDestination::InPlace(_) => std::fs::create_dir_all(sandbox_dir),
+        RestoreMetadataDestination::Scoped(_) => {
+            let (Some(cache), Some(name)) = (sandbox_dir.parent(), sandbox_dir.file_name()) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "restore staging has no parent",
+                ));
+            };
+            crate::transfer_directory::prepare_readable_child(cache, name, group)
+        }
+    }
 }
 
 pub(crate) fn validate_restore_metadata_identity(
@@ -1860,7 +1886,12 @@ async fn restore_pull_metadata_from_source_for_identity(
     // here so the directory shape matches what `start_from_checkpoint`'s
     // downstream callers expect to find.
     let snapshots_dir = sandbox_dir.join("snapshots");
-    std::fs::create_dir_all(&sandbox_dir).map_err(|source| RestoreError::CreateDirectory {
+    create_restore_root(
+        &sandbox_dir,
+        destination,
+        crate::transfer_directory::shared_cache_group(),
+    )
+    .map_err(|source| RestoreError::CreateDirectory {
         path: sandbox_dir.clone(),
         source,
     })?;
@@ -1991,7 +2022,7 @@ fn preserve_attributed_metadata_retry(
 /// completed, verified files for the next retry.
 pub async fn restore_pull_rootfs(
     stage: &RestoreMetadataStaged,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
@@ -2003,7 +2034,7 @@ pub async fn restore_pull_rootfs(
         InstanceTarget::RestoreScope,
     );
     if let Some(size_mib) = stage.meta.source.rootfs_size_mib {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(RestoreError::RootfsPolicy)?;
     }
     let sandbox_id = stage.meta.sandbox_id.as_str();
@@ -2193,7 +2224,7 @@ async fn cleanup_partial_restore_artifacts(
 async fn cleanup_partial_restore_artifacts_with(
     sandbox_dir: &Path,
     sandbox_id: &str,
-    transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    transfer_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
     cleanup: impl std::future::Future<
         Output = Result<(), crate::btrfs_via_nodemgr::BtrfsViaNodemgrError>,
     >,
@@ -2258,7 +2289,7 @@ async fn pull_artifact(
     config: &SnapshotUploadConfig,
     local_path: PathBuf,
     kind: SnapshotArtifact,
-    transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    transfer_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
 ) -> Result<(), RestoreError> {
     let file_name = kind.file_name();
     pull_artifact_inner(
@@ -2299,7 +2330,7 @@ async fn pull_artifact_inner(
     kind: SnapshotArtifact,
     file_name: &'static str,
     priority: i32,
-    transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    transfer_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
 ) -> Result<(), RestoreError> {
     let sandbox_id = identity.sandbox_id;
     let parent = local_path
@@ -2335,23 +2366,9 @@ async fn pull_artifact_inner(
             .local_path(local_path_str.clone())
             .object_uri(s3_uri.clone()),
     );
-    let volmgr = match pplx_space_volmgr_client::connect(VOLMGR_SOCKET).await {
-        Ok(volmgr) => volmgr,
-        Err(error) => {
-            emit_sandbox_event(
-                sandbox_id,
-                SandboxEventType::SnapshotArtifactPullFailed,
-                SandboxEventSource::SbxManager,
-                SandboxEventDetails::default()
-                    .artifact(file_name)
-                    .local_path(local_path_str.clone())
-                    .object_uri(s3_uri)
-                    .reason("vol_mgr_connect")
-                    .error(error.to_string()),
-            );
-            return Err(RestoreError::Other(format!("vol-mgr connect: {error}")));
-        }
-    };
+    // Dialed by the first request, so a volume-manager that is restarting is
+    // waited for by the submission's retry rather than a separate connect.
+    let volmgr = pplx_space_volmgr_client::lazy(std::path::Path::new(VOLMGR_SOCKET));
     let output = match ensure_file_replica_with_config(
         volmgr,
         PullFileRequest {
@@ -2596,7 +2613,7 @@ async fn stage_full_codec_artifacts(
             "restored rootfs must be a regular file".to_string(),
         ));
     }
-    pplx_space_common_core::sandbox_storage::validate_rootfs_bytes(rootfs_metadata.len())
+    pplx_space_sandbox_model::sandbox_storage::validate_rootfs_bytes(rootfs_metadata.len())
         .map_err(RestoreError::RootfsPolicy)?;
     // Retained instances are root-owned after execution cleanup. Replace them
     // through their fenced owner only after every source artifact is staged and
@@ -2675,7 +2692,7 @@ async fn stage_encrypted_restore(
     identity: RestoreTransferIdentity<'_>,
     config: &SnapshotUploadConfig,
     snapshot_dir: &Path,
-    transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    transfer_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
     artifact_kind: ArtifactKind,
 ) -> Result<(), RestoreError> {
     std::fs::create_dir_all(snapshot_dir)
@@ -2716,12 +2733,12 @@ async fn stage_encrypted_restore(
 )]
 async fn stage_btrfs_send_restore(
     identity: RestoreTransferIdentity<'_>,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     config: &SnapshotUploadConfig,
     sidecar_path: &Path,
     snapshot_dir: &Path,
     artifact_kind: ArtifactKind,
-    transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
+    transfer_scope_id: Option<pplx_space_snapshot_model::TransferScopeId>,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
@@ -2878,10 +2895,10 @@ async fn run_btrfs_staging<'a>(
 async fn ensure_local_template(
     templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox_id: &str,
-    owner: &pplx_space_common_core::types::SandboxOwner,
+    owner: &pplx_space_accounts::SandboxOwner,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> Result<String, RestoreError> {
     use crate::template_resolver::TemplateLookupError;
     async {
@@ -2897,6 +2914,7 @@ async fn ensure_local_template(
                 }),
                 vcpu: None,
                 memory_mib: None,
+                environment_required: false,
             });
         let scope = crate::service::template_lookup_scope(owner, Some(sandbox_id))
             .map_err(|error| RestoreError::Other(error.to_string()))?;

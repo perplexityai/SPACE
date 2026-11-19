@@ -38,7 +38,7 @@ pub(super) fn lease_liveness(info: &SlotInfo) -> LeaseLiveness {
     }
     let [sidecar, vm] =
         crate::cgroup::sandbox_cgroup_occupancy(&info.sandbox_id).map(LeaseLiveness::observed);
-    let pid_link = Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR)
+    let pid_link = Path::new(pplx_space_host_layout::paths::SANDBOX_RUN_DIR)
         .join(&info.sandbox_id)
         .join("fc.pid");
     let firecracker = match std::fs::read_link(pid_link) {

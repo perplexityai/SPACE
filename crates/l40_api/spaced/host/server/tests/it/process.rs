@@ -92,14 +92,11 @@ async fn process_start_relays_to_guest_bridge() {
     let mut stream = client
         .start_process_stream_with_options(pplx_space_spaced_host_client::StartProcessOptions {
             idempotency_key: Some(
-                pplx_space_common_core::types::IdempotencyKey::parse("start-key").unwrap(),
+                pplx_space_guest_process::IdempotencyKey::parse("start-key").unwrap(),
             ),
             ..pplx_space_spaced_host_client::StartProcessOptions::new(
-                pplx_space_common_core::types::ProcessCommand::new(vec![
-                    "echo".into(),
-                    "hello".into(),
-                ])
-                .unwrap(),
+                pplx_space_guest_process::ProcessCommand::new(vec!["echo".into(), "hello".into()])
+                    .unwrap(),
             )
         })
         .await
@@ -127,19 +124,16 @@ async fn process_start_forwards_assigned_process_id_to_guest_bridge() {
         .await
         .expect("wait ready response");
 
-    let assigned = pplx_space_common_core::types::ProcessId::parse("assigned-proc").unwrap();
+    let assigned = pplx_space_guest_process::ProcessId::parse("assigned-proc").unwrap();
     let mut stream = client
         .start_process_stream_with_options(pplx_space_spaced_host_client::StartProcessOptions {
             idempotency_key: Some(
-                pplx_space_common_core::types::IdempotencyKey::parse("start-key").unwrap(),
+                pplx_space_guest_process::IdempotencyKey::parse("start-key").unwrap(),
             ),
             process_id: Some(assigned.clone()),
             ..pplx_space_spaced_host_client::StartProcessOptions::new(
-                pplx_space_common_core::types::ProcessCommand::new(vec![
-                    "echo".into(),
-                    "hello".into(),
-                ])
-                .unwrap(),
+                pplx_space_guest_process::ProcessCommand::new(vec!["echo".into(), "hello".into()])
+                    .unwrap(),
             )
         })
         .await
@@ -300,7 +294,8 @@ async fn readiness_only_guest_cannot_gain_operations_from_its_version() {
         let temp_dir = tempfile::tempdir().unwrap();
         let socket = temp_dir.path().join("bridge.sock");
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut platform = pplx_space_spaced_common::platform::GuestPlatform::linux().wire();
+        let mut platform =
+            pplx_space_spaced_guest_protocol::platform::GuestPlatform::linux().wire();
         platform.operations.clear();
         let task = start_mock_bridge_guest_with_service(
             socket.clone(),
@@ -345,7 +340,9 @@ async fn operation_connection_does_not_inherit_readiness_capabilities() {
     let task = start_mock_bridge_guest_with_service(
         socket.clone(),
         MockBridgeGuest {
-            platform: Some(pplx_space_spaced_common::platform::GuestPlatform::linux().wire()),
+            platform: Some(
+                pplx_space_spaced_guest_protocol::platform::GuestPlatform::linux().wire(),
+            ),
             platform_withdrawn: Some(withdrawn.clone()),
             interactive_process_control_calls: Some(calls.clone()),
             ..Default::default()

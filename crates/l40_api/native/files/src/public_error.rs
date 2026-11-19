@@ -25,6 +25,13 @@ impl From<FileCallError> for PublicApiError {
             FileCallErrorKind::PathNotFound(message) => Self::path_not_found(message),
             FileCallErrorKind::NotFound(message) => Self::not_found(message),
             FileCallErrorKind::Conflict(message) => Self::conflict(message),
+            FileCallErrorKind::SandboxNotRunning {
+                sandbox_id,
+                lifecycle,
+            } => Self::sandbox_not_running(
+                pplx_space_public_api::PublicSandboxId::from(sandbox_id),
+                &pplx_space_public_api::SandboxLifecycleState::from(lifecycle),
+            ),
             FileCallErrorKind::FailedPrecondition(message) => Self::failed_precondition(message),
             FileCallErrorKind::RateLimited {
                 message,

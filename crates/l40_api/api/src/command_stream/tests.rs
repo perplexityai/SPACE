@@ -8,9 +8,9 @@ use axum::{
 };
 use futures_util::FutureExt;
 use http_body_util::BodyExt;
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDbResult, pg_test_db};
 use pplx_space_public_api::{DATA_PLANE_SESSION_EVENTS_PATH_TEMPLATE, PublicSandboxId};
+use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;

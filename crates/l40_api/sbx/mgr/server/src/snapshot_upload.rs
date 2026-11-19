@@ -30,17 +30,16 @@
 //! | `SPACE_INTERNAL_API_ENDPOINT`     | no       | —           |
 //! | `SPACE_INTERNAL_TOKEN`            | no       | —           |
 
-use pplx_space_common_core::types::JobId;
+use pplx_space_accounts::JobId;
 
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use pplx_space_common_core::types::snapshot_shard;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotArtifact, SnapshotName,
-    snapshot_object_key,
-};
+use pplx_space_artifact_model::snapshot_shard;
+use pplx_space_artifact_model::{SnapshotArtifact, snapshot_object_key};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
 use pplx_space_volmgr_client::proto::PushFileRequest;
 
 /// Resolved S3 configuration for snapshot uploads.
@@ -102,7 +101,7 @@ impl SnapshotUploadConfig {
     /// URI. The org-level override lives in this form on the `organizations`
     /// row and is forwarded through the substrate.
     pub fn from_uri(uri: &str) -> Result<Self, String> {
-        let parsed = pplx_space_common_core::types::StorageUri::parse(uri)
+        let parsed = pplx_space_artifact_model::StorageUri::parse(uri)
             .map_err(|e| format!("invalid snapshot storage uri: {e}"))?;
         Ok(Self {
             bucket: parsed.bucket,
@@ -130,7 +129,7 @@ pub struct SnapshotMeta {
     /// Version 2 execution metadata. Version 1 snapshots derive this from
     /// the legacy flat fields in `source` at the Firecracker boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution: Option<pplx_space_common_core::types::SnapshotExecutionMetadata>,
+    pub execution: Option<pplx_space_execution_spec::SnapshotExecutionMetadata>,
     pub sandbox_id: String,
     /// Total logical (uncompressed) bytes of all VM artifacts, summed from
     /// the local files at submit time. vol-mgr may compress the bytes it
@@ -177,7 +176,7 @@ pub struct SnapshotMeta {
     /// snapshots, whose ciphertext belongs to `sandbox_id`. Restore-as-new
     /// retains this identity until node-manager re-encrypts the child's COW.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rootfs_encryption_source: Option<pplx_space_common_core::types::SandboxId>,
+    pub rootfs_encryption_source: Option<pplx_space_sandbox_model::SandboxId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_artifact_id: Option<LocalArtifactId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,13 +192,11 @@ pub const SNAPSHOT_METADATA_VERSION: u32 = 2;
 impl SnapshotMeta {
     pub fn execution_metadata(
         &self,
-        legacy_architecture: pplx_space_common_core::types::Arch,
-    ) -> Result<
-        pplx_space_common_core::types::SnapshotExecutionMetadata,
-        SnapshotRuntimeMetadataError,
-    > {
+        legacy_architecture: pplx_space_cpu_arch::Arch,
+    ) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, SnapshotRuntimeMetadataError>
+    {
         match self.version {
-            1 => pplx_space_common_core::types::SnapshotExecutionMetadata::new(
+            1 => pplx_space_execution_spec::SnapshotExecutionMetadata::new(
                 self.source.legacy_execution_metadata(legacy_architecture)?,
             )
             .map_err(SnapshotRuntimeMetadataError::InvalidExecution),
@@ -260,6 +257,38 @@ pub(crate) enum SnapshotMetadataWriteError {
     WriteMetadata(#[source] std::io::Error),
 }
 
+/// Why a deferred upload has no staging directory for its `snapshot.json`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DeferredMetadataStagingDirError {
+    #[error("sandbox id {0:?} is not a UUID")]
+    SandboxId(String),
+    #[error("snapshot directory {} is not inside a directory named for sandbox {sandbox_id}", snapshot_dir.display())]
+    OutsideSandboxDirectory {
+        snapshot_dir: PathBuf,
+        sandbox_id: SandboxId,
+    },
+    #[error("backup attempt id {0:?} is not a UUID")]
+    AttemptId(String),
+}
+
+/// Why a deferred upload could not stage its `snapshot.json` in its staging
+/// directory in the cache directory, beside the sandbox's own.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DeferredMetadataStagingError {
+    #[error("share deferred metadata staging {path} failed: {source}")]
+    Share {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("write {path} failed: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Sandbox-row fields that live only in node-local sqlite (not in the
 /// cluster Postgres `sandboxes` table) and so must be carried in the
 /// snapshot metadata for restores on other nodes.
@@ -275,7 +304,7 @@ pub struct SnapshotSandbox {
     #[serde(default)]
     pub process_env: std::collections::BTreeMap<String, String>,
     /// Auto-suspend / auto-stop policy.
-    pub auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy,
+    pub auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 }
 
 /// Capture-time description of what a snapshot was taken from. Stored inline
@@ -292,11 +321,11 @@ pub struct SnapshotSource {
     /// runtime. Snapshots written before this field existed are assigned the
     /// initial Firecracker `1.15.1` identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_version: Option<pplx_space_common_core::types::RuntimeVersion>,
+    pub runtime_version: Option<pplx_space_execution_spec::RuntimeVersion>,
     /// Persisted VM state format produced by the runtime. Legacy snapshots
     /// without either version field are assigned Firecracker format `9.0.0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_format_version: Option<pplx_space_common_core::types::StateFormatVersion>,
+    pub state_format_version: Option<pplx_space_execution_spec::StateFormatVersion>,
     /// Template the sandbox was created from.
     pub template_id: String,
     /// Pinned content hash of the template build at suspend time. Restoring
@@ -330,10 +359,9 @@ pub struct SnapshotSource {
 impl SnapshotSource {
     pub fn legacy_execution_metadata(
         &self,
-        architecture: pplx_space_common_core::types::Arch,
-    ) -> Result<pplx_space_common_core::types::ExecutionMetadata, SnapshotRuntimeMetadataError>
-    {
-        use pplx_space_common_core::types::{
+        architecture: pplx_space_cpu_arch::Arch,
+    ) -> Result<pplx_space_execution_spec::ExecutionMetadata, SnapshotRuntimeMetadataError> {
+        use pplx_space_execution_spec::{
             ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole,
             ArtifactFormat, ArtifactVersion, ExecutionMetadata, FIRECRACKER_STATE_FORMAT,
             GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
@@ -408,23 +436,23 @@ pub enum SnapshotRuntimeMetadataError {
     #[error("snapshot metadata version 2 requires execution metadata")]
     MissingExecution,
     #[error("legacy snapshot metadata cannot describe runtime {0}")]
-    UnsupportedLegacyRuntime(pplx_space_common_core::types::RuntimeKind),
+    UnsupportedLegacyRuntime(pplx_space_execution_spec::RuntimeKind),
     #[error(transparent)]
-    Runtime(#[from] pplx_space_common_core::types::RuntimeKindParseError),
+    Runtime(#[from] pplx_space_execution_spec::RuntimeKindParseError),
     #[error("runtime_version and state_format_version must be populated together")]
     PartialRuntime,
     #[error(transparent)]
-    InvalidExecution(#[from] pplx_space_common_core::types::ExecutionMetadataError),
+    InvalidExecution(#[from] pplx_space_execution_spec::ExecutionMetadataError),
     #[error(transparent)]
-    KernelVersion(#[from] pplx_space_common_core::types::ArtifactVersionParseError),
+    KernelVersion(#[from] pplx_space_execution_spec::ArtifactVersionParseError),
     #[error(transparent)]
-    KernelRole(#[from] pplx_space_common_core::types::ArtifactComponentRoleParseError),
+    KernelRole(#[from] pplx_space_execution_spec::ArtifactComponentRoleParseError),
     #[error(transparent)]
-    KernelDigest(#[from] pplx_space_common_core::types::DigestParseError),
+    KernelDigest(#[from] pplx_space_content_digest::DigestParseError),
     #[error(transparent)]
-    KernelFormat(#[from] pplx_space_common_core::types::ArtifactFormatParseError),
+    KernelFormat(#[from] pplx_space_execution_spec::ArtifactFormatParseError),
     #[error(transparent)]
-    StateFormat(#[from] pplx_space_common_core::types::StateFormatNameParseError),
+    StateFormat(#[from] pplx_space_execution_spec::StateFormatNameParseError),
     #[error("kernel_version and kernel_digest must be populated together")]
     PartialKernel,
 }
@@ -455,9 +483,20 @@ pub struct SnapshotUploadJobs {
     /// Empty means this is a prepared intent that has not reached vol-mgr.
     /// The durable worker owns remote submission for that shape.
     pub job_ids: Vec<JobId>,
-    /// Temporary directory used only when a read-only disk artifact needs a
-    /// writable home for generated metadata. Owned by the durable worker after
-    /// `submit_suspend_snapshot` succeeds; legacy/full payloads leave it unset.
+    /// Where this upload stages the `snapshot.json` it uploads, when that is
+    /// not the artifact's own sidecar in `snapshot_dir`. Unset for a full
+    /// artifact without a retained source, and in payloads persisted before
+    /// metadata was staged.
+    ///
+    /// An upload whose metadata is not deferred (a disk artifact, or one with
+    /// a retained source) stages it beside the artifact directory, written
+    /// when the upload is prepared. A deferred upload stages it in
+    /// `<cache>/.artifact-metadata-<sandbox>_<attempt>`, which only the worker
+    /// creates, when it writes the document; a deferred payload persisted by
+    /// an older version names a directory beside the artifact directory
+    /// instead. That name decides how the worker writes the document, so it is
+    /// a contract across versions, and it lets periodic inventory reclaim the
+    /// directory once no upload of the sandbox is in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_staging_dir: Option<PathBuf>,
     /// Whether `job_ids` already contains the `snapshot.json` upload job.
@@ -480,7 +519,13 @@ pub struct SnapshotUploadJobs {
     /// control plane can refuse a runtime it has superseded. Absent for backups that aren't bound
     /// to one execution, and in payloads persisted before the fence existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    pub execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    /// `execution_generation` is the capturing execution's by evidence, not
+    /// inferred, so the control plane records it to order captures (see
+    /// `BeginArtifactBackupRequest.execution_generation_names_capture`). A
+    /// payload persisted before this field existed reads as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub execution_generation_names_capture: bool,
     /// What this upload's permanent failure, if it has one, failed. The
     /// worker records it beside the job's own failure, which says only whether
     /// the job retries. A payload persisted before this field existed reads as
@@ -730,6 +775,38 @@ pub(crate) fn write_snapshot_metadata_to(
     destination: MetadataDestination,
     retained_rootfs_bytes: Option<u64>,
 ) -> Result<SnapshotMeta, SnapshotMetadataWriteError> {
+    let meta_final =
+        size_snapshot_metadata(meta, artifact_dir, vm_artifacts, retained_rootfs_bytes)?;
+    let written = match destination {
+        MetadataDestination::Local => meta_final.clone(),
+        MetadataDestination::Remote => SnapshotMeta {
+            rootfs_send_source_id: None,
+            ..meta_final.clone()
+        },
+    };
+    let meta_json = serde_json::to_string_pretty(&written)?;
+    std::fs::create_dir_all(metadata_dir).map_err(SnapshotMetadataWriteError::CreateMetadataDir)?;
+    // Restores may leave a sidecar owned by volume-manager. Directory write
+    // permission lets us replace it without writing another service's inode;
+    // readers keep a complete old or new document even across a crash.
+    replace_file_durably(
+        metadata_dir,
+        ".snapshot.json.upload",
+        SNAPSHOT_METADATA_FILENAME,
+        meta_json.as_bytes(),
+    )
+    .map_err(SnapshotMetadataWriteError::WriteMetadata)?;
+    Ok(meta_final)
+}
+
+/// The metadata [`write_snapshot_metadata_to`] returns, sized from the VM
+/// artifacts in `artifact_dir`, without writing it.
+fn size_snapshot_metadata(
+    meta: &SnapshotMeta,
+    artifact_dir: &Path,
+    vm_artifacts: &[Artifact],
+    retained_rootfs_bytes: Option<u64>,
+) -> Result<SnapshotMeta, SnapshotMetadataWriteError> {
     let btrfs_send = format_from_meta(meta) == SuspendSnapshotFormat::BtrfsSend;
     let rootfs_send_source_id = meta.rootfs_send_source_id.filter(|_| btrfs_send);
     let stat = |path: PathBuf| {
@@ -778,32 +855,12 @@ pub(crate) fn write_snapshot_metadata_to(
         size_bytes = size_bytes.saturating_add(len);
     }
 
-    let meta_final = SnapshotMeta {
+    Ok(SnapshotMeta {
         size_bytes,
         rootfs_size_bytes,
         rootfs_send_source_id,
         ..meta.clone()
-    };
-    let written = match destination {
-        MetadataDestination::Local => meta_final.clone(),
-        MetadataDestination::Remote => SnapshotMeta {
-            rootfs_send_source_id: None,
-            ..meta_final.clone()
-        },
-    };
-    let meta_json = serde_json::to_string_pretty(&written)?;
-    std::fs::create_dir_all(metadata_dir).map_err(SnapshotMetadataWriteError::CreateMetadataDir)?;
-    // Restores may leave a sidecar owned by volume-manager. Directory write
-    // permission lets us replace it without writing another service's inode;
-    // readers keep a complete old or new document even across a crash.
-    replace_file_durably(
-        metadata_dir,
-        ".snapshot.json.upload",
-        SNAPSHOT_METADATA_FILENAME,
-        meta_json.as_bytes(),
-    )
-    .map_err(SnapshotMetadataWriteError::WriteMetadata)?;
-    Ok(meta_final)
+    })
 }
 
 /// Replace `final_name` in `dir` with `bytes` through a sibling temporary
@@ -969,38 +1026,58 @@ pub(crate) fn prepare_suspend_snapshot(
         && format == SuspendSnapshotFormat::BtrfsSend
         && retained_rootfs
         && retained.as_ref().is_some_and(|retained| retained.stream);
-    // Size and write `snapshot.json` now so it uploads as a regular staged
-    // artifact below; `meta_final` carries the computed `size_bytes`
-    // through to the durable worker payload. An artifact with a retained
-    // source keeps that identity in its own sidecar, so the uploaded copy
-    // is always staged separately.
+    // Size `snapshot.json` now and, unless its metadata is deferred, write it
+    // so it uploads as a regular staged artifact; `meta_final` carries the
+    // computed `size_bytes` through to the durable worker payload. An
+    // artifact with a retained source keeps that identity in its own
+    // sidecar, so the uploaded copy is always staged separately.
     let retained_identity = !meta.encrypted
         && format == SuspendSnapshotFormat::BtrfsSend
         && meta.rootfs_send_source_id.is_some();
-    let metadata_staging_dir =
-        if artifact_kind == ArtifactKind::Disk || deferred_metadata || retained_identity {
-            Some(
-                snapshot_dir
-                    .parent()
-                    .unwrap_or(snapshot_dir)
-                    .join(format!(".artifact-metadata-{snapshot_id}")),
-            )
-        } else {
-            None
-        };
-    let metadata_staging_guard = MetadataStagingDirGuard::new(metadata_staging_dir.clone());
-    let (metadata_dir, destination) = match metadata_staging_dir.as_deref() {
-        Some(staging) => (staging.to_path_buf(), MetadataDestination::Remote),
-        None => (snapshot_dir.to_path_buf(), MetadataDestination::Local),
+    let metadata_staging_dir = if deferred_metadata {
+        Some(
+            deferred_metadata_staging_dir(snapshot_dir, sandbox_id, snapshot_id)
+                .map_err(|error| error.to_string())?,
+        )
+    } else if artifact_kind == ArtifactKind::Disk || retained_identity {
+        // Staged into volume-manager before the runtime is released, so
+        // nothing writes here after teardown removes the sandbox directory.
+        Some(
+            snapshot_dir
+                .parent()
+                .unwrap_or(snapshot_dir)
+                .join(format!(".artifact-metadata-{snapshot_id}")),
+        )
+    } else {
+        None
     };
-    let meta_final = write_snapshot_metadata_to(
-        meta,
-        snapshot_dir,
-        &vm_artifacts,
-        &metadata_dir,
-        destination,
-        retained.as_ref().map(|retained| retained.rootfs_bytes),
-    )
+    let metadata_staging_guard = MetadataStagingDirGuard::new(metadata_staging_dir.clone());
+    let retained_rootfs_bytes = retained.as_ref().map(|retained| retained.rootfs_bytes);
+    let meta_final = match metadata_staging_dir.as_deref() {
+        // Only the worker writes a deferred upload's `snapshot.json`, once the
+        // stream's length is known, and so only it creates the staging
+        // directory. Periodic inventory reclaims one while its sandbox has no
+        // upload job in flight, and this upload's job does not exist yet.
+        Some(_) if deferred_metadata => {
+            size_snapshot_metadata(meta, snapshot_dir, &vm_artifacts, retained_rootfs_bytes)
+        }
+        Some(staging) => write_snapshot_metadata_to(
+            meta,
+            snapshot_dir,
+            &vm_artifacts,
+            staging,
+            MetadataDestination::Remote,
+            retained_rootfs_bytes,
+        ),
+        None => write_snapshot_metadata_to(
+            meta,
+            snapshot_dir,
+            &vm_artifacts,
+            snapshot_dir,
+            MetadataDestination::Local,
+            retained_rootfs_bytes,
+        ),
+    }
     .map_err(|error| error.to_string())?;
 
     Ok(SnapshotUploadJobs {
@@ -1014,6 +1091,7 @@ pub(crate) fn prepare_suspend_snapshot(
         includes_metadata_job: true,
         deferred_metadata,
         execution_generation: None,
+        execution_generation_names_capture: false,
         failure_scope: UploadFailureScope::Attempt,
     })
 }
@@ -1161,6 +1239,59 @@ pub async fn submit_prepared_snapshot(
     Ok(submitted)
 }
 
+const DEFERRED_METADATA_STAGING_PREFIX: &str = ".artifact-metadata-";
+
+/// Where an upload stages its deferred `snapshot.json`: beside the sandbox's
+/// cache directory, never inside it. The worker writes this document after
+/// the VM artifacts transfer, when runtime teardown may already have removed
+/// the sandbox directory; recreating that directory would leave an empty one
+/// that inventory quarantines as an orphan. The name is the one
+/// [`deferred_metadata_staging_sandbox_id`] recognizes, so `snapshot_id`, the
+/// backup attempt, must be a UUID.
+pub(crate) fn deferred_metadata_staging_dir(
+    snapshot_dir: &Path,
+    sandbox_id: &str,
+    snapshot_id: &str,
+) -> Result<PathBuf, DeferredMetadataStagingDirError> {
+    let sandbox_id: SandboxId = sandbox_id
+        .parse()
+        .map_err(|_| DeferredMetadataStagingDirError::SandboxId(sandbox_id.to_owned()))?;
+    let cache_dir = snapshot_dir
+        .ancestors()
+        .find(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<SandboxId>().ok())
+                == Some(sandbox_id)
+        })
+        .and_then(Path::parent)
+        .ok_or_else(
+            || DeferredMetadataStagingDirError::OutsideSandboxDirectory {
+                snapshot_dir: snapshot_dir.to_owned(),
+                sandbox_id,
+            },
+        )?;
+    if snapshot_id.parse::<uuid::Uuid>().is_err() {
+        return Err(DeferredMetadataStagingDirError::AttemptId(
+            snapshot_id.to_owned(),
+        ));
+    }
+    Ok(cache_dir.join(format!(
+        "{DEFERRED_METADATA_STAGING_PREFIX}{sandbox_id}_{snapshot_id}"
+    )))
+}
+
+/// The sandbox whose upload owns the cache entry `name`, if `name` is a
+/// deferred-metadata staging directory.
+pub(crate) fn deferred_metadata_staging_sandbox_id(name: &std::ffi::OsStr) -> Option<SandboxId> {
+    let (sandbox_id, snapshot_id) = name
+        .to_str()?
+        .strip_prefix(DEFERRED_METADATA_STAGING_PREFIX)?
+        .split_once('_')?;
+    snapshot_id.parse::<uuid::Uuid>().ok()?;
+    sandbox_id.parse().ok()
+}
+
 pub(crate) fn cleanup_metadata_staging_dir(jobs: &SnapshotUploadJobs) {
     drop(MetadataStagingDirGuard::new(
         jobs.metadata_staging_dir.clone(),
@@ -1202,7 +1333,7 @@ pub(crate) fn build_storage_uri(
     snapshot_id: &str,
     config: &SnapshotUploadConfig,
 ) -> String {
-    let dir_prefix = pplx_space_common_core::types::snapshot_attempt_key_prefix(
+    let dir_prefix = pplx_space_artifact_model::snapshot_attempt_key_prefix(
         &config.key_prefix,
         sandbox_id,
         snapshot_id,
@@ -1229,26 +1360,13 @@ pub(crate) async fn submit_streamed_metadata(
     rootfs_size_bytes: u64,
     volume_manager_socket: &Path,
 ) -> Result<JobId, String> {
-    let directory = payload
-        .metadata_staging_dir
-        .as_ref()
-        .ok_or("deferred metadata requires private staging")?;
-    tokio::fs::create_dir_all(directory)
-        .await
-        .map_err(|error| error.to_string())?;
-    let path = directory.join(SNAPSHOT_METADATA_FILENAME);
-    let remote = SnapshotMeta {
-        size_bytes: logical_bytes,
-        rootfs_size_bytes: Some(rootfs_size_bytes),
-        rootfs_send_source_id: None,
-        ..payload.meta.clone()
-    };
-    let bytes = serde_json::to_vec_pretty(&remote).map_err(|error| error.to_string())?;
-    // Volume-manager stages only after the complete write. The job's immutable
-    // backup-attempt key makes resubmission after an ambiguous reply idempotent.
-    tokio::fs::write(&path, bytes)
-        .await
-        .map_err(|error| error.to_string())?;
+    let path = stage_streamed_metadata(
+        payload,
+        logical_bytes,
+        rootfs_size_bytes,
+        crate::transfer_directory::shared_cache_group(),
+    )
+    .await?;
     let key = snapshot_object_key(
         &payload.config.key_prefix,
         &payload.meta.sandbox_id,
@@ -1271,4 +1389,81 @@ pub(crate) async fn submit_streamed_metadata(
         .job_id
         .parse::<JobId>()
         .map_err(|error| error.to_string())
+}
+
+/// Write the remote `snapshot.json` into the payload's staging directory and
+/// return its path. A staging directory in the cache directory, beside the
+/// sandbox's own, is created here and shared with volume-manager through
+/// `group`. Payloads persisted before deferred metadata moved out of the
+/// sandbox directory still name a directory inside it, written as before.
+async fn stage_streamed_metadata(
+    payload: &SnapshotUploadJobs,
+    logical_bytes: u64,
+    rootfs_size_bytes: u64,
+    group: nix::unistd::Gid,
+) -> Result<PathBuf, String> {
+    let directory = payload
+        .metadata_staging_dir
+        .as_ref()
+        .ok_or("deferred metadata requires private staging")?;
+    let path = directory.join(SNAPSHOT_METADATA_FILENAME);
+    let remote = SnapshotMeta {
+        size_bytes: logical_bytes,
+        rootfs_size_bytes: Some(rootfs_size_bytes),
+        rootfs_send_source_id: None,
+        ..payload.meta.clone()
+    };
+    let bytes = serde_json::to_vec_pretty(&remote).map_err(|error| error.to_string())?;
+    // Volume-manager stages only after the complete write. The job's immutable
+    // backup-attempt key makes resubmission after an ambiguous reply idempotent.
+    if directory
+        .file_name()
+        .and_then(deferred_metadata_staging_sandbox_id)
+        .is_some()
+    {
+        let staging = directory.clone();
+        tokio::task::spawn_blocking(move || write_deferred_metadata(&staging, group, &bytes))
+            .await
+            .map_err(|error| format!("deferred metadata staging task failed: {error}"))?
+            .map_err(|error| error.to_string())?;
+        return Ok(path);
+    }
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+/// Create a deferred upload's staging directory, or reuse the one an earlier
+/// attempt of its job created, and stage `bytes` in it as the `snapshot.json`
+/// that volume-manager reads through `group`.
+fn write_deferred_metadata(
+    staging: &Path,
+    group: nix::unistd::Gid,
+    bytes: &[u8],
+) -> Result<(), DeferredMetadataStagingError> {
+    let share = |source| DeferredMetadataStagingError::Share {
+        path: staging.to_owned(),
+        source,
+    };
+    let (Some(parent), Some(name)) = (staging.parent(), staging.file_name()) else {
+        return Err(share(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "deferred metadata staging has no parent",
+        )));
+    };
+    crate::transfer_directory::prepare_readable_child(parent, name, group).map_err(share)?;
+    replace_file_durably(
+        staging,
+        ".snapshot.json.upload",
+        SNAPSHOT_METADATA_FILENAME,
+        bytes,
+    )
+    .map_err(|source| DeferredMetadataStagingError::Write {
+        path: staging.join(SNAPSHOT_METADATA_FILENAME),
+        source,
+    })
 }

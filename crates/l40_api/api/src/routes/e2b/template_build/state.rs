@@ -17,10 +17,9 @@
 //!   the same alias would otherwise clobber each other's tags or
 //!   sizing).
 //!
-use pplx_space_common_core::{
-    sql,
-    types::{OrgId, TemplateName},
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_sql_locator::sql;
+use pplx_space_template_model::TemplateName;
 use std::sync::Arc;
 
 use sqlx::PgPool;

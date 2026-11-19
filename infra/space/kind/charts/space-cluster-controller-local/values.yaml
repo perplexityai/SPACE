@@ -194,6 +194,9 @@ reconcilers:
   #   them.
   # - Failed-sandbox cleanup (retrying the teardown of `failed` rows that
   #   still hold an active execution) ships on; rendered explicitly.
+  # - The command-ready-pending phase (heal or reap a `started` row whose
+  #   create returned before its guest answered) ships off, and its switch
+  #   (`..._COMMAND_READY_PENDING_ENABLED`) is unset here, so it stays off.
   # At these ages a row a scenario legitimately holds mid-transition is never
   # old enough to sweep; one that is swept was stuck past what a deployment
   # tolerates.
@@ -215,7 +218,7 @@ reconcilers:
       SPACE_STUCK_SNAPSHOT_REAPER_ENABLED: "true"
   # The minimum age (SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS) is a test
   # hook left at its release value, which equals the API's fork-retention grace
-  # (crates/libs/common/core/src/types/snapshot.rs). The retention scenarios
+  # (crates/l20_domain/snapshot/model/src/lib.rs). The retention scenarios
   # shorten it for their own run and restore it afterwards.
   snapshotRetentionSweeper:
     env:

@@ -1,14 +1,14 @@
 use super::cleanup_helpers::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::host::linux::paths;
-use pplx_space_common_core::host::linux::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
-use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
-use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_host_layout::paths;
+use pplx_space_host_layout::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_node_runtime_core::proto::{ArtifactIntegrityRequirement, VerifiedRuntimeLaunch};
 use pplx_space_node_runtime_core::runtime_inventory::{
     ExecutionSelectionMode, ExecutionSourceIntegrity, RuntimeFileRole, boot_component_role,
 };
+use pplx_space_sandbox_model::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 
 struct PreparationOwnership {
     lease: SlotInfo,
@@ -77,7 +77,9 @@ impl NodeManagerService {
         }
         validate_sandbox_uid(sandbox_id, uid, current.sandbox_uid)?;
         if self.pool.shutdown_token.is_cancelled() {
-            return Err(Status::unavailable("node-manager is shutting down"));
+            return Err(Status::unavailable(
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE,
+            ));
         }
         Ok(PreparationOwnership {
             lease: current,
@@ -118,18 +120,18 @@ fn parse_runtime_request(
     requested_execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> Result<
     (
-        pplx_space_common_core::types::RuntimeKind,
-        Option<pplx_space_common_core::types::ExecutionMetadata>,
+        pplx_space_execution_spec::RuntimeKind,
+        Option<pplx_space_execution_spec::ExecutionMetadata>,
     ),
     Status,
 > {
-    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_execution_spec::RuntimeKind;
 
     let runtime = runtime
         .parse::<RuntimeKind>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let requested = requested_execution
-        .map(pplx_space_common_core::types::ExecutionMetadata::try_from)
+        .map(pplx_space_execution_spec::ExecutionMetadata::try_from)
         .transpose()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     Ok((runtime, requested))
@@ -150,13 +152,14 @@ fn parse_execution_selection_mode(value: i32) -> Result<ExecutionSelectionMode, 
 
 fn sandbox_metadata(
     req: &PrepareSandboxRequest,
-    execution: pplx_space_common_core::types::ExecutionMetadata,
-) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
+    execution: pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<pplx_space_artifact_model::SandboxArtifactMetadata, Status> {
     use std::str::FromStr;
 
-    use pplx_space_common_core::types::{
-        ContentHash, ORPHANED_SANDBOX_TEMPLATE, SandboxArtifactMetadata, SandboxId, TemplateName,
-    };
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_content_digest::ContentHash;
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_template_model::{ORPHANED_SANDBOX_TEMPLATE, TemplateName};
 
     let sandbox_id = SandboxId::from_str(&req.sandbox_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -236,9 +239,9 @@ fn prepare_sandbox_cache_paths(sandbox_id: &str) -> PrepareSandboxCachePaths {
 fn log_resolved_execution(
     operation: &'static str,
     sandbox_id: &str,
-    execution: &pplx_space_common_core::types::ExecutionMetadata,
+    execution: &pplx_space_execution_spec::ExecutionMetadata,
 ) {
-    use pplx_space_common_core::types::ArtifactComponentKind;
+    use pplx_space_execution_spec::ArtifactComponentKind;
 
     let state_format = execution.state_format();
     let kernel = execution
@@ -313,14 +316,12 @@ impl NodeManagerService {
             .runtime_files
             .path(RuntimeFileRole::LauncherExecutable)
             .map(|path| path.display().to_string());
-        if runtime == pplx_space_common_core::types::RuntimeKind::Firecracker
-            && jailer_bin.is_none()
-        {
+        if runtime == pplx_space_execution_spec::RuntimeKind::Firecracker && jailer_bin.is_none() {
             return Err(Status::failed_precondition(
                 "resolved runtime is missing its launcher",
             ));
         }
-        let standalone = runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor;
+        let standalone = runtime == pplx_space_execution_spec::RuntimeKind::CloudHypervisor;
         if standalone && self.disk_io_ceiling.configured().is_some() {
             return Err(Status::failed_precondition(
                 "runtime does not support a live node disk-I/O ceiling",
@@ -358,7 +359,7 @@ impl NodeManagerService {
             Some(
                 resolved_execution
                     .component(
-                        pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+                        pplx_space_execution_spec::ArtifactComponentKind::Kernel,
                         Some(&boot_component_role()),
                     )
                     .ok_or_else(|| {
@@ -371,7 +372,7 @@ impl NodeManagerService {
             Some(
                 resolved_execution
                     .component(
-                        pplx_space_common_core::types::ArtifactComponentKind::Firmware,
+                        pplx_space_execution_spec::ArtifactComponentKind::Firmware,
                         Some(&"firmware".parse().map_err(|error| {
                             Status::internal(format!("firmware role: {error}"))
                         })?),
@@ -928,7 +929,7 @@ impl NodeManagerService {
         let sandbox_cache_dir_b = sandbox_cache_dir.clone();
         let snapshots_dir_b = snapshots_dir.clone();
         let sandbox_metadata_path_b =
-            pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id);
+            pplx_space_host_layout::paths::sandbox_metadata_path(sandbox_id);
         let sandbox_metadata = sandbox_metadata.clone();
         let vm_config_json = req.vm_config_json.clone();
         let rootfs_size_mb = req.rootfs_size_mb;
@@ -1109,11 +1110,11 @@ impl NodeManagerService {
 fn protected_launch_environment(
     kind: RuntimeKind,
     runtime: ExecutionSourceIntegrity,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
-    requested: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+    requested: Option<pplx_space_execution_spec::EnvironmentReference>,
     snapshot_restore: bool,
     components: impl IntoIterator<Item = ExecutionSourceIntegrity>,
-) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, Status> {
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, Status> {
     let authenticated = |integrity| match integrity {
         ExecutionSourceIntegrity::FsVerity => true,
         ExecutionSourceIntegrity::CatalogSha256 => kind == RuntimeKind::CloudHypervisor,
@@ -1145,7 +1146,7 @@ fn protected_launch_environment(
 fn resize_guest_disk(
     rootfs_path: &str,
     rootfs_size_mb: u32,
-    layout: pplx_space_common_core::types::guest_image::GuestDiskLayout,
+    layout: pplx_space_execution_spec::guest_image::GuestDiskLayout,
 ) -> Result<(), Status> {
     let target_bytes = validate_rootfs_mib(rootfs_size_mb)
         .map_err(|error| Status::invalid_argument(error.to_string()))?
@@ -1173,7 +1174,7 @@ fn resize_guest_disk(
     backing
         .resize(target_bytes)
         .map_err(super::artifact_fs::error)?;
-    if layout == pplx_space_common_core::types::guest_image::GuestDiskLayout::OpaqueRawDisk {
+    if layout == pplx_space_execution_spec::guest_image::GuestDiskLayout::OpaqueRawDisk {
         return Ok(());
     }
     // These tools must see the pinned inode too, not a cache pathname which
@@ -1258,7 +1259,7 @@ mod tests;
 /// than stalling the VMM, and readable by sandbox-manager's group.
 fn create_firecracker_metrics_fifo(path: &Path, sandbox_uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    let sbxmgr_gid = pplx_space_common_core::host::linux::identities::groups::SPACE_SBXMGR.gid;
+    let sbxmgr_gid = pplx_space_host_layout::identities::groups::SPACE_SBXMGR.gid;
     nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))?;
     let configured = std::os::unix::fs::lchown(path, Some(sandbox_uid), Some(sbxmgr_gid))
         .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)));

@@ -1,9 +1,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::GrpcRetryPolicy;
 use pplx_space_node_mgr_client::{ConnectError, NodeManagerGrpcClient};
+use pplx_space_sandbox_model::SandboxId;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 

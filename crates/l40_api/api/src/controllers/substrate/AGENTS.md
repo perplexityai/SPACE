@@ -58,7 +58,11 @@ For new work:
 
 - Put behavior above the adapter. Add an adapter method only for an
   infrastructure action the existing ones cannot express, and implement it
-  for both substrates in the same PR.
+  for both substrates in the same PR. The one exception is a pre-check that
+  lets a route refuse before it enqueues the operation, such as
+  `check_node_pool_placement`: it returns the same `Unsupported` as the
+  operation it guards, through one refusal function both call, and the gap
+  row names both.
 - Record every gap. If one substrate cannot support an operation yet, return
   `SubstrateError::Unsupported` from it and add a row to the gap table in its
   module doc (`direct.rs`, or `kubernetes/mod.rs`, whose first gap starts
@@ -73,7 +77,8 @@ For new work:
   Kubernetes objects themselves (pods, Nodes, DaemonSets) belongs to the
   Kubernetes adapter side, and its module doc says so. The state loops
   `run_reconcilers` (`cluster/controller/server/src/reconcilers.rs`) starts
-  only for Kubernetes are debt, not precedent or a Direct retry path.
+  only for Kubernetes, classified in its module doc, are debt, not
+  precedent or a Direct retry path.
 - Make a new `SubstrateAdapter` operation a required method, so the compiler
   demands each implementation and its arm in `impl SubstrateAdapter for
   Substrate`: with a default, a forgotten forwarding arm silently gives both
@@ -127,7 +132,7 @@ For new work:
 
 ## Tests
 
-Kubernetes pod rendering is owned by `pplx_space_common_core::kubernetes`.
+Kubernetes pod rendering is owned by `pplx_space_sandbox_pod`.
 Keep broad, human-readable golden snapshots for the shared pod shapes there
 rather than in controller-specific tests, so reviewers can compare on-demand,
 restore, and pooled manifests in one place.

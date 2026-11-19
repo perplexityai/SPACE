@@ -10,7 +10,6 @@ use axum::{
     http::Request,
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_native_files::{
     FileOperation, disable_file_changes_request, enable_file_changes_request, mkdir_fingerprint,
     modified_files_request, modified_files_response, parse_guest_path, parse_guest_user,
@@ -22,6 +21,7 @@ use pplx_space_public_api::{
     FileChangeTrackingRequest, FileChangeTrackingResponse, FileMkdirRequest, FileModifiedRequest,
     FileMutationResponse, FileRemoveRequest, FileRenameRequest,
 };
+use pplx_space_sandbox_model::SandboxId;
 
 use super::call::{Reconnect, SandboxCall};
 use super::{FileRequest, Refusal, idempotency_key, json_body, optional_json_body, rejected};
@@ -250,7 +250,7 @@ async fn modified(state: &DataPlaneState, request: Request<Body>) -> Result<Resp
     let response = call
         .call(
             "spaced_get_modified_files",
-            Reconnect::WhenDraining,
+            Reconnect::ReadOnly,
             Some(NodeApiOperationBudget::FilesystemMetadata),
             message,
             |mut client, request| async move { client.spaced_get_modified_files(request).await },

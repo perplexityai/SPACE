@@ -203,14 +203,14 @@ pub type BuilderClient =
 /// The 150s timeout leaves a 135s blocking budget after reserving 15s for
 /// completing the response.
 ///
-/// The value comes from `common-core`'s `restore_ownership` module, which
+/// The value comes from `rpc-contracts`'s `restore_ownership` module, which
 /// compile-asserts that the restore execution-ownership window outlives it.
 /// The Direct and Kubernetes restore lease claims pass this timeout as their
 /// lease TTL, and other crates derive their own timeouts and windows from the
 /// module, so a future timeout bump reaches every use of it and fails the
 /// build if it would reach the ownership window.
 pub(crate) const NODE_RPC_TIMEOUT: Duration =
-    pplx_space_common_core::restore_ownership::NODE_RPC_TIMEOUT;
+    pplx_space_rpc_contracts::restore_ownership::NODE_RPC_TIMEOUT;
 
 pub(crate) const NODE_RPC_TIMEOUT_SECS: u64 = NODE_RPC_TIMEOUT.as_secs();
 
@@ -413,18 +413,9 @@ pub(super) async fn connect_worker_watched_with(
     endpoint: Endpoint,
     retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
 ) -> Result<(Channel, pplx_space_common_grpc::ConnectionWatch), ControllerError> {
-    // A kept connection carries every call to its pod, so it needs its own
-    // liveness check: ping it while idle too, so a peer lost without a FIN is
-    // torn down before the next caller reuses it, rather than only once a
-    // call is in flight.
-    //
-    // It also carries concurrent streams that used to get a connection each,
-    // so it takes the multiplexed connection window.
-    let endpoint = endpoint
-        .keep_alive_while_idle(true)
-        .initial_connection_window_size(
-            pplx_space_node_api_client::MULTIPLEXED_CONNECTION_WINDOW_BYTES,
-        );
+    // A kept connection carries every call to its pod, including concurrent
+    // streams that used to get a connection each.
+    let endpoint = pplx_space_node_api_client::configure_kept_node_api_endpoint(endpoint);
     node_api_connect_endpoint(endpoint)
         .await?
         .connect_with_retry_watched("worker-node-api", "worker-node-api", retry_policy)

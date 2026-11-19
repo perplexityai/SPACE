@@ -2,9 +2,13 @@
 //! Every expected answer is the one the API's own route gives; the rows of
 //! [`each_failure_answers_as_the_api_answers_it`] say where it comes from.
 
+mod activation_connection;
 mod drain;
 mod fakes;
 mod mutations;
+mod proxy;
+mod stale_connection;
+mod transport_failure;
 mod write;
 
 use std::sync::{
@@ -62,7 +66,21 @@ impl Harness {
     /// `upload_admission`.
     async fn start_with(upload_admission: Option<crate::NativeUploadAdmissionConfig>) -> Self {
         let (worker, worker_addr) = FakeWorker::start().await;
-        let (api, api_addr) = FakeApi::start(worker_addr).await;
+        Self::build(worker, worker_addr, upload_admission).await
+    }
+
+    /// One whose API grants `runtime` as the sandbox's runtime: a proxy in
+    /// front of `worker`, or a runtime of its own that misbehaves.
+    async fn with_runtime(worker: FakeWorker, runtime: std::net::SocketAddr) -> Self {
+        Self::build(worker, runtime, None).await
+    }
+
+    async fn build(
+        worker: FakeWorker,
+        runtime: std::net::SocketAddr,
+        upload_admission: Option<crate::NativeUploadAdmissionConfig>,
+    ) -> Self {
+        let (api, api_addr) = FakeApi::start(runtime).await;
         let mut state = crate::tests::test_data_plane_state().await;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{api_addr}"))
             .unwrap()
@@ -452,9 +470,9 @@ fn guest_missing() -> Reply {
 fn storage_full() -> Reply {
     let mut status = Status::resource_exhausted("No space left on device (os error 28)");
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::GUEST_STORAGE_FULL,
+            pplx_space_guest_process::status::GUEST_STORAGE_FULL,
         ),
     );
     failed_stat(status)

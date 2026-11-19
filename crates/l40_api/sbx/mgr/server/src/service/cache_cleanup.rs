@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 #[cfg(test)]
 use super::cleanup_support::CleanupLockGuard;
@@ -9,8 +9,8 @@ use crate::metrics::sandbox::worker::{
     InventoryReconcileOperation, InventoryReconcileOutcome, InventoryReconcileReason,
     inventory_reconcile,
 };
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 mod periodic;
 #[cfg(test)]
@@ -87,6 +87,7 @@ fn durable_inventory_reason(
     }
 }
 
+#[tracing::instrument(name = "sbxmgr.cache.ensure_root", skip_all, err)]
 pub(super) fn ensure_sandbox_cache_root_in(
     cache_dir: &Path,
     sandbox_id: &str,
@@ -216,15 +217,57 @@ impl SandboxInventoryPresence {
 }
 
 /// Check if a sandbox's Firecracker process is alive via the fc.pid symlink.
-/// The symlink points to /proc/{pid} — if the target exists, the process is alive.
+/// An unreadable path reads as not running; callers that must tell it from a
+/// confirmed exit use [`runtime_alive_in`].
 pub(super) fn is_sandbox_running(sandbox_id: &str) -> bool {
     is_sandbox_running_in(Path::new(RUN_DIR), sandbox_id)
 }
 
 pub(super) fn is_sandbox_running_in(run_dir: &Path, sandbox_id: &str) -> bool {
-    let link_path = run_dir.join(sandbox_id).join("fc.pid");
-    // Path::exists() follows the symlink — returns true only if /proc/{pid} exists
-    link_path.exists()
+    runtime_alive_in(run_dir, sandbox_id).unwrap_or(false)
+}
+
+/// Whether the process the sandbox's `fc.pid` link names (`/proc/{pid}`) is
+/// alive: `Ok(false)` once it has exited, `Err` when that can't be read.
+///
+/// A process that has exited keeps its `/proc/{pid}` entry until its parent
+/// reaps it, so the link alone still resolves for a few hundred milliseconds
+/// after a runtime dies. That window is exactly when a failed capture asks
+/// whether its runtime is gone, so a zombie (`Z`) or dead (`X`) process counts
+/// as exited.
+pub(super) fn runtime_alive_in(run_dir: &Path, sandbox_id: &str) -> std::io::Result<bool> {
+    let link = run_dir.join(sandbox_id).join("fc.pid");
+    let process = match std::fs::read_link(&link) {
+        Ok(process) => process,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let stat = match std::fs::read_to_string(process.join("stat")) {
+        Ok(stat) => stat,
+        // Gone between the two reads, or a target that isn't a /proc entry,
+        // whose existence alone is all the link can say.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return process.try_exists();
+        }
+        Err(error) => return Err(error),
+    };
+    // `pid (comm) state ...`; comm may itself hold parentheses, so the state
+    // follows the last one.
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unparsable {}", process.join("stat").display()),
+            )
+        })?;
+    Ok(!matches!(state, "Z" | "X"))
 }
 
 fn rootfs_size_mb(cache_dir: &Path, sandbox_id: &str) -> Option<u32> {
@@ -289,7 +332,7 @@ impl OrphanedSandboxRowMaterializationError {
 }
 
 enum RemoteRestoreProvenanceInspection {
-    Confirmed(pplx_space_common_core::types::ExactStorageUri),
+    Confirmed(pplx_space_artifact_model::ExactStorageUri),
     Absent,
     Unsafe { detail: String },
 }
@@ -312,7 +355,7 @@ fn inspect_remote_restore_provenance(
                 });
             }
         };
-    let expected_subject = pplx_space_common_core::types::SubjectId::Sandbox(sandbox_id);
+    let expected_subject = pplx_space_subject_model::SubjectId::Sandbox(sandbox_id);
     if provenance.subject_id != expected_subject {
         return Ok(RemoteRestoreProvenanceInspection::Unsafe {
             detail: format!(
@@ -323,7 +366,7 @@ fn inspect_remote_restore_provenance(
     }
     match crate::snapshot_restore::restore_source_from_artifact_location(
         &provenance.storage_uri,
-        pplx_space_common_core::types::SnapshotArtifact::Metadata,
+        pplx_space_artifact_model::SnapshotArtifact::Metadata,
     ) {
         Ok(source) => Ok(RemoteRestoreProvenanceInspection::Confirmed(source)),
         Err(error) => Ok(RemoteRestoreProvenanceInspection::Unsafe {
@@ -337,7 +380,7 @@ pub(super) enum CanonicalSuspendArtifactInspection {
     InterruptedRestore {
         metadata: Box<super::suspend_snapshot_publication::ValidatedSuspendSnapshotMetadata>,
         detail: String,
-        restore_source: pplx_space_common_core::types::ExactStorageUri,
+        restore_source: pplx_space_artifact_model::ExactStorageUri,
     },
     Unsafe {
         detail: String,
@@ -596,10 +639,10 @@ fn insert_orphaned_sandbox_row_in_transaction(
                         network_policy_authority: crate::db::PolicyAuthority::Cluster,
                         auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
                     },
-                    pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
+                    pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
                     reason_code,
                     &reason,
-                    pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
                 )?;
                 Ok(CommittedOrphanRowMaterialization {
                     disposition:
@@ -706,6 +749,53 @@ pub(super) fn reclaim_abandoned_restore_metadata_staging<StagingGuard>(
             ),
         }
     }
+}
+
+/// Remove `path` if it is an upload's deferred-metadata staging directory and
+/// no upload of its sandbox is pending, running or cancelling. Only an
+/// upload's worker creates the directory, once the upload's job exists, and
+/// the upload removes it when its transfers finish or one fails permanently.
+/// A job that ends without that cleanup after its worker wrote the directory
+/// leaves it behind, for example one cancelled while running; this reclaims
+/// it.
+///
+/// Returns whether `path` names such a directory, so the caller stops there.
+pub(super) fn reclaim_abandoned_upload_metadata_staging(
+    path: &Path,
+    db: &impl InventoryDbAccess,
+) -> Result<bool, InventoryError> {
+    let Some(sandbox_id) = path
+        .file_name()
+        .and_then(crate::snapshot_upload::deferred_metadata_staging_sandbox_id)
+    else {
+        return Ok(false);
+    };
+    if db.with_connection(|conn| {
+        crate::db::read::snapshot_upload_in_flight(conn, &sandbox_id.to_string())
+    })?? {
+        return Ok(true);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => match std::fs::remove_dir_all(path) {
+            Ok(()) => tracing::info!(
+                sandbox_id = %sandbox_id,
+                "removed abandoned upload metadata staging"
+            ),
+            Err(error) => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %error,
+                "failed to remove abandoned upload metadata staging"
+            ),
+        },
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            sandbox_id = %sandbox_id,
+            %error,
+            "failed to inspect abandoned upload metadata staging"
+        ),
+    }
+    Ok(true)
 }
 
 pub(super) trait InventoryDbAccess {
@@ -1362,7 +1452,7 @@ pub(super) fn inventory_cleanup_guard_for_test(sandbox_id: &str) -> CleanupLockT
 #[cfg(test)]
 pub(super) fn inventory_execution_for_test(_: SandboxId) -> Result<Option<ExecutionFence>, Status> {
     Ok(Some(ExecutionFence::new(
-        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
         None,
     )))
 }

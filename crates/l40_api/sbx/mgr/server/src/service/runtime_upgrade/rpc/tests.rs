@@ -4,13 +4,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use pplx_space_common_core::types::{ExecutionMetadata, LocalArtifactId, SandboxId};
+use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotRequest,
     DeleteBtrfsSnapshotResponse, ResolveExecutionEnvironmentRequest,
     ResolveExecutionEnvironmentResponse, RestoreInstanceSnapshotRequest,
     RestoreInstanceSnapshotResponse,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
 
 use super::super::node_effects::tests::{
@@ -46,7 +48,7 @@ fn pod_identity(sandbox_id: &str, pod_uid: &str, generation: i64) -> SpaceApiRou
 
 /// The `UpgradeRuntime` a runtime upgrade pod's shim sends: the pod's own
 /// cold start, with its namespace and route identity.
-fn pod_upgrade(
+pub(in crate::service::runtime_upgrade) fn pod_upgrade(
     sandbox_id: &str,
     target: &ExecutionMetadata,
     operation_id: RuntimeUpgradeOperationId,
@@ -67,14 +69,15 @@ fn pod_upgrade(
         target_state: target_state as i32,
         stage_from: None,
         checkpoint_local_artifact_id: None,
+        attempt_id: None,
     }
 }
 
-fn operation() -> RuntimeUpgradeOperationId {
+pub(in crate::service::runtime_upgrade) fn operation() -> RuntimeUpgradeOperationId {
     RuntimeUpgradeOperationId::from_uuid(uuid::Uuid::now_v7())
 }
 
-fn authorization() -> RuntimeUpgradeAuthorization {
+pub(in crate::service::runtime_upgrade) fn authorization() -> RuntimeUpgradeAuthorization {
     RuntimeUpgradeAuthorization {
         authorization_id: "environment-block-e0".into(),
         reason: "e0 runs a blocked runtime".into(),
@@ -114,7 +117,7 @@ impl Fixture {
     }
 }
 
-async fn upgrade(
+pub(in crate::service::runtime_upgrade) async fn upgrade(
     service: &SandboxManagerService,
     request: UpgradeRuntimeRequest,
 ) -> Result<crate::proto::UpgradeRuntimeResponse, Status> {
@@ -133,6 +136,7 @@ fn report(
         .get_runtime_upgrade(&internal_request(GetRuntimeUpgradeRequest {
             sandbox_id: sandbox_id.to_string(),
             operation_id: operation_id.to_string(),
+            attempt_id: None,
         }))
         .unwrap()
 }
@@ -146,7 +150,7 @@ fn node_reaching_the_boot(
 ) -> FakeNodeManager {
     use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
     let compiled =
-        CompiledEnvironment::for_architecture(pplx_space_common_core::types::Arch::X86_64).unwrap();
+        CompiledEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64).unwrap();
     let definition = compiled
         .iter()
         .find(|environment| Some(environment.definition().reference()) == target.environment())
@@ -223,7 +227,7 @@ async fn a_pods_upgrade_boots_in_the_pods_namespace_under_the_target() {
     assert!(
         !error
             .message()
-            .contains(pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER),
+            .contains(pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER),
         "{error}"
     );
     assert!(error.message().contains("rolled back"), "{error}");
@@ -301,6 +305,7 @@ async fn an_upgrade_already_on_its_target_is_recorded_and_replays_the_same() {
         .get_runtime_upgrade(&internal_request(GetRuntimeUpgradeRequest {
             sandbox_id: other,
             operation_id: operation_id.to_string(),
+            attempt_id: None,
         }))
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused}");
@@ -684,7 +689,7 @@ async fn a_suspended_sandbox_already_on_its_target_is_restored_in_place() {
     std::fs::write(
         f.checkpoint().join("runtime.json"),
         serde_json::to_vec(
-            &pplx_space_common_core::types::SnapshotExecutionMetadata::new(target.clone()).unwrap(),
+            &pplx_space_execution_spec::SnapshotExecutionMetadata::new(target.clone()).unwrap(),
         )
         .unwrap(),
     )
@@ -1103,7 +1108,7 @@ async fn an_activated_upgrade_never_starts_its_sandbox_again() {
                     // the sandbox since the claim.
                     crate::db::RuntimeUpgradeActivationClaim::Start {
                         from_execution: Some(
-                            pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+                            pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
                         ),
                     },
                 )
@@ -1593,6 +1598,7 @@ async fn the_runtime_upgrade_report_is_read_only_by_the_upgrades_principals() {
         let mut request = tonic::Request::new(GetRuntimeUpgradeRequest {
             sandbox_id: SandboxId::new().to_string(),
             operation_id: operation().to_string(),
+            attempt_id: None,
         });
         request
             .extensions_mut()

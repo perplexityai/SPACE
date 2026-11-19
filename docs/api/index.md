@@ -41,7 +41,7 @@ Sandbox create (`POST /v1/sandboxes`) and update (`PATCH /v1/sandboxes/{sandbox_
 | `metadata` | 64 entries; keys up to 128 bytes; string values up to 1024 bytes; 16 KiB across keys and string values |
 | `env` (create only) | 256 entries; keys up to 128 bytes; values up to 8192 bytes; 64 KiB in total |
 | `resources.vcpu` | 1 to 32 |
-| `resources.memory_mib` | 512 to 8192 |
+| `resources.memory_mib` | 512 to 65536 |
 | `resources.disk_mib` (create only) | 1 to 131072; it must also hold the template's root filesystem |
 
 Every request that requires an `Idempotency-Key` header takes 1 to 1024 printable ASCII characters (space through `~`) or tabs; other control characters and non-ASCII bytes are rejected. A missing header and an invalid one return different messages.

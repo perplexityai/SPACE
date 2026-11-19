@@ -22,17 +22,19 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
-use pplx_space_common_core::types::{
-    DEFAULT_GUEST_USER, IdempotencyKey, NodeId, ProcessId, SandboxId, generated_idempotency_key,
-};
+use pplx_space_accounts::NodeId;
 use pplx_space_common_grpc::trace_grpc_client_transport as wrap_grpc_client_channel;
 use pplx_space_common_grpc::{
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryContext, UdsPerSandboxLimitExceeded,
     is_temporary_tcp_failure, retry_grpc_status_with_context_if,
 };
+use pplx_space_guest_process::{
+    DEFAULT_GUEST_USER, IdempotencyKey, ProcessId, generated_idempotency_key,
+};
 use pplx_space_node_api_client::{
     NodeApiOperationBudget, proto::worker_api_client::WorkerApiClient,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     SpacedCloseStdinRequest, SpacedConnectProcessRequest, SpacedListProcessesRequest,
@@ -828,14 +830,11 @@ fn client_bound_process_start_key(
 }
 
 fn ecw_default_workdir(template_id: Option<&str>) -> Option<String> {
-    ecw_default_workdir_from_environment(
-        template_id,
-        &pplx_space_common_core::env::ProcessEnvironment,
-    )
+    ecw_default_workdir_from_environment(template_id, &pplx_space_env_vars::ProcessEnvironment)
 }
 fn ecw_default_workdir_from_environment(
     template_id: Option<&str>,
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
 ) -> Option<String> {
     let template_id = template_id.filter(|name| !name.is_empty())?;
     let templates = env

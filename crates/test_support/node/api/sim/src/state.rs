@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use pplx_space_common_core::types::NodeManagedBy;
+use pplx_space_node_model::NodeManagedBy;
 
 /// String values match the production `SandboxInfo.status` lexicon so existing
 /// clients can deserialize the simulator's responses unchanged.
@@ -41,7 +41,7 @@ pub struct SandboxRecord {
     #[serde(default)]
     pub access_idle_policy: Vec<u8>,
     #[serde(default)]
-    pub auto_lifecycle_authority: pplx_space_common_core::types::PolicyAuthority,
+    pub auto_lifecycle_authority: pplx_space_policy_authority::PolicyAuthority,
     #[serde(default)]
     pub route_substrate_kind: Option<NodeManagedBy>,
     /// Activation attempt the simulator last reported with the generations
@@ -121,6 +121,8 @@ pub struct SimState {
     inner: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     transition_after_state_read: Arc<Mutex<HashMap<String, String>>>,
     failing_wakes: Arc<Mutex<HashSet<String>>>,
+    refused_artifact_backups: Arc<Mutex<HashMap<String, tonic::Code>>>,
+    refused_resource_updates: Arc<Mutex<HashMap<String, tonic::Code>>>,
     snapshot_dir: PathBuf,
     node_id: String,
     fs: crate::fs::SandboxFs,
@@ -164,6 +166,8 @@ impl SimState {
             inner: Arc::new(Mutex::new(HashMap::new())),
             transition_after_state_read: Default::default(),
             failing_wakes: Default::default(),
+            refused_artifact_backups: Default::default(),
+            refused_resource_updates: Default::default(),
             snapshot_dir,
             node_id,
             fs: crate::fs::SandboxFs::new(sandbox_fs_dir),
@@ -298,6 +302,45 @@ impl SimState {
 
     pub(crate) async fn take_wake_failure(&self, sandbox_id: &str) -> bool {
         self.failing_wakes.lock().await.remove(sandbox_id)
+    }
+
+    /// Refuse the next artifact backup enqueue for `sandbox_id` with `code`,
+    /// as sandbox-manager refuses one for a sandbox it can't back up yet.
+    pub async fn refuse_next_artifact_backup(&self, sandbox_id: String, code: tonic::Code) {
+        self.refused_artifact_backups
+            .lock()
+            .await
+            .insert(sandbox_id, code);
+    }
+
+    pub(crate) async fn take_artifact_backup_refusal(
+        &self,
+        sandbox_id: &str,
+    ) -> Option<tonic::Code> {
+        self.refused_artifact_backups
+            .lock()
+            .await
+            .remove(sandbox_id)
+    }
+
+    /// Refuse the next resource update of `sandbox_id` with `code`, as
+    /// sandbox-manager refuses one the node will not apply, such as a lower
+    /// memory limit for a running VM.
+    pub async fn refuse_next_resource_update(&self, sandbox_id: String, code: tonic::Code) {
+        self.refused_resource_updates
+            .lock()
+            .await
+            .insert(sandbox_id, code);
+    }
+
+    pub(crate) async fn take_resource_update_refusal(
+        &self,
+        sandbox_id: &str,
+    ) -> Option<tonic::Code> {
+        self.refused_resource_updates
+            .lock()
+            .await
+            .remove(sandbox_id)
     }
 
     pub async fn state_of(&self, ids: &[String]) -> (Vec<SandboxRecord>, Vec<String>) {

@@ -1,5 +1,5 @@
 use kube::runtime::reflector::ObjectRef;
-use pplx_space_common_core::kubernetes::SANDBOX_PROCESS_ENV_ANNOTATION;
+use pplx_space_sandbox_pod::SANDBOX_PROCESS_ENV_ANNOTATION;
 
 use super::*;
 
@@ -259,7 +259,14 @@ fn apply(writer: &mut SandboxPodWriter, event: watcher::Event<Pod>) {
 fn network_slots_track_bound_active_requests_per_node() {
     use watcher::Event;
 
-    let (_, slots, mut writer) = seeded_sandbox_pod_cache([
+    let (
+        _,
+        SandboxPodIndexes {
+            network_slots: slots,
+            ..
+        },
+        mut writer,
+    ) = seeded_sandbox_pod_cache([
         slot_pod("a", Some("node-a"), 2, "Running", false),
         slot_pod("b", Some("node-a"), 1, "Pending", false),
         slot_pod("c", Some("node-b"), 4, "Running", false),
@@ -324,8 +331,14 @@ fn network_slots_track_bound_active_requests_per_node() {
 fn network_slots_swap_in_a_relist_only_when_it_completes() {
     use watcher::Event;
 
-    let (store, slots, mut writer) =
-        seeded_sandbox_pod_cache([slot_pod("stale", Some("node-a"), 2, "Running", false)]);
+    let (
+        store,
+        SandboxPodIndexes {
+            network_slots: slots,
+            ..
+        },
+        mut writer,
+    ) = seeded_sandbox_pod_cache([slot_pod("stale", Some("node-a"), 2, "Running", false)]);
     // The index follows the store's re-list semantics; kube's store is the
     // oracle for which pods a completed list leaves behind.
     let cached = || {
@@ -404,7 +417,14 @@ fn an_overflowing_slot_request_saturates_without_corrupting_the_node_total() {
         u64::MAX
     );
 
-    let (_, slots, mut writer) = seeded_sandbox_pod_cache([
+    let (
+        _,
+        SandboxPodIndexes {
+            network_slots: slots,
+            ..
+        },
+        mut writer,
+    ) = seeded_sandbox_pod_cache([
         greedy.clone(),
         slot_pod("other", Some("node-a"), 1, "Running", false),
     ]);
@@ -414,4 +434,47 @@ fn an_overflowing_slot_request_saturates_without_corrupting_the_node_total() {
     // Removing the saturated pod leaves exactly what the other pod holds.
     apply(&mut writer, watcher::Event::Delete(greedy));
     assert_eq!(slots.requested_on("node-a"), 1);
+}
+
+/// A pod built with the environment placement gate on requires an
+/// environment label in a required node-affinity term; a recorded annotation
+/// alone, as in shadow, or a preferred term doesn't count.
+#[test]
+fn view_reads_whether_a_pod_requires_its_environment_label() {
+    let environment_key = pplx_space_sandbox_pod::environment_label_key(
+        &format!("sha256:{}", "1".repeat(64))
+            .parse()
+            .expect("valid reference"),
+    );
+    let pod = |required: serde_json::Value, preferred: serde_json::Value| -> SandboxPodView {
+        serde_json::from_value::<Pod>(serde_json::json!({
+            "metadata": {"name": "space-sbx-env-g1"},
+            "spec": {
+                "containers": [],
+                "affinity": {"nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": required},
+                    "preferredDuringSchedulingIgnoredDuringExecution": preferred,
+                }},
+            },
+        }))
+        .expect("valid pod")
+        .into()
+    };
+    let expression =
+        |key: &str| serde_json::json!({"key": key, "operator": "In", "values": ["usable"]});
+    assert!(
+        pod(
+            serde_json::json!([{"matchExpressions": [expression("space.pplx.net/node-pool"), expression(&environment_key)]}]),
+            serde_json::json!([]),
+        )
+        .requires_environment_label()
+    );
+    assert!(
+        !pod(
+            serde_json::json!([{"matchExpressions": [expression("space.pplx.net/node-pool")]}]),
+            serde_json::json!([{"weight": 1, "preference": {"matchExpressions": [expression(&environment_key)]}}]),
+        )
+        .requires_environment_label()
+    );
+    assert!(!SandboxPodView::from(Pod::default()).requires_environment_label());
 }

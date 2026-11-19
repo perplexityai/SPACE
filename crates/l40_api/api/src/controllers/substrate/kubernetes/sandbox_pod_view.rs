@@ -22,15 +22,17 @@ use std::{
     sync::{Arc, PoisonError, RwLock},
 };
 
+use super::client_live_pods::ClientLivePods;
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodCondition};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::runtime::{reflector, watcher};
-use pplx_space_common_core::kubernetes::{
-    NODE_NAME_MATCH_FIELD, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
-    SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL, SANDBOX_NETWORK_SLOTS_RESOURCE,
-    SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_SLOT_ID_KEY,
+use pplx_space_sandbox_pod::{
+    NODE_NAME_MATCH_FIELD, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_CLIENT_ID_LABEL,
+    SANDBOX_ENVIRONMENT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
+    SANDBOX_MANAGED_BY_LABEL, SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_POOL_CONFIG_ID_KEY,
+    SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_SLOT_ID_KEY,
     SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION, SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    SANDBOX_TRACEPARENT_ANNOTATION,
+    SANDBOX_TRACEPARENT_ANNOTATION, is_environment_label_key,
 };
 
 /// Declares [`SandboxPodKey`] from one list, so a variant can't exist without
@@ -72,6 +74,8 @@ sandbox_pod_keys! {
     PoolRole => SANDBOX_POOL_ROLE_KEY,
     PoolConfigId => SANDBOX_POOL_CONFIG_ID_KEY,
     PoolSlotId => SANDBOX_POOL_SLOT_ID_KEY,
+    Environment => SANDBOX_ENVIRONMENT_ANNOTATION,
+    ClientId => SANDBOX_CLIENT_ID_LABEL,
 }
 
 impl SandboxPodKey {
@@ -156,6 +160,7 @@ pub struct SandboxPodView {
     labels: RetainedKeys,
     node_name: Option<Box<str>>,
     required_source_pin: bool,
+    requires_environment_label: bool,
     network_slot_request: u64,
     phase: Option<Box<str>>,
     pod_ip: Option<Box<str>>,
@@ -204,6 +209,13 @@ impl SandboxPodView {
         find_key(&self.labels, key)
     }
 
+    /// The client id whose activation created this pod, from its
+    /// `space.pplx.net/client-id` label; `None` for an unlabeled pod.
+    pub fn client_id(&self) -> Option<pplx_space_accounts::ClientId> {
+        self.label(SandboxPodKey::ClientId)
+            .and_then(|value| pplx_space_accounts::ClientId::parse(value).ok())
+    }
+
     /// The annotation, falling back to the same-keyed label. The shared pod
     /// builder stamps identity keys into both.
     pub fn annotation_or_label(&self, key: SandboxPodKey) -> Option<&str> {
@@ -232,6 +244,14 @@ impl SandboxPodView {
     /// count.
     pub fn has_required_source_pin(&self) -> bool {
         self.required_source_pin
+    }
+
+    /// Whether a required node-affinity term asks for an environment label
+    /// (`is_environment_label_key`): the pod was built with the environment
+    /// placement gate on, so a node without its environment's label can't
+    /// take it.
+    pub fn requires_environment_label(&self) -> bool {
+        self.requires_environment_label
     }
 
     /// Sum of the containers' `space.pplx.net/network-slots` requests,
@@ -289,7 +309,7 @@ impl From<Pod> for SandboxPodView {
             status,
         } = pod;
         let spec = spec.unwrap_or_default();
-        let required_source_pin = spec
+        let required_terms = spec
             .affinity
             .as_ref()
             .and_then(|affinity| affinity.node_affinity.as_ref())
@@ -298,15 +318,22 @@ impl From<Pod> for SandboxPodView {
                     .required_during_scheduling_ignored_during_execution
                     .as_ref()
             })
-            .is_some_and(|selector| {
-                selector.node_selector_terms.iter().any(|term| {
-                    term.match_fields.as_ref().is_some_and(|fields| {
-                        fields.iter().any(|field| {
-                            field.key == NODE_NAME_MATCH_FIELD && field.operator == "In"
-                        })
-                    })
-                })
-            });
+            .map(|selector| selector.node_selector_terms.as_slice())
+            .unwrap_or_default();
+        let required_source_pin = required_terms.iter().any(|term| {
+            term.match_fields.as_ref().is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| field.key == NODE_NAME_MATCH_FIELD && field.operator == "In")
+            })
+        });
+        let requires_environment_label = required_terms.iter().any(|term| {
+            term.match_expressions.as_ref().is_some_and(|expressions| {
+                expressions
+                    .iter()
+                    .any(|expression| is_environment_label_key(&expression.key))
+            })
+        });
         let network_slot_request = spec
             .containers
             .iter()
@@ -335,6 +362,7 @@ impl From<Pod> for SandboxPodView {
             labels: retain_keys(metadata.labels),
             node_name: spec.node_name.map(Into::into),
             required_source_pin,
+            requires_environment_label,
             network_slot_request,
             phase: status.phase.map(Into::into),
             pod_ip: status.pod_ip.map(Into::into),
@@ -552,32 +580,47 @@ impl NodeNetworkSlots {
 pub(super) struct SandboxPodWriter {
     store: reflector::store::Writer<SandboxPodView>,
     network_slots: NodeNetworkSlots,
+    client_pods: ClientLivePods,
 }
 
 impl SandboxPodWriter {
     pub(super) fn apply_watcher_event(&mut self, event: &watcher::Event<SandboxPodView>) {
-        // Index first. It matters at `InitDone`: the store's swap releases the
-        // readiness waiters, and nothing ready should read an index that
-        // hasn't caught up. No reader joins the two, so the brief lead on
-        // other events is harmless.
+        // Indexes first. It matters at `InitDone`: the store's swap releases
+        // the readiness waiters, and nothing ready should read an index that
+        // hasn't caught up. No reader joins them, so the brief lead on other
+        // events is harmless.
         self.network_slots.apply(event);
+        self.client_pods.apply(event);
         self.store.apply_watcher_event(event);
+    }
+
+    /// The watch returned an error; see [`ClientLivePods::mark_watch_error`].
+    pub(super) fn mark_watch_error(&self) {
+        self.client_pods.mark_watch_error();
     }
 }
 
-/// Create an empty sandbox-pod store, its slot index, and their shared writer.
+/// The indexes kept beside the sandbox-pod store, written by the same writer.
+#[derive(Clone, Default)]
+pub(super) struct SandboxPodIndexes {
+    pub(super) network_slots: NodeNetworkSlots,
+    pub(super) client_pods: ClientLivePods,
+}
+
+/// Create an empty sandbox-pod store, its indexes, and their shared writer.
 pub(super) fn sandbox_pod_cache() -> (
     reflector::Store<SandboxPodView>,
-    NodeNetworkSlots,
+    SandboxPodIndexes,
     SandboxPodWriter,
 ) {
     let (store, writer) = reflector::store::<SandboxPodView>();
-    let network_slots = NodeNetworkSlots::default();
+    let indexes = SandboxPodIndexes::default();
     let writer = SandboxPodWriter {
         store: writer,
-        network_slots: network_slots.clone(),
+        network_slots: indexes.network_slots.clone(),
+        client_pods: indexes.client_pods.clone(),
     };
-    (store, network_slots, writer)
+    (store, indexes, writer)
 }
 
 /// A sandbox-pod store and slot index seeded with `pods` through one complete
@@ -588,16 +631,16 @@ pub(super) fn seeded_sandbox_pod_cache(
     pods: impl IntoIterator<Item = Pod>,
 ) -> (
     reflector::Store<SandboxPodView>,
-    NodeNetworkSlots,
+    SandboxPodIndexes,
     SandboxPodWriter,
 ) {
-    let (store, network_slots, mut writer) = sandbox_pod_cache();
+    let (store, indexes, mut writer) = sandbox_pod_cache();
     writer.apply_watcher_event(&watcher::Event::Init);
     for pod in pods {
         writer.apply_watcher_event(&watcher::Event::InitApply(pod.into()));
     }
     writer.apply_watcher_event(&watcher::Event::InitDone);
-    (store, network_slots, writer)
+    (store, indexes, writer)
 }
 
 #[cfg(test)]

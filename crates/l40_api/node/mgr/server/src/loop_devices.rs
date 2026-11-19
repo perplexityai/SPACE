@@ -146,7 +146,7 @@ impl TryFrom<&str> for LoopDeviceTarget {
 /// itself, so the startup pass and the live slot-increase pass cannot end up
 /// disagreeing about what the node was configured for.
 pub fn override_from_env() -> Option<String> {
-    pplx_space_common_core::env::test_hook_var(LOOP_DEVICE_TARGET_ENV)
+    pplx_space_test_hooks::test_hook_var(LOOP_DEVICE_TARGET_ENV)
 }
 
 /// Target to satisfy before a live slot-budget increase becomes visible, or

@@ -1,5 +1,5 @@
-use pplx_space_common_core::types::OrgId;
-use pplx_space_common_core::types::UserId;
+use pplx_space_accounts::OrgId;
+use pplx_space_accounts::UserId;
 
 use super::*;
 use pplx_space_api::public_operations::{ApiProduct, CompleteClaimedPublicOperation};
@@ -9,11 +9,12 @@ use pplx_space_api_route::{
     ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID_ENV,
     ed25519::SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH_ENV, ed25519::SpaceApiRouteEd25519Authority,
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{RuntimeKind, TemplateId, TemplateReference};
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_public_api::{
     OperationId, OperationTargetType, PublicOperationEventType, PublicSandboxId, SandboxResources,
 };
+use pplx_space_sql_locator::sql;
+use pplx_space_template_model::{TemplateId, TemplateReference};
 use pplx_space_test_env::TestResult;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -59,6 +60,7 @@ fn direct_native_executor(
                 refill_rps: 6.0,
                 burst: 60.0,
                 redis_url: None,
+                slot_check_enabled: false,
             },
             FeatureFlagClient::disabled(),
         ),
@@ -607,6 +609,68 @@ async fn run_shutdown_drains_in_flight_executions() -> TestResult {
         operation_state(&db.pool, slow).await?,
         OperationState::Succeeded.as_str()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_shutdown_hands_back_executions_that_outlast_the_grace() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let slow = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        TargetBlockingExecutor::BLOCKED_TARGET,
+    )
+    .await?;
+    let config = ReconcilerConfig {
+        shutdown_grace: Duration::from_millis(100),
+        ..fast_loop_config(1)
+    };
+    // Never released: the execution outlasts the grace.
+    let stuck = TargetBlockingExecutor::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        config.clone(),
+        store.clone(),
+        stuck.clone(),
+        shutdown.clone(),
+    ));
+    stuck.started.notified().await;
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher)
+        .await
+        .expect("shutdown stops an execution that outlasts the grace")?;
+
+    // The claim the stopped execution held would stay live for the default
+    // 60 s `claim_stale_after`; a successor starts the operation at once.
+    let successor = TargetBlockingExecutor::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        config,
+        store.clone(),
+        successor.clone(),
+        shutdown.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), successor.started.notified())
+        .await
+        .expect("a successor claims the handed-back operation at once");
+    successor.release.notify_one();
+    wait_for_state(&db.pool, slow, OperationState::Succeeded).await?;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    let attempts: i32 = sqlx::query_scalar(sql!(
+        "SELECT attempts FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(slow.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(attempts, 1, "the stopped attempt is not charged");
     Ok(())
 }
 

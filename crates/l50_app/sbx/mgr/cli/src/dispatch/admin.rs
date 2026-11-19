@@ -329,6 +329,7 @@ pub(super) async fn handle(
             max,
             sleep,
             min_age,
+            hand_over_sockets,
         } => {
             // State requires explicit ids (empty is rejected server-side), so
             // enumerate the node's sandboxes via List first.
@@ -450,7 +451,7 @@ pub(super) async fn handle(
                     sandbox.sandbox_id,
                     sandbox.template.as_deref().unwrap_or("-"),
                     sandbox
-                        .observed_lifecycle()
+                        .observed_status()
                         .map(|state| state.label())
                         .unwrap_or("unknown"),
                 );
@@ -486,14 +487,17 @@ pub(super) async fn handle(
                 match client
                     .cycle_net_gateway(CycleNetGatewayRequest {
                         sandbox_id: sandbox.sandbox_id.clone(),
+                        hand_over_sockets,
                     })
                     .await
                 {
                     Ok(response) => {
                         let response = response.into_inner();
                         println!(
-                            "cycled {sandbox_id}: pid {} -> {}",
-                            response.old_pid, response.new_pid
+                            "cycled {sandbox_id}: pid {} -> {}{}",
+                            response.old_pid,
+                            response.new_pid,
+                            handover_note(hand_over_sockets, response.inherited_sockets)
                         );
                     }
                     Err(error) => {
@@ -554,7 +558,7 @@ async fn collect_cycle_state<R: CycleStateReader>(
     all_ids: &[String],
 ) -> Result<Vec<SandboxInfo>, tonic::Status> {
     let mut pending = all_ids
-        .chunks(pplx_space_common_core::inventory::READ_BATCH_ITEMS)
+        .chunks(pplx_space_rpc_contracts::inventory::READ_BATCH_ITEMS)
         .map(|batch| batch.to_vec())
         .collect::<std::collections::VecDeque<_>>();
     let mut sandboxes = Vec::with_capacity(all_ids.len());
@@ -573,6 +577,16 @@ async fn collect_cycle_state<R: CycleStateReader>(
         }
     }
     Ok(sandboxes)
+}
+
+/// What a cycle line adds about socket handover: nothing unless it was
+/// requested, then whether the node performed it.
+fn handover_note(requested: bool, inherited_sockets: u32) -> String {
+    match (requested, inherited_sockets) {
+        (false, _) => String::new(),
+        (true, 0) => " (sockets not handed over; stopped and relaunched)".to_string(),
+        (true, sockets) => format!(" ({sockets} sockets handed over)"),
+    }
 }
 
 fn bulk_cycle_candidates(sandboxes: Vec<SandboxInfo>, refresh_config: bool) -> Vec<SandboxInfo> {

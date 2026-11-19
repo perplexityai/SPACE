@@ -1,14 +1,15 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use pplx_space_cluster_pool::{TemplateWarmPoolUsage, WarmPoolStore};
-use pplx_space_common_core::types::{SubstrateKind, TemplateDesiredState, TemplateName};
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicErrorDetail, PublicOperationResult,
     PublicTemplateOperationResult,
 };
+use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;

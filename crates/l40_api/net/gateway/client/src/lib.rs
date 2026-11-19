@@ -1,4 +1,5 @@
-pub use pplx_space_net_common::{orig_dst, proxy::*};
+pub use pplx_space_net_common::proxy::*;
+pub use pplx_space_transparent_proxy_socket as orig_dst;
 
 pub use pplx_space_net_gateway_protocol::proto;
 
@@ -86,7 +87,7 @@ pub const MAX_ACTIVE_SERVICE_PORT_INGRESS_STREAMS: usize = 64;
 /// The compatibility alias lives in the sandbox UID's writable directory and
 /// cannot authenticate a gateway. Clients must never fall back to that alias.
 pub fn control_socket_path(sandbox_id: &str) -> String {
-    pplx_space_common_core::host::linux::paths::isolated_net_gateway_control_socket(sandbox_id)
+    pplx_space_host_layout::paths::isolated_net_gateway_control_socket(sandbox_id)
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -1,10 +1,11 @@
 //! Shared protobuf conversions for portable execution metadata.
 
-use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-    ArtifactVersion, Digest, ExecutionMetadata, GuestOperatingSystem, GuestPlatform,
-    RuntimeIdentity, RuntimeKind, RuntimeVersion, StateFormatIdentity, StateFormatName,
-    StateFormatVersion,
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
+    ArtifactVersion, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity,
+    RuntimeKind, RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion,
 };
 
 pub mod environment;
@@ -39,21 +40,21 @@ pub enum ExecutionProtoError {
     #[error("state format capability is missing identity")]
     MissingStateFormatIdentity,
     #[error("invalid execution metadata: {0}")]
-    InvalidMetadata(#[from] pplx_space_common_core::types::ExecutionMetadataError),
+    InvalidMetadata(#[from] pplx_space_execution_spec::ExecutionMetadataError),
     #[error("invalid runtime version: {0}")]
-    RuntimeVersion(#[from] pplx_space_common_core::types::RuntimeVersionParseError),
+    RuntimeVersion(#[from] pplx_space_execution_spec::RuntimeVersionParseError),
     #[error("invalid state format name: {0}")]
-    StateFormatName(#[from] pplx_space_common_core::types::StateFormatNameParseError),
+    StateFormatName(#[from] pplx_space_execution_spec::StateFormatNameParseError),
     #[error("invalid state format version: {0}")]
-    StateFormatVersion(#[from] pplx_space_common_core::types::StateFormatVersionParseError),
+    StateFormatVersion(#[from] pplx_space_execution_spec::StateFormatVersionParseError),
     #[error("invalid artifact component role: {0}")]
-    ComponentRole(#[from] pplx_space_common_core::types::ArtifactComponentRoleParseError),
+    ComponentRole(#[from] pplx_space_execution_spec::ArtifactComponentRoleParseError),
     #[error("invalid artifact version: {0}")]
-    ArtifactVersion(#[from] pplx_space_common_core::types::ArtifactVersionParseError),
+    ArtifactVersion(#[from] pplx_space_execution_spec::ArtifactVersionParseError),
     #[error("invalid artifact digest: {0}")]
-    Digest(#[from] pplx_space_common_core::types::DigestParseError),
+    Digest(#[from] pplx_space_content_digest::DigestParseError),
     #[error("invalid artifact format: {0}")]
-    ArtifactFormat(#[from] pplx_space_common_core::types::ArtifactFormatParseError),
+    ArtifactFormat(#[from] pplx_space_execution_spec::ArtifactFormatParseError),
 }
 
 impl From<RuntimeKind> for proto::RuntimeKind {

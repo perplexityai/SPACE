@@ -1,4 +1,4 @@
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -40,7 +40,7 @@ impl ReconcilerConfig {
                 "SPACE_ADMIN_AUDIT_RETENTION_GRACE_SECS",
                 default.retention,
             ),
-            max_records: env_config::EnvConfig(&pplx_space_common_core::env::ProcessEnvironment)
+            max_records: env_config::EnvConfig(&pplx_space_env_vars::ProcessEnvironment)
                 .bounded_u32(
                     "SPACE_ADMIN_AUDIT_RETENTION_MAX_RECORDS",
                     default.max_records,

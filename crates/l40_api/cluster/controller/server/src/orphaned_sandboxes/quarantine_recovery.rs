@@ -6,8 +6,9 @@ use pplx_space_api::controllers::substrate::{
     NodeApiTarget, ObservedSandboxState, connect_node_api_client_for_target,
     kubernetes::KubernetesSubstrate, sandbox_states_with_client,
 };
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole, SandboxId};
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_node_model::{NodeManagedBy, NodeRole};
+use pplx_space_sandbox_model::SandboxId;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;

@@ -26,8 +26,9 @@ Its normal native selection now includes these checks; no extra package or
 separate hardening workflow is needed. Existing duration-balanced sharding
 also includes them.
 
-Kind CI runs this inventory on main and on pull requests whose paths select
-the Kind smoke in Pull CI. This does not introduce Kind execution on every PR.
+Kind CI runs this inventory on main, on pull requests whose paths select the
+Kind smoke in Pull CI, and on pull requests that carry the `kind-smoke` label.
+This does not introduce Kind execution on every PR.
 Private compositions invoke platform commands through their platform-command
 wrapper.
 
@@ -160,9 +161,10 @@ also stops the controller before it acts, so an operation that reaches
 `running` meanwhile is one the API runs inline. The API pod kill then
 force-deletes every API pod, with no drain. The failover scenario runs creates
 and wakes inline with the controller stopped, queues a suspend, and restores
-the controller, so a new leader is elected while their claims may still be
-live; it requires each create and wake to have been claimed once and to end
-once.
+the controller, and proves its dispatcher ran while the inline claims remained
+live. A run-owned release file ends the test hold after that observation;
+the hold's timeout is only a fail-safe. Each create and wake must have been
+claimed once and end once. Release builds ignore both test-hook settings.
 
 When invoking a Kind-only fault scenario directly (including zero-vCPU
 admission) rather than through the Kind shell harness, supply `SPACE_SMOKE_NATIVE_RECOVERY=1`,
@@ -174,9 +176,9 @@ safety guards; normal Kind suite execution prepares them automatically.
 Both HTTP endpoints must be loopback forwards for that exact cluster.
 Restoration verifies original replica counts, unchanged deployment configuration,
 and ready pods before fixture cleanup. Failures remain visible; database sizing
-is not changed. The zero-vCPU regression temporarily shortens only
-the controller create-readiness and operation-age budgets, so an erroneously
-accepted create can be drained. It restores the original literal settings
+is not changed. Only if the zero-vCPU regression sees an erroneously accepted
+create does it shorten the controller create-readiness and operation-age
+budgets to drain that create. It restores the original literal settings
 (including unset values) and verifies running pods before reporting admission
 failure. This does not test the deployment's default operation deadline.
 

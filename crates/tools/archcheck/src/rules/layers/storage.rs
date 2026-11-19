@@ -1,6 +1,8 @@
 //! `storage_access` and `codec_features`: nothing above Storage talks to a
-//! database or object storage directly, Domain never does, and Foundation
-//! does only in a storage helper, which names nothing SPACE-specific.
+//! database or object storage directly, Foundation does only in a storage
+//! helper, which names nothing SPACE-specific, and Domain and other
+//! Foundation crates hold at most a codec, behind an optional dependency on
+//! a codec facade.
 //!
 //! The drivers are the packages `[rules.layers.storage] drivers` lists. The
 //! storage helpers are the Foundation crates `helpers` lists, the full list:
@@ -10,38 +12,50 @@
 //! listed helper need not depend on a driver, such as a connector for a
 //! driver's client that does not depend on the driver itself. A Foundation
 //! crate `[rules.layers] legacy` lists is never a helper, so it is checked
-//! like any other; test support and tools are left out.
+//! like any other; test support and tools are left out. The codec facades
+//! are the Foundation crates `codec_facades` lists, other than helpers and
+//! legacy crates: each re-exports only a driver's codec items, behind
+//! features, those its `exports` list, so that list is what a codec may
+//! use.
 //!
 //! - `storage_access`: only stores and helpers may have a normal or build
-//!   dependency on a driver or helper. An optional one counts too, except
-//!   from a Foundation crate, where it is a codec behind a feature, such as
-//!   `sqlx` impls for an identifier type, whose enabling `codec_features`
-//!   covers.
+//!   dependency on a driver, helper or codec facade, optional or not, with
+//!   two exceptions, both optional normal dependencies: a Foundation or
+//!   Domain crate's on a facade, a codec behind a feature, such as `sqlx`
+//!   impls for an identifier type, whose enabling `codec_features` covers;
+//!   and a facade's own on a driver. Its findings also cover a facade's
+//!   source beyond its listed exports ([`facade`]), which no baseline entry
+//!   tolerates.
 //! - `codec_features`: a driver feature of a crate outside Storage, one that
 //!   turns on an optional dependency on a driver or helper, itself, through
 //!   the features it requests of an optional dependency, or by forwarding to
-//!   another crate's driver feature, may be enabled only by stores and
-//!   helpers: with `features = […]` on the dependency, through its default
-//!   features, or by forwarding from `[features]`. A Foundation crate's
-//!   enabling behind a feature of its own, on an optional dependency or by
-//!   forwarding, is exempt as its optional driver dependency is: that
-//!   feature is a driver feature, whose enabling is checked. A store's own
+//!   another crate's driver feature, may be enabled by stores and helpers:
+//!   with `features = […]` on the dependency, through its default
+//!   features, or by forwarding from `[features]`; and by a Foundation or
+//!   Domain crate only behind a feature of its own, on an optional
+//!   dependency or by forwarding, as its codec is exempt: that feature is
+//!   then a driver feature, whose enabling is checked. A store's own
 //!   driver features are not checked: depending on a store is the way to
 //!   reach storage.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    Crossing, GUIDE, RULE, config_finding,
+    Crossing, GUIDE, RULE, config_finding, facade,
     graph::{Graph, Member, list, used_items},
 };
 use crate::{
-    config::{CONFIG_FILE, Layer, LayersConfig},
+    config::{CONFIG_FILE, CodecFacade, Layer, LayersConfig},
     context::{Context, Crate, Dependency},
     finding::{Finding, Location},
 };
 
 pub(super) const STORAGE_ACCESS: &str = "storage_access";
+
+/// How a codec facade may reach a driver, for the fixes that say so.
+pub(super) const FACADE_FIX: &str = "a codec facade reaches a driver only through an optional \
+                                     normal dependency behind its own features, and never \
+                                     becomes a store or a storage helper";
 pub(super) const CODEC_FEATURES: &str = "codec_features";
 
 /// What `[rules.layers.storage] helpers` lists a storage helper for.
@@ -79,6 +93,9 @@ struct Enabling<'b> {
 /// `--write-baseline`.
 pub(super) struct Storage<'a> {
     pub helpers: BTreeMap<&'a str, Helper>,
+    /// The codec facades: the Foundation crates `codec_facades` lists that
+    /// are neither helpers nor legacy.
+    facades: BTreeSet<&'a str>,
     /// The Foundation crates derivation finds that `helpers` doesn't list,
     /// each with the drivers it requires: no helper until listed.
     unlisted: BTreeMap<&'a str, BTreeSet<&'a str>>,
@@ -137,14 +154,29 @@ impl<'a> Storage<'a> {
                 (None, true) => {
                     helpers.insert(member.name(), Helper::Listed);
                 }
+                // A facade's required driver dependency is no reason to
+                // list it in helpers, which would make it no facade.
+                (Some(_), false) if config.storage.codec_facades.contains_key(member.name()) => {}
                 (Some(_), false) => {
                     unlisted.insert(member.name(), required.into_iter().collect());
                 }
                 (None, false) => {}
             }
         }
+        let facades = graph
+            .members
+            .values()
+            .filter(|member| {
+                member.layer == Some(Layer::Foundation)
+                    && config.storage.codec_facades.contains_key(member.name())
+                    && !config.storage.helpers.contains(member.name())
+                    && !config.legacy.contains(member.name())
+            })
+            .map(|member| member.name())
+            .collect();
         let mut storage = Self {
             helpers,
+            facades,
             unlisted,
             features: BTreeMap::new(),
             access: BTreeMap::new(),
@@ -178,6 +210,28 @@ impl<'a> Storage<'a> {
     /// Whether `package` is a driver or a storage helper.
     pub(super) fn is_target(&self, config: &LayersConfig, package: &str) -> bool {
         config.storage.drivers.contains(package) || self.helpers.contains_key(package)
+    }
+
+    /// Whether `package` is a codec facade.
+    pub(super) fn is_facade(&self, package: &str) -> bool {
+        self.facades.contains(package)
+    }
+
+    /// Whether `dependency` of `member` is a codec, which `storage_access`
+    /// exempts: an optional normal dependency of a Foundation or Domain
+    /// crate on a codec facade, or of a facade on a driver.
+    fn is_codec(
+        &self,
+        config: &LayersConfig,
+        member: &Member<'_>,
+        dependency: &Dependency,
+    ) -> bool {
+        let to = dependency.package.as_str();
+        dependency.optional
+            && dependency.kind.is_none()
+            && ((self.is_facade(to)
+                && matches!(member.layer, Some(Layer::Foundation | Layer::Domain)))
+                || (self.is_facade(member.name()) && config.storage.drivers.contains(to)))
     }
 
     /// Each crate's driver features, outside Storage, to a fixpoint: a
@@ -317,9 +371,38 @@ impl<'a> Storage<'a> {
         let from = member.name();
         for dependency in production(member) {
             let to = &dependency.package;
-            if !self.is_target(config, to) || (dependency.optional && layer == Layer::Foundation) {
+            let facade = self.is_facade(to);
+            if !(facade || self.is_target(config, to)) || self.is_codec(config, member, dependency)
+            {
                 continue;
             }
+            // What a Foundation or Domain crate's codec depends on instead
+            // of `to`, if a facade exports any of that driver.
+            let covering: Vec<String> = self
+                .facades
+                .iter()
+                .filter(|&&facade| {
+                    facade != from
+                        && config
+                            .storage
+                            .codec_facades
+                            .get(facade)
+                            .and_then(|entry| entry.exports.get(to.as_str()))
+                            .is_some_and(|paths| paths.iter().next().is_some())
+                        && graph.member(facade).is_some_and(|member| {
+                            production(member).any(|dependency| {
+                                dependency.kind.is_none() && dependency.package == *to
+                            })
+                        })
+                })
+                .map(|&facade| facade.to_owned())
+                .collect();
+            let codec = (!covering.is_empty()).then(|| {
+                format!(
+                    "depend on {} (optional, behind your codec feature) for encode/decode impls",
+                    or_list(&covering)
+                )
+            });
             let key = (from.to_owned(), to.clone());
             if self.access.contains_key(&key) {
                 continue;
@@ -332,6 +415,10 @@ impl<'a> Storage<'a> {
                 (Some(_), Some(helper)) => (
                     format!("a storage helper ([rules.{RULE}.storage] helpers lists it)"),
                     helper.krate.lib.clone().unwrap_or_default(),
+                ),
+                (None, Some(target)) if facade => (
+                    format!("a codec facade ([rules.{RULE}.storage] codec_facades lists it)"),
+                    target.krate.lib.clone().unwrap_or_default(),
                 ),
                 _ => (
                     format!("a driver ([rules.{RULE}.storage] drivers lists it)"),
@@ -348,13 +435,31 @@ impl<'a> Storage<'a> {
                 "Moving it into a new storage helper does not let {from} depend on that helper: \
                  {RULE}.{STORAGE_ACCESS} checks that edge too."
             );
-            let fixes = match layer {
-                Layer::Domain => format!(
+            let fixes = match (layer, &codec) {
+                (Layer::Domain | Layer::Foundation, _) if facade => format!(
+                    "Fix: a codec facade is a codec's only behind a feature: make {to} an \
+                     optional normal dependency, under [dependencies] or a \
+                     [target.'cfg(…)'.dependencies] table, and turn it on from a feature of \
+                     {from}'s own, which {RULE}.{CODEC_FEATURES} lets only stores and storage \
+                     helpers enable, directly or through a feature of another l10_foundation or \
+                     l20_domain crate's own that forwards to it."
+                ),
+                (Layer::Domain, Some(codec)) => format!(
+                    "Fix: {codec}; anything else belongs in a store: move the code that uses \
+                     it{items} into the store that persists these types, where a wrapper type \
+                     can carry them."
+                ),
+                (Layer::Domain, None) => format!(
                     "Fix: move the code that uses it{items}, such as a codec's impls, into the \
                      store that persists these types, where a wrapper type can carry them."
                 ),
+                // Listing a facade in helpers would make it no facade.
+                (Layer::Foundation, _) if self.is_facade(from) => format!(
+                    "Fix: {FACADE_FIX}: if {to} is a driver, make it an optional normal \
+                     dependency behind the facade's features; otherwise drop it."
+                ),
                 // Derivation sees a helper that the list lacks.
-                Layer::Foundation if self.lacks_helper(from, to) => {
+                (Layer::Foundation, _) if self.lacks_helper(from, to) => {
                     format!(
                         "Fix one of: [rules.{RULE}.storage] helpers in {CONFIG_FILE} lists every \
                          storage helper, and a required driver dependency makes {from} one, but \
@@ -363,21 +468,29 @@ impl<'a> Storage<'a> {
                          move the code that uses it{items} into a store or a storage helper."
                     )
                 }
-                Layer::Foundation if config.legacy.contains(from) => format!(
-                    "Fix: move the code that uses it{items} into a store or a storage helper, \
+                (Layer::Foundation, _) if config.legacy.contains(from) => format!(
+                    "Fix: {}move the code that uses it{items} into a store or a storage helper, \
                      as splitting {from} up would: [rules.{RULE}] legacy lists it, so it is no \
-                     storage helper itself."
+                     storage helper itself.",
+                    codec
+                        .as_ref()
+                        .map(|codec| format!("{codec}; for anything else, "))
+                        .unwrap_or_default()
                 ),
-                Layer::Foundation => format!(
-                    "Fix one of: if {from} names nothing SPACE-specific, list it in \
+                (Layer::Foundation, _) => format!(
+                    "Fix one of: {}if {from} names nothing SPACE-specific, list it in \
                      [rules.{RULE}.storage] helpers in {CONFIG_FILE}, which \
                      {RULE}.policy_changed reports; or move the code that uses it{items} into a \
-                     store or a storage helper."
+                     store or a storage helper.",
+                    codec
+                        .as_ref()
+                        .map(|codec| format!("{codec}; "))
+                        .unwrap_or_default()
                 ),
                 // Neither an app nor a client may use a store: an app goes
                 // through the API crate that owns the state, a client
                 // through its server's protocol.
-                Layer::App => format!(
+                (Layer::App, _) => format!(
                     "Fix: an app reaches state only through the l40_api crate that owns it: move \
                      the code that uses it{items} into that crate, or a store it uses, and call \
                      the API crate. {no_helper}"
@@ -400,10 +513,12 @@ impl<'a> Storage<'a> {
                 ""
             };
             let detail = format!(
-                ": {from} ({layer}) depends on {to}, {what}, {}{optional}, but only l30_storage crates and \
-                 storage helpers may: nothing above l30_storage reaches a database or object \
-                 storage directly, l20_domain never does, and l10_foundation does only in a \
-                 helper that names nothing SPACE-specific. {fixes} See {GUIDE}.",
+                ": {from} ({layer}) depends on {to}, {what}, {}{optional}, but only l30_storage \
+                 crates and storage helpers may: nothing above l30_storage reaches a database or \
+                 object storage directly, l10_foundation does only in a helper that names \
+                 nothing SPACE-specific, and l20_domain and other l10_foundation crates hold at \
+                 most a codec, behind an optional normal dependency on a codec facade. {fixes} \
+                 See {GUIDE}.",
                 dependency.describe(),
             );
             self.access.insert(
@@ -471,14 +586,14 @@ impl<'a> Storage<'a> {
     }
 
     /// `codec_features` for `member`, which is neither left out, a store
-    /// nor a helper. A Foundation crate's enabling behind a feature of its
-    /// own is exempt, as its optional driver dependency is: that feature is
-    /// then a driver feature itself, whose enabling this checks.
+    /// nor a helper. A Foundation or Domain crate's enabling behind a
+    /// feature of its own is exempt, as its codec is: that feature is then
+    /// a driver feature itself, whose enabling this checks.
     fn check_codecs(&mut self, graph: &Graph<'_>, member: &Member<'_>) {
         let Some(layer) = member.layer else { return };
         let from = member.name();
         for enabling in self.enablings(graph, member) {
-            if enabling.behind_feature && layer == Layer::Foundation {
+            if enabling.behind_feature && matches!(layer, Layer::Foundation | Layer::Domain) {
                 continue;
             }
             let Enabling {
@@ -507,7 +622,8 @@ impl<'a> Storage<'a> {
             let detail = format!(
                 ": {from} ({layer}) enables the `{feature}` feature of {target}, {how}, which \
                  {turns_on}, but only l30_storage crates and storage helpers may turn on a driver \
-                 feature. Fix: drop the feature, move the code that needs it, such as a codec or \
+                 feature, directly or through a feature of an l10_foundation or l20_domain \
+                 crate's own that forwards to it. Fix: drop the feature, move the code that needs it, such as a codec or \
                  a client, into a store in l30_storage (which may enable the feature itself) or a \
                  storage helper, and reach the data through that. See {GUIDE}.",
             );
@@ -523,6 +639,138 @@ impl<'a> Storage<'a> {
                 },
             );
         }
+    }
+
+    /// `storage_access` findings for what each codec facade's source holds
+    /// beyond the re-exports its `[rules.layers.storage.codec_facades]`
+    /// entry lists, read by [`facade::read`], and for a facade whose library
+    /// is not `src/lib.rs`, the source that is read. A source finding is on
+    /// line 1 of the file, naming the item, or, for a file syn can't parse,
+    /// giving syn's error without a position. Each is reported as it is found,
+    /// with no baseline entry to tolerate it: the re-exports are what every
+    /// codec may use. Then `layers.stale_entries`
+    /// for its exports that allow nothing ([`stale_exports`]).
+    pub fn facade_exports(
+        &self,
+        ctx: &Context,
+        config: &LayersConfig,
+        graph: &Graph<'_>,
+    ) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        let mut stale = Vec::new();
+        for &facade in &self.facades {
+            let Some(member) = graph.member(facade) else {
+                continue;
+            };
+            let krate = member.krate;
+            let src = if krate.member.is_empty() {
+                "src/".to_owned()
+            } else {
+                format!("{}/src/", krate.member)
+            };
+            let entry = format!("[rules.{RULE}.storage.codec_facades.\"{facade}\"]");
+            let mut finding = |path: &str, line: usize, reason: String| {
+                findings.push(Finding {
+                    rule: RULE,
+                    instance: Some(STORAGE_ACCESS.to_owned()),
+                    behaviour: "no_crossing",
+                    path: path.to_owned(),
+                    detail: format!(
+                        ": {facade} is a codec facade ([rules.{RULE}.storage] codec_facades \
+                         lists it), whose source holds only `pub mod` blocks of re-exports and \
+                         `pub use` items of drivers it depends on, each an export that \
+                         {entry} lists, with `cfg` and `doc` attributes and comments, since \
+                         what it re-exports every codec may use; {reason}. No baseline entry \
+                         tolerates this. Fix: remove it, or, for an item that encoding or \
+                         decoding a value needs, re-export it and add it to the exports, which \
+                         {RULE}.policy_changed reports for review. See {GUIDE}."
+                    ),
+                    mode: config.storage_access.no_crossing.mode,
+                    location: Location {
+                        path: path.to_owned(),
+                        line,
+                    },
+                });
+            };
+            let lib = format!("{src}lib.rs");
+            if krate.lib_path.as_deref() != Some(lib.as_str()) {
+                let actual = krate.lib_path.as_deref().map_or_else(
+                    || "it has no library".to_owned(),
+                    |path| format!("its library is {path}"),
+                );
+                finding(
+                    &krate.manifest(),
+                    krate.name_line,
+                    format!("{actual}, and only {lib} is read"),
+                );
+                continue;
+            }
+            if ctx.file(&lib).is_none() {
+                finding(
+                    &krate.manifest(),
+                    krate.name_line,
+                    format!("{lib} is no file archcheck reads"),
+                );
+                continue;
+            }
+            // What its code can name: its normal dependencies, not its
+            // build-dependencies.
+            let drivers: BTreeMap<String, String> = production(member)
+                .filter(|dependency| {
+                    dependency.kind.is_none()
+                        && config.storage.drivers.contains(&dependency.package)
+                })
+                .map(|dependency| {
+                    (
+                        dependency.key().replace('-', "_"),
+                        dependency.package.clone(),
+                    )
+                })
+                .collect();
+            let listed = config.storage.codec_facades.get(facade);
+            // Whether every file was read, so that an export no file
+            // re-exports is one the facade lacks.
+            let mut read_all = true;
+            let mut exported = BTreeSet::new();
+            for file in ctx.files.iter().filter(|file| file.path.starts_with(&src)) {
+                let source = facade::read(&file.text, &drivers);
+                read_all &= source.problems.is_empty();
+                for problem in source.problems {
+                    finding(&file.path, 1, problem);
+                }
+                for export in source.exports {
+                    exported.insert((export.driver.clone(), export.path.clone()));
+                    let allowed = listed.is_some_and(|listed| {
+                        listed
+                            .exports
+                            .get(&export.driver)
+                            .is_some_and(|paths| paths.contains(&export.path))
+                    });
+                    if !allowed {
+                        finding(
+                            &file.path,
+                            1,
+                            format!(
+                                "it re-exports {}::{}, which its exports do not list for {}",
+                                export.root, export.path, export.driver
+                            ),
+                        );
+                    }
+                }
+            }
+            if let Some(listed) = listed {
+                stale.extend(stale_exports(
+                    ctx,
+                    config,
+                    facade,
+                    listed,
+                    &drivers,
+                    read_all.then_some(&exported),
+                ));
+            }
+        }
+        findings.extend(stale);
+        findings
     }
 
     /// The member `package` names, if it has driver features: a crate
@@ -556,16 +804,26 @@ impl<'a> Storage<'a> {
             return format!("{from} is a storage helper, which may reach storage");
         }
         if check == STORAGE_ACCESS {
-            if !self.is_target(config, to) {
+            if !(self.is_target(config, to) || self.is_facade(to)) {
                 return format!(
-                    "{to} is neither a driver in [rules.{RULE}.storage] nor a storage helper"
+                    "{to} is neither a driver in [rules.{RULE}.storage], a storage helper nor a \
+                     codec facade"
                 );
             }
+            let layer = member
+                .layer
+                .map(|layer| layer.to_string())
+                .unwrap_or_default();
             return match production(member).find(|dependency| dependency.package == to) {
                 None => format!("{from} has no normal or build dependency on {to}"),
+                Some(_) if self.is_facade(to) => format!(
+                    "{from}'s dependency on {to}, a codec facade, is optional and normal in an \
+                     {layer} crate: a codec behind a feature, whose enabling \
+                     {RULE}.{CODEC_FEATURES} checks"
+                ),
                 Some(_) => format!(
-                    "{from}'s dependency on {to} is optional in an l10_foundation crate, a codec \
-                     behind a feature, whose enabling {RULE}.{CODEC_FEATURES} checks"
+                    "{from} is a codec facade, and its dependency on {to} is optional and \
+                     normal: a driver feature, whose enabling {RULE}.{CODEC_FEATURES} checks"
                 ),
             };
         }
@@ -586,7 +844,7 @@ impl<'a> Storage<'a> {
                 format!("`{feature}` of {package} does not turn on a driver or storage helper")
             }
             Some(_)
-                if member.layer == Some(Layer::Foundation)
+                if matches!(member.layer, Some(Layer::Foundation | Layer::Domain))
                     && self.enablings(graph, member).iter().any(|enabling| {
                         enabling.behind_feature
                             && enabling.target == package
@@ -594,12 +852,102 @@ impl<'a> Storage<'a> {
                     }) =>
             {
                 format!(
-                    "{from} enables it only behind a feature of its own in an l10_foundation \
-                     crate, a codec, whose enabling {RULE}.{CODEC_FEATURES} checks"
+                    "{from} enables it only behind a feature of its own in an {} crate, a \
+                     codec, whose enabling {RULE}.{CODEC_FEATURES} checks",
+                    member
+                        .layer
+                        .map(|layer| layer.to_string())
+                        .unwrap_or_default()
                 )
             }
             Some(_) => format!("{from} does not enable it"),
         }
+    }
+}
+
+/// `layers.stale_entries` for `facade`'s `exports`, so that the lists only
+/// shrink: a driver key that names no driver of its normal dependencies
+/// (`drivers`, keyed by the name its code uses), a key whose list is empty,
+/// and, when every source file was read and re-exports `exported`, a listed
+/// path no file re-exports.
+fn stale_exports(
+    ctx: &Context,
+    config: &LayersConfig,
+    facade: &str,
+    listed: &CodecFacade,
+    drivers: &BTreeMap<String, String>,
+    exported: Option<&BTreeSet<(String, String)>>,
+) -> Vec<Finding> {
+    let policy = &ctx.layers_policy.storage.codec_facades;
+    let (lines, facade_line) = match policy.entries.get(facade) {
+        Some((lines, line)) => (Some(lines), *line),
+        None => (None, policy.line.unwrap_or(ctx.layers_policy.line)),
+    };
+    let line_of = |driver: &str, path: Option<&str>| {
+        lines
+            .and_then(|lines| match path {
+                Some(path) => lines.get(&format!("{driver}::{path}")).copied(),
+                None => lines
+                    .iter()
+                    .find(|(item, _)| item.starts_with(&format!("{driver}::")))
+                    .map(|(_, line)| *line),
+            })
+            .unwrap_or(facade_line)
+    };
+    let table = format!("[rules.{RULE}.storage.codec_facades.\"{facade}\"] exports");
+    let mut findings = Vec::new();
+    let mut stale = |line: usize, detail: String| {
+        findings.push(config_finding(
+            "stale_entries",
+            &config.stale_entries,
+            facade,
+            line,
+            detail,
+        ));
+    };
+    for (driver, paths) in &listed.exports {
+        if !drivers.values().any(|package| package == driver) {
+            stale(
+                line_of(driver, None),
+                format!(
+                    ": {table} in {CONFIG_FILE} has an entry for {driver}, but {facade} has no \
+                     normal dependency on {driver} that [rules.{RULE}.storage] drivers lists, so \
+                     it allows nothing. Remove the entry."
+                ),
+            );
+            continue;
+        }
+        if paths.iter().next().is_none() {
+            stale(
+                facade_line,
+                format!(
+                    ": {table} in {CONFIG_FILE} lists nothing for {driver}, which allows \
+                     nothing. Remove the entry."
+                ),
+            );
+            continue;
+        }
+        let Some(exported) = exported else { continue };
+        for path in paths.iter() {
+            if !exported.contains(&(driver.clone(), path.clone())) {
+                stale(
+                    line_of(driver, Some(path)),
+                    format!(
+                        ": {table} in {CONFIG_FILE} lists {driver}::{path}, but no file of \
+                         {facade}'s src/ re-exports it. Remove it."
+                    ),
+                );
+            }
+        }
+    }
+    findings
+}
+
+/// `names` as alternatives for a sentence: `a`, `a or b`, `a, b or c`.
+fn or_list(names: &[String]) -> String {
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => names.join(""),
     }
 }
 
@@ -634,7 +982,8 @@ pub(super) fn features_of(member: &Member<'_>) -> BTreeMap<String, Vec<String>> 
 }
 
 /// `layers.stale_entries` for `[rules.layers.storage]`: a `helpers` entry
-/// that is no Foundation crate or is legacy. An entry for a crate without a
+/// that is no Foundation crate or is legacy, and a `codec_facades` entry
+/// that is no Foundation crate, is legacy or is a helper. An entry for a crate without a
 /// layer is left to `layers.placement`.
 pub(super) fn stale_entries(
     ctx: &Context,
@@ -664,6 +1013,34 @@ pub(super) fn stale_entries(
             helper,
             policy.helpers.get(helper).copied().unwrap_or(fallback),
             format!(": is in {table} helpers in {CONFIG_FILE}, but {reason}. Remove it."),
+        ));
+    }
+    for facade in config.storage.codec_facades.keys() {
+        let reason = match graph.member(facade).map(|member| member.layer) {
+            None => "no workspace member has this name".to_owned(),
+            Some(None) => continue,
+            Some(Some(layer)) if layer != Layer::Foundation => {
+                format!("a codec facade is an l10_foundation crate, and its layer is {layer}")
+            }
+            Some(_) if config.legacy.contains(facade) => format!(
+                "[rules.{RULE}] legacy lists it too, which keeps a crate from being a codec facade"
+            ),
+            Some(_) if config.storage.helpers.contains(facade) => {
+                "helpers lists it too, and a storage helper may reach storage already".to_owned()
+            }
+            Some(_) => continue,
+        };
+        findings.push(config_finding(
+            "stale_entries",
+            &config.stale_entries,
+            facade,
+            policy
+                .codec_facades
+                .entries
+                .get(facade)
+                .map(|(_, line)| *line)
+                .unwrap_or(fallback),
+            format!(": is in {table} codec_facades in {CONFIG_FILE}, but {reason}. Remove it."),
         ));
     }
     findings

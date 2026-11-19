@@ -570,7 +570,7 @@ export class ListSelection {
 }
 
 // A template name as the server parses one (`TemplateName` in
-// crates/libs/common/core/src/types/template/identity.rs); it refuses any
+// crates/l20_domain/template/model/src/identity.rs); it refuses any
 // other `template` with a 400.
 export function isTemplateName(value: string): boolean {
   return value.length <= 255 && value !== '.' && value !== '..' && /^[A-Za-z0-9._-]+$/.test(value);

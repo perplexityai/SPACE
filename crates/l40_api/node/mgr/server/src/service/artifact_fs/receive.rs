@@ -114,7 +114,7 @@ impl ReceiveRoot {
         }
         let received = directory(&self.directory, "instance.ro".as_ref()).map_err(error)?;
         let rootfs = trusted_paths::open_regular_file(&received, "rootfs.ext4".as_ref())?;
-        pplx_space_common_core::sandbox_storage::validate_rootfs_bytes(
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_bytes(
             rootfs.metadata().map_err(error)?.len(),
         )
         .map_err(error)?;
@@ -173,7 +173,7 @@ impl ValidatedStream {
             )
             .map_err(error)?,
         );
-        pplx_space_common_io::reflink::preserve_nocow(source, &stream).map_err(error)?;
+        pplx_space_file_io::reflink::preserve_nocow(source, &stream).map_err(error)?;
         // Both files live on the cache btrfs filesystem. Do not silently turn
         // failure into a potentially unbounded byte copy under the mutation lock.
         rustix::fs::ioctl_ficlone(&stream, source).map_err(error)?;

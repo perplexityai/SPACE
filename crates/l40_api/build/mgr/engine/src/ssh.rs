@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::{command_as_root, environment::StepEnvironment};
-use pplx_space_common_core::types::DEFAULT_GUEST_USER;
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
 
 const SSH_KEY_PATH: &str = "/root/.ssh/sandbox_ed25519";
 const SSH_CONNECT_TIMEOUT: u32 = 60;

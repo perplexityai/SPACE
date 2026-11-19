@@ -4,7 +4,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 COPY docker/build-btrfs-progs.sh /tmp/build-btrfs-progs.sh
 RUN bash /tmp/build-btrfs-progs.sh
 
-FROM docker.io/library/rust:1.99.1-bookworm@sha256:edaa2a8cc254d5936207af267114814c61cceea40b46eaa4e976068af55e20e7
+FROM docker.io/library/rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 
 ARG CARGO_DENY_VERSION=0.20.2
 ARG CARGO_DENY_X86_64_SHA256=9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f

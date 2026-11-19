@@ -5,9 +5,9 @@
 //! large. Driven from `k8s_store_postgres_behaviors` against the parent's
 //! fixture.
 
-use pplx_space_common_core::types::{
-    LocalArtifactId, NodeId, SandboxActivationAttemptId, SandboxId,
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
 

@@ -10,7 +10,7 @@ import space_smoke as smoke
         "SPACE_SMOKE_BUILD_FOREIGN_ORG_ID",
     ),
 )
-def private_template_build_isolation(test: smoke.KindEcw) -> None:
+def private_template_build_isolation(test: smoke.KindAdmin) -> None:
     """An owner can derive a working template from its private base, while a
     different authenticated organization cannot build from the same tag or
     digest, including after the owner's successful materialization."""

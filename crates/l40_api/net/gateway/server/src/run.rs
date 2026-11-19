@@ -7,13 +7,13 @@
 //! deployment that needs private wiring can supply its own `main` against this
 //! library without copying any of the service.
 
-use pplx_space_common_core::types::{SandboxId, SpaceApiRouteIdentity};
+use pplx_space_sandbox_model::{SandboxId, SpaceApiRouteIdentity};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_connection_admission::{
+use pplx_space_connection_admission::{
     AdmittedConnections, ConnectionAdmissionConfig, ConnectionAdmissionEvent,
     ConnectionAdmissionFailure, admit_connections,
 };
@@ -303,7 +303,7 @@ pub async fn run(
     let known_egress_state = KnownEgressState::new(config.known_egress_domains.clone());
     let proxy_shutdown_token = CancellationToken::new();
     let authority = GatewayAuthority::new(
-        pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.into(),
+        pplx_space_host_layout::paths::SANDBOX_HOST_CONTROL_SOCKET.into(),
         service_port_ingress.clone(),
         proxy_shutdown_token.clone(),
     )

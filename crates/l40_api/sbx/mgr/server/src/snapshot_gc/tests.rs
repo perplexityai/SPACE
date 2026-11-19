@@ -838,20 +838,18 @@ fn row_commit_failure_after_the_rename_is_finished_by_startup_recovery() {
 #[tokio::test]
 async fn named_delete_failing_partway_leaves_staging_for_the_orphan_sweep() {
     use crate::local_artifacts::NamedSnapshotDelete;
-    use pplx_space_common_core::types::{ArtifactKind, SandboxId, SnapshotName};
     use pplx_space_node_mgr_client::proto::{
         DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
     };
+    use pplx_space_sandbox_model::SandboxId;
+    use pplx_space_snapshot_model::{ArtifactKind, SnapshotName};
 
     const NAME: &str = "d-user-partial";
     let root = TempDir::new().unwrap();
     let cache_root = root.path().to_str().unwrap().to_owned();
     let sandbox = SandboxId::new().to_string();
-    let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
-        &cache_root,
-        &sandbox,
-        NAME,
-    );
+    let local_path =
+        pplx_space_host_layout::paths::sandbox_snapshot_dir_in(&cache_root, &sandbox, NAME);
     fs::create_dir_all(Path::new(&local_path).join("nested")).unwrap();
     for file in ["memory", "vmstate", "nested/rootfs"] {
         fs::write(Path::new(&local_path).join(file), file).unwrap();

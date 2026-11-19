@@ -1,20 +1,26 @@
-use pplx_space_common_core::types::{OrgId, SnapshotId, UserId};
+use pplx_space_accounts::ClientId;
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, BackupAttemptId, EcwCredentialEpoch, IdempotencyKey, LocalArtifactId,
-    SANDBOX_FORK_SNAPSHOT_RETENTION_DEFAULT_GRACE_SECONDS,
-    SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS, SandboxId, SandboxLifecycle,
-    SandboxLifecycleParseError, TemplateReference, UpstreamIssuer, UpstreamOrgId,
-    UpstreamSubjectId,
-};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationTargetType, PublicApiParseError, RequestFingerprint,
 };
+use pplx_space_sandbox_model::{
+    EcwCredentialEpoch, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
+};
+use pplx_space_snapshot_model::{
+    BackupAttemptId, LocalArtifactId, SANDBOX_FORK_SNAPSHOT_RETENTION_DEFAULT_GRACE_SECONDS,
+    SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
+};
+use pplx_space_template_model::TemplateReference;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -81,13 +87,13 @@ const FORK_ENABLED_ENV: &str = "SPACE_SANDBOX_FORK_ENABLED";
 
 impl ForkAvailabilityConfig {
     pub fn from_env() -> Result<Self, ForkAvailabilityError> {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     pub(crate) fn from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Self, ForkAvailabilityError> {
-        if !pplx_space_common_core::env::env_flag(env.var(FORK_ENABLED_ENV).ok().as_deref(), true) {
+        if !pplx_space_env_vars::env_flag(env.var(FORK_ENABLED_ENV).ok().as_deref(), true) {
             return Err(ForkAvailabilityError::Disabled);
         }
         let hard_deadline = match env.var(FORK_HARD_DEADLINE_ENV) {
@@ -265,6 +271,10 @@ pub struct ForkSandboxPayloadV1 {
     source_refreeze_count: u8,
     target_sandbox_id: SandboxId,
     workflow: ForkWorkflowState,
+    /// The forking ECW client's id, so the executor attributes the target's
+    /// activation to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<ClientId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +603,7 @@ impl ForkSandboxPayloadV1 {
             source_refreeze_count: 0,
             target_sandbox_id: SandboxId::new(),
             workflow: ForkWorkflowState::AwaitingSource,
+            client_id: None,
         }
     }
 
@@ -618,6 +629,16 @@ impl ForkSandboxPayloadV1 {
 
     pub fn federated_create(&self) -> Option<&ForkFederatedCreateContext> {
         self.federated_create.as_ref()
+    }
+
+    /// Whose activation the fork target is: the forking client, or, for a
+    /// payload written before forks carried their client, an inheriting
+    /// activation, which a new sandbox resolves to no client at all.
+    pub fn activating_client(&self) -> crate::controllers::substrate::ActivationClient {
+        self.client_id.clone().map_or(
+            crate::controllers::substrate::ActivationClient::Inherit,
+            crate::controllers::substrate::ActivationClient::Client,
+        )
     }
 
     fn set_federated_create(
@@ -915,6 +936,8 @@ pub struct AdmitForkOperation<'a> {
     pub federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     pub federated_service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
     pub idempotency_key: &'a IdempotencyKey,
+    /// The forking ECW client's id.
+    pub client_id: &'a ClientId,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -975,6 +998,7 @@ fn prepare_fork_operation(
         input.ecw_host_domain.to_string(),
         input.hard_deadline,
     );
+    payload.client_id = Some(input.client_id.clone());
     match (input.federated_owner, input.federated_service_grant) {
         (Some(owner), Some(service_grant)) => {
             payload.set_federated_create(owner, service_grant);
@@ -989,7 +1013,7 @@ fn prepare_fork_operation(
     )?;
     let source_id = fork_operation_target_id(
         input.source_sandbox_id,
-        pplx_space_common_core::env::env_flag_var(FORK_PUBLIC_TARGET_ID_ENV, false),
+        pplx_space_env_vars::env_flag_var(FORK_PUBLIC_TARGET_ID_ENV, false),
     );
     let payload_json = serde_json::to_value(ForkSandboxPayload::v1(payload))?;
     Ok(PreparedForkOperation {

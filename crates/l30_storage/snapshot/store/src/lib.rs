@@ -3,17 +3,21 @@
 use std::str::FromStr;
 
 use jiff::Timestamp;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
+use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_artifact_model::ExactStorageUri;
+use pplx_space_artifact_model::{
+    SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
+};
+use pplx_space_content_digest::{Digest, DigestParseError};
+use pplx_space_execution_spec::SnapshotExecutionMetadata;
+use pplx_space_sandbox_model::{ExecutionGeneration, ExecutionGenerationParseError, SandboxId};
+use pplx_space_snapshot_model::{
     ArtifactKind, ArtifactKindParseError, ArtifactOrigin, ArtifactOriginParseError,
-    ExactStorageUri, ExecutionGeneration, ExecutionGenerationParseError, LocalArtifactId, NodeId,
-    OrgId, SandboxId, SnapshotContentHash, SnapshotExecutionMetadata, SnapshotId, SnapshotKind,
-    SnapshotKindParseError, SnapshotName, SnapshotParseError, SnapshotState,
-    SnapshotStateParseError, TemplateName, TemplateParseError,
+    LocalArtifactId, SnapshotContentHash, SnapshotId, SnapshotKind, SnapshotKindParseError,
+    SnapshotName, SnapshotParseError, SnapshotState, SnapshotStateParseError,
 };
-use pplx_space_common_core::types::{
-    Digest, DigestParseError, SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
-};
+use pplx_space_sql_locator::sql;
+use pplx_space_template_model::{TemplateName, TemplateParseError};
 use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;
@@ -146,6 +150,7 @@ pub struct NewSnapshot {
     org_id: OrgId,
     artifact: Option<SnapshotArtifact>,
     execution_metadata: Option<SnapshotExecutionMetadata>,
+    generation: Option<ExecutionGeneration>,
     storage_uri: ExactStorageUri,
 }
 
@@ -173,6 +178,7 @@ impl NewSnapshot {
             org_id,
             artifact: None,
             execution_metadata: None,
+            generation: None,
             storage_uri,
         }
     }
@@ -219,6 +225,13 @@ impl NewSnapshot {
         execution_metadata: SnapshotExecutionMetadata,
     ) -> Self {
         self.execution_metadata = Some(execution_metadata);
+        self
+    }
+
+    /// Set the generation of the execution that captured the bytes, which
+    /// orders this capture against the sandbox's others.
+    pub fn with_generation(mut self, generation: Option<ExecutionGeneration>) -> Self {
+        self.generation = generation;
         self
     }
 }
@@ -788,6 +801,49 @@ pub async fn artifact_backup_ready(
     .await?)
 }
 
+/// Whether `later`'s ready backup was captured by a later execution of
+/// `sandbox_id` than `earlier`'s: the least capture generation `later`'s ready,
+/// non-orphaned backups record is greater than the greatest `earlier`'s do.
+/// Executions' generations only grow, so this orders the two captures
+/// whatever the clocks of the nodes that took them, or the order their backups
+/// registered in. `false` when either artifact has no such backup recording a
+/// generation.
+pub async fn artifact_captured_after(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    later: (LocalArtifactId, ArtifactKind),
+    earlier: (LocalArtifactId, ArtifactKind),
+) -> Result<bool, CheckBackupError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT COALESCE((
+             SELECT MIN(s.generation)
+             FROM snapshots s
+             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+             WHERE s.sandbox_id = $1
+               AND s.local_artifact_id = $2
+               AND s.artifact_kind = $3
+               AND s.state = 'ready'
+               AND ssl.orphaned_at IS NULL
+         ) > (
+             SELECT MAX(s.generation)
+             FROM snapshots s
+             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+             WHERE s.sandbox_id = $1
+               AND s.local_artifact_id = $4
+               AND s.artifact_kind = $5
+               AND s.state = 'ready'
+               AND ssl.orphaned_at IS NULL
+         ), FALSE)"
+    ))
+    .bind(sandbox_id)
+    .bind(later.0.as_uuid())
+    .bind(later.1.as_str())
+    .bind(earlier.0.as_uuid())
+    .bind(earlier.1.as_str())
+    .fetch_one(executor)
+    .await?)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CheckArtifactRegistrationError {
     #[error(transparent)]
@@ -1104,9 +1160,9 @@ pub async fn insert(
               local_artifact_id, artifact_kind, artifact_origin,
               artifact_snapshot_name, runtime, runtime_version, guest_os,
               guest_arch, state_format_name, state_format_version,
-              execution_metadata)
+              execution_metadata, generation)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
          ON CONFLICT DO NOTHING
          RETURNING id"
     ))
@@ -1140,6 +1196,7 @@ pub async fn insert(
     .bind(state_format.map(|identity| identity.format.as_str()))
     .bind(state_format.map(|identity| identity.version.as_str()))
     .bind(snapshot.execution_metadata.as_ref().map(Json))
+    .bind(snapshot.generation.map(ExecutionGeneration::get))
     .fetch_optional(&mut **tx)
     .await?;
 

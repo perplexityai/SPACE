@@ -55,6 +55,19 @@ tokio::task_local! {
     pub(super) static GUEST_PREPARATION: GuestPreparation;
 }
 
+#[cfg(test)]
+pub(super) fn inherit_guest_preparation<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let prepare = GUEST_PREPARATION.try_with(Clone::clone).ok();
+    async move {
+        match prepare {
+            Some(prepare) => GUEST_PREPARATION.scope(prepare, future).await,
+            None => future.await,
+        }
+    }
+}
+
 pub(super) async fn prepare_guest_for_pause(
     sandbox_id: &str,
     budget: GuestSnapshotPreparationBudget,
@@ -248,7 +261,7 @@ impl SandboxManagerService {
         let sandbox = self.lookup_sandbox(sandbox_id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
         crate::service::guest_image::require_memory_lifecycle(&sandbox)?;
-        let runtime: pplx_space_common_core::types::RuntimeKind = sandbox
+        let runtime: pplx_space_execution_spec::RuntimeKind = sandbox
             .runtime
             .parse()
             .map_err(|e| Status::failed_precondition(format!("runtime: {e}")))?;
@@ -268,7 +281,8 @@ impl SandboxManagerService {
             event_details,
         );
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let _artifact_guard = artifact_lock.lock().await;
+        let _artifact_guard = artifact_lock.lock_for_capture().await;
+        self.settle_guest_update_for_lifecycle(&sandbox.id).await?;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
         sandbox
@@ -563,9 +577,9 @@ impl SandboxManagerService {
             // leaves its substrate out can't pass for a Direct one. One that
             // names neither substrate nor pod for a sandbox the node doesn't
             // hold is an identity-free Direct activation.
-            let kubernetes = |identity: &pplx_space_common_core::types::SpaceApiRouteIdentity| {
+            let kubernetes = |identity: &pplx_space_sandbox_model::SpaceApiRouteIdentity| {
                 identity.effective_substrate_kind()
-                    == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes)
+                    == Some(pplx_space_node_model::NodeManagedBy::Kubernetes)
             };
             let row_kubernetes = match self.lookup_sandbox(&req.sandbox_id) {
                 Ok(row) => kubernetes(&row.space_api_route_identity),

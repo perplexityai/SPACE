@@ -3,10 +3,9 @@ use super::*;
 #[test]
 fn create_snapshot_accepts_runtime_scoped_destinations() {
     let sandbox_id = "sbx_123";
-    let sandbox_snapshot_dir =
-        Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR)
-            .join(sandbox_id)
-            .join("snapshot");
+    let sandbox_snapshot_dir = Path::new(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR)
+        .join(sandbox_id)
+        .join("snapshot");
 
     let paths = RuntimePaths::firecracker()
         .create_snapshot_paths(
@@ -23,11 +22,10 @@ fn create_snapshot_accepts_runtime_scoped_destinations() {
         Some(sandbox_snapshot_dir.as_path())
     );
 
-    let template_staging_dir =
-        Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR)
-            .join(sandbox_id)
-            .join("template-snapshot-staging")
-            .join("base");
+    let template_staging_dir = Path::new(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR)
+        .join(sandbox_id)
+        .join("template-snapshot-staging")
+        .join("base");
     let paths = RuntimePaths::firecracker()
         .create_snapshot_paths(
             sandbox_id,
@@ -45,10 +43,7 @@ fn create_snapshot_accepts_runtime_scoped_destinations() {
 #[test]
 fn create_snapshot_rejects_destinations_outside_the_sandbox_roots() {
     let files = SnapshotFiles::parse("/vmstate".into(), "/memory".into()).unwrap();
-    for path in [
-        "/tmp/snapshot",
-        pplx_space_common_core::host::linux::paths::TEMPLATE_DIR,
-    ] {
+    for path in ["/tmp/snapshot", pplx_space_host_layout::paths::TEMPLATE_DIR] {
         RuntimePaths::firecracker()
             .create_snapshot_paths(
                 "sbx_123",

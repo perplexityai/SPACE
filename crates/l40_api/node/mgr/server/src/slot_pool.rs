@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use pplx_space_common_core::types::{SandboxId, SandboxIdParseError};
+use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -24,6 +24,15 @@ const REPAIR_CONCURRENCY: usize = 10;
 const CREATE_CONCURRENCY: usize = 2;
 const VALIDATION_CONCURRENCY: usize = 16;
 const POOL_FILL_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// How long after its last write a lease that node-manager finds at startup
+/// without a runtime is kept rather than reset. During a handoff the
+/// predecessor allocates a slot, then stops serving and drains for up to its
+/// pod's 60 s termination grace before this process starts; the activation
+/// that allocated it launches here once this process listens. 90 s covers that
+/// grace plus 30 s for this process's startup and the caller's redial. A lease
+/// with no runtime once the grace ends is reset as before, at the next
+/// validation retry ([`POOL_FILL_RETRY_DELAY`]).
+const STARTUP_YOUNG_LEASE_GRACE: Duration = Duration::from_secs(90);
 const MAX_SLOT_CLEANUP_RESET_RETRIES: u32 = 5;
 const MAX_SLOT_TRANSIENT_VALIDATION_RETRIES: u32 = 5;
 const MAX_SLOT_TRANSIENT_SETUP_RETRIES: u32 = 5;
@@ -55,9 +64,7 @@ impl NetworkPoolConfig {
             min_ready_slots: max_slots.min(32),
             pod_netns_path: None,
             service_port_ingress_isolation: ServicePortIngressIsolation::ExclusiveHost,
-            sandbox_cache_dir: PathBuf::from(
-                pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR,
-            ),
+            sandbox_cache_dir: PathBuf::from(pplx_space_host_layout::paths::SANDBOX_CACHE_DIR),
         }
     }
 
@@ -578,6 +585,12 @@ pub struct NetworkPool {
     startup_leasing: Mutex<Vec<LeaseKey>>,
     // Lock after db: adoption and recovery must decide ownership atomically.
     startup_leases: Mutex<HashSet<LeaseKey>>,
+    // Startup leases written within STARTUP_YOUNG_LEASE_GRACE before open,
+    // with the time (secs) their grace ends. Fixed at open: later health
+    // writes must not extend it.
+    startup_young_leases: HashMap<LeaseKey, u64>,
+    // Slots owned by a live `reset::SlotGuard`; only a guard inserts or removes
+    // an entry. The scheduler and worker read it directly; one test seeds it.
     active_resets: Mutex<HashSet<u32>>,
     sandbox_mutations: std::sync::Arc<Mutex<HashMap<String, SandboxMutationOwnership>>>,
     sandbox_mutations_released: std::sync::Arc<tokio::sync::Notify>,
@@ -717,7 +730,7 @@ impl NetworkPool {
     ) -> Result<std::sync::Arc<Self>, PoolOpenError> {
         config.pod_netns_path = config.pod_netns_path.as_deref().map(normalize_netns_name);
         validate_config(&config).map_err(PoolOpenError::Configuration)?;
-        let db_path = pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB;
+        let db_path = pplx_space_host_layout::paths::NODE_MANAGER_DB;
         if let Some(parent) = std::path::Path::new(db_path).parent() {
             std::fs::create_dir_all(parent).map_err(|source| PoolOpenError::Directory {
                 path: parent.to_path_buf(),
@@ -732,7 +745,12 @@ impl NetworkPool {
             },
         )?;
         init_db(&mut conn, &config)?;
-        reconcile_runtime_state(&mut conn, &config).map_err(SlotStoreError::from)?;
+        // Before the runtime reconcile, which would dirty a young lease the
+        // predecessor allocated moments ago.
+        let startup_young_leases =
+            query_startup_young_leases(&conn, now_secs(), STARTUP_YOUNG_LEASE_GRACE)?;
+        reconcile_runtime_state(&mut conn, &config, &startup_young_leases)
+            .map_err(SlotStoreError::from)?;
         // Existing durable TAP namespaces must carry both containments before
         // the node admits work: guest L2 ingress filtering and the constrained
         // direct inbound reply path. Probe each TAP once and apply both.
@@ -765,6 +783,7 @@ impl NetworkPool {
             lease_health_recovery_pending: AtomicBool::new(true),
             startup_leasing: Mutex::new(startup_leasing),
             startup_leases: Mutex::new(startup_leases),
+            startup_young_leases,
             active_resets: Mutex::new(HashSet::new()),
             sandbox_mutations: Default::default(),
             sandbox_mutations_released: Default::default(),
@@ -819,6 +838,7 @@ impl NetworkPool {
             lease_health_recovery_pending: AtomicBool::new(false),
             startup_leasing: Mutex::new(Vec::new()),
             startup_leases: Mutex::new(HashSet::new()),
+            startup_young_leases: HashMap::new(),
             active_resets: Mutex::new(HashSet::new()),
             sandbox_mutations: Default::default(),
             sandbox_mutations_released: Default::default(),
@@ -939,7 +959,7 @@ impl NetworkPool {
     ) -> Result<ClaimedSlotAllocation, AllocateSlotError> {
         if self.shutdown_token.is_cancelled() {
             return Err(AllocateSlotError::InProgress(
-                "node-manager is shutting down".into(),
+                pplx_space_node_mgr_client::SHUTTING_DOWN_MESSAGE.into(),
             ));
         }
         if self.is_draining()? {
@@ -1759,6 +1779,13 @@ impl NetworkPool {
         Ok(Some(record.info))
     }
 
+    /// Whether a startup lease is still inside its handoff grace at `now`.
+    fn startup_lease_is_young(&self, key: &LeaseKey, now: u64) -> bool {
+        self.startup_young_leases
+            .get(key)
+            .is_some_and(|grace_ends| now < *grace_ends)
+    }
+
     // Caller holds db. Never acquire db while holding startup_leases.
     fn adopt_record(&self, record: &SlotRecord) -> Result<(), SlotStoreError> {
         if let Some(key) = LeaseKey::from_record(record) {
@@ -2057,6 +2084,8 @@ mod liveness;
 mod node_status_tests;
 mod reset;
 mod scheduler;
+#[cfg(test)]
+mod slot_guard_tests;
 mod startup_containment;
 use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};
 #[cfg(test)]

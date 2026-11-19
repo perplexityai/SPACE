@@ -13,9 +13,9 @@
 use pplx_space_sql_locator::sql;
 use std::sync::Arc;
 
-use pplx_space_common_core::{
-    types::KekProvider, types::MasterKeyIdentifier, types::OrgId, types::SandboxId,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
+use pplx_space_sandbox_model::SandboxId;
 use uuid::Uuid;
 
 use crate::intermediate_key_broker::{IntermediateKeyBrokerApi, ProviderError};

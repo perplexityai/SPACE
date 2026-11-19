@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use uuid::Uuid;
 
 /// Truth table for the no-op short-circuit. The supplied-equal-owner row

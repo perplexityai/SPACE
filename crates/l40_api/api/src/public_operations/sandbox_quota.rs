@@ -63,10 +63,10 @@
 use std::time::Duration;
 
 use crate::metrics::operations as metrics;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_postgres_pool::contention;
 use pplx_space_public_api::OperationKind;
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 use super::{

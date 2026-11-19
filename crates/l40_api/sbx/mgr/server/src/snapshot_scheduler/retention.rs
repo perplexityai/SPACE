@@ -6,16 +6,17 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::metrics::snapshot::SchedulerCaptureSkip;
-use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 use tokio::sync::Mutex;
 
 use super::{CheckpointContext, SandboxSnapshotState};
-use pplx_space_common_core::types::ArtifactKind;
 use pplx_space_node_mgr_client::NodeManagerGrpcClient;
+use pplx_space_snapshot_model::ArtifactKind;
 
 use crate::local_artifacts::{CheckoutError, LocalArtifacts, NamedSnapshotDelete};
 
@@ -468,7 +469,7 @@ async fn prune_scheduled_snapshots(
     {
         for snapshot in snapshots {
             if crate::local_artifacts::is_gc_staging_name(&snapshot.name) {
-                let staging = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+                let staging = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
                     cache_root,
                     sandbox_id,
                     &snapshot.name,
@@ -488,7 +489,7 @@ async fn prune_scheduled_snapshots(
             // DeleteBtrfsSnapshot deletes this path. A catalogued one is
             // renamed to its GC staging sibling, which the caller deletes
             // with DeleteCacheArtifact once it releases its locks.
-            let delete_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+            let delete_path = pplx_space_host_layout::paths::sandbox_snapshot_dir_in(
                 cache_root, sandbox_id, &name,
             );
             let request = pplx_space_node_mgr_client::proto::DeleteBtrfsSnapshotRequest {

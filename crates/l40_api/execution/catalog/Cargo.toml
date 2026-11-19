@@ -15,8 +15,11 @@ default = []
 test-support = []
 
 [dependencies]
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-content-digest = { workspace = true, features = ["serde"] }
+pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-common = { workspace = true }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-template-model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

@@ -3,9 +3,9 @@
 
 use super::*;
 use crate::db::TemplateCachePartition;
-use pplx_space_common_core::types::{
-    Arch, EnvironmentReference, ExecutionMetadata, TemplateManifest,
-};
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
+use pplx_space_template_manifest::TemplateManifest;
 
 const NAME: &str = "seed";
 
@@ -87,6 +87,7 @@ fn lookup(environment: Option<EnvironmentReference>) -> Request<crate::proto::Ge
         vcpu: Some(2),
         memory_mib: Some(1024),
         cached_only: false,
+        environment_required: false,
     })
 }
 
@@ -424,7 +425,7 @@ fn base_snapshot_capture_boots_a_twin_under_its_environment() {
         &hash(),
         TemplateCachePartition::Legacy,
         Some(4),
-        pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeKind::Firecracker,
     );
     assert_eq!(legacy.environment, None);
     assert_eq!(legacy.template, NAME);
@@ -435,7 +436,7 @@ fn base_snapshot_capture_boots_a_twin_under_its_environment() {
         &hash(),
         twin(),
         Some(4),
-        pplx_space_common_core::types::RuntimeKind::Firecracker,
+        pplx_space_execution_spec::RuntimeKind::Firecracker,
     );
     let input = twin
         .environment
@@ -628,7 +629,7 @@ fn imports_target_the_partition_their_manifest_binds() {
 
     // A manifest without execution metadata takes the header metadata's
     // binding, which registration copies into it.
-    let mut metadata = pplx_space_common_core::types::TemplateMetadata::default();
+    let mut metadata = pplx_space_template_manifest::TemplateMetadata::default();
     metadata.set_execution_metadata(
         ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])
             .with_environment(twin_environment()),
@@ -878,4 +879,276 @@ async fn a_cached_only_lookup_takes_an_exact_digest_and_no_org(
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+}
+
+/// A lookup that requires `environment`'s build, as sandbox-manager sends for
+/// a Kubernetes pod the environment placement gate requires it for.
+fn required_lookup(environment: EnvironmentReference) -> Request<crate::proto::GetTemplateRequest> {
+    let mut request = lookup(Some(environment));
+    request.get_mut().environment_required = true;
+    request
+}
+
+/// [`required_lookup`] on the path whose release resolution and pull the test
+/// supplies: a tenant lookup resolves its release before reading the cache.
+fn resolved_required_lookup(
+    environment: EnvironmentReference,
+) -> Request<crate::proto::GetTemplateRequest> {
+    let mut request = required_lookup(environment);
+    request.get_mut().caller_org_id = Some(OrgId::new().to_string());
+    request
+}
+
+fn generic_release() -> crate::volume::ResolvedRelease {
+    crate::volume::ResolvedRelease {
+        hash: hash(),
+        storage_uris: vec![],
+        visibility: pplx_space_node_api_client::proto::TemplateVisibility::Generic,
+    }
+}
+
+/// A fixture holding only the legacy build of the digest.
+fn legacy_only_fixture() -> (tempfile::TempDir, TemplateManagerService) {
+    let root = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    insert_bound_build(&conn, initial());
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    (root, service)
+}
+
+/// A required lookup answers with the required environment's build of the
+/// digest, from whichever builds the node holds.
+#[rstest::rstest]
+#[case::twin(twin_environment(), twin())]
+#[case::initial(initial(), TemplateCachePartition::Legacy)]
+#[tokio::test]
+async fn a_required_lookup_answers_with_the_environment_s_own_build(
+    #[case] required: EnvironmentReference,
+    #[case] partition: TemplateCachePartition,
+) {
+    let (root, service) = twin_fixture();
+    let response = service
+        .get_template_resolving(
+            required_lookup(required),
+            async |_, _, _, _| panic!("cached exact digests resolve offline"),
+            async |_, _, _| panic!("cached builds are not pulled"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.template_dir,
+        root.path()
+            .join(NAME)
+            .join(partition.build_dir_name(&hash()))
+            .to_string_lossy()
+    );
+    assert_eq!(
+        response.template.unwrap().environment,
+        Some(required.to_string())
+    );
+}
+
+/// Unlike a preference, which falls back to the legacy build, a required
+/// lookup of a digest the node holds only under another environment pulls
+/// the release, which lands in the required environment's partition here.
+#[tokio::test]
+async fn a_required_lookup_pulls_the_environment_s_build_of_a_digest_held_under_another() {
+    let (root, service) = legacy_only_fixture();
+    let materialized = std::cell::Cell::new(false);
+    let response = service
+        .get_template_resolving(
+            resolved_required_lookup(twin_environment()),
+            async |_, _, _, _| Ok(generic_release()),
+            async |spec, _, _| {
+                assert_eq!(spec.required, Some(twin()), "the pull knows the partition");
+                insert_bound_build(&service.db.lock().unwrap(), twin_environment());
+                materialized.set(true);
+                crate::volume::PullOutcome::Materialized
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(materialized.get(), "the legacy build must not answer");
+    assert_eq!(
+        response.template_dir,
+        root.path()
+            .join(NAME)
+            .join(twin().build_dir_name(&hash()))
+            .to_string_lossy()
+    );
+}
+
+/// A release that doesn't land in the required partition leaves the lookup
+/// unanswered, rather than answered with the build that's there.
+#[tokio::test]
+async fn a_required_lookup_whose_release_lands_elsewhere_is_not_found() {
+    let (_root, service) = legacy_only_fixture();
+    let error = service
+        .get_template_resolving(
+            resolved_required_lookup(twin_environment()),
+            async |_, _, _, _| Ok(generic_release()),
+            // The release is the legacy build the node already holds.
+            async |_, _, _| crate::volume::PullOutcome::Materialized,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound, "{error}");
+}
+
+/// The path sandbox-manager's creates take, an exact digest with no caller
+/// org, resolves the release inside the puller, which is told the partition
+/// too.
+#[tokio::test]
+async fn a_required_lookup_on_the_default_path_pulls_rather_than_answer_with_the_legacy_build() {
+    let (root, service) = legacy_only_fixture();
+    let pulled = std::cell::Cell::new(false);
+    let response = service
+        .get_template_with(
+            required_lookup(twin_environment()),
+            async |_, _, _, _| panic!("exact digests aren't resolved before the cache"),
+            async |_, _, _| panic!("the default path pulls through the puller"),
+            async |spec, _| {
+                assert_eq!(spec.required, Some(twin()), "the pull knows the partition");
+                insert_bound_build(&service.db.lock().unwrap(), twin_environment());
+                pulled.set(true);
+                crate::volume::PullOutcome::Materialized
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(pulled.get(), "the legacy build must not answer");
+    assert_eq!(
+        response.template_dir,
+        root.path()
+            .join(NAME)
+            .join(twin().build_dir_name(&hash()))
+            .to_string_lossy()
+    );
+}
+
+/// A legacy row bound to the required environment, as startup recovery
+/// adopts a legacy-layout build in place, is that environment's build.
+#[tokio::test]
+async fn a_required_lookup_answers_with_an_adopted_legacy_build_bound_to_it() {
+    let (root, service) = twin_fixture();
+    {
+        let conn = service.db.lock().unwrap();
+        crate::db::delete_build(&conn, NAME, &hash(), TemplateCachePartition::Legacy).unwrap();
+        conn.execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
+            .unwrap();
+        conn.execute(
+            "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
+            [NAME],
+        )
+        .unwrap();
+    }
+    let mut request = required_lookup(twin_environment());
+    request.get_mut().vcpu = None;
+    request.get_mut().memory_mib = None;
+    let response = service
+        .get_template_resolving(
+            request,
+            async |_, _, _, _| panic!("cached exact digests resolve offline"),
+            async |_, _, _| panic!("cached builds are not pulled"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.template_dir,
+        root.path().join(NAME).join(hash()).to_string_lossy()
+    );
+    assert_eq!(
+        response.template.unwrap().environment,
+        Some(twin_environment().to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_required_lookup_needs_an_environment_and_an_exact_digest_and_isn_t_cached_only() {
+    let (_root, service) = twin_fixture();
+    let without_environment = {
+        let mut request = lookup(None);
+        request.get_mut().environment_required = true;
+        request
+    };
+    let without_digest = {
+        let mut request = required_lookup(twin_environment());
+        request.get_mut().template.as_mut().unwrap().content_hash = None;
+        request
+    };
+    let cached_only = {
+        let mut request = required_lookup(twin_environment());
+        request.get_mut().cached_only = true;
+        request.get_mut().vcpu = None;
+        request.get_mut().memory_mib = None;
+        request
+    };
+    for (name, request) in [
+        ("without environment", without_environment),
+        ("without digest", without_digest),
+        ("cached only", cached_only),
+    ] {
+        let error = service
+            .get_template_resolving(
+                request,
+                async |_, _, _, _| panic!("{name}: refused before resolution"),
+                async |_, _, _| panic!("{name}: refused before any pull"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{name}: {error}"
+        );
+    }
+}
+
+/// A required lookup's base-snapshot policy read takes the template's
+/// settings by name and resolves no build, so another environment's build of
+/// the digest isn't touched and kept from eviction by lookups it doesn't
+/// serve.
+#[tokio::test]
+async fn a_required_lookup_touches_no_other_environment_s_build() {
+    let (_root, service) = legacy_only_fixture();
+    let legacy_last_used = || -> String {
+        service
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT last_used_at FROM template_builds WHERE cache_partition = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE template_builds SET last_used_at = '0'", [])
+        .unwrap();
+    let mut request = required_lookup(twin_environment());
+    // Without snapshot dimensions, the lookup also reads the template's
+    // base-snapshot policy.
+    request.get_mut().vcpu = None;
+    request.get_mut().memory_mib = None;
+    service
+        .get_template_with(
+            request,
+            async |_, _, _, _| panic!("exact digests aren't resolved before the cache"),
+            async |_, _, _| panic!("the default path pulls through the puller"),
+            async |_, _| {
+                insert_bound_build(&service.db.lock().unwrap(), twin_environment());
+                crate::volume::PullOutcome::Materialized
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_last_used(), "0");
 }

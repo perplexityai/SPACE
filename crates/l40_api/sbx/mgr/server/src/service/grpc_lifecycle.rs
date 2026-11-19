@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{JobId, LocalArtifactId};
+use pplx_space_accounts::JobId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::activation_support::{
     GuestActivityKind, IdentityFreeDirectActivationAuthority, WakeNetworkContext, WakeStartConfig,
@@ -16,9 +17,8 @@ use super::network_runtime::*;
 use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
 use super::suspend_snapshot_publication::{
     RecordedPublicationError, SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
-    classify_suspend_snapshot_publication, commit_encrypted_capture_record,
-    prepare_encrypted_capture_record, publish_recorded_suspend_snapshot_dir,
-    read_encrypted_capture_record, recorded_encrypted_capture_to_seal,
+    commit_capture_for_receiptless_producer, prepare_encrypted_capture_record,
+    publish_recorded_suspend_snapshot_dir, read_encrypted_capture_record,
     remove_encrypted_capture_record, suspend_snapshot_staging_dir,
     suspend_snapshot_staging_parent_dir,
 };
@@ -28,11 +28,12 @@ use super::*;
 use crate::guest_filesystem_flush::{
     GuestSnapshotPreparationBudget, prepare_guest_for_vm_snapshot_via_spaced_host,
 };
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, SandboxId};
 use pplx_space_events::{
     SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
     SandboxEventType, emit_sandbox_event,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin};
 
 mod artifact_backup;
 mod auto_lifecycle_policy;
@@ -66,9 +67,7 @@ use self::suspend::emit_suspend_failed_event;
 use self::suspend::ensure_completed_suspend_retry_format;
 pub(super) use self::suspend::{suspend_superseded_by_wake, suspend_wake_arbitration_enabled};
 #[cfg(test)]
-pub(super) use self::suspend_snapshot::{
-    SuspendSnapshotStagingDisposition, failed_encrypted_capture_may_release_volume,
-};
+pub(super) use self::suspend_snapshot::SuspendSnapshotStagingDisposition;
 #[cfg(test)]
 use self::suspend_snapshot::{
     btrfs_send_encode_falls_back_to_full, encrypted_snapshot_prepare_error_status,
@@ -203,7 +202,7 @@ pub(super) struct SuspendSnapshotPublicationContext {
 enum SuspendDurability {
     NodeLocal,
     RemoteBeforeTeardown {
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     },
 }
 
@@ -212,9 +211,7 @@ impl SuspendDurability {
         matches!(self, Self::RemoteBeforeTeardown { .. })
     }
 
-    const fn execution_generation(
-        self,
-    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+    const fn execution_generation(self) -> Option<pplx_space_sandbox_model::ExecutionGeneration> {
         match self {
             Self::NodeLocal => None,
             Self::RemoteBeforeTeardown {
@@ -294,7 +291,7 @@ impl SuspendRequestContext {
 
     pub(super) fn for_teardown(
         sandbox_id: String,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     ) -> Self {
         let mut context = Self::new(
             sandbox_id,
@@ -312,16 +309,21 @@ impl SuspendRequestContext {
 
 struct ArtifactBackupSubmission<'a> {
     local_artifact_id: LocalArtifactId,
-    artifact_kind: pplx_space_common_core::types::ArtifactKind,
-    artifact_origin: pplx_space_common_core::types::ArtifactOrigin,
+    artifact_kind: pplx_space_snapshot_model::ArtifactKind,
+    artifact_origin: pplx_space_snapshot_model::ArtifactOrigin,
     snapshot_name: Option<&'a str>,
-    backup_attempt_id: pplx_space_common_core::types::BackupAttemptId,
+    backup_attempt_id: pplx_space_snapshot_model::BackupAttemptId,
     snapshot_dir: &'a str,
     request_override: Option<&'a crate::snapshot_upload::SnapshotUploadConfig>,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
     handoff: ArtifactBackupHandoff,
     /// The teardown suspend's execution, for `BeginArtifactBackup`'s fence.
-    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    execution_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
+    /// The caller holds evidence that `execution_generation` is the
+    /// capturing execution's: the capture was just taken by it, or an earlier
+    /// upload of the same bytes recorded it so. Without that, the capture's
+    /// own record can still show it (see `submit_artifact_backup`).
+    capture_vouched: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,16 +344,28 @@ pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
 enum ArtifactBackupSubmissionError {
     #[error("{0}")]
     Other(String),
+    #[error("terminal backup handoff: {0}")]
+    TerminalHandoff(String),
     /// `superseded_generation` is the generation the control plane named
     /// when it refused the registration as superseded.
     #[error("begin restore-visible snapshot backup: {error}")]
     Begin {
         #[source]
-        error: pplx_space_common_jobs::JobError,
-        superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        error: crate::db::jobs::JobError,
+        superseded_generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
     },
     #[error(transparent)]
     RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
+}
+
+impl ArtifactBackupSubmissionError {
+    fn handoff_is_terminal(&self) -> bool {
+        match self {
+            Self::TerminalHandoff(_) => true,
+            Self::Begin { error, .. } => error.kind() == crate::db::jobs::JobFailureKind::Permanent,
+            Self::Other(_) | Self::RetainedUpload(_) => false,
+        }
+    }
 }
 
 impl From<String> for ArtifactBackupSubmissionError {
@@ -370,7 +384,7 @@ pub(super) fn artifact_backup_fence_status(error: String) -> Status {
 }
 
 struct TeardownSuspendBackup<'a> {
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+    execution_generation: pplx_space_sandbox_model::ExecutionGeneration,
     artifact: &'a crate::db::LocalArtifactRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
     origin: TeardownBackupOrigin,
@@ -379,9 +393,7 @@ struct TeardownSuspendBackup<'a> {
 impl TeardownSuspendBackup<'_> {
     /// The generation the backup registers under: only this execution's own
     /// capture carries it to the control plane's fence.
-    fn registration_generation(
-        &self,
-    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+    fn registration_generation(&self) -> Option<pplx_space_sandbox_model::ExecutionGeneration> {
         match self.origin {
             TeardownBackupOrigin::Captured => Some(self.execution_generation),
             TeardownBackupOrigin::PreviouslySuspended => None,
@@ -399,12 +411,11 @@ impl TeardownSuspendBackup<'_> {
 /// unfenced.
 fn node_local_registration_generation(
     sandbox: &crate::db::SandboxRow,
-) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+) -> Option<pplx_space_sandbox_model::ExecutionGeneration> {
     let route = &sandbox.space_api_route_identity;
-    (route.effective_substrate_kind()
-        == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes))
-    .then_some(route.execution_generation)
-    .flatten()
+    (route.effective_substrate_kind() == Some(pplx_space_node_model::NodeManagedBy::Kubernetes))
+        .then_some(route.execution_generation)
+        .flatten()
 }
 
 /// Where a teardown suspend's artifact came from, which decides whether its
@@ -469,6 +480,8 @@ pub(super) fn sidecar_rootfs_send_source_id(
 mod backup_policy_tests;
 #[cfg(test)]
 mod retired_teardown_tests;
+#[cfg(test)]
+pub(super) use self::retired_teardown_tests::{answer, with_cluster_api};
 #[cfg(test)]
 mod tests;
 

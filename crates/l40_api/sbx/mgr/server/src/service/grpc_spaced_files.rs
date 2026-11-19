@@ -222,7 +222,10 @@ impl SandboxManagerService {
                 .with_grpc_timeout_metadata(request.metadata()),
             || {
                 let mut client = node_manager.clone();
-                let inspect_request = inspect_request.clone();
+                // A dial node-manager never answers is reported below, once
+                // per node, rather than by each attempt's client trace.
+                let mut inspect_request = tonic::Request::new(inspect_request.clone());
+                pplx_space_common_grpc::ExpectedConnectFailure.mark(&mut inspect_request);
                 async move { client.inspect_sandbox(inspect_request).await }
             },
         )
@@ -435,13 +438,29 @@ impl SandboxManagerService {
             let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::unavailable(format!("cannot connect to node-manager: {e}")))?;
+            // The request names guest memory; node-manager takes the host
+            // cgroup limit, which launch sets to the guest's memory plus the
+            // node's headroom. Sending the guest's value would leave the VM
+            // no headroom.
+            let cgroup_memory_mib = match req.memory_mib {
+                Some(guest_memory_mib) => {
+                    let policy = Self::node_sandbox_memory_policy(&mut node_client).await?;
+                    let limit = self
+                        .resolve_sandbox_memory_policy(guest_memory_mib, policy)
+                        .cgroup_memory_mib;
+                    Some(u32::try_from(limit).map_err(|_| {
+                        Status::internal(format!("sandbox cgroup memory exceeds u32: {limit} MiB"))
+                    })?)
+                }
+                None => None,
+            };
 
             node_client
                 .update_cgroup(pplx_space_node_mgr_client::proto::UpdateCgroupRequest {
                     execution_fence: sandbox.node_execution_fence(),
                     sandbox_id: sandbox.id.clone(),
                     vcpu_count: req.vcpu,
-                    memory_mib: req.memory_mib,
+                    memory_mib: cgroup_memory_mib,
                     pids_max: req.pids_max,
                 })
                 .await
@@ -512,7 +531,16 @@ impl SandboxManagerService {
             SpacedRpc::WaitReady,
             &peer,
         )?;
-        let sandbox = self.lookup_started_sandbox(&req.sandbox_id)?;
+        let timeout = proto_duration_to_std(req.timeout)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
+        let started_at = tokio::time::Instant::now();
+        // A sandbox still being created or started is waited for, for up to
+        // half the timeout: the caller learns it is ready when it is, rather
+        // than on its next poll, and a start that takes longer is still
+        // refused in time for the caller to try again.
+        let sandbox = self
+            .lookup_started_sandbox_after_start(&req.sandbox_id, started_at + timeout / 2)
+            .await?;
         if let Some(route_auth) = &route_auth {
             route_auth.authorize_sandbox(&sandbox)?;
         }
@@ -521,12 +549,12 @@ impl SandboxManagerService {
         } else {
             SpacedEndpointProofPolicy::Required
         };
-        let timeout = proto_duration_to_std(req.timeout)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCKING_READY_TIMEOUT_SECS as u64));
         let client = self
             .connect_spaced_host_with_policy(&sandbox, endpoint_proof_policy)
             .await?;
-        let response = client.wait_ready(timeout).await?;
+        let response = client
+            .wait_ready(timeout.saturating_sub(started_at.elapsed()))
+            .await?;
         Ok(Response::new(SpacedWaitReadyResponse {
             guest_uptime: response.guest_uptime,
         }))
@@ -905,8 +933,12 @@ impl SandboxManagerService {
                 pplx_space_spaced_host_client::WatchOptions {
                     recursive: operation.recursive,
                     include_metadata_events: operation.include_metadata_events,
-                    include_globs: pplx_space_spaced_common::parse_globs(operation.include_globs)?,
-                    exclude_globs: pplx_space_spaced_common::parse_globs(operation.exclude_globs)?,
+                    include_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.include_globs,
+                    )?,
+                    exclude_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.exclude_globs,
+                    )?,
                     use_default_excludes: operation.use_default_excludes,
                     user: parse_operation_user(operation.user)?,
                 },
@@ -949,8 +981,12 @@ impl SandboxManagerService {
                 pplx_space_spaced_host_client::WatchOptions {
                     recursive: operation.recursive,
                     include_metadata_events: operation.include_metadata_events,
-                    include_globs: pplx_space_spaced_common::parse_globs(operation.include_globs)?,
-                    exclude_globs: pplx_space_spaced_common::parse_globs(operation.exclude_globs)?,
+                    include_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.include_globs,
+                    )?,
+                    exclude_globs: pplx_space_spaced_guest_protocol::parse_globs(
+                        operation.exclude_globs,
+                    )?,
                     use_default_excludes: operation.use_default_excludes,
                     user: parse_operation_user(operation.user)?,
                 },
@@ -1092,8 +1128,8 @@ impl SandboxManagerService {
         let response = client
             .enable_file_changes_with_options_as_user(
                 operation.roots,
-                pplx_space_spaced_common::parse_globs(operation.include_globs)?,
-                pplx_space_spaced_common::parse_globs(operation.exclude_globs)?,
+                pplx_space_spaced_guest_protocol::parse_globs(operation.include_globs)?,
+                pplx_space_spaced_guest_protocol::parse_globs(operation.exclude_globs)?,
                 operation.use_default_excludes,
                 parse_operation_user(operation.user)?,
             )

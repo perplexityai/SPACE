@@ -1,9 +1,13 @@
+use pplx_space_accounts::NodeId;
+use pplx_space_byte_size::MemorySize;
 use pplx_space_cluster_pool::{
     ClaimedPoolSlot, ManualPoolConfigSpec, PoolAssignment, PoolConfigWithCounts, PoolSlotState,
     ReservedPoolSlot, WarmPoolStore,
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{MemorySize, NodeId, PodUid, SandboxId, VcpuCount};
+use pplx_space_execution_spec::VcpuCount;
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -59,7 +63,7 @@ pub(super) async fn upsert_pool_config(
     request: ClusterPoolConfigRequest,
 ) -> Result<ClusterPoolConfigResponse, ControllerError> {
     if let Some(disk_mib) = request.disk_mib {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(disk_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(disk_mib)
             .map_err(|error| ControllerError::bad_request(format!("disk_mib: {error}")))?;
     }
     if request.reset_disk_to_template_default && request.disk_mib.is_some() {
@@ -563,15 +567,16 @@ pub(super) async fn persist_pooled_execution_claim(
     Ok(())
 }
 
+/// Returns whether this call took the slot out; `false` when it was no
+/// longer claimed under this claim (already released, invalidated or bound).
 pub(super) async fn invalidate_claimed_pool_slot(
     pool: &PgPool,
     claim: &PooledExecutionClaim,
-) -> Result<(), ControllerError> {
+) -> Result<bool, ControllerError> {
     WarmPoolStore::new(pool.clone())
         .invalidate_claimed_slot(claim.claim_id, claim.sandbox_id)
         .await
-        .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))?;
-    Ok(())
+        .map_err(|err| pool_store_error("failed to invalidate claimed pool slot", &err))
 }
 
 pub(super) async fn mark_claimed_pool_slot_cleanup_pending(
@@ -649,6 +654,9 @@ async fn resolve_pool_template_release(
     .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
 }
 
+/// The worker registered under the slot pod's Kubernetes node name. Node ids
+/// are scoped by role, so a builder on the same host has its own row under
+/// that name.
 async fn resolve_pool_slot_node_id(
     tx: &mut Transaction<'_, Postgres>,
     node_name: Option<&str>,
@@ -657,7 +665,11 @@ async fn resolve_pool_slot_node_id(
         return Ok(None);
     };
     sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT node_id FROM node_k8s WHERE k8s_node_name = $1"
+        "SELECT nk.node_id
+         FROM node_k8s nk
+         JOIN nodes n ON n.id = nk.node_id
+         WHERE nk.k8s_node_name = $1
+           AND n.role = 'worker'"
     ))
     .bind(node_name)
     .fetch_optional(&mut **tx)

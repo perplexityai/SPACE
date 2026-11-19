@@ -402,8 +402,8 @@ async fn full_guest_storage_is_named_and_not_retryable() {
 
     let mut status = tonic::Status::resource_exhausted("No space left on device (os error 28)");
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::GUEST_STORAGE_FULL
             .parse()
             .unwrap(),
     );
@@ -2198,7 +2198,7 @@ fn end(code: tonic::Code) -> FakeReply {
 
 fn with_reason(mut status: tonic::Status, reason: &'static str) -> tonic::Status {
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(reason),
     );
     status
@@ -2208,7 +2208,7 @@ fn with_reason(mut status: tonic::Status, reason: &'static str) -> tonic::Status
 fn cursor_ahead() -> FakeReply {
     FakeReply::End(with_reason(
         tonic::Status::out_of_range("fake"),
-        pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+        pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD,
     ))
 }
 
@@ -2217,13 +2217,13 @@ fn cursor_ahead() -> FakeReply {
 fn lagged(first_retained: Option<u64>) -> FakeReply {
     let mut status = with_reason(
         tonic::Status::resource_exhausted(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE,
         ),
-        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+        pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED,
     );
     if let Some(first_retained) = first_retained {
         status.metadata_mut().insert(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
             first_retained.into(),
         );
     }
@@ -2233,7 +2233,7 @@ fn lagged(first_retained: Option<u64>) -> FakeReply {
 /// Ends the stream as a guest older than the lag reason does on eviction.
 fn untagged_lagged() -> FakeReply {
     FakeReply::End(tonic::Status::resource_exhausted(
-        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE,
+        pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE,
     ))
 }
 
@@ -2364,6 +2364,8 @@ struct ProcessFake {
     bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
     started_stdin: Arc<std::sync::Mutex<Vec<bool>>>,
+    /// Whether the guest lists the session's process as running.
+    running: Arc<AtomicBool>,
 }
 
 impl ProcessFake {
@@ -2413,6 +2415,7 @@ async fn spawn_process_fake(
         bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         started_stdin: Arc::new(std::sync::Mutex::new(Vec::new())),
+        running: Arc::new(AtomicBool::new(true)),
     };
     let bound = Arc::clone(&fake.bound);
     let calls = Arc::clone(&fake.calls);
@@ -2421,6 +2424,7 @@ async fn spawn_process_fake(
     let release = Arc::clone(&fake.release);
     let bind_started = Arc::clone(&fake.bind_started);
     let bound_process_ids = Arc::clone(&fake.bound_process_ids);
+    let running = Arc::clone(&fake.running);
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
         let mut route = route.clone();
         let process_id = process_id.clone();
@@ -2433,6 +2437,7 @@ async fn spawn_process_fake(
         let calls = Arc::clone(&calls);
         let started_stdin = Arc::clone(&started_stdin);
         let route_lookups = Arc::clone(&route_lookups);
+        let running = Arc::clone(&running);
         async move {
             let path = request.uri().path().to_string();
             calls.lock().unwrap().push(path.clone());
@@ -2464,6 +2469,21 @@ async fn spawn_process_fake(
             }
             if path.ends_with("/RecordDataPlaneSessionReconnect") {
                 return crate::tests::grpc_test_response(Vec::new());
+            }
+            if path.ends_with("/SpacedListProcesses") {
+                let processes = if running.load(Ordering::SeqCst) {
+                    vec![pplx_space_sbx_mgr_client::operations::ProcessInfo {
+                        process_id: process_id.clone(),
+                        pid: 42,
+                        ..Default::default()
+                    }]
+                } else {
+                    Vec::new()
+                };
+                return crate::tests::grpc_test_response(
+                    pplx_space_sbx_mgr_client::proto::SpacedListProcessesResponse { processes }
+                        .encode_to_vec(),
+                );
             }
             let open = if path.ends_with("/SpacedWatch") {
                 // A file-watch session's watch is answered as a start, so a
@@ -2748,6 +2768,130 @@ async fn evicted_process_output_continues_from_the_oldest_retained_output() {
     );
 }
 
+/// `process_exited` says whether the stream skipped output the process
+/// wrote: after a gap it reports as `cursor_out_of_window`, whether a guest
+/// that does not slow the process for its reader dropped output the stream
+/// had not read yet, or the output a reattach asked for was evicted. A replay
+/// from the start of the output after an id past it repeats output instead,
+/// and a stream that delivered everything reports none.
+#[tokio::test]
+async fn process_exit_reports_whether_the_stream_skipped_output() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let past_the_output = ProcessEventId::Position {
+        position: 10,
+        frame: 0,
+    }
+    .encode();
+    struct Case {
+        name: &'static str,
+        replies: FakeReplies,
+        last_event_id: Option<u64>,
+        resyncs: &'static [&'static str],
+        output: &'static str,
+        truncated: bool,
+    }
+    let cases = [
+        Case {
+            name: "delivered whole",
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            last_event_id: None,
+            resyncs: &[],
+            output: "one\ntwo\nthree\nfour\n",
+            truncated: false,
+        },
+        Case {
+            name: "fell behind a guest without backpressure",
+            replies: Arc::new(|_, open| match open {
+                FakeOpen::Connect(Some(0)) => {
+                    vec![connected(), stdout(JOURNAL[0]), untagged_lagged()]
+                }
+                FakeOpen::Connect(None) => vec![connected(), stdout(JOURNAL[3]), exited()],
+                open => panic!("unexpected open {open:?}"),
+            }),
+            last_event_id: None,
+            resyncs: &["cursor_out_of_window"],
+            output: "one\nfour\n",
+            truncated: true,
+        },
+        Case {
+            name: "reattached after eviction",
+            replies: Arc::new(|_, open| match open {
+                FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![connected(), lagged(Some(2))],
+                open => journal_replay(&JOURNAL, open),
+            }),
+            last_event_id: None,
+            resyncs: &["cursor_out_of_window"],
+            output: "three\nfour\n",
+            truncated: true,
+        },
+        Case {
+            name: "replayed from the start",
+            replies: Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+            last_event_id: Some(past_the_output),
+            resyncs: &["cursor_out_of_window"],
+            output: "one\ntwo\nthree\nfour\n",
+            truncated: false,
+        },
+    ];
+    for Case {
+        name: case,
+        replies,
+        last_event_id,
+        resyncs,
+        output,
+        truncated,
+    } in cases
+    {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_journal_fake(session_id, true, replies).await;
+
+        let frames = process_events_to_close(&fake.endpoint, session_id, last_event_id).await;
+
+        assert_eq!(resync_reasons(&frames), resyncs, "{case}");
+        assert_eq!(stdout_text(&frames), output, "{case}");
+        let exits: Vec<_> = frames_of_type(&frames, "process_exited").collect();
+        assert_eq!(exits.len(), 1, "{case}: {frames:?}");
+        assert_eq!(
+            exits[0].1["output_truncated"],
+            serde_json::Value::Bool(truncated),
+            "{case}"
+        );
+    }
+}
+
+/// A WebSocket stream reopens a failed backend at the live tail, so its
+/// `process_exited` reports that output may be missing.
+#[tokio::test]
+async fn websocket_exit_after_a_live_reopen_reports_skipped_output() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|opened, _| match opened {
+            0 => vec![
+                connected(),
+                stdout(JOURNAL[0]),
+                FakeReply::End(tonic::Status::unavailable("worker restarted")),
+            ],
+            _ => vec![connected(), stdout(JOURNAL[3]), exited()],
+        }),
+    )
+    .await;
+
+    let mut tcp = attach_native_websocket(&fake.endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "process_exited").await;
+
+    assert!(seen.contains("process_stream_reconnected"), "{seen}");
+    assert!(seen.contains(r#""output_truncated":true"#), "{seen}");
+    assert_eq!(fake.opens.lock().unwrap().len(), 2);
+}
+
 /// A guest that starts a lagged connect at its oldest retained output, and
 /// says so, needs no reopen: the stream reports the gap once and continues
 /// from there, with ids that keep their positions.
@@ -2790,6 +2934,91 @@ async fn evicted_output_continues_where_the_guest_reports_the_stream_starts() {
     assert_eq!(stdout_text(&resumed), "three\nfour\n");
     assert_ids_above(&resumed, gap);
     assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), Some(2)]));
+}
+
+/// A guest too old to say where its retained output starts answers an
+/// evicted cursor with a bare lag status. Once the process has exited, and
+/// the guest no longer lists it as running, the stream finds that start
+/// itself and continues there behind one `resync_required`, as with a guest
+/// that reports it; ids keep their positions, so a resume from the gap's id
+/// is exact. While the process runs, the stream follows the live tail.
+#[tokio::test]
+async fn exited_output_from_a_guest_that_does_not_report_its_start_continues_there() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    const LINES: [&str; 8] = ["1\n", "2\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n"];
+    const FIRST_RETAINED: u64 = 5;
+    for has_exited in [true, false] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_journal_fake(
+            session_id,
+            true,
+            Arc::new(|_, open| match open {
+                FakeOpen::Connect(Some(cursor)) if cursor < FIRST_RETAINED => {
+                    vec![connected(), untagged_lagged()]
+                }
+                // Past the output, such a guest sends the exit.
+                FakeOpen::Connect(Some(cursor)) => {
+                    let mut replies = vec![connected()];
+                    replies.extend(LINES.iter().skip(cursor as usize).map(|line| stdout(line)));
+                    replies.push(exited());
+                    replies
+                }
+                FakeOpen::Connect(None) => vec![started(), stdout("live\n"), exited()],
+                FakeOpen::Start => panic!("the process is already bound"),
+            }),
+        )
+        .await;
+        fake.running.store(!has_exited, Ordering::SeqCst);
+
+        let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+        assert_eq!(
+            resync_reasons(&frames),
+            ["cursor_out_of_window"],
+            "{has_exited}"
+        );
+        if !has_exited {
+            assert_eq!(stdout_text(&frames), "live\n");
+            assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), None]));
+            continue;
+        }
+        assert_eq!(
+            stdout_text(&frames),
+            LINES[FIRST_RETAINED as usize..].concat()
+        );
+        // The exit must not call this transcript whole: cursors 0 to 4 were
+        // skipped.
+        let exits: Vec<_> = frames_of_type(&frames, "process_exited").collect();
+        assert_eq!(exits.len(), 1, "{frames:?}");
+        assert_eq!(
+            exits[0].1["output_truncated"],
+            serde_json::Value::Bool(true)
+        );
+        let gap = frames_of_type(&frames, "resync_required")
+            .next()
+            .unwrap()
+            .0
+            .unwrap();
+        let resumed = process_events_to_close(&fake.endpoint, session_id, Some(gap)).await;
+        assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+        assert_eq!(
+            stdout_text(&resumed),
+            LINES[FIRST_RETAINED as usize..].concat()
+        );
+        let opens = fake.opens.lock().unwrap();
+        assert_eq!(opens.first(), Some(&FakeOpen::Connect(Some(0))));
+        assert_eq!(
+            opens.iter().rev().take(2).collect::<Vec<_>>(),
+            [
+                &FakeOpen::Connect(Some(FIRST_RETAINED)),
+                &FakeOpen::Connect(Some(FIRST_RETAINED))
+            ],
+            "the stream and its resume both read from the oldest retained output: {opens:?}"
+        );
+        assert!(!opens.contains(&FakeOpen::Connect(None)), "{opens:?}");
+    }
 }
 
 /// A guest older than the lag reason does not say where its retained output
@@ -3405,10 +3634,12 @@ async fn already_started_process_is_resumed_exactly() {
     );
 }
 
-/// A `Last-Event-ID` too close to the end of the id space to number a later
-/// frame above is refused before anything is opened.
+/// A `Last-Event-ID` too high for any id to follow, up to the schema's
+/// maximum, was never sent: like any id that does not resume exactly, it
+/// replays the output from its start behind `resync_required`, and a resume
+/// from the ids that replay sends is exact.
 #[tokio::test]
-async fn last_event_id_without_room_after_it_is_rejected() {
+async fn last_event_id_without_room_after_it_replays_behind_a_resync() {
     if !binding_fake_test_process() {
         return;
     }
@@ -3419,26 +3650,36 @@ async fn last_event_id_without_room_after_it_is_rejected() {
         Arc::new(|_, open| journal_replay(&JOURNAL, open)),
     )
     .await;
-    let mut state = crate::tests::test_data_plane_state().await;
-    state.cluster_api = ClusterApiClients::service_only(
-        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
-            .await
-            .unwrap(),
-    );
-    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-    let response = tower::ServiceExt::oneshot(
-        router(state),
-        Request::get(format!("/v1/sessions/{session_id}/events"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header("last-event-id", MAX_LAST_EVENT_ID.to_string())
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(fake.opens.lock().unwrap().is_empty());
+    let frames = process_events_to_close(&fake.endpoint, session_id, Some(MAX_LAST_EVENT_ID)).await;
+
+    assert_eq!(resync_reasons(&frames), ["cursor_replay_unavailable"]);
+    // Numbered from the start of the output: the id after the unsent
+    // `START`, below every output id that follows.
+    let resync_ids: Vec<_> = frames_of_type(&frames, "resync_required")
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        resync_ids,
+        [Some(
+            ProcessEventId::Position {
+                position: 0,
+                frame: 1,
+            }
+            .encode()
+        )]
+    );
+    assert_eq!(stdout_text(&frames), JOURNAL.concat());
+    let after_two: Vec<_> = frames
+        .iter()
+        .take_while(|(_, frame)| frame["seq"] != 3)
+        .cloned()
+        .collect();
+    let resumed =
+        process_events_to_close(&fake.endpoint, session_id, Some(last_id(&after_two))).await;
+    assert_eq!(stdout_text(&resumed), "three\nfour\n");
+    assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+    assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), Some(2)]));
 }
 
 #[tokio::test]
@@ -3528,13 +3769,10 @@ async fn an_at_rest_route_answers_as_the_node_refusal_does() {
     let public_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id);
     for (lifecycle, action) in [
         (
-            pplx_space_common_core::types::SandboxLifecycle::Suspended,
+            pplx_space_sandbox_model::SandboxLifecycle::Suspended,
             "wake",
         ),
-        (
-            pplx_space_common_core::types::SandboxLifecycle::Stopped,
-            "start",
-        ),
+        (pplx_space_sandbox_model::SandboxLifecycle::Stopped, "start"),
     ] {
         let at_rest =
             RouteResolutionError::SessionAtRest(pplx_space_sandbox_grpc::SessionRouteAtRest {
@@ -3644,6 +3882,165 @@ async fn an_attach_waits_for_a_route_within_its_deadline() {
     assert_eq!(calls.load(Ordering::Relaxed), 1, "nothing to wait for");
 }
 
+/// A cluster API that refuses every session route resolve with `refusal`,
+/// given how long since the first resolve it received, so the caller's setup
+/// does not count.
+async fn spawn_route_refusing_fake(
+    refusal: impl Fn(Duration) -> tonic::Status + Clone + Send + Sync + 'static,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let first_resolve = Arc::new(std::sync::OnceLock::new());
+    let service = axum::Router::new().fallback(move |request: Request<Body>| {
+        let refusal = refusal.clone();
+        let first_resolve = Arc::clone(&first_resolve);
+        async move {
+            let path = request.uri().path().to_string();
+            if path.ends_with("/Check") {
+                return crate::tests::grpc_test_response(vec![8, 1]);
+            }
+            assert!(path.ends_with("/ResolveDataPlaneSessionRoute"), "{path}");
+            let started = *first_resolve.get_or_init(tokio::time::Instant::now);
+            refusal(started.elapsed()).into_http::<Body>()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    endpoint
+}
+
+/// An events attach waits while its sandbox restores, which ClusterApi
+/// answers as a marked `Unavailable`, longer than a WebSocket's first-frame
+/// deadline, and answers how the wake ended: here, back at rest, a final
+/// `409`.
+#[tokio::test]
+async fn an_events_attach_waits_out_a_restore_and_reports_how_it_ended() {
+    use http_body_util::BodyExt;
+
+    if !binding_fake_test_process() {
+        return;
+    }
+    let sandbox_id = SandboxId::new();
+    let restoring_for = Duration::from_millis(1500);
+    let endpoint = spawn_route_refusing_fake(move |elapsed| {
+        if elapsed < restoring_for {
+            pplx_space_common_grpc::sandbox_service_route_not_ready_status(
+                tonic::Code::Unavailable,
+                "sandbox is restoring; retry once the restore completes",
+            )
+        } else {
+            pplx_space_sandbox_grpc::mark_session_route_at_rest(
+                tonic::Status::failed_precondition(
+                    "data-plane session sandbox is not assigned to a node",
+                ),
+                sandbox_id,
+                pplx_space_sandbox_model::SandboxLifecycle::Suspended,
+            )
+        }
+    })
+    .await;
+    let state = fake_state(&endpoint).await;
+    assert!(state.attach_deadline < restoring_for);
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+
+    let started = tokio::time::Instant::now();
+    let response = get_session_events(&state, session_id, None).await;
+    assert!(
+        started.elapsed() >= restoring_for,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["retryable"], false, "{body}");
+    assert_eq!(body["error"]["details"][1]["value"], "suspended", "{body}");
+}
+
+/// A drain that starts while an events attach waits for its sandbox's route
+/// answers the attach as draining at once, rather than holding the drain
+/// for the rest of the wait.
+#[tokio::test]
+async fn an_events_attach_waiting_for_a_route_yields_to_a_drain() {
+    use http_body_util::BodyExt;
+
+    if !binding_fake_test_process() {
+        return;
+    }
+    let resolving = Arc::new(tokio::sync::Notify::new());
+    let resolved = Arc::clone(&resolving);
+    let endpoint = spawn_route_refusing_fake(move |_| {
+        resolved.notify_one();
+        tonic::Status::failed_precondition("data-plane session sandbox is about to be activated")
+    })
+    .await;
+    let state = fake_state(&endpoint).await;
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let drain = state.drain_started.clone();
+    tokio::spawn(async move {
+        resolving.notified().await;
+        drain.cancel();
+    });
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        get_session_events(&state, session_id, None),
+    )
+    .await
+    .expect("the drain ends the wait");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["error"]["message"], "data plane is draining; retry",
+        "{body}"
+    );
+}
+
+/// A resolve still running at the attach's deadline, as one ClusterApi holds
+/// on a restore, does not hold the attach past it.
+#[tokio::test(start_paused = true)]
+async fn an_attach_answers_by_its_deadline_whatever_resolve_is_running() {
+    use std::sync::atomic::AtomicUsize;
+
+    let calls = AtomicUsize::new(0);
+    let started = tokio::time::Instant::now();
+    let answer: Result<(), _> = tokio::time::timeout(
+        Duration::from_secs(60),
+        retry_not_ready_until(started + Duration::from_secs(5), || {
+            let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+            async move {
+                if first {
+                    Err(RouteResolutionError::SessionNotReady)
+                } else {
+                    std::future::pending().await
+                }
+            }
+        }),
+    )
+    .await
+    .expect("answered by the deadline");
+    assert_eq!(answer, Err(RouteResolutionError::SessionNotReady));
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+}
+
+#[test]
+fn only_a_marked_unavailable_route_refusal_is_a_route_that_is_coming() {
+    let restoring = pplx_space_common_grpc::sandbox_service_route_not_ready_status(
+        tonic::Code::Unavailable,
+        "sandbox is restoring; retry once the restore completes",
+    );
+    assert_eq!(
+        route_resolution_error(&restoring),
+        RouteResolutionError::SessionNotReady
+    );
+    assert_eq!(
+        route_resolution_error(&tonic::Status::unavailable("connection refused")),
+        RouteResolutionError::ResolutionFailed
+    );
+}
+
 /// A WebSocket attach has one attach deadline from accept: the wait for a
 /// first-frame token and the wait for the sandbox's route share it, so the
 /// first frame cannot hold the socket for one deadline and the route a second.
@@ -3729,7 +4126,7 @@ fn a_route_refusal_marked_at_rest_is_not_a_route_that_is_coming() {
         RouteResolutionError::SessionNotReady
     );
     let sandbox_id = SandboxId::new();
-    let suspended = pplx_space_common_core::types::SandboxLifecycle::Suspended;
+    let suspended = pplx_space_sandbox_model::SandboxLifecycle::Suspended;
     let at_rest = pplx_space_sandbox_grpc::mark_session_route_at_rest(plain, sandbox_id, suspended);
     assert_eq!(
         route_resolution_error(&at_rest),

@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::types::Digest;
+use pplx_space_content_digest::Digest;
 
 #[test]
 fn unsealed_files_cannot_be_used_as_authenticated_inputs() {

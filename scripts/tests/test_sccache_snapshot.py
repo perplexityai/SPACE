@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -23,15 +28,16 @@ INPUTS = f"space-sccache-v1-Linux-X64-tests-{HASH}-"
 RESTORED = f"{INPUTS}100-1"
 
 
-def stats(hits: int, misses: int) -> str:
-    return json.dumps(
-        {
-            "stats": {
-                "cache_hits": {"counts": {"Rust": hits, "C/C++": 5}, "adv_counts": {}},
-                "cache_misses": {"counts": {"Rust": misses}, "adv_counts": {}},
-            }
+def stats(hits: int, misses: int, size: int | None = None, maximum: int = 1000) -> str:
+    report: dict = {
+        "stats": {
+            "cache_hits": {"counts": {"Rust": hits, "C/C++": 5}, "adv_counts": {}},
+            "cache_misses": {"counts": {"Rust": misses}, "adv_counts": {}},
         }
-    )
+    }
+    if size is not None:
+        report |= {"cache_size": size, "max_cache_size": maximum}
+    return json.dumps(report)
 
 
 class DecideTest(unittest.TestCase):
@@ -72,6 +78,84 @@ class DecideTest(unittest.TestCase):
             self.assertIsNone(threshold, value)
             self.assertTrue(snapshot.decide(RESTORED, INPUTS, stats(849, 0), threshold).save)
         self.assertEqual(snapshot.parse_threshold("20"), 20)
+
+
+class CacheChecksTest(unittest.TestCase):
+    """Which advisory checks a run trips; the warnings' wording is not a contract."""
+
+    def test_a_cache_is_nearly_full_only_close_to_its_maximum(self) -> None:
+        self.assertTrue(snapshot.nearly_full(stats(800, 50, size=1000)))
+        for size in (0, 1, 500):
+            self.assertFalse(snapshot.nearly_full(stats(800, 50, size=size)), size)
+        for stats_json in (None, "", "{", stats(800, 50), stats(800, 50, size=0, maximum=0)):
+            self.assertFalse(snapshot.nearly_full(stats_json), stats_json)
+
+    def test_a_warm_restore_misses_only_when_most_compilations_miss(self) -> None:
+        self.assertTrue(snapshot.missed_warm(RESTORED, INPUTS, stats(0, 900)))
+        self.assertTrue(snapshot.missed_warm(RESTORED, INPUTS, stats(100, 900)))
+        for hits, misses in ((900, 0), (900, 100), (0, 0)):
+            self.assertFalse(snapshot.missed_warm(RESTORED, INPUTS, stats(hits, misses)), hits)
+
+    def test_a_cold_restore_or_unusable_statistics_never_miss_warm(self) -> None:
+        other = f"space-sccache-v1-Linux-X64-tests-{OTHER_HASH}-100-1"
+        for restored in ("", other):
+            self.assertFalse(snapshot.missed_warm(restored, INPUTS, stats(0, 900)), restored)
+        for stats_json in (None, "", "{", "{}"):
+            self.assertFalse(snapshot.missed_warm(RESTORED, INPUTS, stats_json), stats_json)
+
+
+class DecideCommandTest(unittest.TestCase):
+    """`decide` runs in every Rust-cache job: its warnings never fail it or
+    change what it decides."""
+
+    def run_decide(self, restored: str, stats_json: str | None) -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as directory:
+            stats_path = Path(directory, "stats.json")
+            if stats_json is not None:
+                stats_path.write_text(stats_json, encoding="utf-8")
+            output = Path(directory, "output")
+            environment = {
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_REF": "refs/heads/main",
+            }
+            with mock.patch.dict(os.environ, environment), contextlib.redirect_stdout(io.StringIO()):
+                status = snapshot.main(
+                    [
+                        "decide",
+                        "--key",
+                        f"{INPUTS}200-1",
+                        "--restored-key",
+                        restored,
+                        "--inputs-prefix",
+                        INPUTS,
+                        "--stats",
+                        str(stats_path),
+                        "--refresh-misses",
+                        "20",
+                    ]
+                )
+            self.assertEqual(status, 0)
+            return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+
+    def test_a_nearly_full_cache_still_keeps_a_current_snapshot(self) -> None:
+        stats_json = stats(830, 19, size=1000)
+        self.assertTrue(snapshot.nearly_full(stats_json))
+        self.assertEqual(self.run_decide(RESTORED, stats_json), {"save": "false", "trim": "false"})
+
+    def test_a_warm_restore_that_missed_still_refreshes_and_trims(self) -> None:
+        for size in (None, 100, 1000):
+            stats_json = stats(100, 900, size=size)
+            self.assertTrue(snapshot.missed_warm(RESTORED, INPUTS, stats_json), size)
+            self.assertEqual(
+                self.run_decide(RESTORED, stats_json), {"save": "true", "trim": "true"}, size
+            )
+
+    def test_unusable_or_missing_statistics_save_without_trimming(self) -> None:
+        for stats_json in (None, "", "{", '{"cache_size": "full", "max_cache_size": 0}'):
+            self.assertEqual(
+                self.run_decide(RESTORED, stats_json), {"save": "true", "trim": "false"}, stats_json
+            )
 
 
 def cache(cache_id: int, key: str, created: str) -> dict:

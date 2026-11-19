@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, UserId};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,10 +13,10 @@ use axum::{
 use base64::Engine;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{Pod, PodIP, PodStatus};
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, pg_test_db};
 use pplx_space_node_api_sim::{SimWorkerHarness, state::status};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sql_locator::sql;
 use rstest::{fixture, rstest};
 use serde::Deserialize;
 use serde_json::json;
@@ -27,15 +28,17 @@ use tower::util::ServiceExt;
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 use uuid::Uuid;
 
-#[cfg(feature = "kubernetes")]
-use pplx_space_common_core::kubernetes::SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION;
-#[cfg(feature = "kubernetes")]
-use pplx_space_common_core::types::SnapshotId;
-use pplx_space_common_core::types::{
-    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, DEFAULT_TEMPLATE_TAG,
-    SandboxLifecycle, SandboxOwnerSource, TemplateVisibility,
+use pplx_space_accounts::SandboxOwnerSource;
+use pplx_space_auto_lifecycle::{
+    AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState,
 };
 use pplx_space_ecw_credential::EcwCredentialKeyring;
+use pplx_space_sandbox_model::SandboxLifecycle;
+#[cfg(feature = "kubernetes")]
+use pplx_space_sandbox_pod::SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION;
+#[cfg(feature = "kubernetes")]
+use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_template_model::{DEFAULT_TEMPLATE_TAG, TemplateVisibility};
 
 use super::{
     ConnectTouchRecovery, ECW_DEFAULT_CREATE_TIMEOUT_SECS, ECW_DEFAULT_TEMPLATE_ID,
@@ -755,7 +758,7 @@ fn test_sandbox() -> Sandbox {
         active_execution_generation: None,
         active_pod_uid: None,
         active_activation_attempt_id: None,
-        ecw_credential_epoch: pplx_space_common_core::types::EcwCredentialEpoch::new(1)
+        ecw_credential_epoch: pplx_space_sandbox_model::EcwCredentialEpoch::new(1)
             .expect("credential epoch is valid"),
         target_node_id: None,
         placement_changed_at: None,
@@ -786,6 +789,7 @@ fn test_sandbox() -> Sandbox {
         last_command_at: None,
         created_at: time::OffsetDateTime::now_utc(),
         updated_at: time::OffsetDateTime::now_utc(),
+        activating_client_id: None,
     }
 }
 
@@ -1075,7 +1079,7 @@ async fn template_build_create_persists_authenticated_org(
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
-    let (name, org): (String, Option<OrgId>) = sqlx::query_as(pplx_space_common_core::sql!(
+    let (name, org): (String, Option<OrgId>) = sqlx::query_as(pplx_space_sql_locator::sql!(
         "SELECT template_id, org_id FROM template_build_jobs WHERE build_id = $1"
     ))
     .bind(body["buildID"].as_str().unwrap())
@@ -1621,7 +1625,7 @@ async fn egress_profile_header_applies_only_to_federated_creates(
         .with_egress_profiles(crate::egress_profiles::EgressProfiles::from_config(
             r#"{"sensor":{"allow":[{"domain":"sensor.example.test"}]}}"#,
         )?);
-    use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+    use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
     let owner = crate::federated_identity::FederatedOwner {
         issuer: UpstreamIssuer::parse("example-issuer")?,
         org_id: UpstreamOrgId::parse("example-org")?,
@@ -1794,6 +1798,21 @@ fn create_translation_applies_resource_overrides() {
         ),
         (r#"{"vcpu":4}"#, Some(4), None, None),
         (r#"{"memory_mib":8192}"#, None, Some(8192), None),
+        // Above a node's default guest maximum, which the node clamps to;
+        // the API still admits it.
+        (r#"{"memory_mib":16896}"#, None, Some(16896), None),
+        (
+            r#"{"vcpu":16,"memory_mib":33280}"#,
+            Some(16),
+            Some(33280),
+            None,
+        ),
+        (
+            r#"{"vcpu":32,"memory_mib":65536,"disk_mib":131072}"#,
+            Some(32),
+            Some(65536),
+            Some(131072),
+        ),
         (r#"{"disk_mib":20480}"#, None, None, Some(20480)),
         ("{}", None, None, None),
     ] {
@@ -1825,8 +1844,12 @@ fn create_translation_rejects_invalid_resource_overrides() {
         r#"{"vcpu":1.5}"#,
         r#"{"vcpu":"4"}"#,
         r#"{"vcpu":2147483648}"#,
+        r#"{"vcpu":33}"#,
         r#"{"memory_mib":2147483648}"#,
+        r#"{"memory_mib":65537}"#,
+        r#"{"memory_mib":511}"#,
         r#"{"disk_mib":0}"#,
+        r#"{"disk_mib":131073}"#,
         r#"{"memory_mb":8192}"#,
     ] {
         let mut request = base_create_request();
@@ -2887,7 +2910,7 @@ fn create_translation_maps_pause_and_resume_policy() {
     assert!(translation.native.wait_until_ready);
     assert_eq!(
         stage.action,
-        pplx_space_common_core::types::AutoLifecycleIdleAction::Suspend
+        pplx_space_auto_lifecycle::AutoLifecycleIdleAction::Suspend
     );
 }
 
@@ -3327,7 +3350,7 @@ fn sandbox_response_uses_ecw_host_domain() {
         &native,
         "seed".to_string(),
         Some(TEST_ECW_HOST.to_string()),
-        pplx_space_common_core::types::EcwCredentialEpoch::new(1).unwrap(),
+        pplx_space_sandbox_model::EcwCredentialEpoch::new(1).unwrap(),
     );
 
     assert_eq!(response.domain.as_deref(), Some(TEST_ECW_HOST));
@@ -3348,7 +3371,7 @@ fn ecw_host_alias_selects_alias_response_domain() {
         &native,
         "seed".to_string(),
         Some(pair.host),
-        pplx_space_common_core::types::EcwCredentialEpoch::new(1).unwrap(),
+        pplx_space_sandbox_model::EcwCredentialEpoch::new(1).unwrap(),
     );
     assert_eq!(response.domain.as_deref(), Some(TEST_ECW_ALIAS_HOST));
 }
@@ -4386,7 +4409,7 @@ async fn connect_route_rejects_missing_restore_context_and_preserves_recovery_st
         executions,
         vec![
             (1, false, "forgotten".to_string(), None, None, None),
-            (2, true, "recovery_failed".to_string(), None, None, None,),
+            (2, true, "recovery_failed".to_string(), None, None, None),
         ]
     );
 
@@ -4586,7 +4609,7 @@ async fn runtime_client_recovers_missing_suspending_pod(
     fixture
         .app_state
         .substrate
-        .runtime_client(fixture.sandbox_id, RecoveryCharge::Exempt)
+        .runtime_client(fixture.sandbox_id, RecoveryCharge::exempt_for_tests())
         .await?;
 
     // Assert.
@@ -5009,6 +5032,146 @@ fn metadata_uses_sandbox_metadata() {
     );
     assert_eq!(metadata.get("priority").map(String::as_str), Some("3"));
     assert_eq!(metadata.get("debug").map(String::as_str), Some("true"));
+}
+
+/// A connect's wake labels the restore pod with the connecting client's
+/// `X-Client-ID`, not the creating client's, and tracking that pod records the
+/// connecting client. A connect without a valid id activates as `unknown`.
+#[cfg(feature = "kubernetes")]
+#[rstest]
+#[case::named(Some("connecting-client"), "connecting-client")]
+#[case::without_an_id(None, "unknown")]
+#[tokio::test(flavor = "current_thread")]
+async fn connect_route_labels_the_restore_pod_with_the_connecting_client(
+    #[case] header: Option<&'static str>,
+    #[case] expected: &str,
+    #[future] missing_pod_suspend_fixture: TestResult<MissingPodSuspendFixture>,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+
+    // Arrange.
+    let fixture = missing_pod_suspend_fixture.await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET activating_client_id = 'creating-client' WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .execute(&fixture.app_state.pool)
+    .await?;
+    let mut request = connect_route_request(
+        fixture.sandbox_id,
+        ConnectRouteRequestShape {
+            label: "empty body",
+            body: None,
+        },
+    )?;
+    if let Some(header) = header {
+        request
+            .headers_mut()
+            .insert("x-client-id", header::HeaderValue::from_static(header));
+    }
+
+    // Act.
+    let response = fixture.app.clone().oneshot(request).await?;
+
+    // Assert.
+    assert_connect_success_response(
+        response,
+        StatusCode::OK,
+        fixture.sandbox_id,
+        "empty body",
+        "missing pod after a current durable suspend snapshot",
+    )
+    .await?;
+    let label = {
+        let pod_creates = fixture
+            .app_state
+            .pod_creates
+            .lock()
+            .expect("capture mutex poisoned");
+        let [pod] = pod_creates.as_slice() else {
+            panic!("expected one restore pod, got {}", pod_creates.len());
+        };
+        pod.pointer("/metadata/labels")
+            .and_then(|labels| labels.get(pplx_space_sandbox_pod::SANDBOX_CLIENT_ID_LABEL))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    assert_eq!(label.as_deref(), Some(expected));
+    let record: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT activating_client_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&fixture.app_state.pool)
+    .await?;
+    assert_eq!(record.as_deref(), Some(expected));
+    Ok(())
+}
+
+/// A resume restores the sandbox, so with attribution on it takes the client's
+/// concurrency slot like create and connect: with the client's one slot held,
+/// its resume is refused with the per-client 429 before the sandbox is even
+/// read. With attribution off it takes no slot, so the same resume reaches the
+/// failed sandbox and gets its usual answer.
+#[rstest]
+#[case::attribution_on(crate::controllers::substrate::ActivationClientAttribution::Enabled)]
+#[case::attribution_off(crate::controllers::substrate::ActivationClientAttribution::Disabled)]
+#[tokio::test(flavor = "current_thread")]
+async fn resume_route_takes_a_client_concurrency_slot(
+    #[case] attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult {
+    use crate::client_concurrency::ClientConcurrencyDecision;
+    use crate::client_concurrency::tests::{redis_limiter, tight_enforce, try_redis_url};
+    use crate::metrics::sandbox::api::client_limit::Operation;
+
+    let Some((_redis, redis_url)) = try_redis_url().await? else {
+        return Ok(());
+    };
+    let db = pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let org = insert_failed_terminal_sandbox(&db.pool, sandbox_id).await?;
+    let client = format!("resumer-{}", Uuid::now_v7());
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::from_direct(
+            crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone())
+                .with_activation_client_attribution(attribution),
+        ),
+    );
+    // One slot per client: the one held below fills it.
+    state.client_concurrency = redis_limiter(&redis_url, tight_enforce(&client));
+    let ClientConcurrencyDecision::Admitted(_held) = state
+        .client_concurrency
+        .try_acquire(Operation::Create, Some(&client))
+        .await
+    else {
+        panic!("the client's first slot is free");
+    };
+    let app = e2b_api_routes()
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/sandboxes/{sandbox_id}/resume"))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .header("x-client-id", &client)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    let expected =
+        if attribution == crate::controllers::substrate::ActivationClientAttribution::Enabled {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+    assert_eq!(response.status(), expected);
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5762,7 +5925,7 @@ struct FederatedConnectFixture {
 /// A federated-owned sandbox behind the real e2b router, with the federated
 /// owner injected as the auth extension the middleware would attach.
 async fn federated_connect_fixture(db: &TestDb) -> TestResult<FederatedConnectFixture> {
-    use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+    use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 
     let sandbox_id = SandboxId::new();
     let org_id = OrgId::new();
@@ -5862,7 +6025,7 @@ async fn template_build_rejects_another_orgs_inputs(
     #[case] body: &str,
 ) -> TestResult {
     let fixture = template_alias_fixture.await?;
-    sqlx::query(pplx_space_common_core::sql!(
+    sqlx::query(pplx_space_sql_locator::sql!(
         "INSERT INTO template_build_jobs (template_id, build_id, daemon_job_id, org_id)
          VALUES ('tenant-inputs', 'foreign', $1, $2)"
     ))
@@ -6457,6 +6620,123 @@ async fn seed_ecw_caller(pool: &PgPool) -> TestResult<(Organization, crate::mode
     Ok((org, actor))
 }
 
+/// Seeds the `seed` template with a `latest` release an ECW create resolves.
+#[cfg(feature = "kubernetes")]
+async fn seed_ecw_create_template(pool: &PgPool) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:ecw-create-seed')"
+    ))
+    .bind(release_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A create whose `space.resources` the native API refuses is a 400 naming the
+/// native bounds, answered before the create reaches the substrate: no
+/// sandbox row is written and no pod is requested.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_create_refuses_out_of_bounds_resources_up_front() -> TestResult {
+    use pplx_space_public_api::limits::{
+        MAX_SANDBOX_MEMORY_MIB, MAX_SANDBOX_VCPU, MIN_SANDBOX_MEMORY_MIB, MIN_SANDBOX_VCPU,
+    };
+    let db = pg_test_db().await?;
+    seed_ecw_create_template(&db.pool).await?;
+    let pod_creates = Arc::new(Mutex::new(Vec::new()));
+    let kubernetes =
+        crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client(
+            db.pool.clone(),
+            crate::controllers::substrate::kubernetes::tests::mock_kubernetes_client(Arc::clone(
+                &pod_creates,
+            )),
+        );
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::from_kubernetes(kubernetes),
+    );
+    let (_, actor) = seed_ecw_caller(&db.pool).await?;
+    let app = e2b_api_routes()
+        .layer(Extension(AuthEcwActor(Some(actor))))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+
+    for (resources, field, min, max) in [
+        (
+            json!({ "vcpu": MAX_SANDBOX_VCPU + 1 }),
+            "vcpu",
+            MIN_SANDBOX_VCPU,
+            MAX_SANDBOX_VCPU,
+        ),
+        (
+            json!({ "memory_mib": MAX_SANDBOX_MEMORY_MIB + 1 }),
+            "memory_mib",
+            MIN_SANDBOX_MEMORY_MIB,
+            MAX_SANDBOX_MEMORY_MIB,
+        ),
+        (
+            json!({ "memory_mib": MIN_SANDBOX_MEMORY_MIB - 1 }),
+            "memory_mib",
+            MIN_SANDBOX_MEMORY_MIB,
+            MAX_SANDBOX_MEMORY_MIB,
+        ),
+    ] {
+        let body = json!({
+            "templateID": "seed",
+            "metadata": { "space.resources": resources.to_string() },
+        });
+        // Bounds a create that reaches the substrate, whose readiness wait
+        // the mock apiserver may not end.
+        let response = tokio::time::timeout(
+            Duration::from_secs(20),
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sandboxes")
+                    .header(header::HOST, TEST_ECW_API_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))?,
+            ),
+        )
+        .await
+        .map_err(|_| format!("{resources}: the create was not refused up front"))??;
+
+        let status = response.status();
+        let error: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resources}: {error}");
+        assert_eq!(
+            error["message"],
+            format!("space.resources.{field} must be between {min} and {max}"),
+            "{resources}"
+        );
+    }
+    assert!(
+        pod_creates.lock().unwrap().is_empty(),
+        "a refused create requested a pod"
+    );
+    let sandboxes: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes"))
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(sandboxes, 0, "a refused create wrote a sandbox row");
+    Ok(())
+}
+
 /// A cold ECW create is admitted once, for the ID it answers with.
 #[cfg(feature = "kubernetes")]
 #[rstest]
@@ -6471,27 +6751,7 @@ async fn ecw_create_is_admitted_for_the_sandbox_it_creates(
         return Ok(());
     }
     let fixture = kubernetes_app_state_fixture.await?;
-    sqlx::query(sql!(
-        "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
-    ))
-    .bind(Uuid::now_v7())
-    .execute(&fixture.pool)
-    .await?;
-    let release_id = Uuid::now_v7();
-    sqlx::query(sql!(
-        "INSERT INTO template_releases (id, template_name, type, hash)
-         VALUES ($1, 'seed', 'fc', 'sha256:ecw-create-admission')"
-    ))
-    .bind(release_id)
-    .execute(&fixture.pool)
-    .await?;
-    sqlx::query(sql!(
-        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-         VALUES ($1, 'seed', 'latest')"
-    ))
-    .bind(release_id)
-    .execute(&fixture.pool)
-    .await?;
+    seed_ecw_create_template(&fixture.pool).await?;
     let (_, actor) = seed_ecw_caller(&fixture.pool).await?;
 
     let response = e2b_api_routes()
@@ -6572,5 +6832,222 @@ async fn ecw_fork_is_admitted_for_its_source_before_it_is_recorded() -> TestResu
         recorded = tokio::time::timeout(Duration::from_secs(30), recorded) => recorded??,
     }
     assert_eq!(admitted(source), [UserLifecycleRequest::Fork]);
+    Ok(())
+}
+
+/// A create whose client disconnects while the create waits for its pod still
+/// runs its failure arm when the wait fails: the pod is deleted, its
+/// execution retired and the sandbox row removed, so the sandbox does not sit
+/// `creating` until a sweep finds it.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_create_cleans_up_a_failed_create_after_its_client_disconnects() -> TestResult {
+    use crate::controllers::substrate::kubernetes::scripted_test_doubles::{
+        KubeReply, kube_status, pod_reply, scripted_kube_client_async,
+    };
+    const PODS_PATH: &str = "/api/v1/namespaces/space/pods";
+    const EVENTS_PATH: &str = "/api/v1/namespaces/space/events";
+    // How a node words a sandbox it refuses as invalid.
+    const REFUSAL: &str = "Failed to create pod sandbox: sbx-manager Wake \
+        [space-err=InvalidArgument]: prepare sandbox failed";
+
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, visibility) VALUES ($1, 'seed', 'generic')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:ecw-create-disconnect')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    let (org, actor) = seed_ecw_caller(&db.pool).await?;
+
+    let pod_name: Arc<Mutex<Option<String>>> = Arc::default();
+    // Signalled when the create waits on its pod's events; the refusal is
+    // answered only once the test has disconnected the client.
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let refuse = Arc::new(tokio::sync::Notify::new());
+    let (client, log) = {
+        let pod_name = Arc::clone(&pod_name);
+        let waiting = Arc::clone(&waiting);
+        let refuse = Arc::clone(&refuse);
+        scripted_kube_client_async(move |request| {
+            let pod_name = Arc::clone(&pod_name);
+            let waiting = Arc::clone(&waiting);
+            let refuse = Arc::clone(&refuse);
+            async move {
+                let pending = |name: &str| {
+                    pod_reply(&Pod {
+                        metadata: kube::api::ObjectMeta {
+                            name: Some(name.to_string()),
+                            namespace: Some("space".to_string()),
+                            uid: Some(format!("{name}-uid")),
+                            ..Default::default()
+                        },
+                        status: Some(PodStatus {
+                            phase: Some("Pending".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                };
+                let name = pod_name.lock().unwrap().clone();
+                let at_pod = name.as_deref().map(|name| format!("{PODS_PATH}/{name}"));
+                match request.method {
+                    Method::POST if request.path == PODS_PATH => {
+                        let name = request
+                            .body
+                            .as_ref()
+                            .and_then(|pod| pod.pointer("/metadata/name"))
+                            .and_then(serde_json::Value::as_str)
+                            .expect("a pod create names its pod")
+                            .to_string();
+                        *pod_name.lock().unwrap() = Some(name.clone());
+                        pending(&name)
+                    }
+                    // The pod never reports an IP.
+                    Method::GET if request.path == PODS_PATH => KubeReply::Hang,
+                    Method::GET if Some(&request.path) == at_pod.as_ref() => {
+                        pending(name.as_deref().expect("the pod was created"))
+                    }
+                    Method::GET if request.path == EVENTS_PATH => {
+                        let name = name.expect("events are watched after the pod is created");
+                        waiting.notify_one();
+                        refuse.notified().await;
+                        KubeReply::WatchEvents(vec![json!({
+                            "type": "ADDED",
+                            "object": {
+                                "apiVersion": "v1",
+                                "kind": "Event",
+                                "metadata": { "name": format!("{name}.1"), "namespace": "space" },
+                                "involvedObject": {
+                                    "kind": "Pod",
+                                    "name": name,
+                                    "uid": format!("{name}-uid"),
+                                },
+                                "reason": "FailedCreatePodSandBox",
+                                "message": REFUSAL,
+                                "type": "Warning",
+                            },
+                        })])
+                    }
+                    Method::DELETE if Some(&request.path) == at_pod.as_ref() => {
+                        kube_status(StatusCode::OK, "Success")
+                    }
+                    _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+                }
+            }
+        })
+    };
+    let kubernetes =
+        crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client(
+            db.pool.clone(),
+            client,
+        );
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    configure_test_ecw_credential_keyring(&mut state);
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::from_kubernetes(kubernetes),
+    );
+    let app = e2b_api_routes()
+        .layer(Extension(AuthEcwActor(Some(actor))))
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+
+    let create = app.clone().oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/sandboxes")
+            .header(header::HOST, TEST_ECW_API_HOST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"templateID":"seed"}"#))?,
+    );
+    tokio::select! {
+        answered = create => {
+            return Err(format!("the create answered before it waited: {:?}", answered?.status()).into());
+        }
+        waited = tokio::time::timeout(Duration::from_secs(30), waiting.notified()) => waited?,
+    }
+    // The create future is dropped above, as the server drops a handler whose
+    // client disconnected.
+    let sandbox_id: SandboxId = sqlx::query_scalar(sql!("SELECT id FROM sandboxes"))
+        .fetch_one(&db.pool)
+        .await?;
+    refuse.notify_one();
+
+    let removed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let rows: i64 =
+                sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+                    .bind(sandbox_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            if rows == 0 {
+                return TestResult::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let lifecycle: Option<String> =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert!(
+        removed.is_ok(),
+        "the failed create's sandbox row survived its client, as {lifecycle:?}"
+    );
+    removed??;
+
+    let pod_name = pod_name
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("the pod was created")?;
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.method == Method::DELETE
+                && request.path == format!("{PODS_PATH}/{pod_name}")),
+        "the failed create deleted its pod"
+    );
+    let active_executions: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        active_executions, 0,
+        "the failed create retired its execution"
+    );
+    let get = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/sandboxes/{sandbox_id}"))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
     Ok(())
 }

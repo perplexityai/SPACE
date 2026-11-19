@@ -2,7 +2,8 @@
 //! contained VMM reads provider state; privileged code accepts a bounded, typed
 //! configuration and stages fresh inodes through pinned directories.
 use super::*;
-use pplx_space_common_core::types::{NodeSpacePath, RuntimeKind};
+use pplx_space_artifact_model::NodeSpacePath;
+use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_runtime_core::{boot::BootSource, control::StateWorkspace};
 use std::io::{Read, Write};
 
@@ -105,46 +106,48 @@ impl NodeManagerService {
     pub(super) async fn capture_cloud_hypervisor_state(
         &self,
         request: Request<StateCapture>,
-        destination: CaptureDestination,
+        destination: &mut CaptureDestination,
         boot_source: BootSource,
     ) -> Result<Response<CaptureVmStateResponse>, Status> {
-        if matches!(&destination, CaptureDestination::Encrypted(_)) {
+        if matches!(destination, CaptureDestination::Encrypted(..)) {
             let id = request.get_ref().sandbox_id.id();
-            let guard = self.sandbox_device_stack_lock(&id).await.lock_owned().await;
-            let service = self.clone();
-            return run_detached(
-                self.device_op_tasks.clone(),
-                "encrypted CH capture",
-                async move {
-                    let _guard = guard;
-                    let result = service
-                        .capture_cloud_hypervisor_inner(request, destination, boot_source)
-                        .await;
-                    let sandbox_id = id.to_string();
-                    // Stop even after a partial capture. Closing the VMM and its
-                    // mount namespace is required before the volume can be sealed.
-                    let stopped = stop_runtime_for_encrypted_seal(&service, &sandbox_id).await;
-                    let root = pplx_space_node_runtime_core::control::isolation_root(
-                        RuntimeKind::CloudHypervisor,
-                        &sandbox_id,
-                    )
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                    let drained = service
-                        .off_runtime("drain CH encrypted snapshot bind", move || {
-                            super::super::cleanup_helpers::drain_stale_mounts(
-                                &root.join("state/encsnap"),
-                                |path| unmount_if_present(path),
-                            )
-                            .map_err(Status::from)?;
-                            Ok(())
-                        })
-                        .await;
-                    stopped?;
-                    drained?;
-                    result
-                },
+            let _guard = self.sandbox_device_stack_lock(&id).await.lock_owned().await;
+            let result = self
+                .capture_cloud_hypervisor_inner(request, destination, boot_source)
+                .await;
+            let CaptureDestination::Encrypted(_, receipt) = destination else {
+                unreachable!("encrypted capture branch");
+            };
+            if !receipt.capture_started() {
+                // The outer owner persists refusal without stopping the runtime.
+                return result;
+            }
+            let sandbox_id = id.to_string();
+            // A partial capture still needs its mappings released. Only capture
+            // success followed by confirmed stop authorizes a committed receipt.
+            let stopped = stop_runtime_for_encrypted_seal(self, &sandbox_id).await;
+            let result = match result {
+                Ok(response) if stopped.is_ok() => receipt.commit().await.map(|()| response),
+                other => other,
+            };
+            let root = pplx_space_node_runtime_core::control::isolation_root(
+                RuntimeKind::CloudHypervisor,
+                &sandbox_id,
             )
-            .await?;
+            .map_err(|e| Status::internal(e.to_string()))?;
+            let drained = self
+                .off_runtime("drain CH encrypted snapshot bind", move || {
+                    super::super::cleanup_helpers::drain_stale_mounts(
+                        &root.join("state/encsnap"),
+                        |path| unmount_if_present(path),
+                    )
+                    .map_err(Status::from)?;
+                    Ok(())
+                })
+                .await;
+            stopped?;
+            drained?;
+            return result;
         }
         self.capture_cloud_hypervisor_inner(request, destination, boot_source)
             .await
@@ -153,13 +156,20 @@ impl NodeManagerService {
     async fn capture_cloud_hypervisor_inner(
         &self,
         request: Request<StateCapture>,
-        destination: CaptureDestination,
+        destination: &mut CaptureDestination,
         boot_source: BootSource,
     ) -> Result<Response<CaptureVmStateResponse>, Status> {
         let req = request.into_inner();
-        let (paths, mount, workspace_kind) = match destination {
-            CaptureDestination::Plain(paths) => (Some(paths), None, StateWorkspace::Plain),
-            CaptureDestination::Encrypted(mount) => (None, Some(mount), StateWorkspace::Encrypted),
+        let (destination, mount, workspace_kind, receipt) = match destination {
+            CaptureDestination::Plain(paths) => {
+                (paths.dest_dir.take(), None, StateWorkspace::Plain, None)
+            }
+            CaptureDestination::Encrypted(mount, receipt) => (
+                None,
+                Some(mount.clone()),
+                StateWorkspace::Encrypted,
+                Some(receipt),
+            ),
         };
         let sandbox_id = req.sandbox_id.as_str().to_owned();
         let lease = self
@@ -186,6 +196,9 @@ impl NodeManagerService {
         let client = self
             .runtime_control(RuntimeKind::CloudHypervisor, &sandbox_id)
             .await?;
+        if let Some(receipt) = receipt {
+            receipt.begin_capture();
+        }
         client
             .capture_state(workspace_kind, boot.memory_bytes())
             .await
@@ -201,7 +214,6 @@ impl NodeManagerService {
                     "encoded runtime state exceeds 16 MiB",
                 ));
             }
-            let destination = paths.and_then(|paths| paths.dest_dir);
             let export = destination.is_some();
             let output = match destination {
                 Some(path) => trusted_paths::create_directory(&path)?,
@@ -238,7 +250,7 @@ impl NodeManagerService {
         lease: &SlotInfo,
         source: RestoreSource,
         boot_source: BootSource,
-        rootfs_limiter: Option<pplx_space_common_core::types::RateLimiter>,
+        rootfs_limiter: Option<pplx_space_execution_spec::RateLimiter>,
     ) -> Result<Response<RestoreVmStateResponse>, Status> {
         let req = request.into_inner();
         let (source, mount, workspace_kind) = match source {

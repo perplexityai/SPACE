@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::{DEFAULT_DISK_IO_BURST_SECS, RateLimiter, TokenBucket};
+use pplx_space_execution_spec::{DEFAULT_DISK_IO_BURST_SECS, RateLimiter, TokenBucket};
 use serde_json::{Value, json};
 use tokio::time::MissedTickBehavior;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -498,10 +498,10 @@ impl NodeManagerService {
             return Ok(Enforcement::Superseded);
         }
         let runtime = self.recorded_execution(id.to_owned()).await?.map_or(
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            pplx_space_execution_spec::RuntimeKind::Firecracker,
             |execution| execution.runtime().kind,
         );
-        if runtime != pplx_space_common_core::types::RuntimeKind::Firecracker {
+        if runtime != pplx_space_execution_spec::RuntimeKind::Firecracker {
             return Err(Status::failed_precondition(
                 "live disk-I/O ceiling is unsupported by this runtime; drain before enabling the ceiling",
             ));

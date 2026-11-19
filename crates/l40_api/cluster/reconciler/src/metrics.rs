@@ -1,4 +1,4 @@
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use pplx_space_state_reconciliation::{NODE_RECONCILE_CLAIM_STALE_SECS, RECONCILE_FACETS};

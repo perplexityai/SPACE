@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING
 
 from space_smoke.capabilities import (
     LimiterProbeOutcome,
-    RateLimitProbe,
     RateLimiterControl,
+    RateLimitProbe,
 )
 from space_smoke.runtime import Compensation, ResourceScope
 
@@ -63,6 +63,7 @@ LIMITER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_NATIVE_INLINE_KINDS",
     "SPACE_NATIVE_INLINE_MAX_CONCURRENT",
     "SPACE_NATIVE_INLINE_TEST_HOLD_SECS",
+    "SPACE_NATIVE_INLINE_TEST_RELEASE_FILE",
 )
 REDIS_URL_ENV = "SPACE_REDIS_URL"
 
@@ -386,21 +387,15 @@ class RateLimiterAssertions:
         self.expect_per_client_limited(outcomes, label="per_client_after_recovery")
 
     def expect_fail_open(self, outcomes: list[LimiterProbeOutcome]) -> None:
-        """With the store down neither limiter may reject; other statuses are not judged."""
+        """With the store down every create must still admit a sandbox."""
 
-        limiter_429s = [
-            o
-            for o in outcomes
-            if is_limiter_rejection(o, SERVER_LIMIT_MESSAGE)
-            or is_limiter_rejection(o, PER_CLIENT_LIMIT_MESSAGE)
-        ]
         histogram = status_histogram(outcomes)
         self._fixture.record("fail_open_statuses", histogram)
         self._fixture.verify(
-            not limiter_429s,
-            "a limiter rejected with Redis unreachable; both must fail open",
+            bool(outcomes) and all(o.status == 201 and o.sandbox_id for o in outcomes),
+            "creates did not all admit sandboxes with Redis unreachable; both limiters must fail open",
             statuses=histogram,
-            limiter_rejections=[o.message[:120] for o in limiter_429s],
+            sample_messages=sorted({o.message[:120] for o in outcomes})[:4],
         )
 
     def admitted_ids(self, outcomes: list[LimiterProbeOutcome]) -> list[str]:

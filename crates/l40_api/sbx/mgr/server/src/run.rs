@@ -19,16 +19,16 @@ use std::time::Duration;
 
 use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse};
 use http_body::{Body, Frame, SizeHint};
-use pplx_space_common_core::host::linux::identities::group_names;
-use pplx_space_common_core::{
-    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_ADMISSION_GATE,
-    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY,
-    host::linux::paths::SANDBOX_MANAGER_DEPENDENCY_WORK_GATE,
+use pplx_space_host_layout::identities::group_names;
+use pplx_space_host_layout::{
+    paths::SANDBOX_MANAGER_DEPENDENCY_ADMISSION_GATE,
+    paths::SANDBOX_MANAGER_DEPENDENCY_DRAIN_CAPABILITY,
+    paths::SANDBOX_MANAGER_DEPENDENCY_WORK_GATE,
 };
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_SERVICE_MUTEX_TIMEOUT};
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
-use pplx_space_spaced_common::proto::host_control::host_control_server::HostControlServer;
+use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControlServer;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -62,7 +62,7 @@ const SPACE_NODE_ROLE_ENV: &str = "SPACE_NODE_ROLE";
 const SPACE_NODE_MANAGED_BY_ENV: &str = "SPACE_NODE_MANAGED_BY";
 const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 // Keep this above E2B_FILE_WRITE_CHUNK_BYTES (3 MiB) plus protobuf overhead.
-const SANDBOX_MANAGER_MAX_DECODE_BYTES: usize = pplx_space_common_core::spaced::MAX_MESSAGE_BYTES;
+const SANDBOX_MANAGER_MAX_DECODE_BYTES: usize = pplx_space_guest_process::MAX_MESSAGE_BYTES;
 const HOST_CONTROL_MAX_DECODE_BYTES: usize = 64 * 1024;
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
@@ -539,6 +539,8 @@ where
 /// code that reads it, so this carries only what the flags do.
 #[derive(Debug, Clone)]
 pub struct SbxMgrRunConfig {
+    /// Typed startup policy for optional admissions; receipt recovery is independent.
+    pub automatic_guest_updates: bool,
     /// Production sandbox-manager Unix socket, bound only after the service
     /// mutex is acquired.
     pub socket_path: PathBuf,
@@ -573,10 +575,10 @@ pub enum RunSbxMgrError {
     NodeRole {
         role: String,
         #[source]
-        source: pplx_space_common_core::types::NodeRoleParseError,
+        source: pplx_space_node_model::NodeRoleParseError,
     },
     #[error("invalid {SPACE_NODE_MANAGED_BY_ENV}: {0}")]
-    NodeManagedBy(#[source] pplx_space_common_core::types::NodeManagedByParseError),
+    NodeManagedBy(#[source] pplx_space_node_model::NodeManagedByParseError),
     #[error("could not read {SPACE_NODE_MANAGED_BY_ENV}: {0}")]
     NodeManagedByEnvironment(#[source] std::env::VarError),
     #[error("failed to enable dependency restart drain: {0}")]
@@ -658,7 +660,7 @@ fn report_active_failure(error: &RunSbxMgrError) {
 
 fn parse_node_managed_by(
     value: Result<String, std::env::VarError>,
-) -> Result<Option<pplx_space_common_core::types::NodeManagedBy>, RunSbxMgrError> {
+) -> Result<Option<pplx_space_node_model::NodeManagedBy>, RunSbxMgrError> {
     match value {
         Ok(value) => value
             .parse()
@@ -806,7 +808,7 @@ pub async fn run(
         Ok(value) if !value.trim().is_empty() => {
             let role = value.trim();
             Some(
-                pplx_space_common_core::types::NodeRole::from_str(role).map_err(|source| {
+                pplx_space_node_model::NodeRole::from_str(role).map_err(|source| {
                     RunSbxMgrError::NodeRole {
                         role: role.to_string(),
                         source,
@@ -822,6 +824,7 @@ pub async fn run(
     let service = SandboxManagerService::new_with_config(
         conn,
         SandboxManagerServiceOptions {
+            automatic_guest_updates: config.automatic_guest_updates,
             host_control_socket_path: config.host_control_socket_path.clone(),
             shutdown_token: shutdown_token.clone(),
             task_tracker: task_tracker.clone(),
@@ -984,6 +987,9 @@ pub async fn run(
     service.start_sandbox_eviction(shutdown_token.child_token(), &task_tracker);
     service.start_snapshot_upload_maintenance(shutdown_token.child_token(), &task_tracker);
     service.start_runtime_upgrade_recovery(shutdown_token.child_token(), &task_tracker);
+    service.start_automatic_guest_updates(shutdown_token.child_token(), &task_tracker);
+    service.start_guest_update_recovery(shutdown_token.child_token(), &task_tracker);
+    service.start_guest_configuration_observation(shutdown_token.child_token(), &task_tracker);
     service.start_teardown_suspend_resumer(shutdown_token.child_token(), &task_tracker);
     task_tracker.spawn(
         snapshot_upload_worker
@@ -1028,6 +1034,12 @@ pub async fn run(
     health_reporter
         .set_service_status(
             pplx_space_sbx_mgr_client::ACTIVATION_POLICY_HEALTH_SERVICE,
+            tonic_health::ServingStatus::Serving,
+        )
+        .await;
+    health_reporter
+        .set_service_status(
+            pplx_space_sbx_mgr_client::CREATE_REQUIRED_ENVIRONMENT_HEALTH_SERVICE,
             tonic_health::ServingStatus::Serving,
         )
         .await;

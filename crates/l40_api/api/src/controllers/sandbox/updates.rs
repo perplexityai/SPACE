@@ -1,11 +1,11 @@
 use super::*;
 use crate::controllers::db_contention_error;
 use crate::controllers::substrate::RuntimeRpcError;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
 use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 
 /// `UpdateSandboxRequest` has no spelling for "clear this override and
@@ -165,8 +165,9 @@ pub(super) fn observed_access_idle_generation(
     if observed.sandbox_id != sandbox_id.to_string()
         || !response.missing_ids.is_empty()
         || observed.state_degraded
-        || observed.observed_lifecycle().ok()
-            != Some(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started)
+        || !observed.observed_status().is_ok_and(|status| {
+            status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started)
+        })
     {
         return Err(unavailable());
     }
@@ -211,7 +212,11 @@ fn classify_deadline_execution(
     {
         return Err(tonic::Status::failed_precondition("access deadline execution changed").into());
     }
-    match observed.observed_lifecycle().ok() {
+    match observed
+        .observed_status()
+        .ok()
+        .and_then(|status| status.unowned())
+    {
         Some(SandboxLifecycleState::Started) => Ok(DeadlineExecutionReadiness::Ready),
         Some(
             SandboxLifecycleState::Creating
@@ -314,6 +319,32 @@ fn access_idle_deadline_request(
     });
     request.set_timeout(budget);
     Ok(request)
+}
+
+/// Retry admission for this elapsed-time window, even when failures are immediate.
+const ROLLBACK_NODE_DELETE_RETRY_WINDOW: Duration = Duration::from_secs(144);
+
+/// Space unconfirmed admission retries from 250 ms up to 5 s apart. The deadline
+/// bounds starting retries, not an in-flight destructive teardown: cancelling
+/// that call could leak a backing instance, especially on the Direct substrate.
+async fn rollback_node_delete<F, Fut>(mut delete: F) -> Result<(), SubstrateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), SubstrateError>>,
+{
+    let deadline = tokio::time::Instant::now() + ROLLBACK_NODE_DELETE_RETRY_WINDOW;
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        let result = delete().await;
+        if !matches!(result, Err(SubstrateError::NodeDeleteNotAdmitted { .. })) {
+            return result;
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return result;
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
 }
 
 impl SandboxController {
@@ -1089,6 +1120,10 @@ impl SandboxController {
                 id,
                 crate::controllers::substrate::RecoveryCharge::enforce(
                     self.cluster_admission.as_ref(),
+                    crate::controllers::substrate::CapPolicy::Check,
+                    crate::controllers::substrate::ActivationAttribution::inherit(
+                        sandbox.activating_client_id.as_ref(),
+                    ),
                 ),
             )
             .await?;
@@ -1124,13 +1159,17 @@ impl SandboxController {
     }
 
     pub(super) async fn rollback_created_sandbox(&self, pool: &PgPool, sandbox_id: SandboxId) {
-        // Let the delete complete — it is NOT response-margin-critical: the
-        // binding upstream cut is the node-RPC channel timeout (which bounds the
-        // individual worker stop/delete RPCs), and the ALB idle timeout is far
-        // higher (see `ALB_IDLE_TIMEOUT_SECS`). Cancelling a slow delete would
-        // leak the backing instance (on direct, with no orphan GC, a running VM
-        // invisibly), so the unbounded delete is the safe choice.
-        if let Err(err) = self.substrate.delete_execution(sandbox_id).await {
+        // Keep teardown request-owned until admission succeeds or its retry
+        // window ends. Each in-flight call keeps its substrate-specific bounds;
+        // durable ownership after exhausted rollback is a separate obligation.
+        let teardown = self.live_teardown(sandbox_id).await;
+        let result = rollback_node_delete(|| self.substrate.delete_execution(sandbox_id)).await;
+        // Only a confirmed teardown, or an absent sandbox, uncounts it.
+        // Otherwise its pending live-cap member stays to lapse.
+        if matches!(result, Ok(()) | Err(SubstrateError::NotFound { .. })) {
+            self.forget_live_sandbox(teardown).await;
+        }
+        if let Err(err) = result {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 error = %err,
@@ -1201,6 +1240,8 @@ fn snapshots_response_json(
 
 #[cfg(test)]
 mod postgres_tests;
+#[cfg(test)]
+mod rollback_tests;
 #[cfg(test)]
 mod transport_tests;
 

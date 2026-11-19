@@ -14,4 +14,4 @@ postgres = []
 workspace = true
 
 [dependencies]
-pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }

@@ -4,8 +4,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::DiskIoLimits;
+use pplx_space_execution_spec::DiskIoLimits;
+use pplx_space_sql_locator::sql;
 use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -276,7 +276,7 @@ fn validate_policy_request(
         ));
     }
     if let Some(disk_mib) = request.disk_mib {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(disk_mib)
+        pplx_space_sandbox_model::sandbox_storage::validate_rootfs_mib(disk_mib)
             .map_err(|error| ControllerError::bad_request(format!("disk_mib: {error}")))?;
     }
     if request.reset_disk_to_template_default && request.disk_mib.is_some() {

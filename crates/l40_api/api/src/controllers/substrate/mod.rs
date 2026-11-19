@@ -1,4 +1,5 @@
 pub mod direct;
+pub mod environment_placement;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
 mod runtime_rpc;
@@ -29,7 +30,7 @@ mod readiness_stub {
 #[cfg(not(feature = "kubernetes"))]
 pub use readiness_stub::ReflectorReady;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
@@ -39,20 +40,25 @@ use std::{
 };
 
 use crate::metrics::sandbox::api::SandboxApiMetricIdentity;
+use pplx_space_accounts::{Email, NodeId, OrgId, SandboxOwner, UserId};
 use pplx_space_api_route::wait_ready_lifecycle_request;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_bearer_token::SpaceBearerToken;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, BackupSource, Email,
-    LocalArtifactId, NodeAddress, NodeId, NodeManagedBy, NodePoolName, NodeRole, OrgId, PodName,
-    PodResourceVersion, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-    SandboxOwner, SandboxRouteIdentity, TemplateName, UserId,
-};
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_k8s_ids::{PodName, PodResourceVersion, PodUid};
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyProto;
+use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
 use pplx_space_rpc_auth::SpaceBearerInterceptor;
+use pplx_space_sandbox_model::{
+    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
+};
+use pplx_space_snapshot_model::{
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, BackupSource, LocalArtifactId,
+};
+use pplx_space_template_model::TemplateName;
 
 /// Convert a request override at the V1-only sandbox-manager boundary.
 pub(super) fn override_request_policy(
@@ -82,6 +88,7 @@ use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse, Sandbox
 use sqlx::{PgPool, Postgres, Transaction};
 
 mod execution_fence;
+mod live_count;
 mod local_artifact;
 pub(crate) mod native_access;
 mod node_api_client;
@@ -89,13 +96,16 @@ mod pool_claims;
 mod recovery_charge;
 pub mod runtime_upgrade;
 mod sandbox_state_probe;
+mod slot_headroom;
 
 pub use execution_fence::*;
+pub use live_count::*;
 pub use local_artifact::*;
 pub use node_api_client::*;
 pub use pool_claims::*;
 pub use recovery_charge::*;
 pub use sandbox_state_probe::*;
+pub use slot_headroom::*;
 
 /// Outcome of a non-recovering guest command-readiness probe.
 ///
@@ -212,7 +222,51 @@ impl ActivationCompletion {
     }
 }
 
-pub use pplx_space_common_core::types::AbandonedRestoreRetirement;
+pub use pplx_space_sandbox_model::AbandonedRestoreRetirement;
+
+/// Whether SPACE records which client's activation created a sandbox's
+/// runtime: the `sandboxes.activating_client_id` record, the
+/// `space.pplx.net/client-id` pod label and the label patch at warm-pool
+/// adoption.
+///
+/// Off, none of the three happens: new pods are unlabeled, adoption sends no
+/// patch, and nothing writes the record. The client is still carried in
+/// process (charges, fork payloads), which changes nothing outside it. The
+/// switch ships off and is turned on per deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivationClientAttribution {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl ActivationClientAttribution {
+    /// The switch both the API and the cluster controller read
+    /// ([`Self::from_env`]): `1`, `true`, `yes`, `on` or `enabled`, in any
+    /// case, turns attribution on; unset or anything else keeps it off.
+    pub const ENV: &'static str = "SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED";
+
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_enabled(pplx_space_env_vars::env_flag_var(Self::ENV, false))
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+
+    /// `client_id` when attribution is on, else `None`.
+    pub fn gate<T>(self, client_id: Option<T>) -> Option<T> {
+        client_id.filter(|_| self.is_enabled())
+    }
+}
 
 /// Exact operation lease to release after the controller publishes its lifecycle.
 /// A later owner or execution must never be released by this completion.
@@ -428,7 +482,7 @@ pub struct CreateExecutionRequest<'a> {
     pub actor: &'a ActorRef,
     pub template_ref: &'a TemplateRef<'a>,
     pub resources: &'a SandboxResources,
-    pub disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    pub disk_io_limits: pplx_space_execution_spec::DiskIoLimits,
     pub env: &'a BTreeMap<String, String>,
     pub auto_lifecycle: &'a AutoLifecyclePolicy,
     pub network_policy_override: Option<&'a NetworkPolicyV1>,
@@ -437,6 +491,10 @@ pub struct CreateExecutionRequest<'a> {
     pub template_network_policy_generation: u64,
     pub restore_from: Option<SnapshotRef<'a>>,
     pub wait_until_ready: bool,
+    /// The caller's cap on a `wait_until_ready` create's wait for its guest,
+    /// below the substrate's own bound; see
+    /// [`crate::models::CreateSandboxRequest::command_ready_wait`].
+    pub command_ready_wait: Option<Duration>,
     /// BYOK: create this sandbox on dm-crypt encrypted volumes. Immutable for
     /// the sandbox's lifetime; the control plane stamps it on the `sandboxes`
     /// row and the substrate must carry it to the node create (or fail closed
@@ -448,6 +506,10 @@ pub struct CreateExecutionRequest<'a> {
     /// PodSpec-only and not persisted, so it applies at create and does not
     /// survive to a later reconcile/restore.
     pub node_pool: Option<&'a NodePoolName>,
+    /// The create's client id: the ECW caller's, or `native`. The sandbox
+    /// pod is labeled with it as `space.pplx.net/client-id`; `None` creates
+    /// it unlabeled.
+    pub client_id: Option<&'a pplx_space_accounts::ClientId>,
 }
 
 pub struct CreateExecutionOutcome {
@@ -568,6 +630,16 @@ pub enum SubstrateError {
     /// a suspend that can't succeed.
     #[error("{message}")]
     SandboxNoPod { message: String },
+    /// kube-scheduler marked the sandbox pod `Unschedulable`: no node it may
+    /// use can take it, usually because their network slots are full. Raised
+    /// where the substrate reads that verdict off a pod. Code that handles a
+    /// failed pod read treats it like [`Self::Unavailable`]; the transport
+    /// classifiers (node-client eviction, node-mgr reachability) leave it out,
+    /// since no connection failed. Its HTTP answer carries the same jittered
+    /// `Retry-After` as the limiter's capacity refusals, except where a create
+    /// rolls back and strips every retry hint from its error.
+    #[error("{message}")]
+    Unschedulable { message: String },
     #[error("{message}")]
     Conflict { message: String },
     #[error("{message}")]
@@ -576,6 +648,11 @@ pub enum SubstrateError {
     Failed { message: String },
     #[error("{message}")]
     NotFound { message: String },
+    /// The node refused the request as invalid, a verdict every retry and
+    /// every node would repeat, such as a disk smaller than the template's
+    /// rootfs. Callers report it as the caller's error instead of retrying.
+    #[error("{message}")]
+    InvalidRequest { message: String },
     /// A readiness wait exhausted its window. `phase` is `Some` when the
     /// timeout fired inside a specific readiness wait (see
     /// [`WaitReadyTimeoutPhase`]); `None` for outer budgets that wrap the
@@ -617,6 +694,12 @@ pub enum SubstrateError {
     /// treating it as an in-flight suspend that will converge unaided.
     #[error("{message}")]
     RetainedFilesystemOnlyCopy { message: String },
+    /// The node had not yet admitted a node-local delete when the teardown
+    /// stopped waiting for it, or could not say whether it had, so the
+    /// delete's refusals have not run. Cluster deletion must preserve its row
+    /// and retry the delete, within the operation's retry budget.
+    #[error("{message}")]
+    NodeDeleteNotAdmitted { message: String },
     /// Another request owns the bounded activation lease for this execution.
     /// Same-target callers may join its result; different-target callers must
     /// retry after the lease lapses.
@@ -625,7 +708,7 @@ pub enum SubstrateError {
         message: String,
         lease_remaining: Duration,
         same_target: bool,
-        owner_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        owner_attempt_id: pplx_space_sandbox_model::SandboxActivationAttemptId,
     },
     /// Cluster activation admission rejected a freshly-won restore claim.
     /// The claim has already been released; the caller should retry after
@@ -634,10 +717,12 @@ pub enum SubstrateError {
     AdmissionRejected {
         message: String,
         retry_after: Option<Duration>,
-        /// Rate-limit rejections carry the admission cause the async
-        /// dispatcher treats as indefinite backpressure; empty-cluster
-        /// rejections get a bounded retry instead.
-        rate_limited: bool,
+        /// Decides the status and whether the async dispatcher waits it out
+        /// as backpressure or retries it against a bounded budget.
+        kind: ActivationRejectionKind,
+        /// The client's live-sandbox cap refused the activation, not cluster
+        /// admission: a per-client refusal, never `rate_limited`.
+        live_cap: bool,
     },
     #[error("{message}")]
     Cancelled { message: String },
@@ -868,6 +953,12 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::Unavailable { message } | SubstrateError::SandboxNoPod { message } => {
                 ControllerError::service_unavailable(message)
             }
+            // Slots free as sandboxes stop, which nothing here can predict, so
+            // this spreads the retries rather than sizing the wait.
+            SubstrateError::Unschedulable { message } => {
+                ControllerError::service_unavailable(message)
+                    .with_retry_after_header(crate::cluster_admission::capacity_retry_after())
+            }
             SubstrateError::Conflict { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
             }
@@ -876,6 +967,7 @@ impl From<SubstrateError> for ControllerError {
             }
             SubstrateError::Failed { message } => ControllerError::internal(message),
             SubstrateError::NotFound { message } => ControllerError::not_found(message),
+            SubstrateError::InvalidRequest { message } => ControllerError::bad_request(message),
             // A substrate wait that exhausted its ALB-aware budget is not a
             // dead end: the node keeps converging, so surface a retryable
             // 503 + `Retry-After` rather than an opaque 504. The
@@ -923,6 +1015,9 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::RetainedFilesystemOnlyCopy { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
             }
+            SubstrateError::NodeDeleteNotAdmitted { message } => {
+                ControllerError::service_unavailable(message).with_retry_after(GATEWAY_RETRY_AFTER)
+            }
             SubstrateError::ActivationInFlight {
                 message,
                 lease_remaining,
@@ -935,8 +1030,15 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::AdmissionRejected {
                 message,
                 retry_after,
-                rate_limited,
-            } => ControllerError::cluster_admission_rejected(message, retry_after, rate_limited),
+                live_cap: true,
+                ..
+            } => ControllerError::live_cap_refused(message, retry_after),
+            SubstrateError::AdmissionRejected {
+                message,
+                retry_after,
+                kind,
+                live_cap: false,
+            } => kind.controller_error(message, retry_after),
             SubstrateError::Cancelled { message } => ControllerError::service_unavailable(message),
             SubstrateError::Unsupported { message } => {
                 ControllerError::new(axum::http::StatusCode::NOT_IMPLEMENTED, message)
@@ -1041,10 +1143,13 @@ pub enum NodeAddressing {
     SubstrateNodeId,
 }
 
-/// Static facts about what a substrate supports. Shared code reads these
-/// instead of matching on which substrate is active. Each substrate returns
-/// one of the constants below; behavior that needs the substrate to act stays
-/// a [`SubstrateAdapter`] method.
+/// Static facts about the substrate. A new field states an infrastructure
+/// fact, never that a SPACE feature is off here: a missing feature is a gap
+/// row in the substrate's module doc, and an existing field that gates one is
+/// debt, not precedent (see this directory's `AGENTS.md`). Shared code reads
+/// these instead of matching on which substrate is active. Each substrate
+/// returns one of the constants below; behavior that needs the substrate to
+/// act stays a [`SubstrateAdapter`] method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubstrateCapabilities {
     /// Every restore-shaped wake (from `suspended` or `restoring`) claims
@@ -1075,19 +1180,31 @@ pub struct SubstrateCapabilities {
     pub start_of_suspended_claims_restoring: bool,
     /// How node-api targets are addressed.
     pub node_addressing: NodeAddressing,
-    /// Nodes live in the admin API's node registry: they are registered,
-    /// updated and deleted there, and their templates are pulled and deleted
-    /// there, rather than discovered by the substrate.
+    /// Nodes are registered through the admin API's node registry, not
+    /// discovered by the substrate: the registry's register and update routes
+    /// store each node's `node_api_endpoint` in its registry row, and the node
+    /// template pull and delete routes use the endpoints stored there. Without
+    /// it, the register, update and delete routes and the node template pull
+    /// and delete routes answer 501 after the admin check, before reading a
+    /// node.
     pub registers_nodes_via_admin_api: bool,
-    /// The control plane resolves a cold Firecracker create's shape: a
-    /// fallthrough create takes a configured or policy pool shape, and
-    /// otherwise vCPU and memory the request left unset come from the
-    /// template's build shape. Without it, the requested shape goes to the
-    /// node unchanged; Direct sends a custom vCPU or memory on its separate
-    /// start call (see the [`direct`] module doc).
+    /// The control plane resolves a cold Firecracker create's shape before
+    /// launch. A fallthrough create takes the vCPU, memory, disk size and disk
+    /// I/O limits of an enabled, non-encryptable pool config for its release,
+    /// or else of the template's preferred enabled warm-pool policy, when there
+    /// is one. Otherwise a create that is not a fork fills the vCPU and memory
+    /// it left unset from the template's build shape, when the template
+    /// inventory records one, so the sandbox row and the pod's annotations
+    /// carry them. Without it, the requested shape goes to the node unchanged;
+    /// Direct sends a custom vCPU or memory on its separate start call (see the
+    /// [`direct`] module doc).
+    ///
+    /// This is a SPACE feature, not an infrastructure fact: on a cold boot,
+    /// sandbox-manager takes the vCPU and memory a launch left unset from the
+    /// template's metadata on either substrate (2 vCPU and 1024 MiB when the
+    /// metadata has none). The field is debt; Direct's lack of the feature is
+    /// the "Cold create shape" gap row in the [`direct`] module doc.
     pub resolves_cold_create_shape: bool,
-    /// Create requests may carry a Kubernetes node-pool placement pin.
-    pub supports_node_pool_placement: bool,
     /// The substrate has a node scheduling primitive for
     /// [`Substrate::set_node_schedulability`] to patch, and the cluster
     /// controller has a node-drain reconciler for it (opt-in through
@@ -1096,7 +1213,7 @@ pub struct SubstrateCapabilities {
     /// and force-upload actions refuse before reading the node, except
     /// `:undrain`, which only clears a `drain_phase` an earlier drain left.
     /// A node row's counterpart is
-    /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_common_core::types::SubstrateKind::has_node_drain_reconciler).
+    /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_node_model::SubstrateKind::has_node_drain_reconciler).
     pub supports_node_drain: bool,
     /// The adapter drives sandboxes through a Kubernetes apiserver, with a
     /// client the process builds from its environment (an in-cluster config
@@ -1123,7 +1240,6 @@ impl SubstrateCapabilities {
         node_addressing: NodeAddressing::DirectEndpoint,
         registers_nodes_via_admin_api: true,
         resolves_cold_create_shape: false,
-        supports_node_pool_placement: false,
         supports_node_drain: false,
         uses_kubernetes_api: false,
         suspend_commits_lifecycle: false,
@@ -1135,7 +1251,6 @@ impl SubstrateCapabilities {
         node_addressing: NodeAddressing::SubstrateNodeId,
         registers_nodes_via_admin_api: false,
         resolves_cold_create_shape: true,
-        supports_node_pool_placement: true,
         supports_node_drain: true,
         uses_kubernetes_api: true,
         suspend_commits_lifecycle: true,
@@ -1180,6 +1295,14 @@ pub trait SubstrateAdapter: Send + Sync {
     /// What this substrate supports. Required, so every substrate (and the
     /// `Substrate` forwarding impl) states its answer.
     fn capabilities(&self) -> SubstrateCapabilities;
+
+    /// Whether this substrate accepts a create pinned to a node pool, so a
+    /// caller can refuse the create before enqueueing it. A substrate
+    /// without node-pool placement returns [`SubstrateError::Unsupported`],
+    /// the refusal [`Self::create_execution`] gives a create that carries a
+    /// pin. `Ok` does not mean `node_pool` exists or has room for the
+    /// execution.
+    fn check_node_pool_placement(&self, node_pool: &NodePoolName) -> Result<(), SubstrateError>;
 
     /// Create the active execution object for a newly-created sandbox.
     ///
@@ -1288,76 +1411,6 @@ pub trait SubstrateAdapter: Send + Sync {
         target: &NodeApiTarget<'_>,
     ) -> Result<(), SubstrateError> {
         delete_observed_execution_via_node_api(self, sandbox_id, target).await
-    }
-
-    async fn enqueue_artifact_backup(
-        &self,
-        sandbox_id: SandboxId,
-        expected_kind: ArtifactKind,
-        source: BackupSource,
-        target: &NodeApiTarget<'_>,
-    ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
-        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
-        enqueue_artifact_backup_via_retrying_node_api(
-            &endpoint_addr,
-            sandbox_id,
-            expected_kind,
-            source,
-        )
-        .await
-    }
-
-    async fn create_snapshot_from_durable_artifact(
-        &self,
-        target: &NodeApiTarget<'_>,
-        operation_id: OperationId,
-        source_sandbox_id: SandboxId,
-        target_sandbox_id: SandboxId,
-        source_storage_uri: String,
-        destination_storage_uri: String,
-    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
-        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
-        let mut node_api = retrying_worker_node_api(&endpoint_addr, Duration::from_secs(30))?;
-        let mut client = RetryingWorkerApiClient::new(&mut node_api);
-        let response = client
-            .create_sandbox_snapshot(
-                pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest {
-                    sandbox_id: source_sandbox_id.to_string(),
-                    r#type: pplx_space_sbx_mgr_client::proto::SnapshotType::Disk as i32,
-                    label: None,
-                    creation_identity: Some(
-                        pplx_space_sbx_mgr_client::proto::SnapshotCreationIdentity {
-                            request_id: operation_id.as_uuid().to_string(),
-                        },
-                    ),
-                    source: Some(pplx_space_sbx_mgr_client::proto::CreateSnapshotSource {
-                        source: Some(
-                            pplx_space_sbx_mgr_client::proto::create_snapshot_source::Source::DurableArtifact(
-                                pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource {
-                                    source_storage_uri,
-                                    destination_storage_uri,
-                                    destination_sandbox_id: target_sandbox_id.to_string(),
-                                    destination_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32,
-                                },
-                            ),
-                        ),
-                    }),
-                },
-                Duration::from_secs(600),
-            )
-            .await
-            .map_err(durable_snapshot_rpc_error)?
-            .into_inner();
-        let published =
-            response
-                .published_durable_artifact
-                .ok_or_else(|| SubstrateError::Failed {
-                    message: "durable snapshot response omitted its storage identity".to_string(),
-                })?;
-        Ok(PublishedDurableSnapshot {
-            storage_uri: published.storage_uri,
-            bytes_published: published.bytes_published,
-        })
     }
 
     /// Ensure the active execution object exists and is usable for runtime calls.
@@ -1599,6 +1652,22 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Label an adopted pool sandbox's runtime with its adopter's client id,
+    /// before the adoption commits. A pool runtime is built before it has an
+    /// adopter, and adoption is its activation. No runtime waiting in the pool
+    /// carries a label. On failure the adoption must not proceed: a
+    /// transient failure gives up the slot or keeps the claim as
+    /// `on_transient` says, and any other failure invalidates it. A slot goes
+    /// back to the pool only when its patch never ran, and
+    /// `rollback_pooled_execution_claim` removes the label from a slot it
+    /// takes out of the inventory.
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_accounts::ClientId>,
+        on_transient: AdoptionLabelTransient,
+    ) -> Result<AdoptionLabelOutcome, ControllerError>;
+
     async fn cleanup_failed_pooled_prepare(
         &self,
         claim: &PooledExecutionClaim,
@@ -1607,26 +1676,15 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(PooledPrepareFailureCleanup::FinalizeSandboxDbDelete)
     }
 
-    async fn apply_pooled_execution_auto_lifecycle(
-        &self,
-        _claim: &PooledExecutionClaim,
-        _policy: &AutoLifecyclePolicy,
-    ) -> Result<(), ControllerError> {
-        Ok(())
-    }
-
     async fn prepare_pooled_execution(
         &self,
-        _metric_identity: SandboxApiMetricIdentity,
-        _request: &PooledExecutionClaimRequest<'_>,
+        metric_identity: SandboxApiMetricIdentity,
+        request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,
-        _wait_until_ready: bool,
-        _timeout: Duration,
-    ) -> Result<(), ControllerError> {
-        self.apply_pooled_execution_auto_lifecycle(claim, policy)
-            .await
-    }
+        wait_until_ready: bool,
+        timeout: Duration,
+    ) -> Result<(), ControllerError>;
 
     async fn list_pool_configs(&self) -> Result<Vec<ClusterPoolConfigResponse>, ControllerError> {
         Err(SubstrateError::Unsupported {
@@ -1702,6 +1760,7 @@ where
                 sandbox_id: sandbox_id.to_string(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             },
             NODE_RPC_TIMEOUT,
         )
@@ -1735,6 +1794,17 @@ enum Inner {
 }
 
 impl Substrate {
+    /// The environment placement gate's mode
+    /// (`SPACE_ENVIRONMENT_PLACEMENT_GATE`), for placement outside the
+    /// adapter, such as warm-pool pods.
+    pub fn environment_placement(&self) -> environment_placement::EnvironmentPlacementGate {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.environment_placement(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.k8s.environment_placement,
+        }
+    }
+
     /// Run on the Direct substrate.
     pub fn from_direct(substrate: direct::DirectSubstrate) -> Self {
         Self {
@@ -1747,6 +1817,16 @@ impl Substrate {
     pub fn from_kubernetes(substrate: kubernetes::KubernetesSubstrate) -> Self {
         Self {
             inner: Inner::Kubernetes(Box::new(substrate)),
+        }
+    }
+
+    /// Whether this substrate records activating clients (see
+    /// [`ActivationClientAttribution`]).
+    pub fn activation_client_attribution(&self) -> ActivationClientAttribution {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.activation_client_attribution(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.k8s.activation_client_attribution,
         }
     }
 
@@ -1791,6 +1871,81 @@ impl Substrate {
         }
     }
 
+    /// Ask the node behind `target` to back up one of its artifacts. Shared
+    /// over any substrate: the adapter only says how to reach the node.
+    pub async fn enqueue_artifact_backup(
+        &self,
+        sandbox_id: SandboxId,
+        expected_kind: ArtifactKind,
+        source: BackupSource,
+        target: &NodeApiTarget<'_>,
+    ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
+        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
+        enqueue_artifact_backup_via_retrying_node_api(
+            &endpoint_addr,
+            sandbox_id,
+            expected_kind,
+            source,
+        )
+        .await
+    }
+
+    /// Copy a durable artifact into a new sandbox's snapshot on the node
+    /// behind `target`. Shared over any substrate: the adapter only says how
+    /// to reach the node.
+    pub async fn create_snapshot_from_durable_artifact(
+        &self,
+        target: &NodeApiTarget<'_>,
+        operation_id: OperationId,
+        source_sandbox_id: SandboxId,
+        target_sandbox_id: SandboxId,
+        source_storage_uri: String,
+        destination_storage_uri: String,
+    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
+        let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
+        let mut node_api = retrying_worker_node_api(&endpoint_addr, Duration::from_secs(30))?;
+        let mut client = RetryingWorkerApiClient::new(&mut node_api);
+        let response = client
+            .create_sandbox_snapshot(
+                pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest {
+                    sandbox_id: source_sandbox_id.to_string(),
+                    r#type: pplx_space_sbx_mgr_client::proto::SnapshotType::Disk as i32,
+                    label: None,
+                    creation_identity: Some(
+                        pplx_space_sbx_mgr_client::proto::SnapshotCreationIdentity {
+                            request_id: operation_id.as_uuid().to_string(),
+                        },
+                    ),
+                    source: Some(pplx_space_sbx_mgr_client::proto::CreateSnapshotSource {
+                        source: Some(
+                            pplx_space_sbx_mgr_client::proto::create_snapshot_source::Source::DurableArtifact(
+                                pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource {
+                                    source_storage_uri,
+                                    destination_storage_uri,
+                                    destination_sandbox_id: target_sandbox_id.to_string(),
+                                    destination_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32,
+                                },
+                            ),
+                        ),
+                    }),
+                },
+                Duration::from_secs(600),
+            )
+            .await
+            .map_err(durable_snapshot_rpc_error)?
+            .into_inner();
+        let published =
+            response
+                .published_durable_artifact
+                .ok_or_else(|| SubstrateError::Failed {
+                    message: "durable snapshot response omitted its storage identity".to_string(),
+                })?;
+        Ok(PublishedDurableSnapshot {
+            storage_uri: published.storage_uri,
+            bytes_published: published.bytes_published,
+        })
+    }
+
     pub async fn from_env(pool: &sqlx::PgPool) -> Result<Self, SubstrateError> {
         Self::from_env_with_lifecycle(pool, CancellationToken::new(), TaskTracker::new()).await
     }
@@ -1800,12 +1955,24 @@ impl Substrate {
         shutdown_token: CancellationToken,
         task_tracker: TaskTracker,
     ) -> Result<Self, SubstrateError> {
+        // Parsed before either substrate starts, so a typo fails startup
+        // wherever it's set; Kubernetes reads it again for its pods.
+        let environment_placement =
+            environment_placement::EnvironmentPlacementGate::from_environment(
+                &pplx_space_env_vars::ProcessEnvironment,
+            )
+            .map_err(|error| SubstrateError::Failed {
+                message: error.to_string(),
+            })?;
         #[cfg(feature = "kubernetes")]
         {
             match kubernetes::KubernetesSubstrate::try_from_env(pool, shutdown_token, task_tracker)
                 .await
             {
-                Ok(Some(substrate)) => return Ok(Self::from_kubernetes(substrate)),
+                Ok(Some(substrate)) => {
+                    environment_placement.check_kubernetes_support()?;
+                    return Ok(Self::from_kubernetes(substrate));
+                }
                 Ok(None) => {}
                 Err(err) => return Err(err),
             }
@@ -1813,9 +1980,11 @@ impl Substrate {
         #[cfg(not(feature = "kubernetes"))]
         drop((shutdown_token, task_tracker));
 
-        Ok(Self::from_direct(direct::DirectSubstrate::new(
-            pool.clone(),
-        )))
+        Ok(Self::from_direct(
+            direct::DirectSubstrate::new(pool.clone())
+                .with_environment_placement_gate(environment_placement)
+                .with_activation_client_attribution(ActivationClientAttribution::from_env()),
+        ))
     }
 
     pub(crate) async fn reserve_rollback_route_identity(
@@ -1928,6 +2097,35 @@ impl Substrate {
         }
     }
 
+    /// How many sandboxes with a live runtime the client ids `ids` select
+    /// hold, other than `activating` and the sandboxes in `already_pending`.
+    /// A synchronous cache read: Kubernetes counts from the sandbox-pod
+    /// reflector, and Direct, with no in-memory inventory, answers
+    /// [`LiveSandboxCountUnknown::Unsupported`], so the live cap admits.
+    /// Without the `kubernetes` feature only Direct is built, so the
+    /// parameters go unread.
+    #[cfg_attr(
+        not(feature = "kubernetes"),
+        expect(
+            unused_variables,
+            reason = "Direct keeps no pod inventory; only the Kubernetes arm reads the parameters"
+        )
+    )]
+    pub fn live_sandboxes_for_client(
+        &self,
+        ids: &CountedIds,
+        activating: Option<SandboxId>,
+        already_pending: &std::collections::HashSet<SandboxId>,
+    ) -> LiveSandboxCount {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.live_sandboxes_for_client(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate.live_sandboxes_for_client(ids, activating, already_pending)
+            }
+        }
+    }
+
     /// Count worker nodes that can accept a new sandbox start before
     /// request-specific template/runtime constraints are applied.
     ///
@@ -1947,6 +2145,18 @@ impl Substrate {
             Inner::Direct(substrate) => Ok(Some(substrate.eligible_start_node_count().await?)),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => Ok(substrate.eligible_start_node_count()),
+        }
+    }
+
+    /// Whether any node [`Self::eligible_start_node_count`] counts has a free
+    /// network slot. A cache read: it makes no apiserver or database call.
+    pub fn network_slot_headroom(&self) -> NetworkSlotHeadroom {
+        match &self.inner {
+            Inner::Direct(_) => {
+                NetworkSlotHeadroom::Unknown(NetworkSlotHeadroomUnknown::Unsupported)
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.network_slot_headroom(),
         }
     }
 
@@ -2023,19 +2233,38 @@ pub async fn enqueue_artifact_backup_with_client(
             },
         )
         .await
-        .map_err(|err| match err.code() {
-            tonic::Code::NotFound => SubstrateError::NotFound {
-                message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
-            },
-            tonic::Code::FailedPrecondition => SubstrateError::Conflict {
-                message: format!("node-api refused artifact backup: {}", err.message()),
-            },
-            _ => SubstrateError::Failed {
-                message: format!("node-api artifact backup error: {err}"),
-            },
-        })?
+        .map_err(|err| artifact_backup_refusal(&err, sandbox_id, endpoint_addr))?
         .into_inner();
     parse_enqueued_artifact_backup(response, expected_kind)
+}
+
+/// The [`SubstrateError`] a refused `EnqueueArtifactBackup` answers with, on
+/// both enqueue paths: [`enqueue_artifact_backup_with_client`] and
+/// [`enqueue_artifact_backup_with_node_api`].
+fn artifact_backup_refusal(
+    err: &tonic::Status,
+    sandbox_id: SandboxId,
+    endpoint_addr: &str,
+) -> SubstrateError {
+    match err.code() {
+        tonic::Code::NotFound => SubstrateError::NotFound {
+            message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
+        },
+        // `Aborted` is a sandbox not yet stopped or suspended, which may
+        // still get there; callers treat it like `FailedPrecondition`.
+        tonic::Code::FailedPrecondition | tonic::Code::Aborted => SubstrateError::Conflict {
+            message: format!("node-api refused artifact backup: {}", err.message()),
+        },
+        // The node or its connection can't take the backup now, for one
+        // while another host mutation holds the sandbox's disk; a caller may
+        // retry.
+        tonic::Code::Unavailable => SubstrateError::Unavailable {
+            message: format!("node-api artifact backup unavailable: {err}"),
+        },
+        _ => SubstrateError::Failed {
+            message: format!("node-api artifact backup error: {err}"),
+        },
+    }
 }
 
 fn parse_enqueued_artifact_backup(
@@ -2133,17 +2362,7 @@ pub async fn enqueue_artifact_backup_with_node_api(
             Duration::from_secs(30),
         )
         .await
-        .map_err(|err| match err.code() {
-            tonic::Code::NotFound => SubstrateError::NotFound {
-                message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
-            },
-            tonic::Code::FailedPrecondition => SubstrateError::Conflict {
-                message: format!("node-api refused artifact backup: {}", err.message()),
-            },
-            _ => SubstrateError::Failed {
-                message: format!("node-api artifact backup error: {err}"),
-            },
-        })?
+        .map_err(|err| artifact_backup_refusal(&err, sandbox_id, endpoint_addr))?
         .into_inner();
     parse_enqueued_artifact_backup(response, expected_kind)
 }
@@ -2402,10 +2621,9 @@ fn node_reported_artifact_from_info(
         pin_unreadable,
         // An undecodable lifecycle reads as not stopped, which the caller
         // treats as the node disagreeing: a deferral, never a teardown.
-        reports_stopped: matches!(
-            info.observed_lifecycle(),
-            Ok(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped)
-        ),
+        reports_stopped: info.observed_status().is_ok_and(|status| {
+            status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped)
+        }),
         // `namespace`, not `pid`: the node sets `namespace` from its live
         // process probe alone, while `pid` also needs the row's persisted pid,
         // which every write into `stopped` clears.
@@ -2452,6 +2670,14 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.capabilities(),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.capabilities(),
+        }
+    }
+
+    fn check_node_pool_placement(&self, node_pool: &NodePoolName) -> Result<(), SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.check_node_pool_placement(node_pool),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.check_node_pool_placement(node_pool),
         }
     }
 
@@ -2618,69 +2844,15 @@ impl SubstrateAdapter for Substrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
-        match &self.inner {
-            Inner::Direct(substrate) => substrate.suspend_execution(sandbox_id).await,
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => substrate.suspend_execution_tracked(sandbox_id).await,
-        }
-    }
-
-    async fn enqueue_artifact_backup(
-        &self,
-        sandbox_id: SandboxId,
-        expected_kind: ArtifactKind,
-        source: BackupSource,
-        target: &NodeApiTarget<'_>,
-    ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
+        // A path, not method syntax: `KubernetesSubstrate` has an inherent
+        // `suspend_execution` that method resolution would pick instead.
         match &self.inner {
             Inner::Direct(substrate) => {
-                substrate
-                    .enqueue_artifact_backup(sandbox_id, expected_kind, source, target)
-                    .await
+                SubstrateAdapter::suspend_execution(substrate.as_ref(), sandbox_id).await
             }
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => {
-                substrate
-                    .enqueue_artifact_backup(sandbox_id, expected_kind, source, target)
-                    .await
-            }
-        }
-    }
-
-    async fn create_snapshot_from_durable_artifact(
-        &self,
-        target: &NodeApiTarget<'_>,
-        operation_id: OperationId,
-        source_sandbox_id: SandboxId,
-        target_sandbox_id: SandboxId,
-        source_storage_uri: String,
-        destination_storage_uri: String,
-    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
-        match &self.inner {
-            Inner::Direct(substrate) => {
-                SubstrateAdapter::create_snapshot_from_durable_artifact(
-                    substrate.as_ref(),
-                    target,
-                    operation_id,
-                    source_sandbox_id,
-                    target_sandbox_id,
-                    source_storage_uri,
-                    destination_storage_uri,
-                )
-                .await
-            }
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => {
-                SubstrateAdapter::create_snapshot_from_durable_artifact(
-                    substrate.as_ref(),
-                    target,
-                    operation_id,
-                    source_sandbox_id,
-                    target_sandbox_id,
-                    source_storage_uri,
-                    destination_storage_uri,
-                )
-                .await
+                SubstrateAdapter::suspend_execution(substrate.as_ref(), sandbox_id).await
             }
         }
     }
@@ -2932,6 +3104,27 @@ impl SubstrateAdapter for Substrate {
         }
     }
 
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_accounts::ClientId>,
+        on_transient: AdoptionLabelTransient,
+    ) -> Result<AdoptionLabelOutcome, ControllerError> {
+        match &self.inner {
+            Inner::Direct(substrate) => {
+                substrate
+                    .label_adopted_execution(claim, client_id, on_transient)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate
+                    .label_adopted_execution(claim, client_id, on_transient)
+                    .await
+            }
+        }
+    }
+
     async fn cleanup_failed_pooled_prepare(
         &self,
         claim: &PooledExecutionClaim,
@@ -2940,26 +3133,6 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
-        }
-    }
-
-    async fn apply_pooled_execution_auto_lifecycle(
-        &self,
-        claim: &PooledExecutionClaim,
-        policy: &AutoLifecyclePolicy,
-    ) -> Result<(), ControllerError> {
-        match &self.inner {
-            Inner::Direct(substrate) => {
-                substrate
-                    .apply_pooled_execution_auto_lifecycle(claim, policy)
-                    .await
-            }
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => {
-                substrate
-                    .apply_pooled_execution_auto_lifecycle(claim, policy)
-                    .await
-            }
         }
     }
 

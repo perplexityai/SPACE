@@ -44,7 +44,6 @@ def encrypted_resuspend_preserves_cow(test: smoke.KindEcw) -> None:
     with test.phase("seal the first encrypted snapshot volume"):
         first_node = encrypted.current_node()
         test.pause()
-        encrypted.clear_completed_pods()
         first = encrypted.sealed_snapshot(first_node)
 
     with test.phase("restore from the first encrypted snapshot"):
@@ -53,11 +52,11 @@ def encrypted_resuspend_preserves_cow(test: smoke.KindEcw) -> None:
         test.expect_command(observed, stdout=marker)
         restored_boot_id = test.run_command_when_ready(BOOT_ID_COMMAND)
         test.expect_command(restored_boot_id, stdout=boot_id)
+        encrypted.expect_prior_executions_retired()
 
     with test.phase("re-suspend into the existing sparse encrypted base"):
         second_node = encrypted.current_node()
         test.pause()
-        encrypted.clear_completed_pods()
         second = encrypted.sealed_snapshot(second_node)
         encrypted.expect_base_reused(first, second)
 
@@ -67,3 +66,4 @@ def encrypted_resuspend_preserves_cow(test: smoke.KindEcw) -> None:
         test.expect_command(observed, stdout=marker)
         restored_boot_id = test.run_command_when_ready(BOOT_ID_COMMAND)
         test.expect_command(restored_boot_id, stdout=boot_id)
+        encrypted.expect_prior_executions_retired()

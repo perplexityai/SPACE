@@ -3,6 +3,7 @@
 use std::{fmt, time::Duration};
 
 use http::StatusCode;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 /// A failed call to the sandbox, as [`file_call_error`] reads it.
 pub trait FileCallFailure: fmt::Display {
@@ -16,7 +17,16 @@ pub trait FileCallFailure: fmt::Display {
     fn is_refused_before_start(&self) -> bool;
     /// A statement in the answering server's own database lost a lock race.
     fn is_lock_contention(&self) -> bool;
+    /// The sandbox was refused the call because it is at rest and its wake
+    /// policy does not let this request wake it, with the state it was in.
+    fn sandbox_not_running(&self) -> Option<(SandboxId, SandboxLifecycle)> {
+        None
+    }
 }
+
+/// How long a caller waits before sending again a call whose connection to
+/// the runtime failed: a new connection is dialed for the next call.
+const TRANSPORT_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// A worker's gRPC status, read as an HTTP failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +48,19 @@ impl WorkerFailure {
                 message: format!("sandbox storage is full: {}", status.message()),
                 retry_after: None,
                 refused_before_start: false,
+                guest_path_not_found: false,
+            };
+        }
+        if pplx_space_common_grpc::is_client_transport_failure(status) {
+            // The client's own connection to the runtime failed before the
+            // runtime answered: the runtime could not be reached, which a
+            // retry over a new connection can fix. A call that was never sent
+            // was refused before it started.
+            return Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: status.message().to_owned(),
+                retry_after: Some(TRANSPORT_FAILURE_RETRY_AFTER),
+                refused_before_start: pplx_space_common_grpc::is_client_connect_failure(status),
                 guest_path_not_found: false,
             };
         }
@@ -93,9 +116,9 @@ fn is_guest_storage_full(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::ResourceExhausted
         && status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
             .and_then(|reason| reason.to_str().ok())
-            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
+            == Some(pplx_space_guest_process::status::GUEST_STORAGE_FULL)
 }
 
 fn http_status_for_grpc_code(code: tonic::Code) -> StatusCode {
@@ -138,6 +161,12 @@ pub enum FileCallErrorKind {
     PathNotFound(String),
     NotFound(String),
     Conflict(String),
+    /// The sandbox is at rest and this request may not wake it; answered
+    /// with the details `createCommand` gives the same refusal.
+    SandboxNotRunning {
+        sandbox_id: SandboxId,
+        lifecycle: SandboxLifecycle,
+    },
     FailedPrecondition(String),
     RateLimited {
         message: String,
@@ -177,6 +206,13 @@ pub fn file_call_error(failure: &impl FileCallFailure) -> FileCallError {
     // would attribute it to the cluster or the node.
     if failure.is_lock_contention() {
         return FileCallErrorKind::LockContention.into();
+    }
+    if let Some((sandbox_id, lifecycle)) = failure.sandbox_not_running() {
+        return FileCallErrorKind::SandboxNotRunning {
+            sandbox_id,
+            lifecycle,
+        }
+        .into();
     }
     let retry_after = failure.retry_after();
     let kind = match failure.status() {

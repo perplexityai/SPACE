@@ -20,7 +20,7 @@ fn layout_edges() -> [u64; 3] {
 /// start, behind `resync_required`.
 #[test]
 fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
-    let fresh = ProcessReplayState::load(None).unwrap();
+    let fresh = ProcessReplayState::load(None);
     assert_eq!(fresh.event_id, ProcessEventId::START);
     assert_eq!(fresh.backend_output_cursor, 0);
     assert_eq!(fresh.resync, None);
@@ -35,7 +35,7 @@ fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
             frame: PROCESS_EVENT_ID_MAX_FRAME,
         },
     ] {
-        let resumed = ProcessReplayState::load(Some(carried.encode())).unwrap();
+        let resumed = ProcessReplayState::load(Some(carried.encode()));
         assert_eq!(resumed.event_id, carried);
         let ProcessEventId::Position { position, .. } = carried else {
             unreachable!()
@@ -69,7 +69,7 @@ fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
         last_accepted_block,
         last_accepted_block + (1 << PROCESS_EVENT_ID_GUARD_BITS) - 1,
     ] {
-        let replay = ProcessReplayState::load(Some(last_event_id)).unwrap();
+        let replay = ProcessReplayState::load(Some(last_event_id));
         assert_eq!(replay.backend_output_cursor, 0, "{last_event_id}");
         assert_eq!(
             replay.resync,
@@ -84,8 +84,39 @@ fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
         }
     }
 
+    // A forged id just below the limit replays above it, in the last resume
+    // block. Those ids are too high to follow, so a resume from the first
+    // of them restarts the numbering from the start of the output, and a
+    // resume from that replay's first id is exact.
+    let near_limit = ProcessReplayState::load(Some(last_accepted_block));
+    assert_eq!(
+        near_limit.event_id,
+        ProcessEventId::Unknown {
+            block: PROCESS_EVENT_ID_MAX_RESUME_BLOCK,
+            frame: 1,
+        }
+    );
+    let restarted = ProcessReplayState::load(Some(near_limit.event_id.encode()));
+    assert_eq!(
+        restarted.event_id,
+        ProcessEventId::Position {
+            position: 0,
+            frame: 1,
+        }
+    );
+    assert_eq!(restarted.backend_output_cursor, 0);
+    assert_eq!(
+        restarted.resync,
+        Some(DataPlaneResyncReason::CursorReplayUnavailable)
+    );
+    let exact = ProcessReplayState::load(Some(restarted.event_id.encode()));
+    assert_eq!(exact.event_id, restarted.event_id);
+    assert_eq!(exact.backend_output_cursor, 0);
+    assert_eq!(exact.resync, None);
+
     // An id this close to the end, or past it, leaves a stream too few ids
-    // to send.
+    // to send above it; only a forged one is, so its replay counts positions
+    // from the start of the output, as a fresh attach does.
     for forged in [
         ProcessEventId::Unknown {
             block: PROCESS_EVENT_ID_MAX_RESUME_BLOCK,
@@ -97,7 +128,18 @@ fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
         1 << 62,
         MAX_LAST_EVENT_ID,
     ] {
-        assert!(ProcessReplayState::load(Some(forged)).is_none(), "{forged}");
+        let replay = ProcessReplayState::load(Some(forged));
+        assert_eq!(replay.backend_output_cursor, 0, "{forged}");
+        assert_eq!(
+            replay.resync,
+            Some(DataPlaneResyncReason::CursorReplayUnavailable),
+            "{forged}"
+        );
+        assert_eq!(
+            replay.event_id,
+            ProcessEventId::START.next(Some(0)),
+            "{forged}"
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::db::Connection;
 use crate::db::fixture::params;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 
@@ -80,7 +80,8 @@ fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
     conn.trace_v2(
         crate::db::fixture::TraceEventCodes::SQLITE_TRACE_ROW,
         Some(race_restore_release_at_gc_read),
-    );
+    )
+    .unwrap();
     let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
     let writer = std::thread::spawn(move || {
         start_rx

@@ -2,6 +2,7 @@ use super::*;
 use crate::{native::first_frame_attach_token_from_recv, runtime_route::sweep_expired_ecw_routes};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
+use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_api_route::{
     RouteIdentityRemediation, SpaceApiRouteIdentityDimension, SpaceApiRouteProtocol,
     set_route_identity_rejection_metadata,
@@ -11,22 +12,24 @@ use pplx_space_api_route::{
     ed25519::SpaceApiRouteEd25519KeyId, ed25519::SpaceApiRouteEd25519Signer,
     ed25519::SpaceApiRouteEd25519Token,
 };
-use pplx_space_common_core::{
-    host::disk_admission::CacheDiskAdmissionReason,
-    types::{
-        ClusterId, EnvMap, ExecutionGeneration, GuestPort, NodeId, OrgId, PodUid, RouteGeneration,
-        SandboxActivationAttemptId, SandboxId, SandboxRouteIdentity, SimpleDuration,
-        SpaceApiRouteIdentity,
-    },
-};
+use pplx_space_cluster_id::ClusterId;
+use pplx_space_durations::SimpleDuration;
+use pplx_space_guest_process::EnvMap;
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
 };
+use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::proto::{
     DataPlaneBackendEndpoint, ResolveDataPlaneSessionRouteResponse,
     SandboxServiceRouteCredentialKind, SandboxServiceRouteCredentialProof, SandboxServiceRouteKind,
     SandboxServiceRouteTransport, SpaceApiRouteToken as ProtoSpaceApiRouteToken,
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
+};
+use pplx_space_node_disk_admission::CacheDiskAdmissionReason;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
+    SandboxRouteIdentity, SpaceApiRouteIdentity,
 };
 use pplx_space_sbx_mgr_client::proto::{
     SpacedProcessExit, SpacedProcessExited, SpacedProcessOutput, SpacedProcessSignaled,
@@ -48,11 +51,17 @@ async fn unsupported_envd_surfaces_return_explicit_ecw_errors() {
         return;
     }
 
-    let app = router(test_data_plane_state().await);
+    let app = router(test_data_plane_state_with_ecw_hosts().await);
+    let envd_host = format!("{ECW_ENVD_PORT}-{}.example.test", SandboxId::new());
     for endpoint in ["/metrics", "/envs", "/files/compose"] {
         let response = app
             .clone()
-            .oneshot(Request::get(endpoint).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(endpoint)
+                    .header(header::HOST, &envd_host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{endpoint}");
@@ -68,6 +77,102 @@ async fn unsupported_envd_surfaces_return_explicit_ecw_errors() {
     }
 }
 
+/// A request that names no ECW sandbox host is a Native client's: when it
+/// matches no route, the envd-only paths included, uses a method a Native
+/// route does not serve, or asks to attach without a WebSocket upgrade, it is
+/// answered in the Native data-plane envelope.
+#[tokio::test]
+async fn unmatched_native_requests_answer_in_the_native_envelope() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let app = router(test_data_plane_state_with_ecw_hosts().await).layer(
+        axum::extract::connect_info::MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))),
+    );
+    let session_id = DataPlaneSessionId::Process(Default::default());
+    for (method, path, status, code) in [
+        (
+            "GET",
+            "/v1/nope".to_string(),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "GET",
+            format!("/v1/sessions/{session_id}/unknown"),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "GET",
+            "/nope".to_string(),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "GET",
+            "/metrics".to_string(),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "POST",
+            format!("/v1/sessions/{session_id}/events"),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request",
+        ),
+        (
+            "DELETE",
+            format!("/v1/sessions/{session_id}/attach"),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request",
+        ),
+        (
+            "GET",
+            format!("/v1/sessions/{session_id}/attach"),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header(header::HOST, "data-plane.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{method} {path}");
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(
+                response.headers().get(header::ALLOW).unwrap(),
+                "GET,HEAD",
+                "{method} {path}"
+            );
+        }
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(body["error"]["code"], code, "{method} {path}: {body}");
+        assert_eq!(body["error"]["retryable"], false, "{method} {path}: {body}");
+    }
+}
+
+async fn test_data_plane_state_with_ecw_hosts() -> DataPlaneState {
+    let mut state = test_data_plane_state().await;
+    state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
+        r#"[{"host":"example.test"}]"#,
+    )));
+    state
+}
+
 #[tokio::test]
 async fn routed_requests_record_latency_by_route_template() {
     if !pplx_space_test_env::enter_test_process(&[(
@@ -78,8 +183,16 @@ async fn routed_requests_record_latency_by_route_template() {
     }
 
     let capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
-    let response = router(test_data_plane_state().await)
-        .oneshot(Request::get("/files/compose").body(Body::empty()).unwrap())
+    let response = router(test_data_plane_state_with_ecw_hosts().await)
+        .oneshot(
+            Request::get("/files/compose")
+                .header(
+                    header::HOST,
+                    format!("{ECW_ENVD_PORT}-{}.example.test", SandboxId::new()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -119,10 +232,11 @@ async fn unsupported_envd_method_returns_explicit_ecw_error() {
     );
 }
 
-/// Both proxy routes must reach the handler through the router. The subpath
-/// mount captures `session_id` and `path`; a scalar extractor rejects it with a
-/// 500 before authentication, so an unauthenticated request must surface the
-/// handler's 401 on every route shape.
+/// Every proxy route must reach the handler through the router, the service
+/// root `/proxy/` included. The subpath mount captures `session_id` and
+/// `path`; a scalar extractor rejects it with a 500 before authentication, so
+/// an unauthenticated request must surface the handler's 401 on every route
+/// shape.
 #[tokio::test]
 async fn proxy_session_routes_extract_path_parameters() {
     if !pplx_space_test_env::enter_test_process(&[(
@@ -134,20 +248,67 @@ async fn proxy_session_routes_extract_path_parameters() {
 
     let app = router(test_data_plane_state().await);
     let session_id = DataPlaneSessionId::Port(Default::default());
-    for path in [
-        format!("/v1/sessions/{session_id}/proxy"),
-        format!("/v1/sessions/{session_id}/proxy/api/v1/healthz"),
-        format!("/v1/sessions/{session_id}/proxy/assets/app.js?v=1"),
-    ] {
+    for route in ["", "/", "/?tab=1", "/api/v1/healthz", "/assets/app.js?v=1"] {
+        let path = format!("/v1/sessions/{session_id}/proxy{route}");
         let response = app
             .clone()
             .oneshot(Request::get(&path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "proxy{route}");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
-        assert_eq!(body["message"], "data-plane token is required", "{path}");
+        assert_eq!(
+            body["error"]["message"], "data-plane token is required",
+            "proxy{route}"
+        );
+    }
+}
+
+/// A credential that is not a data-plane token answers as an invalid token,
+/// a 401, before any route lookup. The WebSocket attach reads the header
+/// through the same `token_from_headers`, but needs a real upgrade to reach.
+#[tokio::test]
+async fn malformed_data_plane_token_is_unauthorized_on_every_native_route() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let app = router(test_data_plane_state().await);
+    let process = DataPlaneSessionId::Process(Default::default());
+    let port = DataPlaneSessionId::Port(Default::default());
+    for path in [
+        format!("/v1/sessions/{process}/events"),
+        format!("/v1/sessions/{port}/proxy"),
+        format!("/v1/sessions/{port}/proxy/api"),
+    ] {
+        for authorization in ["Bearer spk_management_api_key", "bearer dpt_short"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(&path)
+                        .header(header::AUTHORIZATION, authorization)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} {authorization}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            assert_eq!(
+                body.pointer("/error/code"),
+                Some(&serde_json::json!("unauthorized")),
+                "{path} {authorization}"
+            );
+        }
     }
 }
 
@@ -1080,7 +1241,7 @@ fn test_route_identity() -> SandboxRouteIdentity {
         SandboxId::new(),
         RouteGeneration::new(7).unwrap(),
         NodeId::new(),
-        pplx_space_common_core::types::NodeManagedBy::Kubernetes,
+        pplx_space_node_model::NodeManagedBy::Kubernetes,
         ExecutionGeneration::new(11).unwrap(),
         SandboxActivationAttemptId::new(),
         Some(PodUid::parse("sandbox-pod-uid").unwrap()),
@@ -1238,10 +1399,10 @@ async fn backend_channels_accept_bare_direct_node_endpoints() {
         return;
     }
 
-    let channels = build_backend_channels("192.0.2.111:9800", 2)
+    let channels = build_backend_channels("192.0.2.111:9800", 2, Default::default())
         .await
         .expect("bare endpoint");
-    let dns_channels = build_backend_channels("worker:9800", 1)
+    let dns_channels = build_backend_channels("worker:9800", 1, Default::default())
         .await
         .expect("bare dns endpoint");
 
@@ -1264,7 +1425,7 @@ async fn backend_channels_advertise_the_configured_connection_window() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap().to_string();
-    let channel = build_backend_channels(&endpoint, 1)
+    let channel = build_backend_channels(&endpoint, 1, Default::default())
         .await
         .expect("backend channel")
         .remove(0);
@@ -1713,6 +1874,7 @@ fn ecw_sandbox_service_route_repair_cooldown_coalesces_and_expires() {
     );
 }
 
+/// The proxy answers in the data-plane envelope the events stream uses.
 #[tokio::test]
 async fn native_route_resolution_error_response_shape_is_stable() {
     let cases = [
@@ -1769,9 +1931,11 @@ async fn native_route_resolution_error_response_shape_is_stable() {
         assert_eq!(
             body,
             serde_json::json!({
-                "code": code,
-                "message": message,
-                "retryable": retryable,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "retryable": retryable,
+                }
             })
         );
     }
@@ -2780,12 +2944,35 @@ async fn attach_error_uses_structured_data_plane_error() {
 #[test]
 fn header_token_accepts_authorization_and_subprotocol() {
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "a".repeat(64));
+    // The scheme is case-insensitive (RFC 7235 section 2.1).
+    for authorization in [
+        format!("Bearer {token}"),
+        format!("bearer {token}"),
+        format!("BEARER  {token} "),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+        assert_eq!(
+            token_from_headers_with_source(&headers).unwrap(),
+            Some((token.clone(), HeaderTokenSource::Authorization)),
+            "{authorization}"
+        );
+    }
+    // Another scheme carries no data-plane token.
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        format!("Bearer {token}").parse().unwrap(),
-    );
-    assert_eq!(token_from_headers(&headers).unwrap(), Some(token.clone()));
+    headers.insert(header::AUTHORIZATION, "Basic Zm9vOmJhcg==".parse().unwrap());
+    assert_eq!(token_from_headers_with_source(&headers).unwrap(), None);
+    // A bearer credential that is not a data-plane token is one the data
+    // plane does not accept, not a malformed request.
+    for authorization in ["Bearer sk-not-a-data-plane-token", "bearer dpt_short"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+        assert_eq!(
+            token_from_headers_with_source(&headers),
+            Err(MalformedToken),
+            "{authorization}"
+        );
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -3446,6 +3633,16 @@ fn proxy_path_rewrite_preserves_tail_and_query() {
         .unwrap();
     assert_eq!(proxy_path_and_query(session_id, &uri).unwrap(), "/");
 
+    let uri = format!("/v1/sessions/{session_id}/proxy/")
+        .parse::<Uri>()
+        .unwrap();
+    assert_eq!(proxy_path_and_query(session_id, &uri).unwrap(), "/");
+
+    let uri = format!("/v1/sessions/{session_id}/proxy/?tab=1")
+        .parse::<Uri>()
+        .unwrap();
+    assert_eq!(proxy_path_and_query(session_id, &uri).unwrap(), "/?tab=1");
+
     let session_id = DataPlaneSessionId::Protocol(Default::default());
     let uri = format!("/v1/sessions/{session_id}/proxy/json/version")
         .parse::<Uri>()
@@ -3919,6 +4116,7 @@ fn process_events_map_to_native_data_plane_frames() {
                 process_id: "proc-1".to_string(),
                 exit_code,
                 status,
+                output_truncated: false,
             }]
         );
     }
@@ -3986,6 +4184,7 @@ fn process_output_frames_are_the_only_backend_cursor_frames() {
             process_id: "proc-1".to_string(),
             exit_code: 0,
             status: DataPlaneProcessExitStatus::Exited,
+            output_truncated: false,
         }
     ));
     assert!(!process_frame_advances_backend_cursor(
@@ -5011,8 +5210,8 @@ fn ecw_answers_refusals_with_retry_after_and_full_disks_by_reason() {
 
     let mut quota = tonic::Status::resource_exhausted("Disk quota exceeded (os error 122)");
     quota.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-        pplx_space_common_core::spaced::GUEST_STORAGE_FULL
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::GUEST_STORAGE_FULL
             .parse()
             .unwrap(),
     );

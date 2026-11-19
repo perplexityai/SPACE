@@ -26,4 +26,4 @@
 
 /// Root of the per-sandbox on-disk layout the encrypted-volume backing files
 /// live under (`<CACHE_DIR>/<sandbox_id>/instance/...`).
-pub(crate) const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+pub(crate) const CACHE_DIR: &str = pplx_space_host_layout::paths::SANDBOX_CACHE_DIR;

@@ -101,7 +101,7 @@ fn missing_backend_is_retried_but_missing_unit_is_terminal() {
 
 #[tokio::test]
 async fn snapshot_observer_refuses_tenant_pool_and_nonrunning_sandboxes() {
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
     for (owner, state, pool, expected) in [
         (
             SandboxOwner::parse("tenant").unwrap(),

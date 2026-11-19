@@ -1,9 +1,9 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::NodeGroupName;
 use pplx_space_db_test_fixtures::{TestDb, try_pg_test_db, try_pg_test_db_with_max_connections};
+use pplx_space_node_model::NodeGroupName;
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 use super::super::{DefaultNodeGroup, EnsureDefaultGroupError, EnsuredDefaultGroup, NodeGroupSink};

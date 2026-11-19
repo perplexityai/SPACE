@@ -10,8 +10,8 @@
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeGroupId, NodeId};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::NodeGroupId;
 use pplx_space_sandbox_portability::{
     inflight_suspend_upload_from_node_exists, snapshot_durable_for_source_release,
     snapshot_is_current_local_artifact,
@@ -20,6 +20,7 @@ use pplx_space_sandbox_residency::{
     ResidencyEvidence, node_heartbeat_fresh, non_resident_lifecycle_exclusion,
     occupies_node_predicate, resident_lifecycle,
 };
+use pplx_space_sql_locator::sql;
 
 /// One node's occupancy counters, as [`node_occupancy`] and
 /// [`fleet_occupancy`] read them. The drainability counters

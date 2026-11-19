@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::resource::{Resource, setrlimit as nix_setrlimit};
-use pplx_space_common_core::types::{LinuxPid, ProcessSignal};
+use pplx_space_guest_process::ProcessSignal;
+use pplx_space_linux_ids::LinuxPid;
 use serde::{Deserialize, Serialize};
 
 /// Check if a PID is alive.
@@ -148,6 +149,114 @@ impl ProcessHandle {
     }
 }
 
+impl ProcessHandle {
+    /// Duplicate the listening socket `expected` describes from the pinned
+    /// process, if it holds one in `network_namespace`.
+    ///
+    /// The duplicate is the same kernel socket, not a copy: datagrams and
+    /// connections queued on it, or arriving after the process stops reading
+    /// or exits, wait for whoever holds it next. Requires ptrace access to the
+    /// process and `CAP_NET_ADMIN` over the socket's network namespace.
+    pub fn duplicate_listening_socket(
+        &self,
+        expected: &PreExecSocket,
+        network_namespace: &std::fs::File,
+    ) -> std::io::Result<Option<OwnedFd>> {
+        let namespace = file_identity(network_namespace)?;
+        for entry in std::fs::read_dir(format!("/proc/{}/fd", self.pid))? {
+            let entry = entry?;
+            let Some(target) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if !std::fs::read_link(entry.path())
+                .is_ok_and(|link| link.as_os_str().as_encoded_bytes().starts_with(b"socket:"))
+            {
+                continue;
+            }
+            // The pidfd, not the listed pid, names the process: if the pid now
+            // belongs to another process this fails instead of reading it.
+            let socket = match rustix::process::pidfd_getfd(
+                &self.pidfd,
+                target,
+                rustix::process::PidfdGetfdFlags::empty(),
+            ) {
+                Ok(socket) => socket,
+                // Closed between listing and duplication.
+                Err(rustix::io::Errno::BADF) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if listening_socket_matches(&socket, expected, namespace)? {
+                return Ok(Some(socket));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Fail unless `namespace` is a network namespace, the kind a sidecar launch
+/// joins with `setns(CLONE_NEWNET)`.
+pub fn require_network_namespace(namespace: &std::fs::File) -> std::io::Result<()> {
+    // SAFETY: NS_GET_NSTYPE reads no argument and returns the namespace type.
+    let kind = unsafe { libc::ioctl(namespace.as_raw_fd(), libc::NS_GET_NSTYPE) };
+    if kind < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if kind != libc::CLONE_NEWNET {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a network namespace",
+        ));
+    }
+    Ok(())
+}
+
+fn listening_socket_matches(
+    socket: &OwnedFd,
+    expected: &PreExecSocket,
+    network_namespace: (u64, u64),
+) -> std::io::Result<bool> {
+    let reference = socket2::SockRef::from(socket);
+    let (kind, protocol) = if expected.tcp {
+        (socket2::Type::STREAM, socket2::Protocol::TCP)
+    } else {
+        (socket2::Type::DGRAM, socket2::Protocol::UDP)
+    };
+    if reference.domain()? != socket2::Domain::for_address(expected.bind_addr)
+        || reference.r#type()? != kind
+        || reference.protocol()? != Some(protocol)
+        || reference.local_addr()?.as_socket() != Some(expected.bind_addr)
+        || (expected.tcp && !reference.is_listener()?)
+        || (expected.transparent && !reference.ip_transparent_v4()?)
+    {
+        return Ok(false);
+    }
+    Ok(socket_network_namespace(socket)? == network_namespace)
+}
+
+fn socket_network_namespace(socket: &OwnedFd) -> std::io::Result<(u64, u64)> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: SIOCGSKNS reads no argument and returns a new close-on-exec
+    // descriptor for the socket's network namespace, owned below.
+    let namespace = unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGSKNS as _) };
+    if namespace < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `namespace` is a descriptor this call just received and nothing
+    // else owns.
+    let namespace = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(namespace) });
+    file_identity(&namespace)
+}
+
+fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 pub(super) fn pin_current_process() -> Result<ProcessHandle, ProcessHandleError> {
     let pid = nix::unistd::getpid().as_raw();
     open_process_handle(pid.cast_unsigned(), pid)
@@ -173,7 +282,7 @@ fn signal_process_handle(
     handle: &ProcessHandle,
     signal: ProcessSignal,
 ) -> Result<bool, ProcessHandleError> {
-    match pplx_space_common_core::host::linux::signal_pidfd(&handle.pidfd, signal) {
+    match pplx_space_host_linux::signal_pidfd(&handle.pidfd, signal.as_i32()) {
         Ok(()) => Ok(true),
         Err(source) if source.raw_os_error() == Some(libc::ESRCH) => Ok(false),
         Err(source) => Err(ProcessHandleError::Signal {
@@ -263,6 +372,12 @@ pub struct PreExecSocket {
     pub recvorigdstaddr: bool,
     /// CLI arg name to pass the FD number (e.g., "--tcp-fd")
     pub fd_arg: String,
+    /// An already-bound socket the launcher inherited for this entry, used
+    /// instead of binding a fresh one. A replacement takes over its
+    /// predecessor's socket this way, so what is queued on it while neither
+    /// process reads it is delivered rather than dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_fd: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -341,6 +456,7 @@ pub fn prepare_sidecar_launch(
     use nix::unistd::{Gid, Uid};
     use std::ffi::CString;
 
+    super::validate_sidecar_launch_strings(&program, &args, &env)?;
     let ns_file = std::fs::File::open(&ns_path)
         .map_err(|e| format!("failed to open namespace {ns_path}: {e}"))?;
     let c_program =
@@ -349,9 +465,6 @@ pub fn prepare_sidecar_launch(
     let c_env: Vec<(CString, CString)> = env
         .into_iter()
         .map(|(key, value)| {
-            if key.is_empty() || key.contains('=') {
-                return Err("invalid env key: must be nonempty and contain no '='".into());
-            }
             Ok((
                 CString::new(key).map_err(|e| format!("invalid env key: {e}"))?,
                 CString::new(value).map_err(|e| format!("invalid env value: {e}"))?,
@@ -366,7 +479,7 @@ pub fn prepare_sidecar_launch(
     crate::cgroup::join_cgroup(&cgroup_path)?;
 
     for sock_cfg in &pre_exec_sockets {
-        let fd = create_pre_exec_socket(sock_cfg)
+        let fd = pre_exec_socket_fd(sock_cfg)
             .map_err(|e| format!("sidecar socket creation failed: {e}"))?;
         full_args.push(sock_cfg.fd_arg.clone());
         full_args.push(fd.to_string());
@@ -385,7 +498,7 @@ pub fn prepare_sidecar_launch(
 
     // Before setuid: an unprivileged, non-dumpable process cannot open its own
     // /proc/self/oom_score_adj.
-    pplx_space_common_core::host::linux::prefer_for_oom_kill()
+    pplx_space_host_linux::prefer_for_oom_kill()
         .map_err(|error| format!("set oom_score_adj failed: {error}"))?;
     nix::unistd::setgroups(&[]).map_err(|e| format!("setgroups([]) failed: {e}"))?;
     nix::unistd::setgid(Gid::from_raw(gid)).map_err(|e| format!("setgid failed: {e}"))?;
@@ -433,8 +546,8 @@ fn apply_child_hardening() -> Result<(), String> {
     set_child_rlimit(
         "RLIMIT_NOFILE",
         Resource::RLIMIT_NOFILE,
-        pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT,
-        pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT,
+        pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT,
+        pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT,
     )?;
     set_child_rlimit("RLIMIT_NPROC", Resource::RLIMIT_NPROC, 512, 512)?;
 
@@ -475,6 +588,31 @@ fn grant_ambient_cap_net_admin() -> Result<(), String> {
     Ok(())
 }
 
+/// The descriptor the sidecar receives for `cfg`: its inherited socket when
+/// it has one, otherwise a freshly bound one.
+/// Called in the child process after setns() but before setuid().
+fn pre_exec_socket_fd(cfg: &PreExecSocket) -> Result<i32, String> {
+    match cfg.inherited_fd {
+        Some(fd) => adopt_inherited_socket(fd, cfg),
+        None => create_pre_exec_socket(cfg),
+    }
+}
+
+/// Keep a socket the supervisor passed for `cfg`, reapplying its options.
+fn adopt_inherited_socket(fd: i32, cfg: &PreExecSocket) -> Result<i32, String> {
+    if fd < 0 {
+        return Err(format!("invalid inherited socket fd {fd}"));
+    }
+    // SAFETY: the supervisor passes this launcher the descriptor for this
+    // entry alone, and it stays open until the sidecar's exec. Borrowing it
+    // takes no ownership.
+    let socket = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    fcntl(socket, FcntlArg::F_GETFD)
+        .map_err(|error| format!("inherited socket fd {fd} is not open: {error}"))?;
+    configure_pre_exec_socket(&socket, cfg)?;
+    Ok(fd)
+}
+
 /// Create a socket with the specified options. Returns the raw FD.
 /// Called in the child process after setns() but before setuid().
 fn create_pre_exec_socket(cfg: &PreExecSocket) -> Result<i32, String> {
@@ -500,11 +638,11 @@ fn configure_pre_exec_socket(
     cfg: &PreExecSocket,
 ) -> Result<(), String> {
     if cfg.transparent {
-        pplx_space_net_common::orig_dst::set_ip_transparent(socket)
+        pplx_space_transparent_proxy_socket::set_ip_transparent(socket)
             .map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
     }
     if cfg.recvorigdstaddr {
-        pplx_space_net_common::orig_dst::set_recvorigdstaddr(socket)
+        pplx_space_transparent_proxy_socket::set_recvorigdstaddr(socket)
             .map_err(|e| format!("IP_RECVORIGDSTADDR: {e}"))?;
     }
     clear_cloexec(socket)
@@ -674,7 +812,7 @@ fn jailer_args(config: JailerArgs<'_>) -> Vec<String> {
         "--resource-limit".to_string(),
         format!(
             "no-file={}",
-            pplx_space_common_core::host::linux::SANDBOX_PROCESS_NOFILE_LIMIT
+            pplx_space_host_layout::SANDBOX_PROCESS_NOFILE_LIMIT
         ),
         "--new-pid-ns".to_string(),
     ];
@@ -720,12 +858,14 @@ fn direct_jailer_command(
     let mut cmd = std::process::Command::new(&program);
     cmd.env_clear().env("PATH", JAILER_PATH);
     cmd.args(jailer_args);
-    // Jailer and the Firecracker process it daemonizes inherit this score.
+    // Firecracker and sandbox sidecars run with the maximum OOM score so host
+    // memory pressure kills sandboxes before node services. Jailer and the
+    // Firecracker process it daemonizes inherit this score.
     // Registered first: the sealed-executable hook below never returns.
     // SAFETY: `prefer_for_oom_kill` is async-signal-safe.
     unsafe {
         use std::os::unix::process::CommandExt;
-        cmd.pre_exec(pplx_space_common_core::host::linux::prefer_for_oom_kill);
+        cmd.pre_exec(pplx_space_host_linux::prefer_for_oom_kill);
     }
     if let JailerExecutable::Sealed(file) = jailer {
         bind_jailer_descriptor(&mut cmd, file.file().try_clone()?, &program, jailer_args)?;

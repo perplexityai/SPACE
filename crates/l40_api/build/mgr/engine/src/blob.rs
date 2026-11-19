@@ -135,7 +135,7 @@ impl BlobStore {
             remote,
             local_dir: blob_dir(),
             storage_admission: Some(BlobStorageAdmission::from_env(PathBuf::from(
-                pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR,
+                pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR,
             ))),
             local_retention: DEFAULT_LOCAL_BLOB_RETENTION,
             local_lifecycle: Arc::new(Mutex::new(())),
@@ -664,7 +664,7 @@ fn blob_path_in(dir: &Path, sha256: &str) -> Result<PathBuf, BlobError> {
 }
 
 fn blob_dir() -> PathBuf {
-    Path::new(pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR).join(BLOB_DIR)
+    Path::new(pplx_space_host_layout::paths::FIRECRACKER_CACHE_DIR).join(BLOB_DIR)
 }
 
 fn cleanup_stale_blob_temps(dir: &Path) {

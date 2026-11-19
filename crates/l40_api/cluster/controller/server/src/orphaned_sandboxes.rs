@@ -9,6 +9,14 @@
 //! recoverable row back to `suspended`, or moves genuinely ambiguous state to
 //! the inert `quarantined` hold state.
 //!
+//! A recovery to `suspended` restores the row's snapshot, which loses what
+//! the node holding the sandbox wrote since, and the activity clocks can't
+//! rule that out. The candidate listing skips a row whose active node has
+//! reported it, for as long as that observed state exists. A report that
+//! commits after the listing reaches the plan, which defers to the node, and
+//! the recovery's own statement checks it again; a publish still uncommitted
+//! when that statement runs isn't seen.
+//!
 //! The reconciler's actions (deletes, recoveries to `suspended` and
 //! quarantines) are capped at `max_classifications_per_minute` in a 60-second
 //! window; anything else, such as a deferral, a terminal skip or an error,
@@ -43,11 +51,11 @@
 //! the operator opts into writes; the deployment itself is the master
 //! enable/disable.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
+use pplx_space_sql_locator::sql;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,19 +63,21 @@ use std::time::{Duration, Instant};
 use crate::metrics::sandbox::reconciler::{
     self as reconciler_metrics, ClassificationOutcome, ClassificationReason, PodEvidence,
 };
-use pplx_space_common_core::types::{
-    PodUid, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SubstrateKind,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{
+    SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+    SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_quarantine_store::{
     quarantine_history_insert_columns, quarantine_state_conflict_assignments,
     quarantine_state_insert_columns,
 };
+use pplx_space_sandbox_residency::node_observes_sandbox;
 use pplx_space_sandbox_store::orphan::{
     self, OrphanGuard, classify_guard_from_sql, classify_guard_lock_sql, classify_guard_sql,
 };
@@ -211,10 +221,10 @@ impl ReconcilerConfig {
     /// explicitly so deployments can keep the loop observable without giving
     /// it write authority.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         Self {
             enabled: config.destructive_gate("SPACE_ORPHANED_SANDBOX_RECONCILER_ENABLED"),
@@ -446,6 +456,15 @@ impl std::fmt::Display for OrphanDeleteReason {
 pub enum OrphanDeferReason {
     InFlightSnapshot,
     PodCleanupUnconfirmed,
+    /// The row's active node has reported the sandbox, so its copy may hold
+    /// writes newer than any snapshot. The candidate listing already
+    /// skips a row its node reports, so the plan sees the report only when
+    /// the node's publish lands after the sweep listed the row: a sandbox
+    /// whose node hadn't published it yet, such as one restored onto a node
+    /// whose publishes there failed. Without this defer that row would revert
+    /// past the node's copy. The next listing skips the row while the node
+    /// keeps reporting it.
+    NodeReportsLocalCopy,
 }
 
 impl OrphanDeferReason {
@@ -453,6 +472,7 @@ impl OrphanDeferReason {
         match self {
             Self::InFlightSnapshot => "in_flight_snapshot",
             Self::PodCleanupUnconfirmed => "pod_cleanup_unconfirmed",
+            Self::NodeReportsLocalCopy => "node_reports_local_copy",
         }
     }
 }
@@ -836,6 +856,12 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                     plan.from_lifecycle,
                     pod_evidence,
                 );
+                if let OrphanDisposition::Defer(defer_reason) = plan.disposition {
+                    reconciler_metrics::rows_deferred(
+                        defer_reason.as_str(),
+                        reconciler_metrics::Mode::DryRun,
+                    );
+                }
                 report.dry_run_classified += 1;
                 if quarantine_blocked {
                     report.circuit_breaker += 1;
@@ -947,6 +973,10 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         reconciler_metrics::Mode::Live,
                         from_lifecycle,
                         pod_evidence,
+                    );
+                    reconciler_metrics::rows_deferred(
+                        defer_reason.as_str(),
+                        reconciler_metrics::Mode::Live,
                     );
                     report.deferred += 1;
                 }
@@ -1552,6 +1582,7 @@ struct OrphanPlanRow {
     from_lifecycle: SandboxLifecycle,
     recoverable: bool,
     creating_snapshot: bool,
+    node_reports_copy: bool,
 }
 
 async fn plan_orphan_in_tx(
@@ -1562,6 +1593,9 @@ async fn plan_orphan_in_tx(
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
     let eligibility = orphan_recovery_revert_eligibility("s");
     let recoverable = eligibility.eligible;
+    // internal-api writes a node's observed state only for the rows it is the
+    // active node of, so that is the node whose report counts.
+    let node_observes = node_observes_sandbox("s", "s.active_node_id");
     let store_guard = guard.store_guard();
     let guard_sql = classify_guard_sql(&store_guard);
     let guard_from_sql = classify_guard_from_sql(&store_guard);
@@ -1578,7 +1612,18 @@ async fn plan_orphan_in_tx(
                       FROM snapshots creating_snapshot
                      WHERE creating_snapshot.sandbox_id = s.id
                        AND creating_snapshot.state = 'creating'
-                ) AS creating_snapshot
+                ) AS creating_snapshot,
+                -- The revert restores a snapshot, which loses whatever the
+                -- sandbox wrote since. The activity clocks can't prove it
+                -- wrote nothing, so while the node holding its copy reports
+                -- it, that node decides. The candidate listing skips such a
+                -- row whatever the census's age, so this sees a report the
+                -- node published after the listing, and holds it the same
+                -- way. Any record
+                -- counts, unlike the drain's `vm_observed`: a node that
+                -- reports the sandbox `failed` gets the row projected
+                -- `failed` itself.
+                {node_observes} AS node_reports_copy
            FROM {guard_from_sql}
           WHERE s.id = $1
             AND s.lifecycle <> ALL($2)
@@ -1597,6 +1642,8 @@ async fn plan_orphan_in_tx(
         OrphanDisposition::FinalizeDelete(OrphanDeleteReason::ExplicitDeleting)
     } else if row.from_lifecycle == SandboxLifecycle::Creating && !row.recoverable {
         OrphanDisposition::FinalizeDelete(OrphanDeleteReason::AbandonedCreate)
+    } else if row.recoverable && row.node_reports_copy {
+        OrphanDisposition::Defer(OrphanDeferReason::NodeReportsLocalCopy)
     } else if row.recoverable {
         OrphanDisposition::RecoverSuspended
     } else {

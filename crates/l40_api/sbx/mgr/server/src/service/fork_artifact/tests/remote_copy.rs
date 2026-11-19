@@ -59,11 +59,10 @@ impl Transfers {
             request.subject_id,
             format!("sandbox:{}", self.metadata.sandbox_id)
         );
-        let source = pplx_space_common_core::types::StorageUri::parse(&request.source_s3_uri)
+        let source = pplx_space_artifact_model::StorageUri::parse(&request.source_s3_uri)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let destination =
-            pplx_space_common_core::types::StorageUri::parse(&request.destination_s3_uri)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let destination = pplx_space_artifact_model::StorageUri::parse(&request.destination_s3_uri)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let disk_name = if self.metadata.encrypted {
             "cow.luks"
         } else {
@@ -273,7 +272,7 @@ async fn run(
                 "server-side copy must not require bulk disk staging admission"
             );
             Ok(CacheDiskMeasurement {
-                status: pplx_space_common_core::host::disk::DiskStatus {
+                status: pplx_space_host_linux::disk::DiskStatus {
                     total_bytes: 1 << 40,
                     free_bytes: 1 << 39,
                     available_bytes: 1 << 39,

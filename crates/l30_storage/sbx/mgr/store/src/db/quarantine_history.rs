@@ -1,6 +1,6 @@
 //! Bounded retention of diagnostic history, never active recovery evidence.
 
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use crate::db::{Connection, Result};
 use rusqlite::{params, types::Value};

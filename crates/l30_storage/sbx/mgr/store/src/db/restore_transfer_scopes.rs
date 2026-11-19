@@ -4,7 +4,7 @@ use super::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreTransferScopeRow {
-    pub transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    pub transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     pub execution_generation: Option<ExecutionGeneration>,
     pub activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub staging_dir: String,
@@ -98,7 +98,7 @@ db_private_outside_tests! {
 pub fn retire_rowless_restore_transfer_scope(
     conn: &Connection,
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<bool> {
     let changed = conn.execute(
         "DELETE FROM sandbox_restore_transfer_scopes
@@ -115,7 +115,7 @@ pub fn retire_rowless_restore_transfer_scope(
 pub fn retire_orphan_quarantine_restore_transfer_scope(
     conn: &Connection,
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<bool> {
     let changed = conn.execute(
         "DELETE FROM sandbox_restore_transfer_scopes
@@ -149,7 +149,7 @@ pub fn retire_orphan_quarantine_restore_transfer_scope(
 pub fn claim_retryable_restore_transfer_scope_if_current_or_newer(
     conn: &Connection,
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     execution_generation: ExecutionGeneration,
     activation_attempt_id: SandboxActivationAttemptId,
 ) -> Result<bool> {
@@ -216,7 +216,7 @@ pub fn claim_retryable_restore_transfer_scope_if_current_or_newer(
 pub fn advance_exchanged_restore_cleanup_owner_if_newer(
     conn: &Connection,
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     execution_generation: ExecutionGeneration,
     activation_attempt_id: SandboxActivationAttemptId,
 ) -> Result<bool> {
@@ -268,7 +268,7 @@ pub fn advance_exchanged_restore_cleanup_owner_if_newer(
 pub fn insert_restore_transfer_scope(
     conn: &Connection,
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
     execution_generation: Option<ExecutionGeneration>,
     activation_attempt_id: Option<SandboxActivationAttemptId>,
     staging_dir: &str,
@@ -302,7 +302,7 @@ pub(super) fn retire_restore_transfer_scope(conn: &Connection, sandbox_id: &str)
 pub fn retire_restore_transfer_scope_if_matches(
     conn: &Connection,
     sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
 ) -> Result<bool> {
     let changed = conn.execute(
         "DELETE FROM sandbox_restore_transfer_scopes
@@ -316,7 +316,7 @@ db_private_outside_tests! {
     fn canonical_restore_reclaim_attempt_is_current(
         conn: &Connection,
         sandbox_id: &str,
-        transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+        transfer_scope_id: pplx_space_snapshot_model::TransferScopeId,
         execution_generation: ExecutionGeneration,
         activation_attempt_id: SandboxActivationAttemptId,
     ) -> Result<bool> {

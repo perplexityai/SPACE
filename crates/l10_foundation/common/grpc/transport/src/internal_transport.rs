@@ -216,10 +216,7 @@ impl ClientTransport {
                         uri.host().map(|host| {
                             // URI authorities bracket IPv6 literals; rustls expects
                             // the IP address itself when checking an IP SAN.
-                            host.strip_prefix('[')
-                                .and_then(|host| host.strip_suffix(']'))
-                                .unwrap_or(host)
-                                .to_owned()
+                            host.strip_circumfix('[', ']').unwrap_or(host).to_owned()
                         })
                     })
                     .ok_or(TransportError::Missing(service.name_env()))?;

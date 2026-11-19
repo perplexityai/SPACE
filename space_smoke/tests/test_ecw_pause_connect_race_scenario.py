@@ -97,7 +97,7 @@ class EcwPauseConnectRaceScenarioTests(unittest.TestCase):
             )
 
     def test_failure_evidence_names_the_exact_cycle_and_mismatched_marker(self) -> None:
-        sandbox = _RaceSandbox(corrupt_iteration=4)
+        sandbox = _RaceSandbox(corrupt_iteration=2)
 
         result = execute_scenario(
             title="Pause connect race",
@@ -117,7 +117,7 @@ class EcwPauseConnectRaceScenarioTests(unittest.TestCase):
         assert isinstance(phases, list)
         self.assertEqual(
             phases[-1]["name"],
-            "cycle 4/10: pause, reconnect, and read marker",
+            f"cycle 2/{ITERATIONS}: pause, reconnect, and read marker",
         )
         self.assertEqual(result.evidence["actual"], (0, "corrupt"))
 

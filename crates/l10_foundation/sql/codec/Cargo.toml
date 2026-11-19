@@ -1,0 +1,23 @@
+[package]
+name = "pplx-space-sql-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite = { workspace = true, optional = true }
+sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
+
+[features]
+default = []
+# The Postgres items, from sqlx; `uuid` for the UUID-backed identifiers'
+# impls, which delegate to `uuid::Uuid`'s.
+postgres = ["dep:sqlx"]
+# The SQLite items, from rusqlite.
+sqlite = ["dep:rusqlite"]

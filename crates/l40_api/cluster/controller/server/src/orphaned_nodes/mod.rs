@@ -50,7 +50,7 @@
 //! don't want to use this path. The master enable gate
 //! `SPACE_ORPHANED_NODES_ENABLED` is the per-environment opt-in.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,10 +101,10 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders these under
     /// `clusterController.reconcilers.orphanedNodes.*`.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {

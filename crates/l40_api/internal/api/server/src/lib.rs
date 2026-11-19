@@ -35,7 +35,7 @@ pub use run::{
     DEFAULT_LISTEN_ADDR, InternalApiRunConfig, NodeIdError, RunInternalApiError, SERVICE_NAME,
 };
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -49,15 +49,20 @@ use sqlx::types::Json;
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 
-use pplx_space_common_core::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, Digest, ExactStorageUri,
-    ExecutionGeneration, LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, OrgId, RuntimeKind,
-    SandboxId, SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId,
-    SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
-};
+use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_artifact_model::{ExactStorageUri, SnapshotArtifact as SnapshotArtifactFile};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_content_digest::Digest;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+};
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
+use pplx_space_rpc_contracts::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
+use pplx_space_snapshot_model::{
+    ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SnapshotContentHash,
+    SnapshotId, SnapshotKind, SnapshotName, SnapshotState,
 };
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
@@ -65,6 +70,7 @@ use pplx_space_state_reconciliation::{
     FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NODE_RECONCILE_CLAIM_STALE_SECS,
     NetworkPolicyTarget, ReconcileFacet,
 };
+use pplx_space_template_model::TemplateName;
 use uuid::Uuid;
 
 use crate::proto::FacetRef;
@@ -350,7 +356,7 @@ pub struct ClusterApiService {
     /// Whether applying a node's rollback receipt for a restore may retire
     /// its execution as `replaced`. Off unless `from_env_with_security_state`
     /// reads it on, for the same reason.
-    abandoned_restore_retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    abandoned_restore_retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -457,6 +463,12 @@ enum BackupReadiness {
     LatestReadySuspend(SnapshotId),
     /// The sandbox is durably restorable from a ready snapshot.
     DurablyRestorable,
+    /// The first artifact's ready backup was captured by a later execution
+    /// than the second's.
+    CapturedAfter {
+        later: (LocalArtifactId, ArtifactKind),
+        earlier: (LocalArtifactId, ArtifactKind),
+    },
 }
 
 fn parse_artifact_backup_query(
@@ -505,6 +517,19 @@ fn parse_artifact_backup_query(
             )?)
         }
         Some(Artifact::DurablyRestorable(true)) => BackupReadiness::DurablyRestorable,
+        Some(Artifact::CapturedAfter(order)) => {
+            let identity = |identity: Option<&crate::proto::LocalArtifactBackupIdentity>,
+                            field: &str| {
+                let identity = identity.ok_or_else(|| {
+                    Status::invalid_argument(format!("captured_after.{field} is required"))
+                })?;
+                parse_artifact(&identity.local_artifact_id, identity.artifact_kind)
+            };
+            BackupReadiness::CapturedAfter {
+                later: identity(order.later.as_ref(), "later")?,
+                earlier: identity(order.earlier.as_ref(), "earlier")?,
+            }
+        }
         Some(Artifact::DurablyRestorable(false)) => {
             return Err(Status::invalid_argument("durably_restorable must be true"));
         }
@@ -616,7 +641,7 @@ impl ClusterApiService {
             runtime_provisioning_cohort:
                 runtime_provisioning_cohort::RuntimeProvisioningCohort::Disabled,
             abandoned_restore_retirement:
-                pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
+                pplx_space_sandbox_model::AbandonedRestoreRetirement::Disabled,
         }
     }
 
@@ -687,7 +712,7 @@ impl ClusterApiService {
             runtime_provisioning_cohort::RuntimeProvisioningCohort::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
         service.abandoned_restore_retirement =
-            pplx_space_common_core::types::AbandonedRestoreRetirement::from_env();
+            pplx_space_sandbox_model::AbandonedRestoreRetirement::from_env();
         Ok(service)
     }
 
@@ -997,7 +1022,12 @@ impl ClusterApiService {
                 storage_uri,
             )?
             .with_artifact(artifact)
-            .with_execution_metadata(execution_metadata);
+            .with_execution_metadata(execution_metadata)
+            // Orders captures only when the node vouches that the generation
+            // is the capturing execution's; it fences either way.
+            .with_generation(
+                execution_generation.filter(|_| req.execution_generation_names_capture),
+            );
         let mut tx = self
             .pool
             .begin()
@@ -1197,6 +1227,11 @@ impl ClusterApiService {
             }
             BackupReadiness::DurablyRestorable => {
                 pplx_space_sandbox_store::durably_restorable(&self.pool, sandbox_id)
+                    .await
+                    .map_err(|e| readiness_error(&e))?
+            }
+            BackupReadiness::CapturedAfter { later, earlier } => {
+                snapshot_store::artifact_captured_after(&self.pool, sandbox_id, later, earlier)
                     .await
                     .map_err(|e| readiness_error(&e))?
             }

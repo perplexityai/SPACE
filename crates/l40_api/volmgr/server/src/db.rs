@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{SandboxId, SandboxIdParseError};
+use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 use rusqlite::{Connection, params};
 use std::{fmt, str::FromStr};
 
@@ -131,7 +131,7 @@ mod tests;
 /// Complete keep-set for the node's privileged send leases. Cancelling work
 /// retains ownership until the executor's cleanup barrier has completed.
 pub(crate) fn active_btrfs_upload_payloads(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    use pplx_space_common_core::sql;
+    use pplx_space_sql_locator::sql;
     let mut query = conn.prepare(sql!("SELECT payload FROM jobs WHERE kind = 'push_btrfs_send' AND status IN ('pending', 'running', 'cancelling')"))?;
     query.query_map([], |row| row.get(0))?.collect()
 }

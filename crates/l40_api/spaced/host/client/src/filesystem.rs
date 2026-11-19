@@ -55,7 +55,7 @@ impl SpacedHostClient {
                 "depth must be greater than 0",
             ));
         }
-        pplx_space_spaced_common::retry_status(
+        pplx_space_spaced_client::retry_status(
             "spaced host",
             "list",
             self.config.command_retry_policy,
@@ -86,7 +86,7 @@ impl SpacedHostClient {
         user: Option<GuestUserName>,
     ) -> Result<tonic::Streaming<proto::FileChunk>, tonic::Status> {
         let path = GuestPath::parse(path).map_err(invalid_argument_status)?;
-        pplx_space_spaced_common::retry_status(
+        pplx_space_spaced_client::retry_status(
             "spaced host",
             "read",
             self.config.command_retry_policy,
@@ -133,7 +133,7 @@ impl SpacedHostClient {
         let idempotency_key = idempotency_key_or_generated(idempotency_key, append)?;
         let data = std::sync::Arc::new(data);
 
-        pplx_space_spaced_common::retry_status(
+        pplx_space_spaced_client::retry_status(
             "spaced host",
             "write",
             self.config.command_retry_policy,

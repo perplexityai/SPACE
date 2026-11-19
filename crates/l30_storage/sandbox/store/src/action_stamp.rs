@@ -1,8 +1,9 @@
-//! Post-action stamps: best-effort writes of a lifecycle action's
-//! user-facing result onto `sandboxes`, made by the api's lifecycle
-//! dispatcher after the substrate call succeeds (for example `paused` after
-//! a pause, or `started`/`on_node` after a start). They are not repairs made
-//! while answering a read.
+//! Post-action stamps: writes of a lifecycle action's user-facing result
+//! onto `sandboxes` after its substrate call succeeds (for example `paused`
+//! after a pause, or `started`/`on_node` after a start). The api's lifecycle
+//! dispatcher makes them, best-effort, except one: a pooled create's wake
+//! ends with [`stamp_pooled_post_wake`], and its refusal fails the create.
+//! They are not repairs made while answering a read.
 //!
 //! Each stamp writes only over a row whose lifecycle, compared case- and
 //! whitespace-insensitively, is admitted by [`ActionStamp::admits`]: the
@@ -119,14 +120,16 @@
 //!
 //! A refused stamp matches zero rows. That is the normal outcome when another
 //! writer won, not an error: each verb returns whether it wrote, and the api's
-//! callers log a refusal without failing the action. Nothing then writes
+//! callers log a refusal without failing the action, except the pooled
+//! create's, which fails the create. Nothing then writes
 //! the action's result: the row keeps the owner's state, and if that owner
 //! is a delete or a drain evacuation that fails, its compensation puts back
 //! the lifecycle it read before this action finished (the `deleting` and
 //! `suspending` bullets).
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sql_locator::sql;
 
 /// How a start's substrate handles a `suspended` row, as far as its stamp
 /// is concerned.
@@ -275,6 +278,47 @@ pub async fn stamp_started_after_start(
     ))
     .bind(id)
     .bind(ActionStamp::Start(substrate).admitted_values())
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// **Operation step.** Stamp a pooled create's completed wake, `started`
+/// and `on_node` on `active_node_id`, onto the row. Returns whether the row
+/// was written; `false` means the row is gone or another writer moved it
+/// while the wake was in flight, and the caller must surface that rather
+/// than report the sandbox started.
+///
+/// The guard is a resume's decision ([`ActionStamp::Resume`]). The pooled
+/// claim inserts the row `paused`, the wake resumes it, and a Kubernetes
+/// activation receipt can project `started` before this stamp. The pooled
+/// prepare claims and joins no restore on either substrate. So, as for a
+/// resume, it refuses `stopped` (a stop that completed while the wake was in
+/// flight; the wake did not begin from it) and `restoring` (another owner's
+/// restore claim). It also refuses `failed`, `quarantined` and the
+/// tombstones (the sweeper or a quarantine won, and the stamp must not
+/// resurrect a torn-down row as started), `deleting` (the delete owns the
+/// row), `suspending` and `suspended` (a suspend owns it), `stopping` (no
+/// control-plane writer sets it; node publication and the
+/// transient-lifecycle sweeper converge it), and any value outside the
+/// stored vocabulary. The module docs say who finishes each.
+pub async fn stamp_pooled_post_wake(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: SandboxId,
+    active_node_id: Option<NodeId>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'started',
+                placement = 'on_node',
+                active_node_id = $1,
+                placement_changed_at = NOW()
+          WHERE id = $2
+            AND LOWER(TRIM(lifecycle)) = ANY($3::TEXT[])"
+    ))
+    .bind(active_node_id)
+    .bind(id)
+    .bind(ActionStamp::Resume.admitted_values())
     .execute(executor)
     .await?;
     Ok(result.rows_affected() > 0)

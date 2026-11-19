@@ -60,7 +60,7 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
 
     let mut space_runtime = row.clone();
     space_runtime.space_api_route_identity.substrate_kind =
-        Some(pplx_space_common_core::types::NodeManagedBy::Space);
+        Some(pplx_space_node_model::NodeManagedBy::Space);
     assert!(space_runtime.space_api_route_identity.pod_uid.is_some());
     assert_eq!(
         super::super::node_local_registration_generation(&space_runtime),
@@ -78,20 +78,22 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
 }
 
 /// The node-local suspend path end to end, up to the runtime it keeps: the
-/// upload it persists carries the sandbox's Kubernetes execution generation,
+/// upload it persists carries the sandbox's Kubernetes execution generation
+/// as the capture's own,
 /// the cluster's refusal of that generation comes back as a backup-fence
-/// failure, and that failure rolls the suspend back to `paused` with the
-/// runtime still resident.
+/// failure, and that failure rolls back to a wakeable paused VM while retaining
+/// the newly published capture instead of its retired predecessor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
+async fn node_local_suspend_of_a_superseded_execution_retains_the_published_capture_on_live_rollback()
+ {
     with_cluster_api(RETIRING, async || {
         use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let mut fields = runtime_fields(generation(GENERATION), 7);
         fields.space_api_route_identity.substrate_kind =
-            Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+            Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
         crate::db::update_runtime_fields(&conn, sandbox_id.parse().unwrap(), fields).unwrap();
         let service = service_with_runtime_probe(conn, true);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
@@ -105,8 +107,12 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
             b"node-local-capture",
         );
 
+        assert!(
+            crate::db::begin_suspend(&service.db.lock().unwrap(), &sandbox_id, local_artifact_id)
+                .unwrap()
+        );
         let refused = service
-            .enqueue_node_local_suspend_backup(
+            .prepare_node_local_suspend_cleanup(
                 &sandbox,
                 local_artifact_id,
                 snapshot_dir.to_str().unwrap(),
@@ -114,6 +120,7 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
             )
             .await
             .expect_err("the cluster refuses a superseded execution's capture");
+        assert_eq!(refused.code(), tonic::Code::Internal);
         assert!(
             refused
                 .metadata()
@@ -136,18 +143,297 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
         let payload: crate::snapshot_upload::SnapshotUploadJobs =
             serde_json::from_str(&payload).unwrap();
         assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
+        // The running execution took this capture, with no record beside it.
+        assert!(payload.execution_generation_names_capture);
 
-        service
-            .require_node_local_backup_handoff(&sandbox_id, local_artifact_id, Err(refused))
-            .expect_err("a refused handoff must stop before runtime finalization");
         let row = service.lookup_sandbox(&sandbox_id).unwrap();
         assert_eq!(
             row.state,
             crate::state::SandboxStatus::from(SandboxState::Paused)
         );
         assert_eq!(row.pid, Some(std::process::id()));
+        assert_eq!(
+            row.space_api_route_identity.execution_generation,
+            Some(generation(GENERATION))
+        );
+        assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
+        service
+            .wake_with_start_config(
+                sandbox_id.clone(),
+                Some(Duration::from_millis(20)),
+                crate::service::activation_support::WakeStartConfig {
+                    target_state: SandboxState::Paused,
+                    ..Default::default()
+                },
+                true,
+                None,
+            )
+            .await
+            .expect("live rollback must remain wakeable");
         drain(&service).await;
     })
+    .await;
+}
+
+/// Cleanup owns failed handoff retries; an inventory report alone cannot
+/// restart them. Persisted transfers allow release even during a later outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspend_cleanup_requires_handoff_and_retries_the_same_artifact() {
+    with_cluster_api(
+        RetiringClusterApi {
+            unavailable: true,
+            ..RETIRING
+        },
+        async || {
+            use crate::db::{CleanupCompletion, cleanup_jobs::CleanupOutcome};
+            use crate::service::cleanup::SynchronousCleanupRequest;
+            use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
+            for case in [
+                "malformed_sidecar_handoff",
+                "expired_concurrent_handoff",
+                "expired_legacy_handoff",
+                "expired_legacy_pending",
+                "expired_legacy_wrong_artifact_handoff",
+                "expired_legacy_missing_metadata_handoff",
+                "expired_wrong_generation_handoff",
+                "crosses_deadline",
+                "restore_retirement",
+                "new",
+                "pending",
+                "terminal",
+                "expired",
+                "expired_handoff",
+            ] {
+                let restore_retirement = case == "restore_retirement";
+                let already_submitted = case != "new";
+                let terminal = case == "terminal";
+                let expired = case.starts_with("expired");
+                let crosses_deadline = case == "crosses_deadline";
+                let conn = crate::db::test_conn();
+                let id = SandboxId::new();
+                let subject = id.to_string();
+                insert_test_sandbox(&conn, &subject, SandboxState::Suspending);
+                let mut fields = runtime_fields(generation(GENERATION), 7);
+                fields.space_api_route_identity.substrate_kind =
+                    Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
+                crate::db::update_runtime_fields(&conn, id, fields).unwrap();
+                let artifact = LocalArtifactId::new();
+                let scratch = tempfile::tempdir().unwrap();
+                let path = scratch.path().join("snapshot");
+                crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+                    &path,
+                    &subject,
+                    artifact,
+                    b"restorable-capture",
+                );
+                if case == "malformed_sidecar_handoff" {
+                    std::fs::write(path.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME), b"malformed").unwrap();
+                }
+                crate::db::pin_suspended_artifact_for_cleanup(
+                    &conn,
+                    &subject,
+                    artifact,
+                    path.to_str().unwrap(),
+                )
+                .unwrap();
+                if restore_retirement {
+                    // A published predecessor belongs to an older execution. Restore
+                    // retirement persists MarkSuspended as stopping, not suspending.
+                    crate::db::complete_row_intent_cleanup(&conn, &subject, CleanupCompletion::MarkSuspended, Some((artifact, path.to_str().unwrap()))).unwrap();
+                    assert!(matches!(crate::db::update_state_from_states(&conn, &subject, crate::db::StateSet::of(&[SandboxState::Suspended]), SandboxState::Restoring).unwrap(), crate::db::StateWriteOutcome::Applied { .. }));
+                    let mut fields = runtime_fields(generation(GENERATION), 7);
+                    fields.space_api_route_identity.substrate_kind = Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
+                    crate::db::update_runtime_fields(&conn, id, fields).unwrap();
+                    crate::db::mark_cleanup_required(&conn, &subject, true, CleanupCompletion::MarkSuspended, "retire incomplete restore").unwrap();
+                }
+                let mut payload = bound_upload_payload(artifact);
+                payload.meta.local_artifact_id = Some(artifact);
+                payload.meta.sandbox_id = subject.clone();
+                payload.job_ids.clear();
+                if case.starts_with("expired_legacy") {
+                    payload.execution_generation = None;
+                } else if case == "expired_wrong_generation_handoff" || restore_retirement {
+                    payload.execution_generation = Some(generation(GENERATION + 1));
+                }
+                if case == "expired_legacy_wrong_artifact_handoff" {
+                    payload.meta.local_artifact_id = Some(LocalArtifactId::new());
+                }
+                if case == "expired_legacy_missing_metadata_handoff" {
+                    payload.includes_metadata_job = false;
+                }
+                if case.ends_with("_handoff") && case != "expired_concurrent_handoff" {
+                    payload.job_ids = vec![JobId::new()];
+                }
+                if already_submitted {
+                    let upload = insert_upload_job(
+                        &conn,
+                        &subject,
+                        artifact,
+                        &serde_json::to_string(&payload).unwrap(),
+                    );
+                    if terminal {
+                        pplx_space_common_jobs::db::fail_job_permanent(
+                            conn.raw(),
+                            &upload,
+                            "synthetic terminal handoff failure",
+                            None,
+                        )
+                        .unwrap();
+                    }
+                }
+                let service = service_with_runtime_probe(conn, true);
+                let row = service.lookup_sandbox(&subject).unwrap();
+                let work = crate::db::cleanup_jobs::CleanupWork {
+                    version: 1, sandbox_id: id, uuid8: row.uuid8.clone(),
+                    execution_generation: row.space_api_route_identity.execution_generation,
+                    cleanup_id: None, completion: CleanupCompletion::MarkSuspended,
+                    keep_filesystem: true, immediate_kill: true,
+                    guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                    published_artifact: None,
+                };
+                let cleanup_job = {
+                    let db = service.db.lock().unwrap();
+                    let job = crate::db::cleanup_jobs::persist(&db, work.clone()).unwrap();
+                    if expired {
+                        db.execute("UPDATE jobs SET created_at = datetime('now', '-16 minutes') WHERE job_id = ?1", [job.to_string()]).unwrap();
+                    }
+                    // Rediscovery joins the same obligation and preserves its clock.
+                    assert_eq!(crate::db::cleanup_jobs::persist(&db, work.clone()).unwrap(), job);
+                    job
+                };
+                let pending_wake = service
+                    .wake_with_start_config(subject.clone(), None, Default::default(), false, None)
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(
+                    pending_wake.transition,
+                    crate::proto::WakeTransition::Wait as i32
+                );
+                let waiting = service.wake_with_start_config(
+                    subject.clone(), Some(Duration::from_millis(20)),
+                    Default::default(), true, None,
+                ).await.expect_err("blocking wake must honor its budget during handoff");
+                assert_eq!(waiting.code(), tonic::Code::DeadlineExceeded);
+                for step in 0..if terminal || expired || case == "malformed_sidecar_handoff" || restore_retirement || crosses_deadline { 1 } else { 2 } {
+                    let concurrent_handoff = case == "expired_concurrent_handoff";
+                    let handed_off = step == 1 || case == "malformed_sidecar_handoff" || case == "expired_handoff" || case == "expired_legacy_handoff" || concurrent_handoff;
+                    assert!(crate::db::cleanup_jobs::mark_running(&service.db.lock().unwrap(), &cleanup_job).unwrap());
+                    if concurrent_handoff {
+                        service.enqueue_node_local_suspend_backup(
+                            &row, artifact, path.to_str().unwrap(), Some(SuspendSnapshotFormat::Full),
+                        ).await.expect_err("the foreground attempt observes the outage");
+                    }
+                    if handed_off {
+                        // Model the durable upload worker completing its handoff between
+                        // cleanup attempts, without making the control plane available.
+                        let upload = service
+                            .snapshot_upload_worker
+                            .find_job_by_dedup_key(
+                                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                                &crate::snapshot_upload_jobs::artifact_backup_dedup_key(artifact),
+                            )
+                            .unwrap()
+                            .expect("cleanup must persist or join an upload");
+                        let mut payload = upload
+                            .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                            .unwrap();
+                        assert_eq!(payload.meta.local_artifact_id, Some(artifact));
+                        payload.job_ids = vec![JobId::new()];
+                        crate::snapshot_upload_jobs::persist_submitted_transfer_ids(
+                            &service.db, &upload.job_id, &payload,
+                        ).unwrap();
+                    }
+                    if concurrent_handoff {
+                        // The worker persists success after the failed foreground read,
+                        // before the expired attempt decides whether to quarantine.
+                        let settled = service.settle_failed_suspend_handoff(
+                            &row, artifact, Some(&cleanup_job), "expired foreground handoff",
+                        ).unwrap();
+                        assert!(settled.is_none(), "a concurrently persisted handoff must continue cleanup");
+                    }
+                    let fence = match service.try_cleanup_fence(&subject) {
+                        crate::service::cleanup_support::CleanupLockTryResult::Acquired(fence) => fence,
+                        _ => panic!("test owns cleanup"),
+                    };
+                    let admission = crate::service::cleanup::CleanupAdmission::Persisted {
+                        sandbox_id: id, expected_execution_generation: row.space_api_route_identity.execution_generation,
+                        dispatch_job_id: Some(cleanup_job), auto_lifecycle_delete_receipt: None, fence,
+                    };
+                    let dispatched = std::sync::atomic::AtomicBool::new(false);
+                    let result = if crosses_deadline {
+                        let created = crate::db::read::cleanup_job_created_at(&service.db.lock().unwrap(), &cleanup_job).unwrap().unwrap().get();
+                        let sampled = std::sync::atomic::AtomicBool::new(false);
+                        service.ensure_suspend_backup_before_cleanup(&subject, None, Some(&cleanup_job), || {
+                            let age = if sampled.swap(true, std::sync::atomic::Ordering::SeqCst) { 900 } else { 899 };
+                            jiff::Timestamp::from_second(created + age).unwrap()
+                        }).await.map(|outcome| outcome.expect("failed handoff crossing its deadline must settle"))
+                    } else { service
+                        .run_cleanup_to_completion_with_node_dispatch_and_admission(
+                            SynchronousCleanupRequest {
+                                sandbox_id: &subject,
+                                uuid8: row.uuid8.as_str(),
+                                keep_filesystem: true,
+                                context: "suspend handoff retry",
+                                completion: CleanupCompletion::MarkSuspended,
+                                published_artifact: None,
+                                immediate_kill: true,
+                                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+                            },
+                            Some(admission),
+                            None,
+                            || async { Ok(()) },
+                            |_| async {
+                                dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Ok(())
+                            },
+                        )
+                        .await };
+                    assert_eq!(
+                        dispatched.load(std::sync::atomic::Ordering::SeqCst),
+                        handed_off || restore_retirement,
+                        "{case}"
+                    );
+                    service.record_cleanup_attempt(&cleanup_job, &result).await.unwrap();
+                    if terminal || crosses_deadline || (expired && !handed_off) {
+                        assert!(matches!(result.unwrap(), CleanupOutcome::Quarantined(_)));
+                        let row = service.lookup_sandbox(&subject).unwrap();
+                        assert_eq!(row.state, SandboxState::Quarantined.into());
+                        assert_eq!(row.current_local_artifact_id, Some(artifact));
+                        assert_eq!(row.cleanup_completion, None);
+                        for blocking in [false, true] {
+                            let refused = service
+                                .wake_with_start_config(
+                                    subject.clone(),
+                                    Some(Duration::from_millis(20)),
+                                    Default::default(),
+                                    blocking,
+                                    None,
+                                )
+                                .await
+                                .expect_err(
+                                    "terminal handoff must refuse wake instead of waiting forever",
+                                );
+                            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+                        }
+                    } else if handed_off || restore_retirement {
+                        assert_eq!(result.unwrap(), CleanupOutcome::Applied);
+                    } else {
+                        result.expect_err("unpersisted handoff must retain the cleanup obligation");
+                        assert_eq!(
+                            service
+                                .lookup_sandbox(&subject)
+                                .unwrap()
+                                .current_local_artifact_id,
+                            Some(artifact)
+                        );
+                    }
+                    assert!(path.exists());
+                }
+                drain(&service).await;
+            }
+        },
+    )
     .await;
 }
 
@@ -264,13 +550,18 @@ async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation()
             ..RETIRING
         },
         async || {
-            for (recorded, upload_retained, carried) in [
-                (true, false, Some(generation(GENERATION))),
-                (false, true, Some(generation(GENERATION))),
-                (false, false, None),
+            // The re-upload orders captures by its generation only when the
+            // capture's record names it or the earlier upload did.
+            for (recorded, upload_retained, upload_names_capture, carried, names_capture) in [
+                (true, false, false, Some(generation(GENERATION)), true),
+                (false, true, false, Some(generation(GENERATION)), false),
+                (false, true, true, Some(generation(GENERATION)), true),
+                (false, false, false, None, false),
             ] {
                 let refused = refused_teardown_with(|staged| {
-                    serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+                    let mut payload = bound_upload_payload(staged);
+                    payload.execution_generation_names_capture = upload_names_capture;
+                    serde_json::to_string(&payload).unwrap()
                 })
                 .await;
                 let service = &refused.service;
@@ -320,6 +611,11 @@ async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation()
                     payload.execution_generation, carried,
                     "recorded {recorded}, upload retained {upload_retained}"
                 );
+                assert_eq!(
+                    payload.execution_generation_names_capture, names_capture,
+                    "recorded {recorded}, upload retained {upload_retained}, earlier upload \
+                     names its capture {upload_names_capture}"
+                );
                 drain(service).await;
             }
         },
@@ -333,17 +629,22 @@ async fn eviction_reupload_of_a_refused_capture_keeps_its_execution_generation()
 /// earlier upload names that generation: after a retriable failure, and after
 /// the refused upload is pruned. The control plane, which superseded the
 /// generation, refuses it each time. A capture with no such evidence, as an
-/// earlier node-local suspend's has, still registers unfenced.
+/// earlier node-local suspend's has, still registers unfenced. The attempt
+/// marks the generation as the capture's own only when the record names it or
+/// the earlier upload marked it so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_suspended_teardown_capture_never_registers_unfenced() {
     with_cluster_api(RETIRING, async || {
-        for (recorded, upload_retained, fenced) in [
-            (true, false, true),
-            (false, true, true),
-            (false, false, false),
+        for (recorded, upload_retained, upload_names_capture, fenced, names_capture) in [
+            (true, false, false, true, true),
+            (false, true, false, true, false),
+            (false, true, true, true, true),
+            (false, false, false, false, false),
         ] {
             let refused = refused_teardown_with(|staged| {
-                serde_json::to_string(&bound_upload_payload(staged)).unwrap()
+                let mut payload = bound_upload_payload(staged);
+                payload.execution_generation_names_capture = upload_names_capture;
+                serde_json::to_string(&payload).unwrap()
             })
             .await;
             let service = &refused.service;
@@ -410,9 +711,180 @@ async fn a_restart_suspended_teardown_capture_never_registers_unfenced() {
                 };
                 result.expect_err("a refused registration can't make the suspend durable");
             }
+            let attempt = service
+                .snapshot_upload_worker
+                .find_job_by_dedup_key(
+                    crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                    &staged,
+                )
+                .unwrap()
+                .expect("the drive persists an attempt")
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .unwrap();
+            assert_ne!(
+                attempt.snapshot_id,
+                bound_upload_payload(refused.staged).snapshot_id,
+                "{case}: the drive must start a new attempt"
+            );
+            assert_eq!(
+                attempt.execution_generation_names_capture, names_capture,
+                "{case}, earlier upload names its capture {upload_names_capture}"
+            );
             drain(service).await;
         }
     })
+    .await;
+}
+
+/// The earlier upload vouches for a generation only when it marked that same
+/// generation as the capture's own.
+#[test]
+fn an_earlier_upload_vouches_only_for_the_generation_it_marked() {
+    let artifact = LocalArtifactId::new();
+    let job = |names_capture| {
+        let mut payload = bound_upload_payload(artifact);
+        payload.execution_generation_names_capture = names_capture;
+        crate::snapshot_upload_jobs::tests::job_fixture(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            serde_json::to_string(&payload).unwrap(),
+        )
+    };
+    let vouches = super::super::artifact_backup::earlier_upload_vouches;
+    let marked = job(true);
+    assert!(vouches(Some(&marked), Some(generation(GENERATION))));
+    assert!(!vouches(Some(&marked), Some(generation(GENERATION + 1))));
+    assert!(!vouches(Some(&marked), None));
+    assert!(!vouches(Some(&job(false)), Some(generation(GENERATION))));
+    assert!(!vouches(None, Some(generation(GENERATION))));
+}
+
+/// A legacy plaintext teardown without an admission identity crashed before
+/// publishing its capture and leaves the
+/// canonical directory holding the previous capture, A, which an earlier
+/// execution took. Startup recovery adopts A as the teardown's capture and
+/// records the teardown's generation for it, so its backup stays fenced under
+/// that generation, as before. That record doesn't make A the capture of the
+/// later execution: the drive's upload doesn't mark the generation as A's
+/// own, so cluster-api records no capture generation for it and A can't order
+/// as newer than a capture taken between the two executions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_capture_recovery_adopts_without_inventing_capture_order() {
+    with_cluster_api(
+        RetiringClusterApi {
+            supersession_lapsed: true,
+            ..RETIRING
+        },
+        async || {
+            use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
+            let mut fields = runtime_fields(generation(GENERATION), 7);
+            fields.space_api_route_identity.substrate_kind =
+                Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
+            crate::db::update_runtime_fields(&conn, sandbox_id.parse().unwrap(), fields).unwrap();
+            // A, captured and published by the previous execution's teardown.
+            let cache_dir = tempfile::tempdir().unwrap();
+            let snapshot_dir =
+                crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+                    &cache_dir.path().join(&sandbox_id),
+                );
+            let earlier = LocalArtifactId::new();
+            crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+                &snapshot_dir,
+                &sandbox_id,
+                earlier,
+                b"earlier-capture",
+            );
+            crate::capture_record::write(
+                &snapshot_dir,
+                earlier,
+                generation(GENERATION - 1),
+                crate::capture_record::RecordWriter::CapturingTeardown,
+            )
+            .unwrap();
+            // This execution's teardown began, then the node went down before
+            // its capture was published.
+            crate::db::begin_teardown_suspend(
+                &conn,
+                &sandbox_id,
+                generation(GENERATION),
+                pplx_space_snapshot_model::LocalArtifactId::new(),
+            )
+            .unwrap();
+            // Only legacy plaintext recovery may adopt an unrelated capture.
+            // New admissions bind an exact artifact; the classifier matrix
+            // covers their refusal to choose the old canonical directory.
+            conn.execute(
+                "UPDATE sandboxes SET suspend_attempt_artifact_id = NULL,
+                     suspend_attempt_started_at = NULL WHERE id = ?1",
+                [&sandbox_id],
+            )
+            .unwrap();
+            let (service, _dispatched) = service_recording_cleanup(conn);
+            service
+                .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
+                .unwrap();
+
+            let row = service.lookup_sandbox(&sandbox_id).unwrap();
+            assert_eq!(row.current_local_artifact_id, Some(earlier));
+            assert_eq!(
+                crate::capture_record::read(&snapshot_dir, earlier).unwrap(),
+                Some(generation(GENERATION)),
+                "recovery's record fences A under the active teardown, as before"
+            );
+            assert_eq!(
+                crate::capture_record::read_capture_order(&snapshot_dir, earlier).unwrap(),
+                None,
+                "recovery's record must not order A"
+            );
+
+            let artifact = crate::db::LocalArtifactRow {
+                local_artifact_id: earlier,
+                sandbox_id: sandbox_id.clone(),
+                artifact_kind: ArtifactKind::Full,
+                artifact_origin: ArtifactOrigin::Suspend,
+                snapshot_name: None,
+                local_path: snapshot_dir.to_str().unwrap().to_string(),
+            };
+            let drive = tokio::time::timeout(
+                Duration::from_secs(3),
+                answered_or_admitted(
+                    earlier,
+                    service.ensure_teardown_suspend_backup(
+                        &row,
+                        TeardownSuspendBackup {
+                            execution_generation: generation(GENERATION),
+                            artifact: &artifact,
+                            format: SuspendSnapshotFormat::Full,
+                            origin: super::super::TeardownBackupOrigin::Captured,
+                        },
+                    ),
+                ),
+            )
+            .await
+            .expect("the drive registers or answers");
+            if let Drive::Answered(result) = &drive {
+                assert!(result.is_ok(), "the lapsed fence admits A: {result:?}");
+            }
+            let payload = service
+                .snapshot_upload_worker
+                .find_job_by_dedup_key(
+                    crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                    &earlier.to_string(),
+                )
+                .unwrap()
+                .expect("the drive persists A's upload")
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .unwrap();
+            assert_eq!(payload.execution_generation, Some(generation(GENERATION)));
+            assert!(
+                !payload.execution_generation_names_capture,
+                "the later execution's generation must not be recorded as A's capture"
+            );
+            drain(&service).await;
+        },
+    )
     .await;
 }
 
@@ -693,6 +1165,54 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
     .await;
 }
 
+/// A worker can finish refusing the registration before its submitting
+/// caller reads the job. The handoff must still return the typed fence
+/// verdict, while an unrelated terminal failure stays failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_refusal_before_handoff_keeps_the_superseded_verdict() {
+    with_cluster_api(RETIRING, async || {
+        for carried in [Some(generation(GENERATION)), None] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new();
+            let staged =
+                insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation(GENERATION));
+            let mut payload = bound_upload_payload(staged);
+            payload.execution_generation = carried;
+            let job_id = insert_upload_job(
+                &conn,
+                &sandbox_id.to_string(),
+                staged,
+                &serde_json::to_string(&payload).unwrap(),
+            );
+            pplx_space_common_jobs::db::fail_job_permanent(
+                conn.raw(),
+                &job_id,
+                "registration failed before handoff",
+                None,
+            )
+            .unwrap();
+            let (service, _) = service_recording_cleanup(conn);
+            let error = service
+                .establish_restore_visible_artifact_backup(&job_id)
+                .await
+                .expect_err("a failed upload cannot establish a handoff");
+            let verdict = match &error {
+                super::super::ArtifactBackupSubmissionError::Begin {
+                    superseded_generation,
+                    ..
+                } => *superseded_generation,
+                _ => None,
+            };
+            assert_eq!(
+                verdict, carried,
+                "the handoff must retain the control plane's verdict: {error}"
+            );
+            drain(&service).await;
+        }
+    })
+    .await;
+}
+
 /// Write `refused`'s capture into `snapshot_dir` and point its local artifact
 /// row there. The capture records [`GENERATION`] when `recorded`, and its
 /// refused upload is pruned unless `upload_retained`.
@@ -729,5 +1249,11 @@ fn stage_refused_capture(
 /// Record [`GENERATION`] as the capture's execution generation in the
 /// capture's record at `snapshot_dir`, as a teardown suspend's capture does.
 fn record_capture_generation(snapshot_dir: &std::path::Path, artifact: LocalArtifactId) {
-    crate::capture_record::write(snapshot_dir, artifact, generation(GENERATION)).unwrap();
+    crate::capture_record::write(
+        snapshot_dir,
+        artifact,
+        generation(GENERATION),
+        crate::capture_record::RecordWriter::CapturingTeardown,
+    )
+    .unwrap();
 }

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{
+use pplx_space_auto_lifecycle::{
     AutoLifecycleActivitySource, AutoLifecycleConditionKind, AutoLifecycleConditionSetId,
     AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, AutoLifecycleWakeSource,
 };

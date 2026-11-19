@@ -312,7 +312,8 @@ async fn cancelled_activation_retries_release_admission_without_releasing_the_lo
     use crate::service::activation_support::internal_request;
     use crate::service::tests::service_tests::insert_test_sandbox;
     use crate::state::SandboxState;
-    use pplx_space_common_core::types::{NodeId, SandboxActivationAttemptId, SandboxId};
+    use pplx_space_accounts::NodeId;
+    use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
 
     enum LockSite {
         Staging,
@@ -517,7 +518,7 @@ async fn activation_admission_bounds_live_waiters_and_rejects_cancelled_ready_wo
 async fn blocking_wake_without_client_deadline_has_bounded_passive_wait() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use crate::state::SandboxState;
-    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_sandbox_model::SandboxId;
 
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();

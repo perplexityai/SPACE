@@ -3,7 +3,8 @@
 import space_smoke as smoke
 
 ALLOWED = "https://1.0.0.1/"
-UNLISTED = "http://208.67.222.222/"
+# 1.1.1.1 and 8.8.8.8 are gateway-owned DNS destinations, not HTTP controls.
+UNLISTED = "http://1.1.1.2/"
 
 
 @smoke.scenario(

@@ -1,6 +1,6 @@
 //! Runtime control owned by node-manager. Lifecycle services do not receive a
 //! VMM's host-path-capable control socket or interpret provider-specific states.
-use pplx_space_common_core::types::RuntimeKind;
+use pplx_space_execution_spec::RuntimeKind;
 use std::{future::Future, path::PathBuf, pin::Pin};
 
 #[cfg(feature = "host-runtime")]
@@ -30,14 +30,11 @@ impl ControlError {
     /// A mutation may have executed when its deadline expires. Callers must
     /// reconcile or terminate the fenced execution, never retry it blindly.
     pub fn is_timeout(&self) -> bool {
-        #[cfg(feature = "host-runtime")]
-        if matches!(
-            self,
-            Self::CloudHypervisor(cloud_hypervisor::ApiError::Timeout)
-        ) {
-            return true;
+        match self {
+            #[cfg(feature = "host-runtime")]
+            Self::CloudHypervisor(cloud_hypervisor::ApiError::Timeout) => true,
+            _ => false,
         }
-        false
     }
 }
 
@@ -165,7 +162,7 @@ impl RuntimeControl for crate::fc_api::FcApiClient {
 /// The shared control trait does not require a socket-backed implementation.
 pub fn socket_path(
     runtime: RuntimeKind,
-    sandbox_id: pplx_space_common_core::types::SandboxId,
+    sandbox_id: pplx_space_sandbox_model::SandboxId,
 ) -> Result<PathBuf, ControlError> {
     let filename = match runtime {
         RuntimeKind::Firecracker => "firecracker.sock",
@@ -179,11 +176,9 @@ pub fn socket_path(
 /// implementations need not expose a chroot or a Unix guest transport.
 pub fn isolation_root(runtime: RuntimeKind, sandbox_id: &str) -> Result<PathBuf, ControlError> {
     match runtime {
-        RuntimeKind::Firecracker => Ok(pplx_space_common_core::types::node_fs::jail_root(
-            sandbox_id,
-        )),
+        RuntimeKind::Firecracker => Ok(pplx_space_host_layout::paths::jail_root(sandbox_id)),
         RuntimeKind::CloudHypervisor => Ok(std::path::Path::new(
-            pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR,
+            pplx_space_host_layout::paths::FIRECRACKER_JAIL_DIR,
         )
         .join(runtime.as_str())
         .join(sandbox_id)

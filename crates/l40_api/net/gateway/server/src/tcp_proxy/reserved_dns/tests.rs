@@ -223,7 +223,7 @@ async fn ready_invalidation_cancels_open_reserved_tcp_connections() {
                 let loader: PolicyLoader = Arc::new(|| {
                     Box::pin(async {
                         Err(crate::state::HydrateNetworkStateError::GetNetworkPolicy {
-                            sandbox_id: pplx_space_common_core::types::SandboxId::new(),
+                            sandbox_id: pplx_space_sandbox_model::SandboxId::new(),
                             source: tonic::Status::unavailable("unavailable"),
                         })
                     })

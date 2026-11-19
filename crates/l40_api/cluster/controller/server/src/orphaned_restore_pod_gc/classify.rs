@@ -9,7 +9,9 @@
 //! timestamp — see the reconciler's `first_seen_orphan` doc.
 
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
-use pplx_space_common_core::types::{PodUid, SandboxId, SandboxLifecycle};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_pod::SANDBOX_POOL_ROLE_WARM;
 use pplx_space_sandbox_portability::execution_supersession::{
     ExecutionSupersessionRow, execution_generation_superseded,
 };
@@ -42,10 +44,16 @@ pub struct RestorePodSnapshot {
     /// `metadata.deletionTimestamp` is set — the pod is already terminating.
     pub terminating: bool,
     /// The pod carries a restore annotation (see
-    /// [`SandboxPodView::has_restore_annotation`]). Always
-    /// true on the cached scan (the backend filters on it); re-checked on the
-    /// fresh read so a pod whose annotations changed isn't deleted.
+    /// [`SandboxPodView::has_restore_annotation`]). Re-checked on the fresh
+    /// read so a pod whose annotations changed isn't deleted.
     pub is_restore: bool,
+    /// The pod's phase is `Succeeded` or `Failed`: every container has exited,
+    /// so no VM runs in it. Re-checked on the fresh read.
+    pub terminal: bool,
+    /// The pod carries the warm pool's `pool-role=warm` label. Such a pod
+    /// belongs to the warm-pool orphan sweep, so it's never scanned as a
+    /// terminal pod here.
+    pub warm_pool: bool,
 }
 
 impl RestorePodSnapshot {
@@ -77,7 +85,21 @@ impl RestorePodSnapshot {
             node_name,
             terminating: pod.is_deleting(),
             is_restore: pod.has_restore_annotation(),
+            terminal: pod.is_terminal(),
+            warm_pool: pod.label(SandboxPodKey::PoolRole) == Some(SANDBOX_POOL_ROLE_WARM),
         }
+    }
+
+    /// Whether this loop classifies the pod at all: a restore pod always,
+    /// and, when `terminal_pods` is on, a terminal pod outside the warm pool.
+    pub(crate) fn is_scanned(&self, terminal_pods: bool) -> bool {
+        self.is_restore || (terminal_pods && self.is_terminal_scanned())
+    }
+
+    /// A terminal pod outside the warm pool, which [`classify_terminal_pod`]
+    /// may reap when `terminal_pods` is on.
+    fn is_terminal_scanned(&self) -> bool {
+        self.terminal && !self.warm_pool
     }
 }
 
@@ -149,7 +171,15 @@ pub enum OrphanReason {
     /// rollback) after the pod teardown failed. The row-driven orphaned-sandbox
     /// reconciler can't discover a pod with no row, so this reaper — the only
     /// pod-driven cleanup for restore pods — owns it, or the VM leaks forever.
+    /// With `terminal_pods` on, the same holds for a terminal pod of any kind,
+    /// such as one an idle or timeout delete left after removing the row.
     SandboxMissing,
+    /// A terminal pod whose row is `suspended` with no active execution: the
+    /// suspend completed and retired the pod's execution, and the VM has
+    /// exited, so the pod holds nothing and no restore can adopt it. An idle
+    /// or timeout suspend leaves this shape, as the node suspends without
+    /// deleting the pod.
+    SuspendedTerminalPod,
 }
 
 impl OrphanReason {
@@ -157,6 +187,7 @@ impl OrphanReason {
         match self {
             Self::RowReverted => "row_reverted",
             Self::SandboxMissing => "sandbox_missing",
+            Self::SuspendedTerminalPod => "suspended_terminal_pod",
         }
     }
 }
@@ -220,6 +251,11 @@ pub enum SkipClass {
     /// while a node still reports the sandbox, so its pod can stay until the
     /// sandbox is deleted (see the module docs).
     CaptureAdmitted,
+    /// A terminal pod that isn't a restore pod, on a row that still exists
+    /// and isn't `suspended` with no active execution. A `stopped` row's
+    /// execution still names its pod, and its next `start` replaces it; any
+    /// other row has an owner that settles the pod.
+    TerminalPodOwned,
 }
 
 impl SkipClass {
@@ -233,6 +269,7 @@ impl SkipClass {
             Self::RowQuarantined => "row_quarantined",
             Self::NoActiveExecution => "no_active_execution",
             Self::CaptureAdmitted => "capture_admitted",
+            Self::TerminalPodOwned => "terminal_pod_owned",
         }
     }
 }
@@ -350,4 +387,63 @@ pub fn classify_disposition(
             }
         }
     }
+}
+
+/// Decide a terminal pod's disposition from its owning row, whatever made the
+/// pod.
+///
+/// A terminal pod's containers have all exited, so no VM runs in it and its
+/// delete starts no teardown capture: what [`classify_disposition`] guards for
+/// a restore pod doesn't arise. The pod is reaped when nothing owns it:
+///
+/// - No row (a soft-deleted tombstone counts as none): the sandbox was deleted
+///   while the pod stayed, as an idle or timeout delete leaves it. The node
+///   deletes the sandbox and the control plane removes the row, but neither
+///   deletes the pod.
+/// - A `suspended` row with no active execution: the suspend completed and
+///   retired the pod's execution, and a restore makes a new pod at a higher
+///   generation. The API's own suspend deletes the pod at this point; an idle
+///   or timeout suspend on the node doesn't.
+///
+/// Every other row is left alone: a `stopped` row's active execution still
+/// names the pod, and `start` replaces it; a transient row has an operation in
+/// flight; a `quarantined` row is held for an operator.
+pub fn classify_terminal_pod(state: Option<&SandboxRestoreState>) -> Disposition {
+    let Some(state) = state else {
+        return Disposition::Orphaned(OrphanReason::SandboxMissing);
+    };
+    match state.lifecycle {
+        RowLifecycle::Known(SandboxLifecycle::Suspended) if state.active_generation().is_none() => {
+            Disposition::Orphaned(OrphanReason::SuspendedTerminalPod)
+        }
+        RowLifecycle::Known(_) => Disposition::Skip(SkipClass::TerminalPodOwned),
+        RowLifecycle::Unrecognized => Disposition::Skip(SkipClass::UnrecognizedRow),
+    }
+}
+
+/// Decide a scanned pod's disposition: a restore pod by
+/// [`classify_disposition`], and, when `terminal_pods` is on, a terminal pod
+/// outside the warm pool by [`classify_terminal_pod`] as well. A pod either
+/// reaps is an orphan; otherwise the restore verdict's skip class stands when
+/// there is one.
+pub fn classify_pod(
+    state: Option<&SandboxRestoreState>,
+    pod: &RestorePodSnapshot,
+    pod_generation: i64,
+    terminal_pods: bool,
+) -> Disposition {
+    let restore = pod
+        .is_restore
+        .then(|| classify_disposition(state, pod_generation));
+    if let Some(orphaned @ Disposition::Orphaned(_)) = restore {
+        return orphaned;
+    }
+    if terminal_pods && pod.is_terminal_scanned() {
+        let terminal = classify_terminal_pod(state);
+        if matches!(terminal, Disposition::Orphaned(_)) {
+            return terminal;
+        }
+        return restore.unwrap_or(terminal);
+    }
+    restore.unwrap_or(Disposition::Skip(SkipClass::TerminalPodOwned))
 }

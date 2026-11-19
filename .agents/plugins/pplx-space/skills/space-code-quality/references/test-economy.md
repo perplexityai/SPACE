@@ -167,7 +167,7 @@ about *ownership of claims*, not file locations.
 | **Smoke** (`space_smoke` scenarios and legacy suites on Kind or a live deployment) | cross-service outcomes on a real substrate: does the *platform* do it | re-assert translation/validation logic the unit layers pin; smokes are for substrate truth |
 
 Where a lower layer owns a shape (the golden pod-spec snapshots in
-`crates/libs/common/core/src/fixtures/`), higher-layer tests assert only
+`crates/l40_api/sandbox/pod/fixtures/`), higher-layer tests assert only
 their *own*
 delta and leave the one-line delegating comment — `cluster-controller`'s
 pod tests write "golden snapshots, so it is not re-asserted here." Copy

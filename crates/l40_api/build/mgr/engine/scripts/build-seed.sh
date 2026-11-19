@@ -232,6 +232,10 @@ for bin in "${GUEST_BINS[@]}"; do
   cp "${GUEST_BIN_DIR}/${bin}" "${GUEST_BIN_STAGE_DIR}/${bin}"
   chmod 755 "${GUEST_BIN_STAGE_DIR}/${bin}"
 done
+if [[ -f "${GUEST_BIN_DIR}/artifact.json" ]]; then
+  cp "${GUEST_BIN_DIR}/artifact.json" "${GUEST_BIN_STAGE_DIR}/artifact.json"
+  chmod 644 "${GUEST_BIN_STAGE_DIR}/artifact.json"
+fi
 
 : "${SPACE_SEED_SOURCE_TYPE:?SPACE_SEED_SOURCE_TYPE is required}"
 : "${SPACE_SEED_UBUNTU_RELEASE:?SPACE_SEED_UBUNTU_RELEASE is required}"

@@ -6,9 +6,10 @@
 //! statement; live alone executes its bounded deletes. The node row is never
 //! deleted.
 
-use pplx_space_common_core::types::{NodeId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use crate::metrics::reconcile::QueueGcMode;

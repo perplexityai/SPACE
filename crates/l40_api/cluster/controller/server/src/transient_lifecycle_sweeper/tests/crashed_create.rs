@@ -313,9 +313,9 @@ fn the_creating_age_knob_overrides_the_default_age() {
 }
 
 mod postgres_backed {
-    use pplx_space_common_core::sql;
-    use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
     use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
+    use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+    use pplx_space_sql_locator::sql;
     use pplx_space_test_env::TestResult;
     use sqlx::PgPool;
 

@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::StreamExt;
-use pplx_space_common_core::types::GuestUserName;
+use pplx_space_guest_process::GuestUserName;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::StartRequest;
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_server::Process;
 
@@ -75,6 +75,88 @@ async fn pty_close_stdin_rejects_without_disabling_input() {
     service.inner.process_tasks.wait().await;
     assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
     input.expect("unsupported close must preserve PTY input");
+}
+
+// A pty-backed process gets a terminal type and a character set unless the
+// sandbox's environment or the request sets them; a process without a pty
+// gets neither.
+#[tokio::test]
+async fn a_pty_starts_with_terminal_defaults_the_sandbox_and_request_override() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{PtyConfig, process_event::Event};
+
+    let service = cancellation_service();
+    let print = || {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '[%s][%s]' \"$TERM\" \"$LANG\"".to_string(),
+        ]
+    };
+    let output = |request: StartRequest| {
+        let service = &service;
+        async move {
+            let response = Process::start(service, Request::new(request))
+                .await
+                .expect("process starts");
+            let mut stream = response.into_inner();
+            let mut stdout = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = stream.next().await {
+                    match event.expect("process stream").event {
+                        Some(Event::Stdout(output)) => stdout.extend(output.data),
+                        Some(Event::Exit(_)) => break,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the process exits");
+            String::from_utf8(stdout).expect("utf-8 output")
+        }
+    };
+    let pty = || Some(PtyConfig { size: None });
+
+    for (label, configured, env, pty, expected) in [
+        ("pty", None, vec![], pty(), "[xterm-256color][C.UTF-8]"),
+        (
+            "request overrides",
+            None,
+            vec![("TERM", "vt100"), ("LANG", "en_US.UTF-8")],
+            pty(),
+            "[vt100][en_US.UTF-8]",
+        ),
+        (
+            "sandbox overrides",
+            Some(("LANG", "ja_JP.UTF-8")),
+            vec![],
+            pty(),
+            "[xterm-256color][ja_JP.UTF-8]",
+        ),
+        ("no pty", None, vec![], None, "[][]"),
+    ] {
+        let configured = configured
+            .map(|(key, value)| HashMap::from([(key.to_string(), value.to_string())]))
+            .unwrap_or_default();
+        service
+            .configure_process_env(EnvMap::try_from(configured).unwrap())
+            .await
+            .unwrap();
+        let printed = output(StartRequest {
+            command: print(),
+            env: env
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            pty,
+            idempotency_key: Some(format!("pty-defaults-{label}")),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(printed, expected, "{label}");
+    }
+    service.inner.shutdown.cancel();
+    service.inner.process_tasks.close();
+    service.inner.process_tasks.wait().await;
 }
 
 // A reconnect re-sends Start for a session whose process may already run. It
@@ -371,7 +453,7 @@ async fn losing_start_response_preserves_output_supervision_and_idempotency() {
                             assert_eq!(error.code(), tonic::Code::ResourceExhausted);
                             assert_eq!(
                                 error.message(),
-                                pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE
+                                pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED_MESSAGE
                             );
                             lagged = true;
                             assert!(replay.next().await.is_none());
@@ -941,9 +1023,9 @@ async fn cursor_past_the_output_fails_instead_of_waiting() {
         assert_eq!(
             error
                 .metadata()
-                .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+                .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
                 .and_then(|value| value.to_str().ok()),
-            Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+            Some(pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD)
         );
         assert!(ahead.next().await.is_none());
 
@@ -986,11 +1068,11 @@ async fn lagged_cursor_reports_the_oldest_retained_output() {
             .map(str::to_owned)
     };
     assert_eq!(
-        metadata(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY).as_deref(),
-        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED)
+        metadata(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY).as_deref(),
+        Some(pplx_space_guest_process::status::PROCESS_OUTPUT_LAGGED)
     );
     let first_sequence: u64 =
-        metadata(pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+        metadata(pplx_space_guest_process::status::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
             .expect("the oldest retained output")
             .parse()
             .unwrap();
@@ -1382,7 +1464,7 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
 #[tokio::test]
 async fn a_reconnect_before_its_process_is_published_waits_or_retries() {
     let (service, placement) = stalled_placement_service();
-    let process_id = pplx_space_common_core::types::ProcessId::new();
+    let process_id = pplx_space_guest_process::ProcessId::new();
     let request = |key: &str| {
         Request::new(StartRequest {
             command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],

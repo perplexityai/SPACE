@@ -1,8 +1,8 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use crate::db::tests::setup_quarantine_recovery_episode;
-use pplx_space_common_core::types::SandboxQuarantineReasonCode;
+use pplx_space_sandbox_model::SandboxQuarantineReasonCode;
 
 #[test]
 fn partial_sweeps_do_not_renew_freshness_but_late_completion_does() {

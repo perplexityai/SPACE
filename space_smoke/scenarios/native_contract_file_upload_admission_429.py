@@ -35,6 +35,7 @@ def _held_upload(url: str, token: str, path: str, key: str, body: bytes, split: 
 
 @scenario(
     "native_contract.file_upload_admission_429",
+    tier="main",
     api_surfaces=("native",),
     required_tools=("kubectl", "kind"),
     rerun_environment=RECOVERY_ENVIRONMENT,

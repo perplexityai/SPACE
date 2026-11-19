@@ -6,7 +6,7 @@ use pplx_space_credmgr_client::{
 };
 use pplx_space_object_store::ObjectCredentials;
 
-use pplx_space_common_core::types::TemplateName;
+use pplx_space_template_model::TemplateName;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectStoreConfig {

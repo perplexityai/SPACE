@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId};
+use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Instant;
 
@@ -6,13 +7,13 @@ use crate::metrics::template::{
     VisibilityLookupCacheOutcome, VisibilityLookupDegradation, visibility_lookup_cache,
     visibility_lookup_degraded,
 };
-use pplx_space_common_core::types::TemplateVisibility as CoreTemplateVisibility;
+use pplx_space_template_model::TemplateVisibility as CoreTemplateVisibility;
 
 use crate::template_visibility_cache::TemplateVisibilityCache;
 
 use super::status::*;
 use super::*;
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 // ── Template metadata: row types and helpers ──────────────────────────────
 
@@ -163,9 +164,7 @@ pub(super) struct ParsedPortExposureApplyState {
 /// than rolling the 347-node node-ctl DaemonSet. Fail-safe: unset means
 /// enabled; any set value other than an explicit truthy disables.
 pub(super) fn deleted_partition_enabled() -> bool {
-    pplx_space_common_core::env::env_destructive_gate_var(
-        "SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED",
-    )
+    pplx_space_env_vars::env_destructive_gate_var("SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED")
 }
 
 /// Plausibility ceiling for the desired-state deleted partition.
@@ -358,7 +357,7 @@ pub(super) fn proto_network_policy_target_to_storage(
 ) -> Result<String, Status> {
     match target.target {
         Some(network_policy_target_ref::Target::Template(template)) => {
-            let template = pplx_space_common_core::types::TemplateName::parse(template)
+            let template = pplx_space_template_model::TemplateName::parse(template)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
             Ok(NetworkPolicyTarget::template(template).as_element_string())
         }
@@ -561,9 +560,10 @@ fn visibility_degraded_with(
 /// never by a conversion.
 ///
 /// A free function rather than a `From` impl because it has to be: both types
-/// are foreign to this crate (`CoreTemplateVisibility` from `common-core`, the
-/// proto enum re-exported from `pplx-space-node-api-client` at `lib.rs`'s
-/// `pub use … ::proto`), so an impl here would violate Rust's orphan rule.
+/// are foreign to this crate (`CoreTemplateVisibility` from
+/// `pplx-space-template-model`, the proto enum re-exported from
+/// `pplx-space-node-api-client` at `lib.rs`'s `pub use … ::proto`), so an impl
+/// here would violate Rust's orphan rule.
 const fn proto_visibility(visibility: CoreTemplateVisibility) -> TemplateVisibility {
     match visibility {
         CoreTemplateVisibility::Generic => TemplateVisibility::Generic,
@@ -1360,7 +1360,7 @@ pub(super) fn unsupported_template_runtime(value: &str) -> Status {
 }
 
 /// Parses `hash` into a canonical
-/// [`pplx_space_common_core::types::ContentHash`]
+/// [`pplx_space_content_digest::ContentHash`]
 /// (`<algorithm>:<64 lowercase hex>`), tolerating a bare 64-hex digest by
 /// assuming SHA-256, and returns the canonical algorithm-prefixed string.
 /// Validating at insertion time means every consumer downstream —
@@ -1369,7 +1369,7 @@ pub(super) fn unsupported_template_runtime(value: &str) -> Status {
 /// path lets a digest stored bare round-trip back through prefetch.
 pub(super) fn validated_release_hash(value: &str) -> Result<String, Status> {
     let trimmed = trimmed_required(value, "hash")?;
-    let Ok(content_hash) = trimmed.parse::<pplx_space_common_core::types::ContentHash>() else {
+    let Ok(content_hash) = trimmed.parse::<pplx_space_content_digest::ContentHash>() else {
         return Err(Status::invalid_argument(format!(
             "hash '{trimmed}' must be formatted as 'sha256:<64 lowercase hex chars>' or 'blake3:<64 lowercase hex chars>'"
         )));
@@ -1385,12 +1385,12 @@ pub(super) fn validated_release_hash(value: &str) -> Result<String, Status> {
 pub(super) fn validated_storage_connection_strings(
     values: Vec<String>,
     trusted: &super::trusted_storage::TrustedTemplateStorageBuckets,
-) -> Result<Vec<pplx_space_common_core::types::ExactStorageUri>, Status> {
+) -> Result<Vec<pplx_space_artifact_model::ExactStorageUri>, Status> {
     dedupe_nonempty_strings(values, "storage_connection_string")?
         .into_iter()
         .map(|value| {
             // Connection strings and parser errors can contain endpoint credentials.
-            let uri = pplx_space_common_core::types::ExactStorageUri::parse(&value)
+            let uri = pplx_space_artifact_model::ExactStorageUri::parse(&value)
                 .map_err(|_| Status::invalid_argument("invalid template storage URI"))?;
             trusted
                 .check(uri.parsed())
@@ -1409,7 +1409,7 @@ pub(super) fn validated_execution_metadata(
     let Some(execution) = execution else {
         return Ok(None);
     };
-    let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(execution)
+    let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(execution)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     serde_json::to_value(&execution)
         .map(Some)
@@ -1495,7 +1495,7 @@ async fn find_template_release_row(
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
-    let bare_hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+    let bare_hash = hash.trim_prefix("sha256:");
     sqlx::query_as::<_, TemplateReleaseRow>(sql!(
         "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at
          FROM template_releases r

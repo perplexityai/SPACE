@@ -13,22 +13,27 @@ use std::{collections::HashMap, time::Duration};
 use super::PodIp;
 use crate::controllers::substrate::ExecutionIdentity;
 use crate::metrics::sandbox::api::RouteIdentityDecisionReason;
+use pplx_space_accounts::{NodeId, SandboxOwner, UserId};
+use pplx_space_artifact_model::{ExactStorageUri, StorageUri};
 use pplx_space_cluster_pool::WarmPoolStore;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExactStorageUri, ExecutionGeneration, LocalArtifactId, NodeId,
-    NodeRole, PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxOwner,
-    SandboxTransitionTargetState, SnapshotState, StorageUri, UserId,
-};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_k8s_node_id::Ec2InstanceId;
 use pplx_space_net_common::NetworkPolicyV1;
+use pplx_space_node_model::NodeRole;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    SandboxTransitionTargetState,
+};
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
     snapshot_is_current_local_artifact,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
@@ -40,12 +45,15 @@ use crate::controllers::substrate::{
 };
 
 mod activation_fence;
+mod environment_placement;
 mod execution_rows;
 mod node_inventory;
 mod pod_placement;
 mod pod_tracking;
 mod restore_lease;
 mod restore_source;
+mod runtime_attribution;
+pub(super) use runtime_attribution::attribution_update;
 mod runtime_upgrade;
 mod started_recovery;
 mod suspend;
@@ -56,6 +64,8 @@ pub(super) use restore_source::RestoreSnapshotChoice;
 pub(super) struct K8sStore {
     pool: PgPool,
     namespace: String,
+    /// Off, pod tracking never writes the sandbox's record.
+    attribution: crate::controllers::substrate::ActivationClientAttribution,
 }
 
 /// Where a sandbox's pod landed. Groups the identity columns
@@ -70,6 +80,10 @@ pub(super) struct PodNodePlacement<'a> {
     pub node_id: NodeId,
     pub role: NodeRole,
     pub address: Option<&'a str>,
+    /// The EC2 instance the Node's `providerID` names. `None` keeps the
+    /// recorded instance while the Node's UID is unchanged; on a UID change
+    /// it clears it, since a new Node may be another machine.
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
 /// What a caller's retry of the *whole operation* would do, for statements that
@@ -285,13 +299,14 @@ pub(super) enum NodeStateWrite {
     InsertOnly(NodeLifecycleState),
 }
 
-struct K8sNodeRoleUpsert<'a> {
-    node_name: &'a str,
-    node_uid: &'a str,
-    node_id: NodeId,
-    role: NodeRole,
-    address: Option<&'a str>,
-    state: NodeStateWrite,
+pub(super) struct K8sNodeRoleUpsert<'a> {
+    pub node_name: &'a str,
+    pub node_uid: &'a str,
+    pub node_id: NodeId,
+    pub role: NodeRole,
+    pub address: Option<&'a str>,
+    pub state: NodeStateWrite,
+    pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -308,6 +323,8 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) create_age_expired: bool,
     pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
+    /// The sandbox's record of whose activation created its runtime.
+    pub(super) activating_client_id: Option<pplx_space_accounts::ClientId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,8 +376,7 @@ pub(super) struct SandboxExecutionRow {
     #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
     pub(super) create_age_expired: bool,
-    pub(super) activation_attempt_id:
-        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub(super) activation_attempt_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
 }
 
@@ -728,8 +744,16 @@ fn emit_started_suspend_recovery_event(
 }
 
 impl K8sStore {
-    pub(super) fn new(pool: PgPool, namespace: String) -> Self {
-        Self { pool, namespace }
+    pub(super) fn new(
+        pool: PgPool,
+        namespace: String,
+        attribution: crate::controllers::substrate::ActivationClientAttribution,
+    ) -> Self {
+        Self {
+            pool,
+            namespace,
+            attribution,
+        }
     }
 
     pub(super) fn pool(&self) -> &PgPool {

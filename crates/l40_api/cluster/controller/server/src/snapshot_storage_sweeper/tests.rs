@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

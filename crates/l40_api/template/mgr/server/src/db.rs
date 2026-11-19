@@ -3,12 +3,13 @@ use std::path::Path;
 
 use rusqlite::{Connection, Result, params, types::Type};
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::AutoLifecyclePolicy;
-pub use pplx_space_common_core::types::PolicyAuthority;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
+pub use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sql_locator::sql;
+use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
 
-pub const DB_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_DB;
+pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;
 
 pub fn open() -> Result<Connection, pplx_space_sqlite::SqliteError> {
     pplx_space_sqlite::open_rusqlite(
@@ -106,7 +107,7 @@ fn parse_policy_authority(value: &str, column: usize) -> Result<PolicyAuthority>
 // no partition get every partition of a hash and prefer the legacy one, which
 // sorts first because its key is the empty string.
 
-pub use pplx_space_common_core::types::TemplateCachePartition;
+pub use pplx_space_template_model::TemplateCachePartition;
 
 #[derive(Debug)]
 pub struct BuildRow {
@@ -139,7 +140,7 @@ pub struct BuildUpsert<'a> {
 impl BuildRow {
     /// The stored execution metadata; `None` when absent or unreadable,
     /// which is logged.
-    pub fn execution_metadata(&self) -> Option<pplx_space_common_core::types::ExecutionMetadata> {
+    pub fn execution_metadata(&self) -> Option<pplx_space_execution_spec::ExecutionMetadata> {
         let raw = self.execution_metadata_json.as_deref()?;
         serde_json::from_str(raw)
             .inspect_err(|error| {
@@ -154,8 +155,20 @@ impl BuildRow {
     }
 
     /// The environment the build is bound to.
-    pub fn environment(&self) -> Option<pplx_space_common_core::types::EnvironmentReference> {
+    pub fn environment(&self) -> Option<pplx_space_execution_spec::EnvironmentReference> {
         self.execution_metadata()?.environment()
+    }
+
+    /// The cache partition of the environment the build is bound to, by the
+    /// rule sandbox-manager checks a build it boots against
+    /// (`template_cache_partition` of the binding). It's the row's partition,
+    /// except for a legacy row bound to another environment, as startup
+    /// recovery adopts a legacy-layout build in place, and for a row whose
+    /// stored execution metadata doesn't parse, which reads as unbound and so
+    /// legacy. Sandbox-manager reads the binding from the build's own
+    /// `metadata.json` and refuses a build of another partition.
+    pub fn bound_partition(&self) -> TemplateCachePartition {
+        pplx_space_node_runtime_core::catalog::template_cache_partition(self.environment())
     }
 }
 
@@ -225,6 +238,21 @@ pub fn find_ready_build(
     rows.next().transpose()
 }
 
+/// The ready build of a digest bound to `partition`'s environment
+/// ([`BuildRow::bound_partition`]): the one in that partition, else an
+/// adopted legacy build bound to it.
+pub fn find_ready_build_bound_to(
+    conn: &Connection,
+    name: &str,
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> Result<Option<BuildRow>> {
+    Ok(list_builds_for_hash(conn, name, content_hash)?
+        .into_iter()
+        .filter(|build| build.state == "ready" && build.bound_partition() == partition)
+        .min_by_key(|build| build.cache_partition != partition))
+}
+
 /// Whether a row exists for the digest in any partition, in any state.
 pub fn build_exists(conn: &Connection, name: &str, content_hash: &str) -> Result<bool> {
     conn.query_row(
@@ -292,18 +320,18 @@ fn invalid_build_upsert(message: &'static str) -> rusqlite::Error {
 }
 
 pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
-    let manifest: pplx_space_common_core::types::TemplateManifest =
+    let manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_str(b.manifest_json)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let execution = manifest
         .execution_metadata()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     if let Some(execution) = execution {
-        let runtime_matches = pplx_space_common_core::types::RuntimeKind::parse(b.runtime)
+        let runtime_matches = pplx_space_execution_spec::RuntimeKind::parse(b.runtime)
             .is_ok_and(|runtime| runtime == execution.runtime().kind);
         let arch_matches = b
             .arch
-            .parse::<pplx_space_common_core::types::Arch>()
+            .parse::<pplx_space_cpu_arch::Arch>()
             .is_ok_and(|arch| arch == execution.guest().architecture);
         if !runtime_matches || !arch_matches {
             return Err(invalid_build_upsert(
@@ -1232,46 +1260,11 @@ fn enqueue_node_dirty_template_inventory_tx(
     Ok(changed != 0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeDirtyRefRow {
-    pub facet: i32,
-    pub element_kind: String,
-    pub element_value: String,
-}
-
-pub fn list_node_dirty_refs(conn: &Connection, limit: usize) -> Result<Vec<NodeDirtyRefRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT facet, element_kind, element_value
-         FROM node_dirty_refs
-         ORDER BY requested_at ASC
-         LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit_to_i64(limit)], |row| {
-        Ok(NodeDirtyRefRow {
-            facet: row.get(0)?,
-            element_kind: row.get(1)?,
-            element_value: row.get(2)?,
-        })
-    })?;
-    rows.collect()
-}
-
+/// Acknowledge only the obligations read before sending. A newer enqueue, even
+/// for a previously deleted key, remains pending for the worker's next retry.
 pub fn delete_node_dirty_refs(conn: &Connection, refs: &[NodeDirtyRefRow]) -> Result<usize> {
     let tx = immediate_transaction(conn)?;
-    let mut deleted = 0;
-    for reference in refs {
-        deleted += tx.execute(
-            "DELETE FROM node_dirty_refs
-             WHERE facet = ?1
-               AND element_kind = ?2
-               AND element_value = ?3",
-            params![
-                reference.facet,
-                reference.element_kind,
-                reference.element_value
-            ],
-        )?;
-    }
+    let deleted = node_dirty_refs::delete_node_dirty_refs_at_revision(&tx, refs)?;
     tx.commit()?;
     Ok(deleted)
 }

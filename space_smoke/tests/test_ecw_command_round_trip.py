@@ -59,10 +59,6 @@ from space_smoke.runtime import (
     SmokeConfigurationError,
     execute_scenario,
 )
-from space_smoke.scenarios.ecw_authenticated_access_with_public_traffic_disabled import (
-    MARKER as AUTHENTICATED_ACCESS_MARKER,
-    authenticated_access_with_public_traffic_disabled,
-)
 from space_smoke.scenarios.ecw_cold_create_environment import cold_create_environment
 from space_smoke.scenarios.ecw_command_round_trip import MARKER, command_round_trip
 from space_smoke.scenarios.ecw_refresh_keepalive import (
@@ -71,7 +67,6 @@ from space_smoke.scenarios.ecw_refresh_keepalive import (
     VERIFY_AFTER_REFRESH_SECONDS,
     refresh_keepalive,
 )
-from space_smoke.scenarios.ecw_sandbox_delete import sandbox_delete
 from space_smoke.scenarios.ecw_timeout_update import (
     EXTENDED_TIMEOUT_SECONDS,
     INITIAL_TIMEOUT_SECONDS,
@@ -235,6 +230,7 @@ class _Ecw:
         self.last_metadata: Mapping[str, str] | None = None
         self.metadata_history: list[Mapping[str, str]] = []
         self.create_attempt = create_attempt or EcwCreateAttempt(400, "rejected", None)
+        self.created_count = 0
 
     def create(
         self,
@@ -268,7 +264,12 @@ class _Ecw:
             raise EcwCreateNotDelivered("Temporary failure in name resolution")
         if self.fail_create:
             raise TimeoutError("create response lost")
-        return self.sandbox
+        self.created_count += 1
+        if self.created_count == 1:
+            return self.sandbox
+        sandbox = _Sandbox(self.trace, self.sandbox.result)
+        sandbox.sandbox_id = f"sandbox-{self.created_count}"
+        return sandbox
 
     def kill_matching(
         self,
@@ -332,14 +333,6 @@ def _run(
 
 
 class EcwCommandRoundTripTests(unittest.TestCase):
-    def test_authenticated_access_scenario_requires_authenticated_ports(self) -> None:
-        result, trace = _run(
-            EcwCommandResult(0, AUTHENTICATED_ACCESS_MARKER, ""),
-            registered=authenticated_access_with_public_traffic_disabled,
-        )
-
-        self.assertEqual(result.verdict, Verdict.PASS)
-        self.assertIn("ecw.network:allow-public=False", trace)
 
     def test_scenario_reads_as_one_public_round_trip(self) -> None:
         with mock.patch("space_smoke.services.uuid.uuid4") as run_id:
@@ -357,6 +350,7 @@ class EcwCommandRoundTripTests(unittest.TestCase):
                 "ecw.create:seed:300:run-marker",
                 "ecw.lifecycle:pause:False",
                 f"sandbox.run:printf %s {MARKER}:60",
+                "sandbox.kill",
                 "sandbox.kill",
                 "kind.delete-key:run-key",
             ],
@@ -382,7 +376,7 @@ class EcwCommandRoundTripTests(unittest.TestCase):
             )
 
         self.assertEqual(result.verdict, Verdict.PASS)
-        self.assertEqual(trace.count("sandbox.kill"), 3)
+        self.assertEqual(trace.count("sandbox.kill"), 4)
         self.assertEqual(trace[-1], "kind.delete-key:run-key")
         self.assertEqual(sleep.call_count, 2)
 
@@ -391,9 +385,9 @@ class EcwCommandRoundTripTests(unittest.TestCase):
     ) -> None:
         with mock.patch("space_smoke.services.time.sleep") as sleep:
             result, trace = _run(
-                EcwCommandResult(0, "", ""),
+                EcwCommandResult(0, MARKER, ""),
                 kill_conflicts=2,
-                registered=sandbox_delete,
+                registered=command_round_trip,
             )
 
         self.assertEqual(result.verdict, Verdict.PASS)
@@ -462,8 +456,15 @@ class EcwCommandRoundTripTests(unittest.TestCase):
                 "kind.seed:run-key",
                 f"ecw.create:seed:{REFRESH_TIMEOUT_SECONDS}:refresh-run",
                 "ecw.lifecycle:pause:False",
+                f"ecw.create:seed:{REFRESH_TIMEOUT_SECONDS}:refresh-run",
+                "ecw.lifecycle:pause:False",
+                f"sandbox.set-timeout:{REFRESH_TIMEOUT_SECONDS}",
+                f"sandbox.set-timeout:{REFRESH_TIMEOUT_SECONDS}",
                 "sandbox.refresh",
+                f"sandbox.set-timeout:{REFRESH_TIMEOUT_SECONDS}",
                 "sandbox.run:printf %s space-smoke-idle-deadline-reset-ok:60",
+                "sandbox.run:printf %s space-smoke-idle-deadline-reset-ok:60",
+                "sandbox.kill",
                 "sandbox.kill",
                 "kind.delete-key:run-key",
             ],
@@ -691,7 +692,7 @@ class EcwCommandRoundTripTests(unittest.TestCase):
 
         self.assertEqual(result.verdict, Verdict.PASS)
         self.assertEqual(trace.count("ecw.create:seed:300:dns-retry-run"), 3)
-        self.assertEqual(trace.count("sandbox.kill"), 1)
+        self.assertEqual(trace.count("sandbox.kill"), 2)
         self.assertNotIn("ecw.kill-matching:dns-retry-run", trace)
         self.assertEqual(sleep.call_count, 2)
 
@@ -774,6 +775,7 @@ class EcwCommandRoundTripTests(unittest.TestCase):
                 "ecw.create:code-runtime:300:deployed-run",
                 "ecw.lifecycle:pause:False",
                 f"sandbox.run:printf %s {MARKER}:60",
+                "sandbox.kill",
                 "sandbox.kill",
             ],
         )

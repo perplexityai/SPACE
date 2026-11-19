@@ -1,3 +1,7 @@
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ComponentIdentity, ExecutionMetadata, GuestOperatingSystem,
+    GuestPlatform, RuntimeIdentity, RuntimeKind, StateFormatIdentity,
+};
 use prost::Message;
 
 use super::*;

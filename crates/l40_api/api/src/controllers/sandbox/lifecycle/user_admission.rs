@@ -3,8 +3,8 @@
 //! The cancelled-wake redrive (`controllers::sandbox::wake_completion`) finishes a wake that
 //! `SandboxController::action` already admitted, so it does not ask again.
 
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_public_api::SandboxLifecycleAction;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::SandboxAction;
 

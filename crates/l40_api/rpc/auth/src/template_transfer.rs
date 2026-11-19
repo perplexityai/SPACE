@@ -46,9 +46,7 @@ pub fn authorize_forwarded_template_export<T>(
     peer: UdsPeerPrincipal,
 ) -> Result<(), Status> {
     if peer
-        == UdsPeerPrincipal::Service(
-            pplx_space_common_core::host::linux::identities::user_names::SPACE_NODEAPI,
-        )
+        == UdsPeerPrincipal::Service(pplx_space_host_layout::identities::user_names::SPACE_NODEAPI)
         && request
             .metadata()
             .get(TRANSFER_AUTHORITY_HEADER)

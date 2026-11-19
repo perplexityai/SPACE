@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [package.metadata.space.state]
-postgres = ["node_reconcile_triggers"]
+postgres = ["node_reconcile_queue", "node_reconcile_triggers"]
 
 [lints]
 workspace = true
@@ -19,9 +19,11 @@ time = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-node-model = { workspace = true, features = ["sqlx"] }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
+pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 
 [dev-dependencies]

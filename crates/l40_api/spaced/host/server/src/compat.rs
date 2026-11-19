@@ -7,7 +7,7 @@
 use super::*;
 use crate::bridge::BridgeGuestOperationBudget;
 use crate::protocol::{HostFileInfoStream, bridge_file_type_to_host, relay_stream};
-use pplx_space_common_core::types::{GuestPath, GuestUserName};
+use pplx_space_guest_process::{GuestPath, GuestUserName};
 
 impl SpacedHostService {
     pub(super) async fn call_bridge_guest_stat(
@@ -84,7 +84,7 @@ impl SpacedHostService {
 
 pub(super) fn legacy_bridge_stat_to_host(
     path: String,
-    response: pplx_space_spaced_common::proto::bridge_guest::LegacyStatResponse,
+    response: pplx_space_spaced_guest_protocol::proto::bridge_guest::LegacyStatResponse,
 ) -> Result<StatResponse, Status> {
     Ok(StatResponse {
         info: Some(FileInfo {
@@ -105,7 +105,7 @@ pub(super) fn legacy_bridge_stat_to_host(
 }
 
 pub(super) fn legacy_bridge_dir_entry_to_host(
-    entry: pplx_space_spaced_common::proto::bridge_guest::LegacyDirEntry,
+    entry: pplx_space_spaced_guest_protocol::proto::bridge_guest::LegacyDirEntry,
 ) -> Result<FileInfo, Status> {
     Ok(FileInfo {
         windows_metadata: None,

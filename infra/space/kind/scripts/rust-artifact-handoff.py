@@ -31,6 +31,8 @@ REVISION_LABEL = "org.opencontainers.image.revision"
 # after this has stalled, and all of its wait is added to the build that
 # then runs anyway. The log reports each pull's duration to calibrate this.
 PULL_TIMEOUT_SECONDS = 90
+# How often `started` reads the producer's status while it waits for a runner.
+STARTED_POLL_SECONDS = 3
 
 
 def context() -> dict:
@@ -365,6 +367,45 @@ def wait(timeout: int) -> None:
     raise TimeoutError("Rust producer did not finish before the handoff deadline")
 
 
+def started(timeout: int) -> None:
+    """Return once this attempt's Rust producer has a runner.
+
+    The shards wait on the producer's image anyway, about two minutes after
+    their own preparation, so Kind CI requests their runners only after the
+    producer has one: asked for together, the shards took the large
+    runners already up and the producer, the one job the run waits on, waited
+    about a minute for a new one. This never fails the run. When the producer
+    does not start within `timeout`, or its status cannot be read, it says so
+    and returns, and the shards are requested anyway: with no large runner
+    up, the producer boots a new one regardless, and the shards should not
+    wait for that too.
+    """
+
+    deadline = time.monotonic() + timeout
+    try:
+        identity = context()
+        prefix = f"repos/{identity['repository']}/actions/runs/{identity['run_id']}"
+        while time.monotonic() < deadline:
+            jobs = [
+                job
+                for page in api_pages(
+                    f"{prefix}/attempts/{identity['run_attempt']}/jobs?per_page=100",
+                    "Rust producer status",
+                    deadline,
+                )
+                for job in page["jobs"]
+                if job["name"] == PRODUCER or job["name"].endswith(" / " + PRODUCER)
+            ]
+            if any(job["status"] in ("in_progress", "completed") for job in jobs):
+                print("The Rust producer has a runner; requesting the shards' runners", flush=True)
+                return
+            time.sleep(min(STARTED_POLL_SECONDS, max(0, deadline - time.monotonic())))
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
+        print(f"::warning::Could not read the Rust producer's status ({error}); requesting the shards' runners now")
+        return
+    print(f"::warning::The Rust producer did not start within {timeout} s; requesting the shards' runners now")
+
+
 def load(directory: Path) -> None:
     identity = context()
     producer = os.environ.get(
@@ -447,11 +488,14 @@ def main() -> None:
     for name in ("reuse", "publish"):
         commands.add_parser(name).add_argument("repository")
     commands.add_parser("wait").add_argument("--timeout", type=int, default=65 * 60)
+    commands.add_parser("started").add_argument("--timeout", type=int, default=75)
     args = parser.parse_args()
+    if args.command in ("wait", "started") and args.timeout <= 0:
+        parser.error("timeout must be positive")
     if args.command == "wait":
-        if args.timeout <= 0:
-            parser.error("timeout must be positive")
         wait(args.timeout)
+    elif args.command == "started":
+        started(args.timeout)
     elif args.command == "record":
         record(args.directory)
     elif args.command == "reuse":

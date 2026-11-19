@@ -39,6 +39,9 @@ pub fn tick(result: &str, started_at: Instant, candidates: u64) {
 ///   nothing can restore the bytes.
 /// - `execution_retired` — the cluster refused a teardown suspend's
 ///   backup because it had retired the execution that captured it.
+/// - `stale_upgrade_copy` — a runtime upgrade decided from another
+///   checkpoint found this suspended copy, proven backed for its exact
+///   pinned artifact, and evicted it to stage the decided checkpoint.
 pub fn evicted(reason: &str) {
     counter("sandbox.evict.evicted", 1, &[tag("reason", reason)]);
 }
@@ -105,16 +108,26 @@ pub fn malformed_updated_at(rows: u64) {
 /// - `not_suspended_at_execute` — the sandbox left `suspended` (or its
 ///   pin changed from the proven identity) between planning and the
 ///   eviction claim (e.g. a resume raced us).
+/// - `held_at_execute` — the sandbox was still suspended with the proven
+///   pin, but the eviction claim was refused because something held it: a
+///   runtime upgrade, an artifact upload in flight, another local artifact
+///   without a backup stamp, or another operation holding its artifact
+///   lock. Each ends on its own; a later tick reconsiders the row.
+/// - `unrecorded_snapshot` — the sandbox's snapshot directory holds a user
+///   snapshot no local artifact records (a publication that failed after
+///   writing it), which the eviction would delete. It stays until someone
+///   backs the snapshot up or deletes it, so the row is backed off.
 /// - `local_read_error` — the node-local SQLite read of one candidate failed;
 ///   that row is backed off while the scan continues.
 /// - `rpc_error` — a candidate-specific cluster response failed or was
 ///   malformed; that row is backed off while the scan continues.
 /// - `rpc_transport_error` — the cluster dependency is unavailable; the scan
 ///   stops and retries from the same cursor next tick.
-/// - `local_artifact_awaiting_backup` — a retired execution's teardown
-///   release is held because another local artifact of the sandbox still
-///   awaits its backup; the pod keeps terminating until it completes.
-///   Emitted by the teardown driver once per drive.
+/// - `local_artifact_awaiting_backup` — another local artifact of the
+///   sandbox still awaits its backup, and the eviction, or a retired
+///   execution's teardown release, would delete it too: the disk-pressure
+///   loop leaves the sandbox for a later tick, and the teardown driver keeps
+///   the pod terminating until it completes, once per drive.
 /// - `local_artifact_stamp_failed` — a retired execution's teardown release
 ///   is held because the cluster proved another local artifact of the sandbox
 ///   backed, but its node-local backup stamp couldn't be written, and the

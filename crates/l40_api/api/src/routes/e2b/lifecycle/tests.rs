@@ -1,5 +1,5 @@
 use axum::http::{HeaderName, HeaderValue, StatusCode};
-use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+use pplx_space_accounts::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 
 use crate::federated_identity::{
     FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER, FEDERATED_SERVICE_GRANT_HEADER,
@@ -85,7 +85,7 @@ fn federated_owner_without_a_grant_expiry_is_unauthorized() {
 /// to bind a grant to, so refresh persists nothing for it.
 #[test]
 fn legacy_local_sandboxes_persist_no_grant() {
-    use pplx_space_common_core::types::SandboxOwnerSource;
+    use pplx_space_accounts::SandboxOwnerSource;
 
     let owner = owner();
     let grant = request_federated_service_grant(
@@ -349,7 +349,7 @@ mod delete {
         };
         use crate::public_operations::{ApiProduct, CreatePublicOperation};
         use crate::public_sandbox_operations::SandboxLifecycleOperationExecutor;
-        use pplx_space_common_core::types::UserId;
+        use pplx_space_accounts::UserId;
         use pplx_space_db_test_fixtures::{
             SEED_USER_ID, insert_suspended_sandbox, insert_uploading_snapshot,
         };

@@ -1,6 +1,8 @@
 use super::*;
-use pplx_space_common_core::types::{
-    Arch, ExecutionMetadata, TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::ExecutionMetadata;
+use pplx_space_template_manifest::{
+    TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION,
 };
 
 #[cfg(unix)]
@@ -126,10 +128,10 @@ fn release_execution_metadata_comes_from_digest_stable_manifest() {
     );
     write_metadata(dir.path(), Arch::Aarch64);
     let path = dir.path().join("manifest.json");
-    let mut manifest: pplx_space_common_core::types::TemplateManifest =
+    let mut manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let reference = pplx_space_common_core::types::EnvironmentReference::new(
-        pplx_space_common_core::types::Digest::sha256([1; 32]),
+    let reference = pplx_space_execution_spec::EnvironmentReference::new(
+        pplx_space_content_digest::Digest::sha256([1; 32]),
     );
     manifest.set_execution_metadata(
         manifest
@@ -493,7 +495,7 @@ fn storage_uri_uses_canonical_digest_prefix() {
 
     let uri = build_storage_uri(&config, &sample_template(), sample_hash());
     let parsed =
-        pplx_space_common_core::types::StorageUri::parse(&uri).expect("storage uri should parse");
+        pplx_space_artifact_model::StorageUri::parse(&uri).expect("storage uri should parse");
 
     assert_eq!(parsed.bucket, "bucket");
     assert_eq!(
@@ -516,7 +518,7 @@ fn storage_uri_keeps_explicit_path_style_override() {
 
     let uri = build_storage_uri(&config, &sample_template(), sample_hash());
     let parsed =
-        pplx_space_common_core::types::StorageUri::parse(&uri).expect("storage uri should parse");
+        pplx_space_artifact_model::StorageUri::parse(&uri).expect("storage uri should parse");
 
     assert_eq!(parsed.endpoint.as_deref(), Some("https://minio.internal"));
     assert!(!parsed.path_style);

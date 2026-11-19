@@ -392,6 +392,42 @@ async fn read_only_rpcs_replay_ambiguous_transport_failures_on_fresh_dials() {
     assert_eq!(harness.calls(), vec![0, 1]);
 }
 
+/// Another caller's shared dial from just before a read failed can still
+/// lead to the process that failed it, so the read's single replay must use a
+/// connection dialed after the failure.
+#[tokio::test]
+async fn a_read_replay_never_reuses_a_shared_dial_from_before_its_failure() {
+    let harness = HandoffHarness::new();
+    let dialer = RestartHandoffDialer::new(Duration::from_secs(60));
+    let dial = harness.dialer();
+    let (_, earlier) = dialer.fresh_client(0, None, &dial).await;
+    assert_eq!(earlier.unwrap(), 1);
+
+    let response = retry_restart_handoff(
+        "SpacedStat",
+        fast_handoff_policy(),
+        RpcReplaySafety::ReadOnly,
+        MetadataMap::new(),
+        (),
+        0usize,
+        &dialer,
+        dial,
+        harness.recording_call(|connection| match connection {
+            // The shared channel and the earlier dial both lead to the
+            // process the handoff is retiring.
+            0 | 1 => Err(Status::unavailable(
+                "sandbox-manager handoff interrupted an in-flight RPC",
+            )),
+            _ => Ok(Response::new("stat")),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.into_inner(), "stat");
+    assert_eq!(harness.calls(), vec![0, 2]);
+}
+
 /// The reviewer-requested fan-out proof: many concurrent marked callers
 /// must coalesce onto single-flighted dials instead of each running its
 /// own dial loop.
@@ -671,17 +707,17 @@ async fn handoff_stops_all_work_when_the_caller_drops_the_future() {
 
 #[test]
 fn handoff_retry_budget_spans_a_full_predecessor_drain() {
-    assert!(RESTART_HANDOFF_RETRY_POLICY.max_elapsed > DEFAULT_DRAIN_TIMEOUT);
+    assert!(PEER_RESTART_RETRY_POLICY.max_elapsed > DEFAULT_DRAIN_TIMEOUT);
 
     let mut worst_case = Duration::ZERO;
-    for retry_index in 0..RESTART_HANDOFF_RETRY_POLICY.max_retries {
-        let Some(delay) = RESTART_HANDOFF_RETRY_POLICY.backoff_delay(retry_index) else {
+    for retry_index in 0..PEER_RESTART_RETRY_POLICY.max_retries {
+        let Some(delay) = PEER_RESTART_RETRY_POLICY.backoff_delay(retry_index) else {
             break;
         };
         worst_case += delay;
     }
     assert!(
-        worst_case > RESTART_HANDOFF_RETRY_POLICY.max_elapsed,
+        worst_case > PEER_RESTART_RETRY_POLICY.max_elapsed,
         "retry count must exhaust after max_elapsed, not before: {worst_case:?}"
     );
 }

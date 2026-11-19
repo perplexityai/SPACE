@@ -28,7 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use pplx_space_common_core::types::{OrgId, SandboxId};
+use pplx_space_accounts::OrgId;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::FileOperation;
 use pplx_space_native_files::limits::{
@@ -37,6 +37,7 @@ use pplx_space_native_files::limits::{
 use pplx_space_public_api::PublicSandboxId;
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api_http::{PublicApiError, normalize_public_error};
+use pplx_space_sandbox_model::SandboxId;
 use serde::de::DeserializeOwned;
 
 pub(crate) use access::NativeFileAccessClient;

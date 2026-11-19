@@ -3,7 +3,7 @@
 
 use std::{fmt, time::Instant};
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 use pplx_space_metrics_emit::{counter, elapsed_ms, tag, timing_ms};
 
@@ -137,6 +137,19 @@ pub fn rows_classified(
             tag("from_lifecycle", from_lifecycle),
             tag("pod_evidence", pod_evidence),
         ],
+    );
+}
+
+/// One row the reconciler deferred, by why. `reason` is bounded:
+/// `in_flight_snapshot`, `pod_cleanup_unconfirmed`, `node_reports_local_copy`.
+/// `node_reports_local_copy` counts a plan that saw a node's report land
+/// after the sweep listed the row; the next listing skips that row while the
+/// node keeps reporting it, so it usually counts once.
+pub fn rows_deferred(reason: &str, mode: Mode) {
+    counter(
+        "sandbox.api.reconciler.rows_deferred",
+        1,
+        &[tag("reason", reason), tag("mode", mode.as_str())],
     );
 }
 

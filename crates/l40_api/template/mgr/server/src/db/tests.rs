@@ -1,7 +1,13 @@
-use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
-    AutoLifecycleWakePolicy, AutoLifecycleWakeSource, Digest, ExecutionMetadata, TemplateManifest,
+use pplx_space_auto_lifecycle::{AutoLifecycleWakePolicy, AutoLifecycleWakeSource};
+use pplx_space_content_digest::Digest;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::{
+    ArtifactComponentKind, ArtifactComponentMetadata, ExecutionMetadata,
 };
+use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
+use pplx_space_template_manifest::TemplateManifest;
+
+use pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs;
 
 use super::*;
 
@@ -274,7 +280,7 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
             }],
         );
         let execution = if bound {
-            execution.with_environment(pplx_space_common_core::types::EnvironmentReference::new(
+            execution.with_environment(pplx_space_execution_spec::EnvironmentReference::new(
                 Digest::sha256([1; 32]),
             ))
         } else {
@@ -572,6 +578,72 @@ fn idempotent_template_network_policy_update_does_not_enqueue_repair() {
 }
 
 #[test]
+fn acking_a_sent_dirty_ref_keeps_a_re_enqueue_made_during_the_send() {
+    let conn = test_conn();
+    assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
+    let sent = list_node_dirty_refs(&conn, 10).unwrap();
+
+    // Same key and, usually, the same timestamp as the listed row.
+    assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
+    assert_eq!(delete_node_dirty_refs(&conn, &sent).unwrap(), 0);
+
+    let pending = list_node_dirty_refs(&conn, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].element_kind, "template_inventory");
+    assert_eq!(pending[0].element_value, "base");
+    assert_eq!(delete_node_dirty_refs(&conn, &pending).unwrap(), 1);
+    assert!(list_node_dirty_refs(&conn, 10).unwrap().is_empty());
+}
+
+#[test]
+fn a_stale_dirty_ref_ack_cannot_delete_a_recreated_key() {
+    let conn = test_conn();
+    assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
+    let sent = list_node_dirty_refs(&conn, 10).unwrap();
+    assert_eq!(delete_node_dirty_refs(&conn, &sent).unwrap(), 1);
+
+    assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
+    assert_eq!(delete_node_dirty_refs(&conn, &sent).unwrap(), 0);
+    assert_eq!(list_node_dirty_refs(&conn, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_same_timestamp_dirty_ref_write_invalidates_the_ack() {
+    for recursive_triggers in [false, true] {
+        let conn = test_conn();
+        conn.pragma_update(None, "recursive_triggers", recursive_triggers)
+            .unwrap();
+        assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
+        let sent = list_node_dirty_refs(&conn, 10).unwrap();
+
+        // An upsert within the same second rewrites both timestamps unchanged.
+        conn.execute(
+            "UPDATE node_dirty_refs SET requested_at = requested_at, updated_at = updated_at",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            delete_node_dirty_refs(&conn, &sent).unwrap(),
+            0,
+            "recursive_triggers={recursive_triggers}"
+        );
+        assert_eq!(list_node_dirty_refs(&conn, 10).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn dirty_ref_revision_exhaustion_keeps_the_pending_obligation() {
+    let conn = test_conn();
+    assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
+    let pending = list_node_dirty_refs(&conn, 10).unwrap();
+    conn.execute("UPDATE node_dirty_ref_revision SET value = ?1", [i64::MAX])
+        .unwrap();
+
+    enqueue_node_dirty_template_inventory(&conn, "base").unwrap_err();
+    assert_eq!(list_node_dirty_refs(&conn, 10).unwrap(), pending);
+}
+
+#[test]
 fn template_settings_conflict_commits_auto_lifecycle_only() {
     let conn = test_conn();
     try_upsert_template_network_policy(
@@ -772,7 +844,7 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
 #[rstest::rstest]
 #[case::legacy(crate::db::TemplateCachePartition::Legacy)]
 #[case::environment(crate::db::TemplateCachePartition::Environment(
-    pplx_space_common_core::types::EnvironmentReference::new(Digest::sha256([2; 32]))
+    pplx_space_execution_spec::EnvironmentReference::new(Digest::sha256([2; 32]))
 ))]
 fn same_key_upserts_replace_in_place_in_each_partition(
     #[case] partition: crate::db::TemplateCachePartition,
@@ -780,7 +852,7 @@ fn same_key_upserts_replace_in_place_in_each_partition(
     use crate::db::TemplateCachePartition;
     let sibling = match partition {
         TemplateCachePartition::Legacy => TemplateCachePartition::Environment(
-            pplx_space_common_core::types::EnvironmentReference::new(Digest::sha256([3; 32])),
+            pplx_space_execution_spec::EnvironmentReference::new(Digest::sha256([3; 32])),
         ),
         TemplateCachePartition::Environment(_) => TemplateCachePartition::Legacy,
     };
@@ -1172,7 +1244,7 @@ fn partition_of(manifest_json: &str) -> TemplateCachePartition {
 #[test]
 fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
     let conn = test_conn();
-    use pplx_space_common_core::types::guest_image::{
+    use pplx_space_execution_spec::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
     let catalog =
@@ -1247,7 +1319,7 @@ fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
         crate::pool_manager::pool_refill_build(&conn, "agentless"),
         Err(crate::pool_manager::PoolError::NoPoolBuild)
     ));
-    let cloud_hypervisor = pplx_space_common_core::types::RuntimeKind::CloudHypervisor.alias();
+    let cloud_hypervisor = pplx_space_execution_spec::RuntimeKind::CloudHypervisor.alias();
     let linux = catalog
         .iter()
         .find(|entry| entry.name() == "ch-54.0-linux-7.2.8")

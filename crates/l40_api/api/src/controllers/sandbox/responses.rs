@@ -1,9 +1,9 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
-use pplx_space_common_core::sql;
 use pplx_space_net_common::NetworkPolicy;
 use pplx_space_sandbox_store as sandbox_store;
+use pplx_space_sql_locator::sql;
 
 use super::lifecycle::SandboxAction;
 
@@ -31,6 +31,7 @@ const SANDBOX_COLUMNS: &str = "
     s.managed_by,
     s.lifecycle,
     s.placement,
+    s.activating_client_id,
     COALESCE(direct_route.current_node_id, s.active_node_id) AS active_node_id,
     COALESCE(active_direct.name, active_k8s.k8s_node_name) AS active_node_name,
     active_node.role AS active_node_role,
@@ -648,7 +649,7 @@ pub(super) fn sandbox_to_cached_response(
             observed.status.clone(),
             observed.node_id,
         ));
-        response.spaced_version = observed.spaced_version.clone();
+        response.spaced_version = observed.version.spaced_version.clone();
         response.pid = observed.pid.and_then(|value| u32::try_from(value).ok());
         response.namespace = observed.namespace.clone();
         response.uptime = observed.uptime.clone();
@@ -700,7 +701,7 @@ pub(super) fn observed_only_sandbox_response(
         active_node_id: None,
         active_node: None,
         runtime: None,
-        spaced_version: observed.spaced_version.clone(),
+        spaced_version: observed.version.spaced_version.clone(),
         pid: observed.pid.and_then(|value| u32::try_from(value).ok()),
         namespace: observed.namespace.clone(),
         uptime: observed.uptime.clone(),
@@ -745,7 +746,7 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         .and_then(|info| info.auto_lifecycle_status.as_ref())
         .and_then(|status| status_from_proto(status).ok());
     let live_lifecycle = live.map(|info| {
-        info.observed_lifecycle()
+        info.observed_status()
             .map(|state| state.label().to_string())
             .unwrap_or_else(|_| "unknown".into())
     });
@@ -757,8 +758,8 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         name: sandbox.name.clone(),
         user_id: Some(sandbox.user_id),
         user_email: match sandbox.owner_source {
-            pplx_space_common_core::types::SandboxOwnerSource::Local => sandbox.user_email.clone(),
-            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => None,
+            pplx_space_accounts::SandboxOwnerSource::Local => sandbox.user_email.clone(),
+            pplx_space_accounts::SandboxOwnerSource::FederatedIdentity => None,
         },
         org_id: Some(sandbox.org_id),
         lifecycle: state_input.reported_lifecycle(),
@@ -802,9 +803,7 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         uptime: live.and_then(|info| info.uptime.clone()),
         // Ownership is an immutable birth fact: the label derives from the
         // cluster's sandbox row, never from what a node reports.
-        user: Some(
-            pplx_space_common_core::types::SandboxOwner::platform_user(sandbox.user_id).to_string(),
-        ),
+        user: Some(pplx_space_accounts::SandboxOwner::platform_user(sandbox.user_id).to_string()),
         image_hash: live.and_then(|info| info.image_hash.clone()),
         snapshots_enabled: live.map(|info| info.snapshots_enabled),
         snapshots_enabled_desired: sandbox.snapshots_enabled_desired,
@@ -825,81 +824,60 @@ pub fn sandbox_query(sql: &str) -> String {
         .replace("{sandbox_join_tail}", SANDBOX_JOIN_TAIL)
 }
 
-pub async fn fetch_sandbox(pool: &PgPool, id: SandboxId) -> Result<Option<Sandbox>, sqlx::Error> {
+pub async fn fetch_sandbox(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: SandboxId,
+) -> Result<Option<Sandbox>, sqlx::Error> {
     sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sandbox_query(
         "SELECT {sandbox_columns} FROM {sandbox_from} WHERE s.id = $1",
     ))))
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
-/// The lifecycles [`update_and_fetch_post_wake_sandbox`] may replace: a
-/// resume's decision. The pooled claim inserts the row `paused`, the wake
-/// resumes it, and a Kubernetes activation receipt can project `started`
-/// before this update. The pooled prepare claims and joins no restore on
-/// either substrate. So, as for a resume, it refuses `stopped` (a stop that
-/// completed while the wake was in flight; the wake did not begin from it)
-/// and `restoring` (another owner's restore claim). It also refuses
-/// `failed`, `quarantined` and the tombstones (the sweeper or a quarantine
-/// won), `deleting` (the delete owns the row), `suspending` and `suspended`
-/// (a suspend owns it), `stopping` (no control-plane writer sets it; node
-/// publication and the transient-lifecycle sweeper converge it), and any
-/// value outside the stored vocabulary. The `action_stamp` module of
-/// `pplx-space-sandbox-store` says who finishes each.
-const POOLED_POST_WAKE_FROM: sandbox_store::action_stamp::ActionStamp =
-    sandbox_store::action_stamp::ActionStamp::Resume;
-
 /// Marks a pooled sandbox as started/on-node after its wake completes and
-/// returns the freshly-joined response row in the same round-trip. The
-/// lifecycle guard ([`POOLED_POST_WAKE_FROM`]) refuses a row another writer
-/// moved while the wake was in flight: this helper must surface the CAS miss
-/// rather than resurrecting a failed row as started or overwriting a delete
-/// or suspend that began.
+/// returns the freshly-joined response row. The store verb's lifecycle guard
+/// ([`sandbox_store::action_stamp::stamp_pooled_post_wake`]) refuses a row
+/// another writer moved while the wake was in flight: this helper must
+/// surface the CAS miss rather than resurrecting a failed row as started or
+/// overwriting a delete or suspend that began. The read shares the write's
+/// transaction, so the row lock keeps the response showing this write.
 pub async fn update_and_fetch_post_wake_sandbox(
     pool: &PgPool,
     id: SandboxId,
     active_node_id: Option<NodeId>,
 ) -> Result<Sandbox, ControllerError> {
-    let sql = sandbox_query(
-        "WITH updated AS (
-             UPDATE sandboxes
-             SET lifecycle = 'started',
-                 placement = 'on_node',
-                 active_node_id = $1,
-                 placement_changed_at = NOW()
-             WHERE id = $2
-               AND LOWER(TRIM(lifecycle)) = ANY($3::TEXT[])
-             RETURNING *
-         )
-         SELECT {sandbox_columns}
-         FROM updated s
-         {sandbox_join_tail}",
-    );
-    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sql.as_str())))
-        .bind(active_node_id)
-        .bind(id)
-        .bind(POOLED_POST_WAKE_FROM.admitted_values())
-        .fetch_optional(pool)
+    // Not classified, deliberately, and for the same reason as the
+    // `fetch_sandbox` arm this shares an `if` with in
+    // `queries::try_create_from_pool`: by the time this runs the warm slot
+    // is claimed, bound, and prepared and the pod is running, with no
+    // rollback on this arm. `create` mints a fresh `SandboxId` per request
+    // with no idempotency key, so a retryable 503 here claims a second
+    // slot and starts a second sandbox while the first stays `started`
+    // under an id the caller never sees. See `db_contention_error`'s
+    // exception. This is the `wait_until_ready` arm — the one ECW create
+    // takes — so it is the more common of the two, not the edge case.
+    let failed =
+        |err| crate::controllers::internal_error("pooled sandbox post-wake update failed", err);
+    let lost_cas = || {
+        ControllerError::internal(
+            "pooled sandbox wake lost the lifecycle CAS — another writer moved the row to a \
+             terminal, deleting, stopped, restoring or suspend lifecycle while pooled wake was \
+             in flight",
+        )
+    };
+    let mut tx = pool.begin().await.map_err(failed)?;
+    if !sandbox_store::action_stamp::stamp_pooled_post_wake(&mut *tx, id, active_node_id)
         .await
-        // Not classified, deliberately, and for the same reason as the
-        // `fetch_sandbox` arm this shares an `if` with in
-        // `queries::try_create_from_pool`: by the time this runs the warm slot
-        // is claimed, bound, and prepared and the pod is running, with no
-        // rollback on this arm. `create` mints a fresh `SandboxId` per request
-        // with no idempotency key, so a retryable 503 here claims a second
-        // slot and starts a second sandbox while the first stays `started`
-        // under an id the caller never sees. See `db_contention_error`'s
-        // exception. This is the `wait_until_ready` arm — the one ECW create
-        // takes — so it is the more common of the two, not the edge case.
-        .map_err(|err| {
-            crate::controllers::internal_error("pooled sandbox post-wake update failed", err)
-        })?
-        .ok_or_else(|| {
-            ControllerError::internal(
-                "pooled sandbox wake lost the lifecycle CAS — another writer moved the row to a \
-                 terminal, deleting, stopped, restoring or suspend lifecycle while pooled wake was \
-                 in flight",
-            )
-        })
+        .map_err(failed)?
+    {
+        return Err(lost_cas());
+    }
+    let sandbox = fetch_sandbox(&mut *tx, id)
+        .await
+        .map_err(failed)?
+        .ok_or_else(lost_cas)?;
+    tx.commit().await.map_err(failed)?;
+    Ok(sandbox)
 }

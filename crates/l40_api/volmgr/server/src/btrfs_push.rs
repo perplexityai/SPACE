@@ -66,8 +66,9 @@ impl crate::service::VolumeManagerService {
         F: std::future::Future<Output = Result<(), Status>>,
     {
         use crate::executor::PullExistingPolicy;
-        use pplx_space_common_core::types::MaterializationMode;
-        use pplx_space_common_core::types::{SandboxId, SnapshotArtifact};
+        use crate::materialization::MaterializationMode;
+        use pplx_space_artifact_model::SnapshotArtifact;
+        use pplx_space_sandbox_model::SandboxId;
         let sandbox_id: SandboxId = req
             .sandbox_id
             .parse()

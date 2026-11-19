@@ -9,11 +9,10 @@
 
 pub mod baselines;
 pub mod runtime_manager;
-mod template_manager;
 
-use pplx_space_migration_checksums::AcceptedChecksums;
+use pplx_space_migration_checksums::{AcceptedChecksums, valid_store_name};
 use pplx_space_sql_locator::sql;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error as StdError;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -138,6 +137,9 @@ pub struct EmbeddedMigrators<'a> {
 }
 
 /// Apply shared schema and service migrations after validating both histories.
+/// A recorded migration its catalog doesn't bundle is refused unless it
+/// succeeded, is newer than that catalog, and [`ACCEPT_NEWER_MIGRATIONS`]
+/// lists it; an accepted one stays as it is.
 ///
 /// Daemons call this after acquiring their database ownership mutex.
 pub async fn migrate_embedded(
@@ -145,15 +147,38 @@ pub async fn migrate_embedded(
     db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
 ) -> SqliteResult<()> {
+    let accepted = match std::env::var(ACCEPT_NEWER_MIGRATIONS) {
+        Ok(value) => AcceptedNewerMigrations::parse(&value),
+        Err(std::env::VarError::NotPresent) => Ok(AcceptedNewerMigrations::default()),
+        Err(error) => Err(error).context(ACCEPT_NEWER_MIGRATIONS),
+    }
+    .with_context(|| migrate_failure(db_name, db_path))?;
+    if !accepted.0.is_empty() {
+        tracing::info!(
+            store = db_name,
+            "{ACCEPT_NEWER_MIGRATIONS} accepts newer migrations {accepted}"
+        );
+    }
+    migrate_accepting(db_name, db_path, migrators, &accepted).await
+}
+
+async fn migrate_accepting(
+    db_name: &str,
+    db_path: &Path,
+    migrators: EmbeddedMigrators<'_>,
+    accepted: &AcceptedNewerMigrations,
+) -> SqliteResult<()> {
     let checksums = AcceptedChecksums::embedded().context("invalid migration checksum manifest")?;
-    migrate_once(db_name, db_path, migrators, &checksums)
+    migrate_once(db_name, db_path, migrators, &checksums, accepted)
         .await
-        .with_context(|| {
-            format!(
-                "failed to migrate {db_name} SQLite at {}",
-                db_path.display()
-            )
-        })
+        .with_context(|| migrate_failure(db_name, db_path))
+}
+
+fn migrate_failure(db_name: &str, db_path: &Path) -> String {
+    format!(
+        "failed to migrate {db_name} SQLite at {}",
+        db_path.display()
+    )
 }
 
 /// Use the existing shared history without moving or rewriting its rows.
@@ -165,13 +190,121 @@ pub fn common_migrator(migrator: &Migrator) -> Migrator {
     }
 }
 
+/// Lists, as comma-separated `<store>:<version>` entries, recorded migrations
+/// newer than this release's catalog that the operator checked it can run on;
+/// see db/README.md "Rolling back past a newer SQLite migration".
+const ACCEPT_NEWER_MIGRATIONS: &str = "SPACE_SQLITE_ACCEPT_NEWER_MIGRATIONS";
+
+/// The parsed [`ACCEPT_NEWER_MIGRATIONS`] entries, by store name (`common` for
+/// the shared catalog) and version.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AcceptedNewerMigrations(BTreeSet<(String, i64)>);
+
+impl AcceptedNewerMigrations {
+    fn parse(value: &str) -> SqliteResult<Self> {
+        if value.is_empty() {
+            return Ok(Self::default());
+        }
+        value
+            .split(',')
+            .map(|entry| {
+                entry
+                    .trim_ascii()
+                    .split_once(':')
+                    .filter(|(store, version)| {
+                        valid_store_name(store)
+                            && !version.is_empty()
+                            && version.bytes().all(|b| b.is_ascii_digit())
+                    })
+                    .and_then(|(store, version)| Some((store.to_owned(), version.parse().ok()?)))
+                    .with_context(|| {
+                        format!(
+                            "{ACCEPT_NEWER_MIGRATIONS} entry {entry:?} is not <store>:<version>"
+                        )
+                    })
+            })
+            .collect::<SqliteResult<_>>()
+            .map(Self)
+    }
+
+    fn contains(&self, store: &str, version: i64) -> bool {
+        self.0.contains(&(store.to_owned(), version))
+    }
+}
+
+impl Display for AcceptedNewerMigrations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, (store, version)) in self.0.iter().enumerate() {
+            let separator = if i == 0 { "" } else { "," };
+            write!(f, "{separator}{store}:{version}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What validation found in one public history.
+#[derive(Debug, Default)]
+struct PublicHistory {
+    /// The history records at least one migration.
+    applied: bool,
+    /// Accepted newer migrations this catalog doesn't bundle, as
+    /// `(version, recorded checksum)`.
+    accepted_newer: Vec<(i64, Vec<u8>)>,
+    /// Successful migrations it records that are newer than this catalog and
+    /// not accepted.
+    unlisted_newer: Vec<i64>,
+}
+
+#[derive(Debug)]
+struct ValidatedHistories {
+    service: PublicHistory,
+    common: PublicHistory,
+}
+
+/// Fails if SQLx ever applies it: a placeholder stands only for a history row
+/// already recorded with its checksum, which SQLx compares and leaves.
+const NEWER_PLACEHOLDER_SQL: &str =
+    "SELECT accepted_newer_migration_recorded_by_a_newer_release_is_never_applied_here;";
+
+/// `migrator` plus a placeholder for each accepted newer row, carrying the
+/// recorded checksum. SQLx then leaves those rows alone and still refuses any
+/// other recorded version it doesn't bundle, such as one a concurrent runner
+/// recorded after validation.
+fn with_newer_placeholders(migrator: &Migrator, accepted: &[(i64, Vec<u8>)]) -> Migrator {
+    use sqlx::SqlSafeStr as _;
+    use sqlx::migrate::MigrationType;
+
+    let mut migrations = migrator.migrations.to_vec();
+    for (version, checksum) in accepted {
+        let mut placeholder = Migration::new(
+            *version,
+            format!("newer migration accepted by {ACCEPT_NEWER_MIGRATIONS}").into(),
+            MigrationType::Simple,
+            NEWER_PLACEHOLDER_SQL.into_sql_str(),
+            false,
+        );
+        placeholder.checksum = checksum.clone().into();
+        migrations.push(placeholder);
+    }
+    migrations.sort_by_key(|migration| migration.version);
+    Migrator {
+        migrations: migrations.into(),
+        ignore_missing: migrator.ignore_missing,
+        locking: migrator.locking,
+        no_tx: migrator.no_tx,
+        table_name: migrator.table_name.clone(),
+        create_schemas: migrator.create_schemas.clone(),
+    }
+}
+
 fn validate_public_history(
     store: &str,
     conn: &Connection,
     migrator: &Migrator,
     common: bool,
     checksums: &AcceptedChecksums,
-) -> SqliteResult<bool> {
+    accepted: &AcceptedNewerMigrations,
+) -> SqliteResult<PublicHistory> {
     let table = if common {
         "_space_common_schema_migrations"
     } else {
@@ -185,12 +318,12 @@ fn validate_public_history(
         )
         .context("failed to inspect public migration history")?;
     if !exists {
-        return Ok(false);
+        return Ok(PublicHistory::default());
     }
     let query = if common {
-        "SELECT version, success, checksum FROM _space_common_schema_migrations"
+        "SELECT version, success, checksum FROM _space_common_schema_migrations ORDER BY version"
     } else {
-        "SELECT version, success, checksum FROM _sqlx_migrations"
+        "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version"
     };
     let mut statement = conn
         .prepare(query)
@@ -205,21 +338,55 @@ fn validate_public_history(
         })
         .context("failed to query public migration history")?;
     let bundled = migrations_by_version(migrator);
-    let mut applied = false;
+    let newest_bundled = bundled.keys().max().copied();
+    let mut history = PublicHistory::default();
     for row in rows {
         let (version, success, checksum) = row.context("invalid public migration history")?;
-        if !success
-            || bundled.get(&version).is_none_or(|migration| {
-                !checksums.accepts(store, version, &migration.checksum, &checksum)
-            })
-        {
+        let valid = match bundled.get(&version) {
+            Some(migration) => {
+                if accepted.contains(store, version) {
+                    tracing::warn!(
+                        store,
+                        migration_version = version,
+                        "{ACCEPT_NEWER_MIGRATIONS} lists {store}:{version}, which this release \
+                         bundles, so the entry has no effect here; remove it, because on a later \
+                         rollback to a release that doesn't bundle {version} it would accept \
+                         that migration without anyone checking it against that release"
+                    );
+                }
+                success && checksums.accepts(store, version, &migration.checksum, &checksum)
+            }
+            // A newer release applied it. Whether this release can run on
+            // its schema depends on this release's code, so only the
+            // operator can accept it. A recorded version below the newest
+            // bundled one is refused even if listed: one withdrawn after a
+            // newer migration was bundled, one merged out of timestamp order,
+            // or an accepted row that a later release's migration overtook.
+            None if success && newest_bundled.is_none_or(|newest| version > newest) => {
+                if accepted.contains(store, version) {
+                    tracing::warn!(
+                        store,
+                        migration_version = version,
+                        recorded_checksum = %hex::encode(&checksum),
+                        "{table} records newer migration {version}, which this release doesn't \
+                         bundle; leaving it applied as {ACCEPT_NEWER_MIGRATIONS} accepts"
+                    );
+                    history.accepted_newer.push((version, checksum));
+                } else {
+                    history.unlisted_newer.push(version);
+                }
+                true
+            }
+            None => false,
+        };
+        if !valid {
             return Err(SqliteError::message(format!(
                 "{table} has failed, modified, or unbundled migration {version}; see db/README.md"
             )));
         }
-        applied = true;
+        history.applied = true;
     }
-    Ok(applied)
+    Ok(history)
 }
 
 async fn validate_schema(
@@ -227,14 +394,48 @@ async fn validate_schema(
     db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
     checksums: &AcceptedChecksums,
-) -> SqliteResult<()> {
+    accepted: &AcceptedNewerMigrations,
+) -> SqliteResult<ValidatedHistories> {
     let conn = Connection::open(db_path).context("failed to open SQLite database")?;
-    let service_applied =
-        validate_public_history(db_name, &conn, migrators.service, false, checksums)?;
-    let common_applied = match migrators.common {
-        Some(common) => validate_public_history("common", &conn, common, true, checksums)?,
-        None => false,
+    let service = validate_public_history(
+        db_name,
+        &conn,
+        migrators.service,
+        false,
+        checksums,
+        accepted,
+    )?;
+    let common = match migrators.common {
+        Some(common) => {
+            validate_public_history("common", &conn, common, true, checksums, accepted)?
+        }
+        None => PublicHistory::default(),
     };
+    let unlisted: Vec<String> = service
+        .unlisted_newer
+        .iter()
+        .map(|version| format!("{db_name}:{version}"))
+        .chain(
+            common
+                .unlisted_newer
+                .iter()
+                .map(|version| format!("common:{version}")),
+        )
+        .collect();
+    if !unlisted.is_empty() {
+        let set = if accepted.0.is_empty() {
+            format!("set {ACCEPT_NEWER_MIGRATIONS}={}", unlisted.join(","))
+        } else {
+            format!("add {} to {ACCEPT_NEWER_MIGRATIONS}", unlisted.join(","))
+        };
+        return Err(SqliteError::message(format!(
+            "{db_name} records migrations newer than this release: {}. To run this release on \
+             that schema, first check it is compatible (see db/README.md \"Rolling back past a \
+             newer SQLite migration\"), then {set}",
+            unlisted.join(", ")
+        )));
+    }
+    let (service_applied, common_applied) = (service.applied, common.applied);
     if service_applied && migrators.common.is_some() && !common_applied {
         return Err(SqliteError::message(
             "SQLite service history is present but shared history is missing; explicit repair is required",
@@ -267,7 +468,7 @@ async fn validate_schema(
             ));
         }
     }
-    Ok(())
+    Ok(ValidatedHistories { service, common })
 }
 
 fn public_application_schema(conn: &Connection) -> SqliteResult<Vec<(String, String)>> {
@@ -300,7 +501,7 @@ pub fn open_rusqlite(db_path: &Path, options: RusqliteOpenOptions) -> SqliteResu
             .with_context(|| format!("failed to create SQLite directory {}", parent.display()))?;
     }
 
-    let conn = Connection::open(db_path)
+    let mut conn = Connection::open(db_path)
         .with_context(|| format!("failed to open SQLite database {}", db_path.display()))?;
     conn.busy_timeout(options.busy_timeout)
         .with_context(|| format!("failed to set busy timeout for {}", db_path.display()))?;
@@ -317,7 +518,13 @@ pub fn open_rusqlite(db_path: &Path, options: RusqliteOpenOptions) -> SqliteResu
     conn.trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE,
         Some(profile_rusqlite_trace_event),
-    );
+    )
+    .with_context(|| {
+        format!(
+            "failed to configure SQLite tracing for {}",
+            db_path.display()
+        )
+    })?;
     restrict_database_permissions(db_path)?;
     Ok(conn)
 }
@@ -349,6 +556,7 @@ async fn migrate_once(
     db_path: &Path,
     migrators: EmbeddedMigrators<'_>,
     checksums: &AcceptedChecksums,
+    accepted: &AcceptedNewerMigrations,
 ) -> SqliteResult<()> {
     checksums
         .validate(db_name, migrators.service)
@@ -386,22 +594,26 @@ async fn migrate_once(
             })?;
 
         let result = async {
-            if db_name == template_manager::STORE {
-                template_manager::reverse_unbundled(db_path, migrators.service)?;
-            }
-            validate_schema(db_name, db_path, migrators, checksums).await?;
+            let validated =
+                validate_schema(db_name, db_path, migrators, checksums, accepted).await?;
             let mut conn = pool
                 .acquire()
                 .await
                 .context("failed to acquire SQLite migration connection")?;
             if let Some(common) = migrators.common {
+                let common = with_newer_placeholders(
+                    &common_migrator(common),
+                    &validated.common.accepted_newer,
+                );
                 checksums
-                    .run("common", &common_migrator(common), &mut *conn)
+                    .run("common", &common, &mut *conn)
                     .await
                     .context("failed to apply common SQLite migrations")?;
             }
+            let service =
+                with_newer_placeholders(migrators.service, &validated.service.accepted_newer);
             checksums
-                .run(db_name, migrators.service, &mut *conn)
+                .run(db_name, &service, &mut *conn)
                 .await
                 .with_context(|| format!("failed to apply {db_name} SQLite migrations"))?;
             Ok(())

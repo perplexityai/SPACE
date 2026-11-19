@@ -1,17 +1,22 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use super::*;
-use pplx_space_common_core::types::{
-    ArtifactKind, Email, LocalArtifactId, NodeManagedBy, NodePoolName, OrgId, TemplateName, UserId,
-};
+use pplx_space_accounts::{Email, OrgId, UserId};
 use pplx_space_db_test_fixtures::{
     TestDb, pg_test_db_with_max_connections, try_pg_test_db_with_max_connections,
 };
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
+use pplx_space_node_model::{NodeManagedBy, NodePoolName};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
+use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
+use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
 
+mod activating_client;
 mod idle_suspended;
+mod live_adoption;
 mod restore_lease_completion;
 mod substrate_scope;
 
@@ -235,6 +240,7 @@ fn direct_pool_candidate_shape_pairs_inventory_dimensions() {
         content_hash: "sha256:pooled".to_string(),
         vcpu: Some(4),
         memory_mib: Some(8192),
+        environment_refusal: None,
     };
 
     assert_eq!(
@@ -252,6 +258,7 @@ fn direct_pool_candidate_shape_rejects_half_populated_inventory() {
             content_hash: "sha256:pooled".to_string(),
             vcpu,
             memory_mib,
+            environment_refusal: None,
         };
 
         DirectSubstrate::pool_candidate_shape(&candidate)
@@ -528,8 +535,6 @@ fn only_a_resident_that_restores_or_starts_reserves_an_identity_before_waking() 
             | State::Checkpointing
             | State::Suspending
             | State::Restoring
-            | State::CleanupRequired
-            | State::CleanupFailed
             | State::Quarantined
             | State::Failed => false,
         };
@@ -539,7 +544,7 @@ fn only_a_resident_that_restores_or_starts_reserves_an_identity_before_waking() 
             "{state:?}"
         );
     }
-    assert_eq!(seen, 19, "every lifecycle state is covered");
+    assert_eq!(seen, 17, "every lifecycle state is covered");
     assert!(!resident_is_dormant(&resident(None)));
 }
 
@@ -930,13 +935,21 @@ async fn restore_attempt_renewal_extends_the_owned_lease() -> TestResult {
 }
 
 async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
+    postgres_fixture_with(crate::controllers::substrate::ActivationClientAttribution::Disabled)
+        .await
+}
+
+async fn postgres_fixture_with(
+    attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult<Option<PostgresFixture>> {
     let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
         return Ok(None);
     };
     let pool = db.pool.clone();
 
     Ok(Some(PostgresFixture {
-        substrate: DirectSubstrate::new(pool.clone()),
+        substrate: DirectSubstrate::new(pool.clone())
+            .with_activation_client_attribution(attribution),
         pool,
         _db: db,
     }))
@@ -989,8 +1002,10 @@ async fn direct_create_rejects_node_pool_placement() -> TestResult {
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: true,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: Some(&node_pool),
+            client_id: None,
         })
         .await;
     let error = match result {
@@ -999,6 +1014,13 @@ async fn direct_create_rejects_node_pool_placement() -> TestResult {
     };
 
     assert!(matches!(error, SubstrateError::Unsupported { .. }));
+    // The precheck answers a pin with the refusal the create would give.
+    let checked = fixture
+        .substrate
+        .check_node_pool_placement(&node_pool)
+        .unwrap_err();
+    assert!(matches!(checked, SubstrateError::Unsupported { .. }));
+    assert_eq!(checked.to_string(), error.to_string());
     Ok(())
 }
 
@@ -2479,6 +2501,7 @@ async fn restore_preflight_reports_unexpired_owner_before_candidate_availability
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
+            &RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -2523,6 +2546,7 @@ async fn restore_without_source_or_ready_storage_uri_does_not_claim_a_lease() ->
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
+            &RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -2611,6 +2635,7 @@ async fn failed_restore_retry_preserves_the_restore_boundary() -> TestResult {
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
+            &RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -2705,8 +2730,10 @@ async fn direct_create_receipt_failure_deletes_node_local_sandbox() -> TestResul
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: true,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         })
         .await;
 
@@ -2782,8 +2809,10 @@ async fn direct_create_identity_preparation_failure_deletes_node_local_sandbox()
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: false,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         })
         .await;
 
@@ -2855,8 +2884,10 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
             disk_io_limits: Default::default(),
             restore_from: None,
             wait_until_ready: false,
+            command_ready_wait: None,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         })
         .await?;
 
@@ -2885,6 +2916,13 @@ struct DirectCreateFixture {
 }
 
 async fn direct_create_fixture() -> TestResult<Option<DirectCreateFixture>> {
+    direct_create_fixture_with(crate::controllers::substrate::ActivationClientAttribution::Disabled)
+        .await
+}
+
+async fn direct_create_fixture_with(
+    attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult<Option<DirectCreateFixture>> {
     let Some(postgres) = postgres_fixture().await? else {
         return Ok(None);
     };
@@ -2916,9 +2954,11 @@ async fn direct_create_fixture() -> TestResult<Option<DirectCreateFixture>> {
     ))
     .fetch_one(&postgres.pool)
     .await?;
-    let controller = crate::controllers::sandbox::SandboxController::new(
-        super::super::Substrate::from_direct(DirectSubstrate::new(postgres.pool.clone())),
-    );
+    let controller =
+        crate::controllers::sandbox::SandboxController::new(super::super::Substrate::from_direct(
+            DirectSubstrate::new(postgres.pool.clone())
+                .with_activation_client_attribution(attribution),
+        ));
     Ok(Some(DirectCreateFixture {
         postgres,
         controller,
@@ -2944,6 +2984,7 @@ fn one_shot_create_request() -> TestResult<crate::models::CreateSandboxRequest> 
         file_changes: None,
         auto_lifecycle: None,
         wait_until_ready: true,
+        command_ready_wait: None,
         network_policy: None,
         node_pool: None,
     })
@@ -2954,6 +2995,18 @@ impl DirectCreateFixture {
         &self,
         request: &crate::models::CreateSandboxRequest,
     ) -> Result<crate::models::SandboxResponse, ControllerError> {
+        self.create_as(
+            request,
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+        .await
+    }
+
+    async fn create_as(
+        &self,
+        request: &crate::models::CreateSandboxRequest,
+        activating_client: crate::controllers::substrate::ActivationClient,
+    ) -> Result<crate::models::SandboxResponse, ControllerError> {
         self.controller
             .create(
                 &self.postgres.pool,
@@ -2961,9 +3014,56 @@ impl DirectCreateFixture {
                 request,
                 crate::metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
                 crate::controllers::sandbox::FederatedSandboxCreateContext::new(None, None),
+                activating_client,
             )
             .await
     }
+}
+
+/// A create records its activating client on the row it inserts: an ECW
+/// caller's id, or `native` for a native call. The insert is shared by both
+/// substrates. With attribution off, nothing is recorded.
+#[rstest::rstest]
+#[case::on(crate::controllers::substrate::ActivationClientAttribution::Enabled)]
+#[case::off(crate::controllers::substrate::ActivationClientAttribution::Disabled)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_create_records_its_activating_client(
+    #[case] attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult {
+    use crate::controllers::substrate::ActivationClient;
+    use pplx_space_accounts::ClientId;
+
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture_with(attribution).await? else {
+        return Ok(());
+    };
+    for (activating_client, expected) in [
+        (
+            ActivationClient::Client(ClientId::parse("creator")?),
+            "creator",
+        ),
+        (ActivationClient::Native, "native"),
+    ] {
+        let response = fixture
+            .create_as(&one_shot_create_request()?, activating_client)
+            .await?;
+
+        let record = pplx_space_sandbox_store::attribute_runtime::activating_client(
+            &fixture.postgres.pool,
+            response.id,
+        )
+        .await?
+        .expect("created sandbox row");
+        assert_eq!(
+            record.as_ref().map(ClientId::as_str),
+            (attribution == crate::controllers::substrate::ActivationClientAttribution::Enabled)
+                .then_some(expected),
+            "{attribution:?}"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3028,10 +3128,9 @@ async fn two_call_direct_create_boots_a_custom_shape_on_the_worker() -> TestResu
         return Ok(());
     };
     // The shape the native create operation sends (`controller_create_request`):
-    // no boot mode and no readiness wait, so the create and start are two calls.
+    // no boot mode and a custom shape, so the create and start are two calls.
     let mut request = one_shot_create_request()?;
     request.boot_mode = None;
-    request.wait_until_ready = false;
     request.vcpu = Some(4);
     request.memory_mib = Some(2048);
 
@@ -3131,7 +3230,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
                         blocking: true,
                         ready_timeout: Duration::from_secs(5),
                     },
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await?;
         }
@@ -3190,7 +3289,7 @@ async fn direct_start_persists_complete_route_identity_receipt() -> TestResult {
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await?;
 
@@ -3275,6 +3374,7 @@ async fn stale_direct_route_receipt_cannot_replace_newer_execution_identity() ->
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await
         .expect_err("a stale route receipt must not replace a newer execution identity");
@@ -3344,6 +3444,7 @@ async fn newer_direct_activation_attempt_replaces_equal_generation_identity() ->
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await?;
 
@@ -3373,6 +3474,7 @@ async fn newer_direct_activation_attempt_replaces_equal_generation_identity() ->
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await
         .expect_err("an older equal-generation attempt must remain stale");
@@ -3413,6 +3515,7 @@ async fn direct_route_provenance_survives_active_receipt_clear() -> TestResult {
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await?;
     fixture
@@ -3532,6 +3635,8 @@ async fn wake_noop_without_receipt_preserves_current_direct_identity() -> TestRe
                 transition: pplx_space_sbx_mgr_client::proto::WakeTransition::Noop as i32,
                 route_identity: None,
             },
+            ReceiptRecord::Unchanged,
+            false,
         )
         .await?
         .expect("a no-op wake must retain the current identity");
@@ -3752,7 +3857,7 @@ async fn direct_start_rejects_wrong_worker_receipt_and_clears_stale_identity() -
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
         .expect_err("a receipt for another worker must fail closed");
@@ -3904,6 +4009,7 @@ async fn pooled_claim_persists_route_receipt_after_api_sandbox_insert() -> TestR
         template_network_policy: &policy,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_id: None,
     };
     let mut transaction = fixture.pool.begin().await?;
 
@@ -3938,7 +4044,10 @@ async fn cross_node_restore_handles_candidate_failures(
         return Ok(());
     }
 
-    let Some(fixture) = postgres_fixture().await? else {
+    let Some(fixture) =
+        postgres_fixture_with(crate::controllers::substrate::ActivationClientAttribution::Enabled)
+            .await?
+    else {
         return Ok(());
     };
     let sandbox_id = SandboxId::new();
@@ -3976,6 +4085,12 @@ async fn cross_node_restore_handles_candidate_failures(
         source_node_id,
         source_server.endpoint(),
         "9.0.0",
+    )
+    .await?;
+    pplx_space_sandbox_store::attribute_runtime::set_activating_client(
+        &fixture.pool,
+        sandbox_id,
+        Some(&pplx_space_accounts::ClientId::parse("previous-client")?),
     )
     .await?;
     insert_ready_worker(
@@ -4034,10 +4149,24 @@ async fn cross_node_restore_handles_candidate_failures(
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::uncapped(
+                crate::controllers::substrate::ChargeState::Exempt,
+                crate::controllers::substrate::ActivationAttribution::client(
+                    pplx_space_accounts::ClientId::parse("restore-client")?,
+                ),
+            ),
         )
         .await;
+    let recorded =
+        pplx_space_sandbox_store::attribute_runtime::activating_client(&fixture.pool, sandbox_id)
+            .await?
+            .expect("sandbox row");
     if !alternate_support {
+        assert_eq!(
+            recorded.as_ref().map(|id| id.as_str()),
+            Some("previous-client"),
+            "a failed restore leaves the previous record"
+        );
         let error = result.expect_err("no candidate supports activation policy");
         assert!(
             error
@@ -4080,6 +4209,11 @@ async fn cross_node_restore_handles_candidate_failures(
     assert_eq!(target_node_id, Some(alternate_node_id));
     assert_eq!(placement, "on_node");
     assert_eq!(lifecycle, "started");
+    // A restore records its client even when nobody charges it.
+    assert_eq!(
+        recorded.as_ref().map(|id| id.as_str()),
+        Some("restore-client")
+    );
     let persisted_identity: Option<(i64, NodeId, String, i64, Uuid, Option<String>)> =
         sqlx::query_as(sql!(
             "SELECT route_generation,
@@ -4190,7 +4324,7 @@ async fn cross_node_restore_retains_source_after_receipt_persistence_failure() -
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
         .expect_err("mismatched destination receipt must fail closed");
@@ -4283,6 +4417,7 @@ async fn stale_cross_node_restore_receipt_cannot_overwrite_newer_placement() -> 
             &stale_response,
             stale_identity,
             stale_lease,
+            ReceiptRecord::Unchanged,
         )
         .await
         .expect_err("an expired restore owner must not publish placement or provenance");
@@ -4340,6 +4475,7 @@ async fn owned_restore_persists_the_supplied_identity_when_legacy_manager_omits_
             },
             supplied_identity,
             lease,
+            ReceiptRecord::Unchanged,
         )
         .await?
         .expect("the supplied identity must be retained during rolling skew");
@@ -4470,7 +4606,7 @@ async fn implicit_access_wake_honors_the_workers_effective_policy() -> TestResul
                 &sandbox,
                 ExecutionActivityKind::Access,
                 Duration::from_secs(5),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await;
 
@@ -4520,7 +4656,7 @@ async fn implicit_access_wake_refuses_when_the_cluster_policy_denies_it() -> Tes
             &sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -4563,6 +4699,7 @@ async fn pooled_claim_checks_capability_before_adopting_and_retains_its_generati
         template_network_policy: &network,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_id: None,
     };
     for supported in [false, true] {
         let node = NodeId::new();
@@ -4690,7 +4827,7 @@ async fn wake_reserves_fresh_identity_when_observed_resident_retires() -> TestRe
             &sandbox,
             Duration::from_secs(5),
             None,
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await?;
     let running = state.get(&sandbox_id.to_string()).await?;
@@ -4751,7 +4888,7 @@ async fn wake_keeps_generation_observed_during_resident_transition(
             &sandbox,
             Duration::from_secs(5),
             Some(ExecutionActivityKind::Access),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await?;
     let resumed = state.get(&sandbox_id.to_string()).await?;
@@ -4764,4 +4901,5 @@ async fn wake_keeps_generation_observed_during_resident_transition(
     Ok(())
 }
 
+mod environment_gate;
 mod runtime_evidence;

@@ -3,10 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use pplx_space_common_core::port_exposure_signals::{
-    EXPOSE_TERMINAL_REASON_METADATA_KEY, EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
-};
-use pplx_space_common_core::types::{PolicyAuthority, SandboxId, SandboxOwner, SemVer};
+use pplx_space_accounts::SandboxOwner;
 use pplx_space_net_common::proto::{
     NetworkPolicyApplyDecision, NetworkPolicySource, NetworkPolicyV1 as ProtoNetworkPolicyV1,
 };
@@ -23,6 +20,11 @@ use pplx_space_node_mgr_client::proto::{
     AllowPortRequest, DenyPortRequest, ExposePortRequest, ListNetworkLeasesRequest,
     NetworkProtocol, NetworkSlotState, UnexposePortRequest,
 };
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_rpc_contracts::port_exposure_signals::{
+    EXPOSE_TERMINAL_REASON_METADATA_KEY, EXPOSE_TERMINAL_REASON_STALE_POD_NETNS,
+};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::{
     AcknowledgeAutoLifecycleDeleteReceiptsRequest, DisableSnapshotsRequest, EnableSnapshotsRequest,
     EvictClusterDeletedSandboxRequest, GetDiskUsageRequest as SbxGetDiskUsageRequest,
@@ -31,6 +33,7 @@ use pplx_space_sbx_mgr_client::proto::{
     SetAutoLifecyclePolicyRequest, SetNetworkPolicyRequest, SnapshotDetail,
     StateRequest as SbxStateRequest, StateResponse as SbxStateResponse,
 };
+use pplx_space_semver::SemVer;
 use pplx_space_state_reconciliation::NetworkPolicyTarget;
 use pplx_space_template_mgr_client::proto::{
     CreatePoolRequest, DeleteIdleTemplateRequest, DeletePoolRequest, DeleteTemplateRequest,
@@ -47,7 +50,7 @@ use crate::dirty_state::{
 use crate::{InboundFacetResult, ReconcileStats, connect_cluster_api, local_manager_request, util};
 
 mod cluster_deleted_eviction;
-mod execution_inventory;
+pub(crate) mod execution_inventory;
 mod inbound_sandbox_listing;
 mod inventory_publish;
 mod local_state;
@@ -94,7 +97,7 @@ enum SandboxInventoryEnrichmentError {
     InvalidSandboxId {
         value: String,
         #[source]
-        source: pplx_space_common_core::types::SandboxIdParseError,
+        source: pplx_space_sandbox_model::SandboxIdParseError,
     },
 
     #[error("get sandbox network policies: {0}")]

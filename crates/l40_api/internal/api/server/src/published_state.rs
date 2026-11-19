@@ -1,6 +1,8 @@
-use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_snapshot_model::SnapshotId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::types::Json;
@@ -9,21 +11,25 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::metadata::artifact_kind_from_proto;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_cluster_trigger_queue::{
     QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
 };
-use pplx_space_common_core::types::{
-    Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration,
-    ExecutionMetadata, LocalArtifactId, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
-    SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
-    SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
-    SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
-    SandboxTransitionTargetState, SemVer,
-};
+use pplx_space_cpu_arch::Arch;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_execution_spec::{ExecutionMetadata, RuntimeKind};
+use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::proto::NetworkPolicySource;
+use pplx_space_node_model::NodeRole;
+use pplx_space_policy_authority::PolicyAuthority;
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
+    SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
+    SandboxQuarantineSource, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
+    SandboxTransitionReceiptKind, SandboxTransitionTargetState,
+};
 use pplx_space_sandbox_portability::{
     started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
 };
@@ -34,6 +40,8 @@ use pplx_space_sandbox_quarantine_store::{
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
 };
+use pplx_space_semver::SemVer;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
     FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
@@ -103,7 +111,7 @@ fn parse_published_transition_receipt(
     let kind = required(Some(&receipt.kind), Field::TransitionReceiptKind)?
         .parse()
         .map_err(
-            |error: pplx_space_common_core::types::SandboxTransitionReceiptKindParseError| {
+            |error: pplx_space_sandbox_model::SandboxTransitionReceiptKindParseError| {
                 PublishedTransitionReceiptError {
                     field: Field::TransitionReceiptKind,
                     message: error.to_string(),
@@ -116,7 +124,7 @@ fn parse_published_transition_receipt(
     )?
     .parse()
     .map_err(
-        |error: pplx_space_common_core::types::SandboxTransitionTargetStateParseError| {
+        |error: pplx_space_sandbox_model::SandboxTransitionTargetStateParseError| {
             PublishedTransitionReceiptError {
                 field: Field::TransitionReceiptTargetState,
                 message: error.to_string(),
@@ -480,12 +488,12 @@ fn quarantine_recovery_projection(
 /// a loud `INVALID_ARGUMENT` instead of a silently backfilled identity.
 pub(crate) fn snapshot_execution_metadata(
     execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, Status> {
+) -> Result<pplx_space_execution_spec::SnapshotExecutionMetadata, Status> {
     let execution =
         execution.ok_or_else(|| Status::invalid_argument("execution metadata is required"))?;
     let execution = ExecutionMetadata::try_from(execution)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    pplx_space_common_core::types::SnapshotExecutionMetadata::new(execution)
+    pplx_space_execution_spec::SnapshotExecutionMetadata::new(execution)
         .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
@@ -503,7 +511,7 @@ pub(crate) fn capture_host_cpu(
     raw: Option<&str>,
     artifact_kind: ArtifactKind,
     sandbox_id: SandboxId,
-) -> Option<pplx_space_common_core::types::HostCpu> {
+) -> Option<pplx_space_execution_spec::HostCpu> {
     if artifact_kind == ArtifactKind::Disk {
         return None;
     }
@@ -511,7 +519,7 @@ pub(crate) fn capture_host_cpu(
     if raw.is_empty() {
         return None;
     }
-    pplx_space_common_core::types::HostCpu::parse(raw)
+    pplx_space_execution_spec::HostCpu::parse(raw)
         .inspect_err(|error| {
             let logged = pplx_space_grpc_server::truncate_utf8_for_log(
                 raw,
@@ -1437,7 +1445,7 @@ pub async fn publish_sandbox_states(
         conn,
         node_id,
         states,
-        pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
+        pplx_space_sandbox_model::AbandonedRestoreRetirement::Disabled,
     )
     .await
 }
@@ -1454,7 +1462,7 @@ pub async fn publish_sandbox_states_with_retirement(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     states: &[PublishedSandboxState],
-    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
@@ -1748,6 +1756,11 @@ pub async fn publish_sandbox_states_with_retirement(
                     .last_command_at
                     .as_ref()
                     .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_command_at"))
+                    .transpose()?,
+                next_auto_event_at: state
+                    .next_auto_event_at
+                    .as_ref()
+                    .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "next_auto_event_at"))
                     .transpose()?,
                 network_tx_bytes: state
                     .network_tx_bytes
@@ -2185,6 +2198,7 @@ pub async fn publish_sandbox_states_with_retirement(
     }));
     reconcile_recovery_observations(conn, node_id, &rows).await?;
     update_activity_timestamps(conn, node_id, &rows).await?;
+    record_idle_deadlines(conn, node_id, &rows).await?;
 
     let first_seen_sandbox_ids = accepted_rows
         .iter()
@@ -3412,7 +3426,7 @@ async fn apply_activation_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows: &[PublishedSandboxRow],
-    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<Vec<PostCommitSandboxEvent>, Status> {
     // These statements require an exact receipt kind. Empty receipt batches
     // cannot release or lock an execution, so ordinary reports need neither query.
@@ -3537,6 +3551,30 @@ async fn update_activity_timestamps(
     )
     .await
     .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
+    Ok(())
+}
+
+/// Record the publishing node's idle deadlines, which `getSandbox` reports as
+/// `expires_at`.
+async fn record_idle_deadlines(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<(), Status> {
+    let deadline_rows = rows
+        .iter()
+        .map(PublishedSandboxRow::idle_deadline_projection)
+        .collect::<Vec<_>>();
+    let deadline_rows = Json(serde_json::to_value(deadline_rows).map_err(|error| {
+        Status::internal(format!("serialize published idle deadlines: {error}"))
+    })?);
+    pplx_space_sandbox_store::ingest::record_published_idle_deadlines(
+        &mut *conn,
+        node_id,
+        deadline_rows,
+    )
+    .await
+    .map_err(|err| Status::internal(format!("record published idle deadlines: {err}")))?;
     Ok(())
 }
 

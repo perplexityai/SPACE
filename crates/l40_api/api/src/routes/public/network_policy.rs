@@ -6,9 +6,9 @@
 //! write contract.
 
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 
 use axum::{
     Extension, Json,
@@ -75,7 +75,7 @@ mod document {
                 // Do not read it as replacing that log.
                 tracing::debug!(
                     %error,
-                    sandbox_id = %pplx_space_common_core::types::SandboxId::from(sandbox_id),
+                    sandbox_id = %pplx_space_sandbox_model::SandboxId::from(sandbox_id),
                     "failed to load sandbox for network policy"
                 );
                 database_error(error)

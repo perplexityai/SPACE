@@ -33,15 +33,17 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_bearer_token::{SpaceBearerToken, insert_space_bearer_token};
-use pplx_space_common_core::types::cluster::process_cluster_id;
-use pplx_space_common_core::types::{NodeId, OrgId, ProcessId, SandboxId, SimpleDuration};
+use pplx_space_cluster_id::process_cluster_id;
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_durations::SimpleDuration;
 use pplx_space_feature_flags::{
     Attributes, FeatureFlagClient, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
 };
+use pplx_space_guest_process::ProcessId;
 use pplx_space_http_server::{HttpServerMakeSpan, HttpSpanMetadata};
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
@@ -66,17 +68,18 @@ use pplx_space_public_api::{
     SessionTargetProtocol, StreamCloseReason, TerminalSize, process_id_for_session,
     routes::{self as native_routes, NativeHttpMethod},
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::operations::{
-    CloseLoopbackBridgeRequest, CloseStdinRequest, ConnectProcessRequest, PtyConfig, PtySize,
-    ResizePtyRequest, SendInputRequest, SendSignalRequest, StartRequest,
+    CloseLoopbackBridgeRequest, CloseStdinRequest, ConnectProcessRequest, ListProcessesRequest,
+    PtyConfig, PtySize, ResizePtyRequest, SendInputRequest, SendSignalRequest, StartRequest,
     WatchRequest as WatchOperation,
 };
 use pplx_space_sbx_mgr_client::proto::{
     SpacedCloseLoopbackBridgeRequest, SpacedCloseStdinRequest, SpacedConnectProcessRequest,
-    SpacedFileEvent as FileEvent, SpacedFileEventKind, SpacedProcessEvent as ProcessEvent,
-    SpacedProcessExit as ProcessExit, SpacedResizePtyRequest, SpacedSendInputRequest,
-    SpacedSendSignalRequest, SpacedStartProcessRequest, SpacedWatchRequest, spaced_process_event,
-    spaced_process_exit,
+    SpacedFileEvent as FileEvent, SpacedFileEventKind, SpacedListProcessesRequest,
+    SpacedProcessEvent as ProcessEvent, SpacedProcessExit as ProcessExit, SpacedResizePtyRequest,
+    SpacedSendInputRequest, SpacedSendSignalRequest, SpacedStartProcessRequest, SpacedWatchRequest,
+    spaced_process_event, spaced_process_exit,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -87,6 +90,7 @@ use tonic::transport::{Channel, Endpoint};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+mod cluster_api_retry;
 mod drain;
 mod ecw_connect;
 mod ecw_files;
@@ -120,14 +124,15 @@ use drain::{
 };
 #[cfg(test)]
 use native::{
-    CdpProxyBase, HeaderTokenSource, MAX_LAST_EVENT_ID, StreamBridgeError, UpgradedProxyClose,
-    attached_json, attached_session_from_route_response, file_event_frame, file_event_kind,
-    file_watch_request, last_event_id, native_requested_transport, process_event_frames,
-    process_frame_advances_backend_cursor, process_start_request, proto_reconnect_reason,
-    proxy_path_and_query, proxy_streams, reconnect_reason_for_route_change,
+    CdpProxyBase, HeaderTokenSource, MAX_LAST_EVENT_ID, MalformedToken, StreamBridgeError,
+    UpgradedProxyClose, attached_json, attached_session_from_route_response, file_event_frame,
+    file_event_kind, file_watch_request, last_event_id, native_requested_transport,
+    process_event_frames, process_frame_advances_backend_cursor, process_start_request,
+    proto_reconnect_reason, proxy_path_and_query, proxy_streams, reconnect_reason_for_route_change,
     refresh_file_watch_attached_if_route_token_stale_with, reject_query_tokens,
     resume_resync_frame, rewrite_cdp_discovery_value, server_frame_event_name, server_frame_json,
     stream_bridge_error_label, strip_data_plane_auth_headers, token_from_headers,
+    token_from_headers_with_source,
 };
 use native::{
     RouteResolutionError, attach_session, data_plane_http_error, is_upgrade_request,
@@ -675,19 +680,22 @@ fn router(state: DataPlaneState) -> Router {
             on(
                 native_method_filter(native_routes::ATTACH_SESSION.method()),
                 attach_session,
-            ),
+            )
+            .fallback(native_method_not_allowed),
         )
         .route(
             native_routes::STREAM_SESSION_EVENTS.runtime_path(),
             on(
                 native_method_filter(native_routes::STREAM_SESSION_EVENTS.method()),
                 session_events,
-            ),
+            )
+            .fallback(native_method_not_allowed),
         )
         .route(
             native_routes::PROXY_SESSION.runtime_path(),
             any(proxy_session),
         )
+        .route(native_routes::PROXY_SESSION_ROOT_MOUNT, any(proxy_session))
         .route(
             native_routes::PROXY_SESSION_SUBPATH_MOUNT,
             any(proxy_session),
@@ -823,7 +831,42 @@ async fn record_request_latency(
     response
 }
 
-async fn unsupported_ecw_envd_endpoint() -> Response {
+/// A request that matches no data-plane route and names no ECW sandbox host
+/// is a Native client's, so it is answered in the Native data-plane envelope.
+/// One for an ECW sandbox host keeps the ECW error shape its SDK reads.
+fn native_route_not_found() -> Response {
+    data_plane_http_error(
+        StatusCode::NOT_FOUND,
+        DataPlaneHttpErrorCode::NotFound,
+        "route not found",
+        false,
+        ResponseOrigin::Client,
+        ResponseKind::Validation,
+    )
+}
+
+/// A Native route's answer to a method it does not serve. The method router
+/// adds the `Allow` header to it.
+async fn native_method_not_allowed() -> Response {
+    data_plane_http_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        DataPlaneHttpErrorCode::InvalidRequest,
+        "this HTTP method is not supported for this route",
+        false,
+        ResponseOrigin::Client,
+        ResponseKind::Validation,
+    )
+}
+
+/// envd endpoints SPACE does not serve. They exist only on an ECW sandbox
+/// host; anywhere else the path is just not a data-plane route.
+async fn unsupported_ecw_envd_endpoint(
+    State(state): State<DataPlaneState>,
+    headers: HeaderMap,
+) -> Response {
+    if state.ecw_hosts.parse_sandbox_host(&headers).is_none() {
+        return native_route_not_found();
+    }
     EcwProxyError::new(
         StatusCode::NOT_IMPLEMENTED,
         "This E2B envd endpoint is not supported by SPACE ECW",
@@ -916,10 +959,9 @@ async fn ecw_service_proxy(
     State(state): State<DataPlaneState>,
     request: Request<Body>,
 ) -> Result<Response, EcwProxyError> {
-    let target = state
-        .ecw_hosts
-        .parse_sandbox_host(request.headers())
-        .ok_or_else(|| EcwProxyError::not_found("Endpoint"))?;
+    let Some(target) = state.ecw_hosts.parse_sandbox_host(request.headers()) else {
+        return Ok(native_route_not_found());
+    };
     validate_ecw_sandbox_headers(request.headers(), &target)?;
 
     if target.port == ECW_ENVD_PORT {
@@ -1231,7 +1273,7 @@ async fn open_service_port_ingress_io(
     // Enrichment must not change ingress admission or route-repair behavior.
     let trace_context = u16::try_from(port)
         .ok()
-        .and_then(|value| pplx_space_common_core::types::GuestPort::try_from_u16(value).ok())
+        .and_then(|value| pplx_space_network_roles::GuestPort::try_from_u16(value).ok())
         .map(|port| pplx_space_sandbox_grpc::SandboxTraceContext {
             sandbox_id: *sandbox_id,
             port,

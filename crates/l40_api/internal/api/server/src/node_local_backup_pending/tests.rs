@@ -1,4 +1,6 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 use uuid::Uuid;
 
 use super::*;

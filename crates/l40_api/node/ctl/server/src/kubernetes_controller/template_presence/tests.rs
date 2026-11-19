@@ -1,4 +1,4 @@
-use pplx_space_common_core::kubernetes::template_build_presence_label_key;
+use pplx_space_sandbox_pod::template_build_presence_label_key;
 
 use super::*;
 

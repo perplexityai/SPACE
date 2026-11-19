@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 use pplx_space_rpc_auth::NodeRole;
 use pplx_space_template_mgr_client::proto as tmpl;
 use rstest::rstest;

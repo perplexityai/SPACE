@@ -4,12 +4,12 @@
 //! (observed state, reconcile state and claimed warm-pool slots are deleted,
 //! and snapshot storage locations are detached).
 
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_teardown::{
     delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Record a caller's delete intent: set `sandboxes.lifecycle` to `deleting`.

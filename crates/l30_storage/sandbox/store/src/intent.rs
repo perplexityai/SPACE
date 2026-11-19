@@ -7,8 +7,8 @@
 //! caller owns everything around it: the transaction and the reconcile
 //! enqueue that has to commit with the write.
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use sqlx::types::JsonValue;
 
 /// **Intent.** Replace the sandbox's network policy override

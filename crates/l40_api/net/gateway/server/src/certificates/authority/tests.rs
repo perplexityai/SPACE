@@ -1,9 +1,8 @@
 use super::super::{CertificateContext, CertificateProvider};
 use super::*;
 use crate::state::{GatewayNetworkState, NetworkStateReason, PulledNetworkPolicy};
-use pplx_space_common_core::{
-    types::ExecutionGeneration, types::RouteGeneration, types::SandboxId,
-    types::SpaceApiRouteIdentity,
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, RouteGeneration, SandboxId, SpaceApiRouteIdentity,
 };
 
 #[test]
@@ -434,7 +433,7 @@ fn authority_validity_is_bounded_by_node_ca_and_renewal_headroom() {
 #[tokio::test]
 async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown() {
     use host_control_server::{HostControl, HostControlServer};
-    use pplx_space_spaced_common::proto::host_control::*;
+    use pplx_space_spaced_protocol::proto::host_control::*;
     use tonic::{Request, Response};
     enum Reply {
         Error(Status),

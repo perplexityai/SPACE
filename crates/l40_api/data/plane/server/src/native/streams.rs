@@ -2,8 +2,8 @@
 //! WebSocket and SSE paths share.
 
 use super::*;
-use pplx_space_common_core::types::SandboxLifecycle;
 use pplx_space_public_api::SandboxLifecycleState;
+use pplx_space_sandbox_model::SandboxLifecycle;
 
 /// What the attach that may start a process can do with its input.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,7 +70,11 @@ pub(super) async fn initial_process_stream(
         // start succeeded earlier and its binding was never persisted. The
         // process id is derived rather than discovered, so recovery does not
         // depend on that binding: connect to the existing process instead of
-        // running the command a second time.
+        // running the command a second time. A guest that predates assigned
+        // ids mints its own and never answers this, so for it only a
+        // persisted binding, or its own handling of the start's idempotency
+        // key (the session id), keeps a repeated start from running the
+        // command again.
         Err(StreamBridgeError::BackendStatus(status))
             if status.code() == tonic::Code::AlreadyExists =>
         {
@@ -199,9 +203,9 @@ pub(super) fn guest_storage_full(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::ResourceExhausted
         && status
             .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
-            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
+            == Some(pplx_space_guest_process::status::GUEST_STORAGE_FULL)
 }
 
 /// The refusal when the backend would not start work because the sandbox is

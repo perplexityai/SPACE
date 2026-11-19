@@ -17,12 +17,14 @@
 //! - R5 `r5_recent_attempt_heartbeat_protects_old_row`
 //! - R6 `r6_stale_attempt_heartbeat_reaped`
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use pplx_space_common_core::types::PositiveDuration;
+use pplx_space_durations::PositiveDuration;
 
 use super::*;
 
@@ -159,8 +161,8 @@ mod postgres_backed {
 
     use super::*;
     use crate::stuck_snapshot_reaper::store::SnapshotDbStore;
-    use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_snapshot_model::SnapshotId;
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;

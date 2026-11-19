@@ -1,13 +1,14 @@
 use std::time::Duration;
 
-use pplx_space_common_core::types::{PositiveDuration, snapshot_sweeper_grace_seconds};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_snapshot_model::snapshot_sweeper_grace_seconds;
 
 /// A borrowed configuration source shared by the reconciler parsers.
-pub(crate) struct EnvConfig<'a>(pub(crate) &'a dyn pplx_space_common_core::env::Environment);
+pub(crate) struct EnvConfig<'a>(pub(crate) &'a dyn pplx_space_env_vars::Environment);
 
 impl EnvConfig<'_> {
     pub(crate) fn test_raw(&self, var: &str) -> Option<String> {
-        pplx_space_common_core::env::test_hook(self.0, var)
+        pplx_space_test_hooks::test_hook(self.0, var)
     }
 
     pub(crate) fn test_duration_secs(&self, var: &str, default: Duration) -> Duration {
@@ -35,6 +36,13 @@ impl EnvConfig<'_> {
         }
     }
 
+    /// A switch in the shared `env_flag` vocabulary (`1`, `true`, `yes`, `on`
+    /// or `enabled`, and their negatives, in any case). Unset or any other
+    /// value keeps `default`.
+    pub(crate) fn flag(&self, var: &str, default: bool) -> bool {
+        pplx_space_env_vars::env_flag(self.0.var(var).ok().as_deref(), default)
+    }
+
     /// A switch whose `true` is the non-destructive mode, such as a dry run.
     /// Unset keeps `default`; a value in the shared `env_flag` vocabulary
     /// wins; any other present value, empty included, turns it on with a
@@ -45,7 +53,7 @@ impl EnvConfig<'_> {
             return default;
         };
         let raw = raw.to_string_lossy();
-        pplx_space_common_core::env::parse_env_flag(&raw).unwrap_or_else(|| {
+        pplx_space_env_vars::parse_env_flag(&raw).unwrap_or_else(|| {
             tracing::warn!(
                 variable = var,
                 value = %raw,
@@ -61,7 +69,7 @@ impl EnvConfig<'_> {
     /// disables it. A misspelled switch must stop the writes, never leave them
     /// running. Same semantics as the shared `env_destructive_gate`.
     pub(crate) fn destructive_gate(&self, var: &str) -> bool {
-        pplx_space_common_core::env::env_destructive_gate(self.0.var(var).ok().as_deref())
+        pplx_space_env_vars::env_destructive_gate(self.0.var(var).ok().as_deref())
     }
 
     /// An optional positive duration from seconds: unset or unparseable keeps
@@ -193,11 +201,7 @@ where
         Ok(n) => Some(n.min(ceiling)),
         Err(err)
             if *err.kind() == std::num::IntErrorKind::PosOverflow
-                && raw
-                    .strip_prefix('+')
-                    .unwrap_or(raw)
-                    .bytes()
-                    .all(|b| b.is_ascii_digit()) =>
+                && raw.trim_prefix('+').bytes().all(|b| b.is_ascii_digit()) =>
         {
             Some(ceiling)
         }
@@ -206,19 +210,19 @@ where
 }
 
 pub(crate) fn truthy_default(var: &str, default: bool) -> bool {
-    EnvConfig(&pplx_space_common_core::env::ProcessEnvironment).truthy_default(var, default)
+    EnvConfig(&pplx_space_env_vars::ProcessEnvironment).truthy_default(var, default)
 }
 
 pub(crate) fn destructive_gate(var: &str) -> bool {
-    EnvConfig(&pplx_space_common_core::env::ProcessEnvironment).destructive_gate(var)
+    EnvConfig(&pplx_space_env_vars::ProcessEnvironment).destructive_gate(var)
 }
 
 pub(crate) fn duration_secs(var: &str, default: Duration) -> Duration {
-    EnvConfig(&pplx_space_common_core::env::ProcessEnvironment).duration_secs(var, default)
+    EnvConfig(&pplx_space_env_vars::ProcessEnvironment).duration_secs(var, default)
 }
 
 pub(crate) fn positive_u32(var: &str, default: u32) -> u32 {
-    EnvConfig(&pplx_space_common_core::env::ProcessEnvironment).positive_u32(var, default)
+    EnvConfig(&pplx_space_env_vars::ProcessEnvironment).positive_u32(var, default)
 }
 
 #[cfg(test)]

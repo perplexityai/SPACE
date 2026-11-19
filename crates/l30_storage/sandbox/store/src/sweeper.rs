@@ -32,15 +32,15 @@
 //! the sweeper's Postgres tests run them directly. Production code calls the
 //! function here that binds each one.
 
-use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle, SubstrateKind};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 use std::fmt;
 use std::str::FromStr;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{
-    PodUid, SandboxActivationAttemptId, SandboxLifecycleParseError,
-};
+use pplx_space_k8s_ids::PodUid;
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxLifecycleParseError};
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, inflight_suspend_upload_exists,
     recoverable_suspend_snapshot_exists, restore_retry_source_snapshot_exists,
@@ -49,6 +49,7 @@ use pplx_space_sandbox_portability::{
 use pplx_space_sandbox_routability::{
     routable_execution_or_non_k8s, routable_k8s_execution_exists,
 };
+use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 
 /// SQL expression naming the lifecycle write a sweep just made.

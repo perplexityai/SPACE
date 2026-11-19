@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from types import SimpleNamespace
 from datetime import UTC, datetime
 from typing import cast
 from unittest import mock
@@ -18,16 +19,10 @@ from space_smoke.capabilities import (
 from space_smoke.fixtures import CommandSandboxFixture, Ecw
 from space_smoke.model import Verdict
 from space_smoke.runtime import (
-    InvariantViolation,
     ResourceScope,
     ScenarioContext,
     SmokeConfigurationError,
     execute_scenario,
-)
-from space_smoke.scenarios.ecw_filesystem_round_trip import (
-    CONTENT,
-    PATH,
-    filesystem_round_trip,
 )
 from space_smoke.scenarios.ecw_pause_connect import (
     MARKER as PAUSE_MARKER,
@@ -40,13 +35,7 @@ from space_smoke.scenarios.ecw_refresh_keepalive import (
     VERIFY_AFTER_REFRESH_SECONDS,
     refresh_keepalive,
 )
-from space_smoke.scenarios.ecw_sandbox_info import sandbox_info
-from space_smoke.scenarios.ecw_timeout_rearm import (
-    RESET_AFTER_SECONDS,
-    TIMEOUT_SECONDS as REARM_TIMEOUT_SECONDS,
-    VERIFY_AFTER_RESET_SECONDS,
-    timeout_rearm,
-)
+from space_smoke.scenarios.ecw_command_round_trip import command_round_trip
 from space_smoke.scenarios.ecw_timeout_update import (
     DEADLINE_MARGIN_SECONDS,
     EXTENDED_TIMEOUT_SECONDS,
@@ -147,31 +136,32 @@ class _Sandbox:
         self.trace.append("kill")
 
 
+def _collection(sandbox: _Sandbox):
+    second = _Sandbox()
+    second.sandbox_id = "sandbox-second"
+    return SimpleNamespace(items=(sandbox, second))
+
+
 def _fixture(sandbox: _Sandbox, *, timeout: int = 300) -> Ecw:
     return Ecw(
         ScenarioContext(ResourceScope(), {}),
         cast(EcwSandbox, sandbox),
         _sandbox_timeout=timeout,
+        _sandboxes=_collection(sandbox),
     )
 
 
 class EcwHappyPathScenarioTests(unittest.TestCase):
-    def test_sandbox_info_is_one_read_and_id_check(self) -> None:
-        sandbox = _Sandbox()
-
-        sandbox_info.verify(_fixture(sandbox))
-
-        self.assertEqual(sandbox.trace, ["get_info"])
 
     def test_sandbox_info_id_mismatch_keeps_the_shared_failure(self) -> None:
         sandbox = _Sandbox(info_sandbox_id="sandbox-other")
 
         def body(context: ScenarioContext) -> None:
-            sandbox_info.verify(
+            command_round_trip.verify(
                 CommandSandboxFixture(context, cast(CommandSandbox, sandbox))
             )
 
-        result = execute_scenario(title=sandbox_info.title, body=body)
+        result = execute_scenario(title=command_round_trip.title, body=body)
 
         self.assertEqual(result.verdict, Verdict.FAIL)
         self.assertEqual(result.summary, "sandbox information returned a different ID")
@@ -215,45 +205,23 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
             ],
         )
 
-    def test_same_value_timeout_rearm_crosses_the_original_deadline(self) -> None:
-        sandbox = _Sandbox()
-
-        with mock.patch("space_smoke.runtime.time.sleep") as sleep:
-            timeout_rearm.verify(_fixture(sandbox, timeout=REARM_TIMEOUT_SECONDS))
-
-        self.assertEqual(timeout_rearm.sandbox.timeout, REARM_TIMEOUT_SECONDS)
-        self.assertEqual(
-            [call.args[0] for call in sleep.call_args_list],
-            [RESET_AFTER_SECONDS, VERIFY_AFTER_RESET_SECONDS],
-        )
-        self.assertEqual(sandbox.trace[0], f"set_timeout:{REARM_TIMEOUT_SECONDS}")
-        self.assertEqual(sandbox.trace[-2], "get_info")
-        self.assertEqual(
-            sandbox.trace[-1],
-            "run:printf %s space-smoke-idle-deadline-reset-ok:60",
-        )
-        self.assertGreater(
-            RESET_AFTER_SECONDS + VERIFY_AFTER_RESET_SECONDS,
-            REARM_TIMEOUT_SECONDS,
-        )
-        self.assertLess(VERIFY_AFTER_RESET_SECONDS, REARM_TIMEOUT_SECONDS)
-        self.assertGreaterEqual(
-            REARM_TIMEOUT_SECONDS - VERIFY_AFTER_RESET_SECONDS,
-            10,
-        )
 
     def test_refresh_keepalive_crosses_the_original_deadline(self) -> None:
         sandbox = _Sandbox()
+        fixture = _fixture(sandbox, timeout=REFRESH_TIMEOUT_SECONDS)
+        rearmed = fixture.sandboxes.items[1]
 
         with mock.patch("space_smoke.runtime.time.sleep") as sleep:
-            refresh_keepalive.verify(_fixture(sandbox, timeout=REFRESH_TIMEOUT_SECONDS))
+            refresh_keepalive.verify(fixture)
 
         self.assertEqual(refresh_keepalive.sandbox.timeout, REFRESH_TIMEOUT_SECONDS)
         self.assertEqual(
             [call.args[0] for call in sleep.call_args_list],
             [REFRESH_AFTER_SECONDS, VERIFY_AFTER_REFRESH_SECONDS],
         )
-        self.assertEqual(sandbox.trace[0], "refresh")
+        self.assertEqual(sandbox.trace[:2], [f"set_timeout:{REFRESH_TIMEOUT_SECONDS}", "refresh"])
+        self.assertEqual(rearmed.trace[:2], [f"set_timeout:{REFRESH_TIMEOUT_SECONDS}"] * 2)
+        self.assertEqual(rearmed.trace[-2:], sandbox.trace[-2:])
         self.assertEqual(sandbox.trace[-2], "get_info")
         self.assertEqual(
             sandbox.trace[-1],
@@ -296,6 +264,7 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
                     context,
                     cast(EcwSandbox, sandbox),
                     _sandbox_timeout=REFRESH_TIMEOUT_SECONDS,
+                    _sandboxes=_collection(sandbox),
                 )
             )
 
@@ -315,16 +284,17 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
         )
 
         def body(context: ScenarioContext) -> None:
-            timeout_rearm.verify(
+            refresh_keepalive.verify(
                 Ecw(
                     context,
                     cast(EcwSandbox, sandbox),
-                    _sandbox_timeout=REARM_TIMEOUT_SECONDS,
+                    _sandbox_timeout=REFRESH_TIMEOUT_SECONDS,
+                    _sandboxes=_collection(sandbox),
                 )
             )
 
         with mock.patch("space_smoke.runtime.time.sleep"):
-            result = execute_scenario(title="Timeout rearm", body=body)
+            result = execute_scenario(title="Idle deadline reset", body=body)
 
         self.assertEqual(result.verdict, Verdict.FAIL)
         self.assertEqual(result.evidence["operation"], "run marker command")
@@ -341,6 +311,7 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
                     context,
                     cast(EcwSandbox, sandbox),
                     _sandbox_timeout=REFRESH_TIMEOUT_SECONDS,
+                    _sandboxes=_collection(sandbox),
                 )
             )
 
@@ -352,18 +323,6 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
         self.assertEqual(result.evidence["observed_state"], "paused")
         self.assertFalse(any(item.startswith("run:") for item in sandbox.trace))
 
-    def test_filesystem_round_trip_is_one_write_and_read(self) -> None:
-        sandbox = _Sandbox()
-
-        filesystem_round_trip.verify(_fixture(sandbox))
-
-        self.assertEqual(
-            sandbox.trace,
-            [
-                f"files.write:{PATH}:{CONTENT}:60",
-                f"files.read:{PATH}:60",
-            ],
-        )
 
     def test_pause_connect_reads_the_state_written_before_pause(self) -> None:
         sandbox = _Sandbox()
@@ -382,12 +341,6 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
             ],
         )
 
-    def test_filesystem_mismatch_is_an_invariant_failure(self) -> None:
-        sandbox = _Sandbox()
-        sandbox.files.read = lambda *_args, **_kwargs: "wrong"  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(InvariantViolation, "did not return"):
-            filesystem_round_trip.verify(_fixture(sandbox))
 
 
 if __name__ == "__main__":

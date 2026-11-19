@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pplx_space_common_core::host::disk::DiskStatus;
+use pplx_space_host_linux::disk::DiskStatus;
 use rstest::{fixture, rstest};
 
 use super::*;

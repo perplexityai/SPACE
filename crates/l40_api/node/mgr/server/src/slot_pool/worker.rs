@@ -66,6 +66,8 @@ pub(super) enum ValidationTaskResult<U> {
     Update(U),
     Transient(String),
     RuntimeUnknown(U),
+    /// Retain the lease and check it again, persisting nothing.
+    Deferred,
 }
 
 pub(super) enum StartupLeaseUpdate {
@@ -78,11 +80,21 @@ struct LiveValidationMeta {
     sandbox_id: String,
 }
 
+/// `young` is whether the lease is still inside its startup grace
+/// (`STARTUP_YOUNG_LEASE_GRACE`).
 pub(super) fn validate_startup_runtime(
     info: SlotInfo,
     host_ready: bool,
     evidence: LeaseLiveness,
+    young: bool,
 ) -> ValidationTaskResult<StartupLeaseUpdate> {
+    // A lease allocated just before this process started has no runtime
+    // until its activation launches. Recheck it without a write: the grace
+    // stays fixed by the predecessor's last write, and a lease its activation
+    // adopts keeps the allocation's health.
+    if young && evidence != LeaseLiveness::Live {
+        return ValidationTaskResult::Deferred;
+    }
     let health = |health, last_error| {
         StartupLeaseUpdate::Health(LeaseHealthValidationUpdate {
             slot_id: info.slot,
@@ -244,6 +256,14 @@ where
                     slot_id,
                     retry_after_secs = POOL_FILL_RETRY_DELAY.as_secs(),
                     "startup lease validation deferred; retaining ownership and retrying"
+                );
+            }
+            ValidationTaskResult::Deferred => {
+                retry = true;
+                tracing::warn!(
+                    slot_id,
+                    retry_after_secs = POOL_FILL_RETRY_DELAY.as_secs(),
+                    "lease allocated just before startup has no runtime yet; retaining it and rechecking"
                 );
             }
             ValidationTaskResult::Update(update) => {
@@ -1116,6 +1136,7 @@ pub(super) async fn validate_live_leased_slots(
     let host_ready = host_ready_for_pool_fill_off_runtime(&pool.config())
         .await
         .is_ok();
+    let grace_pool = pool.clone();
     run_validation_pump(
         pool,
         records,
@@ -1125,32 +1146,36 @@ pub(super) async fn validate_live_leased_slots(
             transient_retry: "live leased network slot validation hit transient host networking error",
             transient_exhausted: "live leased network slot validation retries exhausted",
         },
-        move |record, key| async move {
-            let slot_id = record.info.slot;
-            let generation = record.info.generation;
-            let sandbox_id = record.info.sandbox_id.clone();
-            let meta = LiveValidationMeta {
-                generation,
-                sandbox_id: sandbox_id.clone(),
-            };
-            let info = record.info.clone();
-            let result = match tokio::task::spawn_blocking(move || {
-                let evidence = lease_liveness(&info);
-                validate_startup_runtime(info, host_ready, evidence)
-            })
-            .await
-            {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::warn!(%error, slot_id, "live leased slot validation task failed");
-                ValidationTaskResult::Transient(error.to_string())
-            }
-            };
-            ValidationTaskOutcome {
-                key,
-                slot_id,
-                meta,
-                result,
+        move |record, key| {
+            let young = LeaseKey::from_record(&record)
+                .is_some_and(|lease| grace_pool.startup_lease_is_young(&lease, now_secs()));
+            async move {
+                let slot_id = record.info.slot;
+                let generation = record.info.generation;
+                let sandbox_id = record.info.sandbox_id.clone();
+                let meta = LiveValidationMeta {
+                    generation,
+                    sandbox_id: sandbox_id.clone(),
+                };
+                let info = record.info.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    let evidence = lease_liveness(&info);
+                    validate_startup_runtime(info, host_ready, evidence, young)
+                })
+                .await
+                {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%error, slot_id, "live leased slot validation task failed");
+                    ValidationTaskResult::Transient(error.to_string())
+                }
+                };
+                ValidationTaskOutcome {
+                    key,
+                    slot_id,
+                    meta,
+                    result,
+                }
             }
         },
         |slot_id, meta, attempts, error| {

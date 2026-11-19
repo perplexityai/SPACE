@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{Digest, HashAlg};
+use pplx_space_content_digest::{Digest, HashAlg};
 use sha2::Digest as _;
 
 /// Streaming verification of the algorithm named by a template's identity.
@@ -42,7 +42,7 @@ const PRODUCTION_ALGORITHM_ENV: &str = "SPACE_TEMPLATE_HASH_ALGORITHM";
 pub struct TemplateHashConfigError;
 
 pub(crate) fn production_algorithm_from_environment(
-    environment: &dyn pplx_space_common_core::env::Environment,
+    environment: &dyn pplx_space_env_vars::Environment,
 ) -> Result<HashAlg, TemplateHashConfigError> {
     match environment.var(PRODUCTION_ALGORITHM_ENV) {
         Ok(value) => value.parse().map_err(|_| TemplateHashConfigError),

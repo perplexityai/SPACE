@@ -231,7 +231,9 @@ pub(super) async fn refresh_sandbox_desired_state(
                     tracing::debug!(
                         sandbox_id,
                         status = %status,
-                        "cluster-deleted eviction deferred to the next sync: restore staging in flight"
+                        "cluster-deleted eviction deferred to the next sync: the sandbox is held by \
+                         a restore staging pull, a runtime upgrade, an artifact upload, or another \
+                         operation on its artifacts"
                     );
                 }
                 ClusterDeletedEvictDisposition::Deferred(backoff) => {

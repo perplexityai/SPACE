@@ -56,9 +56,15 @@ pub(super) const OPTIONAL_PATHS: &[&str] = &[
     "usr/bin/ssh-keygen",
     "usr/bin/sudo",
     "usr/bin/systemctl",
+    "usr/bin/gnusleep",
+    "usr/bin/sleep",
     "usr/lib/openssh",
     "usr/libexec/sudo",
     "usr/local/sbin/space-configure-apt-mirror",
+    "var/lib/spaced",
+    // Explicit seed ExecStartPre ABI; the containing directory is archived
+    // once after dependency discovery removes overlapping descendants.
+    "var/lib/spaced/committed/spaced-svc",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,7 +136,7 @@ pub(super) fn normalize_relative_path(path: &Path) -> Result<PathBuf, GuestBundl
             }
         }
     }
-    if normalized.as_os_str().is_empty() {
+    if normalized.is_empty() {
         return Err(GuestBundleError::UnsafeDependency {
             path: path.display().to_string(),
         });

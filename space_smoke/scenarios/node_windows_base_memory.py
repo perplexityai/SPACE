@@ -12,7 +12,8 @@ from space_smoke.base_memory import exercise_base_memory
     cleanup_timeout_seconds=600,
     api_surfaces=("node",),
     required_tools=("ssh",),
-    ignored="requires a Windows template with native spaced memory lifecycle on a standalone KVM worker",
+    tier="manual",
+    manual_reason="requires a Windows template with native spaced memory lifecycle on a standalone KVM worker",
     rerun_environment=(
         "SPACE_SMOKE_NODE_RECOVERY", "SPACE_SMOKE_NODE_HOST", "SPACE_SMOKE_NODE_MACHINE_ID",
         "SPACE_SMOKE_NODE_CLIENT_ENV", "SPACE_SMOKE_NODE_TEMPLATE", "SPACE_SMOKE_NODE_CONTENT_HASH",

@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ExecutionGeneration, JobId, LocalArtifactId, SandboxId,
-};
+use pplx_space_accounts::JobId;
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sbx_mgr_client::proto::{
     SuspendSnapshotFormat, TeardownSuspendAction, TeardownSuspendOutcome,
 };
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use super::{OrgSnapshotConfigResolution, TeardownSuspendBackup};
 use crate::service::SandboxManagerService;
@@ -22,11 +22,12 @@ use crate::service::tests::service_tests::{
 use crate::snapshot_upload_jobs::RegistrationProbe;
 use crate::state::SandboxState;
 pub(super) use cluster_api_stub_tests::{
-    FinalizedBackup, finalized_backups, record_finalized_backup, with_cluster_api,
+    FinalizedBackup, finalized_backups, record_finalized_backup,
 };
 use cluster_api_stub_tests::{
     RETIRING, RetiringClusterApi, admitted_registrations, bound_upload_payload,
 };
+pub(in crate::service) use cluster_api_stub_tests::{answer, with_cluster_api};
 
 const GENERATION: i64 = 7;
 

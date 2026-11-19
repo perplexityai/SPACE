@@ -1,8 +1,9 @@
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
-use pplx_space_common_core::types::{
-    NodeAddress, TemplateReference,
-    admin::{AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSort, DrainRequest},
+use pplx_space_admin_protocol::{
+    AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSort, DrainRequest,
 };
+use pplx_space_node_model::NodeAddress;
+use pplx_space_template_model::TemplateReference;
 use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -298,8 +299,8 @@ pub(crate) enum CliError {
         hash = .content_hash.as_ref().map_or_else(|| "unavailable".to_string(), ToString::to_string))]
     Build {
         job_id: String,
-        state: pplx_space_common_core::types::TemplateBuildJobState,
-        content_hash: Option<pplx_space_common_core::types::ContentHash>,
+        state: pplx_space_template_model::TemplateBuildJobState,
+        content_hash: Option<pplx_space_content_digest::ContentHash>,
         error: String,
     },
 }
@@ -880,7 +881,7 @@ fn network_slots_empty(slots: &AdminNodeNetworkSlots) -> bool {
 /// Render an optional number, with `-` for absent. Absent is a real state
 /// here — an uncomputed counter or a node-manager field the node never
 /// reported — and must not print as `0`.
-fn opt_num<T: std::fmt::Display>(value: Option<T>) -> String {
+pub(crate) fn opt_num<T: std::fmt::Display>(value: Option<T>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())

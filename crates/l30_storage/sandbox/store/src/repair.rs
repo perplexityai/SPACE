@@ -12,14 +12,17 @@
 //! and the writes to the other tables the same repair touches (executions,
 //! port exposures, observed states, quarantine state).
 
-use pplx_space_common_core::types::{LocalArtifactId, PositiveDuration, SandboxId, SubstrateKind};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::sync::LazyLock;
 
-use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_suspend_snapshot_current,
 };
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// `make_interval(secs => $n::BIGINT)` needs an i64 bind. Saturate rather

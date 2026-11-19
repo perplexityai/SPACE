@@ -111,11 +111,12 @@ async fn db_contention_error_separates_a_lost_lock_race_from_a_real_failure()
         // against the row that is already contended.
         //
         // The absent *converging* marker is not observable in production
-        // today — both readers of `retry_after()` return on
+        // today — the reader of `retry_after()` returns on
         // `is_lock_contention()` first — so this pins the semantic choice
         // against a future regression rather than a current behavior: were the
-        // marker set and either guard removed, contention would fold into
-        // `reason:wait_budget`, incorrectly classifying contention as a timeout.
+        // marker set and that guard removed, contention would fold into the
+        // SDK's `sandbox_timeout`, incorrectly classifying contention as a
+        // timeout.
         assert_eq!(
             error.retry_after_header(),
             Some(crate::controllers::substrate::LOCK_CONTENTION_RETRY_AFTER),

@@ -31,7 +31,7 @@
 //!   ordered by `id` so a cursor can make forward progress past stuck
 //!   rows) and for each one:
 //!   1. Parses the `storage_connection_string` into a
-//!      [`pplx_space_common_core::types::StorageUri`]. Parse failure is
+//!      [`pplx_space_artifact_model::StorageUri`]. Parse failure is
 //!      logged + counted as `failed{reason:parse_uri}`; the row is
 //!      left in place so the failure stays visible until repaired.
 //!   2. Calls [`pplx_space_snapshot_storage::StorageBackend::delete_prefix`]. The backend lists
@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::snapshot_storage_sweeper as sweeper_metrics;
 use futures_util::stream::{self, StreamExt};
-use pplx_space_common_core::types::StorageUri;
+use pplx_space_artifact_model::StorageUri;
 #[cfg(test)]
 use pplx_space_snapshot_storage::DeletePrefixError;
 use pplx_space_snapshot_storage::{DeletePrefixOutcome, StorageBackend};
@@ -96,7 +96,7 @@ pub(crate) const DEFAULT_CONCURRENCY: usize = 8;
 /// still-uploading prefix would leave late-arriving objects without
 /// a DB anchor for any future sweep.
 pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(
-    pplx_space_common_core::types::SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
+    pplx_space_snapshot_model::SNAPSHOT_STORAGE_SWEEPER_DEFAULT_MIN_AGE_SECONDS,
 );
 
 #[derive(Debug, Clone)]
@@ -165,10 +165,10 @@ impl ReconcilerConfig {
     /// except `scoped_bucket` which is sourced from the cluster-wide
     /// `SPACE_SNAPSHOT_BUCKET`.
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {

@@ -371,7 +371,7 @@ fn exact_requests_use_indexed_lookups_including_disk_only_and_absent_targets() {
         }
     }
     for (metadata, disk) in [(true, false), (true, true), (false, true), (false, false)] {
-        let conn = crate::db::test_conn();
+        let mut conn = crate::db::test_conn();
         let cache = tempfile::tempdir().unwrap();
         let target = SandboxId::new().to_string();
         for _ in 0..128 {
@@ -399,7 +399,8 @@ fn exact_requests_use_indexed_lookups_including_disk_only_and_absent_targets() {
         if disk {
             std::fs::create_dir(cache.path().join(&target)).unwrap();
         }
-        conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace));
+        conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace))
+            .unwrap();
         let db = crate::db::SharedConnection::new(conn);
         for selector in [&target, &target.to_uppercase(), &target.replace('-', "")] {
             let resolved = resolve_lifecycle_target_blocking(
@@ -414,8 +415,8 @@ fn exact_requests_use_indexed_lookups_including_disk_only_and_absent_targets() {
             .unwrap();
             assert_eq!(resolved.is_some(), metadata || disk);
         }
-        let conn = db.lock().unwrap();
-        conn.trace_v2(TraceEventCodes::empty(), None);
+        let mut conn = db.lock().unwrap();
+        conn.trace_v2(TraceEventCodes::empty(), None).unwrap();
         for sql in QUERIES.lock().unwrap().drain(..) {
             let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             for detail in plan.query_map([], |row| row.get::<_, String>(3)).unwrap() {

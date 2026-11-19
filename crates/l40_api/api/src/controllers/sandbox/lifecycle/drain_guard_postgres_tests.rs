@@ -1,9 +1,10 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 use axum::{http::StatusCode, response::IntoResponse};
-use pplx_space_common_core::types::NodeDrainMode;
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_node_model::NodeDrainMode;
 
 use pplx_space_test_env::TestResult;
 
@@ -704,7 +705,7 @@ async fn drain_gate_blocks_via_sandbox_k8s_executions_fallback() -> TestResult {
 /// A fresh ready full snapshot with a storage location, which makes a
 /// `suspended` / `restoring` row portable for restore affinity.
 async fn insert_fresh_ready_snapshot(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
-    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let snapshot_id = pplx_space_snapshot_model::SnapshotId::new();
     sqlx::query(sql!(
         "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp)
          VALUES ($1, $2, 'full', 'ready', NOW())"

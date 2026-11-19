@@ -197,6 +197,7 @@ impl TemplateManagerService {
                             sandbox_id: sbx.sandbox_id.clone(),
                             template_filter: None,
                             blocking: true,
+                            discard_retained_filesystem_reason: None,
                         })
                         .await;
                     deleted_sandbox_ids.push(sbx.sandbox_id);
@@ -254,7 +255,7 @@ impl TemplateManagerService {
 
         for sandbox in &sbx_sandboxes {
             sandbox
-                .observed_lifecycle()
+                .observed_status()
                 .map_err(|error| Status::internal(error.to_string()))?;
         }
 
@@ -266,7 +267,7 @@ impl TemplateManagerService {
                     .filter(|s| s.pool_template.as_deref() == Some(p.template.as_str()))
                     .collect();
                 let current_count =
-                    u32::try_from(pool_sbxs.iter().filter(|s| s.observed_lifecycle().is_ok_and(|state| state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused)).count())
+                    u32::try_from(pool_sbxs.iter().filter(|s| s.observed_status().is_ok_and(|state| state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused))).count())
                         .map_err(|_| {
                             Status::internal(format!(
                                 "pool '{}' has too many paused sandboxes to report",
@@ -277,10 +278,10 @@ impl TemplateManagerService {
                     pool_sbxs
                         .iter()
                         .filter(|s| {
-                            s.observed_lifecycle().is_ok_and(|state| state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Creating)
-                                || s.observed_lifecycle().is_ok_and(|state| state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Created)
-                                || s.observed_lifecycle().is_ok_and(|state| state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Starting)
-                                || s.observed_lifecycle().is_ok_and(|state| state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Pausing)
+                            s.observed_status().is_ok_and(|state| state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Creating))
+                                || s.observed_status().is_ok_and(|state| state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Created))
+                                || s.observed_status().is_ok_and(|state| state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Starting))
+                                || s.observed_status().is_ok_and(|state| state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Pausing))
                         })
                         .count(),
                 )

@@ -9,7 +9,7 @@
 //! work between them.
 
 use super::*;
-use pplx_space_common_core::types::EnvironmentReference;
+use pplx_space_execution_spec::EnvironmentReference;
 
 /// Caller-chosen identity of one upgrade; retries of the same upgrade reuse it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -53,6 +53,16 @@ pub enum RuntimeUpgradePhase {
     Retired,
 }
 
+/// The phases in which a row refuses other activations of its sandbox.
+/// `fencing_runtime_upgrade` and `fenced_runtime_upgrade_publications` bind
+/// these. Other phase lists spell them out; a test holds
+/// [`UNRETIRED_UPGRADE_PHASES_SQL`] to exactly these and `verified`.
+const FENCING_PHASES: [RuntimeUpgradePhase; 3] = [
+    RuntimeUpgradePhase::Fenced,
+    RuntimeUpgradePhase::Preserved,
+    RuntimeUpgradePhase::Booting,
+];
+
 impl RuntimeUpgradePhase {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -66,8 +76,8 @@ impl RuntimeUpgradePhase {
     }
 
     /// Whether a row in this phase refuses other activations of its sandbox.
-    pub const fn fences_activation(self) -> bool {
-        matches!(self, Self::Fenced | Self::Preserved | Self::Booting)
+    pub fn fences_activation(self) -> bool {
+        FENCING_PHASES.contains(&self)
     }
 
     const fn can_advance_to(self, next: Self) -> bool {
@@ -321,23 +331,29 @@ db_private_outside_tests! {
 }
 
 db_private_outside_tests! {
-    /// The upgrade that fences `sandbox_id`'s activations, if any. The phases
-    /// listed are those [`RuntimeUpgradePhase::fences_activation`] names.
+    /// The upgrade that fences `sandbox_id`'s activations, if any: one in a
+    /// phase of [`FENCING_PHASES`].
     fn fencing_runtime_upgrade(
         conn: &Connection,
         sandbox_id: &str,
     ) -> Result<Option<(RuntimeUpgradeOperationId, RuntimeUpgradePhase)>> {
-        let row: Option<(String, String)> = conn
-            .query_row(
+        static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
                 "SELECT operation_id, phase
                    FROM sandbox_runtime_upgrades
-                  WHERE sandbox_id = ?1
-                    AND phase IN ('fenced', 'preserved', 'booting')
+                  WHERE sandbox_id = ?
+                    AND phase IN ({})
                   ORDER BY created_at, operation_id
                   LIMIT 1",
-                params![sandbox_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                crate::db::sql_placeholders(FENCING_PHASES.len())
             )
+        });
+        let params = std::iter::once(sandbox_id)
+            .chain(FENCING_PHASES.map(RuntimeUpgradePhase::as_str));
+        let row: Option<(String, String)> = conn
+            .query_row(QUERY.as_str(), rusqlite::params_from_iter(params), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()?;
         row.map(|(operation_id, phase)| {
             Ok((
@@ -353,6 +369,76 @@ db_private_outside_tests! {
     }
 }
 
+/// The phases of an upgrade that still owns its sandbox, as an SQL list: a
+/// fencing one, or a verified one whose retirement is pending. A suspended
+/// eviction and its candidate scan hold off a sandbox in these too.
+pub(crate) const UNRETIRED_UPGRADE_PHASES_SQL: &str =
+    "('fenced', 'preserved', 'booting', 'verified')";
+
+db_private_outside_tests! {
+    /// The execution each of `sandbox_ids` publishes while a runtime upgrade
+    /// fences it: the one the upgrade restores on a rollback
+    /// ([`RuntimeUpgradeRecord::previous_execution`]). Sandboxes no upgrade
+    /// fences are absent. The boot saves the target as the sandbox's
+    /// consumer before it runs, and a failed boot's cleanup stops the
+    /// sandbox with it still saved, so until the boot is verified the saved
+    /// consumer isn't what the sandbox runs under; the rollback's restore
+    /// commits with the end of the fence.
+    fn fenced_runtime_upgrade_publications(
+        conn: &Connection,
+        sandbox_ids: &[String],
+        budget: &mut pplx_space_rpc_contracts::inventory::InventoryBudget,
+    ) -> std::result::Result<
+        HashMap<String, Result<ExecutionMetadata>>,
+        crate::db::inventory_read::InventoryReadError,
+    > {
+        if sandbox_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // At most one upgrade fences a sandbox. Should that ever not hold,
+        // the earliest wins, as it does in `fencing_runtime_upgrade`.
+        let query = format!(
+            "SELECT sandbox_id, previous_execution_metadata_json
+               FROM sandbox_runtime_upgrades
+              WHERE sandbox_id IN ({})
+                AND phase IN ({})
+              ORDER BY sandbox_id, created_at, operation_id",
+            crate::db::sql_placeholders(sandbox_ids.len()),
+            crate::db::sql_placeholders(FENCING_PHASES.len())
+        );
+        let params = sandbox_ids
+            .iter()
+            .map(String::as_str)
+            .chain(FENCING_PHASES.map(RuntimeUpgradePhase::as_str));
+        let mut statement = conn.prepare(&query)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+        let mut publications = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let sandbox_id: String = row.get(0)?;
+            if publications.contains_key(&sandbox_id) {
+                continue;
+            }
+            // Charged from SQLite's own buffer before it's copied or decoded,
+            // as the State page charges each sandbox row it reads.
+            let previous = row.get_ref(1)?;
+            budget.charge_bytes(crate::db::inventory_read::value_raw_bytes(previous))?;
+            // One that isn't text or doesn't decode is that sandbox's own
+            // failure, which the State page publishes without an execution;
+            // the rest of the page stands.
+            let previous = previous
+                .as_str()
+                .map_err(|error| conversion_error(1, Type::Text, error))
+                .and_then(|previous| {
+                    serde_json::from_str::<ExecutionMetadata>(previous)
+                        .map_err(|error| conversion_error(1, Type::Text, error))
+                })
+                .map_err(crate::db::Error::from);
+            publications.insert(sandbox_id, previous);
+        }
+        Ok(publications)
+    }
+}
+
 db_private_outside_tests! {
     /// The upgrade of `sandbox_id` that hasn't retired the checkpoint it
     /// superseded yet, if any: a fencing one, or a verified one whose
@@ -363,13 +449,56 @@ db_private_outside_tests! {
     ) -> Result<Option<RuntimeUpgradeOperationId>> {
         let row: Option<String> = conn
             .query_row(
-                "SELECT operation_id
-                   FROM sandbox_runtime_upgrades
-                  WHERE sandbox_id = ?1
-                    AND phase IN ('fenced', 'preserved', 'booting', 'verified')
-                  ORDER BY created_at, operation_id
-                  LIMIT 1",
+                &format!(
+                    "SELECT operation_id
+                       FROM sandbox_runtime_upgrades
+                      WHERE sandbox_id = ?1
+                        AND phase IN {UNRETIRED_UPGRADE_PHASES_SQL}
+                      ORDER BY created_at, operation_id
+                      LIMIT 1"
+                ),
                 params![sandbox_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        row.map(|operation_id| {
+            operation_id
+                .parse()
+                .map_err(|error| conversion_error(0, Type::Text, error).into())
+        })
+        .transpose()
+    }
+}
+
+db_private_outside_tests! {
+    /// The upgrade of `sandbox_id` that must leave it `stopped` and hasn't
+    /// stopped its boot yet, if any: a fencing one, whatever the sandbox's
+    /// state, since its boot may be about to start and verify, or a verified
+    /// one whose boot's execution still runs: the sandbox's current execution,
+    /// on a started or paused row, as `boot_activity` in the service reads it.
+    /// A stop keeps the execution's id, so the state decides. Once that
+    /// execution is gone, by a stop or anything else, the upgrade never stops
+    /// a later one, so only this window counts. A suspend that holds the
+    /// artifact lock, which a fence takes, sees every upgrade that could boot
+    /// before its capture.
+    fn stay_stopped_runtime_upgrade_awaiting_its_stop(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<RuntimeUpgradeOperationId>> {
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT upgrade.operation_id
+                   FROM sandbox_runtime_upgrades AS upgrade
+                   JOIN sandboxes AS sandbox ON sandbox.id = upgrade.sandbox_id
+                  WHERE upgrade.sandbox_id = ?1
+                    AND upgrade.target_state = ?2
+                    AND (upgrade.phase IN ('fenced', 'preserved', 'booting')
+                         OR (upgrade.phase = 'verified'
+                             AND sandbox.unowned_state IN ('started', 'paused')
+                             AND upgrade.boot_execution_id = sandbox.node_execution_id))
+                  ORDER BY upgrade.created_at, upgrade.operation_id
+                  LIMIT 1",
+                params![sandbox_id, RuntimeUpgradeTargetState::Stopped.as_str()],
                 |row| row.get(0),
             )
             .optional()?;

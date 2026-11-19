@@ -618,7 +618,7 @@ variable "workers_rollout_cohorts" {
   description = <<-EOT
     Target worker MNGs for blue/green rollouts after workers_cgnat_retired, keyed by MNG name (`workers-N`, N >= 2, not a worker_capacity_groups key). Empty, the default, creates nothing.
 
-    Each entry launches from the shared worker launch template's latest version when it's created, with workers-1's subnets, instance types, capacity type, labels and taints, so a cohort carries a launch template delta only. Changing workers_instance_types, workers_capacity_type or the default worker subnet set (the tier-discovered secondary subnets, or the worker_subnet_pools entry marked default_for_existing_mngs) replaces workers-1 and every cohort. A workers_capacity_type change also replaces every worker_capacity_groups entry, and a subnet change replaces any entry whose resolved subnets change. Bumping the template updates every worker_capacity_groups entry in place. Each entry joins the cluster-controller and rollout-orchestrator worker IAM scope. Create a target at `min_size = 0` and `desired_size = max_size = H`, the headroom, with a `cohort_taint_value` matching `clusterController.drainEvacuationPlacement.cohortValue` (by convention the MNG's index as a string, `"2"` for `workers-2`); the orchestrator resizes it from there. The rollout-mng module ignores live scaling and launch template changes, so later edits to the sizing record intent in tfvars without planning an update. The cleanup after promotion sets `cohort_taint_value = null`, which drops the taint and cohort label from the MNG configuration; nodes registered before that apply keep the taint until it's removed from them directly (`rollout-mng/README.md`).
+    Each entry launches from the shared worker launch template's latest version when it's created, with workers-1's subnets, instance types, capacity type, labels and taints, so a cohort carries a launch template delta only. Changing workers_instance_types, workers_capacity_type or the default worker subnet set (the tier-discovered secondary subnets, or the worker_subnet_pools entry marked default_for_existing_mngs) replaces workers-1 and every cohort. A workers_capacity_type change also replaces every worker_capacity_groups entry, and a subnet change replaces any entry whose resolved subnets change. Bumping the template updates every unpinned worker_capacity_groups entry in place. Each entry joins the cluster-controller and rollout-orchestrator worker IAM scope. Create a target at `min_size = 0` and `desired_size = max_size = H`, the headroom, with a `cohort_taint_value` matching `clusterController.drainEvacuationPlacement.cohortValue` (by convention the MNG's index as a string, `"2"` for `workers-2`); the orchestrator resizes it from there. The rollout-mng module ignores live scaling and launch template changes, so later edits to the sizing record intent in tfvars without planning an update. The cleanup after promotion sets `cohort_taint_value = null`, which drops the taint and cohort label from the MNG configuration; nodes registered before that apply keep the taint until it's removed from them directly (`rollout-mng/README.md`).
 
     `cohort_taint_value` has no default, so each entry states whether it's tainted. Renaming or removing an entry replaces or destroys its MNG. Each entry's ASG gets the worker common tags plus `Name` and `NodeGroup`, keyed by entry name as the capacity groups' are, so adding one is a single apply.
   EOT
@@ -702,12 +702,13 @@ variable "workers_cgnat_retired" {
 }
 
 variable "worker_capacity_groups" {
-  description = "Optional permanent worker MNGs for capacity expansion. Keys reserve entries in the cluster-wide generic workers-N sequence after workers-1; a later rollout must use an index above every allocated capacity or rollout MNG. Every group starts at min=0 and desired=0, uses the normal worker launch template and identity, and has a Terraform-enforced ceiling below 100 nodes. An optional availability_zone narrows a named subnet pool to exactly one subnet in that zone. Splitting MNGs does not bound the scheduler's cross-group feasible set; validate placement before the total matching worker fleet exceeds 100."
+  description = "Optional permanent worker MNGs for capacity expansion. Keys reserve entries in the cluster-wide generic workers-N sequence after workers-1; a later rollout must use an index above every allocated capacity or rollout MNG. Every group starts at min=0 and desired=0, uses the normal worker launch template and identity, and has a Terraform-enforced ceiling below 100 nodes. An optional availability_zone narrows a named subnet pool to exactly one subnet in that zone. Splitting MNGs does not bound the scheduler's cross-group feasible set; validate placement before the total matching worker fleet exceeds 100. An optional launch_template_version pins the group to that version of the shared worker launch template; null, the default, tracks the latest version and is what empty or dormant groups should keep. A pin must not exceed the template's latest version. Pin every populated group to the version it runs so a template change reaches only unpinned groups. Changing a populated group's pin, or a template change on a populated unpinned group, starts an EKS managed node group update of the whole group; the comment at the top of worker_capacity.tf describes its effect and the alternatives."
   type = map(object({
-    instance_types    = list(string)
-    subnet_pool       = optional(string)
-    availability_zone = optional(string)
-    max_size          = optional(number, 99)
+    instance_types          = list(string)
+    subnet_pool             = optional(string)
+    availability_zone       = optional(string)
+    max_size                = optional(number, 99)
+    launch_template_version = optional(string)
   }))
   default = {}
 
@@ -759,6 +760,14 @@ variable "worker_capacity_groups" {
     ])
     error_message = "A worker capacity availability_zone requires a named subnet_pool."
   }
+
+  validation {
+    condition = alltrue([
+      for group in values(var.worker_capacity_groups) :
+      group.launch_template_version == null ? true : can(regex("^[1-9][0-9]*$", group.launch_template_version))
+    ])
+    error_message = "A worker capacity launch_template_version must be null or a launch template version number such as \"3\"."
+  }
 }
 
 variable "builders_instance_types" {
@@ -800,6 +809,18 @@ variable "builders_capacity_reservation_preference" {
   validation {
     condition     = var.builders_capacity_reservation_preference == null ? true : contains(["capacity-reservations-only", "none", "open"], var.builders_capacity_reservation_preference)
     error_message = "builders_capacity_reservation_preference must be null, capacity-reservations-only, none, or open."
+  }
+}
+
+variable "builders_launch_template_version" {
+  description = "Optional version of the builders launch template the builders node group runs. Null, the default, tracks the latest version, so any change to the builders template or bootstrap replaces the builder nodes on the next apply. A version number, at most the template's latest, holds the group there: a template change then only publishes a new version, and moving the pin replaces the builders as an EKS managed node group update (see the comment at the top of worker_capacity.tf). What a replacement needs depends on the builders' update strategy: DEFAULT launches it before terminating the node it replaces, so it needs a spare instance of the builder type in the same availability zone; MINIMAL terminates first, leaving the group a node short until the replacement joins."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.builders_launch_template_version == null ? true : can(regex("^[1-9][0-9]*$", var.builders_launch_template_version))
+    error_message = "builders_launch_template_version must be null or a launch template version number."
   }
 }
 

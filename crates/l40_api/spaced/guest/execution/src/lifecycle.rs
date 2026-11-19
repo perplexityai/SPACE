@@ -9,6 +9,7 @@ use tonic::Status;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Running,
+    Maintenance(uuid::Uuid),
     Closing,
 }
 
@@ -52,9 +53,7 @@ impl Lifecycle {
             .phase
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *phase == Phase::Running {
-            *phase = Phase::Closing;
-        }
+        *phase = Phase::Closing;
         self.0.operations.close();
         self.0.closed.cancel();
     }
@@ -71,6 +70,69 @@ impl Lifecycle {
     pub(crate) async fn wait(&self) {
         self.0.operations.wait().await;
     }
+
+    pub(crate) fn hold(&self, owner: uuid::Uuid) -> Result<MaintenanceHold, Status> {
+        let mut phase = self
+            .0
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owner.is_nil() || *phase != Phase::Running || self.0.cancelled.is_cancelled() {
+            return Err(crate::refused(Status::unavailable(
+                "execution admission is already held",
+            )));
+        }
+        *phase = Phase::Maintenance(owner);
+        Ok(MaintenanceHold {
+            lifecycle: self.clone(),
+            owner,
+        })
+    }
+
+    pub(crate) fn admitted_count(&self) -> usize {
+        self.0.operations.len()
+    }
+
+    pub(crate) fn admit_maintenance(
+        &self,
+        hold: &MaintenanceHold,
+    ) -> Result<TaskTrackerToken, Status> {
+        let phase = self
+            .0
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !Arc::ptr_eq(&self.0, &hold.lifecycle.0)
+            || *phase != Phase::Maintenance(hold.owner)
+            || self.0.cancelled.is_cancelled()
+        {
+            return Err(crate::refused(Status::unavailable(
+                "maintenance ownership changed",
+            )));
+        }
+        Ok(self.0.operations.token())
+    }
+}
+
+/// Reversible maintenance admission. Closing the service permanently supersedes
+/// this owner; dropping a stale hold cannot reopen a closing service.
+pub struct MaintenanceHold {
+    lifecycle: Lifecycle,
+    owner: uuid::Uuid,
+}
+
+impl Drop for MaintenanceHold {
+    fn drop(&mut self) {
+        let mut phase = self
+            .lifecycle
+            .0
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *phase == Phase::Maintenance(self.owner) {
+            *phase = Phase::Running;
+        }
+    }
 }
 
 /// The wait expired; cancellation was requested but owned work has not settled.
@@ -78,3 +140,6 @@ impl Lifecycle {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("execution cleanup is incomplete; keep the runtime alive and drain again")]
 pub struct IncompleteExecutionDrain;
+
+#[cfg(test)]
+mod tests;

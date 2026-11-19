@@ -93,7 +93,7 @@ async fn drain_deadline_retains_mutex_until_owned_child_exits() {
     });
     tracker.close();
     let drain = tokio::spawn(async move {
-        drain_before_handoff(tracker.wait(), Duration::ZERO).await;
+        drain_before_handoff(tracker.wait(), Duration::ZERO, || {}).await;
         drop(mutex);
     });
     let mut drain = Box::pin(drain);
@@ -162,4 +162,21 @@ fn service_port_ingress_isolation_explicit_values_override_auto() {
         ServicePortIngressIsolation::ExclusiveHost
     );
     resolve_service_port_ingress_isolation(Some("k8s"), true).unwrap_err();
+}
+
+// A drain that outlasts its budget asks the remaining work to stop, and then
+// keeps waiting for it rather than giving up ownership.
+#[tokio::test(start_paused = true)]
+async fn an_exhausted_drain_budget_asks_the_remaining_work_to_stop() {
+    let stop = tokio_util::sync::CancellationToken::new();
+    let work = {
+        let stop = stop.clone();
+        async move { stop.cancelled().await }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        drain_before_handoff(work, Duration::from_secs(25), || stop.cancel()),
+    )
+    .await
+    .expect("the drain ends once its budget asks the work to stop");
 }

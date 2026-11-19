@@ -269,9 +269,8 @@ async fn admit_inline_round(
     let mut recorded = Vec::new();
     let mut claimed = 0;
     for sandbox in sandboxes {
-        let key = pplx_space_common_core::types::IdempotencyKey::parse(format!(
-            "inline-{round}-{sandbox}"
-        ))?;
+        let key =
+            pplx_space_guest_process::IdempotencyKey::parse(format!("inline-{round}-{sandbox}"))?;
         let fingerprint = pplx_space_public_api::RequestFingerprint::parse("a".repeat(64))?;
         let idempotency = CreatePublicOperationIdempotency {
             method: HttpOperationMethod::Post,

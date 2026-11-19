@@ -6,8 +6,7 @@
 //!
 //! These are generic validated value types over the `bytesize` crate with
 //! nothing SPACE-specific in them, so they live in their own crate rather than
-//! in the domain model. `pplx-space-common-core` re-exports these types as
-//! `types::size`.
+//! in the domain model: import them from here.
 //!
 //! # Examples
 //!

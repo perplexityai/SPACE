@@ -151,6 +151,8 @@ pub(crate) fn process_event_frames(event: ProcessEvent, output_seq: &mut u64) ->
                 process_id: event.process_id,
                 exit_code: exit.shell_exit_code(),
                 status: process_exit_status(&exit),
+                // The stream that forwards it knows whether it skipped output.
+                output_truncated: false,
             }],
             output_bytes: 0,
         },

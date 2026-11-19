@@ -3,10 +3,14 @@
 //! It owns `node_dirty_ref_revision`, the node-wide counter whose value
 //! template-manager's `node_dirty_refs` triggers stamp onto each enqueued row,
 //! so that acknowledging a sent reference deletes only the obligation that was
-//! sent. template-manager's other tables have no owning store yet.
+//! sent. The store owns template-manager's other tables too, but
+//! template-manager's server still writes most of them directly until that
+//! code moves behind the store.
 //!
-//! The crate has no statements yet. Its first ones arrive with their first
-//! caller, the outbox's revision-guarded acknowledgement, in the same change as
-//! the migration that creates the counter.
+//! [`node_dirty_refs`] holds the statements that read and acknowledge those
+//! revisions. Each function takes a `rusqlite::Connection`, so a caller can
+//! pass its own open transaction, and returns rusqlite's error unchanged.
 
 #![forbid(unsafe_code)]
+
+pub mod node_dirty_refs;

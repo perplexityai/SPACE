@@ -3,21 +3,411 @@
 [Documentation](../README.md)
 
 `spaced-svc` is the daemon inside the guest; `spaced` is its companion CLI.
-Updating the host or publishing a new template does not replace these binaries
-in an existing sandbox. Upgrade the pair from the same verified guest release.
+An existing sandbox keeps its own guest binaries until maintenance selects a
+replacement. A capable host can install its verified bundle under the automatic
+policy below, or an operator can request maintenance explicitly. Always replace
+the daemon and CLI together from the same verified guest release.
 
 ## Three upgrade modes
 
 | Mode | Status | Behavior |
 |---|---|---|
 | **1. Wake and upgrade** | Supported today as a manual operator procedure | Activate the sandbox through its normal lifecycle, replace and restart spaced, then persist the updated sandbox through normal snapshot publication. This is disruptive and counts as sandbox use. |
-| **2. Upgrade opportunistically when the sandbox is running** | Planned; not implemented | Wait for a customer-initiated running period and a safe opportunity to upgrade, without waking a dormant sandbox solely for maintenance. Requires coordination with active workloads, retries, version tracking and persistence. |
-| **3. Upgrade outside the customer-invoked lifecycle** | Planned; not implemented | Perform maintenance without advancing customer lifecycle/activity accounting or running customer workloads. Requires an isolated maintenance mechanism and coherent snapshot publication. |
+| **2. Upgrade a running sandbox through its manager** | Node-local automatic selection and operator commands | Stage an authorized bundle and restart only when idle, or with explicit force. Requires a 0.8.2-or-newer two-slot guest; never wakes dormant sandboxes. |
+| **3. Maintain a dormant sandbox offline** | Planned; not implemented | Perform maintenance without advancing customer lifecycle/activity accounting or running customer workloads. Requires an isolated maintenance mechanism and coherent snapshot publication. |
 
-Only mode 1 is currently supported. Manually upgrading a sandbox that happens
-to be running is still this disruptive procedure; it is not an implementation
-of the coordinated opportunistic mode. There is no automatic updater or
-maintenance API providing modes 2 or 3.
+Node-local automatic guest updates are enabled by default for updater-capable
+guests on 0.8.2 or newer with an installed target catalog. Older guests remain
+usable but are outside manager-owned maintenance. The manual procedure supports
+only legacy Linux layouts with regular spaced binary files. Older Windows or
+two-slot guests require recreation from a current template or separately
+qualified repair.
+Offline maintenance remains unimplemented; dormant sandboxes are never woken.
+
+## Automatic node-local guest updates
+
+Sandbox-manager considers running customer sandboxes once per minute. New
+executions, resume/restore and manager restart rebuild a 30–120 second grace
+hint and a concurrent 120-second quiet window that customer activity extends. Discovery is
+off the activation response path; it does not touch activity or lifecycle clocks.
+Pool members, builders and unsupported guests are excluded. The trusted image
+profile must name LinuxV1 or WindowsV1, and guest status must report a matching
+recovery contract and committed version at least 0.8.2. An installed catalog
+entry must select `upgrade`, cap the guest at the installed target, and stay in
+the guest's compatibility family. The target
+version and guest-relevant marker must both be newer than the committed guest.
+
+Only one transfer/activation runs per node, shared with manual requests and
+recovery. The node's existing cache-disk status must be `READY`; this is not a
+CPU or memory pressure detector. Guest free-space and inode checks still apply.
+Each pass probes at most eight due guests, with a five-second end-to-end budget
+per probe. Busy guests, retained process obligations, lifecycle headroom, missing
+observations and disk pressure defer for 15 minutes plus 0–60 seconds of jitter.
+A known quiet-period expiry is reconsidered after that expiry (at least one
+pass later). Unsupported guests and unchanged or missing targets wait for
+execution, template or installed authority changes. `guest-update status --json`
+reports an ephemeral `automatic_deferral` hint when no operation is active,
+separate from durable operation `outcome`. Hints reflect the last discovery pass
+and use bare reasons: `activation_grace`, `customer_activity`, `guest_busy`,
+`lifecycle_window`, `cache_disk_not_ready`, `observation_unavailable`,
+`no_platform_target`, `unsupported_guest`, `target_not_required`, `target_cutoff`
+and `operation_active`.
+
+Terminal `candidate_failed`, `retry_exhausted` or `recovery_required` outcomes from three distinct
+sandboxes stop new automatic admissions for that target digest on this node.
+Repeated failures across operations or executions of one sandbox count once. Busy deferrals,
+customer lifecycle cancellation and successful rollback awaiting its authorized
+retry do not count. The cutoff is in memory: deleting a sandbox does not reset
+it, but restarting the manager does. Per-execution retry/quarantine history stays
+durable. Investigate before resetting by restart; a different bundle digest has
+its own cutoff. The cutoff retains at most 256 failed targets. If recording another distinct
+failed target would exceed that capacity, automatic admissions stop until
+manager restart instead of forgetting retained failures. No fleet or cluster rollout controller is required.
+
+Set `SPACE_GUEST_AUTO_UPDATE=0` in the sandbox-manager environment and restart
+it to disable new automatic admissions. The typed startup setting also accepts
+`false`/`off` and `true`/`on`/`1`; invalid values fail startup. The equivalent CLI
+disabling option is `--automatic-guest-updates false`. An explicit CLI value
+wins over the environment: remove `--automatic-guest-updates true` or change it
+to `false` when disabling admissions, including for the downgrade drain below.
+Manual commands and unfinished receipt
+recovery continue. Before an incompatible host downgrade: disable automation,
+restart the manager, wait for operations to settle, then deploy the older host
+services. This drain requires two service restarts. Verify that the target manager
+includes the applied migration catalog and preserve receipt/policy history.
+Do not drop those tables merely to make an older manager start. A guest-marker bump affects
+every eligible idle sandbox on each enabled node; release review must verify
+that the change warrants restarting existing guests.
+
+Pause/suspend/capture cancel staging and settle an armed trial; stop/delete
+revoke its authority. Automatic work rechecks quiet time before arming. In-process
+receipt recovery preserves manual versus automatic admission semantics. After a
+manager restart, origin is unknown and pending recovery conservatively checks
+quiet time; explicit new manual requests keep their existing idle semantics.
+Customer requests arriving during an operation hold wait at the host boundary,
+within their deadline and the fixed maintenance bound, rather than being
+replayed. A caller with a shorter deadline may still receive a before-start
+refusal. Long-lived work or short suspend deadlines can leave no update window.
+
+## Manager-owned guest update and restart
+
+Deploy capable host services **and the OCI build engine on every builder**
+before publishing an updater-capable template. An older OCI engine cannot
+preserve the slot layout required by the new seed's systemd drop-in; using it
+with that seed produces an unbootable agent.
+The seed builder recognizes `artifact.json` beside its `spaced-svc` and `spaced`
+inputs and installs two slots, the committed selector, and systemd hooks. OCI
+assembly preserves that layout and installs a complete verified binary pair.
+Without that descriptor, a seed stays on the legacy layout. Do not convert a
+running legacy guest by copying symlinks or unit fragments into it.
+
+For local Kind development, commit the candidate before building an
+updater-capable seed. Dirty image provenance contains a `-dirty-` suffix and
+intentionally produces the legacy layout; it cannot identify a release bundle.
+A clean commit is necessary but not sufficient: supply the verified descriptor
+and build the guest on the 0.8.2-or-newer maintenance baseline. Worker
+image builds also require `SPACE_BUILD_TIME` from the source commit timestamp;
+Kind and bundle CI supply it automatically. Do not use rebuild wall time.
+
+Before publishing a guest release, check the installed selector ABI against
+both the old and new binaries. Additive diagnostic journal fields may remain
+on schema 1; a new phase, changed decision semantics, changed hashing, or an
+incompatible selector CLI requires a new seed contract and explicit host
+qualification. Unknown phases are not additive diagnostics: the old selector
+falls back to its committed link. Test interrupted commit/link repair with
+the previous committed selector, not only the new binary.
+
+Linux uses systemd's pre-start selector and startup timeout. The experimental
+Cloud Hypervisor + Windows backend uses SCM plus bounded Task Scheduler
+recovery in the existing agent binary; see the [Windows recovery contract](../templates/cloud-hypervisor/windows/README.md#guest-update-recovery).
+VMM choice does not change maintenance ownership. The shared RPCs describe
+logical payloads, slots and execution/boot fences; SQLite receipts remain
+host-owned. No SQL or protobuf replacement is required for Windows.
+Unknown installed contracts are unsupported. Host artifact selection matches
+the installed recovery ABI and architecture; it never tries the Linux installer
+on another OS. The catalog selects independent target bundles by recovery contract and
+architecture, so one node can authorize Linux and Windows simultaneously.
+Changing one entry does not withdraw another entry's authority.
+
+A release bundle carries the ordinary workspace version, source revision,
+diagnostic build time, binary hashes and `guest_update_required_since`. Normal
+selection requires both its version and that marker to exceed the installed
+guest version. For example, target 0.8.145 with marker 0.8.143 leaves a guest at
+0.8.143 running but updates a guest at 0.8.140 to 0.8.145. Equal-version bytes
+with a different digest are rejected. A build date is never an ordering key.
+See [versioning](versioning.md) for immutable release allocation prerequisites.
+
+Node installation distributes verified artifacts into the root-owned directory
+`/opt/space/guest-update/<artifact-digest>/` and installs root-owned
+`/etc/space/guest-update/policy.json`. All parent directories and files must be
+non-writable by group/other; the manager rejects symlinks. Use the installer as
+part of a direct service deployment (or `--root` for an offline image):
+
+```sh
+sudo python3 scripts/build/install-agent-bundle.py /path/to/verified-bundle
+```
+
+Repeat for another platform's bundle; the installer preserves other entries.
+For container deployments, bake **all** supported platform bundles and the
+complete catalog into the worker image with `--root`. The stock worker image
+contains Linux only. A host-side installation is not mounted into the container,
+and edits inside a running container do not survive replacement. Publish a
+custom worker image containing Windows too for mixed-platform container nodes;
+do not use ad-hoc installs into a running pod as deployment configuration.
+It verifies both payload identities, publishes the bundle before atomically
+replacing policy, and retains authorization when reinstalling the same selection.
+Identical offline image rebuilds retain authority; explicit reauthorization
+rules are described below.
+The guest ceiling defaults to that exact target version and the host floor to
+the bundle's workspace version; `--minimum-host` requires compatibility review.
+Same-version replacement with different bytes is refused. The policy is keyed
+by installed recovery contract and architecture:
+
+```json
+{
+  "targets": {
+    "linux-systemd-selector-v1": {
+      "x86_64": {
+        "authorization": "019b0000-0000-7000-8000-000000000001",
+        "promotion": {
+          "channel": "stable",
+          "target": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "target_version": "0.8.145",
+          "guest_update_required_since": "0.8.143",
+          "intent": "upgrade",
+          "minimum_host": "0.8.143",
+          "maximum_guest": "0.8.145"
+        }
+      }
+    }
+  }
+}
+```
+
+These are illustrative identities, not installable values. The catalog selects
+host-authorized bundles by recovery contract and architecture; it has no template
+digest allowlist or publisher attestation. The manager checks guest status against
+the trusted image profile and the 0.8.2 maintenance floor at admission and before
+Arm. Local catalog authority is rechecked at Arm and Commit.
+
+Eligibility deliberately relies on guest-reported recovery capability. Build
+images using the current builder and preserve the installed slot layout, systemd
+units or Windows recovery tasks. A version number alone does not verify those
+files. Modified recovery units/tasks may require manual repair; the manager's
+operation deadline is not a substitute for working supervision. The cutoff is a
+node-local reliability control keyed by sandbox, with no per-tenant isolation.
+
+The 0.8.2 floor enables maintenance **from** this baseline onward. It does not
+migrate older guests to 0.8.2. Before recreating, verify that the replacement
+template contains a committed guest version of at least 0.8.2; a newly built
+template alone does not establish that baseline. The
+separate manual procedure applies only to legacy Linux regular-file layouts,
+not Windows or two-slot guests. No runtime-proof token or new wire/storage field is
+introduced.
+
+The ceiling must cover permitted placement/rollback hosts and does not bypass
+protocol or platform compatibility. Windows bundles occupy their own
+`windows-scm-two-slot-v1` entry, installed using the same command for direct
+services or baked into the complete worker image for container deployments.
+
+The CLI selects the appropriate entry using guest status; the manager
+independently checks trusted image identity. Install the manager, CLI and catalog
+as one node release. Replacing one platform entry never withdraws
+another platform's receipt authority. Drain unfinished operations before changing
+a target's authority. Malformed policy files are rejected before installation;
+after draining guest updates, remove the invalid file and reinstall each platform
+target to recreate the catalog. The installer does not translate other formats.
+
+For installer reauthorization, default authority is derived from promotion
+identity. Returning A → B → A or removing and reinstalling A reuses the original
+authority and consumed budget. After investigation, pass
+`--authorization <fresh-uuidv7>` to permit another bounded attempt, and retain
+that value in deployment inputs. Identical reinstalls preserve it. Do not use
+reauthorization as an automatic retry loop. Container deployments must bake the
+complete catalog into their worker image; direct-service installs may merge entries.
+
+The host socket retains its root-or-sandbox-manager UDS trust boundary. Root
+is a trusted node administrator and can invoke its maintenance primitives;
+this is not a security boundary against root. Operational tooling must use the
+manager commands below to obtain durable authorization and lifecycle fencing.
+
+Run on the sandbox's current worker, as an authorized local operator:
+
+```sh
+space-sbxmgr guest-update status <sandbox-id> --json
+space-sbxmgr guest-update apply <sandbox-id> --json
+space-sbxmgr guest-update status <sandbox-id> --operation <operation-id> --json
+```
+
+Both mutation commands generate a UUIDv7 operation ID and discover the current
+execution automatically. Neither ID flag is required. Before submission the CLI
+prints the selected retry flags to stderr, leaving JSON on stdout unchanged.
+Apply/restart return an operation receipt immediately. Poll that same operation;
+reuse `--operation` and `--expected-execution` on `apply` or `guest-restart`
+using the printed IDs after an ambiguous response. Automation may supply both
+flags upfront when it needs to persist its own request identity. `status` accepts
+`--operation`, but not
+`--expected-execution` or `--force`. `apply --policy` defaults to
+`/etc/space/guest-update/policy.json`; it must match the worker's configured
+authority, rather than granting new authority from the CLI.
+A normal request defers without interrupting active work, process attachments,
+retained results/retry records, filesystem watches, descendants or forwarding.
+Process records can remain relevant for 15 minutes after exit. Long-lived
+background services and short idle-to-suspend policies can prevent any eligible
+window. Maintenance does not extend lifecycle deadlines or activity clocks.
+
+`guest-update apply --force` and `guest-restart --force` permit terminating API
+workloads and their descendants. They retain compatibility, storage and
+execution checks, and do not kill independent SSH/template services. Force is
+not rollback authorization and does not provide an independent kill channel
+when the guest bridge is already hung. Systemd supervises crashes; no watchdog
+is enabled. Never automatically replay interrupted customer commands.
+
+For a separate restart that intentionally terminates active API workloads, run:
+
+```sh
+space-sbxmgr guest-restart <sandbox-id> --force --json
+```
+
+A rollback requires a fresh operator authorization selecting an older immutable
+release with `intent: "rollback"`. Forward release history survives rollback;
+reusing a lower version or an operation UUID does not erase it. Retry allowance
+is at most two activations per execution and authorization. A normal candidate
+that passed its self-test but failed to commit gets one retry after at least
+five minutes plus jitter. If the retry again rolls back after its self-test
+without committing, the receipt ends with `retry_exhausted`. Reaching the
+host-wait phase does not prove host fault. Earlier
+candidate failure quarantines the selection. Forced maintenance never retries
+interruption automatically. A new authorization permits another bounded
+attempt after the operator has investigated the outcome. Lifecycle cancellation
+before activation adds no new backoff; cancellation after activation retains
+the five-minute delay plus jitter to prevent restart churn. Existing backoff
+is never shortened by cancellation.
+A busy refusal does not consume an activation if the guest durably aborts the
+staged attempt and confirms the original daemon is still running its committed
+bundle. The refund and receipt settlement are atomic; repeated settlement cannot
+refund twice. A timeout, missing evidence, or changed guest generation does not
+justify a refund.
+Previously used authorizations cannot be reintroduced to replenish that
+allowance. The worker activates at most one guest at a time; other accepted
+receipts remain queued. Automatic selection has a node-local cutoff; see
+[Automatic node-local guest updates](#automatic-node-local-guest-updates).
+
+
+Timeout changes persist while maintenance runs. Stop/delete revokes maintenance
+authority. Explicit pause, suspend and memory-capture requests preempt optional
+maintenance. A scheduled lifecycle event within the activation budget plus its
+30-second margin, or expiration of the operation deadline, also defers arming
+or aborts a running trial. During activation, the lifecycle cutoff uses the
+fixed activation finish time plus the margin, rather than a sliding window.
+Inventory reads and other ordinary artifact-lock waiters do not preempt maintenance.
+A queued lifecycle capture cancels a transfer before activation;
+partial bytes never authorize a restart. Once armed, pause, suspend and
+checkpoint must wait for a settled, configured guest before capturing memory.
+Settlement retains the conservative 210-second activation budget; an
+unreachable guest can cause the capture request to fail. There is no promise
+of immediate pause or suspend while a trial is already running. A broken guest
+that cannot flush or settle still
+requires normal stop/delete or operator recovery, rather than an unsafe
+snapshot. Capture quiesces only the metadata subscription. The manager owns
+lifecycle routing; actual guest-update/reconfiguration holds own customer
+admission. A failed capture therefore cannot leave a metadata pause blocking
+customer traffic, including on legacy, pool and builder guests without a
+configuration observer. A paused execution with a pending receipt from older
+host code must be explicitly resumed to settle it before another capture;
+maintenance never wakes it implicitly. Successful checkpoints restart metadata
+observation after VM resume. Capture requires fresh maintenance status; an I/O
+or transport failure prevents capture because cached stability cannot exclude a
+new trial. This read does not create a configuration hold for pool or builder guests.
+Forwarded connections refused during maintenance are reset and logged at debug
+level; they are not queued across a guest replacement.
+
+During an operation-owned guest update, new command, file and forwarding
+requests wait at spaced-host until the configured terminal generation is ready.
+Authentication and existing request limits run before this wait; maintenance and
+configuration RPCs have separate capacity. Waiting does not decode stream bodies
+or count as guest work. Cancellation or deadline expiry removes the waiter without
+executing it later. The wait uses the caller's remaining deadline and a fixed
+210-second cap from the first Hold; repeated Hold calls do not extend it. Shorter
+client deadlines can still fail before dispatch. Ordinary configuration-only
+holds retain their existing refusal behavior.
+
+The trial self-test spawns the real filesystem worker, resolves/validates its
+account, checks its protocol handshake and stats `/` through it. It does not
+exercise the customer process API; qualify command execution separately in
+the deployment canary before selecting the release broadly.
+
+The guest keeps exactly two bundle slots. Partial transfer uses the inactive
+slot, with capacity checks and no extra archive. Reuse refuses while an old
+binary remains mapped or open. Systemd invokes the short selector from the
+committed slot; an unready candidate times out and the next start selects the
+fallback. A durable commit record, not readiness notification, commits the
+release. The host reapplies process environment and forwarding before releasing
+its hold. Recovery reconciles the persisted manager receipt with fresh guest
+status. Guest fsync orders journal changes but does not guarantee survival of
+a host failure before host writeback; do not infer the guest commit from the
+manager receipt alone after that failure.
+Host-only and manager-only restarts adopt a surviving guest without closing
+customer admission. A changed guest incarnation triggers reconfiguration;
+transport disconnection alone does not. Simultaneous host/guest loss has no
+surviving host observation, so ordinary crash configuration retains the existing
+best-effort guarantee outside an explicit guest-update hold.
+
+In protocol v1, equal operation/execution IDs are reserved for background
+configuration ownership. Shared owner parsing and constructors enforce this
+convention; manager operation RPCs reject that reserved combination before
+probing or recording intent. Root remains a trusted node administrator.
+
+Confirmation failures include the operation ID and status in warning logs.
+Terminal rejections stop repeated confirmation; the next durable guest status
+still decides whether commit happened. Receipts retain bounded typed outcomes,
+not arbitrary remote error text; correlate the operation ID with host logs for
+the detailed cause. A lost reply or deadline is never proof that commit failed;
+a viable trial retries confirmation after reading fresh status.
+
+An unchanged committed start needs no writable metadata. Recovery transitions
+still need to persist journal/link changes; a disk that becomes full or read-only
+during a transition can prevent startup and requires operator repair. Slot reuse
+keeps inode-based checks for mapped/open binaries, including hardlinks. Unreadable
+process metadata or traversal limits defer staging; special-filesystem fd metadata
+can delay the scan.
+
+A missing or malformed journal enters `RecoveryRequired` after verifying the
+committed bytes. Serving can resume, but guest maintenance remains disabled:
+the lost receipt might contain a consumed attempt, so treating it as `Stable`
+would erase replay protection. Preserve both slots and the available metadata
+for diagnosis. The selector replaces a malformed `update-state` with its recovery
+record; the original bytes are no longer available afterward. If corruption is
+detected before restart, preserve that journal before the selector runs.
+Before retiring the execution, recover unbacked-up customer data
+or verify a current backup. Delete discards the disk, and stop can proceed after
+a failed or timed-out flush; neither is a data-recovery step. Use the qualified
+SSH/VM recovery path if ordinary guest access is unavailable. Once data is safe,
+retire the execution through normal stop/delete and provision from a qualified
+template; do not reset the journal on a live execution or reuse its authorization.
+See [guest I/O lifecycle boundaries](space/design/guest-io.md#lifecycle-boundaries)
+for the persistence guarantees.
+
+The selector-v1 trial window is 30 seconds from selection, capped by the
+attempt's overall expiry. The manager's 420-second operation and 210-second
+activation/reconciliation budgets include staging, shutdown and fallback; they
+are not extra candidate confirmation time. The seed unit's startup timeout
+must cover the trial and selector overhead; qualify changes together with the
+selector contract. An absent host cannot extend the candidate's startup.
+
+Drain unfinished maintenance before rolling host services back, and verify
+that the destination manager accepts the database's applied migration catalog.
+Draining does not make a pre-protocol manager able to reopen the migrated
+SQLite database. An image-only rollback to an incompatible catalog is
+unsupported. The guest-update down migration drops receipt and policy history;
+it is not a state-preserving rollback procedure. Preserve verified backups and
+use a reviewed recovery plan that retains the required state, following the
+[database rollback guidance](../db/README.md).
+
+If the committed selector itself is broken, preserve both slots
+and use the qualified independent SSH or VM-level recovery path. The two-slot
+bound is a guest-visible payload bound; deleting a template-shared file does
+not reclaim the template's host CoW extents.
 
 ### Effects of wake and upgrade
 
@@ -56,7 +446,9 @@ sequence of today's operator commands.
 
 ## Execute mode 1: wake and upgrade
 
-This procedure covers a Linux/systemd guest with the standard executable paths.
+This legacy procedure covers a Linux/systemd guest with regular files at the
+standard executable paths. It intentionally rejects the two-slot symlinks; use
+the manager-owned operations above for those guests.
 Use normal SPACE lifecycle and backup operations so full snapshots, encryption,
 and incremental storage remain the responsibility of their existing owners.
 Do not edit snapshot metadata, catalog rows or S3 objects manually.
@@ -387,6 +779,6 @@ for intervening writes.
 
 - [Execution-generation allocation](../crates/l40_api/api/src/controllers/substrate/kubernetes/store/execution_rows.rs).
 - [Activity clocks and lifecycle timers](../crates/l30_storage/sbx/mgr/store/src/auto_lifecycle.rs).
-- [Guest workload ownership on daemon restart](../crates/l40_api/spaced/guest/server/src/cgroup.rs) and [seed units](../templates/firecracker/seed/rootfs-builder.sh).
+- [Guest workload ownership on daemon restart](../crates/l40_api/spaced/guest/server/src/platform/unix/cgroup.rs) and [seed units](../templates/firecracker/seed/rootfs-builder.sh).
 - [Snapshot capture and publication](../crates/l40_api/sbx/mgr/server/src/service/suspend_snapshot_publication.rs).
 - [Snapshot metadata](../crates/l40_api/sbx/mgr/server/src/snapshot_upload.rs) and [write-once digests](../crates/l30_storage/snapshot/store/src/lib.rs).

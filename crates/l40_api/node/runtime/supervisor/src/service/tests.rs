@@ -25,7 +25,7 @@ async fn retirement_failure_does_not_skip_locked_runtime_cleanup() {
                 ..Default::default()
             };
             let sandbox_id = SandboxId::new();
-            let execution_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+            let execution_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
             service
                 .execution_store
                 .write(sandbox_id, execution_id)
@@ -36,9 +36,8 @@ async fn retirement_failure_does_not_skip_locked_runtime_cleanup() {
                 .stop_sandbox_runtime_with(
                     StopSandboxRuntimeRequest {
                         sandbox_id: sandbox_id.to_string(),
-                        execution_id:
-                            pplx_space_common_core::types::SandboxActivationAttemptId::new()
-                                .to_string(),
+                        execution_id: pplx_space_sandbox_model::SandboxActivationAttemptId::new()
+                            .to_string(),
                         ..Default::default()
                     },
                     None,
@@ -135,7 +134,7 @@ async fn retirement_failure_does_not_skip_locked_runtime_cleanup() {
 
 #[tokio::test]
 async fn execution_checks_survive_supervisor_restart_and_reject_superseded_work() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let temp = tempfile::tempdir().unwrap();
     let store = crate::execution_store::ExecutionStore::at(temp.path().join("executions"));
     let sandbox = SandboxId::new();
@@ -177,8 +176,8 @@ async fn execution_checks_survive_supervisor_restart_and_reject_superseded_work(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn execution_binding_cannot_resurrect_work_from_an_exited_daemon() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
     use pplx_space_node_runtime_core::proto::{BindExecutionRequest, RetireExecutionRequest};
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let temp = tempfile::tempdir().unwrap();
     let service = RuntimeSupervisorService {
         execution_store: crate::execution_store::ExecutionStore::at(temp.path().join("executions")),
@@ -602,7 +601,7 @@ async fn cpu_updates_require_execution_launch_evidence() {
         ..Default::default()
     };
     let sandbox = SandboxId::new();
-    let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let execution = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     service.execution_store.write(sandbox, execution).unwrap();
     let request = |cpu| UpdateCgroupRequest {
         sandbox_id: sandbox.to_string(),
@@ -629,7 +628,7 @@ async fn cpu_updates_require_execution_launch_evidence() {
             .code(),
         tonic::Code::NotFound
     );
-    let count = |value| pplx_space_common_core::types::VcpuCount::try_from_u32(value).unwrap();
+    let count = |value| pplx_space_execution_spec::VcpuCount::try_from_u32(value).unwrap();
     service
         .execution_store
         .record_cpu_budget(sandbox, execution, count(4))
@@ -657,8 +656,7 @@ async fn cpu_updates_require_execution_launch_evidence() {
         );
     }
     let mut stale = request(Some(1));
-    stale.execution_id =
-        pplx_space_common_core::types::SandboxActivationAttemptId::new().to_string();
+    stale.execution_id = pplx_space_sandbox_model::SandboxActivationAttemptId::new().to_string();
     assert_eq!(
         service
             .update_cgroup_owned(stale, None)
@@ -694,10 +692,12 @@ async fn cpu_updates_require_execution_launch_evidence() {
 
 #[tokio::test]
 async fn authentication_failure_preserves_status_and_existing_cpu_budget() {
-    use pplx_space_common_core::types::{Arch, SandboxActivationAttemptId, VcpuCount};
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::VcpuCount;
     use pplx_space_node_runtime_core::{
         artifact_store::managed_release_directory, catalog::CompiledEnvironment,
     };
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     let temp = tempfile::tempdir().unwrap();
     let service = RuntimeSupervisorService {
         execution_store: crate::execution_store::ExecutionStore::at(temp.path().join("executions")),
@@ -757,7 +757,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
         ..Default::default()
     };
     let sandbox = SandboxId::new();
-    let execution = pplx_space_common_core::types::SandboxActivationAttemptId::new();
+    let execution = pplx_space_sandbox_model::SandboxActivationAttemptId::new();
     service.execution_store.write(sandbox, execution).unwrap();
     enum Invalid {
         IdentityMismatch,
@@ -792,7 +792,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
             }),
             ..Default::default()
         };
-        request.set_runtime(pplx_space_common_core::types::RuntimeKind::Firecracker.into());
+        request.set_runtime(pplx_space_execution_spec::RuntimeKind::Firecracker.into());
         let input = request.verified_runtime.as_mut().unwrap();
         let expected = match invalid {
             Invalid::IdentityMismatch => {
@@ -816,7 +816,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
             Invalid::Layout => {
                 input.environment_reference =
                     pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                        pplx_space_common_core::types::Arch::X86_64,
+                        pplx_space_cpu_arch::Arch::X86_64,
                     )
                     .unwrap()[0]
                         .definition()
@@ -854,7 +854,7 @@ async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_executi
 
 #[tokio::test]
 async fn resident_execution_adoption_does_not_require_current_catalog_or_sources() {
-    use pplx_space_common_core::types::SandboxActivationAttemptId;
+    use pplx_space_sandbox_model::SandboxActivationAttemptId;
     for resident in [false, true] {
         for current in [false, true] {
             let temp = tempfile::tempdir().unwrap();
@@ -886,7 +886,7 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
                             }),
                             ..Default::default()
                         };
-                        wire.set_runtime(pplx_space_common_core::types::RuntimeKind::Firecracker.into());
+                        wire.set_runtime(pplx_space_execution_spec::RuntimeKind::Firecracker.into());
                         wire.try_into().unwrap()
                     },
                     None,
@@ -924,5 +924,175 @@ async fn resident_execution_adoption_does_not_require_current_catalog_or_sources
                     .unwrap(),
             );
         }
+    }
+}
+
+/// A stand-in gateway for `sandbox_id`: a shell that names the sandbox in its
+/// command line, as a gateway's `--sandbox-id` does, and holds `sockets`.
+fn spawn_socket_holder(
+    sandbox_id: SandboxId,
+    sockets: Vec<i32>,
+) -> gateway_handover::tests::ReapedChild {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(gateway_handover::tests::ready_script("true"))
+        .arg(sandbox_id.to_string());
+    let inherit = move || {
+        for socket in &sockets {
+            // SAFETY: fcntl(2) on a descriptor this test keeps open until the
+            // spawn returns.
+            if unsafe { libc::fcntl(*socket, libc::F_SETFD, 0) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    };
+    // SAFETY: the closure calls only fcntl(2) and allocates nothing.
+    unsafe {
+        command.pre_exec(inherit);
+    }
+    gateway_handover::tests::spawn_ready(&mut command)
+}
+
+fn listener_specs(
+    udp: std::net::SocketAddr,
+    tcp: std::net::SocketAddr,
+) -> Vec<launch::PreExecSocket> {
+    [(udp, false, "--udp-fd"), (tcp, true, "--tcp-fd")]
+        .into_iter()
+        .map(|(bind_addr, tcp, fd_arg)| launch::PreExecSocket {
+            bind_addr,
+            tcp,
+            transparent: false,
+            recvorigdstaddr: false,
+            fd_arg: fd_arg.to_string(),
+            inherited_fd: None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn replaced_gateway_hands_its_listening_sockets_to_its_replacement() {
+    use std::os::unix::process::ExitStatusExt;
+    if !pplx_space_test_env::root_or_skip("duplicate another process's sockets") {
+        return;
+    }
+    let service = RuntimeSupervisorService::default();
+    let sandbox_id = SandboxId::new();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (udp_addr, tcp_addr) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+    // From here only the holder has the sockets.
+    drop((udp, tcp));
+
+    let mut inherited = service
+        .retire_replaced_gateway(
+            sandbox_id,
+            holder.id(),
+            "/proc/self/ns/net",
+            &listener_specs(udp_addr, tcp_addr),
+        )
+        .await
+        .unwrap();
+    assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
+    assert_eq!(inherited.len(), 2);
+
+    // What arrives after the holder is gone waits on the same sockets.
+    let listener = std::net::TcpListener::from(inherited.pop().unwrap());
+    let receiver = std::net::UdpSocket::from(inherited.pop().unwrap());
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .send_to(b"query", udp_addr)
+        .unwrap();
+    let _client = std::net::TcpStream::connect(tcp_addr).unwrap();
+    receiver.set_nonblocking(false).unwrap();
+    let mut datagram = [0; 16];
+    assert_eq!(receiver.recv(&mut datagram).unwrap(), 5);
+    listener.set_nonblocking(false).unwrap();
+    listener.accept().unwrap();
+}
+
+#[tokio::test]
+async fn replaced_gateway_without_every_listener_still_stops_and_hands_over_none() {
+    use std::os::unix::process::ExitStatusExt;
+    if !pplx_space_test_env::root_or_skip("duplicate another process's sockets") {
+        return;
+    }
+    let service = RuntimeSupervisorService::default();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let specs = listener_specs(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let mut not_transparent = specs.clone();
+    not_transparent[0].transparent = true;
+    // A network namespace other than the one holding the sockets.
+    let other_namespace = gateway_handover::tests::spawn_ready(
+        std::process::Command::new("unshare")
+            .arg("--net")
+            .arg("sh")
+            .arg("-c")
+            .arg(gateway_handover::tests::ready_script("true")),
+    );
+    let other_ns_path = format!("/proc/{}/ns/net", other_namespace.id());
+    for (specs, ns_path) in [
+        (not_transparent, "/proc/self/ns/net"),
+        (specs.clone(), other_ns_path.as_str()),
+    ] {
+        let sandbox_id = SandboxId::new();
+        let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+        let inherited = service
+            .retire_replaced_gateway(sandbox_id, holder.id(), ns_path, &specs)
+            .await
+            .unwrap();
+        assert!(inherited.is_empty(), "{ns_path}");
+        assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    // A path that is no network namespace fails the launch, so the old
+    // gateway is left running.
+    let sandbox_id = SandboxId::new();
+    let mut holder = spawn_socket_holder(sandbox_id, vec![udp.as_raw_fd(), tcp.as_raw_fd()]);
+    let status = service
+        .retire_replaced_gateway(sandbox_id, holder.id(), "/proc/self/ns/uts", &specs)
+        .await
+        .expect_err("a non-network namespace must be refused");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(
+        holder.try_wait().unwrap().is_none(),
+        "the old gateway keeps running"
+    );
+}
+
+#[tokio::test]
+async fn an_unlaunchable_replacement_is_refused_before_anything_changes() {
+    let service = RuntimeSupervisorService::default();
+    let bad_env = LaunchSidecarRequest {
+        env: std::collections::HashMap::from([("BAD=KEY".to_string(), "x".to_string())]),
+        ..Default::default()
+    };
+    let bad_fd_arg = LaunchSidecarRequest {
+        pre_exec_sockets: vec![pplx_space_node_runtime_core::proto::PreExecSocket {
+            bind_addr: "0.0.0.0:15002".to_string(),
+            fd_arg: "--udp-fd\0".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for request in [bad_env, bad_fd_arg] {
+        let status = service
+            .launch_sidecar_owned(
+                LaunchSidecarRequest {
+                    sandbox_id: SandboxId::new().to_string(),
+                    program: pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN.to_string(),
+                    replace_pid: Some(4242),
+                    ..request
+                },
+                None,
+            )
+            .await
+            .expect_err("a request the launcher would reject must be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
     }
 }

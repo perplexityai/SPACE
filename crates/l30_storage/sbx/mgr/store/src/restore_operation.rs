@@ -7,7 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use pplx_space_common_core::types::ExactStorageUri;
+use pplx_space_artifact_model::ExactStorageUri;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreOrigin {

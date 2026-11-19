@@ -24,6 +24,17 @@ pub fn unretired_runtime_upgrade(
     crate::db::unretired_runtime_upgrade(conn, sandbox_id)
 }
 
+/// The upgrade of `sandbox_id` that must leave it `stopped` while its boot's
+/// execution may yet run it, if one exists: a fencing one, or a verified one
+/// whose boot's execution still runs. Other unretired upgrades of the sandbox
+/// don't hide it.
+pub fn stay_stopped_runtime_upgrade_awaiting_its_stop(
+    conn: &Connection,
+    sandbox_id: &str,
+) -> Result<Option<RuntimeUpgradeOperationId>> {
+    crate::db::stay_stopped_runtime_upgrade_awaiting_its_stop(conn, sandbox_id)
+}
+
 /// The upgrade that refuses other activations of `sandbox_id`, if one does.
 pub fn runtime_upgrade_fence(
     conn: &Connection,

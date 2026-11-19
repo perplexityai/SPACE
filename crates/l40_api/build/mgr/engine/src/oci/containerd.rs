@@ -6,7 +6,8 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use oci_spec::distribution::Reference as OciReference;
-use pplx_space_common_core::types::{Arch, ArchParseError, Digest, DigestParseError};
+use pplx_space_content_digest::{Digest, DigestParseError};
+use pplx_space_cpu_arch::{Arch, ArchParseError};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::Instrument as _;
@@ -1097,8 +1098,8 @@ struct OpenStorageProbe;
 
 #[cfg(test)]
 impl StorageProbe for OpenStorageProbe {
-    fn status(&self, _root: &Path) -> Option<pplx_space_common_core::host::disk::DiskStatus> {
-        Some(pplx_space_common_core::host::disk::DiskStatus {
+    fn status(&self, _root: &Path) -> Option<pplx_space_host_linux::disk::DiskStatus> {
+        Some(pplx_space_host_linux::disk::DiskStatus {
             total_bytes: 4,
             free_bytes: 4,
             available_bytes: 4,
@@ -1138,10 +1139,7 @@ fn parse_native_snapshot_mount(
 ) -> Result<PathBuf, OciBuildError> {
     let output = bounded_output(output);
     let target_and_options = format!(" {} -o rbind,ro", expected_target.display());
-    let Some(source) = output
-        .strip_prefix("mount -t bind ")
-        .and_then(|mount| mount.strip_suffix(&target_and_options))
-    else {
+    let Some(source) = output.strip_circumfix("mount -t bind ", &target_and_options) else {
         return Err(OciBuildError::InvalidSnapshotMount { output });
     };
     let source = PathBuf::from(source);

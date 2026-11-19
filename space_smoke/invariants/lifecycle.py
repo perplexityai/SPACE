@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import NoReturn
 
 from space_smoke.capabilities import EcwSandbox, EcwSandboxState
@@ -25,8 +25,11 @@ def prove_idle_deadline_reset(
     reset_after: float,
     verify_after_reset: float,
     reset: Callable[[], None],
+    additional_resets: Sequence[tuple[EcwSandbox, Callable[[], None]]] = (),
 ) -> None:
-    """Prove that one action moves a sandbox's idle deadline forward."""
+    """Prove independent reset actions against one shared observation window."""
+
+    resets = ((sandbox, reset), *additional_resets)
 
     _validate_window(
         sandbox_timeout=sandbox_timeout,
@@ -48,65 +51,67 @@ def prove_idle_deadline_reset(
     with context.phase("wait before resetting sandbox idle deadline"):
         context.wait(reset_after)
 
-    with context.phase("reset sandbox idle deadline"):
-        try:
-            reset()
-        except (InvariantViolation, ScenarioTimedOut, SmokeConfigurationError):
-            raise
-        except Exception as error:  # noqa: BLE001 - public rejection fails invariant
-            _fail_operation(
-                context,
-                sandbox,
-                "sandbox idle deadline reset failed",
-                operation="reset idle deadline",
-                error=error,
-            )
+    for sandbox, action in resets:
+        with context.phase("reset sandbox idle deadline"):
+            try:
+                action()
+            except (InvariantViolation, ScenarioTimedOut, SmokeConfigurationError):
+                raise
+            except Exception as error:  # noqa: BLE001 - public rejection fails invariant
+                _fail_operation(
+                    context,
+                    sandbox,
+                    "sandbox idle deadline reset failed",
+                    operation="reset idle deadline",
+                    error=error,
+                )
 
     with context.phase("wait beyond original sandbox deadline"):
         context.wait(verify_after_reset)
 
-    with context.phase("observe sandbox after original deadline"):
-        try:
-            observed = sandbox.get_info()
-        except (InvariantViolation, ScenarioTimedOut, SmokeConfigurationError):
-            raise
-        except Exception as error:  # noqa: BLE001 - public rejection fails invariant
-            _fail_operation(
-                context,
-                sandbox,
-                "sandbox state was unavailable after its idle deadline was reset",
-                operation="read sandbox state",
-                error=error,
+    for sandbox, _ in resets:
+        with context.phase("observe sandbox after original deadline"):
+            try:
+                observed = sandbox.get_info()
+            except (InvariantViolation, ScenarioTimedOut, SmokeConfigurationError):
+                raise
+            except Exception as error:  # noqa: BLE001 - public rejection fails invariant
+                _fail_operation(
+                    context,
+                    sandbox,
+                    "sandbox state was unavailable after its idle deadline was reset",
+                    operation="read sandbox state",
+                    error=error,
+                )
+            context.verify(
+                observed.state is EcwSandboxState.RUNNING,
+                "sandbox was not running after its idle deadline was reset",
+                expected_state=EcwSandboxState.RUNNING.value,
+                observed_state=(
+                    observed.state.value if observed.state is not None else "unknown"
+                ),
             )
-        context.verify(
-            observed.state is EcwSandboxState.RUNNING,
-            "sandbox was not running after its idle deadline was reset",
-            expected_state=EcwSandboxState.RUNNING.value,
-            observed_state=(
-                observed.state.value if observed.state is not None else "unknown"
-            ),
-        )
 
-    with context.phase("verify sandbox remains usable after idle deadline reset"):
-        try:
-            result = sandbox.run(f"printf %s {_MARKER}")
-        except (InvariantViolation, ScenarioTimedOut, SmokeConfigurationError):
-            raise
-        except Exception as error:  # noqa: BLE001 - public rejection fails invariant
-            _fail_operation(
-                context,
-                sandbox,
+        with context.phase("verify sandbox remains usable after idle deadline reset"):
+            try:
+                result = sandbox.run(f"printf %s {_MARKER}")
+            except (InvariantViolation, ScenarioTimedOut, SmokeConfigurationError):
+                raise
+            except Exception as error:  # noqa: BLE001 - public rejection fails invariant
+                _fail_operation(
+                    context,
+                    sandbox,
+                    "sandbox was not usable after its idle deadline was reset",
+                    operation="run marker command",
+                    error=error,
+                )
+            context.verify(
+                (result.exit_code, result.stdout) == (0, _MARKER),
                 "sandbox was not usable after its idle deadline was reset",
-                operation="run marker command",
-                error=error,
+                expected=(0, _MARKER),
+                actual=(result.exit_code, result.stdout),
+                command_stderr=result.stderr,
             )
-        context.verify(
-            (result.exit_code, result.stdout) == (0, _MARKER),
-            "sandbox was not usable after its idle deadline was reset",
-            expected=(0, _MARKER),
-            actual=(result.exit_code, result.stdout),
-            command_stderr=result.stderr,
-        )
 
 
 def _validate_window(

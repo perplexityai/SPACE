@@ -11,10 +11,10 @@ use kube::runtime::{reflector, watcher::Event};
 
 use super::execution::RecoveryJoinBackoffPolicy;
 use super::*;
-use crate::controllers::substrate::AbandonedRestoreRetirement;
 use crate::controllers::substrate::runtime_upgrade::{
     RuntimePolicyCache, RuntimeUpgradeAtActivation,
 };
+use crate::controllers::substrate::{AbandonedRestoreRetirement, ActivationClientAttribution};
 
 /// The namespace a substrate built here keeps its sandbox pods and their
 /// `sandbox_k8s_executions` rows in.
@@ -87,7 +87,7 @@ pub(super) fn seeded_substrate(
         node_api_pod_writer.apply_watcher_event(&Event::InitApply(pod.clone()));
     }
     node_api_pod_writer.apply_watcher_event(&Event::InitDone);
-    let (pod_store, pod_network_slots, _) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
+    let (pod_store, pod_indexes, _) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
 
     let (node_store, mut node_writer) = reflector::store::<Node>();
     node_writer.apply_watcher_event(&Event::Init);
@@ -103,7 +103,7 @@ pub(super) fn seeded_substrate(
         sandbox_proxy_port,
         SandboxPodConfigValues::default(),
         caches,
-        (pod_store, pod_network_slots),
+        (pod_store, pod_indexes),
     )
 }
 
@@ -118,7 +118,7 @@ pub(super) fn assemble_substrate(
     sandbox_proxy_port: u16,
     sandbox_pod_config: SandboxPodConfigValues,
     caches: Arc<K8sCaches>,
-    (pod_store, pod_network_slots): (Store<SandboxPodView>, NodeNetworkSlots),
+    (pod_store, pod_indexes): (Store<SandboxPodView>, SandboxPodIndexes),
 ) -> KubernetesSubstrate {
     let shutdown_token = CancellationToken::new();
     let task_tracker = TaskTracker::new();
@@ -134,21 +134,33 @@ pub(super) fn assemble_substrate(
             k8s_blocking_delete_timeout: TEST_BLOCKING_DELETE_TIMEOUT,
             abandoned_restore_retirement: AbandonedRestoreRetirement::Enabled,
             runtime_upgrade_at_activation: RuntimeUpgradeAtActivation::Disabled,
+            environment_placement:
+                crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::Off,
+            activation_client_attribution: ActivationClientAttribution::Enabled,
             caches,
         },
         restore_waiters: RestoreWaiters::with_max_poll_interval(
-            K8sStore::new(pool.clone(), TEST_SANDBOX_NAMESPACE.to_string()),
+            K8sStore::new(
+                pool.clone(),
+                TEST_SANDBOX_NAMESPACE.to_string(),
+                ActivationClientAttribution::Enabled,
+            ),
             shutdown_token.clone(),
             task_tracker.clone(),
             TEST_RESTORE_POLL_INTERVAL,
         ),
         pod_worker_channels: Arc::default(),
-        wake_coalescer: Arc::new(
-            pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
+        wake_coalescer: Arc::new(pplx_space_work_coalescer::WorkCoalescer::with_tracker(
+            task_tracker.clone(),
+        )),
+        store: K8sStore::new(
+            pool.clone(),
+            TEST_SANDBOX_NAMESPACE.to_string(),
+            ActivationClientAttribution::Enabled,
         ),
-        store: K8sStore::new(pool.clone(), TEST_SANDBOX_NAMESPACE.to_string()),
         pod_store,
-        pod_network_slots,
+        pod_network_slots: pod_indexes.network_slots,
+        pod_client_index: pod_indexes.client_pods,
         pod_events: pod_reflector::PodEvents::for_test(),
         pod_reflector_ready: ReflectorReady::always_ready(),
         cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
@@ -179,7 +191,11 @@ pub async fn retire_executions_predating_current_stop(
     pool: PgPool,
     sandbox_id: SandboxId,
 ) -> Result<bool, SubstrateError> {
-    K8sStore::new(pool, TEST_SANDBOX_NAMESPACE.to_string())
-        .retire_executions_predating_current_stop(sandbox_id)
-        .await
+    K8sStore::new(
+        pool,
+        TEST_SANDBOX_NAMESPACE.to_string(),
+        ActivationClientAttribution::Enabled,
+    )
+    .retire_executions_predating_current_stop(sandbox_id)
+    .await
 }

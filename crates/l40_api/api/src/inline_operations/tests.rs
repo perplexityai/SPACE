@@ -1,5 +1,22 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn an_inline_hold_without_release_ends_at_its_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("never-released");
+    let hold = Duration::from_secs(30);
+    for release_file in [None, Some(missing.as_path())] {
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            hold + Duration::from_secs(1),
+            wait_inline_test_hold(hold, release_file),
+        )
+        .await
+        .expect("the fail-safe deadline must release an unwritten hold");
+        assert_eq!(started.elapsed(), hold, "the hold must not end early");
+    }
+}
+
 fn runner(max_concurrent: usize, route_signing: bool) -> (InlineOperations, DrainSignal) {
     let drain_signal = DrainSignal::new();
     let runner = InlineOperations::new(
@@ -31,6 +48,7 @@ fn inline_switches_default_off_and_read_from_the_environment() {
             max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
             org_limit: None,
             test_hold: None,
+            test_release_file: None,
         }
     );
 
@@ -50,6 +68,7 @@ fn inline_switches_default_off_and_read_from_the_environment() {
             max_concurrent: 8,
             org_limit: None,
             test_hold: None,
+            test_release_file: None,
         }
     );
 
@@ -69,6 +88,11 @@ fn inline_switches_default_off_and_read_from_the_environment() {
 
     // The test hold, read here because this crate's tests build with
     // `test-hooks`, is capped; `0` or a malformed value sets none.
+    env.set(INLINE_TEST_RELEASE_FILE_ENV, "/tmp/space-inline-release");
+    assert_eq!(
+        config(&env).test_release_file,
+        Some(PathBuf::from("/tmp/space-inline-release"))
+    );
     env.set(INLINE_TEST_HOLD_SECS_ENV, " 30 ");
     assert_eq!(config(&env).test_hold, Some(Duration::from_secs(30)));
     env.set(INLINE_TEST_HOLD_SECS_ENV, "100000");

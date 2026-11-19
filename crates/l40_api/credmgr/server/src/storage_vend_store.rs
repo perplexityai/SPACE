@@ -1,14 +1,16 @@
 //! Durable authorization context for scoped storage credential exchange.
 
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::str::FromStr;
 
-use pplx_space_common_core::{
-    types::ContentHash, types::K8sNodeName, types::K8sNodeUid, types::OrgId, types::SandboxId,
-    types::StorageUri, types::TemplateName,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::StorageUri;
+use pplx_space_content_digest::ContentHash;
+use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_model::TemplateName;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxStorageContext {
@@ -133,6 +135,7 @@ impl StorageVendStore for PgStorageVendStore {
             return Ok(None);
         };
 
+        let snapshot_id = snapshot_id.as_uuid();
         let node_rows: Vec<(String, String)> = sqlx::query_as(sql!(
             "WITH latest_execution AS (
                  SELECT k8s_node_name
@@ -262,10 +265,7 @@ impl StorageVendStore for PgStorageVendStore {
         // and, for releases registered before the prefix was required, the
         // bare hex. A published release must be found under either spelling.
         let canonical = hash.to_string();
-        let bare = canonical
-            .strip_prefix("sha256:")
-            .unwrap_or(&canonical)
-            .to_string();
+        let bare = canonical.trim_prefix("sha256:").to_string();
         let published: bool = sqlx::query_scalar(sql!(
             "SELECT EXISTS (
                  SELECT 1

@@ -21,9 +21,9 @@ fn step_descriptions_do_not_disclose_recipe_inputs() {
         ),
         (
             Step::Env {
-                vars: pplx_space_common_core::types::EnvMap::try_from(
-                    std::collections::BTreeMap::from([(secret.into(), secret.into())]),
-                )
+                vars: pplx_space_guest_process::EnvMap::try_from(std::collections::BTreeMap::from(
+                    [(secret.into(), secret.into())],
+                ))
                 .unwrap(),
             },
             "env (1 vars)",
@@ -55,7 +55,7 @@ fn step_descriptions_do_not_disclose_recipe_inputs() {
         assert_eq!(step.to_string(), expected);
         let named = super::NamedStep {
             display_name: Some(secret.into()),
-            env_refs: vec![pplx_space_common_core::types::EnvKey::parse(secret).unwrap()],
+            env_refs: vec![pplx_space_guest_process::EnvKey::parse(secret).unwrap()],
             step,
         };
         assert_eq!(named.to_string(), expected);
@@ -981,7 +981,7 @@ fn package_install_uses_single_structural_step() {
     ));
     assert_eq!(
         recipe.steps[0].env_refs,
-        vec![pplx_space_common_core::types::EnvKey::parse("TOKEN").unwrap()]
+        vec![pplx_space_guest_process::EnvKey::parse("TOKEN").unwrap()]
     );
 }
 
@@ -1106,7 +1106,7 @@ type = "launch"
 
 #[test]
 fn balloon_round_trips_from_toml_through_the_wire() {
-    use pplx_space_common_core::types::BalloonMode;
+    use pplx_space_execution_spec::BalloonMode;
 
     let parse = |balloon: &str| {
         toml::from_str::<TomlRecipe>(&format!(

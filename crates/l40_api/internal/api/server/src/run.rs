@@ -4,7 +4,7 @@
 //! binary's `main` used to hold; the binary now only parses flags,
 //! initializes telemetry, and calls [`run`].
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};

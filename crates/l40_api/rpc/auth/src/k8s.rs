@@ -473,11 +473,11 @@ impl K8sTokenAuthConfig {
     /// caller falls back to the static-token-only path. When enabled, requires
     /// `KUBERNETES_SERVICE_HOST` to be present.
     pub(super) fn from_env() -> Result<Option<Self>, AuthConfigError> {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
     pub(crate) fn from_environment(
-        env: &dyn pplx_space_common_core::env::Environment,
+        env: &dyn pplx_space_env_vars::Environment,
     ) -> Result<Option<Self>, AuthConfigError> {
         if !super::env_bool_from_environment(env, SPACE_K8S_TOKEN_AUTH_ENABLED_ENV) {
             return Ok(None);
@@ -962,7 +962,7 @@ fn service_account_username(namespace: &str, name: &str) -> String {
     }
 }
 
-fn env_csv_set(env: &dyn pplx_space_common_core::env::Environment, name: &str) -> BTreeSet<String> {
+fn env_csv_set(env: &dyn pplx_space_env_vars::Environment, name: &str) -> BTreeSet<String> {
     env.var(name)
         .ok()
         .into_iter()
@@ -977,7 +977,7 @@ fn env_csv_set(env: &dyn pplx_space_common_core::env::Environment, name: &str) -
         .collect()
 }
 
-fn env_u64(env: &dyn pplx_space_common_core::env::Environment, name: &str, default: u64) -> u64 {
+fn env_u64(env: &dyn pplx_space_env_vars::Environment, name: &str, default: u64) -> u64 {
     env.var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -985,9 +985,7 @@ fn env_u64(env: &dyn pplx_space_common_core::env::Environment, name: &str, defau
         .unwrap_or(default)
 }
 
-fn auth_namespace(
-    env: &dyn pplx_space_common_core::env::Environment,
-) -> Result<String, AuthConfigError> {
+fn auth_namespace(env: &dyn pplx_space_env_vars::Environment) -> Result<String, AuthConfigError> {
     auth_namespace_from_file(
         env,
         Path::new("/var/run/secrets/kubernetes.io/serviceaccount/namespace"),
@@ -995,10 +993,10 @@ fn auth_namespace(
 }
 
 fn auth_namespace_from_file(
-    env: &dyn pplx_space_common_core::env::Environment,
+    env: &dyn pplx_space_env_vars::Environment,
     namespace_path: &Path,
 ) -> Result<String, AuthConfigError> {
-    pplx_space_common_core::env::test_hook(env, SPACE_K8S_TOKEN_AUTH_NAMESPACE_ENV)
+    pplx_space_test_hooks::test_hook(env, SPACE_K8S_TOKEN_AUTH_NAMESPACE_ENV)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .or_else(|| {

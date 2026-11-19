@@ -14,11 +14,12 @@ use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
 use futures_util::StreamExt;
-use pplx_space_common_core::types::{GuestPort, SandboxId};
 use pplx_space_events::{
     SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
     emit_sandbox_event,
 };
+use pplx_space_network_roles::GuestPort;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use rollback_state::restage_rolled_back_full_snapshot;
 use std::str::FromStr;
@@ -29,7 +30,66 @@ const LOG_TARGET: &str = module_path!();
 
 const CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX: &str = "d-stop-";
 const OPERATION_DISK_ARTIFACT_PREFIX: &str =
-    pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
+    pplx_space_host_layout::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
+
+/// The VM state files a full snapshot can't restore without.
+const FULL_SNAPSHOT_REQUIRED_FILES: &[&str] = &["vmstate", "memory"];
+
+/// Whether every one of `required` is a non-empty regular file in `path`.
+fn snapshot_files_present(path: &std::path::Path, required: &[&str]) -> bool {
+    required.iter().all(|file| {
+        std::fs::symlink_metadata(path.join(file))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    })
+}
+
+/// Whether the full snapshot directory at `path` holds the VM state it
+/// restores from, by the test the snapshot listing reports `incomplete` by:
+/// each of [`FULL_SNAPSHOT_REQUIRED_FILES`] is a non-empty regular file. A
+/// failed capture can leave the disk without it. Unlike the listing, which
+/// shows an unreadable file as incomplete, a caller deciding whether the
+/// directory may be deleted gets any error other than `NotFound` back, so
+/// that an unreadable snapshot isn't taken for an incomplete one.
+pub(super) fn full_snapshot_complete(path: &std::path::Path) -> std::io::Result<bool> {
+    for file in FULL_SNAPSHOT_REQUIRED_FILES {
+        match snapshot_entry_metadata(&path.join(file)) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// `symlink_metadata` of an entry in a sandbox's snapshot directory, which
+/// doesn't follow a symlink, as the listing's `DirEntry::file_type` doesn't.
+/// A test can make it fail for chosen paths ([`fail_snapshot_metadata`]).
+pub(super) fn snapshot_entry_metadata(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    if SNAPSHOT_METADATA_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|fault| fault == path)
+    {
+        return Err(std::io::Error::other("injected snapshot metadata error"));
+    }
+    std::fs::symlink_metadata(path)
+}
+
+/// The paths whose [`snapshot_entry_metadata`] fails in this test process.
+#[cfg(test)]
+static SNAPSHOT_METADATA_FAULTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Make [`snapshot_entry_metadata`] fail for `path` in this test process.
+#[cfg(test)]
+pub(crate) fn fail_snapshot_metadata(path: std::path::PathBuf) {
+    SNAPSHOT_METADATA_FAULTS.lock().unwrap().push(path);
+}
 
 /// A snapshot directory users can't list, delete, roll back to, export or
 /// back up: sbx-mgr's own disk artifacts, and GC staging (logically deleted
@@ -850,7 +910,7 @@ impl SandboxManagerService {
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         self.authorize_peer(&request, "ListSnapshots", ALLOW_SANDBOX_OBSERVER)?;
         let req = request.get_ref();
-        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
+        use pplx_space_rpc_contracts::inventory::{InventoryBudget, MAX_ENCODED_BYTES, MAX_ITEMS};
         use prost::Message as _;
         let mut request_budget = InventoryBudget::new(MAX_ITEMS, MAX_ENCODED_BYTES);
         for id in &req.sandbox_ids {
@@ -954,8 +1014,7 @@ async fn list_snapshots_for_sandbox(
         let publications = artifacts
             .list_named_publications(&sandbox_id)
             .map_err(|error| error.into_status())?;
-        let snapshots_dir =
-            pplx_space_common_core::host::linux::paths::sandbox_snapshots_dir(&sandbox_id);
+        let snapshots_dir = pplx_space_host_layout::paths::sandbox_snapshots_dir(&sandbox_id);
         project_snapshot_inventory(
             &sandbox_id,
             &template,
@@ -977,7 +1036,7 @@ fn project_snapshot_inventory(
     btrfs: Vec<pplx_space_node_mgr_client::proto::BtrfsSnapshotInfo>,
     publications: Vec<crate::local_artifacts::NamedArtifactPublication>,
 ) -> Result<Vec<SnapshotDetail>, Status> {
-    use pplx_space_common_core::inventory::{
+    use pplx_space_rpc_contracts::inventory::{
         InventoryBudget, InventoryLimitExceeded, MAX_ENCODED_BYTES, MAX_ITEMS, MAX_RAW_BYTES,
     };
     use prost::Message as _;
@@ -996,7 +1055,7 @@ fn project_snapshot_inventory(
         if is_internal_snapshot_name(&snapshot.name) {
             continue;
         }
-        pplx_space_common_core::types::SnapshotName::parse(&snapshot.name).map_err(|error| {
+        pplx_space_snapshot_model::SnapshotName::parse(&snapshot.name).map_err(|error| {
             Status::data_loss(format!("invalid snapshot inventory name: {error}"))
         })?;
         snapshots.insert(
@@ -1091,9 +1150,9 @@ fn project_snapshot_inventory(
             snapshot.state = "incomplete".into();
         } else if full || transfer_binding.is_some() {
             let kind = if full {
-                pplx_space_common_core::types::ArtifactKind::Full
+                pplx_space_snapshot_model::ArtifactKind::Full
             } else {
-                pplx_space_common_core::types::ArtifactKind::Disk
+                pplx_space_snapshot_model::ArtifactKind::Disk
             };
             let publication = publications.get(&snapshot.id).filter(|publication| {
                 publication.artifact_kind == kind
@@ -1104,7 +1163,7 @@ fn project_snapshot_inventory(
             // survive a failed SQLite commit, which an identical retry repairs.
             // Otherwise skip_if_exists would falsely acknowledge that retry.
             let required: &[&str] = if full {
-                &["vmstate", "memory"]
+                FULL_SNAPSHOT_REQUIRED_FILES
             } else {
                 &["rootfs.ext4"]
             };
@@ -1112,13 +1171,7 @@ fn project_snapshot_inventory(
                 Some(state) if state != crate::local_artifacts::ArtifactState::Ready => {
                     state.as_str()
                 }
-                _ if !required.iter().all(|file| {
-                    std::fs::symlink_metadata(path.join(file))
-                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
-                }) =>
-                {
-                    "incomplete"
-                }
+                _ if !snapshot_files_present(&path, required) => "incomplete",
                 Some(_) => "ready",
                 None => "unknown",
             }
@@ -1187,7 +1240,7 @@ impl SandboxManagerService {
         snapshot_name: &str,
     ) -> Result<Option<crate::local_artifacts::RestoreLease>, Status> {
         let name = snapshot_name
-            .parse::<pplx_space_common_core::types::SnapshotName>()
+            .parse::<pplx_space_snapshot_model::SnapshotName>()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let Some(publication) = self
             .local_artifacts
@@ -1197,10 +1250,8 @@ impl SandboxManagerService {
             // Older locally created snapshots may predate the artifact catalog.
             return Ok(None);
         };
-        let expected_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            sandbox_id,
-            snapshot_name,
-        );
+        let expected_path =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(sandbox_id, snapshot_name);
         if publication.local_path != expected_path {
             return Err(Status::failed_precondition(
                 "rollback publication path differs",
@@ -1276,7 +1327,7 @@ impl SandboxManagerService {
         // don't restore from it: a running sandbox is stopped first, and a
         // stopped row's pin is dropped before the disk is rewritten.
         let pins_suspend_artifact = sandbox.current_local_artifact_origin
-            == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+            == Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
         if sandbox.state.is_unowned(SandboxState::Suspended)
             || sandbox.cleanup_completion == Some(CleanupCompletion::MarkSuspended)
             || (pins_suspend_artifact
@@ -1291,10 +1342,8 @@ impl SandboxManagerService {
                  been restored",
             ));
         }
-        let transferred_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-            &sandbox.id,
-            snapshot_name,
-        );
+        let transferred_path =
+            pplx_space_host_layout::paths::sandbox_snapshot_dir(&sandbox.id, snapshot_name);
         // GC owns a catalog lease, not the per-sandbox artifact lock. Checkout
         // before any destructive RPC, and retain it through the last file read.
         let snapshot_lease = self.checkout_rollback_snapshot(&sandbox.id, snapshot_name)?;
@@ -1313,7 +1362,7 @@ impl SandboxManagerService {
         let published_route_identity = sandbox.space_api_route_identity.clone();
         let preserves_kubernetes_identity = req.route_identity.is_none()
             && published_route_identity.effective_substrate_kind()
-                == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+                == Some(pplx_space_node_model::NodeManagedBy::Kubernetes);
         let requested_route_identity = if preserves_kubernetes_identity {
             published_route_identity
         } else {
@@ -1625,15 +1674,15 @@ fn start_process_options(
 ) -> Result<pplx_space_spaced_host_client::StartProcessOptions, Status> {
     let invalid = |error: std::fmt::Arguments<'_>| Status::invalid_argument(error.to_string());
     Ok(pplx_space_spaced_host_client::StartProcessOptions {
-        command: pplx_space_common_core::types::ProcessCommand::new(operation.command.clone())
+        command: pplx_space_guest_process::ProcessCommand::new(operation.command.clone())
             .map_err(|error| invalid(format_args!("{error}")))?,
         cwd: operation
             .cwd
             .clone()
-            .map(pplx_space_common_core::types::GuestPath::parse)
+            .map(pplx_space_guest_process::GuestPath::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
-        env: pplx_space_spaced_common::parse_env(operation.env.clone()),
+        env: pplx_space_spaced_guest_protocol::parse_env(operation.env.clone()),
         user: operation
             .user
             .clone()
@@ -1645,7 +1694,7 @@ fn start_process_options(
         idempotency_key: operation
             .idempotency_key
             .clone()
-            .map(pplx_space_common_core::types::IdempotencyKey::parse)
+            .map(pplx_space_guest_process::IdempotencyKey::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
         tag: operation.tag.clone(),
@@ -1655,7 +1704,7 @@ fn start_process_options(
         process_id: operation
             .process_id
             .clone()
-            .map(pplx_space_common_core::types::ProcessId::parse)
+            .map(pplx_space_guest_process::ProcessId::parse)
             .transpose()
             .map_err(|error| invalid(format_args!("{error}")))?,
     })

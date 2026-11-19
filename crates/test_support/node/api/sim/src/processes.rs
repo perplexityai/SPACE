@@ -61,6 +61,10 @@ pub struct SimProcessSpec {
     /// A background start returns after `Started`, as in production; the
     /// process stays in the table for list/connect/signal/kill.
     pub background: bool,
+    /// The id the caller assigned, which a current guest keeps. `None` mints
+    /// one, as every guest does for a start without one and a guest that
+    /// predates assigned ids does for every start.
+    pub process_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -110,7 +114,10 @@ impl SimProcessTable {
     /// Register a process and return its `Started`/`stdout`/`Exit` stream.
     pub async fn start(&self, sandbox_id: &str, spec: SimProcessSpec) -> SimProcessEventStream {
         let pid = FIRST_PID + self.next_pid.fetch_add(1, Ordering::Relaxed);
-        let process_id = format!("sim-proc-{pid}");
+        let process_id = spec
+            .process_id
+            .clone()
+            .unwrap_or_else(|| format!("sim-proc-{pid}"));
         let output = vec![format!("sim: {}\n", spec.command.join(" ")).into_bytes()];
         let (exit_tx, exit_rx) = watch::channel(None);
         let process = SimProcess {
@@ -332,9 +339,9 @@ fn cursor_ahead_status() -> Status {
     let mut status =
         Status::out_of_range("process output cursor is past the output the process has written");
     status.metadata_mut().insert(
-        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
         tonic::metadata::MetadataValue::from_static(
-            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+            pplx_space_guest_process::status::PROCESS_OUTPUT_CURSOR_AHEAD,
         ),
     );
     status

@@ -1,19 +1,21 @@
 //! Guarded writes the Direct substrate makes to `sandboxes`: the restore
-//! lease's claim, renewal, release and completion, and the placement an owned
-//! restore receipt records.
+//! lease's claim, renewal, release and completion, the placement an owned
+//! restore receipt records, and the adoption of a live node record by a row
+//! with no active node.
 //!
-//! The adoption of a live node record by a row with no active node stays in
-//! the substrate. Its update joins the Direct-only route-identity and
+//! The adoption's guard also reads the Direct-only route-identity and
 //! provenance tables, which `pattern_ratchet.direct_tables` confines to the
-//! Direct substrate.
+//! Direct substrate. The substrate evaluates that part and passes what it
+//! decided; [`adopt_live_execution`] guards on the row's own columns.
 //!
-//! The substrate keeps everything around them: the restore-ownership row lock
-//! (`SELECT ... FOR UPDATE`), the route-identity writes beside the receipt
-//! placement, the transactions, and the lease's duration. Each function runs
-//! on the executor its caller passes, so it composes into the caller's
-//! transaction when there is one. A guarded write that matches no row returns
-//! `false` (or `None`), whether another writer won or the row never met the
-//! guard; the caller decides what that means.
+//! The substrate keeps everything around them: the row locks
+//! (`SELECT ... FOR UPDATE` for restore ownership, `FOR NO KEY UPDATE` for
+//! the adoption), the route-identity writes beside the receipt placement and
+//! the reads the adoption decides from, the transactions, and the lease's
+//! duration. Each function runs on the executor its caller passes, so it
+//! composes into the caller's transaction when there is one. A guarded write
+//! that matches no row returns `false` (or `None`), whether another writer
+//! won or the row never met the guard; the caller decides what that means.
 //!
 //! Lease tokens need no lifecycle re-check of their own, because a row that
 //! holds a token is `restoring`. The `sandboxes_clear_restore_lease` BEFORE
@@ -22,9 +24,11 @@
 //! and an insert that sets a token starts the row in `restoring`, as
 //! `insert_unplaced` does.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 use uuid::Uuid;
 
@@ -198,4 +202,53 @@ pub async fn place_owned_restore_receipt<'e>(
     .execute(executor)
     .await?;
     Ok(placed.rows_affected() == 1)
+}
+
+/// Observed projection: places a Direct row with no active node back on the
+/// node still running its execution, as both its active and target node.
+/// Returns whether the row was placed.
+///
+/// The caller decides from the Direct route identity and provenance rows that
+/// `node_id` runs the execution to adopt, and passes two facts derived from
+/// them: `one_generation`, that the route identity, the execution and the last
+/// reservation are one generation, and `started_now`, that the execution is
+/// started and is the route identity's. It holds the row lock while it reads
+/// them, in the transaction this runs in.
+///
+/// Guarded on the row's own columns: Direct's row, no active node, still in
+/// `read_lifecycle` (compared case- and whitespace-insensitively), no live
+/// restore lease, and either no restore-lease token or `one_generation`. The
+/// row becomes `started` only when `started_now`; otherwise it keeps its
+/// lifecycle, and a row that stays `restoring` keeps its token.
+pub async fn adopt_live_execution<'e>(
+    executor: impl PgExecutor<'e>,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+    read_lifecycle: SandboxLifecycle,
+    one_generation: bool,
+    started_now: bool,
+) -> Result<bool, sqlx::Error> {
+    let adopted = sqlx::query(sql!(
+        "UPDATE sandboxes
+                SET active_node_id = $2,
+                    target_node_id = $2,
+                    placement = 'on_node',
+                    placement_changed_at = NOW(),
+                    lifecycle = CASE WHEN $5 THEN 'started' ELSE lifecycle END
+              WHERE id = $1
+                AND managed_by = $6
+                AND active_node_id IS NULL
+                AND LOWER(TRIM(lifecycle)) = $3
+                AND (restore_lease_expires_at IS NULL OR restore_lease_expires_at <= NOW())
+                AND (restore_lease_token IS NULL OR $4)"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(read_lifecycle.as_str())
+    .bind(one_generation)
+    .bind(started_now)
+    .bind(SubstrateKind::Space)
+    .execute(executor)
+    .await?;
+    Ok(adopted.rows_affected() == 1)
 }

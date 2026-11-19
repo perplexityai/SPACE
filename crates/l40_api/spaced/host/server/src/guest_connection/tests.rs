@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_spaced_common::proto::bridge_guest::{
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     ConfigureProcessEnvResponse as BridgeGuestConfigureProcessEnvResponse,
     FlushFilesystemsResponse as BridgeGuestFlushFilesystemsResponse,
     NotifyResumeResponse as BridgeGuestNotifyResumeResponse,
@@ -22,9 +22,10 @@ fn historical_omission_and_explicit_platforms_have_distinct_admission() {
         let response = BridgeGuestWaitReadyResponse {
             version: version.into(),
             compatibility_family:
-                pplx_space_spaced_common::spaced_compatibility_family_for_version(version).unwrap(),
+                pplx_space_spaced_guest_protocol::spaced_compatibility_family_for_version(version)
+                    .unwrap(),
             platform: os.map(|os| {
-                pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor {
+                pplx_space_spaced_guest_protocol::proto::platform::GuestPlatformDescriptor {
                     os: os as i32,
                     operations: vec![],
                 }
@@ -71,7 +72,7 @@ fn windows_operations_require_trusted_os_and_advertised_capabilities() {
                 version: "0.8.0".into(),
                 compatibility_family: "0.8".into(),
                 platform: os.map(|os| {
-                    pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor {
+                    pplx_space_spaced_guest_protocol::proto::platform::GuestPlatformDescriptor {
                         os: os as i32,
                         operations,
                     }
@@ -107,7 +108,7 @@ struct ChangingGuest {
     configured: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[tonic::async_trait]
-impl pplx_space_spaced_common::proto::bridge_guest::meta_server::Meta for ChangingGuest {
+impl pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::Meta for ChangingGuest {
     async fn wait_ready(
         &self,
         _: Request<BridgeGuestWaitReadyRequest>,
@@ -119,7 +120,7 @@ impl pplx_space_spaced_common::proto::bridge_guest::meta_server::Meta for Changi
             version: "0.8.0".into(),
             compatibility_family: "0.8".into(),
             platform: Some(
-                pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor {
+                pplx_space_spaced_guest_protocol::proto::platform::GuestPlatformDescriptor {
                     os: GuestOs::Linux as i32,
                     operations: if first {
                         vec![GuestOperation::ProcessEnvironment as i32]
@@ -175,7 +176,9 @@ async fn readiness_claim_cannot_authorize_a_different_dispatch_observation() {
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(
-                pplx_space_spaced_common::proto::bridge_guest::meta_server::MetaServer::new(guest),
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::meta_server::MetaServer::new(
+                    guest,
+                ),
             )
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::UnixListenerStream::new(listener),
@@ -220,12 +223,12 @@ async fn negotiation_expiry_is_retryable_without_reclassifying_peer_cancellation
         .await
         .unwrap_err();
     assert_eq!(expired.code(), tonic::Code::DeadlineExceeded);
-    assert!(pplx_space_spaced_common::status_is_retryable(&expired));
+    assert!(pplx_space_spaced_client::status_is_retryable(&expired));
     let cancelled = negotiation_response(async { Err(Status::cancelled("peer cancelled")) })
         .await
         .unwrap_err();
     assert_eq!(cancelled.code(), tonic::Code::Cancelled);
-    assert!(!pplx_space_spaced_common::status_is_retryable(&cancelled));
+    assert!(!pplx_space_spaced_client::status_is_retryable(&cancelled));
 }
 
 #[test]

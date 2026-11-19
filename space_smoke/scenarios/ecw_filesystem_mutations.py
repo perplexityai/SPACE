@@ -10,7 +10,8 @@ ORIGINAL_PATH = f"{NESTED_DIR}/before.txt"
 RENAMED_PATH = f"{NESTED_DIR}/after.txt"
 SIBLING_PATH = f"{NESTED_DIR}/sibling.bin"
 CONTENT = "space-smoke-filesystem-mutations"
-SIBLING_CONTENT = b"\x00\x01\x02\x03\xff"
+SIBLING_CONTENT = bytes(range(256)) * 16
+STREAMED_CONTENT = b"streamed replacement\0" + SIBLING_CONTENT[::-1]
 
 
 @smoke.scenario("ecw.filesystem_mutations")
@@ -25,7 +26,12 @@ def filesystem_mutations(test: smoke.Ecw) -> None:
         test.sandbox.files.make_dir(ROOT)
         root_exists = test.sandbox.files.exists(ROOT)
         test.sandbox.files.write(ORIGINAL_PATH, CONTENT)
-        test.sandbox.files.write(SIBLING_PATH, io.BytesIO(SIBLING_CONTENT))
+        test.sandbox.files.write(SIBLING_PATH, SIBLING_CONTENT)
+        test.verify(
+            test.sandbox.files.read_bytes(SIBLING_PATH) == SIBLING_CONTENT,
+            "Files API direct binary write changed the bytes",
+        )
+        test.sandbox.files.write(SIBLING_PATH, io.BytesIO(STREAMED_CONTENT))
         nested_exists_after = test.sandbox.files.exists(NESTED_DIR)
         observed_content = test.sandbox.files.read(ORIGINAL_PATH)
         observed_sibling = test.sandbox.files.read_bytes(SIBLING_PATH)
@@ -46,9 +52,9 @@ def filesystem_mutations(test: smoke.Ecw) -> None:
             observed_text=observed_content,
         )
         test.verify(
-            observed_sibling == SIBLING_CONTENT,
+            observed_sibling == STREAMED_CONTENT,
             "Files API streamed write changed the binary content",
-            expected_streamed_bytes=SIBLING_CONTENT.hex(),
+            expected_streamed_bytes=STREAMED_CONTENT.hex(),
             observed_streamed_bytes=observed_sibling.hex(),
         )
         test.verify(

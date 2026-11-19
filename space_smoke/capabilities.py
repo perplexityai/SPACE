@@ -47,6 +47,12 @@ class ColdCreatePod:
     rejected_markers: tuple[str, ...]
 
 
+class NetworkPolicyObserver(Protocol):
+    def network_policy_state(self, sandbox_id: str) -> Mapping[str, str]:
+        """Read the resident gateway's installed policy through its node CLI."""
+        ...
+
+
 class ColdCreateObserver(Protocol):
     def cold_create_pod(self, sandbox_id: str) -> ColdCreatePod: ...
 
@@ -677,6 +683,82 @@ class TeardownRestartControl(PendingBackupControl, Protocol):
         ...
 
 
+class RetainedOnlyCopyControl(Protocol):
+    """Kind-only operations for an interrupted suspend that leaves the only copy.
+
+    The fault is a process fault, the one direct manipulation the scenario
+    needs: node-manager is held while the suspend sits in `suspending`, the
+    sandbox's Firecracker is killed, and node-manager is released, so the
+    suspend fails with its runtime gone and no capture kept. Everything else
+    goes through the public API and the product's `space-sbxmgr` on the node.
+    """
+
+    def sandbox_node_name(self, sandbox_id: str) -> str | None:
+        """The node the sandbox is placed on, from the admin API."""
+        ...
+
+    def pause_in_memory(self, sandbox_id: str) -> None:
+        """Native `:pause`; returns once accepted."""
+        ...
+
+    def suspend_without_waiting(self, sandbox_id: str) -> str:
+        """Native `:suspend`; returns its operation id without waiting."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+    def native_sandbox_state(self, sandbox_id: str) -> str:
+        """The sandbox's control-plane state from the native API."""
+        ...
+
+    def hold_node_manager(self, node_name: str) -> None:
+        """Stop node-manager on the node, so its RPCs wait."""
+        ...
+
+    def release_node_manager(self, node_name: str) -> None:
+        """Continue node-manager on the node."""
+        ...
+
+    def kill_sandbox_runtime(self, node_name: str, sandbox_id: str) -> str:
+        """SIGKILL the sandbox's Firecracker and wait until it is reaped; returns a report."""
+        ...
+
+    def node_sandbox_delete(
+        self, node_name: str, sandbox_id: str, *, discard_reason: str | None
+    ) -> Any:
+        """`space-sbxmgr delete --blocking` on the node; a discard when a reason is given.
+
+        Returns the command result (`returncode`, `detail()`).
+        """
+        ...
+
+    def api_delete(self, sandbox_id: str) -> str:
+        """The public delete; returns its operation id."""
+        ...
+
+    def operation(self, operation_id: str) -> dict[str, Any]:
+        """The public operation's record."""
+        ...
+
+    def native_sandbox_present(self, sandbox_id: str) -> bool:
+        """Whether the native API still finds the sandbox."""
+        ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
+        """The sandbox's execution pods as the apiserver shows them."""
+        ...
+
+    def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:
+        """Whether the sandbox's cache directory, its retained filesystem, is on the node."""
+        ...
+
+    def discard_attempt_window_seconds(self, node_name: str) -> int:
+        """The window the node's discard refuses within, from the suspend attempt's start."""
+        ...
+
+
 @dataclass(frozen=True)
 class ReconcileQueueRef:
     """One `node_reconcile_queue` row: its node, facet and whether it is a dead letter."""
@@ -821,7 +903,8 @@ class NodeCtlFacetRun:
     Times are unix seconds, 0 before the first run. node-ctl runs one work
     item at a time, so `running` false with `last_completed_at` no earlier
     than `last_started_at` means the latest started run has finished, and
-    `last_success_at` equal to `last_completed_at` that it succeeded.
+    `last_success_at` equal to `last_completed_at` with an empty `last_error`
+    that it succeeded (node-ctl clears the error on success, sets it on failure).
     """
 
     last_started_at: int
@@ -831,7 +914,29 @@ class NodeCtlFacetRun:
     last_error: str
 
 
-class UnansweredTemplateEvictionControl(Protocol):
+class NodeCtlFacetControl(Protocol):
+    """Run a worker node-ctl inbound facet on demand and read its latest run.
+
+    Both go through the production `space-nodectl` CLI on the node; see
+    `space_smoke.node_ctl_facets.sync_node_ctl_facet`.
+    """
+
+    def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        """Have that node's node-ctl run inbound `facet` at full scope now (`space-nodectl reconcile`).
+
+        node-ctl's `RefreshFacetState` with no element: the run a poll makes
+        for that facet, followed by an outbound sync. It only enqueues the
+        run; read `node_ctl_facet_run` to see it finish. Raises if node-ctl
+        did not take the request.
+        """
+        ...
+
+    def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
+        """That node's node-ctl status for inbound `facet`'s latest run."""
+        ...
+
+
+class UnansweredTemplateEvictionControl(NodeCtlFacetControl, Protocol):
     """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
 
     A worker's node-ctl waits an hour before deleting a local template the
@@ -880,20 +985,6 @@ class UnansweredTemplateEvictionControl(Protocol):
         ...
 
     def node_template_presence(self, node_name: str) -> NodeTemplatePresence: ...
-
-    def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
-        """Have that node's node-ctl run inbound `facet` at full scope now (`space-nodectl reconcile`).
-
-        node-ctl's `RefreshFacetState` with no element: the run a poll makes
-        for that facet, followed by an outbound sync. It only enqueues the
-        run; read `node_ctl_facet_run` to see it finish. Raises if node-ctl
-        did not take the request.
-        """
-        ...
-
-    def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
-        """That node's node-ctl status for inbound `facet`'s latest run."""
-        ...
 
     def node_ctl_log(self, node_name: str, *, since_time: str) -> str:
         """That worker's node-ctl log since `since_time`. Failure evidence only."""
@@ -1310,7 +1401,13 @@ class EcwScenarioSandboxes(Protocol):
     @property
     def items(self) -> tuple[EcwSandbox, ...]: ...
 
-    def create(self, metadata: Mapping[str, str] | None = None) -> EcwSandbox: ...
+    def create(
+        self,
+        metadata: Mapping[str, str] | None = None,
+        *,
+        network: NetworkConfig | None = None,
+        allow_internet_access: bool | None = None,
+    ) -> EcwSandbox: ...
 
     def fork(
         self,
@@ -1721,10 +1818,6 @@ class EncryptedResuspendControl(RestoreStateRead, Protocol):
         """Read LUKS identity and sparse allocation from the sealed backing file."""
         ...
 
-    def clear_completed_sandbox_pods(self, sandbox_id: str) -> tuple[str, ...]:
-        """Force-clear only deleting pods whose containers all exited successfully."""
-        ...
-
     def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
         """The sandbox's execution pods by label, including terminating ones."""
         ...
@@ -1935,6 +2028,12 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         once at daemon start, and mid-rollout the spec describes a pod that
         does not exist yet on this node.
         """
+        ...
+
+    def template_rootfs_allocated_bytes(
+        self, node_name: str, template: str, content_hash: str
+    ) -> int:
+        """Allocated rootfs bytes, without resolving or touching the LRU clock."""
         ...
 
     def register_unpinned_template(
@@ -2680,8 +2779,18 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """Start watching the leadership Lease; every change it delivers is kept."""
         ...
 
-    def controller_pods(self, *, refused_contender: bool = False) -> list[ControllerPod]:
+    def controller_pods(
+        self, *, refused_contender: bool = False, budget_contender: bool = False
+    ) -> list[ControllerPod]:
         """The healthy Deployment's pods, or the refused contender's."""
+        ...
+
+    def place_budget_contender(self) -> None:
+        """Run the controller template with an unreachable pod-local API endpoint."""
+        ...
+
+    def remove_budget_contender(self, *, wait: bool = False) -> None:
+        """Delete this run's budget control without waiting for its teardown."""
         ...
 
     def place_refused_contender(self) -> None:

@@ -1,12 +1,13 @@
 use super::*;
-use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, NodeId, SandboxId, SandboxLifecycle, SnapshotState, SubstrateKind,
-};
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, pg_test_db,
     pg_test_db_with_max_connections, try_pg_test_db,
 };
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
+use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, SnapshotState};
 
 use pplx_space_test_env::TestResult;
 

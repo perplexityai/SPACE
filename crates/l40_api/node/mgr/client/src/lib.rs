@@ -2,6 +2,16 @@
 /// plus staging overhead. Expiry does not cancel node-owned capture work.
 pub const MEMORY_CAPTURE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(960);
 
+/// Stable allocation-status prefix preserved through the shim into kubelet
+/// Events. Distinguishes memory admission from other ResourceExhausted errors.
+pub const MEMORY_ADMISSION_REFUSAL_PREFIX: &str = "node memory admission refused:";
+
+/// `UNAVAILABLE` message node-manager returns for a call it refuses because
+/// its shutdown has begun. Clients match it by its exact text to tell a
+/// restart from other `UNAVAILABLE` answers, and released clients compare
+/// against this text, so it must not change.
+pub const SHUTTING_DOWN_MESSAGE: &str = "node-manager is shutting down";
+
 pub use pplx_space_node_mgr_protocol::proto;
 
 pub mod environment_selection;
@@ -14,7 +24,7 @@ pub struct SnapshotPages {
 }
 
 impl SnapshotPages {
-    pub fn new(sandbox: pplx_space_common_core::types::SandboxId, measure: bool) -> Self {
+    pub fn new(sandbox: pplx_space_sandbox_model::SandboxId, measure: bool) -> Self {
         Self {
             request: Some(proto::ListBtrfsSnapshotsRequest {
                 sandbox_id: sandbox.to_string(),
@@ -323,7 +333,7 @@ fn validate_resource_status_response(
 }
 
 /// Unix socket path for the node-manager gRPC service.
-pub const SOCKET_PATH: &str = pplx_space_common_core::host::linux::paths::NODE_MANAGER_SOCKET;
+pub const SOCKET_PATH: &str = pplx_space_host_layout::paths::NODE_MANAGER_SOCKET;
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
 
 pub type NodeManagerGrpcClient =
@@ -343,9 +353,13 @@ fn endpoint() -> Result<Endpoint, tonic::transport::Error> {
     Endpoint::try_from(LOCAL_ENDPOINT_URI)
 }
 
-/// Connect to the node-manager gRPC service over Unix socket.
+/// Connect to the node-manager gRPC service over Unix socket. The first dial,
+/// and every redial after the channel's connection drops, retry under the
+/// default connect policy, so a call made while node-manager hands over to its
+/// successor waits for the successor to listen instead of failing with the
+/// refused dial.
 pub async fn connect() -> Result<NodeManagerGrpcClient, ConnectError> {
-    let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint_with_retry(
+    let channel = pplx_space_common_grpc::connect_uds_channel_with_retrying_redials(
         "node-manager",
         std::path::Path::new(SOCKET_PATH),
         endpoint()?,
@@ -392,3 +406,5 @@ pub fn lazy_unshared() -> NodeManagerGrpcClient {
 
 #[cfg(test)]
 mod tests;
+
+pub use pplx_space_node_mgr_protocol::capture_receipt;

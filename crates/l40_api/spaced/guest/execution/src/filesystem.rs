@@ -19,7 +19,7 @@ use metadata::{
     classify_file_type, file_link_count, file_mode, file_owner, symlink_target,
     system_time_to_timestamp,
 };
-use pplx_space_common_core::types::{GuestPath, GuestUserName};
+use pplx_space_guest_process::{GuestPath, GuestUserName};
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     CreateWatcherRequest, CreateWatcherResponse, DisableFileChangesRequest,
     DisableFileChangesResponse, EnableFileChangesRequest, EnableFileChangesResponse, FileInfo,

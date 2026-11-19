@@ -68,10 +68,20 @@ message LaunchSidecarRequest {
   repeated PreExecSocket pre_exec_sockets = 8;
   bool grant_cap_net_admin = 9;
   string execution_id = 10;
+  // Net-gateway only: replace the live gateway with this pid instead of
+  // returning it. Its listening sockets are handed to the replacement when
+  // every one is found, so traffic queued on them is not lost; otherwise the
+  // replacement binds fresh ones. A gateway without launch evidence is
+  // refused, as every launch refuses it. A supervisor that predates this
+  // field returns the live pid unchanged.
+  optional uint32 replace_pid = 11;
 }
 
 message LaunchSidecarResponse {
   uint32 pid = 1;
+  // How many pre-exec sockets the sidecar took over from the process it
+  // replaced; zero when it bound fresh ones.
+  uint32 inherited_sockets = 2;
 }
 
 message StopProcessRequest {

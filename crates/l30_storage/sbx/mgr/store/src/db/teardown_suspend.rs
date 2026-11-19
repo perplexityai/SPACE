@@ -283,6 +283,13 @@ pub fn stage_teardown_suspend_artifact(
     if operation.execution_generation != execution_generation {
         return Err(Error::no_rows());
     }
+    // New captures may stage only their admitted identity. Legacy recovery has
+    // no attempt record and retains its existing canonical-artifact path.
+    if super::read::suspend_attempt(&tx, id)?
+        .is_some_and(|attempt| attempt.artifact_id != local_artifact_id)
+    {
+        return Err(Error::no_rows());
+    }
     upsert_suspend_local_artifact(&tx, id, local_artifact_id, local_path)?;
     let changed = tx.execute(
         "UPDATE sandboxes

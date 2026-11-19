@@ -1,11 +1,13 @@
 use std::time::{Duration, Instant};
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{IdempotencyKey, OrgId, SandboxId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections;
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicSandboxId, RequestFingerprint,
 };
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 

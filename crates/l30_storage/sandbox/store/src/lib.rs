@@ -16,7 +16,11 @@
 //!   cap in `architecture-baseline.toml`. The plain write verbs
 //!   ([`insert_unplaced`], [`insert_pooled`], [`update_desired_state`],
 //!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
-//!   nothing in their `WHERE` beyond the row's id.
+//!   nothing in their `WHERE` beyond the row's id. A write whose caller
+//!   answers with a row shape this crate does not own, such as the api's
+//!   joined response row, still moves here: the caller reads its shape after
+//!   the verb in the same transaction, as the pooled create does after
+//!   [`action_stamp::stamp_pooled_post_wake`].
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
 //!   here leave it to the trigger, except
@@ -70,7 +74,11 @@
 //!   as a `get` plus a filter.
 //! * **Aggregate reads are modules too.** [`stuck`] counts the rows in each
 //!   transient lifecycle by age for a gauge; it reads the row's own clock and
-//!   writes nothing.
+//!   writes nothing. [`node_holds`] lists the rows the node-release gates
+//!   count against one node, each with the gate terms that count it, composed
+//!   from the residency and portability fragments those gates read.
+//!   [`node_placements`] pages one node's placement history, every lifecycle
+//!   included.
 //!
 //! # Fact kinds
 //!
@@ -90,18 +98,21 @@
 //! speculatively — and so are transition modules, which arrive with their
 //! first moved statement. Keep the module declarations below sorted.
 
-use pplx_space_common_core::types::{LocalArtifactId, OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_snapshot_model::LocalArtifactId;
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, latest_full_snapshot_ready, restore_retry_source_snapshot_exists,
     sandbox_attached_anywhere, sandbox_attached_to_node, snapshot_durable_for_source_release,
 };
+use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
 use sqlx::types::JsonValue;
 use time::OffsetDateTime;
@@ -110,6 +121,7 @@ use uuid::Uuid;
 pub mod action_stamp;
 pub mod admin_occupancy;
 pub mod artifact_marker;
+pub mod attribute_runtime;
 pub mod create;
 pub mod delete;
 pub mod direct;
@@ -119,6 +131,8 @@ pub mod ingest;
 pub mod intent;
 mod lifecycle;
 pub mod lost;
+pub mod node_holds;
+pub mod node_placements;
 pub mod orphan;
 pub mod pod_tracking;
 pub mod quarantine;
@@ -137,9 +151,15 @@ pub mod wake;
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 pub use lifecycle::StoredSandboxLifecycle;
 
+/// The nullable `spaced_version` column shared by sandbox observation queries.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ObservedSpacedVersion {
+    pub spaced_version: Option<pplx_space_semver::SemVer>,
+}
+
 /// The `sandboxes.metadata` document: caller-supplied labels, untyped by
 /// design. Distinct from the validated `SandboxMetadata` newtype in
-/// `pplx-space-common-core` — that one enforces a key/value vocabulary,
+/// `pplx-space-sandbox-model` — that one enforces a key/value vocabulary,
 /// this one is whatever a caller already stored. Unifying them is its own
 /// change.
 pub type SandboxMetadata = BTreeMap<String, SandboxMetadataValue>;
@@ -571,8 +591,8 @@ pub struct SandboxDesiredStatePatch<'a> {
 ///
 /// `updated_at` is deliberately not assigned here. The
 /// `sandboxes_set_updated_at` trigger stamps it, and only when a column
-/// outside `{updated_at, last_used_at, last_access_at, last_command_at}`
-/// actually changed; writing it explicitly makes the trigger return early
+/// outside `{updated_at, last_used_at, last_access_at, last_command_at,
+/// next_auto_event_at}` actually changed; writing it explicitly makes the trigger return early
 /// and defeats that no-op detection.
 ///
 /// This row carries four further `BEFORE UPDATE` triggers, two of which
@@ -631,7 +651,7 @@ pub struct SandboxActivationObservation {
     /// restore or wake) is queued or running for it.
     pub activation_pending: bool,
     /// The sandbox's stored lifecycle policy, read with the lifecycle.
-    pub auto_lifecycle: sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
+    pub auto_lifecycle: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
 }
 
 /// Observe the org's sandbox's lifecycle, policy and pending activation, the
@@ -672,7 +692,7 @@ pub async fn activation_observation(
 pub async fn set_auto_lifecycle_policy(
     executor: impl sqlx::PgExecutor<'_>,
     id: SandboxId,
-    policy: &pplx_space_common_core::types::AutoLifecyclePolicy,
+    policy: &pplx_space_auto_lifecycle::AutoLifecyclePolicy,
 ) -> Result<bool, SandboxStoreError> {
     Ok(sqlx::query(sql!(
         "UPDATE sandboxes SET auto_lifecycle_json = $1,
@@ -692,16 +712,14 @@ pub async fn set_auto_lifecycle_policy(
 pub async fn auto_lifecycle_policy(
     executor: impl sqlx::PgExecutor<'_>,
     id: SandboxId,
-) -> Result<Option<pplx_space_common_core::types::AutoLifecyclePolicy>, SandboxStoreError> {
-    let policy = sqlx::query_scalar::<
-        _,
-        sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
-    >(sql!(
-        "SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(executor)
-    .await?;
+) -> Result<Option<pplx_space_auto_lifecycle::AutoLifecyclePolicy>, SandboxStoreError> {
+    let policy =
+        sqlx::query_scalar::<_, sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>>(
+            sql!("SELECT auto_lifecycle_json FROM sandboxes WHERE id = $1"),
+        )
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
     Ok(policy.map(|policy| policy.0))
 }
 
@@ -722,7 +740,7 @@ pub struct AutoLifecycleExecution {
     pub execution_generation: Option<i64>,
     pub has_direct_route: bool,
     pub has_activation_lease: bool,
-    pub policy: sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
+    pub policy: sqlx::types::Json<pplx_space_auto_lifecycle::AutoLifecyclePolicy>,
 }
 
 impl AutoLifecycleExecution {

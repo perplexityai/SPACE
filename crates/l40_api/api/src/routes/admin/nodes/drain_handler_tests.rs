@@ -30,10 +30,11 @@ use axum::Extension;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use pplx_space_common_core::sql;
-use pplx_space_common_core::types::admin::DrainRequest;
-use pplx_space_common_core::types::{NodeDrainMode, NodeId, OrgId, SandboxOwnerSource, UserId};
+use pplx_space_accounts::{NodeId, OrgId, SandboxOwnerSource, UserId};
+use pplx_space_admin_protocol::DrainRequest;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_node_model::NodeDrainMode;
+use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -416,6 +417,31 @@ async fn terminate_does_not_rewrite_the_drains_own_columns() -> TestResult {
     );
     assert_eq!(after.started_at, before.started_at);
     assert_eq!(after.phase.as_deref(), Some("terminating"));
+    // The guard must count target-only ownership through the handler, not
+    // only through the store's occupancy helper. No Kubernetes action is
+    // reachable on this refusal, so a real cluster adds no evidence.
+    let held = insert_node(&db.pool, Some("drained"), Some("forced"), false).await?;
+    super::super::node_store::terminate_gate_agreement_tests::insert_target_pinned(
+        &db.pool,
+        held.as_uuid(),
+        "suspending",
+        None,
+    )
+    .await?;
+    let held_before = drain_columns(&db.pool, held).await?;
+    let (status, body) = post_drain_response(
+        &state,
+        &actor,
+        held,
+        DrainAction::Terminate,
+        DrainRequest::default(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["sandboxes_active"], 0);
+    assert_eq!(body["sandboxes_drain_blockers"], 1);
+    assert_eq!(body["sandboxes_local_snapshots"], 1);
+    assert_eq!(drain_columns(&db.pool, held).await?, held_before);
     Ok(())
 }
 

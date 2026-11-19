@@ -105,7 +105,7 @@ fn lifetime_jitter_spreads_retirement_around_target() {
 
 #[test]
 fn pool_retires_connections_after_release_and_keeps_a_floor() {
-    let options = postgres_pool_options();
+    let options = postgres_pool_options(DatabaseIdentity::SpaceUser);
 
     assert_eq!(options.get_max_lifetime(), None);
     assert!(options.get_min_connections() > 0);
@@ -175,6 +175,35 @@ async fn a_capped_pool_ignores_the_service_wide_connection_env() {
         3,
         "an env floor above the cap must clamp to the cap, never exceed it"
     );
+}
+
+/// `POSTGRES_CREDS_POOL_MAX_CONNECTIONS` caps only the `space_creds` pool;
+/// the `space_user` pool beside it keeps `POSTGRES_POOL_MAX_CONNECTIONS`.
+#[tokio::test]
+async fn the_creds_pool_cap_applies_only_to_space_creds() {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "POSTGRES_POOL_MAX_CONNECTIONS",
+            Some(std::ffi::OsStr::new("50")),
+        ),
+        (
+            "POSTGRES_CREDS_POOL_MAX_CONNECTIONS",
+            Some(std::ffi::OsStr::new("4")),
+        ),
+        ("POSTGRES_POOL_MIN_CONNECTIONS", None),
+    ]) {
+        return;
+    }
+    let url = "postgres://space_admin:admin@127.0.0.1:1/space?sslmode=disable";
+    let password = std::process::id().to_string();
+    let max = |identity| {
+        connect_postgres_lazy_as(url, "creds-cap-test", identity, &password)
+            .unwrap()
+            .options()
+            .get_max_connections()
+    };
+    assert_eq!(max(DatabaseIdentity::SpaceUser), 50);
+    assert_eq!(max(DatabaseIdentity::SpaceCreds), 4);
 }
 
 /// Pins the always-on query spans: SQLx keeps the statement level only in

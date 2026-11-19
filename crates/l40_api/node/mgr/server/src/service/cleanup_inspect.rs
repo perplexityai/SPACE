@@ -2,11 +2,11 @@ use super::cleanup_helpers::*;
 use super::disk::*;
 use super::validation::*;
 use super::*;
-use pplx_space_common_core::host::linux::paths;
-use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
+use pplx_space_host_layout::paths;
+use pplx_space_sandbox_model::SandboxId;
 use tracing::Instrument as _;
 
 type CleanupOperationResult = Result<CleanupSandboxResponse, Status>;
@@ -269,6 +269,13 @@ impl NodeManagerService {
         self.pool.shutdown_token.cancel();
         self.lifecycle_limiter.close();
         self.cleanup_operations.stop_admitting();
+    }
+
+    /// Ask admitted artifact mutations to stop before their next phase. The
+    /// drain calls this once its budget runs out, so the process still exits
+    /// within its grace period.
+    pub fn cancel_admitted_artifact_work(&self) {
+        self.artifact_work_cancel.cancel();
     }
 
     pub(super) async fn cleanup_sandbox(
@@ -810,8 +817,8 @@ impl NodeManagerService {
         // Inspection reports filesystem presence, not execution authority.
         // Probe both owned adapter roots even when metadata is damaged.
         let jail_roots = [
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
-            pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+            pplx_space_execution_spec::RuntimeKind::Firecracker,
+            pplx_space_execution_spec::RuntimeKind::CloudHypervisor,
         ]
         .into_iter()
         .map(|runtime| pplx_space_node_runtime_core::control::isolation_root(runtime, sandbox_id))

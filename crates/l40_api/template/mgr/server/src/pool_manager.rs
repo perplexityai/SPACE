@@ -8,8 +8,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pplx_space_common_core::ids::sandbox_label_or_id;
-use pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER;
+use pplx_space_accounts::TEMPLATE_MANAGER_SANDBOX_OWNER;
+use pplx_space_sandbox_model::ids::sandbox_label_or_id;
 
 const BASE_TICK: u64 = 5;
 const MAX_TICK: u64 = 160;
@@ -113,9 +113,9 @@ pub(crate) fn pool_base_build(
                 && resolved.get(&build.content_hash) == Some(&build.cache_partition.key())
         })
         .filter_map(|build| {
-            use pplx_space_common_core::types::RuntimeKind;
+            use pplx_space_execution_spec::RuntimeKind;
             let runtime = build.runtime.parse::<RuntimeKind>().ok()?;
-            let manifest: pplx_space_common_core::types::TemplateManifest =
+            let manifest: pplx_space_template_manifest::TemplateManifest =
                 serde_json::from_str(&build.manifest_json).ok()?;
             let execution = manifest.execution_metadata().ok()?;
             if let Some(execution) = execution {
@@ -235,15 +235,15 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
     // Unknown inventory cannot prove pool capacity or authorize its cleanup.
     for sandbox in &all_sandboxes {
         sandbox
-            .observed_lifecycle()
+            .observed_status()
             .map_err(|error| PoolError::SandboxClient(error.to_string()))?;
     }
 
     // Clean up failed pool sandboxes
     for sbx in &all_sandboxes {
         if sbx.pool_template.is_some()
-            && sbx.observed_lifecycle().is_ok_and(|state| {
-                state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Failed
+            && sbx.observed_status().is_ok_and(|state| {
+                state.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Failed)
             })
         {
             outcome.record_failure(PoolError::FailedSandbox {
@@ -267,6 +267,7 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
                     sandbox_id: sbx.sandbox_id.clone(),
                     template_filter: None,
                     blocking: true,
+                    discard_retained_filesystem_reason: None,
                 })
                 .await
             {
@@ -285,8 +286,10 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             .iter()
             .filter(|s| {
                 s.pool_template.as_deref() == Some(pool.template.as_str())
-                    && s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+                    && s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused,
+                        )
                     })
             })
             .count();
@@ -295,16 +298,26 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             .iter()
             .filter(|s| {
                 s.pool_template.as_deref() == Some(pool.template.as_str())
-                    && (s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Creating
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Created
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Starting
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started
-                    }) || s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Pausing
+                    && (s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Creating,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Created,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Starting,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started,
+                        )
+                    }) || s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Pausing,
+                        )
                     }))
             })
             .count();
@@ -320,8 +333,10 @@ async fn pool_tick(db: &Arc<Mutex<rusqlite::Connection>>) -> PoolResult<PoolTick
             .iter()
             .find(|s| {
                 s.pool_template.as_deref() == Some(pool.template.as_str())
-                    && s.observed_lifecycle().is_ok_and(|state| {
-                        state == pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused
+                    && s.observed_status().is_ok_and(|state| {
+                        state.is_unowned(
+                            pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Paused,
+                        )
                     })
             })
             .map(|s| s.sandbox_id.clone());
@@ -417,14 +432,11 @@ pub(crate) async fn create_from_base(
         Some(build) => {
             let runtime = build
                 .runtime
-                .parse::<pplx_space_common_core::types::RuntimeKind>()
+                .parse::<pplx_space_execution_spec::RuntimeKind>()
                 .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
             (Some(build.content_hash), runtime)
         }
-        None => (
-            None,
-            pplx_space_common_core::types::RuntimeKind::Firecracker,
-        ),
+        None => (None, pplx_space_execution_spec::RuntimeKind::Firecracker),
     };
     match do_create_from_base(
         &template,
@@ -450,7 +462,7 @@ pub(crate) async fn create_from_base(
 async fn do_create_from_base(
     template: &str,
     content_hash: Option<String>,
-    runtime: pplx_space_common_core::types::RuntimeKind,
+    runtime: pplx_space_execution_spec::RuntimeKind,
     from_snapshot: bool,
     vcpu: u32,
     memory_mib: u32,
@@ -484,6 +496,7 @@ async fn do_create_from_base(
             rootfs_size_mb: None,
             disk_io_max_operations_per_sec: None,
             disk_io_max_bandwidth_mib_per_sec: None,
+            required_environment: None,
             network_policy: None,
             network_policy_generation: 0,
             network_policy_authority: crate::db::PolicyAuthority::Cluster.as_proto_i32(),
@@ -550,6 +563,7 @@ async fn do_create_from_base(
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {
@@ -665,6 +679,7 @@ async fn do_clone_and_start(
                 sandbox_id: sandbox_id.clone(),
                 template_filter: None,
                 blocking: true,
+                discard_retained_filesystem_reason: None,
             })
             .await
         {

@@ -4,13 +4,16 @@ use std::{
 };
 
 use bytes::Bytes;
-use pplx_space_common_core::host::linux::paths::template_build_dir;
-use pplx_space_common_core::types::{
-    AuthIdParseError, ContentHash, OrgId, RUNTIME_FIRECRACKER_ALIAS, StorageUri,
-    SystemPublicationGrantId, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
-    TEMPLATE_ROOTFS_ZSTD_LEVEL, TemplateArtifact, TemplateName, TenantPublicationGrantId,
-    template_object_key, template_object_prefix,
+use pplx_space_accounts::{
+    AuthIdParseError, OrgId, SystemPublicationGrantId, TenantPublicationGrantId,
 };
+use pplx_space_artifact_model::template_build_dir;
+use pplx_space_artifact_model::{
+    StorageUri, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
+    TemplateArtifact, template_object_key, template_object_prefix,
+};
+use pplx_space_content_digest::ContentHash;
+use pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS;
 use pplx_space_node_api_client::cluster::{
     AuthenticatedClusterApiClient, ConnectClusterApiError,
     connect_from_env as connect_cluster_api_from_env,
@@ -24,6 +27,7 @@ use pplx_space_object_store::{
     ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
 };
 use pplx_space_page_cache as page_cache;
+use pplx_space_template_model::TemplateName;
 use serde::{Deserialize, Serialize};
 use tonic::Code;
 
@@ -96,9 +100,9 @@ pub enum PublishError {
     #[error("invalid system publication grant returned by ClusterApi: {0}")]
     InvalidSystemGrant(#[source] AuthIdParseError),
     #[error(transparent)]
-    InvalidTemplateName(#[from] pplx_space_common_core::types::TemplateParseError),
+    InvalidTemplateName(#[from] pplx_space_template_model::TemplateParseError),
     #[error(transparent)]
-    InvalidContentHash(#[from] pplx_space_common_core::types::DigestParseError),
+    InvalidContentHash(#[from] pplx_space_content_digest::DigestParseError),
     #[error(transparent)]
     ObjectStoreConfig(#[from] ObjectStoreConfigError),
     #[error("required build artifact is missing: {path}")]
@@ -121,7 +125,7 @@ pub enum PublishError {
     ManifestExecutionMetadata {
         path: PathBuf,
         #[source]
-        source: pplx_space_common_core::types::TemplateManifestSchemaError,
+        source: pplx_space_template_manifest::TemplateManifestSchemaError,
     },
     #[error(
         "manifest {path} carries no execution metadata; registering would create a \
@@ -223,7 +227,7 @@ pub async fn register_build_template(
 pub(crate) fn published_build_dir(
     template: &TemplateName,
     content_hash: &ContentHash,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> PathBuf {
     PathBuf::from(template_build_dir(
         template.as_str(),
@@ -237,7 +241,7 @@ pub(crate) fn published_build_dir(
 pub async fn publish_build(
     template_id: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     publish_tags: &[String],
     publication: TemplatePublication,
 ) -> Result<(), PublishError> {
@@ -726,13 +730,11 @@ async fn load_build_execution_metadata(
                 path: manifest_path.clone(),
                 source,
             })?;
-    let manifest = serde_json::from_slice::<pplx_space_common_core::types::TemplateManifest>(
-        &bytes,
-    )
-    .map_err(|source| PublishError::InvalidArtifact {
-        path: manifest_path.clone(),
-        source,
-    })?;
+    let manifest = serde_json::from_slice::<pplx_space_template_manifest::TemplateManifest>(&bytes)
+        .map_err(|source| PublishError::InvalidArtifact {
+            path: manifest_path.clone(),
+            source,
+        })?;
     let execution = manifest.execution_metadata().map_err(|source| {
         PublishError::ManifestExecutionMetadata {
             path: manifest_path.clone(),

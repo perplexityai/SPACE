@@ -1,6 +1,6 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_accounts::NodeId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::future::Future;
 
 use sqlx::{FromRow, PgPool};

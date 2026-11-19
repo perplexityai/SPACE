@@ -10,12 +10,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pplx_space_common_core::host::linux::identities::group_names;
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 use serde::Deserialize;
-use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -32,6 +31,10 @@ use crate::slot_pool::{
 /// The service name node-manager reports to telemetry, names its health and
 /// rate-limit surfaces with, and binds its production socket under.
 pub const SERVICE_NAME: &str = "space-node-manager";
+
+const CAPTURE_VM_STATE_PATH: &str = "/space.node.v1.NodeManager/CaptureVmState";
+const CAPTURE_VM_STATE_RPC_BUDGET: Duration =
+    pplx_space_node_mgr_client::MEMORY_CAPTURE_WAIT_TIMEOUT.saturating_add(Duration::from_secs(30));
 
 /// Group name that controls who can connect to the node-manager socket.
 const SOCKET_GROUP: &str = group_names::SPACE_NODECLIENTS;
@@ -583,7 +586,7 @@ fn activate_runtime_supervisor_on_start() -> Result<(), RunNodeMgrError> {
 }
 
 fn runtime_supervisor_activation_enabled(raw: Option<&str>) -> bool {
-    pplx_space_common_core::env::env_flag(raw, false)
+    pplx_space_env_vars::env_flag(raw, false)
 }
 
 /// Run node-manager until `shutdown_token` fires or a startup step fails.
@@ -655,7 +658,7 @@ pub async fn run(
 
     // Reject incompatible ownership before any host limit can shrink beneath
     // live sandboxes. Pool construction repeats this check before row repair.
-    let db_path = Path::new(pplx_space_common_core::host::linux::paths::NODE_MANAGER_DB);
+    let db_path = Path::new(pplx_space_host_layout::paths::NODE_MANAGER_DB);
     pplx_space_sqlite::migrate("node-manager", db_path, &NODE_MANAGER_MIGRATOR)
         .await
         .map_err(RunNodeMgrError::Migrate)?;
@@ -892,18 +895,31 @@ pub async fn run(
                 tonic_health::ServingStatus::Serving,
             )
             .await;
-        let production_shutdown = {
-            let token = production_shutdown_token.clone();
-            async move { token.cancelled().await }
-        };
         let server_handle = tokio::spawn(
-            pplx_space_grpc_server::grpc_server_builder()
+            pplx_space_grpc_server::grpc_server_builder_with_request_timeout(
+                CAPTURE_VM_STATE_RPC_BUDGET,
+            )
+                .layer(pplx_space_grpc_server::MethodTimeoutLayer(|path| {
+                    if path == CAPTURE_VM_STATE_PATH {
+                        CAPTURE_VM_STATE_RPC_BUDGET
+                    } else {
+                        pplx_space_grpc_server::GRPC_REQUEST_TIMEOUT
+                    }
+                }))
                 .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_ACCEPT_RESET_STREAMS))
                 .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
                 .layer(pplx_space_grpc_server::grpc_trace_layer())
                 .add_service(health_service)
                 .add_service(NodeManagerServer::new(service.clone()))
-                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), production_shutdown),
+                .serve_with_incoming_shutdown(
+                    // Closed when the drain starts: connects are refused, not
+                    // queued until the drain ends.
+                    pplx_space_grpc_server::unix_incoming_until_shutdown(
+                        listener,
+                        production_shutdown_token.clone(),
+                    ),
+                    std::future::pending(),
+                ),
         );
 
         shutdown_token.cancelled().await;
@@ -919,7 +935,13 @@ pub async fn run(
             server_result
         };
 
-        if let Err(error) = drain_before_handoff(drain, DEFAULT_DRAIN_TIMEOUT).await {
+        // Admitted artifact work, such as a restore's receive, finishes inside
+        // the budget; past it, it is cancelled so the drain still ends within
+        // the pod's grace period.
+        let cancel_artifact_work = || service.cancel_admitted_artifact_work();
+        if let Err(error) =
+            drain_before_handoff(drain, DEFAULT_DRAIN_TIMEOUT, cancel_artifact_work).await
+        {
             tracing::warn!(%error, "node-manager gRPC server task ended unexpectedly");
         }
         Ok(())
@@ -927,13 +949,19 @@ pub async fn run(
     .await;
     shutdown_token.cancel();
     task_tracker.close();
-    drain_before_handoff(task_tracker.wait(), DEFAULT_DRAIN_TIMEOUT).await;
+    drain_before_handoff(task_tracker.wait(), DEFAULT_DRAIN_TIMEOUT, || {}).await;
     drop(service_mutex);
     active_result
 }
 
-/// A deadline signals escalation, never permission to release exclusion.
-async fn drain_before_handoff<F: std::future::Future>(drain: F, budget: Duration) -> F::Output {
+/// A deadline signals escalation, never permission to release exclusion. Once
+/// `budget` runs out, `on_budget_exhausted` asks the remaining work to stop,
+/// and the drain keeps waiting for it.
+async fn drain_before_handoff<F: std::future::Future>(
+    drain: F,
+    budget: Duration,
+    on_budget_exhausted: impl FnOnce(),
+) -> F::Output {
     tokio::pin!(drain);
     match tokio::time::timeout(budget, &mut drain).await {
         Ok(result) => result,
@@ -942,6 +970,7 @@ async fn drain_before_handoff<F: std::future::Future>(drain: F, budget: Duration
                 drain_timeout_secs = budget.as_secs(),
                 "drain budget exhausted; retaining service mutex until mutations stop; operator must verify child termination before forced handoff"
             );
+            on_budget_exhausted();
             drain.await
         }
     }

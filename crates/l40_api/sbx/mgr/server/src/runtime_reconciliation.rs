@@ -1,7 +1,7 @@
-use pplx_space_common_core::types::{
+use pplx_space_node_runtime_core::vm_state::VmState;
+use pplx_space_sandbox_model::{
     SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
-use pplx_space_node_runtime_core::vm_state::VmState;
 
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::state::SandboxState;

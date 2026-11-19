@@ -9,13 +9,15 @@
 //! fail-closed direction is unchanged: a node the control plane cannot see
 //! keeps every row blocking.
 
-use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_residency::{CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SETTLE};
+use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use super::{

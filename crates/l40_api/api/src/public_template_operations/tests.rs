@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, OrgId};
+use pplx_space_accounts::{NodeId, OrgId};
 
 use pplx_space_cluster_pool::{PoolConfigOwner, PoolSlotState};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, pg_test_db, pg_test_db_with_max_connections};

@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
+pplx-space-artifact-model = { workspace = true, features = ["serde"] }
+pplx-space-subject-model = { workspace = true, features = ["serde"] }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -22,8 +24,10 @@ tonic-prost = { workspace = true }
 tower = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-accounts = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-host-layout = { workspace = true }
+pplx-space-snapshot-model = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
@@ -33,3 +37,4 @@ tonic-prost-build = { workspace = true }
 [dev-dependencies]
 hex = { workspace = true }
 insta = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

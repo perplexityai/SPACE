@@ -91,6 +91,7 @@ crates/l50_app/data/plane/svc/**
 # Guest execution and shared gRPC admission run in every sandbox.
 crates/l10_foundation/spaced/**
 crates/l20_domain/spaced/**
+crates/l40_api/spaced/client/**
 crates/l40_api/spaced/guest/client/**
 crates/l40_api/spaced/guest/execution/**
 crates/l40_api/spaced/guest/server/**

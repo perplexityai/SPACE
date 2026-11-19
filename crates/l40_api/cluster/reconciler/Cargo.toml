@@ -21,12 +21,14 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-accounts = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
-pplx-space-common-core = { workspace = true }
+pplx-space-node-model = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-reconcile-metrics = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 
 [dev-dependencies]

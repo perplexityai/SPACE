@@ -81,6 +81,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -231,6 +232,21 @@ def image_digests(ref: str) -> tuple[str, str]:
 
 def docker_build(command: list[str], identity: str, revision_label: bool) -> None:
     env = dict(os.environ, SPACE_GIT_SHA=identity)
+    if "SPACE_BUILD_TIME" in command and re.fullmatch(r"[0-9a-f]{40,64}", identity):
+        # Descriptor identity must not vary with a cold-cache rebuild.
+        revision = identity.split("-dirty-", 1)[0]
+        if (REPO_ROOT / ".sl").exists():
+            timestamp = run([
+                "sl", "-R", str(REPO_ROOT), "log", "-r", revision,
+                "-T", "{date|hgdate}",
+            ]).split()[0]
+        else:
+            timestamp = run([
+                "git", "-C", str(REPO_ROOT), "show", "-s", "--format=%ct", revision,
+            ]).strip()
+        env["SPACE_BUILD_TIME"] = datetime.fromtimestamp(
+            float(timestamp), timezone.utc,
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
     label = ["--label", f"{REVISION_LABEL}={identity}"] if revision_label else []
     status = subprocess.run(command + label, env=env).returncode
     if status:

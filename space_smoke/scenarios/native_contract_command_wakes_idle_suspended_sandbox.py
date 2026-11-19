@@ -6,7 +6,8 @@ from space_smoke.native_hardening import NativeEvents, NativeHardeningFixture
 from space_smoke.registry import scenario
 
 MARKER = "space-smoke-command-wake-ok"
-IDLE_SECONDS = 60
+# Long enough to finish the small setup; suspension itself is observed, not slept.
+IDLE_SECONDS = 15
 # The idle deadline is checked on reconciler ticks, and the suspend uploads a
 # snapshot before the sandbox reports suspended.
 SUSPEND_BUDGET_SECONDS = 300

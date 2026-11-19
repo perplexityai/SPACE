@@ -1,9 +1,10 @@
 //! Recovery of an abandoned publication after its only execution disappeared.
 
-use pplx_space_common_core::{
-    sql,
-    types::{LocalArtifactId, NodeId, SandboxId, SnapshotId, SubstrateKind},
-};
+use pplx_space_accounts::NodeId;
+use pplx_space_node_model::SubstrateKind;
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
+use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 

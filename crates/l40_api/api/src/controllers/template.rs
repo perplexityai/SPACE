@@ -1,15 +1,14 @@
 use std::{future::Future, time::Duration};
 
+use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
 use pplx_space_build_mgr_client::proto::{
     self as build_proto, BuildOptions, ClientContext, GetBuildStatusRequest,
     GetBuildStatusResponse, StartBuildRequest, StartBuildResponse, UploadBlobChunk,
     UploadBlobResponse,
 };
-use pplx_space_common_core::types::{
-    BuildRunId, EnvironmentReference, NodeId, OrgId, SystemPublicationGrantId, SystemTemplate,
-    TemplateName, TemplateReference, TenantPublicationGrantId,
-};
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_node_api_client::proto::BuildTemplateResponse;
+use pplx_space_template_model::{BuildRunId, SystemTemplate, TemplateName, TemplateReference};
 
 use super::{
     ControllerError, db_contention_error,

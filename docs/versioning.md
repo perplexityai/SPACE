@@ -20,6 +20,34 @@ backward-compatible. From 1.0, compatible features increment the minor version,
 compatible fixes increment the patch version, and breaking changes require a new
 major version.
 
+## Workspace releases and existing guests
+
+The workspace version is the sole ordered release version for host and guest
+components. Running instances can differ during deployment or while dormant;
+one release history does not imply simultaneous fleet upgrades.
+
+Guest bundles record `guest_update_required_since`, the latest workspace release
+whose guest changes warrant restarting existing guests. It is an existing
+release reference at or below the bundle version, not a separately allocated
+number. A normal upgrade requires both the target version and marker to exceed
+the installed guest version. Compatibility, a deployment ceiling, idle admission
+and explicit artifact authorization remain independent requirements. Explicit
+rollback is separately authorized and preserves forward release history.
+
+[`ci/guest-update-required-since`](../ci/guest-update-required-since) supplies the
+marker when packaging a release. Release automation must allocate the final
+workspace version in a serialized publication process. A normalized spaced
+protobuf descriptor change requests a patch release and advances the marker;
+comments and source locations are excluded. Authors explicitly request the same
+for behavior changes that should reach existing guests. Other release triggers
+leave the marker unchanged. Descriptor comparison detects contract changes, not
+whether a breaking change is safe: the minor/major policy still applies.
+
+Current bundle CI publishes commit-tagged builds and does not allocate immutable
+workspace releases. Until serialized allocation and immutable publication are
+in place, same-version development builds cannot authorize automatic guest
+upgrades. Do not independently pick patch versions in concurrent feature PRs.
+
 ## Service contracts
 
 At 1.0, backward compatibility throughout 1.x covers:
@@ -39,7 +67,7 @@ a separate crate-level policy.
 
 The host supports stable `spaced` guest versions **>=0.1.0 and <0.9.0**.
 Prereleases are not admitted. Build metadata does not change compatibility.
-The supported range is declared in `pplx-space-spaced-common`; changing the host
+The supported range is declared in `pplx-space-spaced-protocol`; changing the host
 release number does not change that range implicitly.
 
 From 0.8.1, guests report their OS and supported operations in the readiness
@@ -90,6 +118,37 @@ bound to `<0.10.0` after validating compatibility. Existing 0.1.4 and 0.8 guests
 then continue running against 0.9 hosts without a guest update or identity
 change. The 0.8 host's `<0.9.0` bound only limits which newer guests that host
 accepts; it does not constrain the support policy of a future host release.
+
+### Guest-update baseline
+
+Manager-owned and node-local automatic guest updates require a committed guest
+version of at least 0.8.2 and a recovery contract matching the sandbox's trusted
+image profile. Older guests keep serving work but are never selected. Before
+recreation, verify that the replacement template has a committed guest version
+of at least 0.8.2 and a recovery contract matching the trusted image profile.
+Follow the [template guidance](spaced-upgrades.md#manager-owned-guest-update-and-restart).
+The separate manual procedure supports only
+legacy Linux guests with regular spaced binary files, not Windows or two-slot
+guests; those require recreation or a separately qualified repair.
+
+This floor identifies the first supported maintenance release, not one immutable
+set of bytes. CI still publishes commit-tagged builds. The 0.8.2 bump reserves
+the baseline in the workspace; it does not create a release tag or implement
+serialized publication. Release owners must coordinate subsequent version
+allocations against main and advance both workspace version and guest marker
+for every guest-relevant change before publishing it to existing guests.
+Within the same recovery contract and architecture, never install a target
+catalog offering existing guests bytes different from an earlier target with
+the same workspace version. Different platform/architecture entries may share
+a workspace version while carrying their own bytes. Commit-tagged CI builds may
+seed new templates; they do not authorize replacing equal-version guests. Reverting
+only the version bump leaves the maintenance floor unchanged and disables
+maintenance for newly built older guests; keep the baseline when rolling back a deployment. Feature rollback requires
+a compatible migration catalog and a state-preserving recovery plan; a
+pre-protocol manager cannot open a database with newer migrations, and dropping
+receipt/history tables loses recovery evidence. Follow the
+[guest-update rollback guidance](spaced-upgrades.md#automatic-node-local-guest-updates)
+before changing deployed host services.
 
 ## Sandbox lifetime from 1.0
 

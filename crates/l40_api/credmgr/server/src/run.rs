@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::host::linux::identities::group_names;
-use pplx_space_common_core::{types::KekProvider, types::MasterKeyIdentifier};
+use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
+use pplx_space_host_layout::identities::group_names;
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
@@ -206,9 +206,7 @@ pub enum RunCredmgrError {
     )]
     MissingPlatformKekIdentifier,
     #[error("SPACE_PLATFORM_KEK_IDENTIFIER is invalid: {0}")]
-    InvalidPlatformKekIdentifier(
-        #[source] pplx_space_common_core::types::MasterKeyIdentifierParseError,
-    ),
+    InvalidPlatformKekIdentifier(#[source] pplx_space_byok_model::MasterKeyIdentifierParseError),
     #[error(
         "SPACE_PLATFORM_KEK_PROVIDER=intermediate-key-broker requires DATABASE_URL and a \
          non-empty SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL"
@@ -504,6 +502,7 @@ pub async fn run(
                 service,
                 config.socket_path.clone(),
                 node_local,
+                Handoff::AfterDrain,
                 shutdown_token,
             )
             .await?
@@ -581,9 +580,9 @@ async fn initialize_authority_service(
             (private_ca_issuer, resolver)
         };
 
-    let platform_kek_provider = pplx_space_common_core::types::platform_default_kek_provider();
-    let in_memory_enabled = pplx_space_common_core::env::env_flag(
-        pplx_space_common_core::env::test_hook_var(IN_MEMORY_KEK_ENABLED_ENV).as_deref(),
+    let platform_kek_provider = pplx_space_byok_model::platform_default_kek_provider();
+    let in_memory_enabled = pplx_space_env_vars::env_flag(
+        pplx_space_test_hooks::test_hook_var(IN_MEMORY_KEK_ENABLED_ENV).as_deref(),
         false,
     );
     let mut composite = CompositeKeyWrapper::new();
@@ -608,7 +607,7 @@ async fn initialize_authority_service(
         let pool = pool
             .as_ref()
             .ok_or(RunCredmgrError::InMemoryPlatformKekMissingDatabase)?;
-        let identifier = pplx_space_common_core::env::test_hook_var(PLATFORM_KEK_IDENTIFIER_ENV)
+        let identifier = pplx_space_test_hooks::test_hook_var(PLATFORM_KEK_IDENTIFIER_ENV)
             .filter(|value| !value.is_empty())
             .ok_or(RunCredmgrError::MissingPlatformKekIdentifier)?;
         let identifier = MasterKeyIdentifier::parse(identifier)
@@ -874,6 +873,21 @@ struct NodeLocalActivation {
     service_mutex: ServiceMutex,
 }
 
+/// When a node-local credential-manager that is shutting down hands the
+/// service mutex to its successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handoff {
+    /// As the drain starts. The listeners close then, so the predecessor only
+    /// finishes RPCs it has already accepted while the successor binds and
+    /// serves new ones. Only the node credential agent, which forwards each
+    /// RPC to the authority and holds no database, runs beside its successor
+    /// this way; its callers are then refused for one mutex poll rather than
+    /// for the whole drain.
+    AtDrainStart,
+    /// Once the drain has finished.
+    AfterDrain,
+}
+
 /// Which listener a supervised credential-manager gRPC server serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialManagerServerKind {
@@ -1065,6 +1079,8 @@ where
     S: CredentialManager,
 {
     let (_, health_service) = pplx_space_grpc_server::grpc_health_service();
+    // The end of the accept stream starts the drain (see
+    // `accept_until_shutdown`); the shutdown future only keeps it graceful.
     pplx_space_grpc_server::grpc_server_builder()
         .layer(pplx_space_grpc_server::grpc_trace_layer())
         .layer(
@@ -1075,11 +1091,36 @@ where
         .layer(access)
         .add_service(health_service)
         .add_service(CredentialManagerServer::new(service))
-        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
-            shutdown_token.cancelled().await
-        })
+        .serve_with_incoming_shutdown(
+            accept_until_shutdown(listener, shutdown_token),
+            std::future::pending(),
+        )
         .await
         .map_err(ServeError::UdsServer)
+}
+
+/// `listener`'s connections until `shutdown` fires, when the listener itself
+/// is dropped. Tonic keeps the stream it serves until every accepted
+/// connection has drained, and a listener kept with it would go on completing
+/// connects into a backlog nothing accepts: a caller's RPC would then hang
+/// until the drain ends and fail with the connection reset. Closed, it refuses
+/// them at once, so the caller's connect retry reaches the successor as soon
+/// as the successor binds.
+fn accept_until_shutdown(
+    listener: tokio::net::UnixListener,
+    shutdown: CancellationToken,
+) -> impl futures_util::Stream<Item = std::io::Result<tokio::net::UnixStream>> {
+    let mut listener = Some(UnixListenerStream::new(listener));
+    let mut shutdown = Box::pin(shutdown.cancelled_owned());
+    futures_util::stream::poll_fn(move |cx| {
+        if shutdown.as_mut().poll(cx).is_ready() {
+            listener = None;
+        }
+        match listener.as_mut() {
+            Some(listener) => futures_util::Stream::poll_next(std::pin::Pin::new(listener), cx),
+            None => std::task::Poll::Ready(None),
+        }
+    })
 }
 
 async fn serve_node_local_uds<S>(
@@ -1087,6 +1128,7 @@ async fn serve_node_local_uds<S>(
     service: S,
     production_socket: PathBuf,
     node_local: NodeLocalActivation,
+    handoff: Handoff,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunCredmgrError>
 where
@@ -1105,6 +1147,7 @@ where
     supervise_node_local_servers(
         servers,
         node_local,
+        handoff,
         shutdown_token,
         production_shutdown_token,
     )
@@ -1138,9 +1181,12 @@ async fn serve_node_local_uds_and_tcp(
     );
     node_local.health_server.activate(production_socket);
 
+    // The TCP listener keeps its port until the drain ends, so a successor
+    // taking over earlier could not bind it.
     supervise_node_local_servers(
         servers,
         node_local,
+        Handoff::AfterDrain,
         shutdown_token,
         production_shutdown_token,
     )
@@ -1150,6 +1196,7 @@ async fn serve_node_local_uds_and_tcp(
 async fn supervise_node_local_servers(
     mut servers: JoinSet<(CredentialManagerServerKind, Result<(), ServeError>)>,
     node_local: NodeLocalActivation,
+    handoff: Handoff,
     shutdown_token: CancellationToken,
     production_shutdown_token: CancellationToken,
 ) -> Result<(), RunCredmgrError> {
@@ -1169,8 +1216,16 @@ async fn supervise_node_local_servers(
         health_server,
         service_mutex,
     } = node_local;
+    production_shutdown_token.cancel();
+    let service_mutex = match handoff {
+        Handoff::AtDrainStart => {
+            drop(service_mutex);
+            tracing::info!("released service mutex; draining accepted RPCs beside the successor");
+            None
+        }
+        Handoff::AfterDrain => Some(service_mutex),
+    };
     let drain = async {
-        production_shutdown_token.cancel();
         let mut results = Vec::new();
         if let Some(result) = first_exit {
             results.push(result);
@@ -1493,6 +1548,7 @@ async fn run_agent(
         ),
         config.socket_path,
         node_local,
+        Handoff::AtDrainStart,
         shutdown_token,
     )
     .await

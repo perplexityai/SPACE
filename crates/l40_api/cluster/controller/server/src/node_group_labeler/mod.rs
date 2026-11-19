@@ -74,7 +74,7 @@
 //! [`WorkerNodeLabels`] for kube (reflector scan, not a per-tick LIST).
 //! Production impls in [`store`] and [`kube`]; fakes in tests.
 
-use pplx_space_common_core::types::NodeGroupId;
+use pplx_space_node_model::NodeGroupId;
 
 use std::time::Duration;
 
@@ -85,9 +85,8 @@ use pplx_space_api::routes::admin::audit::{
     SYSTEM_ACTOR_NODE_GROUP_LABELER, SystemNodeGroupAuditEntry, record_node_group_system,
 };
 use pplx_space_api::routes::admin::node_groups::group_state_summary;
-use pplx_space_common_core::types::{
-    NodeGroupName, NodeGroupNameParseError, NodeGroupTemplatePolicy, PositiveDuration,
-};
+use pplx_space_durations::PositiveDuration;
+use pplx_space_node_model::{NodeGroupName, NodeGroupNameParseError, NodeGroupTemplatePolicy};
 
 use crate::env_config;
 
@@ -105,16 +104,17 @@ pub use store::NodeGroupDbStore;
 pub use tick::Reconciler;
 
 /// Node label that binds a kube Node to its SPACE node group, re-exported from
-/// the canonical definition in `common-core`'s placement module.
+/// the canonical definition in `pplx-space-sandbox-pod`'s placement module.
 ///
 /// Not defined here on purpose: `build_sandbox_pod` renders required
 /// nodeAffinity over this same key, so the writer and the reader must be the
 /// same string by construction rather than by two constants agreeing.
 #[cfg(feature = "kubernetes")]
-pub use pplx_space_common_core::kubernetes::SANDBOX_NODE_GROUP_LABEL as NODE_GROUP_LABEL;
+pub use pplx_space_sandbox_pod::SANDBOX_NODE_GROUP_LABEL as NODE_GROUP_LABEL;
 
 /// Taint key carried by dedicated (org-owned) node-group nodes, re-exported
-/// from `common-core`'s placement module. The value is the owning org's UUID.
+/// from `pplx-space-sandbox-pod`'s placement module. The value is the owning
+/// org's UUID.
 ///
 /// Deliberately not `space.pplx.net/dedicated`, which is the cred-authority
 /// fence: only one taint per key+effect is allowed, and a reconciler enumerating
@@ -126,7 +126,7 @@ pub use pplx_space_common_core::kubernetes::SANDBOX_NODE_GROUP_LABEL as NODE_GRO
 /// leaving an untainted, label-less window. The `non_default_group_count` gate is
 /// the safety property, not this check.
 #[cfg(feature = "kubernetes")]
-pub use pplx_space_common_core::kubernetes::DEDICATED_NODE_TAINT_KEY as DEDICATED_TAINT_KEY;
+pub use pplx_space_sandbox_pod::DEDICATED_NODE_TAINT_KEY as DEDICATED_TAINT_KEY;
 
 pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(30);
 /// Label patches in flight at once. Independent single-object writes, which the

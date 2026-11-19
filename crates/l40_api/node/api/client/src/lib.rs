@@ -28,7 +28,7 @@ use pplx_space_common_grpc::{
 };
 use tonic::transport::{Channel, Endpoint};
 
-pub use pplx_space_common_core::operation_budget::RuntimeOperationBudget as NodeApiOperationBudget;
+pub use pplx_space_rpc_contracts::operation_budget::RuntimeOperationBudget as NodeApiOperationBudget;
 
 type NodeApiConnectFuture = Pin<
     Box<
@@ -294,6 +294,22 @@ pub fn configure_node_api_endpoint(endpoint: Endpoint, config: NodeApiEndpointCo
     } else {
         endpoint
     }
+}
+
+/// What a node-api connection that is kept and shared needs, on top of
+/// [`configure_node_api_endpoint`]: one connection per runtime endpoint that
+/// carries many callers' calls and outlives each of them.
+///
+/// - It pings while idle too, so a connection whose far end went away without
+///   a FIN, as a deleted pod's whose address a later pod can be given, is
+///   closed within the keep-alive interval and timeout. The next call then
+///   dials the endpoint anew, rather than waiting out the keep-alive timeout
+///   on a connection nothing answers or failing at once on one that is reset.
+/// - Its concurrent streams share [`MULTIPLEXED_CONNECTION_WINDOW_BYTES`].
+pub fn configure_kept_node_api_endpoint(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .keep_alive_while_idle(true)
+        .initial_connection_window_size(MULTIPLEXED_CONNECTION_WINDOW_BYTES)
 }
 
 fn configure_node_ctl_endpoint(endpoint: Endpoint) -> Endpoint {
@@ -711,10 +727,9 @@ async fn connect_node_ctl_channel() -> Result<Channel, tonic::transport::Error> 
     );
     endpoint
         .connect_with_connector(tower::service_fn(|_| async {
-            let stream = tokio::net::UnixStream::connect(
-                pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET,
-            )
-            .await?;
+            let stream =
+                tokio::net::UnixStream::connect(pplx_space_host_layout::paths::NODE_CTL_SOCKET)
+                    .await?;
             Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
         }))
         .await
@@ -728,7 +743,7 @@ pub async fn connect_node_ctl() -> Result<NodeCtlGrpcClient, pplx_space_common_g
     );
     let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint_with_retry(
         "node-ctl",
-        std::path::Path::new(pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET),
+        std::path::Path::new(pplx_space_host_layout::paths::NODE_CTL_SOCKET),
         endpoint,
         pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
     )

@@ -1,7 +1,8 @@
 use crate::routes::public::error::database_error;
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, UserId};
+use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::{convert::Infallible, str::FromStr, time::Duration};
 
 use crate::metrics::operations::InlineAdmissionPath;
@@ -17,9 +18,9 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle, SubstrateKind,
-};
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_guest_process::IdempotencyKey;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
     OperationTargetType, PageCursor, PublicErrorCode, PublicOperationRecord, PublicPage,
@@ -29,6 +30,7 @@ use pplx_space_public_api::{
     SandboxOperationResponse, SandboxResources, SandboxStatsResponse, UpdateSandboxRequest,
     routes as native_routes,
 };
+use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_state_reconciliation::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
     SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
@@ -143,7 +145,7 @@ fn native_create_pool_claim_enabled(
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
 ) -> bool {
     native_create_pool_claim_gate(
-        pplx_space_common_core::env::env_flag_var(
+        pplx_space_env_vars::env_flag_var(
             NATIVE_CREATE_POOL_CLAIM_ENV,
             DEFAULT_NATIVE_CREATE_POOL_CLAIM_ENABLED,
         ),
@@ -1563,8 +1565,17 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
     let failure_code = sandbox
         .has_current_failure
         .then_some(SandboxFailureCode::RuntimeFailure);
+    // The deadline is the one the sandbox's node last published, and only a
+    // node holding the sandbox's runtime schedules one. A suspended or stopped
+    // sandbox keeps the deadline it had when it left its node, so it reports
+    // none.
+    let resident = matches!(
+        state,
+        SandboxLifecycleState::Running | SandboxLifecycleState::Paused
+    );
     let expires_at = sandbox
         .next_auto_event_at
+        .filter(|_| resident)
         .map(OffsetDateTime::from_unix_timestamp)
         .transpose()
         .map_err(|error| {

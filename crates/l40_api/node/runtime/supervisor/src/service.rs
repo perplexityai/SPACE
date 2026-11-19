@@ -1,12 +1,14 @@
+mod gateway_handover;
 mod standalone;
 
 use std::collections::HashSet;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use pplx_space_common_core::types::{ProcessSignal, SandboxId};
+use pplx_space_guest_process::ProcessSignal;
 use pplx_space_node_runtime_core::cgroup::{self, CgroupLimits};
 use pplx_space_node_runtime_core::launch;
 use pplx_space_node_runtime_core::launch_admission::runtime_operation_status;
@@ -16,6 +18,7 @@ use pplx_space_node_runtime_core::proto::{
     StopProcessResponse, StopSandboxRuntimeRequest, StopSandboxRuntimeResponse,
     UpdateCgroupRequest, UpdateCgroupResponse,
 };
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_uds_peer_auth::{UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -585,8 +588,8 @@ impl RuntimeSupervisorService {
     async fn prepare_firecracker_launch(
         &self,
         sandbox_id: SandboxId,
-        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
-        budget: pplx_space_common_core::types::VcpuCount,
+        execution: pplx_space_sandbox_model::SandboxActivationAttemptId,
+        budget: pplx_space_execution_spec::VcpuCount,
         sealed_launch: Option<crate::verified_launch::VerifiedLaunch>,
     ) -> Result<Option<crate::verified_launch::OpenedRuntime>, Status> {
         self.execution_io(move |store| {
@@ -798,8 +801,22 @@ impl RuntimeSupervisorService {
     ) -> Result<Response<LaunchSidecarResponse>, Status> {
         let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
         validate_sidecar_program(&req.program)?;
-        let is_gateway =
-            req.program == pplx_space_common_core::host::linux::paths::NET_GATEWAY_SVC_BIN;
+        let is_gateway = req.program == pplx_space_host_layout::paths::NET_GATEWAY_SVC_BIN;
+        let replace_pid = req.replace_pid.filter(|_| is_gateway);
+        // Before anything irreversible: a replacement stops the old gateway
+        // before the launcher could reject these.
+        let exec_args = req
+            .args
+            .iter()
+            .cloned()
+            .chain(
+                req.pre_exec_sockets
+                    .iter()
+                    .map(|socket| socket.fd_arg.clone()),
+            )
+            .collect::<Vec<_>>();
+        launch::validate_sidecar_launch_strings(&req.program, &exec_args, &req.env)
+            .map_err(Status::invalid_argument)?;
         let program_filename = sidecar_program_filename(&req.program)?;
         let pid_filename = sidecar_pid_filename(&req.program)?;
         let launch_key = (sandbox_id, req.program.clone());
@@ -812,36 +829,54 @@ impl RuntimeSupervisorService {
             .await?;
         let result = async {
             let sandbox_id = launch_key.0;
+            // A live sidecar is returned as it is, unless it is the gateway
+            // this launch replaces.
+            let mut replaced = None;
             if let Some(pid) = live_runtime_pid(&sandbox_id, &pid_filename)?
                 && require_sidecar_identity(pid, &req.program, req.uid, req.gid)?
             {
                 if is_gateway {
                     require_recorded_gateway(self, sandbox_id, pid, req.uid).await?;
                 }
-                tracing::info!(
-                    sandbox_id = %sandbox_id,
-                    program = %program_filename,
-                    pid,
-                    source = "run_dir_pid",
-                    "runtime supervisor found live sidecar"
-                );
-                return Ok(Response::new(LaunchSidecarResponse { pid }));
+                if replace_pid == Some(pid) {
+                    replaced = Some(pid);
+                } else {
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        program = %program_filename,
+                        pid,
+                        source = "run_dir_pid",
+                        "runtime supervisor found live sidecar"
+                    );
+                    return Ok(Response::new(LaunchSidecarResponse {
+                        pid,
+                        inherited_sockets: 0,
+                    }));
+                }
             }
-            if let Some(pid) = live_sidecar_pid_from_cgroup(&sandbox_id, &program_filename)?
+            if replaced.is_none()
+                && let Some(pid) = live_sidecar_pid_from_cgroup(&sandbox_id, &program_filename)?
                 && require_sidecar_identity(pid, &req.program, req.uid, req.gid)?
             {
                 if is_gateway {
                     require_recorded_gateway(self, sandbox_id, pid, req.uid).await?;
                 }
-                write_pid_symlink(&sandbox_id, &pid_filename, pid)?;
-                tracing::info!(
-                    sandbox_id = %sandbox_id,
-                    program = %program_filename,
-                    pid,
-                    source = "cgroup",
-                    "runtime supervisor recovered sidecar pid"
-                );
-                return Ok(Response::new(LaunchSidecarResponse { pid }));
+                if replace_pid == Some(pid) {
+                    replaced = Some(pid);
+                } else {
+                    write_pid_symlink(&sandbox_id, &pid_filename, pid)?;
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        program = %program_filename,
+                        pid,
+                        source = "cgroup",
+                        "runtime supervisor recovered sidecar pid"
+                    );
+                    return Ok(Response::new(LaunchSidecarResponse {
+                        pid,
+                        inherited_sockets: 0,
+                    }));
+                }
             }
             let capability = is_gateway
                 .then(pplx_space_node_runtime_core::gateway_launch::new_capability)
@@ -853,7 +888,7 @@ impl RuntimeSupervisorService {
                     capability.to_string(),
                 );
             }
-            let pre_exec_sockets = req
+            let mut pre_exec_sockets = req
                 .pre_exec_sockets
                 .into_iter()
                 .map(|socket| {
@@ -868,9 +903,22 @@ impl RuntimeSupervisorService {
                         transparent: socket.transparent,
                         recvorigdstaddr: socket.recvorigdstaddr,
                         fd_arg: socket.fd_arg,
+                        inherited_fd: None,
                     })
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
+            // Held until this launch returns, past the replacement's exec.
+            let inherited = match replaced {
+                Some(pid) => {
+                    self.retire_replaced_gateway(sandbox_id, pid, &req.ns_path, &pre_exec_sockets)
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            for (socket, inherited) in pre_exec_sockets.iter_mut().zip(&inherited) {
+                socket.inherited_fd = Some(inherited.as_raw_fd());
+            }
+            let inherited_sockets = u32::try_from(inherited.len()).unwrap_or(u32::MAX);
             let launcher = self
                 .spawn_sidecar_launcher(
                     sandbox_id,
@@ -945,14 +993,90 @@ impl RuntimeSupervisorService {
                 sandbox_id = %sandbox_id,
                 program = %program_filename,
                 pid,
+                replaced_pid = replaced,
+                inherited_sockets,
                 "runtime supervisor launched sidecar"
             );
-            Ok(Response::new(LaunchSidecarResponse { pid }))
+            Ok(Response::new(LaunchSidecarResponse {
+                pid,
+                inherited_sockets,
+            }))
         }
         .await;
         drop(runtime_guard);
         drop(launch_guard);
         result
+    }
+
+    /// Stop the gateway at `pid` so its replacement can launch, first taking
+    /// the listening sockets the replacement would otherwise bind. Returns
+    /// them in `sockets` order, or none when any is missing, and then the
+    /// replacement binds fresh ones.
+    async fn retire_replaced_gateway(
+        &self,
+        sandbox_id: SandboxId,
+        pid: u32,
+        ns_path: &str,
+        sockets: &[launch::PreExecSocket],
+    ) -> Result<Vec<OwnedFd>, Status> {
+        let process = match launch::ProcessHandle::open(pid) {
+            Ok(process) => process,
+            Err(error) if error.is_not_found() => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(Status::failed_precondition(format!(
+                    "open process handle: {error}"
+                )));
+            }
+        };
+        match process
+            .sandbox_ownership(&sandbox_id.to_string())
+            .map_err(|error| {
+                Status::unavailable(format!("process ownership unavailable: {error}"))
+            })? {
+            launch::ProcessOwnership::Gone => return Ok(Vec::new()),
+            launch::ProcessOwnership::Foreign => {
+                return Err(Status::permission_denied(format!(
+                    "pid {pid} does not belong to sandbox {sandbox_id}"
+                )));
+            }
+            launch::ProcessOwnership::Owned => {}
+        }
+        // The replacement launches into this namespace; one that cannot be
+        // opened fails the launch, so keep the old gateway running.
+        let namespace = std::fs::File::open(ns_path)
+            .and_then(|namespace| {
+                launch::require_network_namespace(&namespace)?;
+                Ok(namespace)
+            })
+            .map_err(|error| {
+                Status::failed_precondition(format!("network namespace {ns_path}: {error}"))
+            })?;
+        let slot = self.acquire_blocking_slot().await?;
+        let sockets = sockets.to_vec();
+        let (process, duplicated) = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let duplicated =
+                gateway_handover::duplicate_listening_sockets(&process, &sockets, &namespace);
+            (process, duplicated)
+        })
+        .await
+        .map_err(|_| Status::internal("net-gateway socket handover task failed"))?;
+        let inherited = duplicated.unwrap_or_else(|error| {
+            tracing::warn!(
+                %sandbox_id,
+                pid,
+                %error,
+                "replacement net-gateway binds fresh sockets"
+            );
+            Vec::new()
+        });
+        gateway_handover::terminate(
+            &process,
+            gateway_handover::REPLACED_GATEWAY_TERM_GRACE,
+            gateway_handover::REPLACED_GATEWAY_KILL_GRACE,
+        )
+        .await?;
+        Ok(inherited)
     }
 
     async fn stop_sandbox_runtime_owned(

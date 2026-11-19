@@ -1,11 +1,12 @@
 //! Guarded snapshot writes for sandboxes given up as lost because the node
 //! holding their only copy is gone.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::time::Duration;
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
 /// Finalize `failed` the dead uploads `node_id` left for `ids`, which were

@@ -4,15 +4,19 @@
 //! state-machine, and audit logging; the SQL strings, row structs, and
 //! transaction-bound helpers live here.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
-use pplx_space_common_core::types::{
-    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeId, NodeManagedBy,
-    NodeRole, SandboxId,
-    admin::{AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters},
+use pplx_space_accounts::NodeId;
+use pplx_space_admin_protocol::{
+    AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters,
 };
+use pplx_space_node_model::{
+    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
+    NodeRole,
+};
+use pplx_space_sandbox_model::SandboxId;
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
 use pplx_space_sandbox_portability::{
@@ -107,7 +111,7 @@ impl AdminNodeRow {
     pub(super) fn execution_policy(
         &self,
     ) -> Option<(
-        pplx_space_common_core::types::ExecutionPolicyObservation,
+        pplx_space_execution_spec::ExecutionPolicyObservation,
         Option<OffsetDateTime>,
     )> {
         let value = self.execution_policy.as_ref()?;
@@ -1372,6 +1376,8 @@ mod live_residents_tests;
 /// `terminate_decrement_capacity` survive whatever the request carried.
 #[cfg(test)]
 mod in_flight_drain_tests;
+#[cfg(test)]
+mod node_holds_agreement_tests;
 /// Postgres-backed plan-structure and page-shape regression for the
 /// `:force-upload-local-snapshots` enumeration: the scan stays bounded by the
 /// node's own pinned history rather than the fleet, the in-flight probe runs
@@ -1383,4 +1389,4 @@ mod pinned_local_only_plan_tests;
 /// Postgres-backed, and each case also shows the pre-change guard disagreed —
 /// otherwise the agreement proves nothing.
 #[cfg(test)]
-mod terminate_gate_agreement_tests;
+pub(super) mod terminate_gate_agreement_tests;

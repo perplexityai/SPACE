@@ -4,7 +4,7 @@
 # build-rust-artifacts.sh and the bring-up up.sh and the smoke suites share):
 #
 #   test-hooks  (default) every crate's `test-hooks` feature is compiled in, so
-#               the hooks the charts set (`pplx_space_common_core::env::test_hook`)
+#               the hooks the charts set (`pplx_space_test_hooks::test_hook`)
 #               take effect, and LTO is off for build time.
 #   release     the release lane: no crate's `test-hooks` feature and thin LTO.
 #               The charts render no test hook, and the typed smoke skips the

@@ -1,13 +1,12 @@
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 
 use super::*;
 use crate::service::recovery_cross_node::{
     insert_restoring_sandbox_row_from_snapshot, transition_restored_sandbox_to_suspended,
 };
 
-use pplx_space_common_core::types::{
-    DEFAULT_GUEST_USER, SandboxOwner, SandboxOwnerKind, TEMPLATE_MANAGER_SANDBOX_OWNER,
-};
+use pplx_space_accounts::{SandboxOwner, SandboxOwnerKind, TEMPLATE_MANAGER_SANDBOX_OWNER};
+use pplx_space_guest_process::DEFAULT_GUEST_USER;
 
 fn snapshot_meta_with_sandbox(
     sandbox: Option<crate::snapshot_upload::SnapshotSandbox>,
@@ -20,7 +19,7 @@ fn snapshot_meta_with_sandbox(
         rootfs_size_bytes: None,
         created_at: "2026-05-21T00:00:00Z".to_string(),
         source: crate::snapshot_upload::SnapshotSource {
-            runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string(),
+            runtime: pplx_space_execution_spec::RUNTIME_FIRECRACKER_ALIAS.to_string(),
             runtime_version: None,
             state_format_version: None,
             template_id: "seed".to_string(),
@@ -51,11 +50,11 @@ fn restore_meta_with_process_env(
         owner: "user".to_string(),
         snapshots_enabled: true,
         process_env,
-        auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
     }))
 }
 
-fn restore_source(sandbox_id: &str) -> pplx_space_common_core::types::ExactStorageUri {
+fn restore_source(sandbox_id: &str) -> pplx_space_artifact_model::ExactStorageUri {
     format!("s3://snapshots/suspend/{sandbox_id}/attempt-1?region=us-east-1")
         .parse()
         .unwrap()
@@ -85,7 +84,7 @@ pub(in crate::service) fn insert_suspended_test_sandbox(conn: &crate::db::Connec
             pool_template: Some("pool-template"),
             volume_encryption: false,
             process_env: &process_env,
-            auto_lifecycle: &pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
             network_policy_override: None,
             network_policy_generation: 0,
             network_policy_authority: crate::db::PolicyAuthority::Cluster,
@@ -103,7 +102,7 @@ fn recovered_sandbox_row_fields_defaults_missing_owner_block_to_legacy_guest_use
     assert!(missing.process_env.is_empty());
     assert_eq!(
         missing.auto_lifecycle,
-        pplx_space_common_core::types::AutoLifecyclePolicy::disabled()
+        pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled()
     );
 }
 
@@ -114,7 +113,7 @@ fn recovered_sandbox_row_fields_rejects_invalid_owner() {
             owner: String::new(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         },
     ))) {
         Ok(_) => panic!("empty sandbox owner must reject"),
@@ -134,7 +133,7 @@ fn recovered_sandbox_row_fields_preserves_template_manager_owner() {
             owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             snapshots_enabled: true,
             process_env: std::collections::BTreeMap::new(),
-            auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+            auto_lifecycle: pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         },
     )))
     .unwrap();
@@ -152,12 +151,12 @@ fn cross_node_restore_row_lifecycle_stays_restoring_until_rootfs_stage_succeeds(
     let local_artifact_id = LocalArtifactId::new();
     let mut meta = restore_meta_with_process_env(process_env);
     meta.local_artifact_id = Some(local_artifact_id);
-    meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Full);
-    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+    meta.artifact_kind = Some(pplx_space_snapshot_model::ArtifactKind::Full);
+    meta.artifact_origin = Some(pplx_space_snapshot_model::ArtifactOrigin::Suspend);
 
     insert_restoring_sandbox_row_from_snapshot(&conn, sandbox_id, &meta, &restore_source, None)
         .unwrap();
-    let transfer_scope_id = pplx_space_common_core::types::TransferScopeId::new();
+    let transfer_scope_id = pplx_space_snapshot_model::TransferScopeId::new();
     crate::db::insert_restore_transfer_scope(
         &conn,
         sandbox_id,
@@ -215,7 +214,7 @@ fn cross_node_restore_row_lifecycle_stays_restoring_until_rootfs_stage_succeeds(
     assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
     assert_eq!(
         row.current_local_artifact_kind,
-        Some(pplx_space_common_core::types::ArtifactKind::Full)
+        Some(pplx_space_snapshot_model::ArtifactKind::Full)
     );
     assert!(
         crate::db::restore_transfer_scope(&conn, sandbox_id)
@@ -298,7 +297,7 @@ fn restore_as_new_uses_target_disk_io_assignment() {
     let sandbox_id = "019d84bd-280d-7331-99c6-b63377f3a3a2";
     insert_quarantined_orphan(&conn, sandbox_id);
     let meta = restore_meta_with_process_env(std::collections::BTreeMap::new());
-    let target_limits = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
+    let target_limits = pplx_space_execution_spec::DiskIoLimits::try_new(5_000, 200).unwrap();
 
     insert_restoring_sandbox_row_from_snapshot(
         &conn,
@@ -609,7 +608,7 @@ async fn a_plan_that_reports_no_progress_charges_the_attempt_and_backs_off() {
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
 
@@ -643,19 +642,18 @@ async fn a_plan_for_a_different_reason_is_recorded_as_a_local_mismatch() {
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
 
     let plan = crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://snapshots/suspend/x?region=us-east-1".to_string(),
         local_artifact_id: None,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap(),
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap(),
         // The central plan disagrees with the local episode's reason code.
-        reason_code:
-            pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed,
+        reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed,
     };
 
     service
@@ -675,7 +673,7 @@ async fn a_failed_plan_lookup_is_recorded_rather_than_retried_immediately() {
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
 
@@ -702,7 +700,7 @@ async fn a_failed_plan_lookup_is_recorded_rather_than_retried_immediately() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_orphan_restore_runs_outside_the_inventory_pass_under_the_node_wide_bound() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -795,7 +793,7 @@ async fn an_orphan_restore_runs_outside_the_inventory_pass_under_the_node_wide_b
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_dispatch_defers_a_second_orphan_while_the_first_holds_capacity() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let first_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
     let second_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -916,7 +914,7 @@ async fn a_detached_orphan_restore_task_panic_is_observed() {
 #[tokio::test]
 async fn the_dispatch_path_supervises_the_task_it_spawns() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -1063,7 +1061,7 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
 #[tokio::test(start_paused = true)]
 async fn a_momentarily_busy_staging_tree_does_not_charge_the_episode() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -1112,7 +1110,7 @@ async fn a_momentarily_busy_staging_tree_does_not_charge_the_episode() {
 #[tokio::test(start_paused = true)]
 async fn a_busy_staging_tree_releases_node_capacity_and_backs_off_the_episode() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -1157,9 +1155,9 @@ async fn a_busy_staging_tree_releases_node_capacity_and_backs_off_the_episode() 
 #[tokio::test]
 async fn closed_capacity_is_not_reported_as_busy_capacity() {
     let artifact_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed;
     let orphan_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let artifact_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, artifact_reason);
@@ -1252,9 +1250,9 @@ async fn closed_capacity_is_not_reported_as_busy_capacity() {
 #[tokio::test]
 async fn capacity_deferred_orphans_do_not_consume_attempts_or_admission_budget() {
     let orphan_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let artifact_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed;
     let conn = crate::db::test_conn();
     let orphan_ids = (0..QUARANTINE_RECOVERY_ADMISSIONS_PER_PASS + 1)
         .map(|_| crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, orphan_reason))
@@ -1333,9 +1331,9 @@ async fn capacity_deferred_orphans_do_not_consume_attempts_or_admission_budget()
 #[tokio::test]
 async fn capacity_released_mid_pass_does_not_leapfrog_an_older_orphan() {
     let orphan_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let artifact_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed;
     let conn = crate::db::test_conn();
     let first_orphan_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, orphan_reason);
@@ -1441,7 +1439,7 @@ async fn capacity_released_mid_pass_does_not_leapfrog_an_older_orphan() {
 #[tokio::test]
 async fn orphan_capacity_is_released_when_plan_lookup_fails_before_spawn() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -1478,7 +1476,7 @@ async fn a_candidate_that_stops_being_admissible_is_reported_without_a_write() {
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
 
@@ -1499,7 +1497,7 @@ async fn a_candidate_that_stops_being_admissible_is_reported_without_a_write() {
              ) VALUES (?1, ?2, 'mark_suspended', TRUE, 'armed', 'restoring', 0)",
             crate::db::fixture::params![
                 sandbox_id.to_string(),
-                pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string()
+                pplx_space_sandbox_model::SandboxCleanupEpisodeId::new().to_string()
             ],
         )
         .unwrap();
@@ -1558,14 +1556,14 @@ fn candidate_artifact_id(service: &SandboxManagerService) -> LocalArtifactId {
 
 fn plan_for(
     local_artifact_id: Option<LocalArtifactId>,
-    reason_code: pplx_space_common_core::types::SandboxQuarantineReasonCode,
+    reason_code: pplx_space_sandbox_model::SandboxQuarantineReasonCode,
 ) -> crate::snapshot_restore::QuarantineRecoveryPlan {
     crate::snapshot_restore::QuarantineRecoveryPlan {
-        recovery_id: pplx_space_common_core::types::SandboxCleanupEpisodeId::new(),
+        recovery_id: pplx_space_sandbox_model::SandboxCleanupEpisodeId::new(),
         snapshot_id: SnapshotId::new(),
         storage_uri: "s3://snapshots/suspend/sandbox/snap?region=us-east-1".to_string(),
         local_artifact_id,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap(),
+        execution_generation: pplx_space_sandbox_model::ExecutionGeneration::new(7).unwrap(),
         reason_code,
     }
 }
@@ -1575,7 +1573,7 @@ async fn a_plan_naming_a_different_artifact_retains_the_quarantine() {
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
     // The central plan points at an artifact this node no longer holds, so the
@@ -1583,7 +1581,7 @@ async fn a_plan_naming_a_different_artifact_retains_the_quarantine() {
     // that has already been replaced.
     let plan = plan_for(
         Some(LocalArtifactId::new()),
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
 
     service
@@ -1603,7 +1601,7 @@ async fn an_unreadable_local_artifact_retains_the_quarantine() {
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
     let artifact_id = candidate_artifact_id(&service);
@@ -1614,7 +1612,7 @@ async fn an_unreadable_local_artifact_retains_the_quarantine() {
     let empty_cache = tempfile::tempdir().unwrap();
     let plan = plan_for(
         Some(artifact_id),
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
 
     service
@@ -1682,7 +1680,7 @@ async fn a_snapshot_on_disk_naming_a_different_artifact_retains_the_quarantine()
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
     let artifact_id = candidate_artifact_id(&service);
@@ -1696,7 +1694,7 @@ async fn a_snapshot_on_disk_naming_a_different_artifact_retains_the_quarantine()
     write_recoverable_suspend_snapshot(cache.path(), sandbox_id, LocalArtifactId::new());
     let plan = plan_for(
         Some(artifact_id),
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
 
     service
@@ -1724,7 +1722,7 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = recovery_test_service(conn);
     let artifact_id = candidate_artifact_id(&service);
@@ -1733,7 +1731,7 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
     write_recoverable_suspend_snapshot(cache.path(), sandbox_id, artifact_id);
     let plan = plan_for(
         Some(artifact_id),
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
 
     let counters = pplx_space_metrics_emit::test_capture::capture_counters_guard();
@@ -1871,7 +1869,7 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
 
     const SECRET: &str = "tOpSeCrEtCrEdEnTiAl";
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -1894,7 +1892,7 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
     // A URI shaped like a connection string with inline credentials, which is
     // what makes this a disclosure rather than noise.
     let uri = format!("s3://AKIAEXAMPLEKEYID:{SECRET}@storage.example.com/snapshots/x");
-    let source = pplx_space_common_core::types::ExactStorageUri::parse("::not-a-uri::")
+    let source = pplx_space_artifact_model::ExactStorageUri::parse("::not-a-uri::")
         .expect_err("a malformed URI should not parse");
     let error = crate::snapshot_restore::RestoreError::InvalidRestoreSource {
         uri: uri.clone(),
@@ -1946,7 +1944,7 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
     // against the real parser rather than against a literal this test chose, which
     // could not fail.
     let rejected = format!("s3://bucket/snap?endpoint=https://user:{SECRET}@minio.internal");
-    let parse_error = pplx_space_common_core::types::StorageUri::parse(&rejected)
+    let parse_error = pplx_space_artifact_model::StorageUri::parse(&rejected)
         .expect_err("a URI with an unsupported query param should not parse");
     assert!(
         parse_error.to_string().contains(SECRET),
@@ -2000,7 +1998,7 @@ async fn a_deferred_orphan_restore_never_logs_the_storage_uri() {
 #[tokio::test]
 async fn abandoning_at_shutdown_schedules_the_retry_one_backoff_away() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -2094,7 +2092,7 @@ async fn abandoning_at_shutdown_schedules_the_retry_one_backoff_away() {
 #[tokio::test]
 async fn cancelling_shutdown_mid_pass_stops_the_next_candidate() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let mut episodes = Vec::new();
     for _ in 0..3 {
@@ -2177,7 +2175,7 @@ async fn a_stale_claim_reaches_the_sandbox_event_timeline() {
     use tracing_subscriber::layer::SubscriberExt;
 
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -2279,7 +2277,7 @@ impl PassAdversary {
                      ) VALUES (?1, ?2, 'mark_suspended', TRUE, 'armed', 'restoring', 0)",
                     crate::db::fixture::params![
                         id,
-                        pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string()
+                        pplx_space_sandbox_model::SandboxCleanupEpisodeId::new().to_string()
                     ],
                 )
                 .unwrap();
@@ -2374,13 +2372,13 @@ enum PassFixture {
 impl PassFixture {
     const ALL: [Self; 2] = [Self::Artifact, Self::Orphan];
 
-    fn reason_code(self) -> pplx_space_common_core::types::SandboxQuarantineReasonCode {
+    fn reason_code(self) -> pplx_space_sandbox_model::SandboxQuarantineReasonCode {
         match self {
             Self::Artifact => {
-                pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed
+                pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed
             }
             Self::Orphan => {
-                pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
+                pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing
             }
         }
     }
@@ -2692,7 +2690,7 @@ fn sandbox_side_row(conn: &crate::db::Connection, sandbox_id: SandboxId) -> Opti
 #[tokio::test]
 async fn the_interleaving_matrix_fixture_adopts_when_nobody_interferes() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -2760,7 +2758,7 @@ async fn the_interleaving_matrix_fixture_adopts_when_nobody_interferes() {
 #[tokio::test]
 async fn the_orphan_branch_reaches_the_restore_window() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -3008,7 +3006,7 @@ async fn the_cleanup_contention_release_reports_only_a_real_loss() {
     use tracing_subscriber::layer::SubscriberExt;
 
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     for supersede in [false, true] {
         let conn = crate::db::test_conn();
         let sandbox_id =
@@ -3089,7 +3087,7 @@ async fn the_cleanup_contention_release_reports_only_a_real_loss() {
 #[tokio::test]
 async fn two_actors_in_two_windows_still_leave_every_fenced_write_missing() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
     let windows = crate::service::recovery::RecoveryPassWindow::ALL;
     let mut pairs_exercised = 0_usize;
     for first in windows {
@@ -3192,7 +3190,7 @@ async fn two_actors_in_two_windows_still_leave_every_fenced_write_missing() {
 #[tokio::test]
 async fn a_token_cancelled_after_a_claim_stops_the_next_candidate_before_its_lookup() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     for _ in 0..3 {
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -3244,7 +3242,7 @@ async fn a_token_cancelled_after_a_claim_stops_the_next_candidate_before_its_loo
 #[tokio::test]
 async fn a_claim_lost_during_the_orphan_restore_is_not_written_up() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -3299,9 +3297,9 @@ async fn a_claim_lost_during_the_orphan_restore_is_not_written_up() {
 #[tokio::test]
 async fn closed_capacity_is_read_off_the_semaphore_not_the_walk() {
     let artifact_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestorePrepareFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestorePrepareFailed;
     let orphan_reason =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
     let conn = crate::db::test_conn();
     // Exactly the admission cap, so the walk breaks on the candidate after them.
     let adoptions: Vec<_> = (0..super::QUARANTINE_RECOVERY_ADMISSIONS_PER_PASS)
@@ -3383,8 +3381,8 @@ fn insert_quarantined_orphan(conn: &crate::db::Connection, sandbox_id: &str) {
         "UPDATE sandboxes SET template = ?1, template_hash = NULL, user = ?2,
          pool_template = NULL, process_env_json = '{}' WHERE id = ?3",
         crate::db::fixture::params![
-            pplx_space_common_core::types::ORPHANED_SANDBOX_TEMPLATE,
-            pplx_space_common_core::types::ORPHANED_SANDBOX_OWNER.as_str(),
+            pplx_space_template_model::ORPHANED_SANDBOX_TEMPLATE,
+            pplx_space_accounts::ORPHANED_SANDBOX_OWNER.as_str(),
             sandbox_id
         ],
     )
@@ -3392,10 +3390,10 @@ fn insert_quarantined_orphan(conn: &crate::db::Connection, sandbox_id: &str) {
     crate::db::mark_quarantined(
         conn,
         sandbox_id,
-        pplx_space_common_core::types::SandboxQuarantineSource::SbxManager,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
+        pplx_space_sandbox_model::SandboxQuarantineSource::SbxManager,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
         "unclassified canonical root",
-        pplx_space_common_core::types::SandboxQuarantineNextAction::RequiresOperatorAttention,
+        pplx_space_sandbox_model::SandboxQuarantineNextAction::RequiresOperatorAttention,
     )
     .unwrap();
 }
@@ -3647,7 +3645,7 @@ fn startup_cleanup_discovery_skips_rows_with_malformed_ids() {
 #[tokio::test]
 async fn a_held_cleanup_fence_defers_adoption_and_charges_the_attempt() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -3765,7 +3763,7 @@ async fn plan_rejections_stop_recovery_at_the_bound_and_later_passes_never_look_
     let conn = crate::db::test_conn();
     let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
     let service = bound_test_service(conn);
     let cache = tempfile::tempdir().unwrap();
@@ -3800,7 +3798,7 @@ async fn plan_rejections_stop_recovery_at_the_bound_and_later_passes_never_look_
 #[tokio::test]
 async fn stopped_holds_take_no_admission_from_a_recoverable_hold() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
     let conn = crate::db::test_conn();
     // More stopped holds than a pass admits, all older than the recoverable one.
     let stopped = (0..QUARANTINE_RECOVERY_ADMISSIONS_PER_PASS + 1)
@@ -3844,7 +3842,7 @@ async fn stopped_holds_take_no_admission_from_a_recoverable_hold() {
 #[tokio::test]
 async fn a_restart_allows_a_stopped_hold_one_more_rejection_and_a_plan_answer_resumes_recovery() {
     let reason_code =
-        pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
+        pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed;
     let conn = crate::db::test_conn();
     let sandbox_id =
         crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
@@ -3885,7 +3883,7 @@ async fn a_restart_allows_a_stopped_hold_one_more_rejection_and_a_plan_answer_re
         recording_plan(&lookups, || {
             crate::snapshot_restore::QuarantineRecoveryPlanResolution::Available(plan_for(
                 Some(LocalArtifactId::new()),
-                pplx_space_common_core::types::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
+                pplx_space_sandbox_model::SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
             ))
         }),
     )

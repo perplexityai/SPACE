@@ -5,10 +5,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::path::{Component, Path};
 
-use pplx_space_common_core::{
-    host::linux::identities::gids, host::linux::identities::group_names,
-    host::linux::identities::users,
-};
+use pplx_space_host_layout::{identities::gids, identities::group_names, identities::users};
 use pplx_space_unix_socket_bind::{SocketGroup, UnixSocketOptions, apply_unix_socket_permissions};
 
 pub(super) fn options() -> UnixSocketOptions {
@@ -107,7 +104,7 @@ pub(super) fn preflight(path: &Path, standard_socket: &Path) -> io::Result<()> {
     if standard_socket.file_name() == Some(name) {
         let standard_parent = standard_socket
             .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+            .filter(|parent| !parent.is_empty())
             .unwrap_or(Path::new("."));
         match fs::metadata(standard_parent) {
             Ok(standard)

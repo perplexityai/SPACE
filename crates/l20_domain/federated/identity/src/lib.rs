@@ -1,7 +1,7 @@
 //! Deployment policy shared by federated grant writers and consumers.
 use std::collections::BTreeSet;
 
-use pplx_space_common_core::types::{FederatedGrantAudience, UpstreamIssuer, UpstreamSubjectId};
+use pplx_space_accounts::{FederatedGrantAudience, UpstreamIssuer, UpstreamSubjectId};
 
 pub const DEFAULT_FEDERATED_IDENTITY_ISSUER: &str = "space";
 pub const DEFAULT_FEDERATED_GRANT_AUDIENCE: &str = "credential-provider";

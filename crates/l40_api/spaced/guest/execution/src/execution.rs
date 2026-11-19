@@ -107,6 +107,49 @@ pub(super) struct ExecutionServiceInner {
 }
 
 impl ExecutionService {
+    /// Extend the same admission lifetime to daemon-owned forwarding operations.
+    pub fn admit_external_operation(
+        &self,
+    ) -> Result<tokio_util::task::task_tracker::TaskTrackerToken, Status> {
+        self.inner.lifecycle.admit()
+    }
+    pub fn hold_for_update(&self, owner: uuid::Uuid) -> Result<crate::MaintenanceHold, Status> {
+        self.inner.lifecycle.hold(owner)
+    }
+
+    /// Advisory until called under the reversible admission hold. Retained
+    /// receipts are distinct from running work so eligibility studies can
+    /// distinguish retention policy from continuous customer execution.
+    pub async fn update_defer_reasons(
+        &self,
+    ) -> Vec<pplx_space_spaced_guest_protocol::proto::update::DeferReason> {
+        use pplx_space_spaced_guest_protocol::proto::update::DeferReason;
+        let mut reasons = Vec::new();
+        if self.inner.lifecycle.admitted_count() != 0 {
+            reasons.push(DeferReason::Operations);
+        }
+        if self.inner.processes.has_records() {
+            reasons.push(DeferReason::RetainedProcesses);
+        }
+        if self.inner.idempotency.has_live_records() {
+            reasons.push(DeferReason::RetryRecords);
+        }
+        if self.inner.filesystem.has_update_obligations().await {
+            reasons.push(DeferReason::Filesystem);
+        }
+        reasons
+    }
+
+    pub async fn configure_process_env_for_update(
+        &self,
+        hold: &crate::MaintenanceHold,
+        env: EnvMap,
+    ) -> Result<(), Status> {
+        let _operation = self.inner.lifecycle.admit_maintenance(hold)?;
+        *self.inner.process_env.write().await = env;
+        Ok(())
+    }
+
     /// Construct a service with the caller's filesystem execution configuration.
     ///
     /// Caller cancellation closes the service. Closing or draining the service

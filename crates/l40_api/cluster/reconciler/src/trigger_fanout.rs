@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, stream};
-use pplx_space_common_core::types::NodeId;
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole as SpaceNodeRole};
+use pplx_space_accounts::NodeId;
 use pplx_space_node_api_client::proto::{
     StateReconciliationReason as ProtoReconcileReason, TriggerStateReconciliationRequest,
 };
 use pplx_space_node_api_client::{BuilderApiClient, NodeApiClient, WorkerApiClient};
+use pplx_space_node_model::{NodeManagedBy, NodeRole as SpaceNodeRole};
 use pplx_space_state_reconciliation::ReconcileReason;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -463,16 +463,7 @@ where
         })
         .await
         .map_err(TriggerError::Resolve)?;
-    let request = TriggerStateReconciliationRequest {
-        reasons: reason
-            .reasons
-            .iter()
-            .copied()
-            .map(proto_reconcile_reason)
-            .map(i32::from)
-            .collect(),
-        diagnostic_reason: reason.diagnostic_reason().to_string(),
-    };
+    let request = trigger_request(reason);
     if target.role == SpaceNodeRole::Cluster {
         return Err(TriggerError::UnknownRole(target.role));
     }
@@ -496,6 +487,19 @@ where
     }
     .map(|_| ())
     .map_err(|status| TriggerError::Rpc { endpoint, status })
+}
+
+fn trigger_request(reason: &TriggerReasonPayload) -> TriggerStateReconciliationRequest {
+    TriggerStateReconciliationRequest {
+        reasons: reason
+            .reasons
+            .iter()
+            .copied()
+            .map(proto_reconcile_reason)
+            .map(i32::from)
+            .collect(),
+        diagnostic_reason: reason.diagnostic_reason().to_string(),
+    }
 }
 
 async fn complete_claim_best_effort(
@@ -600,6 +604,7 @@ fn proto_reconcile_reason(reason: ReconcileReason) -> ProtoReconcileReason {
         ReconcileReason::NodeTemplateInventoryPublished => {
             ProtoReconcileReason::NodeTemplateInventoryPublished
         }
+        ReconcileReason::FirewallRulesChanged => ProtoReconcileReason::FirewallRulesChanged,
     }
 }
 

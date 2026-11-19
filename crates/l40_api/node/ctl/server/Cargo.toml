@@ -26,7 +26,11 @@ datadog-otel = ["otel", "datadog"]
 kubernetes = [
     "dep:k8s-openapi",
     "dep:kube",
-    "pplx-space-common-core/kubernetes",
+    "dep:pplx-space-sandbox-pod",
+    "pplx-space-content-digest/serde",
+    "pplx-space-cpu-arch/serde",
+    "pplx-space-semver/serde",
+    "pplx-space-execution-spec/serde",
     "dep:pplx-space-kube-client",
 ]
 
@@ -35,14 +39,22 @@ dashmap = { workspace = true }
 futures-util = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "client", "config", "rustls-tls"], optional = true }
+pplx-space-accounts = { workspace = true }
 pplx-space-bearer-token = { workspace = true }
-pplx-space-common-core = { workspace = true }
+pplx-space-sandbox-model = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
+pplx-space-content-digest = { workspace = true }
+pplx-space-cpu-arch = { workspace = true }
+pplx-space-execution-spec = { workspace = true }
 pplx-space-grpc-rate-limiter = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-kube-client = { workspace = true, optional = true }
+pplx-space-rpc-contracts = { workspace = true }
+pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-local-health = { workspace = true }
 pplx-space-observability = { workspace = true }
+pplx-space-semver = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-sqlite = { workspace = true }
@@ -55,9 +67,11 @@ pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-node-runtime-manager-client = { workspace = true }
+pplx-space-policy-authority = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
+pplx-space-template-model = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 prost-types = { workspace = true }
@@ -80,6 +94,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true }
+# `serde` reads the E0 fixture document the environment-label tests build on.
+pplx-space-execution-common = { workspace = true, features = ["serde"] }
 pplx-space-sbx-mgr-client = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the facet

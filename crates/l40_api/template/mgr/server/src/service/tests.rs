@@ -1,7 +1,7 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_accounts::OrgId;
 
 use super::*;
-use pplx_space_common_core::host::linux::identities::users;
+use pplx_space_host_layout::identities::users;
 use pplx_space_net_common::TlsInterception;
 use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
 use std::{path::Path, sync::Arc};
@@ -282,6 +282,74 @@ async fn pool_counts_read_only_pool_members_and_match_a_sandbox_manager_that_ign
         ))
     );
     assert_eq!(pool("other"), Some((1, 0, vec!["other-warm".to_string()])));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn list_templates_does_not_wait_on_a_stalled_sandbox_memory_policy() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let conn = crate::db::test_conn();
+    insert_ready_build(&conn, "big", "sha256:big");
+    crate::db::update_template_snapshot_policy(&conn, "big", true, 2, 4096).unwrap();
+    // The policy clamps to 2048 MiB, answering only while `stalled` is false.
+    let (stall, stalled) = tokio::sync::watch::channel(true);
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let policy = memory_policy_cache::SandboxMemoryPolicyCache::new({
+        let resolves = Arc::clone(&resolves);
+        move |requested_memory_mib, _| {
+            resolves.fetch_add(1, Ordering::SeqCst);
+            let mut stalled = stalled.clone();
+            Box::pin(async move {
+                stalled.wait_for(|stalled| !stalled).await.unwrap();
+                Ok(ResolvedSandboxMemory {
+                    requested_memory_mib,
+                    effective_memory_mib: requested_memory_mib.min(2048),
+                    cgroup_memory_mib: 2304,
+                    guest_memory_max_mib: 2048,
+                    cgroup_memory_max_mib: 2304,
+                    memory_headroom_mib: 256,
+                })
+            })
+        }
+    });
+    let service = TemplateManagerService::new(conn)
+        .unwrap()
+        .without_sbx_connect_retries()
+        .with_sandbox_memory_policy(policy);
+    let list = || async {
+        let started = tokio::time::Instant::now();
+        let listed = service
+            .list_templates(internal_request(ListTemplatesRequest {
+                omit_sandbox_counts: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        (listed.templates[0].snapshot_memory_mib, started.elapsed())
+    };
+
+    // Never resolved: a bounded wait, then the requested size, as on failure.
+    for _ in 0..2 {
+        let (memory, waited) = list().await;
+        assert_eq!(memory, Some(4096));
+        assert!(
+            waited <= std::time::Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+    }
+    assert_eq!(resolves.load(Ordering::SeqCst), 1, "one refresh in flight");
+
+    stall.send(false).unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(list().await, (Some(2048), std::time::Duration::ZERO));
+
+    // Stale and stalled again: the last resolution answers at once.
+    stall.send(true).unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    for _ in 0..3 {
+        assert_eq!(list().await, (Some(2048), std::time::Duration::ZERO));
+    }
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -1044,8 +1112,7 @@ impl BtrfsDeleteBench {
             snapshots_dir,
         };
 
-        if let Err(error) = pplx_space_common_core::host::btrfs::create_subvolume(&bench.digest_dir)
-        {
+        if let Err(error) = pplx_space_btrfs::create_subvolume(&bench.digest_dir) {
             eprintln!(
                 "skipping {test_label}: SPACE_TEST_BTRFS_DIR is not a writable btrfs \
                  mount ({error})"
@@ -1062,7 +1129,7 @@ impl BtrfsDeleteBench {
         // The install path finalizes the digest subvolume read-only;
         // the RO flag is what makes plain `remove_dir_all` fail with
         // EROFS.
-        pplx_space_common_core::host::btrfs::set_readonly(&bench.digest_dir, true).unwrap();
+        pplx_space_btrfs::set_readonly(&bench.digest_dir, true).unwrap();
         Some(bench)
     }
 }
@@ -1080,9 +1147,9 @@ impl Drop for BtrfsDeleteBench {
         if let Ok(entries) = std::fs::read_dir(&self.name_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if pplx_space_common_core::host::btrfs::is_subvolume(&path) {
-                    let _ = pplx_space_common_core::host::btrfs::set_readonly(&path, false);
-                    let _ = pplx_space_common_core::host::btrfs::delete_subvolume_if_present(&path);
+                if pplx_space_btrfs::is_subvolume(&path) {
+                    let _ = pplx_space_btrfs::set_readonly(&path, false);
+                    let _ = pplx_space_btrfs::delete_subvolume_if_present(&path);
                 }
             }
         }
@@ -1125,11 +1192,11 @@ fn delete_template_build_removes_read_only_btrfs_subvolume_build() {
     // pin both answers on a real btrfs mount (this test does not run
     // as root).
     assert!(
-        pplx_space_common_core::host::btrfs::is_subvolume(&bench.digest_dir),
+        pplx_space_btrfs::is_subvolume(&bench.digest_dir),
         "digest dir must be detected as a subvolume without privilege"
     );
     assert!(
-        !pplx_space_common_core::host::btrfs::is_subvolume(&bench.name_dir),
+        !pplx_space_btrfs::is_subvolume(&bench.name_dir),
         "plain directory on btrfs must not be detected as a subvolume"
     );
 
@@ -1187,9 +1254,9 @@ fn delete_template_removes_read_only_btrfs_subvolume_builds() {
             .name_dir
             .join(std::ffi::OsStr::from_bytes(b"stray-\xff-subvolume"))
     };
-    pplx_space_common_core::host::btrfs::create_subvolume(&stray_subvolume).unwrap();
+    pplx_space_btrfs::create_subvolume(&stray_subvolume).unwrap();
     std::fs::write(stray_subvolume.join("data"), b"bytes").unwrap();
-    pplx_space_common_core::host::btrfs::set_readonly(&stray_subvolume, true).unwrap();
+    pplx_space_btrfs::set_readonly(&stray_subvolume, true).unwrap();
 
     let conn = crate::db::test_conn();
     insert_ready_build(&conn, template, content_hash);
@@ -1520,6 +1587,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
             cached_only: false,
             vcpu: Some(1),
             memory_mib: Some(512),
+            environment_required: false,
         })
     };
 
@@ -1640,6 +1708,7 @@ fn cached_only_lookup(hash: Option<String>) -> Request<crate::proto::GetTemplate
         cached_only: true,
         vcpu: None,
         memory_mib: None,
+        environment_required: false,
     })
 }
 
@@ -2151,9 +2220,10 @@ async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
 
 #[tokio::test]
 async fn register_refresh_cannot_add_remove_or_replace_a_retained_binding() {
-    use pplx_space_common_core::types::{
-        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
-    };
+    use pplx_space_content_digest::Digest;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
+    use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
     let first = EnvironmentReference::new(Digest::sha256([1; 32]));
     let second = EnvironmentReference::new(Digest::sha256([2; 32]));
     for (retained, incoming, accepted) in [
@@ -2813,7 +2883,8 @@ async fn register_template_uses_producer_algorithm(
     // environment's cache partition.
     let mut partition = crate::db::TemplateCachePartition::Legacy;
     if cloud_hypervisor {
-        use pplx_space_common_core::types::{Arch, TemplateMetadata};
+        use pplx_space_cpu_arch::Arch;
+        use pplx_space_template_manifest::TemplateMetadata;
         let environments =
             pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
                 Arch::X86_64,
@@ -2887,7 +2958,7 @@ async fn register_template_uses_producer_algorithm(
         std::fs::read(published.join(TEMPLATE_ROOTFS_FILE)).unwrap(),
         bytes
     );
-    let manifest: pplx_space_common_core::types::TemplateManifest =
+    let manifest: pplx_space_template_manifest::TemplateManifest =
         serde_json::from_slice(&std::fs::read(published.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.content_hash, expected);
     let build = crate::db::get_build(&service.db.lock().unwrap(), name, &expected, partition)
@@ -2917,7 +2988,7 @@ async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() 
         "readiness":{"kind":"tcp_service", "port":3389}
     }))
     .unwrap();
-    let mut manifest = pplx_space_common_core::types::TemplateManifest {
+    let mut manifest = pplx_space_template_manifest::TemplateManifest {
         guest_image: Some(image),
         ..Default::default()
     };
@@ -2979,7 +3050,7 @@ async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() 
 async fn legacy_guest_policy_does_not_require_a_retired_execution_environment() {
     let root = tempfile::tempdir().unwrap();
     let conn = crate::db::test_conn();
-    let mut manifest = pplx_space_common_core::types::TemplateManifest::default();
+    let mut manifest = pplx_space_template_manifest::TemplateManifest::default();
     manifest.set_execution_metadata(
         serde_json::from_value(serde_json::json!({
             "environment": format!("sha256:{}", "a".repeat(64)),

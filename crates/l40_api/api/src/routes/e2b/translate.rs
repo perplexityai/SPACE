@@ -2,12 +2,13 @@ use super::*;
 use crate::metrics::sandbox::api::{
     SandboxApiMetricIdentity, TemplateSelectorKind, TemplateSelectorRequest, TemplateTagShape,
 };
-use pplx_space_common_core::types::{SandboxId, TemplateReference, TemplateSelector};
 use pplx_space_net_common::{
     DomainName, EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, IpCidr, NetworkPolicyV1,
     NetworkPolicyVersion, TlsInterception, WildcardDomainName,
 };
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_template_model::{TemplateReference, TemplateSelector};
 use std::net::IpAddr;
 
 use crate::controllers::ControllerError;
@@ -47,21 +48,17 @@ pub(super) fn translate_create_request(
         .transpose()
         .map_err(|error| E2bApiError::bad_request(format!("invalid space.resources: {error}")))?
         .unwrap_or_default();
-    for (field, value) in [
-        ("vcpu", resources.vcpu),
-        ("memory_mib", resources.memory_mib),
-        ("disk_mib", resources.disk_mib),
-    ] {
-        // Resource columns are signed 32-bit integers; reject before admission.
-        if let Some(value) = value
-            && (value == 0 || value > i32::MAX as u32)
-        {
-            return Err(E2bApiError::bad_request(format!(
-                "space.resources.{field} must be between 1 and {}",
-                i32::MAX
-            )));
-        }
-    }
+    // The native API's bounds, checked before admission. Past them a node
+    // boots no VM (too many vCPUs, so the create waits out its readiness
+    // budget) or clamps the guest memory it was asked for.
+    pplx_space_public_api::limits::validate_resources(&pplx_space_public_api::SandboxResources {
+        vcpu: resources.vcpu,
+        memory_mib: resources.memory_mib,
+        disk_mib: resources.disk_mib,
+    })
+    // The native field is `resources.<name>`; ECW's is the reserved
+    // `space.resources` metadata key.
+    .map_err(|error| E2bApiError::bad_request(format!("space.{error}")))?;
     let mut unsupported = Vec::new();
     let network_policy = if let Some(raw) = req.metadata.remove(NETWORK_POLICY_METADATA_KEY) {
         if req.network.is_some()
@@ -160,6 +157,7 @@ pub(super) fn translate_create_request(
             // sandbox is command-ready so those follow-ups don't race the
             // sbx-mgr `Starting → Started` transition.
             wait_until_ready: true,
+            command_ready_wait: None,
             network_policy,
             // Placement is an internal/operator-only knob; ECW/E2B never pins.
             node_pool: None,
@@ -782,10 +780,10 @@ pub(super) fn build_detail_sandbox(
 
     Ok(SandboxDetailE2b {
         ownership: match sandbox.owner_source {
-            pplx_space_common_core::types::SandboxOwnerSource::Local => {
+            pplx_space_accounts::SandboxOwnerSource::Local => {
                 crate::e2b::schema::SandboxOwnershipE2b::Local
             }
-            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => {
+            pplx_space_accounts::SandboxOwnerSource::FederatedIdentity => {
                 let invalid = || E2bApiError::internal("Invalid sandbox ownership");
                 crate::e2b::schema::SandboxOwnershipE2b::FederatedIdentity {
                     issuer: sandbox

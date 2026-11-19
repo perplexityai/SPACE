@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use super::*;
 
@@ -107,8 +108,9 @@ async fn create_refusals_before_insert_persist_nothing() {
 /// qualifies for memory state.
 #[tokio::test]
 async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoint() {
-    use pplx_space_common_core::types::{Arch, EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_cpu_arch::Arch;
     use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_execution_spec::{EnvironmentDescriptor, RuntimeBinding};
     if !crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
@@ -143,19 +145,19 @@ async fn restore_persists_consumer_before_allocation_and_reselects_from_checkpoi
 }
 
 async fn restore_selects_its_consumer_from_the_checkpoint(
-    producer: pplx_space_common_core::types::ExecutionMetadata,
+    producer: pplx_space_execution_spec::ExecutionMetadata,
     consumer_definition: pplx_space_execution_common::environment::EnvironmentDefinition,
 ) {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{
-        ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
-        SnapshotExecutionMetadata,
-    };
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_content_digest::ContentHash;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ReleaseResponse, ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
         resolve_execution_environment_request::Compatible,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
     let consumer = consumer_definition.execution_requirements().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");
@@ -231,7 +233,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
                     panic!("restore must use its operation-specific resolver");
                 };
                 assert_eq!(
-                    pplx_space_common_core::types::ExecutionMetadata::try_from(&source).unwrap(),
+                    pplx_space_execution_spec::ExecutionMetadata::try_from(&source).unwrap(),
                     expected_producer
                 );
                 Ok(ResolveExecutionEnvironmentResponse {
@@ -322,14 +324,15 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
 #[tokio::test]
 async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation() {
     use crate::node_manager_transport::fake::FakeNodeManager;
-    use pplx_space_common_core::types::{
-        Arch, ContentHash, RuntimeKind, SandboxArtifactMetadata, SandboxRuntimeLabel,
-        SnapshotExecutionMetadata,
-    };
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_content_digest::ContentHash;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateResponse, ExecutionEnvironmentSelection, NetworkPoolStatusResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
     if !crate::service::tests::enter_route_test_process(&[
         ("EPPO_SDK_KEY", None),
         ("SPACE_FLAGD_ENABLED", None),
@@ -376,9 +379,14 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
     )
     .unwrap();
     crate::db::upsert_sandbox_execution_metadata(&conn, &id.to_string(), &producer).unwrap();
-    let operation_id =
-        crate::db::test_fixtures::fence_runtime_upgrade(&conn, &id.to_string(), target, None)
-            .operation_id;
+    let operation_id = crate::db::test_fixtures::fence_runtime_upgrade(
+        &conn,
+        &id.to_string(),
+        target,
+        crate::db::RuntimeUpgradeTargetState::Started,
+        None,
+    )
+    .operation_id;
     let instance = cache.join(id.to_string()).join("instance");
     let snapshot = cache.join(id.to_string()).join("snapshot");
     std::fs::create_dir_all(&instance).unwrap();
@@ -479,7 +487,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
 
 #[test]
 fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflict() {
-    use pplx_space_common_core::types::MemorySize;
+    use pplx_space_byte_size::MemorySize;
     for (captured, file, expected) in [
         (None, None, Ok(None)),
         (None, Some(2048), Ok(Some(2048))),
@@ -503,15 +511,17 @@ fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflic
 async fn suspend_restore_is_admitted_before_the_vm_launches() {
     use crate::node_manager_transport::fake::FakeNodeManager;
     use crate::service::start_support::{ActivationAdmissionKind, REQUESTED_VM_ACTIVATIONS};
-    use pplx_space_common_core::types::{
-        Arch, AutoLifecyclePolicy, ContentHash, RuntimeKind, SandboxArtifactMetadata,
-        SandboxRuntimeLabel, SnapshotExecutionMetadata,
-    };
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+    use pplx_space_content_digest::ContentHash;
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::{RuntimeKind, SnapshotExecutionMetadata};
     use pplx_space_node_mgr_client::proto::{
         AllocateRequest, AllocateResponse, ExecutionEnvironmentSelection, LaunchSandboxResponse,
         NetworkPoolStatusRequest, NetworkPoolStatusResponse, PrepareSandboxResponse,
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
+    use pplx_space_sandbox_model::SandboxRuntimeLabel;
 
     let compiled =
         pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)

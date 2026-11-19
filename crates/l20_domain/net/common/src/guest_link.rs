@@ -1,6 +1,8 @@
 //! Fixed execution-local link, shared by kernel configuration and DHCP.
 use std::net::Ipv4Addr;
 
+pub const PRIMARY_INTERFACE: &str = "eth0";
+
 // Keep legacy string consumers and typed network code on the same addresses.
 macro_rules! address {
     ($typed:ident, $text:ident, $a:literal, $b:literal, $c:literal, $d:literal $(; $cidr:ident, $prefix:literal)?) => {

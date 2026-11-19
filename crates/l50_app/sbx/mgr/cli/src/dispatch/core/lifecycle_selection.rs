@@ -34,6 +34,7 @@ impl Mutation {
                 sandbox_id: id,
                 template_filter,
                 blocking,
+                discard_retained_filesystem_reason: None,
             }),
         }
     }
@@ -72,7 +73,7 @@ fn matching_id(
     selector: Option<&SandboxSelector>,
 ) -> Result<Option<SandboxId>, String> {
     if selector.is_some_and(|selector| {
-        !pplx_space_common_core::ids::sandbox_id_matches(&target.sandbox_id, selector.as_str())
+        !pplx_space_sandbox_model::ids::sandbox_id_matches(&target.sandbox_id, selector.as_str())
     }) {
         return Ok(None);
     }

@@ -1,22 +1,22 @@
-use pplx_space_common_core::types::{OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
 use axum::http::StatusCode;
-use pplx_space_common_core::types::{
-    NodeId, NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
-};
+use pplx_space_accounts::NodeId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_node_model::NodePoolName;
 use pplx_space_public_api::{
     OperationKind, OperationState, PublicErrorCode, PublicOperationResult, PublicSandboxId,
     PublicSandboxOperationResult, RollbackSandboxRequest, SandboxLifecycleAction,
     SandboxLifecycleState, SandboxNetworkPolicyPatch as PublicSandboxNetworkPolicyPatch,
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle, SandboxLifecycleParseError};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
@@ -220,7 +220,7 @@ pub(crate) const IMPLICIT_WAKE_ACTIVITY_ENV: &str = "SPACE_IMPLICIT_WAKE_ACTIVIT
 /// Whether the API records the activity on the system's wakes it queues; see
 /// [`IMPLICIT_WAKE_ACTIVITY_ENV`].
 pub(crate) fn implicit_wake_activity_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
+    pplx_space_env_vars::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
 }
 
 /// The switch for recording
@@ -244,7 +244,7 @@ pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUE
 /// Whether admin creates record their requester; see
 /// [`ADMIN_CREATE_REQUESTED_BY_ENV`].
 pub(crate) fn admin_create_requested_by_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
+    pplx_space_env_vars::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, true)
 }
 
 /// The switch for recording [`CreateSandboxOperationPayload::metric_client_id`]
@@ -265,7 +265,7 @@ pub(crate) const NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV: &str =
 /// Whether native creates record their client; see
 /// [`NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV`].
 pub(crate) fn native_create_client_attribution_enabled() -> bool {
-    pplx_space_common_core::env::env_flag_var(NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV, false)
+    pplx_space_env_vars::env_flag_var(NATIVE_CREATE_CLIENT_ATTRIBUTION_ENV, false)
 }
 
 impl SandboxLifecycleOperationPayload {
@@ -834,7 +834,8 @@ impl SandboxLifecycleOperationExecutor {
             return Err(SandboxLifecycleExecutionError::SandboxNotFound);
         };
         let current_state = public_lifecycle_state(&sandbox.lifecycle)?;
-        if let Some(state) = completed_lifecycle_target_state(payload.action, current_state) {
+        if let Some(state) = completed_lifecycle_target_state(payload.action, current_state.clone())
+        {
             return Ok(lifecycle_success_result(
                 payload.sandbox_id,
                 payload.action,
@@ -847,6 +848,15 @@ impl SandboxLifecycleOperationExecutor {
                 }),
                 "sandbox lifecycle action already completed",
             ));
+        }
+        if payload.action == SandboxLifecycleAction::Pause
+            && pause_cannot_succeed(sandbox.lifecycle.parse()?)
+        {
+            return Err(SandboxLifecycleExecutionError::NotRunning {
+                sandbox_id: payload.sandbox_id,
+                action: payload.action,
+                state: current_state,
+            });
         }
         if payload.action == SandboxLifecycleAction::Rollback {
             admit_user_lifecycle(sandbox_uuid.into(), UserLifecycleRequest::Rollback);
@@ -880,14 +890,23 @@ impl SandboxLifecycleOperationExecutor {
                 "sandbox rollback completed",
             ));
         }
-        let controller_action = if is_implicit_wake(operation, payload.action) {
+        // A system wake acts for the sandbox's recorded client; a caller's
+        // own native operation is native.
+        let (controller_action, activating_client) = if is_implicit_wake(operation, payload.action)
+        {
             let activity = implicit_wake_activity(payload.wake_activity);
             if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
                 return Err(SandboxLifecycleExecutionError::ImplicitWakeNotAllowed);
             }
-            SandboxAction::ImplicitWake(activity)
+            (
+                SandboxAction::ImplicitWake(activity),
+                crate::controllers::substrate::ActivationClient::Inherit,
+            )
         } else {
-            sandbox_action(payload.action)?
+            (
+                sandbox_action(payload.action)?,
+                crate::controllers::substrate::ActivationClient::Native,
+            )
         };
         let body = self
             .controller
@@ -898,6 +917,7 @@ impl SandboxLifecycleOperationExecutor {
                 SandboxApiMetricIdentity::native(payload.action.as_str()),
                 controller_action,
                 None,
+                activating_client,
             )
             .await?;
         let updated = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
@@ -916,6 +936,14 @@ impl SandboxLifecycleOperationExecutor {
         ))
     }
 }
+
+/// How long a Native create waits for its guest to answer. One that does not
+/// answer in time still succeeds with the sandbox `running`, and the first
+/// call waits for the guest, as every Native create did before it waited. A
+/// cold create holds a dispatcher execution slot while it waits, so this stays
+/// well below the 30 s an ECW create may wait.
+pub(crate) const NATIVE_CREATE_COMMAND_READY_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 pub(crate) fn controller_create_request(
     request: pplx_space_public_api::CreateSandboxRequest,
@@ -940,7 +968,12 @@ pub(crate) fn controller_create_request(
         disk_mib: resources.disk_mib,
         file_changes: None,
         auto_lifecycle: request.auto_lifecycle,
-        wait_until_ready: false,
+        // The operation succeeds once the guest answers, so a client that
+        // waited for it can run a command or a file call at once, as an ECW
+        // create answers. The pinned sandbox ID keeps this from adopting a
+        // warm-pool slot, which only the admission-time claim does.
+        wait_until_ready: true,
+        command_ready_wait: Some(NATIVE_CREATE_COMMAND_READY_WAIT),
         network_policy: request.network_policy,
         // Placement pin carried from the operator (admin) create surface; the
         // public API never sets it.
@@ -1108,6 +1141,32 @@ fn completed_lifecycle_target_state(
     }
 }
 
+/// Whether a pause of a sandbox in `lifecycle` can only fail: it needs the
+/// resident runtime these lifecycles lack or are giving up, and no retry
+/// brings it back. A checkpoint returns the sandbox to the state it left, so
+/// it reaches the node like the other transient lifecycles, and the node
+/// pauses a running sandbox or answers why it cannot.
+fn pause_cannot_succeed(lifecycle: SandboxLifecycle) -> bool {
+    match lifecycle {
+        SandboxLifecycle::Suspending
+        | SandboxLifecycle::Suspended
+        | SandboxLifecycle::Stopping
+        | SandboxLifecycle::Stopped
+        | SandboxLifecycle::Deleting
+        | SandboxLifecycle::Failed
+        | SandboxLifecycle::Quarantined => true,
+        SandboxLifecycle::Created
+        | SandboxLifecycle::Creating
+        | SandboxLifecycle::Starting
+        | SandboxLifecycle::Started
+        | SandboxLifecycle::Restoring
+        | SandboxLifecycle::Pausing
+        | SandboxLifecycle::Paused
+        | SandboxLifecycle::Resuming
+        | SandboxLifecycle::Checkpointing => false,
+    }
+}
+
 /// A native wake operation with no actor is the system's wake for a session
 /// (`create_or_join_active_sandbox_wake`): no caller asked for it, so it runs
 /// only while the sandbox's wake policy, read now, still lets the session's
@@ -1242,6 +1301,12 @@ enum SandboxLifecycleExecutionError {
     UnsupportedAction(SandboxLifecycleAction),
     #[error("the sandbox's wake policy no longer lets the waiting session's activity wake it")]
     ImplicitWakeNotAllowed,
+    #[error("cannot {action} a sandbox that is {state}")]
+    NotRunning {
+        sandbox_id: PublicSandboxId,
+        action: SandboxLifecycleAction,
+        state: SandboxLifecycleState,
+    },
     #[error("unknown sandbox lifecycle: {0}")]
     UnknownLifecycle(#[from] SandboxLifecycleParseError),
     #[error("database error: {0}")]
@@ -1276,6 +1341,25 @@ impl SandboxLifecycleExecutionError {
                 PublicErrorCode::Conflict,
                 terminal_error_json(operation, self.to_string()),
             ),
+            Self::NotRunning {
+                sandbox_id,
+                ref state,
+                ..
+            } => {
+                let mut terminal_error = terminal_error_json(operation, self.to_string());
+                if let Some(fields) = terminal_error.as_object_mut() {
+                    for detail in
+                        pplx_space_public_api::sandbox_not_running_details(sandbox_id, state)
+                    {
+                        fields.insert(detail.key, detail.value.into());
+                    }
+                }
+                PublicOperationExecutionResult::failed(
+                    "sandbox is not running",
+                    PublicErrorCode::Conflict,
+                    terminal_error,
+                )
+            }
             Self::Sql(error) => {
                 tracing::warn!(
                     operation_id = %operation.id,

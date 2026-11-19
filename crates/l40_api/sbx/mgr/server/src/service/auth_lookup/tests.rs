@@ -5,7 +5,7 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     conn.execute(
-        pplx_space_common_core::sql!(
+        pplx_space_sql_locator::sql!(
             "INSERT INTO sandboxes (id,uuid8,state,template,user,runtime,created_at,updated_at)
              VALUES (?1,'gateway1','started','seed','deploy','fc','1','1')"
         ),
@@ -13,11 +13,10 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
     )
     .unwrap();
     let owner = 10_042;
-    let isolated = pplx_space_common_core::host::linux::gateway::gateway_uid(
-        pplx_space_common_core::types::LinuxUid::new(owner),
-    )
-    .unwrap()
-    .get();
+    let isolated =
+        pplx_space_host_layout::gateway::gateway_uid(pplx_space_linux_ids::LinuxUid::new(owner))
+            .unwrap()
+            .get();
     crate::db::update_netgtw_pid(&conn, &id, owner, 4242).unwrap();
     let service = SandboxManagerService::new_with_options(
         conn,

@@ -9,11 +9,16 @@
 use std::collections::BTreeMap;
 
 use crate::db::Connection;
-use pplx_space_common_core::types::{
-    Arch, AutoLifecyclePolicy, ExecutionGeneration, LinuxPid, LinuxUid, LocalArtifactId,
-    RuntimeKind, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner,
-    SandboxQuarantineReasonCode, SandboxRuntimeLabel, VsockCid,
+use pplx_space_accounts::SandboxOwner;
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_cpu_arch::Arch;
+use pplx_space_execution_spec::RuntimeKind;
+use pplx_space_linux_ids::{LinuxPid, LinuxUid, VsockCid};
+use pplx_space_sandbox_model::{
+    ExecutionGeneration, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId,
+    SandboxQuarantineReasonCode, SandboxRuntimeLabel,
 };
+use pplx_space_snapshot_model::LocalArtifactId;
 use rusqlite::params;
 use rusqlite::types::Value;
 
@@ -64,7 +69,6 @@ pub fn snapshot(conn: &Connection) -> Snapshot {
                     .unwrap();
                 let names: Vec<String> = statement
                     .column_names()
-                    .into_iter()
                     .skip(1)
                     .map(str::to_owned)
                     .collect();
@@ -445,14 +449,13 @@ pub fn write_status(conn: &Connection, id: &str, state: impl Into<SandboxStatus>
 /// A snapshot shows a `sandboxes` row's combined status as `state`, as rows
 /// stored it before cleanup ownership moved to its own column, so a write's
 /// expected diff names one status. The split columns are pinned by the
-/// migration and writer tests. `unowned_state` and `legacy_state` are
-/// generated from the two, so a snapshot leaves them out.
+/// migration and writer tests. `unowned_state` is generated from the two, so
+/// a snapshot leaves it out.
 fn fold_sandbox_status(table: &str, values: &mut Row) {
     if table != "sandboxes" {
         return;
     }
     values.remove("unowned_state");
-    values.remove("legacy_state");
     if let Some(Value::Text(cleanup)) = values.remove("cleanup_state") {
         values.insert(
             "state".to_owned(),
@@ -496,7 +499,7 @@ pub fn stop(conn: &Connection, id: &str) {
 pub const RESTORE_STORAGE_URI: &str = "s3://snapshots/suspend/restore?region=us-east-1";
 
 /// The remote snapshot a seeded cross-node restore stages from.
-pub fn restore_source() -> pplx_space_common_core::types::ExactStorageUri {
+pub fn restore_source() -> pplx_space_artifact_model::ExactStorageUri {
     RESTORE_STORAGE_URI.parse().unwrap()
 }
 
@@ -755,7 +758,7 @@ pub fn begin_cold_start(conn: &Connection, id: &str) -> CleanupEpisode {
 /// A `suspended` row pinning its published suspend artifact.
 pub fn insert_suspended_with_artifact(conn: &Connection) -> (String, LocalArtifactId) {
     let id = insert_row(conn, SandboxState::Paused);
-    assert!(begin_suspend(conn, &id).unwrap());
+    assert!(begin_suspend(conn, &id, LocalArtifactId::new()).unwrap());
     let artifact = LocalArtifactId::new();
     complete_row_intent_cleanup_for_job(
         conn,

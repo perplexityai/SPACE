@@ -42,6 +42,14 @@ pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionE
             RouteResolutionError::SessionAtRest(at_rest)
         }
         tonic::Code::FailedPrecondition => RouteResolutionError::SessionNotReady,
+        // ClusterApi routes no session to a sandbox that is restoring, and
+        // marks that refusal: the restore is the wake on its way.
+        tonic::Code::Unavailable
+            if pplx_space_common_grpc::SandboxServiceRouteNotReady::from_status(status)
+                .is_some() =>
+        {
+            RouteResolutionError::SessionNotReady
+        }
         _ => RouteResolutionError::ResolutionFailed,
     }
 }
@@ -49,21 +57,34 @@ pub(super) fn route_resolution_error(status: &tonic::Status) -> RouteResolutionE
 /// How often an attach looks again for a route its sandbox does not have yet.
 const SESSION_NOT_READY_POLL: Duration = Duration::from_millis(500);
 
-/// [`resolve_session_route`] for a client attach, which waits up to the
-/// attach deadline while the session's sandbox has no route: a wake started
-/// with the session, such as the one `createCommand` starts for a sandbox at
-/// rest, places the sandbox again in about that time.
+/// How long an events attach waits for a route its sandbox is on its way to.
+///
+/// The wake `createCommand` queues for a sandbox at rest runs behind the
+/// sandbox's earlier lifecycle operations and the organization's lifecycle
+/// limits, so when many sandboxes wake at once the last ones are placed tens
+/// of seconds after their commands were created. The wait stays under the
+/// 60 s idle timeout common to HTTP proxies, so a client behind one gets the
+/// attach's own answer rather than the proxy's.
+const ATTACH_ROUTE_WAIT: Duration = Duration::from_secs(45);
+
+/// [`resolve_session_route`] for a client attach, which waits up to
+/// [`ATTACH_ROUTE_WAIT`] while the session's sandbox has no route but is
+/// about to: it is placing, waking or restoring, as after the wake
+/// `createCommand` starts for a sandbox at rest.
 pub(super) async fn resolve_attach_route(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
     token: &str,
 ) -> Result<AttachedSession, RouteResolutionError> {
-    retry_not_ready_until(tokio::time::Instant::now() + state.attach_deadline, || {
+    retry_not_ready_until(tokio::time::Instant::now() + ATTACH_ROUTE_WAIT, || {
         resolve_session_route(state, session_id, token)
     })
     .await
 }
 
+/// Resolve until the route is anything but not ready, or until `deadline`.
+/// A resolve still running at the deadline, such as one ClusterApi holds on
+/// a restore, ends there as not ready: the attach answers by its deadline.
 pub(super) async fn retry_not_ready_until<T, F, Fut>(
     deadline: tokio::time::Instant,
     mut resolve: F,
@@ -73,13 +94,14 @@ where
     Fut: Future<Output = Result<T, RouteResolutionError>>,
 {
     loop {
-        match resolve().await {
-            Err(RouteResolutionError::SessionNotReady)
+        match tokio::time::timeout_at(deadline, resolve()).await {
+            Err(_) => return Err(RouteResolutionError::SessionNotReady),
+            Ok(Err(RouteResolutionError::SessionNotReady))
                 if tokio::time::Instant::now() + SESSION_NOT_READY_POLL < deadline =>
             {
                 tokio::time::sleep(SESSION_NOT_READY_POLL).await;
             }
-            result => return result,
+            Ok(result) => return result,
         }
     }
 }
@@ -110,19 +132,19 @@ async fn resolve_session_route_with_cache(
         return Ok(attached);
     }
 
-    let mut client = state.cluster_api.for_session(&session_id);
-    let read = start_revocation_read(state);
-    let response = client
-        .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
+    let (read, response) = resolve_data_plane_session_route(
+        state,
+        session_id,
+        ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             token_sha256: Some(token_sha256),
             required_scope: Some(required_scope),
             requested_transport: Some(native_requested_transport(session_id.kind()) as i32),
-        })
-        .await
-        .map_err(|status| route_resolution_error(&status))?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(|status| route_resolution_error(&status))?;
 
     let mut attached = attached_session_from_route_response(
         response,
@@ -427,19 +449,19 @@ pub(super) async fn resolve_session_route_internal(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
 ) -> Result<AttachedSession, StreamBridgeError> {
-    let mut client = state.cluster_api.for_session(&session_id);
-    let read = start_revocation_read(state);
-    let response = client
-        .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
+    let (read, response) = resolve_data_plane_session_route(
+        state,
+        session_id,
+        ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
             token_sha256: None,
             required_scope: None,
             requested_transport: Some(native_requested_transport(session_id.kind()) as i32),
-        })
-        .await
-        .map_err(StreamBridgeError::ClusterStatus)?
-        .into_inner();
+        },
+    )
+    .await
+    .map_err(StreamBridgeError::ClusterStatus)?;
 
     let attached = attached_session_from_route_response(
         response,
@@ -454,6 +476,31 @@ pub(super) async fn resolve_session_route_internal(
         read,
     );
     Ok(attached)
+}
+
+/// Ask ClusterApi for a session's route, sending the request again while this
+/// client's transport to it fails ([`crate::cluster_api_retry`]). The
+/// revocation read is dated from the attempt that answered.
+async fn resolve_data_plane_session_route(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    message: ResolveDataPlaneSessionRouteRequest,
+) -> Result<(RevocationRead, ResolveDataPlaneSessionRouteResponse), tonic::Status> {
+    let client = state.cluster_api.for_session(&session_id);
+    crate::cluster_api_retry::retry_cluster_api_transport(
+        "resolve_data_plane_session_route",
+        tokio::time::Instant::now() + crate::cluster_api_retry::CLUSTER_API_TRANSPORT_RETRY_WINDOW,
+        || {
+            let mut client = client.clone();
+            let message = message.clone();
+            let read = start_revocation_read(state);
+            async move {
+                let response = client.resolve_data_plane_session_route(message).await?;
+                Ok((read, response.into_inner()))
+            }
+        },
+    )
+    .await
 }
 
 pub(super) fn attached_session_from_route_response(
@@ -564,7 +611,7 @@ pub(super) async fn proxy_session(
         .parse::<DataPlaneSessionId>()
         .map_err(|_| ProxyError::BadRequest("invalid session id"))?;
     let (token, token_source) = token_from_headers_with_source(request.headers())
-        .map_err(ProxyError::BadRequest)?
+        .map_err(|MalformedToken| ProxyError::Unauthorized(INVALID_TOKEN_MESSAGE))?
         .ok_or(ProxyError::Unauthorized("data-plane token is required"))?;
     if is_upgrade_request(request.headers()) && state.drain_started.is_cancelled() {
         return Ok(native_draining_response(session_id.kind().as_str()));
@@ -1131,7 +1178,11 @@ pub(super) async fn bind_session_process(
 /// commit it. Until it settles, nothing can start the command a second time:
 /// the binding holds the session's start permit, so another attach on this
 /// replica is refused, and a start of the derived process id the guest
-/// already holds connects to it instead (`initial_process_stream`).
+/// already holds connects to it instead (`initial_process_stream`). A guest
+/// that predates assigned ids mints its own id and never reports the derived
+/// one as taken, so for it an attach on another replica before the binding
+/// commits is held back only by the guest's handling of the start's
+/// idempotency key.
 ///
 /// The write runs in its own task so a client that disconnects mid-bind does
 /// not cancel it; the cluster API client's RPC timeout bounds it. Streams

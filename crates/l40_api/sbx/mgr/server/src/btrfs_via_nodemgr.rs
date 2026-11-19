@@ -134,11 +134,11 @@ impl CapturedRootfs {
 /// resolves the legacy build.
 pub(crate) fn codec_environment_build(
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
 ) -> Option<pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild> {
     let environment = environment?;
     (pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
-        != pplx_space_common_core::types::TemplateCachePartition::Legacy)
+        != pplx_space_template_model::TemplateCachePartition::Legacy)
         .then(
             || pplx_space_node_mgr_client::proto::EnvironmentTemplateBuild {
                 content_hash: content_hash.to_string(),
@@ -154,7 +154,7 @@ pub(crate) async fn encode_rootfs_send(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     snapshot_dir: &str,
     execution_fence: ExecutionFence,
     node_manager: &NodeManagerConnector,
@@ -197,7 +197,7 @@ pub(crate) async fn encode_snapshot_rootfs_send(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     snapshot_name: &str,
     dest_dir: &str,
     node_manager: &NodeManagerConnector,
@@ -236,7 +236,7 @@ pub(crate) async fn receive_instance(
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
-    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
     target: InstanceTarget,
     node_manager: &NodeManagerConnector,
 ) -> Result<(), BtrfsViaNodemgrError> {
@@ -345,7 +345,7 @@ fn retain_send_sources() -> bool {
 /// Capture still defers only when volume-manager and node-manager advertise
 /// the capabilities it needs.
 fn retain_send_sources_from(raw: Option<&str>) -> bool {
-    pplx_space_common_core::env::env_flag(raw, true)
+    pplx_space_env_vars::env_flag(raw, true)
 }
 
 pub(crate) async fn materialize_rootfs_send(

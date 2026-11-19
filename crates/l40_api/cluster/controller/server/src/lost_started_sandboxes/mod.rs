@@ -62,7 +62,8 @@
 //! initialized when the loop is enabled. Without EC2 access the lookup errors
 //! defer each candidate, and only the deleted-node-row arm can act.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_accounts::NodeId;
+use pplx_space_sandbox_model::SandboxId;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -118,10 +119,10 @@ impl Default for ReconcilerConfig {
 
 impl ReconcilerConfig {
     pub fn from_env() -> Self {
-        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+        Self::from_environment(&pplx_space_env_vars::ProcessEnvironment)
     }
 
-    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+    pub(crate) fn from_environment(env: &dyn pplx_space_env_vars::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {

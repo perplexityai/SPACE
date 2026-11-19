@@ -98,7 +98,8 @@
 //! that earlier versions of this module documented are both closed by the
 //! immutable-row design.
 
-use pplx_space_common_core::types::{ArtifactOrigin, SandboxLifecycle};
+use pplx_space_sandbox_model::SandboxLifecycle;
+use pplx_space_snapshot_model::ArtifactOrigin;
 
 /// Returns a self-contained `EXISTS(...)` SQL fragment evaluating to TRUE iff
 /// the sandbox row aliased as `sandbox_alias` has a `state='ready'` full

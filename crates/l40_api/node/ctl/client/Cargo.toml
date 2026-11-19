@@ -17,8 +17,8 @@ tokio = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 tower = { workspace = true }
-pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-host-layout = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

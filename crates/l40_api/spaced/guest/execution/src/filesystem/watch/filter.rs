@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use pplx_space_common_core::types::RelativeGlobPattern;
+use pplx_space_guest_process::RelativeGlobPattern;
 use tonic::Status;
 
 const MAX_GLOB_PATTERNS: usize = 128;
@@ -143,7 +143,7 @@ impl WatchFilter {
         if self.config.use_default_excludes && is_tmp_browser_scratch_path(path) {
             return false;
         }
-        let relative = if relative.as_os_str().is_empty() {
+        let relative = if relative.is_empty() {
             Path::new(".")
         } else {
             relative

@@ -1,11 +1,13 @@
-use pplx_space_common_core::types::SnapshotId;
+use pplx_space_snapshot_model::SnapshotId;
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::{
-    types::ContentHash, types::K8sNodeName, types::K8sNodeUid, types::OrgId, types::SandboxId,
-    types::StorageUri, types::TemplateName, types::snapshot_shard,
-};
+use pplx_space_accounts::OrgId;
+use pplx_space_artifact_model::{StorageUri, snapshot_shard};
+use pplx_space_content_digest::ContentHash;
+use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_template_model::TemplateName;
 
 use super::*;
 use crate::auth::K8sIdentity;

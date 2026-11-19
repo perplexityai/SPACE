@@ -5,10 +5,7 @@ async fn copy_jobs_deduplicate_live_work_without_claiming_a_pull_writer_barrier(
     let temp = tempfile::tempdir().unwrap();
     let service = test_service(&temp).await;
     let request = crate::proto::CopyObjectRequest {
-        subject_id: format!(
-            "sandbox:{}",
-            pplx_space_common_core::types::SandboxId::new()
-        ),
+        subject_id: format!("sandbox:{}", pplx_space_sandbox_model::SandboxId::new()),
         source_s3_uri: "s3://example-artifacts/source?region=us-east-1".into(),
         destination_s3_uri: "s3://example-artifacts/destination?region=us-east-1".into(),
     };
@@ -146,7 +143,7 @@ fn root_request<T>(message: T) -> Request<T> {
 
 fn service_request<T>(
     message: T,
-    user: pplx_space_common_core::host::linux::identities::LinuxUser,
+    user: pplx_space_host_layout::identities::LinuxUser,
 ) -> Request<T> {
     request_from_peer(message, user.uid, user.primary_group.gid)
 }
@@ -266,7 +263,7 @@ async fn pull_artifact_as(
     service: &VolumeManagerService,
     subject_id: &str,
     artifact_id: &str,
-    user: pplx_space_common_core::host::linux::identities::LinuxUser,
+    user: pplx_space_host_layout::identities::LinuxUser,
 ) -> Result<String, Status> {
     VolumeManager::pull_files_async(
         service,
@@ -365,8 +362,91 @@ async fn closing_admission_rejects_mutations() {
 }
 
 #[tokio::test]
+async fn handing_off_persists_queued_submissions_for_the_successor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(&temp).await;
+    let pull = || PullFileRequest {
+        subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
+        s3_uri: "s3://bucket/snapshots/a/memfile?region=us-east-2".to_string(),
+        local_path: "/space/cache/replacements/download-7b47".to_string(),
+        ..Default::default()
+    };
+    service.transfer_admission().hand_off();
+    service.worker().stop_starting_jobs();
+
+    let job_id =
+        VolumeManager::submit_pull_file(&service, service_request(pull(), users::SPACE_SBXMGR))
+            .await
+            .expect("a queued submission is persisted while handing off")
+            .into_inner()
+            .job_id;
+    let job = service
+        .worker()
+        .get_job(&job_id.parse().unwrap())
+        .unwrap()
+        .expect("persisted job");
+    assert_eq!(job.status, "pending");
+
+    let blocking = VolumeManager::pull_file(&service, service_request(pull(), users::SPACE_SBXMGR))
+        .await
+        .expect_err("a transfer the caller waits for is refused while handing off");
+    assert_eq!(blocking.code(), tonic::Code::Unavailable);
+
+    let wait = tokio::spawn({
+        let service = service.clone();
+        let job_id = job_id.clone();
+        async move {
+            VolumeManager::wait_transfer_job(
+                &service,
+                service_request(GetTransferJobRequest { job_id }, users::SPACE_SBXMGR),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!wait.is_finished(), "the job is still pending");
+    service.transfer_admission().end_waits();
+    let ended = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("ending waits answers a wait for a job left to the successor")
+        .unwrap()
+        .expect_err("the successor finishes the job");
+    assert_eq!(ended.code(), tonic::Code::Unavailable);
+}
+
+#[tokio::test]
+async fn staging_orphan_sweep_keeps_inputs_of_artifact_pushes_left_to_the_successor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = test_service(&temp).await;
+    service.worker().stop_starting_jobs();
+    let staged = temp.path().join("staging").join("artifact-entry");
+    let orphan = temp.path().join("staging").join("orphan");
+    std::fs::write(&staged, b"entry").unwrap();
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let mut artifact = sample_artifact();
+    artifact.entries[0].staged_path = Some(staged.to_string_lossy().into_owned());
+    service
+        .worker()
+        .submit(
+            PUSH_ARTIFACT_KIND,
+            &artifact.to_json(),
+            Some(&artifact.subject_id),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(service.cleanup_staging_orphans().unwrap(), 1);
+
+    assert!(
+        staged.exists(),
+        "a pending artifact push keeps its staged input"
+    );
+    assert!(!orphan.exists());
+}
+
+#[tokio::test]
 async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
-    use pplx_space_common_core::{host::linux::identities::groups, host::linux::identities::users};
+    use pplx_space_host_layout::{identities::groups, identities::users};
 
     let temp = tempfile::tempdir().expect("tempdir");
     let service = test_service(&temp).await;
@@ -471,7 +551,7 @@ async fn rpc_authorization_rejects_group_members_and_separates_subject_kinds() {
 
 #[tokio::test]
 async fn pull_artifact_dedup_never_returns_the_other_manager_class_job() {
-    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_host_layout::identities::users;
 
     const SANDBOX_SUBJECT: &str = "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2";
     const TEMPLATE_SUBJECT: &str = "template:seed";

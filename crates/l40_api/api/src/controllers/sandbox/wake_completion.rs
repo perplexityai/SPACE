@@ -33,16 +33,16 @@
 //! whose owner commit didn't land, and a redrive that finds the row already
 //! `started` has nothing left to do.
 
-use pplx_space_common_core::sql;
+use pplx_space_sql_locator::sql;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::{WakeCompletionAction, WakeCompletionRedriveOutcome};
 use futures_util::future::BoxFuture;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
