@@ -21,6 +21,8 @@ space-admin-cli warm-pool create --template NAME --vcpu N --memory-mib N \
   --target-ready-slots N --refill-per-tick N --max-warming-slots N
 space-admin-cli warm-pool add ...             # alias for warm-pool create
 space-admin-cli warm-pool update --template NAME@sha256:... --vcpu N ...
+space-admin-cli warm-pool disable <uuid> [--json]
+                                               DELETE /admin/api/v1/warm-pools/{pool_id}
 space-admin-cli runtime env list [--json]
 space-admin-cli runtime env default <environment> --reason TEXT [--strand] [--if-generation N] [--json]
 space-admin-cli runtime env state <environment> <allowed|deprecated|blocked> --reason TEXT [--strand] [--if-generation N] [--json]
@@ -393,14 +395,51 @@ space-admin-cli warm-pool create \
 Use `--disabled` to write the config without allowing the reconciler to fill
 it yet, and `--json` to print the raw API response.
 
-A template can't be deleted while one of its pool configs or rolling policies
-is enabled, or while one of its pools still has slots. Disable each config with
-`warm-pool update ... --disabled` and each policy through the Admin API, and
-wait for the open slots to drain; a slot claimed by a create still in flight
+### Disable one config
+
+`warm-pool disable <uuid>` disables exactly one config through
+`DELETE /admin/api/v1/warm-pools/{pool_id}` and prints it. `<uuid>` must be the
+config's full UUID. Unlike `warm-pool get`, `disable` refuses ID prefixes and
+template references, even one that matches a single config. Config IDs are
+UUIDv7, which start with their creation time, so configs created close
+together, such as the ones one autoscaler pass creates, often share the
+8-character ID `warm-pool list` shows, and a prefix that names one config today
+can name another once the first is deleted. Copy the full ID from
+`warm-pool get <id-prefix|template-reference> --json` or
+`warm-pool list --json`. An unknown UUID gets the API's 404.
+
+```bash
+space-admin-cli warm-pool get my-template@sha256:a710c90b3897 --json
+space-admin-cli warm-pool disable 01937b2e-4c1a-7d3f-9a2b-5e6f7a8b9c0d
+```
+
+The API sets the config's `enabled` to false and its target ready slots to 0, so
+the reconciler drains its open slots. It leaves the config's other settings and
+its owner alone, which matters for a config a rolling policy created: while an
+enabled policy still selects that release, the autoscaler re-enables the config
+and sets its target from the policy again on its next pass. To make the disable
+stick, either disable the policy, after which a later autoscaler pass drains
+every config it manages across all its releases, or use
+`warm-pool update ... --disabled` on just this config, which takes it over as
+manual for good: the policy no longer manages that release and shape, even
+after you re-enable the config. Once a disabled autoscaler-owned config has no
+slots left, the autoscaler deletes it.
+
+Use `warm-pool disable` to turn off a config you've identified by ID. Use
+`warm-pool update ... --disabled` when you're also changing the config's sizing
+in the same write. That goes through the upsert, so it finds the config by
+template release, `--vcpu` and `--memory-mib` rather than by ID, needs every
+sizing flag restated, keeps the target you pass, and marks the config manually
+owned.
+
+A template can't be deleted while one of its pool configs or rolling policies is
+enabled, or while one of its pools still has slots. Disable each policy through
+the Admin API first, then each remaining config with `warm-pool disable <uuid>`,
+and wait for the open slots to drain; a slot claimed by a create still in flight
 settles within minutes. A slot held by a sandbox created from the pool clears
-only when that sandbox's pod is retired, for example when the sandbox is
-deleted or suspended. Then delete the template again, with a new
-`Idempotency-Key` if an earlier delete failed. The CLI has no template-delete
+only when that sandbox's pod is retired, for example when the sandbox is deleted
+or suspended. Then delete the template again, with a new `Idempotency-Key` if an
+earlier delete failed. The CLI has no template-delete
 command; see [Delete a template that has pools](../../../../docs/warm-pools.md#delete-a-template-that-has-pools).
 
 List configs:

@@ -95,6 +95,7 @@ async fn main() {
             }
             WarmPoolCommands::List { json } => client.list_warm_pools(json).await,
             WarmPoolCommands::Get { pool, json } => client.get_warm_pool(&pool, json).await,
+            WarmPoolCommands::Disable { pool, json } => client.disable_warm_pool(&pool, json).await,
         },
     };
 

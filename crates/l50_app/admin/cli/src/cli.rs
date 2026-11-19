@@ -492,6 +492,19 @@ pub(crate) enum WarmPoolCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Disable exactly one warm-pool config by its full UUID.
+    ///
+    /// ID prefixes and template references are refused, so the command acts
+    /// only on the config whose ID was passed.
+    #[command(name = "disable")]
+    Disable {
+        /// Full pool config UUID, as printed by `warm-pool get --json` or
+        /// `warm-pool list --json`.
+        pool: String,
+        /// Emit the raw JSON response instead of a formatted view.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Args)]

@@ -441,7 +441,7 @@ fn render_warm_pool_config_emits_config_and_slot_counts() {
         updated_at: "2026-05-19T00:01:00Z".to_string(),
     };
 
-    let out = render_warm_pool_config(&config);
+    let out = render_warm_pool_config(&config, "GET /admin/api/v1/warm-pools");
 
     assert!(out.contains("app-runtime"));
     assert!(out.contains("sha256:abc"));
@@ -538,6 +538,103 @@ fn resolve_warm_pool_ref_errors_on_ambiguous_template_name() {
         }
         other => panic!("expected Argument, got {other:?}"),
     }
+}
+
+/// `disable` takes only a full UUID. A unique ID prefix and a template
+/// reference that `warm-pool get` would each resolve to one config are
+/// refused before any request, and an unknown UUID reaches the server.
+#[tokio::test]
+async fn disable_warm_pool_deletes_only_the_named_uuid() {
+    use axum::{Json, Router, extract::Path, http::StatusCode, response::IntoResponse};
+    use std::sync::{Arc, Mutex};
+
+    let original = warm_pool("11111111-1111-1111-1111-111111111111", "app-runtime");
+    let original_id = original.id;
+    let configs = vec![
+        warm_pool("11111111-1111-1111-1111-111111111111", "app-runtime"),
+        warm_pool("22222222-2222-2222-2222-222222222222", "seed"),
+    ];
+    let mut disabled = serde_json::to_value(&original).unwrap();
+    disabled["enabled"] = serde_json::json!(false);
+    let deleted: Arc<Mutex<Vec<Uuid>>> = Arc::default();
+    let recorder = Arc::clone(&deleted);
+    let app = Router::new().route(
+        "/admin/api/v1/warm-pools/{pool_id}",
+        axum::routing::delete(move |Path(pool_id): Path<Uuid>| async move {
+            recorder.lock().unwrap().push(pool_id);
+            if pool_id == original_id {
+                Json(disabled).into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "cluster pool config not found").into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = AdminClient::new(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        "synthetic-token",
+    )
+    .unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let out = client
+        .disable_warm_pool("11111111-1111-1111-1111-111111111111", false)
+        .await
+        .unwrap();
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with("Enabled ") && line.trim_end().ends_with(" false")),
+        "{out}"
+    );
+    assert!(
+        out.contains("DELETE /admin/api/v1/warm-pools/11111111-1111-1111-1111-111111111111"),
+        "{out}"
+    );
+    let json = client
+        .disable_warm_pool(
+            " 11111111-1111-1111-1111-111111111111 "
+                .to_uppercase()
+                .as_str(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["enabled"],
+        false
+    );
+    for reference in [
+        "11111111",
+        "1111",
+        "app-runtime",
+        "app-runtime@sha256:abcdef012345",
+        "",
+    ] {
+        if !reference.is_empty() {
+            resolve_warm_pool_ref(reference, &configs).unwrap();
+        }
+        let err = client
+            .disable_warm_pool(reference, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CliError::Argument(_)),
+            "{reference:?}: {err:?}"
+        );
+    }
+    let err = client
+        .disable_warm_pool("33333333-3333-3333-3333-333333333333", false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CliError::Api { status: 404, .. }), "{err:?}");
+
+    let unknown = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    assert_eq!(
+        *deleted.lock().unwrap(),
+        vec![original_id, original_id, unknown]
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 fn warm_pool(id: &str, template_name: &str) -> WarmPoolConfigResponse {
