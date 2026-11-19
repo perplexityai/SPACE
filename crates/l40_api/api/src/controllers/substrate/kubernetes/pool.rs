@@ -629,6 +629,9 @@ struct PoolTemplateReleaseRow {
 /// Resolve the template release a pool claim or config upsert targets: the
 /// release matching the requested content hash when one is pinned, otherwise
 /// the tagged-`latest` release, otherwise the newest release of the template.
+/// Only original releases are candidates (no older release of the same
+/// template and hash): a twin bound to another environment is registered
+/// after its original and would otherwise be the newest.
 /// Template-domain logic; deliberately not part of the warm-pool store.
 async fn resolve_pool_template_release(
     tx: &mut Transaction<'_, Postgres>,
@@ -644,6 +647,12 @@ async fn resolve_pool_template_release(
           AND t.tag = 'latest'
          WHERE r.template_name = $1
            AND ($2::TEXT IS NULL OR r.hash = $2)
+           AND NOT EXISTS (
+               SELECT 1
+               FROM template_releases o
+               WHERE o.template_name = r.template_name
+                 AND o.hash = r.hash
+                 AND (o.created_at, o.id) < (r.created_at, r.id))
          ORDER BY (t.tag IS NOT NULL) DESC, r.created_at DESC
          LIMIT 1"
     ))

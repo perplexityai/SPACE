@@ -191,6 +191,120 @@ pub fn template_object_prefix(
     }
 }
 
+/// Directory, under a build's [`template_object_prefix`], holding the
+/// per-environment metadata of the build's twins.
+pub const TEMPLATE_ENVIRONMENTS_DIR: &str = "environments";
+
+/// The build-relative keys of a release's `metadata.json`, in the order a
+/// reader tries them: for a release bound to `environment`, its own
+/// `environments/<environment>/metadata.json` first, then the shared one.
+///
+/// A twin of a release has the same template name and rootfs digest, and so
+/// the same build directory and artifacts, but its own execution metadata,
+/// bound to another environment. It's written under the environment key so
+/// the original's shared `metadata.json` is never rewritten. A release whose
+/// environment has no key of its own, such as every original, reads the
+/// shared one. With no environment, only the shared key is read, as before
+/// twins.
+///
+/// # Examples
+///
+/// ```rust
+/// # use pplx_space_artifact_model::*;
+/// # use pplx_space_content_digest::Digest;
+/// # use pplx_space_execution_spec::EnvironmentReference;
+/// assert_eq!(template_metadata_relative_keys(None), vec!["metadata.json".to_string()]);
+/// let environment = EnvironmentReference::new(Digest::sha256([0xcd; 32]));
+/// assert_eq!(
+///     template_metadata_relative_keys(Some(environment)),
+///     vec![format!("environments/{environment}/metadata.json"), "metadata.json".to_string()],
+/// );
+/// ```
+pub fn template_metadata_relative_keys(
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+) -> Vec<String> {
+    let shared = TemplateArtifact::Metadata.file_name().to_string();
+    match environment {
+        Some(environment) => vec![
+            template_environment_metadata_relative_key(environment),
+            shared,
+        ],
+        None => vec![shared],
+    }
+}
+
+/// The build-relative key of the `metadata.json` of a twin bound to
+/// `environment`: `environments/<environment>/metadata.json`.
+pub fn template_environment_metadata_relative_key(
+    environment: pplx_space_execution_spec::EnvironmentReference,
+) -> String {
+    format!(
+        "{TEMPLATE_ENVIRONMENTS_DIR}/{environment}/{file}",
+        file = TemplateArtifact::Metadata.file_name(),
+    )
+}
+
+/// The environment a build-relative key written by
+/// [`template_environment_metadata_relative_key`] names; `None` for any other
+/// key, including one whose environment segment isn't an environment
+/// reference in its canonical spelling.
+pub fn template_environment_metadata_environment(
+    relative_key: &str,
+) -> Option<pplx_space_execution_spec::EnvironmentReference> {
+    let rest = relative_key
+        .strip_prefix(TEMPLATE_ENVIRONMENTS_DIR)?
+        .strip_prefix('/')?;
+    let (environment, file) = rest.split_once('/')?;
+    if file != TemplateArtifact::Metadata.file_name() {
+        return None;
+    }
+    // The parser accepts only the canonical spelling, the one a writer
+    // produces: lowercase hex of the exact length after a known algorithm.
+    environment.parse().ok()
+}
+
+/// The object-store key of the `metadata.json` of a twin bound to
+/// `environment`: [`template_object_prefix`] joined with
+/// [`template_environment_metadata_relative_key`]. It names a twin's own
+/// metadata; the original release's stays at
+/// [`template_object_key`]`(.., TemplateArtifact::Metadata)`. Credential
+/// Manager treats the key as part of the release, which is immutable once
+/// published, and it refuses writes to it then: a twin, registered after its
+/// original, needs its own write path. Readers exchange for it like any
+/// release object.
+///
+/// # Examples
+///
+/// ```rust
+/// # use pplx_space_artifact_model::*;
+/// # use pplx_space_content_digest::{ContentHash, Digest};
+/// # use pplx_space_template_model::TemplateName;
+/// # use pplx_space_execution_spec::EnvironmentReference;
+/// let template = TemplateName::parse("seed")?;
+/// let hash = ContentHash::new(Digest::sha256([0xab; 32]));
+/// let environment = EnvironmentReference::new(Digest::sha256([0xcd; 32]));
+/// assert_eq!(
+///     template_environment_metadata_key("p", &template, hash, environment),
+///     format!(
+///         "{}/environments/{environment}/metadata.json",
+///         template_object_prefix("p", &template, hash),
+///     ),
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn template_environment_metadata_key(
+    key_prefix: &str,
+    template: &TemplateName,
+    content_hash: ContentHash,
+    environment: pplx_space_execution_spec::EnvironmentReference,
+) -> String {
+    format!(
+        "{prefix}/{relative}",
+        prefix = template_object_prefix(key_prefix, template, content_hash),
+        relative = template_environment_metadata_relative_key(environment),
+    )
+}
+
 /// Identifies one artifact of a Firecracker microVM snapshot.
 ///
 /// The rootfs slot has two distinct shapes today:

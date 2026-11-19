@@ -360,3 +360,50 @@ fn storage_uri_rejects_unknown_query_params() {
         Err(StorageUriParseError::InvalidPathStyle { .. }),
     ));
 }
+
+#[test]
+fn twin_metadata_key_is_beside_the_shared_one_and_round_trips() {
+    use pplx_space_execution_spec::EnvironmentReference;
+    let template = TemplateName::parse("seed").unwrap();
+    let hash = fixture_hash();
+    let environment = EnvironmentReference::new(Digest::sha256([0xcd; 32]));
+    let shared = template_object_key("p/", &template, hash, TemplateArtifact::Metadata);
+    let twin = template_environment_metadata_key("p/", &template, hash, environment);
+    assert_eq!(
+        twin,
+        "p/templates/seed/sha256:abababababababababababababababababababababababababababababababab/environments/sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd/metadata.json",
+    );
+    assert_ne!(twin, shared);
+
+    let relative = template_environment_metadata_relative_key(environment);
+    assert_eq!(
+        template_environment_metadata_environment(&relative),
+        Some(environment)
+    );
+    assert_eq!(
+        template_metadata_relative_keys(Some(environment)),
+        vec![relative.clone(), "metadata.json".to_string()]
+    );
+    assert_eq!(
+        template_metadata_relative_keys(None),
+        vec!["metadata.json".to_string()]
+    );
+
+    for other in [
+        "metadata.json".to_string(),
+        relative.replace("metadata.json", "manifest.json"),
+        format!("{relative}/extra"),
+        format!("/{relative}"),
+        relative.replace("environments/", "environment/"),
+        relative.replace("sha256:", ""),
+        relative.replace("cdcd", "CDCD"),
+        relative.replace("sha256:", "SHA256:"),
+        "environments/not-a-digest/metadata.json".to_string(),
+    ] {
+        assert_eq!(
+            template_environment_metadata_environment(&other),
+            None,
+            "{other}"
+        );
+    }
+}

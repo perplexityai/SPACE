@@ -24,7 +24,7 @@ use pplx_space_node_api_client::proto::{
     facet_ref,
 };
 use pplx_space_object_store::{
-    ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
+    ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, PutIfAbsent, S3ObjectStore,
 };
 use pplx_space_page_cache as page_cache;
 use pplx_space_template_model::TemplateName;
@@ -140,6 +140,12 @@ pub enum PublishError {
         #[source]
         source: ObjectStoreError,
     },
+    #[error(
+        "{key} already holds the {artifact} of another execution; a release and its \
+         twins share the build prefix, so publishing would rewrite what the first \
+         publication's consumers read"
+    )]
+    BuildPrefixHeldByAnotherExecution { artifact: String, key: String },
     #[error("cluster api connect failed: {0}")]
     ClusterApiConnect(#[from] pplx_space_node_api_client::cluster::ConnectClusterApiError),
     #[error("register template failed: {0}")]
@@ -169,6 +175,7 @@ impl PublishError {
             | Self::MissingExecutionMetadata { .. }
             | Self::CredentialExchange(_)
             | Self::ObjectStore { .. }
+            | Self::BuildPrefixHeldByAnotherExecution { .. }
             | Self::ClusterApiConnect(_)
             | Self::RegisterTemplate(_)
             | Self::RegisterTemplateRelease(_)
@@ -345,7 +352,7 @@ async fn publish_build_from_dir(
                 &publication_prefix,
                 true,
                 crate::object_store::CredentialSubject::Template(template),
-                StorageAccess::Write,
+                StorageAccess::ReadWrite,
             )
         })
         .await?;
@@ -404,6 +411,7 @@ async fn recorded_release_locations(
     template_org: Option<TemplateOrg>,
 ) -> Result<Option<Vec<String>>, PublishError> {
     let request = FindTemplateReleaseByHashRequest {
+        environment: None,
         generic_only: false,
         template_name: template.as_str().to_string(),
         hash: content_hash.to_string(),
@@ -777,55 +785,49 @@ async fn upload_build_artifacts(
         TemplateArtifact::Manifest,
     );
 
-    let metadata_bytes =
-        tokio::fs::read(&metadata_path)
-            .await
-            .map_err(|source| PublishError::ReadArtifact {
-                path: metadata_path.clone(),
-                source,
-            })?;
-    store
-        .put_bytes(
-            creds,
-            ObjectTarget {
-                bucket: &object_store.bucket,
-                key: &metadata_key,
-                region: &object_store.region,
-                endpoint: object_store.endpoint.as_deref(),
-                path_style: object_store.path_style,
-            },
-            Bytes::from(metadata_bytes),
+    // Inspect both control objects before writing either, then create the
+    // absent ones, then replace the stale ones. A refusal at any step writes
+    // nothing over a stored object, and one found before the first write
+    // writes nothing at all, so a prefix left by an interrupted publish of
+    // another execution never gains this build's objects beside its own.
+    // The manifest goes first, since it names the build's execution and pins
+    // the rootfs digest pull verifies.
+    let mut objects = [
+        ControlObject::read(
+            TemplateArtifact::Manifest,
+            &manifest_key,
+            &manifest_path,
+            manifest_identity,
         )
-        .await
-        .map_err(|source| PublishError::ObjectStore {
-            artifact: TemplateArtifact::Metadata.file_name().to_string(),
-            source,
-        })?;
-
-    let manifest_bytes =
-        tokio::fs::read(&manifest_path)
-            .await
-            .map_err(|source| PublishError::ReadArtifact {
-                path: manifest_path.clone(),
-                source,
-            })?;
-    store
-        .put_bytes(
-            creds,
-            ObjectTarget {
-                bucket: &object_store.bucket,
-                key: &manifest_key,
-                region: &object_store.region,
-                endpoint: object_store.endpoint.as_deref(),
-                path_style: object_store.path_style,
-            },
-            Bytes::from(manifest_bytes),
+        .await?,
+        ControlObject::read(
+            TemplateArtifact::Metadata,
+            &metadata_key,
+            &metadata_path,
+            metadata_identity,
         )
-        .await
-        .map_err(|source| PublishError::ObjectStore {
-            artifact: TemplateArtifact::Manifest.file_name().to_string(),
-            source,
-        })?;
+        .await?,
+    ];
+    for object in &mut objects {
+        object.claim = object.inspect(store, creds, object_store).await?;
+    }
+    for object in &mut objects {
+        if object.claim == Claim::Create {
+            object.claim = object.create(store, creds, object_store).await?;
+        }
+    }
+    for object in &objects {
+        if object.claim == Claim::Replace {
+            store
+                .put_bytes(
+                    creds,
+                    object_target(object_store, object.key),
+                    object.bytes.clone(),
+                )
+                .await
+                .map_err(|source| object.store_error(source))?;
+        }
+    }
 
     let compressed_rootfs_key = template_object_key(
         &object_store.key_prefix,
@@ -856,6 +858,155 @@ async fn upload_build_artifacts(
     );
 
     Ok(())
+}
+
+/// What a control object says about which build it belongs to. Two
+/// publications agree on a build prefix only when these match; everything
+/// else in the object (build date, digests) may differ between rebuilds.
+type BuildIdentity = (
+    Option<pplx_space_execution_spec::ExecutionMetadata>,
+    Option<pplx_space_execution_spec::guest_image::GuestImageContract>,
+);
+
+fn manifest_identity(bytes: &[u8]) -> Result<BuildIdentity, serde_json::Error> {
+    let manifest = serde_json::from_slice::<pplx_space_template_manifest::TemplateManifest>(bytes)?;
+    Ok((manifest.execution, manifest.guest_image))
+}
+
+fn metadata_identity(bytes: &[u8]) -> Result<BuildIdentity, serde_json::Error> {
+    let metadata = serde_json::from_slice::<pplx_space_template_manifest::TemplateMetadata>(bytes)?;
+    Ok((metadata.execution, metadata.guest_image))
+}
+
+/// What publishing a control object still needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Claim {
+    /// Nothing is stored at the key yet.
+    Create,
+    /// The stored object is this build's, byte for byte.
+    Settled,
+    /// The stored object names this build's execution but differs (a
+    /// rebuild of the same environment, whose manifest has to match its new
+    /// rootfs), so this build's bytes replace it.
+    Replace,
+}
+
+fn object_target<'a>(object_store: &'a ObjectStoreConfig, key: &'a str) -> ObjectTarget<'a> {
+    ObjectTarget {
+        bucket: &object_store.bucket,
+        key,
+        region: &object_store.region,
+        endpoint: object_store.endpoint.as_deref(),
+        path_style: object_store.path_style,
+    }
+}
+
+/// One control object of the build prefix, which a release and its twins
+/// share, since the key carries only template and content hash. Pull
+/// derives the cache partition and execution from these objects, so one is
+/// never taken from another execution: it's created only if absent, and a
+/// stored one is replaced only if it names the same execution and guest
+/// image as this build. One that doesn't, or doesn't parse, refuses the
+/// publish.
+struct ControlObject<'a> {
+    artifact: TemplateArtifact,
+    key: &'a str,
+    bytes: Bytes,
+    identity: fn(&[u8]) -> Result<BuildIdentity, serde_json::Error>,
+    ours: BuildIdentity,
+    claim: Claim,
+}
+
+impl<'a> ControlObject<'a> {
+    async fn read(
+        artifact: TemplateArtifact,
+        key: &'a str,
+        path: &Path,
+        identity: fn(&[u8]) -> Result<BuildIdentity, serde_json::Error>,
+    ) -> Result<Self, PublishError> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|source| PublishError::ReadArtifact {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let ours = identity(&bytes).map_err(|source| PublishError::InvalidArtifact {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(Self {
+            artifact,
+            key,
+            bytes: Bytes::from(bytes),
+            identity,
+            ours,
+            claim: Claim::Create,
+        })
+    }
+
+    fn store_error(&self, source: ObjectStoreError) -> PublishError {
+        PublishError::ObjectStore {
+            artifact: self.artifact.file_name().to_string(),
+            source,
+        }
+    }
+
+    /// Compare what's stored at the key with this build's object.
+    async fn inspect(
+        &self,
+        store: &impl ObjectStore,
+        creds: &ObjectCredentials,
+        object_store: &ObjectStoreConfig,
+    ) -> Result<Claim, PublishError> {
+        let stored = match store
+            .get_bytes(creds, object_target(object_store, self.key))
+            .await
+        {
+            Ok(stored) => stored,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(Claim::Create),
+            Err(source) => return Err(self.store_error(source)),
+        };
+        if (self.identity)(&stored).ok().as_ref() != Some(&self.ours) {
+            return Err(PublishError::BuildPrefixHeldByAnotherExecution {
+                artifact: self.artifact.file_name().to_string(),
+                key: self.key.to_string(),
+            });
+        }
+        Ok(if stored == self.bytes {
+            Claim::Settled
+        } else {
+            Claim::Replace
+        })
+    }
+
+    /// Create the object if it's still absent. When another publication
+    /// created it since [`Self::inspect`], compare again.
+    async fn create(
+        &self,
+        store: &impl ObjectStore,
+        creds: &ObjectCredentials,
+        object_store: &ObjectStoreConfig,
+    ) -> Result<Claim, PublishError> {
+        match store
+            .put_bytes_if_absent(
+                creds,
+                object_target(object_store, self.key),
+                self.bytes.clone(),
+            )
+            .await
+            .map_err(|source| self.store_error(source))?
+        {
+            PutIfAbsent::Created => Ok(Claim::Settled),
+            PutIfAbsent::AlreadyExists => match self.inspect(store, creds, object_store).await? {
+                // Deleted again in between: don't guess, let a retry decide.
+                Claim::Create => Err(self.store_error(ObjectStoreError::Put(format!(
+                    "{} appeared and disappeared during the publish",
+                    self.key
+                )))),
+                claim => Ok(claim),
+            },
+        }
+    }
 }
 
 const COMPRESSED_ROOTFS_READY_TIMEOUT: Duration = Duration::from_secs(30 * 60);

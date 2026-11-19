@@ -28,6 +28,7 @@ async fn resolve(
         Lookup::Tag => {
             client
                 .find_template_release(authenticated(FindTemplateReleaseRequest {
+                    environment: None,
                     template_name: "prefetch-transition".into(),
                     runtime: "fc".into(),
                     tag: "latest".into(),
@@ -39,6 +40,7 @@ async fn resolve(
         Lookup::Hash => {
             client
                 .find_template_release_by_hash(authenticated(FindTemplateReleaseByHashRequest {
+                    environment: None,
                     template_name: "prefetch-transition".into(),
                     hash: hash.into(),
                     caller_org_id: org.map(|id| id.to_string()),

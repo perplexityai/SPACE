@@ -2,6 +2,7 @@ use pplx_space_accounts::OrgId;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 use super::metadata::*;
+use super::release_registration::*;
 use super::status::*;
 use super::*;
 use pplx_space_snapshot_model::BaseSnapshotShape;
@@ -388,9 +389,15 @@ impl ClusterApi for ClusterApiService {
         .await?;
 
         let mut tag_rows = Vec::with_capacity(tags.len());
-        for tag in &tags {
-            let row = ensure_template_release_tag(&mut tx, &release, tag).await?;
-            tag_rows.push(row);
+        if !tags.is_empty() {
+            let tagged = tag_release(&mut tx, &release).await?;
+            if tagged.id == release.id {
+                for tag in &tags {
+                    tag_rows.push(ensure_template_release_tag(&mut tx, &tagged, tag).await?);
+                }
+            } else {
+                tag_rows = twin_tags(&mut tx, &tagged, &tags).await?;
+            }
         }
 
         let mut location_rows = Vec::with_capacity(storage_locations.len());
@@ -436,6 +443,7 @@ impl ClusterApi for ClusterApiService {
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
         let tag = trimmed_required(&request.tag, "tag")?;
+        let environment = environment_selector(request.environment.as_deref())?;
 
         // Authorization, release, and storage locations share one DB snapshot.
         // The cached visibility appended below is advisory, never an auth gate.
@@ -451,9 +459,12 @@ impl ClusterApi for ClusterApiService {
                 &template_name,
                 runtime,
                 &tag,
-                caller_org,
                 &scope,
-                request.generic_only,
+                crate::template_releases_store::ReleaseLookupFilter {
+                    caller_org,
+                    generic_only: request.generic_only,
+                    environment,
+                },
             )
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
@@ -466,14 +477,21 @@ impl ClusterApi for ClusterApiService {
                 runtime: first.release_type.clone(),
                 hash: first.release_hash.clone(),
                 created_at: format_time(first.release_created_at),
+                environment: first.release_environment.clone(),
             },
             None => {
                 return Err(Status::not_found("template release not found"));
             }
         };
 
+        // A selected lookup answers with one release: where it matches a
+        // release under each spelling of the digest, only the first one's
+        // storage locations go with it. An unselected lookup gets only the
+        // tagged release's rows from the store.
+        let release_id = rows.first().map(|first| first.release_id);
         let storage_locations = rows
             .into_iter()
+            .filter(|row| environment.is_none() || Some(row.release_id) == release_id)
             .filter_map(|row| {
                 let id = row.storage_id?;
                 let connection_string = row.storage_connection_string?;
@@ -499,6 +517,7 @@ impl ClusterApi for ClusterApiService {
             release: Some(release),
             storage_locations,
             template_visibility: visibility.into(),
+            environment_applied: environment.is_some(),
         });
         if let Some(scope) = delegation {
             scope.receipt(&mut response);
@@ -521,6 +540,7 @@ impl ClusterApi for ClusterApiService {
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         // Canonical `sha256:`-prefixed form.
         let hash = validated_release_hash(&request.hash)?;
+        let environment = environment_selector(request.environment.as_deref())?;
         // Bare form for tolerant column matching: `template_releases.hash`
         // is observed both bare and `sha256:`-prefixed, so match either
         // shape rather than rejecting a digest stored in the other form.
@@ -546,9 +566,12 @@ impl ClusterApi for ClusterApiService {
                 &template_name,
                 &hash,
                 &bare_hash,
-                caller_org,
                 &scope,
-                request.generic_only,
+                crate::template_releases_store::ReleaseLookupFilter {
+                    caller_org,
+                    generic_only: request.generic_only,
+                    environment,
+                },
             )
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
@@ -561,14 +584,33 @@ impl ClusterApi for ClusterApiService {
                 runtime: first.release_type.clone(),
                 hash: first.release_hash.clone(),
                 created_at: format_time(first.release_created_at),
+                environment: first.release_environment.clone(),
             },
             None => {
                 return Err(Status::not_found("template release not found"));
             }
         };
 
+        // A selected lookup answers with one release. Where it matches a
+        // release under each spelling of the digest, the other's storage
+        // locations go with it only if it records the same binding: both are
+        // builds of the digest for that environment, so either serves a pull
+        // that finds the first's copy gone. An unselected lookup keeps
+        // merging them, as it always has, but only within the first one's
+        // cache partition, so a pull never reads another partition's build.
+        let first_partition = rows.first().map(|first| {
+            release_cache_partition(first.release_environment.as_deref()).map(str::to_owned)
+        });
+        let first_environment = rows.first().map(|first| first.release_environment.clone());
         let storage_locations = rows
             .into_iter()
+            .filter(|row| match environment {
+                Some(_) => first_environment.as_ref() == Some(&row.release_environment),
+                None => {
+                    Some(release_cache_partition(row.release_environment.as_deref()))
+                        == first_partition.as_ref().map(Option::as_deref)
+                }
+            })
             .filter_map(|row| {
                 let id = row.storage_id?;
                 let connection_string = row.storage_connection_string?;
@@ -594,6 +636,7 @@ impl ClusterApi for ClusterApiService {
             release: Some(release),
             storage_locations,
             template_visibility: visibility.into(),
+            environment_applied: environment.is_some(),
         });
         if let Some(scope) = delegation {
             scope.receipt(&mut response);
@@ -610,10 +653,17 @@ impl ClusterApi for ClusterApiService {
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
         let limit = validated_list_limit(request.limit)?;
+        let environment = environment_selector(request.environment.as_deref())?;
 
         let releases = self
             .template_releases_store
-            .list_latest(&template_name, runtime, i64::from(limit), &scope)
+            .list_latest(
+                &template_name,
+                runtime,
+                i64::from(limit),
+                &scope,
+                environment,
+            )
             .await?;
 
         let visibility = template_visibility(
@@ -632,6 +682,7 @@ impl ClusterApi for ClusterApiService {
                     runtime: release.runtime,
                     hash: release.hash,
                     created_at: format_time(release.created_at),
+                    environment: release.environment,
                 }),
                 storage_locations: release
                     .storage_locations
@@ -649,6 +700,7 @@ impl ClusterApi for ClusterApiService {
         Ok(Response::new(ListLatestTemplateReleasesResponse {
             entries,
             template_visibility: visibility.into(),
+            environment_applied: environment.is_some(),
         }))
     }
 
@@ -1931,4 +1983,15 @@ impl ClusterApi for ClusterApiService {
     ) -> Result<Response<crate::proto::GetExecutionCurrencyResponse>, Status> {
         ClusterApiService::get_execution_currency(self, request).await
     }
+}
+
+/// The node cache partition a release's stored binding puts its build in:
+/// `None` for the legacy partition, which holds unbound builds and builds bound
+/// to the initial environment, or the environment otherwise. Compared as the
+/// stored text, so a binding that doesn't parse is its own partition.
+fn release_cache_partition(environment: Option<&str>) -> Option<&str> {
+    environment.filter(|environment| {
+        *environment
+            != pplx_space_execution_catalog::catalog::initial_environment_reference().to_string()
+    })
 }

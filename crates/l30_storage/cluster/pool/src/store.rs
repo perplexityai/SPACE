@@ -667,6 +667,14 @@ impl WarmPoolStore {
                   FROM template_releases release
                   WHERE release.template_name = p.template_name
                     AND release.type = p.runtime
+                    -- Originals only: a twin of a retained release, bound to
+                    -- another environment, would use up a retain slot.
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM template_releases o
+                        WHERE o.template_name = release.template_name
+                          AND o.hash = release.hash
+                          AND (o.created_at, o.id) < (release.created_at, release.id))
                   ORDER BY published_at DESC, release.id DESC
                   LIMIT p.retain_releases
              ) retained ON TRUE
@@ -792,6 +800,14 @@ impl WarmPoolStore {
                        OR r.hash = s.bare_content_hash
                        OR r.hash = 'sha256:' || s.bare_content_hash
                    )
+                   -- Originals only: a twin registered after its original
+                   -- would otherwise take the original's demand.
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM template_releases o
+                       WHERE o.template_name = r.template_name
+                         AND o.hash = r.hash
+                         AND (o.created_at, o.id) < (r.created_at, r.id))
                  ORDER BY (r.hash = s.content_hash) DESC, r.created_at DESC, r.id DESC
                  LIMIT 1
              ) release_by_hash ON TRUE

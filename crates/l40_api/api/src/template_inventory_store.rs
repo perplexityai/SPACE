@@ -60,10 +60,16 @@ pub(crate) async fn release_build_shape(
 /// build's. A row without a binding doesn't count either way. A legacy
 /// unprefixed hash matches its `sha256:` spelling, as the template release
 /// lookups match it.
+///
+/// A row bound to one of `excluded` doesn't count either way: the caller
+/// passes the bindings of the hash's other releases, its twins, whose
+/// builds share the template and hash but can't stand in for this release's
+/// binding.
 pub(crate) async fn agreed_build_environment(
     executor: impl PgExecutor<'_>,
     template: &str,
     content_hash: &str,
+    excluded: &[String],
 ) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar::<_, Option<String>>(sql!(
         "SELECT CASE WHEN COUNT(DISTINCT bindings.environment) = 1
@@ -74,10 +80,12 @@ pub(crate) async fn agreed_build_environment(
              WHERE nti.template_name = $1
                AND nti.content_hash IN ($2, replace($2, 'sha256:', ''))
                AND nti.execution_metadata->>'environment' IS NOT NULL
+               AND NOT (nti.execution_metadata->>'environment' = ANY($3))
          ) bindings"
     ))
     .bind(template)
     .bind(content_hash)
+    .bind(excluded)
     .fetch_one(executor)
     .await
 }

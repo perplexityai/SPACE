@@ -4849,3 +4849,72 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
     }
     Ok(())
 }
+
+/// Twins: once `idx_template_releases_template_name_hash_unique` is gone, a
+/// release can have a twin with the same template and hash, bound to another
+/// execution environment and registered after it. Retention and demand
+/// matching count originals only, so a fresh, untagged twin neither uses up a
+/// retain slot nor takes its original's demand.
+#[tokio::test(flavor = "current_thread")]
+async fn retention_and_demand_ignore_twins() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let w = seed_resolver_releases(&fixture.pool).await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+        .execute(&fixture.pool)
+        .await?;
+    for original in [w.latest_holder, w.bare] {
+        sqlx::query(
+            "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+             SELECT template_name, type, hash,
+                    jsonb_build_object('environment', 'sha256:' || repeat('7', 64))
+             FROM template_releases WHERE id = $1",
+        )
+        .bind(original)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    let sha = |c| format!("sha256:{}", hex(c));
+
+    upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 1, 10, 2).await?;
+    let mut protected = fixture
+        .store
+        .protected_template_releases()
+        .await?
+        .into_iter()
+        .map(|release| release.content_hash)
+        .collect::<Vec<_>>();
+    protected.sort();
+    assert_eq!(
+        protected,
+        vec![sha('d'), sha('e')],
+        "the twin of `latest_holder` takes no slot"
+    );
+
+    upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 2, 10, 1).await?;
+    for _ in 0..10 {
+        insert_sandbox_for_template(
+            &fixture.pool,
+            RESOLVER_TEMPLATE,
+            "k8s",
+            &hex('a'),
+            None,
+            None,
+        )
+        .await?;
+    }
+    fixture.store.autoscale_configs("sandboxes").await?;
+    let demanded = sqlx::query_scalar::<_, Uuid>(
+        "SELECT template_release_id
+         FROM kubernetes_pool_configs
+         WHERE template_release_id <> $1",
+    )
+    .bind(w.latest_holder)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(
+        demanded,
+        vec![w.bare],
+        "demand for `bare` stays on the original"
+    );
+    Ok(())
+}

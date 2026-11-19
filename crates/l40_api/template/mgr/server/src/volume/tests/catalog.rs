@@ -204,6 +204,7 @@ async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
                 };
                 let result = if by_hash {
                     let mut request = tonic::Request::new(FindTemplateReleaseByHashRequest {
+                        environment: None,
                         template_name: TEMPLATE.into(),
                         hash: digest.clone(),
                         caller_org_id: Some(org.into()),
@@ -216,6 +217,7 @@ async fn catalog_receipts_preserve_legacy_org_checks() -> TestResult {
                     client.find_template_release_by_hash(request).await
                 } else {
                     let mut request = tonic::Request::new(FindTemplateReleaseRequest {
+                        environment: None,
                         template_name: TEMPLATE.into(),
                         runtime: "fc".into(),
                         tag: "latest".into(),

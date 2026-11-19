@@ -133,7 +133,9 @@ pub(crate) async fn start_a_request_blocked_on_operations<T: Send + 'static>(
 }
 
 /// Wait until some backend is blocked on a lock `holder` holds: proof that
-/// the request under test queued behind it.
+/// the request under test queued behind it. `holder` is usually inside a
+/// transaction, where `pg_stat_activity` keeps the snapshot of its first
+/// read, so each poll clears it to see backends that connected since.
 pub(crate) async fn wait_until_blocked_by(
     holder: &mut sqlx::PgConnection,
 ) -> pplx_space_db_test_fixtures::TestDbResult<()> {
@@ -141,6 +143,9 @@ pub(crate) async fn wait_until_blocked_by(
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
+        sqlx::query(sql!("SELECT pg_stat_clear_snapshot()"))
+            .execute(&mut *holder)
+            .await?;
         let blocked: bool = sqlx::query_scalar(sql!(
             "SELECT EXISTS (
                  SELECT 1 FROM pg_stat_activity

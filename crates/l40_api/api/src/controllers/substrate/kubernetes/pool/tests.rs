@@ -858,6 +858,59 @@ async fn upsert_pool_config_uses_store_namespace() -> TestResult {
     Ok(())
 }
 
+/// A pinned hash resolves to its original release, never a twin bound to
+/// another environment that was registered after it. Twins exist only once
+/// `idx_template_releases_template_name_hash_unique` is dropped, which the
+/// test does to stand in for the contract migration.
+#[tokio::test(flavor = "current_thread")]
+async fn upsert_pool_config_resolves_the_original_not_a_twin() -> TestResult {
+    let db = pg_test_db().await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let original: Uuid = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE hash = 'sha256:newer-untagged'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, created_at, execution_metadata)
+         VALUES ('seed', 'fc', 'sha256:newer-untagged', NOW() + INTERVAL '1 minute',
+                 jsonb_build_object('environment', 'sha256:' || repeat('7', 64)))"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+
+    let config = upsert_pool_config(
+        &store,
+        ClusterPoolConfigRequest {
+            template_name: "seed".to_string(),
+            content_hash: Some("sha256:newer-untagged".to_string()),
+            vcpu: 4,
+            memory_mib: 2048,
+            disk_mib: None,
+            reset_disk_to_template_default: false,
+            target_ready_slots: 1,
+            refill_per_tick: 1,
+            max_warming_slots: 1,
+            namespace: None,
+            enabled: true,
+            encryptable: false,
+        },
+    )
+    .await?;
+    assert_eq!(config.template_release_id, original);
+    Ok(())
+}
+
 /// No encryptable config may be created through the operator surface —
 /// enabled or not — while the legacy release/shape index still forbids twin
 /// rows and members cannot carry the encryptable shape.

@@ -41,15 +41,18 @@ nodeFence:
     - space.pplx.net/ssd-placement-blocked
     - space.pplx.net/host-cpu
   allowedLabelKeyPrefixes:
-    # TEMPLATE_BUILD_LABEL_KEY_PREFIX: one key per ready local template build.
+    # TEMPLATE_BUILD_LABEL_KEY_PREFIX: per ready local template build, a
+    # partition-less key (shared with the build's twins) and, when its
+    # partition key parses, its cache partition's.
     - space.pplx.net/template-build-
     # ENVIRONMENT_LABEL_KEY_PREFIX: one key per environment the node's latest
     # complete execution inventory lists as usable.
     - space.pplx.net/env-
   allowedAnnotationKeys: []
   allowedAnnotationKeyPrefixes:
-    # Template presence mirrors each build label with a same-key annotation
-    # carrying the full content hash.
+    # Template presence mirrors each build label with a same-key annotation:
+    # the full content hash for the partition-less key, and
+    # `<content_hash>@<partition key>` for the partition's.
     - space.pplx.net/template-build-
   # Removable but not writable. node-ctl only ever *clears* a satisfied
   # template-write key; an added one is a pull request it then honors, and that

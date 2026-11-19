@@ -257,7 +257,7 @@ async fn wait_until_a_session_waits_on_a_lock<T>(
     }
 }
 
-async fn create_delete_operation(
+pub(crate) async fn create_delete_operation(
     pool: &PgPool,
     template: &TemplateName,
 ) -> TestResult<ClaimedPublicOperation> {

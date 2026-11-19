@@ -1091,6 +1091,63 @@ mod template_release_resolution_postgres_tests {
         Ok(())
     }
 
+    /// A digest resolves to its original release (the first registered),
+    /// never a twin bound to another environment that was registered after
+    /// it. Twins exist only once the `(template_name, hash)` unique index is
+    /// dropped, which the test does to stand in for the contract migration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn digest_lookup_resolves_the_original_not_a_twin() -> TestResult {
+        let db = pg_test_db().await?;
+        let release_id = Uuid::now_v7();
+        let content_hash =
+            "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+        insert_org_specific_template(&db.pool, "tenant-twin", Uuid::parse_str(TENANT_ORG)?).await?;
+        sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+            .execute(&db.pool)
+            .await?;
+        // The twins go into the heap first, so a lookup with no age order
+        // would scan one of them first.
+        for seed in ["a", "b", "c"] {
+            sqlx::query(
+                "INSERT INTO template_releases
+                     (id, template_name, type, hash, org_id, execution_metadata)
+                 VALUES ($1, 'tenant-twin', 'fc', $2, $3,
+                         jsonb_build_object('environment', 'sha256:' || repeat($4, 64)))",
+            )
+            .bind(Uuid::now_v7())
+            .bind(content_hash)
+            .bind(Uuid::parse_str(TENANT_ORG)?)
+            .bind(seed)
+            .execute(&db.pool)
+            .await?;
+        }
+        insert_release_with_latest_tag(
+            &db.pool,
+            "tenant-twin",
+            release_id,
+            content_hash,
+            Some(Uuid::parse_str(TENANT_ORG)?),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE template_releases SET created_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+        )
+        .bind(release_id)
+        .execute(&db.pool)
+        .await?;
+
+        let resolved = crate::template_releases_store::resolve_template_release_by_digest(
+            &db.pool,
+            &TemplateName::parse("tenant-twin")?,
+            content_hash.parse()?,
+            RuntimeKind::Firecracker,
+            org(TENANT_ORG),
+        )
+        .await?;
+        assert_eq!(resolved, Some((release_id, content_hash.to_string())));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn org_specific_template_without_owner_is_rejected_by_check() -> TestResult {
         let db = pg_test_db().await?;

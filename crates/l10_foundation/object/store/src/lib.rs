@@ -37,6 +37,8 @@ mod copy;
 mod download;
 pub mod metrics;
 #[cfg(test)]
+mod put_if_absent_tests;
+#[cfg(test)]
 mod test_support;
 mod timeouts;
 mod upload;
@@ -119,6 +121,16 @@ pub struct ObjectMeta {
     pub size: u64,
     /// Provider-supplied entity tag, if available.
     pub etag: Option<String>,
+}
+
+/// What [`ObjectStore::put_bytes_if_absent`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PutIfAbsent {
+    /// No object was at the key, and the body is now there.
+    Created,
+    /// An object was already at the key. It's unchanged and the body wasn't
+    /// written.
+    AlreadyExists,
 }
 
 /// Errors raised by [`ObjectStore`] implementations.
@@ -285,6 +297,26 @@ pub trait ObjectStore: Send + Sync {
         target: ObjectTarget<'_>,
         body: Bytes,
     ) -> Result<(), ObjectStoreError>;
+
+    /// Uploads `body` as a single object only if nothing is at `target` yet,
+    /// atomically: of two concurrent calls for one key, one creates the object
+    /// and the other reports [`PutIfAbsent::AlreadyExists`]. An existing
+    /// object is never replaced.
+    ///
+    /// Defaults to refusing, like [`Self::copy_object`]: a check-then-put
+    /// fallback would let a concurrent writer's object be replaced, which is
+    /// what a caller asking for this is guarding against.
+    async fn put_bytes_if_absent(
+        &self,
+        _creds: &ObjectCredentials,
+        target: ObjectTarget<'_>,
+        _body: Bytes,
+    ) -> Result<PutIfAbsent, ObjectStoreError> {
+        Err(ObjectStoreError::Put(format!(
+            "this object store can't create {}/{} conditionally",
+            target.bucket, target.key,
+        )))
+    }
 
     /// Copies one object to another location without the bytes passing through
     /// this process, which is what lets a caller move a multi-GiB artifact
@@ -983,6 +1015,46 @@ impl ObjectStore for S3ObjectStore {
                 ObjectStoreError::Put(DisplayErrorContext(&err).to_string())
             })?;
         Ok(())
+    }
+
+    async fn put_bytes_if_absent(
+        &self,
+        creds: &ObjectCredentials,
+        target: ObjectTarget<'_>,
+        body: Bytes,
+    ) -> Result<PutIfAbsent, ObjectStoreError> {
+        let digest_body = body.clone();
+        let content_md5 = tokio::task::spawn_blocking(move || content_md5::of_bytes(&digest_body))
+            .await
+            .map_err(|err| ObjectStoreError::Put(err.to_string()))?;
+        let sent = self
+            .base
+            .put_object()
+            .bucket(target.bucket)
+            .key(target.key)
+            .content_md5(content_md5)
+            // S3's conditional create: the store refuses the write with 412
+            // when any object is at the key, deciding atomically between
+            // concurrent writers.
+            .if_none_match("*")
+            .body(ByteStream::from(body))
+            .customize()
+            .config_override(self.op_config(creds, &target, S3Operation::PutObject))
+            .send()
+            .await;
+        match sent {
+            Ok(_) => Ok(PutIfAbsent::Created),
+            Err(err)
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("PreconditionFailed") =>
+            {
+                Ok(PutIfAbsent::AlreadyExists)
+            }
+            Err(err) => {
+                observe_s3_error(S3Operation::PutObject, target.bucket, target.key, &err);
+                Err(ObjectStoreError::Put(DisplayErrorContext(&err).to_string()))
+            }
+        }
     }
 
     async fn get_bytes(
