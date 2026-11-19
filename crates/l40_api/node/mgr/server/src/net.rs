@@ -929,6 +929,17 @@ pub(crate) fn command_output_with_stdin_in_ns(
     native::command_output_with_stdin_in_ns(ns, program, args, stdin)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn command_output_in_pinned_ns(
+    netns: &std::fs::File,
+    program: &str,
+    args: &[&str],
+    stdin: &[u8],
+    budget: std::time::Duration,
+) -> io::Result<Output> {
+    native::command_output_in_pinned_ns(netns, program, args, stdin, budget)
+}
+
 pub fn sysctl_check(key: &str, expected: &str) -> bool {
     native::read_sysctl(None, key)
         .map(|value| value.trim() == expected)
