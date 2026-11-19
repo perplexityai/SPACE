@@ -8,7 +8,7 @@
 //! into vol-mgr, and persists those transfer handles before teardown. The worker
 //! performs the same idempotent Begin and staging calls as a restart/failure
 //! fallback; object upload and finalization remain asynchronous. A mid-flight
-//! restart resumes via [`BackgroundWorker::recover`] instead of orphaning the
+//! restart resumes via [`JobWorker::recover_and_log`] instead of orphaning the
 //! node's newest artifact.
 //!
 //! Each `execute` attempt:
@@ -36,8 +36,8 @@ use pplx_space_accounts::JobId;
 
 use std::time::{Duration, Instant};
 
+use crate::db::jobs::{Job, JobError, JobExecutor, JobWorker, WorkerConfig};
 use futures_util::future::join_all;
-use pplx_space_common_jobs::{BackgroundWorker, Job, JobError, JobExecutor, WorkerConfig};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
@@ -64,12 +64,12 @@ pub(crate) fn worker_config() -> WorkerConfig {
         .with_recovery_job_kind(SNAPSHOT_UPLOAD_JOB_KIND)
 }
 
-/// Build a `BackgroundWorker` for the snapshot-upload pipeline from `config`,
+/// Build a `JobWorker` for the snapshot-upload pipeline from `config`,
 /// [`worker_config`] in production.
 /// Caller owns the `crate::db::Connection` (it lives alongside the rest of
 /// sbx-mgr's SQLite state) and is responsible for calling
-/// [`BackgroundWorker::recover_and_log`] at startup and
-/// [`BackgroundWorker::yield_for_restart`] at exit.
+/// [`JobWorker::recover_and_log`] at startup and
+/// [`JobWorker::yield_for_restart`] at exit.
 ///
 /// This worker is intentionally scoped to [`SNAPSHOT_UPLOAD_JOB_KIND`]:
 /// sandbox-manager gives local finalization a bounded deploy-shutdown drain,
@@ -80,7 +80,7 @@ pub(crate) fn build_worker(
     node_manager: crate::node_manager_transport::NodeManagerConnector,
     volume_manager_socket: std::path::PathBuf,
     config: WorkerConfig,
-) -> BackgroundWorker<SnapshotUploadExecutor> {
+) -> JobWorker<SnapshotUploadExecutor> {
     let executor = SnapshotUploadExecutor {
         db: db.clone(),
         drain_state,
@@ -733,7 +733,7 @@ pub(crate) async fn prepared_begin_refused_as_superseded(
         Ok(Ok(reply)) if reply.generation_fence_admitted => RegistrationProbe::Admitted,
         Ok(Ok(_)) => RegistrationProbe::NotSuperseded,
         Ok(Err(refused)) => match classify_begin_error(refused).kind() {
-            pplx_space_common_jobs::JobFailureKind::Permanent => RegistrationProbe::NotSuperseded,
+            crate::db::jobs::JobFailureKind::Permanent => RegistrationProbe::NotSuperseded,
             _ => RegistrationProbe::Unanswered,
         },
         Err(_) => RegistrationProbe::NotSuperseded,
@@ -1764,7 +1764,7 @@ pub fn backfill_backup_completed_markers(
 /// the daemon's task drain. The pruning trigger protects unvisited obligations.
 pub(crate) async fn run_maintenance(
     db: crate::db::SharedConnection,
-    worker: BackgroundWorker<SnapshotUploadExecutor>,
+    worker: JobWorker<SnapshotUploadExecutor>,
     drain: std::sync::Arc<crate::service::drain::DrainState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
@@ -1787,7 +1787,7 @@ pub(crate) async fn run_maintenance(
         let db = db.clone();
         let worker = worker.clone();
         let prune = last_prune.is_none_or(|last: tokio::time::Instant| {
-            last.elapsed() >= pplx_space_common_jobs::TERMINAL_JOB_PRUNE_INTERVAL
+            last.elapsed() >= crate::db::jobs::TERMINAL_JOB_PRUNE_INTERVAL
         });
         match tokio::task::spawn_blocking(move || {
             let _writer = writer;

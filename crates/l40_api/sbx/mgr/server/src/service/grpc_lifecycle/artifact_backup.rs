@@ -617,7 +617,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn reusable_artifact_backup_attempt(
-        status: pplx_space_common_jobs::JobStatus,
+        status: crate::db::jobs::JobStatus,
         has_failure: bool,
         payload: &str,
     ) -> Result<Option<String>, serde_json::Error> {
@@ -628,8 +628,7 @@ impl SandboxManagerService {
         if has_failure
             || !matches!(
                 status,
-                pplx_space_common_jobs::JobStatus::Pending
-                    | pplx_space_common_jobs::JobStatus::Running
+                crate::db::jobs::JobStatus::Pending | crate::db::jobs::JobStatus::Running
             )
         {
             return Ok(None);
@@ -931,7 +930,7 @@ impl SandboxManagerService {
         if let Some(job) = &previous_job {
             let job_status = job
                 .status
-                .parse::<pplx_space_common_jobs::JobStatus>()
+                .parse::<crate::db::jobs::JobStatus>()
                 .map_err(|error| {
                     Status::internal(format!(
                         "persisted artifact backup status is invalid for {}: {error}",
@@ -1313,7 +1312,7 @@ impl SandboxManagerService {
         &self,
         sandbox: &crate::db::SandboxRow,
         artifact: &crate::db::LocalArtifactRow,
-        previous_job: Option<&pplx_space_common_jobs::Job>,
+        previous_job: Option<&crate::db::jobs::Job>,
     ) -> Result<Option<pplx_space_sandbox_model::ExecutionGeneration>, Status> {
         if let Some(generation) = capture_generation_from_record(artifact)? {
             return Ok(Some(generation));
@@ -1355,7 +1354,7 @@ impl SandboxManagerService {
 /// Whether `previous_job`, the bytes' earlier upload, recorded `generation`
 /// as the capturing execution's, so a re-upload under it may order captures.
 pub(super) fn earlier_upload_vouches(
-    previous_job: Option<&pplx_space_common_jobs::Job>,
+    previous_job: Option<&crate::db::jobs::Job>,
     generation: Option<pplx_space_sandbox_model::ExecutionGeneration>,
 ) -> bool {
     generation.is_some()

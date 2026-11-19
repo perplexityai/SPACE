@@ -24,6 +24,11 @@ there, but not a build or dev dependency, nor `libsqlite3-sys`.
   view of it) and `db::scan` (named many-row scans). Extend those before
   adding a public reader; the readers they consolidate are declared through
   `db_private_outside_tests!`, so only tests outside the store still call them.
+- sbx-mgr reaches the job queue's worker only through `db::jobs::JobWorker`
+  (`src/db/jobs.rs`). A worker operation sbx-mgr does not call yet is a new
+  forwarding method there; never re-export `BackgroundWorker`. A read of job
+  rows that must run under the caller's held connection or transaction goes
+  in `db::read`, as `read::cleanup_job` and `read::local_artifact_upload` do.
 - Write `sandboxes.state` only through `update_state_from` with an explicit
   edge, or through a named specialized writer. A new edge in
   `src/db/state_write.rs` needs a kind and a doc comment naming its writer;

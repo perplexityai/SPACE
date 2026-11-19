@@ -50,6 +50,7 @@ pub mod guest_health_scan;
 pub mod guest_updates;
 pub mod inventory;
 pub mod inventory_read;
+pub mod jobs;
 pub mod local_artifact_leases;
 pub mod migration;
 pub mod quarantine_history;

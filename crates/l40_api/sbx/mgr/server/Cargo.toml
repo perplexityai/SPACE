@@ -82,7 +82,6 @@ pplx-space-node-disk-admission = { workspace = true }
 pplx-space-template-cache-permissions = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-file-io = { workspace = true }
-pplx-space-common-jobs = { workspace = true }
 pplx-space-lru-reaper = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }

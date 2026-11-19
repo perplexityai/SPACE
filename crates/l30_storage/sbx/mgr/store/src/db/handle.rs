@@ -337,12 +337,16 @@ impl SharedConnection {
     }
 
     /// A jobs worker over this connection, sharing its mutex.
-    pub fn background_worker<E: pplx_space_common_jobs::JobExecutor>(
+    pub fn background_worker<E: super::jobs::JobExecutor>(
         &self,
         executor: E,
-        config: pplx_space_common_jobs::WorkerConfig,
-    ) -> pplx_space_common_jobs::BackgroundWorker<E> {
-        pplx_space_common_jobs::BackgroundWorker::new(Arc::clone(&self.0), executor, config)
+        config: super::jobs::WorkerConfig,
+    ) -> super::jobs::JobWorker<E> {
+        super::jobs::JobWorker::new(pplx_space_common_jobs::BackgroundWorker::new(
+            Arc::clone(&self.0),
+            executor,
+            config,
+        ))
     }
 }
 
