@@ -361,13 +361,13 @@ printed at the end) lists each bench's phase times and SUITE counts, every
 scenario that did not pass with its log, and checks that the benches cover the
 inventory exactly once: each (surface, scenario) pair has one `=== RUN`, or was
 skipped by a bench's mode after the partition, which counts as covered. The
-script exits as the typed suite ranks a suite: 1 when any scenario failed;
-else 2 when a bench did not come up, a scenario was inconclusive or did not
-finish, a pass exited 2 outside any scenario, the coverage check failed, the
-checkout changed during the run, or the run's teardown left benches on the
-host; else 42 when a scenario warned; else 0.
-A failure the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) excused is
-listed but does not fail the run.
+script exits as the typed suite ranks a suite: 1 when a scenario failed that
+the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) did not excuse; else 2
+when a bench did not come up, a scenario was inconclusive or did not finish, a
+pass exited 2 outside any scenario, the coverage check failed, the checkout
+changed during the run, or the run's teardown left benches on the host; else
+42 when a scenario warned; else 0. A failure that list excused is listed as
+`known failure` and does not fail the run.
 
 The checkout must not change during a run: no edits, checkouts or commits
 until it ends. Each bench copies it, with its uncommitted changes, when it

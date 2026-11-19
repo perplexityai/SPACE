@@ -35,7 +35,8 @@
 #   --out DIR    where logs, timings and the summary go
 #                (default: ~/.space-devbox/kind-parallel/<run id>)
 #
-# Exit status: as the typed suite ranks a suite: 1 a scenario failed; else 2
+# Exit status: as the typed suite ranks a suite: 1 a scenario failed that
+# SPACE_SMOKE_KNOWN_FAILURES did not excuse; else 2
 # a bench did not come up, a scenario was inconclusive or unfinished, a pass
 # exited 2 outside any scenario, the coverage check failed, the checkout
 # changed before the benches had copied it or the host had built it, or the

@@ -59,7 +59,8 @@ host-wide changes below, a full Kubernetes Kind validation is
 did not pass with its log, and a check that the benches cover the inventory
 exactly once (each (surface, scenario) pair has one `=== RUN`, or was skipped
 by a bench's mode after the partition, which counts as covered). Its exit
-status ranks as a typed suite's does: `1` when a scenario failed, else `2` for an
+status ranks as a typed suite's does: `1` when a scenario failed that
+`SPACE_SMOKE_KNOWN_FAILURES` did not excuse, else `2` for an
 incomplete run (a bench down, an inconclusive scenario, a coverage gap, a
 checkout that changed during the run, a failed teardown), else
 `42` for a warning, else `0`. Don't run the CI shards one after another on one
@@ -81,10 +82,12 @@ The runner starts N isolated benches side by side, each one CI shard runner
 shared images once, and picks N from the host's CPUs, available memory, free
 disk and a short write-throughput probe of the bench volume (`--benches N`
 overrides). It takes about 23 minutes at N=4 or 5 on that host shape with a
-warm Rust target directory. A scenario that fails here fails the run. If it
-passes when rerun, report both runs. Call a failure contention only when it
-fails beside other benches more than once and passes each time with
-`--benches 1`. "The whole suite on one host" in `infra/space/kind/README.md`
+warm Rust target directory. An unexcused scenario failure here fails the run
+with exit `1`; one the known-failures list excused is listed as
+`known failure` and leaves the exit status as the rest of the run sets it. If
+a failed scenario passes when rerun, report both runs. Call a failure
+contention only when it fails beside other benches more than once and passes
+each time with `--benches 1`. "The whole suite on one host" in `infra/space/kind/README.md`
 lists every host change, what each bench shares, and what it costs.
 
 ## Scenario-scoped cluster knobs (kind)
