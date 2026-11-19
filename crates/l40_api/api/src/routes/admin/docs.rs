@@ -7,6 +7,7 @@ use pplx_space_runtime_environment_policy_store::PolicyChangeReason;
 use serde_json::{Map, Value, json};
 
 mod cross_org;
+mod runtime_upgrade_campaigns;
 
 const ADMIN_LLMS_TXT: &str = "SPACE Admin API\n\n\
 - Admin OpenAPI: /openapi.json on admin.api.space hosts, /admin/api/openapi.json on shared hosts\n\
@@ -362,6 +363,7 @@ fn admin_openapi_value() -> Value {
     insert_audit_event_paths(paths);
     insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
+    runtime_upgrade_campaigns::insert_runtime_upgrade_campaign_paths(paths);
     cross_org::insert_admin_sandbox_session_paths(paths);
     spec
 }
@@ -1015,25 +1017,38 @@ fn insert_audit_event_paths(paths: &mut Map<String, Value>) {
     );
 }
 
-fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
-    let environment_ref = json!({
+/// An execution environment reference, as a schema.
+fn environment_ref_schema() -> Value {
+    json!({
         "type": "string",
         "pattern": "^(sha256|blake3):[0-9a-f]{64}$",
         "description": "Execution environment reference"
-    });
+    })
+}
+
+/// An optional `If-Match` header carrying a generation, optionally quoted,
+/// described by `description`.
+fn if_match_param(description: &str) -> Value {
+    json!({
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string", "pattern": "^\"?[0-9]+\"?$" },
+        "description": description
+    })
+}
+
+fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
+    let environment_ref = environment_ref_schema();
     let reason = json!({
         "type": "string",
         "minLength": 1,
         "maxLength": PolicyChangeReason::MAX_CHARS,
         "description": "Why the policy changed. Recorded with the caller on the policy row, and on the environment's state row when the write changes it."
     });
-    let if_match = json!({
-        "name": "If-Match",
-        "in": "header",
-        "required": false,
-        "schema": { "type": "string", "pattern": "^\"?[0-9]+\"?$" },
-        "description": "The policy generation the caller last read, optionally quoted. The write applies only at that generation, compared under the policy row lock; absent, it's unconditional."
-    });
+    let if_match = if_match_param(
+        "The policy generation the caller last read, optionally quoted. The write applies only at that generation, compared under the policy row lock; absent, it's unconditional.",
+    );
     paths.insert(
         "/runtime-environments".to_string(),
         json!({
@@ -1054,7 +1069,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
             "put": {
                 "summary": "Set the cluster default execution environment",
                 "parameters": [if_match.clone()],
-                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified.",
+                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified. No check yet for an unfinished template runtime upgrade campaign moving releases off an environment the first default stops; only a block checks campaigns.",
                 "requestBody": {
                     "required": true,
                     "content": {
@@ -1091,7 +1106,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
         json!({
             "put": {
                 "summary": "Set an execution environment's state",
-                "description": "allowed and deprecated execute; blocked never executes. Increments the generation in the same transaction. The default must stay allowed, and blocking requires a cluster default. Blocking an environment that still has sandboxes, or template releases in use (a tag points to it or an enabled pool config pins it), bound to it, or while any sandbox has no environment binding, an unreadable one, or no binding record, needs strand: true: unbound legacy work executes as the environment it matches, which the server can't resolve, and a sandbox with no observation from its node may be bound to this one. In-use releases with no or an unreadable binding gate too, since new creates from them may run on the environment that stops. Other template releases, and sandboxes that can't run again (deleting, or failed with no live evidence and nothing the repair loop could revert to), are reported in at_risk but don't require strand. Blocking an environment that already doesn't execute (blocked, or with no state under a default) normally needs no strand; if another policy write lands while the block waits, the check runs in full. The counts are read just before the write and sandboxes keep changing, so strand is an acknowledgement, not a guarantee.",
+                "description": "allowed and deprecated execute; blocked never executes. Increments the generation in the same transaction. The default must stay allowed, and blocking requires a cluster default. Blocking an environment that still has sandboxes, or template releases in use (a tag points to it or an enabled pool config pins it), bound to it, or while any sandbox has no environment binding, an unreadable one, or no binding record, needs strand: true: unbound legacy work executes as the environment it matches, which the server can't resolve, and a sandbox with no observation from its node may be bound to this one. In-use releases with no or an unreadable binding gate too, since new creates from them may run on the environment that stops. Other template releases, and sandboxes that can't run again (deleting, or failed with no live evidence and nothing the repair loop could revert to), are reported in at_risk but don't require strand. Blocking an environment that already doesn't execute (blocked, or with no state under a default) normally needs no strand; if another policy write lands while the block waits, the check runs in full. The counts are read just before the write and sandboxes keep changing, so strand is an acknowledgement, not a guarantee. Blocking also needs strand: true while an unfinished template runtime upgrade campaign moves the environment's releases, since a block mid-campaign stops the releases the campaign hasn't given a twin on its target yet; as for bound work, not when the environment already doesn't execute.",
                 "parameters": [
                     { "name": "environment_ref", "in": "path", "required": true, "schema": environment_ref },
                     if_match
@@ -1110,7 +1125,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                                     "strand": {
                                         "type": "boolean",
                                         "default": false,
-                                        "description": "Block even though work may still depend on the environment: work bound to it, or a sandbox whose environment can't be told. Only accepted with state blocked."
+                                        "description": "Block even though work may still depend on the environment: work bound to it, a sandbox whose environment can't be told, or an unfinished template runtime upgrade campaign moving it. Only accepted with state blocked."
                                     }
                                 }
                             }
@@ -1121,7 +1136,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                     "200": { "description": "Object with the new generation, environment_ref and state" },
                     "400": { "description": "Invalid body, environment reference, state or reason, or strand without blocked" },
                     "403": { "description": "Managing organization administrator required" },
-                    "409": { "description": "The environment is the default, blocking needs a default first, or work may still be bound to it (at_risk carries the environments and counts)" },
+                    "409": { "description": "The environment is the default, blocking needs a default first, work may still be bound to it (at_risk carries the environments and counts), or an unfinished template runtime upgrade campaign still moves it (with at_risk when work is bound to it too, since strand: true waives both)" },
                     "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" }
                 }
             }
