@@ -12,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
 pub mod config_version;
 mod host_cache;
+pub mod rules;
 
 #[cfg(test)]
 pub(crate) use tests::packaged_pre_tproxy_guardrails_policy as packaged_pre_tproxy_guardrails_policy_for_test;

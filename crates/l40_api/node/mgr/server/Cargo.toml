@@ -31,6 +31,7 @@ hyper = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
 pplx-space-artifact-model = { workspace = true, features = ["serde"] }
+pplx-space-firewall-rules-model = { workspace = true }
 pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs", "mount", "process"] }
@@ -101,6 +102,7 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+pplx-space-firewall-rules-protocol = { workspace = true }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
