@@ -63,6 +63,19 @@
 //! and changes nothing. The call's guard is released when the call ends,
 //! however it ends, and the call is bounded by a whole-call timeout, after
 //! which it answers `DeadlineExceeded`.
+//!
+//! `PreviewDrainNode` ([`crate::service::SandboxManagerService::finish_preview`])
+//! reports what an evacuating drain would find on this unsealed node now,
+//! without being one: it runs a call's reads, its planner and its cache
+//! disk measurement, but takes no seal, starts no work and writes nothing,
+//! the drain's memory of earlier calls included. It plans as an evacuating
+//! drain would, so it lists a started sandbox with the work an evacuating
+//! drain would start for it, never held, and answers the report a drain call
+//! would. It doesn't read node-manager's orphan inventory, whose few scans
+//! every caller on the node shares, so a drain may find more node-wide
+//! blockers. A sealed node refuses it with `FailedPrecondition`, naming the
+//! generation it is sealed under, and one preview runs at a time: another
+//! fails at once with `Aborted` and the same marker as a `DrainNode` call.
 
 mod actions;
 mod planner;

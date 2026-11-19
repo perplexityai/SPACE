@@ -18,6 +18,13 @@ pub mod wake_signals {
     /// launch state without the pod network namespace required to boot it.
     pub const MISSING_RUNTIME_CONTEXT_MARKER: &str =
         "wake start context has no network namespace; re-place via restore";
+
+    /// `FailedPrecondition` message marker a node returns when it refuses a
+    /// VM activation (a cold boot, a restore from a snapshot, or a resume)
+    /// because a node drain has sealed it. The refusal comes before any VM
+    /// work, and the same activation lands on another node once the drain
+    /// has made the sandbox durable, so a caller answers it as retryable.
+    pub const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed";
 }
 
 /// Markers of sandbox-manager's node drain calls, `DrainNode` and

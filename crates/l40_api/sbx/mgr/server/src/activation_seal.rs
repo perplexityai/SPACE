@@ -399,6 +399,13 @@ impl ActivationSeal {
         Ok(record.generation)
     }
 
+    /// Why the seal row couldn't be read, while the last read failed and no
+    /// seal or cancel has read it since; a preview can't report it then.
+    #[cfg(test)]
+    pub(crate) fn read_error(&self) -> Option<String> {
+        self.lock_state().record.as_ref().err().cloned()
+    }
+
     #[cfg(test)]
     pub(crate) fn status(&self) -> ActivationSealStatus {
         let sealed_generation = self.lock_state().sealed_generation();
