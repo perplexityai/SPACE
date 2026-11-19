@@ -689,3 +689,83 @@ async fn a_finished_rollouts_live_lease_holds_its_node() -> TestResult {
     assert_eq!(nodes_of(&lease(&db.pool, third, 1).await?), [node]);
     Ok(())
 }
+
+/// Catches a scan that spends its limit on nodes another rollout holds,
+/// which would find no work while an eligible node waits behind them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_held_elsewhere_doesnt_use_up_the_scan() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let nodes = online_nodes(&db.pool, 2).await?;
+    let (a, b) = (nodes[0], nodes[1]);
+    let old = rollout(&db.pool, "rolling").await?;
+    save_targets(&db.pool, old, &[a]).await?;
+    assert_eq!(nodes_of(&lease(&db.pool, old, 1).await?), [a]);
+    set_phase(&db.pool, old, "aborted").await?;
+
+    let new = rollout(&db.pool, "rolling").await?;
+    save_targets(&db.pool, new, &nodes).await?;
+    let mut conn = db.pool.acquire().await?;
+    let leased = lease_targets(&mut conn, new, 10, LEASE, 1).await?;
+    assert_eq!(nodes_of(&leased), [b]);
+    Ok(())
+}
+
+/// Catches a claim that trusts the scan: a node that goes offline or stops
+/// being due after it would still be leased and charged an attempt.
+#[tokio::test(flavor = "current_thread")]
+async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let rollout = rollout(&db.pool, "rolling").await?;
+    let nodes = online_nodes(&db.pool, 4).await?;
+    let (first, offline, not_due, eligible) = (nodes[0], nodes[1], nodes[2], nodes[3]);
+    save_targets(&db.pool, rollout, &nodes).await?;
+    issue(&db.pool, rollout, not_due, 1, Some(-1.0)).await?;
+
+    // The claim scans all four, then waits to write the first.
+    let mut locker = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM firewall_rules_rollout_items
+         WHERE rollout_id = $1 AND node_id = $2
+         FOR UPDATE"
+    ))
+    .bind(rollout)
+    .bind(first)
+    .execute(&mut *locker)
+    .await?;
+    let pool = db.pool.clone();
+    let claiming = tokio::spawn(async move {
+        let mut conn = pool.acquire().await?;
+        lease_targets(&mut conn, rollout, 10, LEASE, SCAN).await
+    });
+    wait_for_lock_waiters(&db.pool, 1).await?;
+    set_status(&db.pool, offline, false, 60.0).await?;
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_rollout_items
+         SET next_check_at = now() + interval '1 hour'
+         WHERE rollout_id = $1 AND node_id = $2"
+    ))
+    .bind(rollout)
+    .bind(not_due)
+    .execute(&db.pool)
+    .await?;
+    locker.commit().await?;
+
+    assert_eq!(nodes_of(&claiming.await??), [first, eligible]);
+    for node in [offline, not_due] {
+        assert_eq!(item(&db.pool, rollout, node).await?.0, 0);
+        let phase = sqlx::query_scalar::<_, String>(sql!(
+            "SELECT phase FROM firewall_rules_rollout_items
+             WHERE rollout_id = $1 AND node_id = $2"
+        ))
+        .bind(rollout)
+        .bind(node)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(phase, "pending");
+    }
+    Ok(())
+}
