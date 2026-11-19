@@ -259,6 +259,17 @@ pub(super) fn artifact_backup_lookup_error(status: Status, full_current_instance
     }
 }
 
+/// Who asks [`SandboxManagerService::enqueue_artifact_backup_authorized`] for
+/// a backup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::service) enum BackupCaller {
+    /// The `EnqueueArtifactBackup` RPC. An artifact it publishes first is a
+    /// node-local artifact producer's, admitted by the activation seal.
+    Rpc,
+    /// The node drain, whose publications and uploads are its own work.
+    NodeDrain,
+}
+
 /// Which caller a backup file preflight answers for. The drain reconciler
 /// classifies `FailedPrecondition` responses carrying the artifact-missing
 /// marker as terminal, so the policy decides where that marker appears.
@@ -648,16 +659,21 @@ impl SandboxManagerService {
         request: Request<EnqueueArtifactBackupRequest>,
     ) -> Result<Response<EnqueueArtifactBackupResponse>, Status> {
         self.authorize_peer(&request, "EnqueueArtifactBackup", ALLOW_SANDBOX_OPERATOR)?;
-        self.enqueue_artifact_backup_authorized(request.into_inner())
+        self.enqueue_artifact_backup_authorized(request.into_inner(), BackupCaller::Rpc)
             .await
     }
 
-    /// [`Self::enqueue_artifact_backup`] for a caller this process already
-    /// trusts: the node drain, which publishes a stopped sandbox's disk and
-    /// finishes a local-only artifact's upload through it.
+    /// [`Self::enqueue_artifact_backup`] once its peer is authorized, or for a
+    /// caller this process already trusts: the node drain, which publishes a
+    /// stopped sandbox's disk and finishes a local-only artifact's upload
+    /// through it. For the RPC, an artifact the backup publishes first, from
+    /// a named snapshot or the current instance, asks the activation seal
+    /// under the artifact lock, which refuses it on a sealed node when the
+    /// sandbox has no VM; the drain's own publications don't ask.
     pub(in crate::service) async fn enqueue_artifact_backup_authorized(
         &self,
         req: EnqueueArtifactBackupRequest,
+        caller: BackupCaller,
     ) -> Result<Response<EnqueueArtifactBackupResponse>, Status> {
         let sandbox_id = req.sandbox_id.trim();
         if sandbox_id.is_empty() {
@@ -708,6 +724,14 @@ impl SandboxManagerService {
         if full_current_instance {
             self.ensure_snapshot_restore_supported("enqueue_artifact_backup")?;
         }
+        let admit_producer = |sandbox: &crate::db::SandboxRow| match caller {
+            BackupCaller::Rpc => self
+                .admit_artifact_producer("artifact backup's publication", sandbox)
+                .map(Some),
+            BackupCaller::NodeDrain => Ok(None),
+        };
+        // Held until the backup answers, by an RPC that publishes first.
+        let mut _producer = None;
         // Outer Some means the destination was already resolved before adopting
         // an unpinned suspend; its inner None selects the configured env default.
         let mut pre_adoption_upload_config = None;
@@ -767,6 +791,7 @@ impl SandboxManagerService {
                             "snapshot {name} has no published local artifact"
                         )));
                     }
+                    _producer = admit_producer(&sandbox)?;
                     let local_artifact_id = LocalArtifactId::new();
                     self.local_artifacts
                         .publish_named_snapshot(
@@ -795,6 +820,7 @@ impl SandboxManagerService {
                 let current_id = match (sandbox.state.unowned(), sandbox.current_local_artifact_id)
                 {
                     (Some(SandboxState::Suspended), None) => {
+                        _producer = admit_producer(&sandbox)?;
                         let sandbox_dir =
                             std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
                         let local_path = canonical_suspend_snapshot_dir(&sandbox_dir)
@@ -825,6 +851,7 @@ impl SandboxManagerService {
                         current_id
                     }
                     (Some(SandboxState::Stopped), None) => {
+                        _producer = admit_producer(&sandbox)?;
                         let id = LocalArtifactId::new();
                         let snapshot_name = format!("d-stop-{id}");
                         let mut node_client =

@@ -304,7 +304,7 @@ impl SandboxManagerService {
 
     async fn import_snapshot_owned(
         &self,
-        mut stream: tonic::Streaming<ImportSnapshotRequest>,
+        mut stream: impl tokio_stream::Stream<Item = Result<ImportSnapshotRequest, Status>> + Unpin,
     ) -> Result<Response<ImportSnapshotResponse>, Status> {
         use super::grpc_sandbox_transfer::receive;
         let deadline = receive::ImportDeadline::new();
@@ -371,6 +371,7 @@ impl SandboxManagerService {
                 "snapshot target identity or state does not match",
             ));
         }
+        let _producer = self.admit_artifact_producer("snapshot import", &sandbox)?;
         let base = pplx_space_host_layout::paths::sandbox_snapshots_dir(&sandbox_id);
         let final_dir = format!("{base}/{name}");
         match tokio::fs::symlink_metadata(&final_dir).await {
