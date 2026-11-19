@@ -232,8 +232,19 @@ publishes a new version that empty entries adopt. Moving a populated
 entry's pin is an EKS managed node group update, not a sandbox-aware
 rollout; the comment at the top of
 [`../space/worker_capacity.tf`](../space/worker_capacity.tf) describes
-its effect. Move a populated entry to a new version with the flow
-above, or drain it to zero before moving its pin.
+its effect. To move a populated entry to a new version without that
+update, empty it first, then clear its pin (`null`, so the empty entry
+tracks the latest version like any other empty entry) before it scales
+out again. Two ways to empty it:
+
+- The flow above, with a `workers_rollout_cohorts` target as the new
+  MNG. A target takes workers-1's instance types and subnets, not the
+  entry's own `instance_types`, `subnet_pool` or `availability_zone`, so
+  for an entry whose settings differ from workers-1's, this moves its
+  sandboxes onto a different instance shape or placement. Capacity type
+  is the same either way: every entry uses `workers_capacity_type`.
+- Drain the entry to zero in place. This keeps its own settings, and is
+  the only path that does: no rollout target takes them.
 
 The cohort taint value (`cohort_taint_value`) **must** be the new
 MNG's running-number index as a string (`"1"`, `"2"`, …) to match the
