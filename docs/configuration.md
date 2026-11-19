@@ -148,7 +148,9 @@ once the wait completes, which a cleanup does only when it has failed, so it
 reports `FAILED` and never `REQUIRED`. The retired `CLEANUP_REQUIRED` and
 `CLEANUP_FAILED` lifecycle values are reserved, and readers, the shim included,
 treat them as unknown, so don't roll sandbox manager back to a release that can
-publish them.
+publish them. Rolling sandbox manager back past the release that adds
+`20261114020000` needs this image's down migrations run first: a release
+refuses a database whose applied migrations it doesn't bundle.
 
 ## API, admission and limits
 
