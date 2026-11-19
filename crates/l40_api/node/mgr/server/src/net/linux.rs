@@ -836,8 +836,6 @@ where
     let ns = ns.to_string();
     let thread_ns = ns.clone();
     thread::spawn(move || {
-        let original = fs::File::open("/proc/thread-self/ns/net")
-            .map_err(|source| E::from(NetnsEnterError::OpenCurrent { source }))?;
         let target_path = netns_path(&thread_ns);
         let target = fs::File::open(&target_path).map_err(|source| {
             E::from(NetnsEnterError::OpenTarget {
@@ -845,21 +843,52 @@ where
                 source,
             })
         })?;
-
-        enter_netns_file(&target_path, &target).map_err(E::from)?;
-        IN_NETNS_THREAD.with(|cell| cell.set(true));
-        let result = f();
-        IN_NETNS_THREAD.with(|cell| cell.set(false));
-        let restore_result =
-            setns_file(&original).map_err(|detail| E::from(NetnsEnterError::SetNs { detail }));
-        match (result, restore_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-        }
+        run_entered(&target_path, &target, f)
     })
     .join()
     .map_err(|_| E::from(NetnsEnterError::ThreadPanicked { ns }))?
+}
+
+/// Runs `program` in the namespace `netns` pins, so a namespace removed or
+/// renamed meanwhile is never confused with another.
+pub(crate) fn command_output_in_pinned_ns(
+    netns: &fs::File,
+    program: &str,
+    args: &[&str],
+    stdin: &[u8],
+    budget: Duration,
+) -> io::Result<Output> {
+    let path = format!("/proc/self/fd/{}", netns.as_raw_fd());
+    let run = || crate::host_command::output(Command::new(program).args(args), budget, stdin);
+    // A thread of its own, so a failed restore never strands a caller's thread.
+    thread::scope(|scope| {
+        scope
+            .spawn(|| run_entered(&path, netns, run))
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("pinned namespace thread panicked")))
+    })
+}
+
+/// Runs `f` with this thread in `target`'s network namespace, then returns it
+/// to the namespace it started in.
+fn run_entered<T, E: From<NetnsEnterError>>(
+    path: &str,
+    target: &fs::File,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let original = fs::File::open("/proc/thread-self/ns/net")
+        .map_err(|source| E::from(NetnsEnterError::OpenCurrent { source }))?;
+    enter_netns_file(path, target).map_err(E::from)?;
+    IN_NETNS_THREAD.with(|cell| cell.set(true));
+    let result = f();
+    IN_NETNS_THREAD.with(|cell| cell.set(false));
+    let restore_result =
+        setns_file(&original).map_err(|detail| E::from(NetnsEnterError::SetNs { detail }));
+    match (result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
 }
 
 /// Enter the namespace an opened /run/netns entry names. Removing a named

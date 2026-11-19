@@ -5,6 +5,9 @@
 use pplx_space_firewall_rules_model::{FirewallRuleRevision, RuleId};
 use serde_json::{Value, json};
 
+#[cfg(target_os = "linux")]
+pub mod install;
+
 const FAMILY: &str = "ip";
 const TABLE: &str = "space_firewall_rules";
 const CHAIN: &str = "guest_drop";
