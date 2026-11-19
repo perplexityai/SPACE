@@ -512,21 +512,20 @@ async fn only_a_live_token_renews_even_after_a_lock_wait() -> TestResult {
     let node = nodes[0];
     save_targets(&db.pool, rollout, &nodes).await?;
     let mut conn = db.pool.acquire().await?;
-    let live_for = || async {
-        sqlx::query_scalar::<_, f64>(sql!(
-            "SELECT extract(epoch FROM lease_expires_at - clock_timestamp())::float8
-             FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
-        ))
-        .bind(rollout)
-        .bind(node)
-        .fetch_one(&db.pool)
-        .await
-    };
     // In whole microseconds, so the bounds compare exactly.
     let clock = || {
         sqlx::query_scalar::<_, i64>(sql!(
             "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::int8"
         ))
+        .fetch_one(&db.pool)
+    };
+    let expires = || {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT (extract(epoch FROM lease_expires_at) * 1000000)::int8
+             FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
+        ))
+        .bind(rollout)
+        .bind(node)
         .fetch_one(&db.pool)
     };
 
@@ -535,37 +534,25 @@ async fn only_a_live_token_renews_even_after_a_lock_wait() -> TestResult {
     let before = clock().await?;
     let live = lease(&db.pool, rollout, 1).await?.remove(0);
     let after = clock().await?;
-    let expires = sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT (extract(epoch FROM lease_expires_at) * 1000000)::int8
-         FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
-    ))
-    .bind(rollout)
-    .bind(node)
-    .fetch_one(&db.pool)
-    .await?;
+    let expires_at = expires().await?;
     let lease_us = i64::try_from(LEASE.as_micros())?;
     assert!(
-        (before + lease_us..=after + lease_us).contains(&expires),
-        "lease expires at {expires}us, not {lease_us}us after [{before}, {after}]us"
+        (before + lease_us..=after + lease_us).contains(&expires_at),
+        "lease expires at {expires_at}us, not {lease_us}us after [{before}, {after}]us"
     );
+    let before = clock().await?;
     assert!(renew_lease(&mut conn, &live, LEASE * 2).await?);
-    let renewed_for = live_for().await?;
+    let after = clock().await?;
+    let expires_at = expires().await?;
+    let renew_us = i64::try_from((LEASE * 2).as_micros())?;
     assert!(
-        renewed_for > LEASE.as_secs_f64() && renewed_for <= (LEASE * 2).as_secs_f64(),
-        "renewed for {renewed_for}s"
+        (before + renew_us..=after + renew_us).contains(&expires_at),
+        "renewal expires at {expires_at}us, not {renew_us}us after [{before}, {after}]us"
     );
     assert!(!renew_lease(&mut conn, &replaced, LEASE).await?);
 
-    // Expires 300 ms from now, while the renewal waits on the item lock.
-    sqlx::query(sql!(
-        "UPDATE firewall_rules_rollout_items
-         SET lease_expires_at = clock_timestamp() + interval '300 milliseconds'
-         WHERE rollout_id = $1 AND node_id = $2"
-    ))
-    .bind(rollout)
-    .bind(node)
-    .execute(&db.pool)
-    .await?;
+    // Hold the item lock and see the renewal wait on it before the lease
+    // starts its last 300 ms.
     let mut locker = db.pool.begin().await?;
     sqlx::query(sql!(
         "SELECT 1 FROM firewall_rules_rollout_items
@@ -576,21 +563,41 @@ async fn only_a_live_token_renews_even_after_a_lock_wait() -> TestResult {
     .bind(node)
     .execute(&mut *locker)
     .await?;
-    let pool = db.pool.clone();
     let waiting = live.clone();
-    let renewing = tokio::spawn(async move {
-        let mut conn = pool.acquire().await?;
-        renew_lease(&mut conn, &waiting, LEASE).await
-    });
+    let renewing = tokio::spawn(async move { renew_lease(&mut conn, &waiting, LEASE).await });
     wait_for_lock_waiters(&db.pool, 1).await?;
-    // Live when the renewal waits, so only a clock read after the wait
+    // Written under the lock, so the renewal reads it once the lock is
+    // released.
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_rollout_items
+         SET lease_expires_at = clock_timestamp() + interval '300 milliseconds'
+         WHERE rollout_id = $1 AND node_id = $2"
+    ))
+    .bind(rollout)
+    .bind(node)
+    .execute(&mut *locker)
+    .await?;
+    let live_now = sql!(
+        "SELECT lease_expires_at > clock_timestamp()
+         FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
+    );
+    // Live after the renewal waits, so only a clock read after the wait
     // refuses it.
     assert!(
-        live_for().await? > 0.0,
-        "the lease lapsed before the renewal waited"
+        sqlx::query_scalar::<_, bool>(live_now)
+            .bind(rollout)
+            .bind(node)
+            .fetch_one(&mut *locker)
+            .await?,
+        "the lease lapsed before it was seen live during the wait"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while live_for().await? > 0.0 {
+    while sqlx::query_scalar::<_, bool>(live_now)
+        .bind(rollout)
+        .bind(node)
+        .fetch_one(&mut *locker)
+        .await?
+    {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the lease didn't lapse"
