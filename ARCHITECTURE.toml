@@ -392,6 +392,7 @@ pplx-space-runtime-environment-policy-store = [
   "pplx-space-api",
   "pplx-space-internal-api-server",
 ]
+pplx-space-runtime-upgrade-campaign-store = ["pplx-space-cluster-controller-server"]
 pplx-space-sandbox-portability = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
