@@ -712,8 +712,9 @@ async fn a_node_held_elsewhere_doesnt_use_up_the_scan() -> TestResult {
     Ok(())
 }
 
-/// Catches a claim that trusts the scan: a node that goes offline or stops
-/// being due after it would still be leased and charged an attempt.
+/// Catches a claim that trusts the scan, or rechecks before its row lock: a
+/// node that goes offline or stops being due after it would still be leased
+/// and charged an attempt.
 #[tokio::test(flavor = "current_thread")]
 async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
@@ -725,7 +726,8 @@ async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
     save_targets(&db.pool, rollout, &nodes).await?;
     issue(&db.pool, rollout, not_due, 1, Some(-1.0)).await?;
 
-    // The claim scans all four, then waits to write the first.
+    // The claim scans all four, then waits to write the first, which goes
+    // offline during the wait.
     let mut locker = db.pool.begin().await?;
     sqlx::query(sql!(
         "SELECT 1 FROM firewall_rules_rollout_items
@@ -742,6 +744,7 @@ async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
         lease_targets(&mut conn, rollout, 10, LEASE, SCAN).await
     });
     wait_for_lock_waiters(&db.pool, 1).await?;
+    set_status(&db.pool, first, false, 60.0).await?;
     set_status(&db.pool, offline, false, 60.0).await?;
     sqlx::query(sql!(
         "UPDATE firewall_rules_rollout_items
@@ -754,8 +757,8 @@ async fn a_claim_rechecks_eligibility_at_the_write() -> TestResult {
     .await?;
     locker.commit().await?;
 
-    assert_eq!(nodes_of(&claiming.await??), [first, eligible]);
-    for node in [offline, not_due] {
+    assert_eq!(nodes_of(&claiming.await??), [eligible]);
+    for node in [first, offline, not_due] {
         assert_eq!(item(&db.pool, rollout, node).await?.0, 0);
         let phase = sqlx::query_scalar::<_, String>(sql!(
             "SELECT phase FROM firewall_rules_rollout_items

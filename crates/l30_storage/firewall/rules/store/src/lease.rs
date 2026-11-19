@@ -264,7 +264,21 @@ impl ClaimStore for Claiming<'_> {
         // The online and due filters of `candidates` again, since either can
         // change after the scan; a miss spends no attempt. The canary pin
         // needs no recheck: under the header lock nothing of this rollout is
-        // in flight to issue.
+        // in flight to issue. The item is locked first, as renewal does: an
+        // update that waited on its row would recheck on its old snapshot.
+        sqlx::query(sql!(
+            "SELECT 1
+             FROM firewall_rules_rollout_items
+             WHERE rollout_id = $1
+               AND node_id = $2
+               AND phase = $3
+             FOR UPDATE"
+        ))
+        .bind(self.rollout_id)
+        .bind(node_id)
+        .bind(ItemPhase::Pending.as_str())
+        .fetch_optional(&mut *self.tx)
+        .await?;
         let claimed = sqlx::query_as::<_, (i64, Option<i64>, Option<OffsetDateTime>)>(sql!(
             "UPDATE firewall_rules_rollout_items
              SET phase = $3,
