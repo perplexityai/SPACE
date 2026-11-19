@@ -145,6 +145,7 @@ impl Targets for Unapproved {
         Err(StartError::NotEnabled)
     }
 
+    // Unreachable for now: `enrolled` refuses first.
     fn qualify(&self, _: &FirewallRuleRevision, _: &[NodeId]) -> Result<(), StartError> {
         Err(StartError::NotEnabled)
     }
@@ -249,10 +250,16 @@ async fn start_in(
     .bind(ItemPhase::Pending.as_str())
     .execute(&mut *tx)
     .await?;
+    // The schema keeps it non-negative; report a violation rather than guess.
+    let generation = u64::try_from(generation).map_err(|_| {
+        sqlx::Error::Decode(
+            format!("firewall rules rollout {rollout_id} has a negative generation").into(),
+        )
+    })?;
     Ok(StartedRollout {
         revision_id,
         rollout_id,
-        generation: u64::try_from(generation).unwrap_or(0),
+        generation,
         review,
     })
 }

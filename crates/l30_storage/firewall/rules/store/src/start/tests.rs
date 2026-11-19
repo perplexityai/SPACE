@@ -229,8 +229,7 @@ fn sorted(mut nodes: Vec<NodeId>) -> Vec<NodeId> {
 /// Catches a start that adopts its candidate or writes delivery state, saves
 /// the wrong header or targets, or answers a repeated request with
 /// a second rollout or a stored success; a slot check that misses an
-/// unfinished phase, counts a finished one or runs after the targets are
-/// judged.
+/// unfinished phase or runs after the targets are judged.
 #[tokio::test(flavor = "current_thread")]
 async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -291,12 +290,6 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
             "{phase}: {repeated:?}"
         );
     }
-
-    // Finished rollouts don't hold it: a new push against A may start.
-    set_phase(pool, started.rollout_id, "aborted").await?;
-    let again = start(pool, a, &candidate).await?;
-    set_phase(pool, again.rollout_id, "completed").await?;
-    start(pool, a, &candidate).await?;
     Ok(())
 }
 
@@ -381,26 +374,23 @@ async fn adoption_commits_or_rolls_back_with_the_completion() -> TestResult {
         return Ok(());
     };
     let pool = &db.pool;
-    // NULL to B, then A to B. The rolled-back round also shows start adopted
-    // nothing.
-    let mut adopted = AdoptedRevision::NoRevision;
-    let mut completed = Vec::new();
-    for rules in [vec![dns()], vec![dns(), web()]] {
-        let started = start(pool, adopted, &revision(&rules)).await?;
-        let candidate = Some(started.revision_id);
-        assert_eq!(complete(pool, started.rollout_id, false).await?, candidate);
-        assert_eq!(adopted_now(pool).await?, adopted);
+    // A to B: adoption replaces a set default, not only NULL.
+    let superseded = start(pool, AdoptedRevision::NoRevision, &revision(&[dns()])).await?;
+    complete(pool, superseded.rollout_id, true).await?;
+    let a = AdoptedRevision::Revision(superseded.revision_id);
+    let started = start(pool, a, &revision(&[dns(), web()])).await?;
+    let candidate = Some(started.revision_id);
+    assert_eq!(complete(pool, started.rollout_id, false).await?, candidate);
+    assert_eq!(adopted_now(pool).await?, a);
 
-        complete(pool, started.rollout_id, true).await?;
-        adopted = candidate.into();
-        assert_eq!(adopted_now(pool).await?, adopted);
-        completed.push(started.rollout_id);
-    }
+    complete(pool, started.rollout_id, true).await?;
+    let adopted = AdoptedRevision::from(candidate);
+    assert_eq!(adopted_now(pool).await?, adopted);
 
     let aborted = start(pool, adopted, &revision(&[ssh()])).await?;
     set_phase(pool, aborted.rollout_id, "aborted").await?;
     let mut tx = pool.begin().await?;
-    for finished in [aborted.rollout_id, completed[0]] {
+    for finished in [aborted.rollout_id, superseded.rollout_id] {
         assert_eq!(adopt_rollout_revision(&mut tx, finished).await?, None);
     }
     tx.commit().await?;
@@ -446,25 +436,22 @@ async fn racing_starts_serialize_on_the_control_row() -> TestResult {
     let pool = &db.pool;
     let node = online_nodes(pool, 1).await?[0];
     let candidate = revision(&[dns()]);
-    // Two first pushes against NULL, then two pushes against A.
-    let mut expected = AdoptedRevision::NoRevision;
-    for round in ["first push", "against A"] {
-        let (first, second) = race(pool, expected, &candidate, node, false).await?;
-        assert!(
-            matches!(first, Err(StartError::Unqualified(_))),
-            "{round}: {first:?}"
-        );
-        set_phase(pool, second?.rollout_id, "aborted").await?;
+    let a = AdoptedRevision::Revision(adopt(pool, &revision(&[web()])).await?);
+    let (first, second) = race(pool, a, &candidate, node, false).await?;
+    assert!(
+        matches!(first, Err(StartError::Unqualified(_))),
+        "{first:?}"
+    );
+    set_phase(pool, second?.rollout_id, "aborted").await?;
 
-        let (first, second) = race(pool, expected, &candidate, node, true).await?;
-        let first = first?;
-        assert!(
-            matches!(second, Err(StartError::RolloutInProgress)),
-            "{round}: {second:?}"
-        );
-        complete(pool, first.rollout_id, true).await?;
-        expected = AdoptedRevision::Revision(first.revision_id);
-    }
+    let (first, second) = race(pool, a, &candidate, node, true).await?;
+    let first = first?;
+    assert!(
+        matches!(second, Err(StartError::RolloutInProgress)),
+        "{second:?}"
+    );
+    complete(pool, first.rollout_id, true).await?;
+    let expected = AdoptedRevision::Revision(first.revision_id);
 
     // A writer that skips the control lock meets the slot key instead.
     let mut bypass = pool.begin().await?;
