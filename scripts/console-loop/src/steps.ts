@@ -1677,6 +1677,7 @@ step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
     // An empty worker can pass through draining faster than the page's poll.
     c.rec.check(await waitForSection(c, /Phase\s+(draining|drained)/, 15_000), 'the Drain section shows the drain (draining, or drained already)');
     c.rec.check(/Mode forced/.test((await drainCard(c.page).innerText()).replace(/\s+/g, ' ')), 'the Drain section shows mode forced');
+    c.rec.check(!/Engine/.test(await drainCard(c.page).innerText()) && !(await c.page.locator('#drain-progress').count()), 'a v1 forced drain shows no engine and no Drain progress panel');
     c.rec.check(kube.unschedulable(node.k8s_node_name!), 'the Kubernetes Node is cordoned');
     await shot(c, 'draining');
     c.rec.check(await waitForPhase(c, node.id, ['drained'], 120_000) === 'drained', 'the empty worker reaches drained');
@@ -1780,6 +1781,40 @@ step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
     } finally {
       await c.page.unroute(terminateUrl, guard);
     }
+  });
+}, true);
+
+// A v1 gentle drain, as on main: Drain sends `mode: gentle` and no engine,
+// and the page shows no v2 drain.
+step('node-gentle-drain-undrain', ['nodes', 'flows'], async (c) => {
+  await withDrainableWorker(c, async (node, kube) => {
+    await visit(c, `/dashboard/nodes/${node.id}`, 3000);
+    await content(c.page).getByRole('button', { name: 'Drain', exact: true }).click();
+    const confirm = c.page.locator('.ant-modal-confirm:visible');
+    await confirm.waitFor({ timeout: 5000 });
+    c.rec.check(/waits for its sandboxes to leave on their own/.test(await confirm.innerText()), 'the confirmation says a gentle drain waits for sandboxes to leave');
+    await shot(c, 'confirmation', { dialog: true });
+    const sent = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:drain`));
+    await confirm.getByRole('button', { name: 'Drain', exact: true }).click();
+    const answer = await sent;
+    c.rec.check(answer?.status() === 200, `the gentle drain is accepted (${answer?.status()})`);
+    c.rec.check(JSON.stringify(answer?.request().postDataJSON()) === '{"mode":"gentle"}', `the request asks for mode gentle and names no engine (${answer?.request().postData()})`);
+    c.rec.check(await waitForSection(c, /Phase\s+(draining|drained)/, 15_000), 'the Drain section shows the drain');
+    const section = (await drainCard(c.page).innerText()).replace(/\s+/g, ' ');
+    c.rec.check(/Mode gentle/.test(section) && !/Engine/.test(section), 'the Drain section shows mode gentle and no engine');
+    c.rec.check(!(await c.page.locator('#drain-progress').count()), 'a v1 drain shows no Drain progress panel');
+    c.rec.check(kube.unschedulable(node.k8s_node_name!), 'the Kubernetes Node is cordoned');
+    await shot(c, 'draining');
+    c.rec.check(await waitForPhase(c, node.id, ['drained'], 180_000) === 'drained', 'the empty worker reaches drained');
+    c.rec.check(await waitForSection(c, /Phase\s+drained/, 15_000), "the page's poll shows drained without a reload");
+    await shot(c, 'drained');
+    await content(c.page).getByRole('button', { name: 'Undrain' }).click();
+    const undo = c.page.locator('.ant-modal-confirm:visible');
+    await undo.waitFor({ timeout: 5000 });
+    const undrain = nextPost(c.page, (p) => p.endsWith(`/nodes/${node.id}:undrain`));
+    await undo.getByRole('button', { name: 'Undrain' }).click();
+    c.rec.check((await undrain)?.status() === 200, 'the undrain is accepted');
+    c.rec.check(await waitForSection(c, /Phase\s+not draining/, 15_000), 'the Drain section shows not draining');
   });
 }, true);
 
