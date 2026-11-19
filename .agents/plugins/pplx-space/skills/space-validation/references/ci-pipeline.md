@@ -29,37 +29,10 @@ Rust CI checks are owned by `ci/scripts/run-rust-checks.sh` and its
 pipeline steps: formatting/error policy, workspace lint and compilation with
 all targets/features, and the observability feature-isolation check. The checks
 that run beside nextest live in `ci/scripts/lib/rust-side-checks.sh`, which the
-Rust caches' keys do not hash.
-
-The `Rust isolated crates (K/N)` jobs (`run-rust-checks.sh isolated-crates`,
-one `rust-static-ci.yml` entry per shard, each with its own compiler-cache
-family) lint workspace libraries one at a time, so a crate that uses a dependency feature
-it gets only through workspace feature unification fails. Its selection and
-lints live in `ci/scripts/lib/rust-isolated-crates.sh`, which the cache keys do
-not hash either. From `cargo metadata` it selects every workspace library, of
-any crate type. Each crate gets its own `cargo clippy` runs with its minimum
-supported features (`--no-default-features`, plus `kubernetes` for the cluster
-controller) and with `--all-features`, each once with `--all-targets` and once
-with `--lib`. The `--lib` runs catch a feature that
-only a dev-dependency turns on. A new crate needs no CI edit. Each entry sets
-`SPACE_RUST_ISOLATED_SHARD=K/N`: every shard splits every selected library into
-the same N parts, balanced by cost (one plus the workspace crates a crate's
-lint builds, from `cargo metadata`), and keeps part K. In Pull CI and the merge
-queue it then lints only the crates of part K the change affects, so a crate
-lints in the shard Main CI puts it in, with that shard's compiler cache; the
-shards of such a run can be far from balanced. Any shard's log shows every
-part's size and cost. To change the shard count, change
-`ISOLATED_CRATE_SHARDS` in `ci/scripts/lib/rust-isolated-crates.sh` and the
-entries together: a shard given another N fails, but the entries, one per K
-with cache key `isolated-crates-K`, are kept by hand. `space-pull-ci` needs no
-edit: it takes the result of the whole `rust_static` call. The `clippy` mode
-does not run this check; to run it locally, from the repository root (with
-`SPACE_RUST_ISOLATED_SHARD=K/N`, N being `ISOLATED_CRATE_SHARDS`, for one
-shard):
-
-```sh
-bash -euo pipefail -c 'source ci/scripts/lib/rust-isolated-crates.sh; run_isolated_crate_checks'
-```
+Rust caches' keys do not hash. Nor do they hash
+`ci/scripts/lib/rust-affected-crates.sh`, with which the `clippy` mode, in Pull
+CI and the merge queue, skips the sbx-mgr production checks when the change
+cannot affect their crates.
 
 Preserve the runner's complete workspace test inventory, including ignored
 tests and doc tests. Do not narrow CI selectors because local checks were

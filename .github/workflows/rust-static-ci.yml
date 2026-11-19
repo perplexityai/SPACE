@@ -48,83 +48,6 @@ jobs:
             cargo_registry: restore
             timeout: 45
             archcheck: true
-          # Lints libraries one at a time (ci/scripts/lib/rust-isolated-crates.sh)
-          # in jobs of their own, so it lengthens neither clippy nor the tests.
-          # The libraries are split by cost into shards K/N (isolated_crate_shard
-          # there). N is ISOLATED_CRATE_SHARDS there, and a shard given another
-          # N fails. These entries are kept by hand, one for each K with cache
-          # key isolated-crates-K: nothing checks that every K has one or that
-          # no two share a key, so change them together, with the shard count.
-          #
-          # Size the limits for a full pass. Main CI passes no base and lints
-          # every selected library, and a pull request does too when it changes
-          # any path outside every crate that affected_lint_crates does not rule
-          # out: the root manifest, db/, proto/, infra/, this workflow and so
-          # on. A Cargo.lock change lints the libraries its changed packages
-          # reach, which can be all of them. The timeout must cover a shard's
-          # full pass on a cold cache, and the cache must hold what one full
-          # pass of a shard fills, both with headroom: a smaller cache evicts,
-          # in lint order, the entries the next run needs first, and hits
-          # almost nothing. A shard's cold full pass wrote at most about 1 GiB
-          # when this was set, more than its share of a single job's pass,
-          # since every shard builds the dependencies they share; compare the
-          # size each shard's upload step prints. The cache decision step warns
-          # when a cache ends nearly full.
-          #
-          # Each shard's compiler cache is a family of its own: its crates build
-          # with other feature sets than the workspace pass and the other shards,
-          # and two jobs saving one family would replace and trim each other's
-          # snapshots.
-          - name: Rust isolated crates (1/5)
-            scope: rust
-            command: SPACE_RUST_ISOLATED_SHARD=1/5 bash ci/scripts/run-rust-checks.sh isolated-crates
-            runner: ubuntu-24.04-16core
-            rust_cache: true
-            rust_cache_key: isolated-crates-1
-            rust_cache_size: 1536M
-            rust_cache_refresh_misses: 20
-            cargo_registry: restore
-            timeout: 30
-          - name: Rust isolated crates (2/5)
-            scope: rust
-            command: SPACE_RUST_ISOLATED_SHARD=2/5 bash ci/scripts/run-rust-checks.sh isolated-crates
-            runner: ubuntu-24.04-16core
-            rust_cache: true
-            rust_cache_key: isolated-crates-2
-            rust_cache_size: 1536M
-            rust_cache_refresh_misses: 20
-            cargo_registry: restore
-            timeout: 30
-          - name: Rust isolated crates (3/5)
-            scope: rust
-            command: SPACE_RUST_ISOLATED_SHARD=3/5 bash ci/scripts/run-rust-checks.sh isolated-crates
-            runner: ubuntu-24.04-16core
-            rust_cache: true
-            rust_cache_key: isolated-crates-3
-            rust_cache_size: 1536M
-            rust_cache_refresh_misses: 20
-            cargo_registry: restore
-            timeout: 30
-          - name: Rust isolated crates (4/5)
-            scope: rust
-            command: SPACE_RUST_ISOLATED_SHARD=4/5 bash ci/scripts/run-rust-checks.sh isolated-crates
-            runner: ubuntu-24.04-16core
-            rust_cache: true
-            rust_cache_key: isolated-crates-4
-            rust_cache_size: 1536M
-            rust_cache_refresh_misses: 20
-            cargo_registry: restore
-            timeout: 30
-          - name: Rust isolated crates (5/5)
-            scope: rust
-            command: SPACE_RUST_ISOLATED_SHARD=5/5 bash ci/scripts/run-rust-checks.sh isolated-crates
-            runner: ubuntu-24.04-16core
-            rust_cache: true
-            rust_cache_key: isolated-crates-5
-            rust_cache_size: 1536M
-            rust_cache_refresh_misses: 20
-            cargo_registry: restore
-            timeout: 30
 
     steps:
       - name: Check out SPACE
@@ -242,7 +165,8 @@ jobs:
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
           SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
-          # The lint jobs check alone only the crates this change can affect.
+          # Clippy runs the sbx-mgr production checks only when this change
+          # can affect their crates (ci/scripts/lib/rust-affected-crates.sh).
           SPACE_RUST_LINT_BASE: ${{ steps.scope.outputs.base }}
           # Unset, run-rust-checks.sh uses its default; 1 turns the parallel
           # front end off.
