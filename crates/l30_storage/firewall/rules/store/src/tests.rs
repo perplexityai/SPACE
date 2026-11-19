@@ -497,14 +497,31 @@ async fn only_a_live_token_renews_even_after_a_lock_wait() -> TestResult {
         .fetch_one(&db.pool)
         .await
     };
+    // In whole microseconds, so the bounds compare exactly.
+    let clock = || {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::int8"
+        ))
+        .fetch_one(&db.pool)
+    };
 
     let replaced = lease(&db.pool, rollout, 1).await?.remove(0);
     assert!(requeue(&db.pool, &replaced, Requeue::Release).await?);
+    let before = clock().await?;
     let live = lease(&db.pool, rollout, 1).await?.remove(0);
-    let leased_for = live_for().await?;
+    let after = clock().await?;
+    let expires = sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT (extract(epoch FROM lease_expires_at) * 1000000)::int8
+         FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
+    ))
+    .bind(rollout)
+    .bind(node)
+    .fetch_one(&db.pool)
+    .await?;
+    let lease_us = i64::try_from(LEASE.as_micros())?;
     assert!(
-        leased_for <= LEASE.as_secs_f64(),
-        "leased for {leased_for}s"
+        (before + lease_us..=after + lease_us).contains(&expires),
+        "lease expires at {expires}us, not {lease_us}us after [{before}, {after}]us"
     );
     assert!(renew_lease(&mut conn, &live, LEASE * 2).await?);
     let renewed_for = live_for().await?;
@@ -541,16 +558,14 @@ async fn only_a_live_token_renews_even_after_a_lock_wait() -> TestResult {
         renew_lease(&mut conn, &waiting, LEASE).await
     });
     wait_for_lock_waiters(&db.pool, 1).await?;
+    // Live when the renewal waits, so only a clock read after the wait
+    // refuses it.
+    assert!(
+        live_for().await? > 0.0,
+        "the lease lapsed before the renewal waited"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT lease_expires_at > clock_timestamp()
-         FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
-    ))
-    .bind(rollout)
-    .bind(node)
-    .fetch_one(&db.pool)
-    .await?
-    {
+    while live_for().await? > 0.0 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the lease didn't lapse"
