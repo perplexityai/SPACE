@@ -88,6 +88,9 @@ pub(in crate::service) struct DrainActions {
     /// runs at a time and each plans with the work earlier ones started,
     /// from the seal as it stands.
     call: CallSlot,
+    /// Taken for the whole of one `PreviewDrainNode` call, so one preview
+    /// runs at a time.
+    preview: CallSlot,
     /// How long one call may run ([`DRAIN_CALL_TIMEOUT`]).
     pub(super) call_timeout: Duration,
     /// The generation a call has said to evacuate under: the drain suspends
@@ -116,6 +119,7 @@ impl DrainActions {
         Self {
             window: window.max(1),
             call: CallSlot::default(),
+            preview: CallSlot::default(),
             call_timeout: DRAIN_CALL_TIMEOUT,
             evacuating: Mutex::default(),
             running: Mutex::default(),
@@ -131,6 +135,17 @@ impl DrainActions {
         self.call.enter().ok_or_else(|| {
             Status::aborted(format!(
                 "{DRAIN_CALL_IN_PROGRESS_MARKER}; this call changed nothing, retry it"
+            ))
+        })
+    }
+
+    /// Take the preview slot for one `PreviewDrainNode` call until the guard
+    /// drops, or refuse the preview with `Aborted` and
+    /// [`DRAIN_CALL_IN_PROGRESS_MARKER`] while another holds it.
+    pub(super) fn enter_preview(&self) -> Result<CallGuard<'_>, Status> {
+        self.preview.enter().ok_or_else(|| {
+            Status::aborted(format!(
+                "{DRAIN_CALL_IN_PROGRESS_MARKER}; this preview changed nothing, retry it"
             ))
         })
     }
