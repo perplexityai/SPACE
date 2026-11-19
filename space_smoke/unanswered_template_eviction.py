@@ -9,7 +9,7 @@ again and, still released, has template-manager delete it with
 `DeleteIdleTemplate` (crates/l40_api/node/ctl/server/src/facets/
 unanswered_templates.rs).
 
-The wait is an hour and is read once at start, so the scenario scopes a
+The wait is six hours and is read once at start, so the scenario scopes a
 short one to itself: the worker node-ctl DaemonSet's literal for
 `SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS` is captured, overridden,
 and put back in a scenario phase, under the node-ctl mutation Lease. It is

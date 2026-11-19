@@ -939,7 +939,7 @@ class NodeCtlFacetControl(Protocol):
 class UnansweredTemplateEvictionControl(NodeCtlFacetControl, Protocol):
     """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
 
-    A worker's node-ctl waits an hour before deleting a local template the
+    A worker's node-ctl waits six hours before deleting a local template the
     cluster released, and reads that wait once at start, so the scenario
     overrides one env key on the worker node-ctl DaemonSet
     (`SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS`, to a bounded number

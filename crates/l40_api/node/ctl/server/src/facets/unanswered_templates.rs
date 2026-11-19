@@ -19,8 +19,11 @@ use super::*;
 
 /// How long a template must stay released before a worker deletes its copy.
 /// The wait keeps the copy for a sandbox of the same template placed here
-/// again soon after.
-pub(super) const UNANSWERED_TEMPLATE_EVICT_AFTER: Duration = Duration::from_secs(60 * 60);
+/// again later. Org templates are often used in bursts hours apart, and a
+/// worker that deleted its copy pulls the template again on the burst's create
+/// path, so the wait outlasts such gaps; the template-manager LRU still bounds
+/// what the kept copies cost in disk.
+pub(super) const UNANSWERED_TEMPLATE_EVICT_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Overrides [`UNANSWERED_TEMPLATE_EVICT_AFTER`] in seconds; `0` turns the
 /// deletes off.
