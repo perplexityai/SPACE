@@ -9,13 +9,10 @@ AMI. This page compares the ways the Terraform modules under
 use for which node group. Operator procedures live in each deployment's
 runbooks; this page covers the mechanisms and their tradeoffs.
 
-Status: the EKS native update and the single-pair sandbox-aware rollout
-exist today. The per-group launch template pin for `worker_capacity_groups`
-is the intended adoption control (see
-[Pin each capacity group's launch template](#pin-each-capacity-groups-launch-template)).
-Per-entry instance type and subnet overrides for rollout targets, and
-running several rollout pairs in parallel, are future work and not
-scheduled.
+Status: the EKS native update, the per-group launch template pin, and the
+single-pair sandbox-aware rollout exist. Per-entry instance type and subnet
+overrides for rollout targets, and running several rollout pairs in
+parallel, are future work and not scheduled.
 
 ## What decides the mechanism
 
@@ -28,16 +25,16 @@ node group resource:
 | Node group resource | LT version it tracks | Effect of a new LT version on apply |
 | --- | --- | --- |
 | `module.workers_1`, `workers_rollout_cohorts` (`rollout-mng`), `aws_eks_node_group.rollout_managed` | Version at creation; `launch_template` is in `ignore_changes` | None. Adoption happens only through a sandbox-aware rollout onto a new MNG. |
-| `aws_eks_node_group.worker_capacity` (`worker_capacity_groups`) | `latest_version` | EKS native in-place update of every group, empty or not |
-| `aws_eks_node_group.custom` (for example `builders`) | `latest_version` | EKS native in-place update with the group's `update_strategy` |
+| `aws_eks_node_group.worker_capacity` (`worker_capacity_groups`) | The entry's `launch_template_version` if set, otherwise `latest_version` | Unpinned groups: EKS native in-place update, empty or not. Pinned groups: none until the pin moves. |
+| `aws_eks_node_group.custom` (for example `builders`) | `builders_launch_template_version` if set, otherwise `latest_version` | Unpinned: EKS native in-place update with `builders_update_strategy`. Pinned: none until the pin moves. |
 
-Capacity groups follow `latest_version` on purpose. A group sitting at zero
-nodes must not scale out later on a stale bootstrap, and an empty group
-adopts a new version in seconds. A nonempty group has the same plan diff,
-`launch_template.version` moving to the next number, and the apply starts a
-native rolling update of live sandbox workers. The module comment asks the
-operator to drain or zero the group first, but nothing enforces it. The
-per-group pin below closes that gap.
+Unpinned capacity groups follow `latest_version` on purpose. A group
+sitting at zero nodes must not scale out later on a stale bootstrap, and an
+empty group adopts a new version quickly, with no node replacement. An
+unpinned nonempty group has the same plan diff, `launch_template.version`
+moving to the next number, and the apply starts a native rolling update of
+live sandbox workers. Pin populated groups to prevent that; see
+[Pin each capacity group's launch template](#pin-each-capacity-groups-launch-template).
 
 ## EKS native in-place update
 
@@ -101,22 +98,33 @@ Use the native update only for:
 
 ### Builders
 
-`builders` is a single-node custom pool. Replacing it loses at most the
-builds in flight, which callers retry, so a native update is appropriate.
-The module sets its `update_strategy` explicitly because EKS keeps returning
-a strategy once one has been set and cannot clear it, so an unset value plans
-`<value> -> null` on every run. The `space` module sets builders to
-`DEFAULT` in `locals.tf`; no input selects the strategy, so moving builders
-to `MINIMAL` is a module change. The tradeoff between the two:
+`builders` is a stateless custom pool. Replacing a builder loses at most
+the builds in flight on it, which callers retry, so a native update is
+appropriate. The `space` module always sets its strategy from
+`builders_update_strategy`, which defaults to `MINIMAL` and cannot be null:
+EKS keeps returning a strategy once one has been set and cannot clear it,
+so an unset value would plan `<value> -> null` on every run. The tradeoff
+between the two values:
 
-- `DEFAULT` keeps a builder serving during the update but needs a second
-  instance of the builder's type in the same AZ, within 15 minutes. When
-  builders draw from a shared reservation that is fully used, that surge
-  falls back to on-demand capacity and can fail.
-- `MINIMAL` terminates the builder first and relaunches into the slot it
-  released, at the cost of a gap with no builder, roughly one node boot. The
-  slot is guaranteed only if the reservation is `targeted` to the builders
-  rather than `open` to every matching launch in the account.
+- `MINIMAL`, the default, terminates a builder first and relaunches into
+  the slot it released, so a roll never needs capacity beyond the group's
+  size. With two or more builders and `max_unavailable = 1`, the others keep
+  serving while one is replaced. A single-node group has no builder for
+  roughly one node boot, and template build submissions fail as unavailable
+  until the replacement joins. The released slot is guaranteed only if the
+  reservation is `targeted` to the builders rather than `open` to every
+  matching launch in the account.
+- `DEFAULT` launches the replacement first, so it keeps every builder
+  serving, but needs a spare instance of the builder's type in the same AZ
+  within 15 minutes. When builders draw from a shared reservation that is
+  fully used, that surge falls back to on-demand capacity and can fail, and
+  EKS rolls the update back.
+
+Run at least two builders per cluster so `MINIMAL` keeps one up. Apply a
+strategy change on its own, before any LT or AMI change to the group: in a
+combined apply the node group version update runs first, under the old
+strategy. `builders_launch_template_version` can hold the builders on a
+version, like the capacity group pin below.
 
 Keep builder LT changes in their own apply, separate from worker changes, so
 a builder capacity failure does not hold up unrelated work.
@@ -150,18 +158,19 @@ a source terminate lowers the source at once and the target node takes
 time to become Ready.
 
 The target must carry the `space.pplx.net/rollout-cohort` taint and its
-matching node label, as `rollout-mng` declares them. The script reads
-target taints on every tick. Its sanity check fails the run when target
-nodes lack the taint, except that on a resumed rollout it allows one
-untainted target node per source node already terminated. It repeats that
-check each tick only until it sees one tainted Ready target node, and does
-not re-check the taints of target nodes that join after that. For a
-custom-AMI node group, EKS applies node group taints after the node registers, unless the
-bootstrap passes them to kubelet with `--register-with-taints`; the shared
-worker bootstrap does not. A new target node can therefore accept a user
-pod before its taint arrives, and an operator check cannot close that
-window. Use a `rollout-mng` or `workers_rollout_cohorts` target. A
-`worker_capacity_groups` entry does not set either today, so it can be a rollout source but not a target.
+matching node label, as `rollout-mng` declares them. The script reads target
+taints on every tick. Its sanity check fails the run when target nodes lack
+the taint, except that on a resumed rollout it allows one untainted target
+node per source node already terminated. It repeats that check each tick
+only until it sees one tainted Ready target node, and does not re-check the
+taints of target nodes that join after that. For a custom-AMI node group,
+EKS applies node group taints after the node registers, unless the bootstrap
+passes them to kubelet with `--register-with-taints`; the shared worker
+bootstrap does not. A new target node can therefore accept a user pod before
+its taint arrives, and an operator check cannot close that window. Use a
+`rollout-mng` or `workers_rollout_cohorts` target. A
+`worker_capacity_groups` entry does not set either today, so it can be a
+rollout source but not a target.
 
 The target must also be able to grow to `N + H`. A `rollout-mng` or
 `workers_rollout_cohorts` target takes its `max_size` from the caller. The
@@ -187,42 +196,41 @@ Tradeoffs:
   cleanup change that removes the cohort taint and records the final sizes.
 
 Today the orchestrator handles one source and one target per run, and the
-evacuation placement selects one cohort value cluster-wide. `workers_rollout_cohorts`
-entries inherit `workers-1`'s instance types and subnets, so they can only
-roll a fleet shaped like `workers-1`. Capacity groups with a different
-instance type or a single-AZ subnet pool need per-entry overrides before
-they can be blue/green targets.
+evacuation placement selects one cohort value cluster-wide.
+`workers_rollout_cohorts` entries inherit `workers-1`'s instance types and
+subnets, so they can only roll a fleet shaped like `workers-1`. Capacity
+groups with a different instance type or a single-AZ subnet pool need
+per-entry overrides before they can be blue/green targets.
 
 ## Pin each capacity group's launch template
 
-The intended control for `worker_capacity_groups` is an optional
-`launch_template_version` on each group, proposed in
-[#1958](https://github.com/perplexityai/SPACE/pull/1958) and not yet on
-`main`:
+Each `worker_capacity_groups` entry has an optional
+`launch_template_version`, a version number such as `"3"`:
 
 - Unset, the group follows `latest_version`. That suits empty groups,
   which then never scale out on a stale bootstrap.
 - Set, the group stays on that version, so a new LT version is published
-  without being adopted. A non-blocking `check` warns while a pin lags the
-  latest version. Adoption becomes a reviewed one-line change to the pin,
+  without being adopted. Adoption is a reviewed one-line change to the pin,
   made after the group is empty or through a blue/green rollout. Moving
   the pin of a populated group is a native in-place update of that group.
 
-The module does not require a populated group to be pinned; pinning
-nonempty groups is a convention to follow. The same change adds a
-`builders_launch_template_version` input for the builders pool.
+The non-blocking `worker_capacity_groups_on_latest_launch_template` check
+warns while any pin lags the latest version. During a plan that changes the
+LT, the latest version is not known until apply, so the check reports as
+unknown. The module does not require a populated group to be pinned;
+pin every populated group to the version it runs.
 
-Until the pin lands, every nonempty capacity group adopts a new shared LT
-version on the next apply. Before applying such a change, drain each
-nonempty group to zero, or hold the apply.
+The builders pool has the same control, `builders_launch_template_version`,
+with the `custom_node_groups_on_latest_launch_template` check. It applies
+only to a custom-AMI pool.
 
-With the pin in place, a change to the shared LT updates only empty groups
-in place, and nonempty groups adopt it when an operator chooses. Empty
-groups adopt it on their own: a group that is zero today picks up the
+With populated groups pinned, a change to the shared LT updates only empty
+groups in place, and nonempty groups adopt it when an operator chooses.
+Empty groups adopt it on their own: a group that is zero today picks up the
 latest version and serves it when it scales out. A group can be drained to
-zero, its pin cleared, and then refilled on the new version without a
-blue/green pair, provided the rest of the fleet can hold its sandboxes
-meanwhile.
+zero, its pin moved or cleared, and then refilled on the new version
+without a blue/green pair, provided the rest of the fleet can hold its
+sandboxes meanwhile.
 
 ## Parallel pairs (future)
 
@@ -241,9 +249,9 @@ wall time roughly by the number of pairs. It is not implemented. It needs:
 | Change | Strategy |
 | --- | --- |
 | Empty capacity group | Native update; it adopts the latest LT on apply. |
-| Boot-only or cosmetic LT change on nonempty groups | Once the pin is available, pin the groups, let empty groups adopt it and roll the rest at the next planned rollout. Until then, hold the apply or drain the nonempty groups to zero first. |
+| Boot-only or cosmetic LT change on nonempty groups | Keep the groups pinned, let empty groups adopt it and roll the rest at the next planned rollout. |
 | Planned worker AMI, kernel or bootstrap change | Pin, or drain to zero, every nonempty capacity group before the apply that publishes the LT. Then roll sandbox-aware blue/green, one pair at a time, with room for `N + H` in the target. |
-| Builders | Native update with an explicit strategy, one cluster at a time. |
+| Builders | Native update with `builders_update_strategy` (`MINIMAL` by default) and at least two builders, one cluster at a time. |
 | Emergency on nonempty workers | Blue/green with larger `K` and `H` if headroom exists; otherwise native update one group at a time, with approval. |
 
 Avoid native updates of several nonempty worker groups in parallel: each
