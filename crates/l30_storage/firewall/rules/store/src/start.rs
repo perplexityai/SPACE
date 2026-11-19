@@ -17,6 +17,8 @@
 //! retries; repeating a start while the first is unfinished is refused by
 //! the slot.
 
+use std::fmt;
+
 use pplx_space_accounts::{NodeId, UserId};
 use pplx_space_firewall_rules_model::{FirewallRuleRevision, RuleRevisionDiff, diff};
 use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision, encode_revision};
@@ -40,6 +42,15 @@ pub enum AdoptedRevision {
     Revision(RevisionId),
 }
 
+impl fmt::Display for AdoptedRevision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoRevision => f.write_str("no revision"),
+            Self::Revision(id) => write!(f, "revision {id}"),
+        }
+    }
+}
+
 impl From<Option<RevisionId>> for AdoptedRevision {
     fn from(id: Option<RevisionId>) -> Self {
         id.map_or(Self::NoRevision, Self::Revision)
@@ -59,7 +70,8 @@ pub struct StartRollout {
     pub expected_adopted: AdoptedRevision,
 }
 
-/// A committed start.
+/// A committed start. Its rollout proves nothing yet, and one with no
+/// targets never will: completing it isn't evidence for adoption.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartedRollout {
     pub revision_id: RevisionId,
@@ -87,7 +99,7 @@ pub enum StartError {
     #[error(transparent)]
     Invalid(DecodeError),
     /// The default isn't the one expected; nothing was written.
-    #[error("the adopted firewall revision is {adopted:?}, not the expected one")]
+    #[error("the adopted firewall default is {adopted}, not the expected one")]
     Stale { adopted: AdoptedRevision },
     #[error("a firewall rules rollout is already in progress")]
     RolloutInProgress,
@@ -180,7 +192,10 @@ async fn start_in(
     document: &str,
     targets: &mut impl Targets,
 ) -> Result<StartedRollout, StartError> {
-    let adopted = AdoptedRevision::from(lock_control(&mut *tx).await?);
+    let adopted = lock_control(&mut *tx)
+        .await?
+        .ok_or(StartError::MissingControlRow)?;
+    let adopted = AdoptedRevision::from(adopted);
     if adopted != start.expected_adopted {
         return Err(StartError::Stale { adopted });
     }
@@ -249,9 +264,9 @@ async fn start_in(
     })
 }
 
-/// Lock the control row and read the default. A missing row is an
-/// invariant break, never seeded here.
-async fn lock_control(tx: &mut PgConnection) -> Result<Option<RevisionId>, StartError> {
+/// Lock the control row and read the default. `None` when the row is
+/// missing, an invariant break, never seeded here.
+async fn lock_control(tx: &mut PgConnection) -> Result<Option<Option<RevisionId>>, sqlx::Error> {
     sqlx::query_scalar::<_, Option<RevisionId>>(sql!(
         "SELECT enrollment_default_revision_id
          FROM firewall_rules_control
@@ -259,8 +274,7 @@ async fn lock_control(tx: &mut PgConnection) -> Result<Option<RevisionId>, Start
          FOR UPDATE"
     ))
     .fetch_optional(tx)
-    .await?
-    .ok_or(StartError::MissingControlRow)
+    .await
 }
 
 /// Read revision `id` back through the protocol's strict decoder.
@@ -280,18 +294,29 @@ pub(crate) async fn read_revision(
     decode_revision(&document).map_err(|source| StartError::StoredRevision { id, source })
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AdoptError {
+    #[error("the firewall_rules_control row is missing")]
+    MissingControlRow,
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
 /// Make `rollout`'s revision the enrollment default within the caller's
 /// transaction, which this neither commits nor rolls back. For the
 /// completion that has proved the rollout: it must also finish the header
 /// in the same transaction, after this, since a finished rollout is never
 /// adopted and so an aborted or superseded one can't roll the default back.
-/// Locks the control row, then the header, as a start does. `None`, writing
-/// nothing, when the rollout is missing or finished.
+/// Locks the control row, then the header, as a start does, so call it
+/// before locking the header. `None`, writing nothing, when the rollout is
+/// missing or finished: then don't complete.
 pub async fn adopt_rollout_revision(
     tx: &mut Transaction<'_, Postgres>,
     rollout: RolloutId,
-) -> Result<Option<RevisionId>, StartError> {
-    lock_control(tx).await?;
+) -> Result<Option<RevisionId>, AdoptError> {
+    lock_control(tx)
+        .await?
+        .ok_or(AdoptError::MissingControlRow)?;
     let Some(revision) = sqlx::query_scalar::<_, RevisionId>(sql!(
         "SELECT to_revision_id
          FROM firewall_rules_rollouts

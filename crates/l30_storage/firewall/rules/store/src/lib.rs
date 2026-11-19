@@ -28,8 +28,8 @@ pub use lease::{
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
 pub use start::{
-    AdoptedRevision, Review, StartError, StartRollout, StartedRollout, adopt_rollout_revision,
-    start_rollout,
+    AdoptError, AdoptedRevision, Review, StartError, StartRollout, StartedRollout,
+    adopt_rollout_revision, start_rollout,
 };
 
 #[cfg(test)]

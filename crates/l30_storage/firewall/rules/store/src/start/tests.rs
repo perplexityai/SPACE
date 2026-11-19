@@ -282,7 +282,8 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
         )
     );
     let items = sqlx::query_as::<_, (NodeId, String, i64, bool)>(sql!(
-        "SELECT node_id, phase, attempts, issued_at IS NULL AND next_check_at IS NULL
+        "SELECT node_id, phase, attempts,
+                issued_at IS NULL AND next_check_at IS NULL AND last_error IS NULL
          FROM firewall_rules_rollout_items WHERE rollout_id = $1 ORDER BY node_id"
     ))
     .bind(started.rollout_id)
@@ -329,8 +330,8 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
 
 /// Catches a precondition that treats either case as a wildcard or compares
 /// NULL unsafely, a first push that adopts its candidate or invents a base,
-/// and a production start that falls back to some membership or
-/// qualification.
+/// a production start that falls back to some membership or qualification,
+/// and a missing control row seeded rather than refused.
 #[tokio::test(flavor = "current_thread")]
 async fn a_start_matches_exactly_the_expected_default() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -370,14 +371,38 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
 
     complete(pool, first.rollout_id, true).await?;
     let a = AdoptedRevision::Revision(first.revision_id);
+    // A real revision that isn't adopted: an aborted candidate.
+    let aborted = start(pool, a, &revision(&[web()])).await?;
+    set_phase(pool, aborted.rollout_id, "aborted").await?;
     let before = state(pool).await?;
-    for expected in [AdoptedRevision::NoRevision, unknown] {
+    for expected in [
+        AdoptedRevision::NoRevision,
+        AdoptedRevision::Revision(aborted.revision_id),
+    ] {
         let refused = start(pool, expected, &candidate).await;
         assert!(
             matches!(refused, Err(StartError::Stale { adopted }) if adopted == a),
             "{expected:?}: {refused:?}"
         );
     }
+    assert_eq!(state(pool).await?, before);
+
+    sqlx::query(sql!("DELETE FROM firewall_rules_control"))
+        .execute(pool)
+        .await?;
+    let before = state(pool).await?;
+    let refused = start(pool, a, &candidate).await;
+    assert!(
+        matches!(refused, Err(StartError::MissingControlRow)),
+        "{refused:?}"
+    );
+    let mut tx = pool.begin().await?;
+    let refused = adopt_rollout_revision(&mut tx, aborted.rollout_id).await;
+    assert!(
+        matches!(refused, Err(AdoptError::MissingControlRow)),
+        "{refused:?}"
+    );
+    tx.commit().await?;
     assert_eq!(state(pool).await?, before);
     Ok(())
 }
