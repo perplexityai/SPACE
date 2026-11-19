@@ -10,7 +10,17 @@
 //! ([`pplx_space_rollout_queue::LEASE_EXPIRED`]).
 //!
 //! A lease isn't permission to assign: the assignment step must still recheck
-//! the live token and the node's eligibility before it issues.
+//! the live token and the node's eligibility before it issues, stamping in the
+//! same `UPDATE` that checks `phase = 'in_flight' AND lease_token = $t`; the
+//! claim's canary pin relies on that.
+//!
+//! In rolling, only leases count against `active_limit`: issued targets
+//! awaiting their check free their slot. Nothing here caps them; the
+//! assignment step or the rollout controller must.
+//!
+//! A check lease spends an attempt, so repeated lapses can redrive an issued
+//! canary to failed. The pin then holds the rollout in canary, and with no
+//! failure budget it never pauses on its own.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -30,7 +40,8 @@ use crate::{ItemPhase, RolloutId, end_transaction, rollout_phase};
 /// once `failed >= failure_budget`, so the budget is one no count reaches.
 const NO_FAILURE_BUDGET: u64 = u64::MAX;
 
-/// Key of the advisory lock that hands a node between rollouts.
+/// Key of the advisory lock that hands a node between rollouts. Frozen:
+/// mixed versions must contend on the same key.
 const HANDOFF_LOCK: &str = "firewall_rules_rollout_items/lease";
 
 /// One saved target leased to the caller.
@@ -100,18 +111,9 @@ struct Claiming<'c> {
 impl FailedItems for Claiming<'_> {
     type Error = sqlx::Error;
 
+    /// Never compared: there's no failure budget ([`NO_FAILURE_BUDGET`]).
     async fn failed(&mut self) -> Result<u64, sqlx::Error> {
-        let failed = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT count(*)
-             FROM firewall_rules_rollout_items
-             WHERE rollout_id = $1
-               AND phase = $2"
-        ))
-        .bind(self.rollout_id)
-        .bind(ItemPhase::Failed.as_str())
-        .fetch_one(&mut *self.tx)
-        .await?;
-        Ok(u64::try_from(failed).unwrap_or(0))
+        Ok(0)
     }
 }
 
@@ -175,7 +177,8 @@ impl ClaimStore for Claiming<'_> {
     async fn held_elsewhere(&mut self, _canary: &bool) -> Result<HashSet<NodeId>, sqlx::Error> {
         // Any phase: a finished rollout's lease holds its node until it ends,
         // since its controller may still be on it. Rollouts first, so each
-        // one's in-flight items come from the item index.
+        // one's in-flight items come from the item index: one probe per
+        // rollout, growing with history, about 0.1 ms at 21 rollouts.
         self.held = sqlx::query_scalar::<_, uuid::Uuid>(sql!(
             "SELECT i.node_id
              FROM firewall_rules_rollouts r
@@ -307,22 +310,32 @@ impl ClaimStore for Claiming<'_> {
         .bind(ItemPhase::Pending.as_str())
         .fetch_optional(&mut *self.tx)
         .await?;
-        Ok(claimed.map(|(attempts, generation, issued_at)| {
-            // The schema sets the pair together.
-            let work = match (generation, issued_at) {
-                (Some(generation), Some(issued_at)) => Work::Check {
-                    assignment_generation: u64::try_from(generation).unwrap_or(0),
-                    issued_at,
-                },
-                _ => Work::FirstAssignment,
-            };
-            LeasedTarget {
-                rollout_id: self.rollout_id,
-                node_id,
-                lease_token,
-                attempts: u64::try_from(attempts).unwrap_or(0),
-                work,
-            }
+        let Some((attempts, generation, issued_at)) = claimed else {
+            return Ok(None);
+        };
+        // The schema keeps these non-negative and the stamp's pair together;
+        // report a violation as a decode error rather than guess.
+        let rollout_id = self.rollout_id;
+        let invalid = |what: &str| {
+            sqlx::Error::Decode(
+                format!("firewall rules rollout item {rollout_id}/{node_id} has {what}").into(),
+            )
+        };
+        let work = match (generation, issued_at) {
+            (None, None) => Work::FirstAssignment,
+            (Some(generation), Some(issued_at)) => Work::Check {
+                assignment_generation: u64::try_from(generation)
+                    .map_err(|_| invalid("a negative generation"))?,
+                issued_at,
+            },
+            _ => return Err(invalid("half an issuance stamp")),
+        };
+        Ok(Some(LeasedTarget {
+            rollout_id,
+            node_id,
+            lease_token,
+            attempts: u64::try_from(attempts).map_err(|_| invalid("negative attempts"))?,
+            work,
         }))
     }
 }
