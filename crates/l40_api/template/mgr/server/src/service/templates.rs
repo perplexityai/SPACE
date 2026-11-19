@@ -378,49 +378,27 @@ impl TemplateManagerService {
         let sbx_sandboxes = self
             .pool_count_sandboxes(request.get_ref().omit_sandbox_counts)
             .await;
-        let mut effective_snapshot_memory_by_requested = HashMap::new();
-        for build in &builds {
-            let settings = template_settings.get(&build.name);
-            let runtime_defaults =
-                template_runtime_defaults(&build.name, &build.content_hash, build.cache_partition);
-            let requested_memory_mib = settings
-                .map(|settings| settings.snapshot_memory_mib)
-                .or(runtime_defaults.memory_mib)
-                .unwrap_or(1024);
-            if effective_snapshot_memory_by_requested.contains_key(&requested_memory_mib) {
-                continue;
-            }
-            let effective_memory_mib =
-                match resolve_sandbox_memory(requested_memory_mib, self.sbx_connect_retry_policy)
-                    .await
-                {
-                    Ok(resolved) => {
-                        if resolved.effective_memory_mib < resolved.requested_memory_mib {
-                            tracing::info!(
-                                requested_snapshot_memory_mib = resolved.requested_memory_mib,
-                                effective_snapshot_memory_mib = resolved.effective_memory_mib,
-                                sandbox_guest_memory_max_mib = resolved.guest_memory_max_mib,
-                                sandbox_cgroup_memory_mib = resolved.cgroup_memory_mib,
-                                sandbox_cgroup_memory_max_mib = resolved.cgroup_memory_max_mib,
-                                sandbox_memory_headroom_mib = resolved.memory_headroom_mib,
-                                "clamped template list snapshot memory to sandbox policy"
-                            );
-                        }
-                        resolved.effective_memory_mib
-                    }
-                    Err(status) => {
-                        tracing::warn!(
-                            code = ?status.code(),
-                            error = %status.message(),
-                            requested_snapshot_memory_mib = requested_memory_mib,
-                            "could not resolve sandbox memory policy for template listing"
-                        );
-                        requested_memory_mib
-                    }
-                };
-            effective_snapshot_memory_by_requested
-                .insert(requested_memory_mib, effective_memory_mib);
-        }
+        let requested_snapshot_memory: std::collections::BTreeSet<u32> = builds
+            .iter()
+            .map(|build| {
+                template_settings
+                    .get(&build.name)
+                    .map(|settings| settings.snapshot_memory_mib)
+                    .or_else(|| {
+                        template_runtime_defaults(
+                            &build.name,
+                            &build.content_hash,
+                            build.cache_partition,
+                        )
+                        .memory_mib
+                    })
+                    .unwrap_or(1024)
+            })
+            .collect();
+        let effective_snapshot_memory_by_requested = self
+            .sandbox_memory_policy
+            .effective_memory_mib(&requested_snapshot_memory, self.sbx_connect_retry_policy)
+            .await;
 
         let effective_snapshot_memory = |requested_memory_mib: u32| {
             effective_snapshot_memory_by_requested

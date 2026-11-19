@@ -284,6 +284,74 @@ async fn pool_counts_read_only_pool_members_and_match_a_sandbox_manager_that_ign
     assert_eq!(pool("other"), Some((1, 0, vec!["other-warm".to_string()])));
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn list_templates_does_not_wait_on_a_stalled_sandbox_memory_policy() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let conn = crate::db::test_conn();
+    insert_ready_build(&conn, "big", "sha256:big");
+    crate::db::update_template_snapshot_policy(&conn, "big", true, 2, 4096).unwrap();
+    // The policy clamps to 2048 MiB, answering only while `stalled` is false.
+    let (stall, stalled) = tokio::sync::watch::channel(true);
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let policy = memory_policy_cache::SandboxMemoryPolicyCache::new({
+        let resolves = Arc::clone(&resolves);
+        move |requested_memory_mib, _| {
+            resolves.fetch_add(1, Ordering::SeqCst);
+            let mut stalled = stalled.clone();
+            Box::pin(async move {
+                stalled.wait_for(|stalled| !stalled).await.unwrap();
+                Ok(ResolvedSandboxMemory {
+                    requested_memory_mib,
+                    effective_memory_mib: requested_memory_mib.min(2048),
+                    cgroup_memory_mib: 2304,
+                    guest_memory_max_mib: 2048,
+                    cgroup_memory_max_mib: 2304,
+                    memory_headroom_mib: 256,
+                })
+            })
+        }
+    });
+    let service = TemplateManagerService::new(conn)
+        .unwrap()
+        .without_sbx_connect_retries()
+        .with_sandbox_memory_policy(policy);
+    let list = || async {
+        let started = tokio::time::Instant::now();
+        let listed = service
+            .list_templates(internal_request(ListTemplatesRequest {
+                omit_sandbox_counts: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        (listed.templates[0].snapshot_memory_mib, started.elapsed())
+    };
+
+    // Never resolved: a bounded wait, then the requested size, as on failure.
+    for _ in 0..2 {
+        let (memory, waited) = list().await;
+        assert_eq!(memory, Some(4096));
+        assert!(
+            waited <= std::time::Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+    }
+    assert_eq!(resolves.load(Ordering::SeqCst), 1, "one refresh in flight");
+
+    stall.send(false).unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(list().await, (Some(2048), std::time::Duration::ZERO));
+
+    // Stale and stalled again: the last resolution answers at once.
+    stall.send(true).unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    for _ in 0..3 {
+        assert_eq!(list().await, (Some(2048), std::time::Duration::ZERO));
+    }
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn pool_shape_prefers_request_then_template_settings() {
     let conn = crate::db::test_conn();
