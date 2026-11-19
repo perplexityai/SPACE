@@ -96,8 +96,12 @@ pub enum StartError {
     /// The default isn't the one expected; nothing was written.
     #[error("the adopted firewall default is {adopted}, not the expected one")]
     Stale { adopted: AdoptedRevision },
-    #[error("a firewall rules rollout is already in progress")]
-    RolloutInProgress,
+    /// The unfinished rollout, read under the control lock.
+    #[error("firewall rules rollout {0} is already in progress")]
+    RolloutInProgress(RolloutId),
+    /// A writer that skipped the control lock took the slot first.
+    #[error("another firewall rules rollout took the unfinished slot")]
+    SlotTaken,
     #[error("node {0} can't enforce the candidate firewall revision")]
     Unqualified(NodeId),
     #[error(
@@ -120,7 +124,7 @@ impl StartError {
             && db.is_unique_violation()
             && db.constraint() == Some("firewall_rules_rollouts_unfinished_slot_key")
         {
-            return Self::RolloutInProgress;
+            return Self::SlotTaken;
         }
         Self::Database(error)
     }
@@ -197,14 +201,13 @@ async fn start_in(
         return Err(StartError::Stale { adopted });
     }
     // The schema keeps the slot exactly while canary, rolling or paused.
-    let in_progress = sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1 FROM firewall_rules_rollouts WHERE unfinished_slot IS NOT NULL)"
+    if let Some(in_progress) = sqlx::query_scalar::<_, RolloutId>(sql!(
+        "SELECT id FROM firewall_rules_rollouts WHERE unfinished_slot IS NOT NULL"
     ))
-    .fetch_one(&mut *tx)
-    .await?;
-    if in_progress {
-        return Err(StartError::RolloutInProgress);
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        return Err(StartError::RolloutInProgress(in_progress));
     }
     let review = match adopted {
         AdoptedRevision::NoRevision => Review::FirstPush,

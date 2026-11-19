@@ -264,7 +264,7 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
         };
         let repeated = start_by(pool, a, &candidate, pinned).await;
         assert!(
-            matches!(repeated, Err(StartError::RolloutInProgress)),
+            matches!(repeated, Err(StartError::RolloutInProgress(id)) if id == started.rollout_id),
             "{phase}: {repeated:?}"
         );
     }
@@ -336,13 +336,13 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
     Ok(())
 }
 
-/// Two starts of `candidate` against `expected`. The first holds the control
-/// lock at its freeze until the second waits for it, then commits, or fails
-/// on an incompatible `node` and rolls back.
+/// Two starts of their own candidates against `expected`. The first holds
+/// the control lock at its freeze until the second waits for it, then
+/// commits, or fails on an incompatible `node` and rolls back.
 async fn race(
     pool: &PgPool,
     expected: AdoptedRevision,
-    candidate: &FirewallRuleRevision,
+    [first_candidate, second_candidate]: [&FirewallRuleRevision; 2],
     node: NodeId,
     first_commits: bool,
 ) -> TestResult<(
@@ -354,18 +354,29 @@ async fn race(
         incompatible: (!first_commits).then(|| (node, id("dns"))),
         hold: Some(Arc::clone(&hold)),
     };
-    let first = spawn_start(pool, expected, candidate, first);
+    let first = spawn_start(pool, expected, first_candidate, first);
     meet(&hold).await?;
-    let second = spawn_start(pool, expected, candidate, Fixture::default());
+    let second = spawn_start(pool, expected, second_candidate, Fixture::default());
     wait_for_lock_waiters(pool, 1).await?;
     meet(&hold).await?;
     Ok((first.await?, second.await?))
 }
 
+/// How many revision, header and item rows are saved.
+async fn saved_rows(pool: &PgPool) -> TestResult<(i64, i64, i64)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT (SELECT count(*) FROM firewall_rules_revisions),
+                (SELECT count(*) FROM firewall_rules_rollouts),
+                (SELECT count(*) FROM firewall_rules_rollout_items)"
+    ))
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Catches starts that don't serialize on the control row, which would let
 /// two pushes both pass the precondition and the slot check, a lock that
-/// outlives a failed start, and a slot-key violation not reported as a
-/// rollout in progress.
+/// outlives a failed start, a blocked start that doesn't name the winner or
+/// saves anything, and a slot-key violation not reported as the slot taken.
 #[tokio::test(flavor = "current_thread")]
 async fn racing_starts_serialize_on_the_control_row() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(5).await? else {
@@ -373,20 +384,27 @@ async fn racing_starts_serialize_on_the_control_row() -> TestResult {
     };
     let pool = &db.pool;
     let node = online_nodes(pool, 1).await?[0];
-    let candidate = revision(&[dns()]);
+    let candidates = [&revision(&[dns()]), &revision(&[ssh()])];
     let a = AdoptedRevision::Revision(adopt(pool, &revision(&[web()])).await?);
-    let (first, second) = race(pool, a, &candidate, node, false).await?;
+    let (first, second) = race(pool, a, candidates, node, false).await?;
     assert!(
         matches!(first, Err(StartError::Unqualified(_))),
         "{first:?}"
     );
     set_phase(pool, second?.rollout_id, "aborted").await?;
 
-    let (first, second) = race(pool, a, &candidate, node, true).await?;
+    let before = saved_rows(pool).await?;
+    let (first, second) = race(pool, a, candidates, node, true).await?;
     let first = first?;
     assert!(
-        matches!(second, Err(StartError::RolloutInProgress)),
+        matches!(second, Err(StartError::RolloutInProgress(id)) if id == first.rollout_id),
         "{second:?}"
+    );
+    // Only the winner's revision, header and item.
+    let (revisions, headers, items) = before;
+    assert_eq!(
+        saved_rows(pool).await?,
+        (revisions + 1, headers + 1, items + 1)
     );
     complete(pool, &first).await?;
     let expected = AdoptedRevision::Revision(first.revision_id);
@@ -401,14 +419,11 @@ async fn racing_starts_serialize_on_the_control_row() -> TestResult {
     .bind(Uuid::now_v7())
     .execute(&mut *bypass)
     .await?;
-    let racing = spawn_start(pool, expected, &candidate, Fixture::default());
+    let racing = spawn_start(pool, expected, candidates[0], Fixture::default());
     wait_for_lock_waiters(pool, 1).await?;
     bypass.commit().await?;
     let refused = racing.await?;
-    assert!(
-        matches!(refused, Err(StartError::RolloutInProgress)),
-        "{refused:?}"
-    );
+    assert!(matches!(refused, Err(StartError::SlotTaken)), "{refused:?}");
     Ok(())
 }
 
