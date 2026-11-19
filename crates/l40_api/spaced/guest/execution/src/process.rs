@@ -17,6 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 mod pty;
 use pty::PtyIo;
+mod spawn_stage;
+pub(crate) use spawn_stage::SpawnProgress;
+use spawn_stage::SpawnStage;
 
 const DEFAULT_LOGIN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_PTY_ROWS: u32 = 24;
@@ -236,6 +239,9 @@ impl ProcessSupervision {
 /// tracked owner task runs it, so it completes even if the request goes away.
 struct ProcessLaunch {
     command: Command,
+    /// What the child's setup recorded, which tells the caller of a failed
+    /// spawn which request field to fix.
+    spawn_progress: SpawnProgress,
     prepared_pty: Option<PreparedPty>,
     stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
@@ -348,6 +354,7 @@ impl ProcessLaunch {
     async fn publish(self) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
+            spawn_progress,
             prepared_pty,
             stdin_enabled,
             mut info,
@@ -378,7 +385,10 @@ impl ProcessLaunch {
             );
         }
         let (spawn_result, mut prepared_pty) = spawned?;
-        let mut child = spawn_result.map_err(map_io_error)?;
+        let mut child = match spawn_result {
+            Ok(child) => child,
+            Err(error) => return Err(spawn_error_status(error, spawn_progress.stage())),
+        };
         let Some(pid) = child.id() else {
             terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
             return Err(Status::internal("spawned child has no pid"));
@@ -905,6 +915,42 @@ static PTY_INHERITANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The environment a pty-backed process starts with unless the sandbox or the
 /// request sets these: the values E2B-compatible terminal clients send.
 const PTY_DEFAULT_ENV: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("LANG", "C.UTF-8")];
+
+/// The status of a spawn that failed: its errno's, tagged with the request
+/// field to fix when the step that failed, as the child recorded it, says so.
+/// A permission error stays untagged, as before the child recorded its steps:
+/// either field could be what the account may not use.
+fn spawn_error_status(error: io::Error, stage: SpawnStage) -> Status {
+    let errno = error.raw_os_error();
+    let status = map_io_error(error);
+    let reason = match (stage, errno) {
+        (_, Some(libc::EACCES | libc::EPERM)) => None,
+        (SpawnStage::WorkingDir, Some(libc::ENOENT | libc::ENOTDIR)) => {
+            Some(pplx_space_guest_process::status::PROCESS_START_CWD)
+        }
+        (SpawnStage::Exec, Some(libc::ENOENT | libc::ENOEXEC | libc::ENOTDIR)) => {
+            Some(pplx_space_guest_process::status::PROCESS_START_COMMAND)
+        }
+        _ => None,
+    };
+    match reason {
+        Some(reason) => with_start_reason(status, reason),
+        None => status,
+    }
+}
+
+/// Tag a failed start with the request field it is about, unless the status
+/// already names a reason of its own (a full disk, say).
+fn with_start_reason(mut status: Status, reason: &'static str) -> Status {
+    let metadata = status.metadata_mut();
+    if !metadata.contains_key(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY) {
+        metadata.insert(
+            pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(reason),
+        );
+    }
+    status
+}
 
 fn spawn_child(command: &mut Command) -> io::Result<tokio::process::Child> {
     #[cfg(not(target_os = "linux"))]
@@ -2291,8 +2337,18 @@ impl Process for ExecutionService {
             self.inner.process_payload_slots.clone(),
             ingress,
             move || {
-                GuestAccount::resolve(account_name)
-                    .map_err(crate::identity::ResolveGuestAccountError::into_status)
+                GuestAccount::resolve(account_name).map_err(|error| {
+                    let not_found = error.is_not_found();
+                    let status = error.into_status();
+                    if not_found {
+                        with_start_reason(
+                            status,
+                            pplx_space_guest_process::status::PROCESS_START_USER,
+                        )
+                    } else {
+                        status
+                    }
+                })
             },
         )
         .await?;
@@ -2378,12 +2434,17 @@ impl Process for ExecutionService {
         if !uses_pty {
             command.process_group(0);
         }
+        let working_dir = cwd
+            .as_ref()
+            .map(|cwd| std::path::Path::new(cwd.expose()))
+            .unwrap_or(account.home())
+            .to_path_buf();
+        let spawn_progress = SpawnProgress::new().map_err(map_io_error)?;
         account.configure_child_credentials(
             &mut command,
             self.inner.identity_policy,
-            cwd.as_ref()
-                .map(|cwd| std::path::Path::new(cwd.expose()))
-                .unwrap_or(account.home()),
+            &working_dir,
+            &spawn_progress,
         )?;
         let mut prepared_pty = pty_config
             .map(|pty_config| prepare_pty(pty_config.size))
@@ -2404,6 +2465,8 @@ impl Process for ExecutionService {
             command.stdout(std::process::Stdio::piped());
             command.stderr(std::process::Stdio::piped());
         }
+        // The last hook, so it runs only once every other one has.
+        spawn_progress.record_exec(&mut command);
 
         let reservation = match self
             .inner
@@ -2418,7 +2481,14 @@ impl Process for ExecutionService {
                     .inner
                     .processes
                     .replay(&process_id, Some(0), false)
-                    .ok_or_else(|| Status::failed_precondition("process replay state expired"))?;
+                    .ok_or_else(|| {
+                        // The command may have run: say so, rather than read as
+                        // a start that failed.
+                        with_start_reason(
+                            Status::failed_precondition("process replay state expired"),
+                            pplx_space_guest_process::status::PROCESS_REPLAY_EXPIRED,
+                        )
+                    })?;
                 return Ok(Response::new(
                     replay_process_event_stream(replay) as Self::StartStream
                 ));
@@ -2469,6 +2539,7 @@ impl Process for ExecutionService {
         let request_lifetime = _start_admission.request_lifetime();
         let launch = ProcessLaunch {
             command,
+            spawn_progress,
             prepared_pty,
             stdin_enabled,
             info: ProcessInfo {
