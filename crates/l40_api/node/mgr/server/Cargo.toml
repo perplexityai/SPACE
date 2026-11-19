@@ -32,6 +32,7 @@ jiff = { workspace = true }
 libc = { workspace = true }
 pplx-space-artifact-model = { workspace = true, features = ["serde"] }
 pplx-space-firewall-rules-model = { workspace = true }
+pplx-space-firewall-rules-protocol = { workspace = true }
 pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs", "mount", "process"] }
@@ -83,6 +84,7 @@ pplx-space-metrics-emit = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-ctl-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-mgr-store = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store", "host-runtime"] }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-test-hooks = { workspace = true }
@@ -102,9 +104,10 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
-pplx-space-firewall-rules-protocol = { workspace = true }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
+# A commit hook lets a test make a commit fail after its writes.
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tower = { workspace = true }

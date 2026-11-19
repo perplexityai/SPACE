@@ -10,6 +10,7 @@ use crate::host_command::Command;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
+pub mod assignment;
 pub mod config_version;
 mod host_cache;
 pub mod rules;

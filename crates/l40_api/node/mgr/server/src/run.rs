@@ -83,7 +83,7 @@ const ENV_DISK_IO_RESERVATION_ENABLED: &[&str] = &["SPACE_NODEMGR_DISK_IO_RESERV
 const DISK_IO_SANDBOX_CAPACITY_PERCENT: u64 = 70;
 const DISK_IO_READ_WEIGHT_PERCENT: u64 = 50;
 const DISK_IO_WRITE_WEIGHT_PERCENT: u64 = 50;
-static NODE_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
+pub(crate) static NODE_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
     sqlx::migrate!("../../../../../db/node-manager");
 const REQUIRED_RUNTIME_GROUPS: &[&str] = &[
     group_names::SPACE_NODECLIENTS,
