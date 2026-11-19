@@ -66,22 +66,22 @@ fn supported_reads_and_values_render_as_submitted() {
         r#"{"id":"shapes","all_of":[
             {"left":{"payload":{"protocol":"ip","field":"daddr"}},"op":"==","right":"192.0.2.1"},
             {"left":{"tcp option":{"name":"mptcp"}},"op":"==","right":true},
-            {"left":{"&":[{"payload":{"protocol":"tcp","field":"flags"}},18]},"op":"==","right":2},
+            {"left":{"&":[{"payload":{"protocol":"ip","field":"frag-off"}},8191]},"op":"==","right":0},
             {"left":{"payload":{"protocol":"ip","field":"saddr"}},"op":"==","right":{"prefix":{"addr":"198.51.100.0","len":24}}},
             {"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":{"range":[1024,65535]}},
-            {"left":{"payload":{"protocol":"tcp","field":"sequence"}},"op":"==","right":18446744073709551615}]}"#,
+            {"left":{"payload":{"protocol":"tcp","field":"sequence"}},"op":"==","right":9223372036854775807}]}"#,
     );
     let expected = json!([
         {"match": {"left": {"meta": {"key": "iifname"}}, "op": "==", "right": "tap0"}},
         {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "192.0.2.1"}},
         {"match": {"left": {"tcp option": {"name": "mptcp"}}, "op": "==", "right": true}},
-        {"match": {"left": {"&": [{"payload": {"protocol": "tcp", "field": "flags"}}, 18]}, "op": "==", "right": 2}},
+        {"match": {"left": {"&": [{"payload": {"protocol": "ip", "field": "frag-off"}}, 8191]}, "op": "==", "right": 0}},
         {"match": {"left": {"payload": {"protocol": "ip", "field": "saddr"}}, "op": "==",
                    "right": {"prefix": {"addr": "198.51.100.0", "len": 24}}}},
         {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==",
                    "right": {"range": [1024, 65535]}}},
         {"match": {"left": {"payload": {"protocol": "tcp", "field": "sequence"}}, "op": "==",
-                   "right": u64::MAX}},
+                   "right": i64::MAX}},
         {"drop": null},
     ]);
     assert_eq!(rule_fields(&revision, "expr"), [expected]);
@@ -127,7 +127,7 @@ fn verdicts_and_nested_reads_are_refused_before_rendering() {
     for all_of in [
         format!(r#"{dport},{{"accept":null}}"#),
         format!(r#"{dport},{{"drop":null}}"#),
-        r#"{"left":{"&":[{"&":[{"payload":{"protocol":"tcp","field":"flags"}},18]},2]},"op":"==","right":2}"#.to_string(),
+        r#"{"left":{"&":[{"&":[{"payload":{"protocol":"ip","field":"frag-off"}},8191]},2]},"op":"==","right":0}"#.to_string(),
     ] {
         let rules = format!(r#"{{"id":"r","all_of":[{all_of}]}}"#);
         assert!(decode_revision(&document(&rules)).is_err(), "decoded {rules}");
