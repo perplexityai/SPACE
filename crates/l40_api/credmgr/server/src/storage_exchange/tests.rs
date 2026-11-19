@@ -447,6 +447,63 @@ async fn builder_cannot_rewrite_a_published_release() {
     .expect("published releases stay readable");
 }
 
+/// A twin's own `metadata.json` sits under the build it shares with its
+/// original, so it's the same release resource: readable, and immutable once
+/// the release is published. Any other shape under `environments/` is refused.
+#[tokio::test]
+async fn twin_environment_metadata_is_the_release_resource() {
+    let template = TemplateName::parse("seed").unwrap();
+    let published_hash: ContentHash = format!("sha256:{}", "ab".repeat(32)).parse().unwrap();
+    let environment = format!("sha256:{}", "cd".repeat(32));
+    let store = TestStore {
+        templates: HashMap::from([(template.clone(), None)]),
+        published: vec![(template.clone(), published_hash)],
+        ..Default::default()
+    };
+    let reader = caller(ClientService::TemplateManager, "worker-a", "worker-a-uid");
+    let object = |key: &str| {
+        let mut request = template_request(&template, STORAGE_READ_SCOPE);
+        request.resource =
+            format!("arn:aws:s3:::space-snapshots/templates/{template}/{published_hash}/{key}");
+        request
+    };
+
+    authorize_exchange(
+        &store,
+        &reader,
+        object(&format!("environments/{environment}/metadata.json")),
+    )
+    .await
+    .expect("a twin's metadata is readable as its release");
+
+    for key in [
+        format!("environments/{environment}/manifest.json"),
+        format!("environments/{environment}/metadata.json/extra"),
+        "environments/not-a-digest/metadata.json".to_string(),
+        format!("environments/{}/metadata.json", "cd".repeat(32)),
+        format!("other/{environment}/metadata.json"),
+    ] {
+        let error = authorize_exchange(&store, &reader, object(&key))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StorageExchangeError::UnauthorizedResource),
+            "{key}: {error:?}"
+        );
+    }
+
+    let builder = caller(ClientService::BuildManager, "builder", "builder-uid");
+    let mut write = object(&format!("environments/{environment}/metadata.json"));
+    write.scope = Some(STORAGE_WRITE_SCOPE.to_string());
+    let error = authorize_exchange(&store, &builder, write)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StorageExchangeError::ReleaseAlreadyPublished
+    ));
+}
+
 #[tokio::test]
 async fn sandbox_exchange_binds_tenant_node_resource_and_org_role() {
     let sandbox = SandboxId::new();

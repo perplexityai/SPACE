@@ -40,6 +40,9 @@ pub(crate) async fn resolve_template_release_by_tag(
     .await
 }
 
+/// The release a create or base resolution names by digest: the original
+/// release of the digest (the first registered), never a twin bound to
+/// another environment, and the canonical spelling over a legacy bare one.
 pub(crate) async fn resolve_template_release_by_digest(
     executor: impl PgExecutor<'_>,
     template_name: &TemplateName,
@@ -57,7 +60,7 @@ pub(crate) async fn resolve_template_release_by_digest(
            AND r.type = $3
            AND (tpl.visibility = $4 OR tpl.org_id = $5)
            AND tpl.desired_state = $6
-         ORDER BY (r.hash = $2) DESC
+         ORDER BY (r.hash = $2) DESC, r.created_at ASC, r.id ASC
          LIMIT 1"
     ))
     .bind(template_name.as_str())
@@ -72,10 +75,13 @@ pub(crate) async fn resolve_template_release_by_digest(
     Ok(release_id.map(|id| (id, hash)))
 }
 
-/// The execution environment the release of `template_name` at
+/// The execution environment the original release of `template_name` at
 /// `content_hash` is bound to (its `execution_metadata.environment`), unparsed;
 /// `None` for an unbound release or no release. A legacy unprefixed hash
-/// matches the way [`resolve_template_release_by_digest`] matches it.
+/// matches the way [`resolve_template_release_by_digest`] matches it. The
+/// original release is the first registered for the hash: its twins, bound to
+/// other environments, are registered after it, and a create that names no
+/// environment resolves the original.
 ///
 /// Placement reads it as the binding of Direct's create, pool and pull
 /// candidates whose own inventory row names none, of pull candidates that
@@ -91,7 +97,7 @@ pub(crate) async fn release_environment(
          FROM template_releases r
          WHERE r.template_name = $1
            AND r.hash IN ($2, replace($2, 'sha256:', ''))
-         ORDER BY (r.hash = $2) DESC
+         ORDER BY (r.hash = $2) DESC, r.created_at ASC, r.id ASC
          LIMIT 1"
     ))
     .bind(template_name)
@@ -99,6 +105,56 @@ pub(crate) async fn release_environment(
     .fetch_optional(executor)
     .await?
     .flatten())
+}
+
+/// The execution environment the release `release_id` is bound to, unparsed;
+/// `None` for an unbound release or no release. Unlike
+/// [`release_environment`], this reads the chosen release's own row, which
+/// may be a twin.
+#[cfg(feature = "kubernetes")]
+pub(crate) async fn release_environment_by_id(
+    executor: impl PgExecutor<'_>,
+    release_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
+        "SELECT execution_metadata->>'environment'
+         FROM template_releases
+         WHERE id = $1"
+    ))
+    .bind(release_id)
+    .fetch_optional(executor)
+    .await?
+    .flatten())
+}
+
+/// The environments outside the legacy cache partition that the releases of
+/// `template_name` at `content_hash` are bound to, unparsed, under both
+/// spellings of the digest, whichever one `content_hash` is. Placement reads them only for a release that
+/// records no binding, so each is a twin's or, where the digest is stored
+/// under both spellings, the other spelling's original's: either way another
+/// release's build, which a holder of it doesn't hold for this release. The
+/// initial environment is left
+/// out: an unbound release and one bound to the initial environment share the
+/// legacy partition, so a holder bound to it holds the unbound release's
+/// build. Both can exist only under different spellings of the digest.
+pub(crate) async fn bound_release_environments(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    content_hash: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(sql!(
+        "SELECT DISTINCT r.execution_metadata->>'environment'
+         FROM template_releases r
+         WHERE r.template_name = $1
+           AND r.hash IN ('sha256:' || replace($2, 'sha256:', ''), replace($2, 'sha256:', ''))
+           AND r.execution_metadata->>'environment' IS NOT NULL
+           AND r.execution_metadata->>'environment' <> $3"
+    ))
+    .bind(template_name)
+    .bind(content_hash)
+    .bind(pplx_space_execution_catalog::catalog::initial_environment_reference().to_string())
+    .fetch_all(executor)
+    .await
 }
 
 /// The digests of the template's `runtime` releases the caller may resolve

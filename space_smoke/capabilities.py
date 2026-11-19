@@ -888,8 +888,12 @@ class OrphanedRestorePodGcControl(Protocol):
 class NodeTemplatePresence:
     """The `space.pplx.net/template-build-*` metadata on one Node.
 
-    node-ctl keeps one label per ready local template build and a same-key
-    annotation carrying the build's full content hash.
+    node-ctl keeps, per ready local template build, a partition-less label
+    (shared with the build's twins) annotated with the full content hash and,
+    when its partition key parses, its cache partition's label annotated
+    `<content_hash>@<partition key>` (an empty key for the legacy partition).
+    Each of a template's build directories on the node is named by exactly
+    one of that template's annotations.
     """
 
     labels: frozenset[str]

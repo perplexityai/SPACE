@@ -440,17 +440,29 @@ async fn enqueue_template_delete_reconcile(
     Ok(())
 }
 
-enum MarkTemplateDeleted {
+pub(crate) enum MarkTemplateDeleted {
     Deleted,
     InUse(TemplateInUse),
 }
 
-async fn mark_template_deleted(
+pub(crate) async fn mark_template_deleted(
     pool: &PgPool,
     template: &TemplateName,
     operation_id: Uuid,
 ) -> Result<MarkTemplateDeleted, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // The template row first, as an admin release delete and a release
+    // registration take it, then the release rows. Taking it only at the
+    // final update would let an admin delete that holds it wait on a
+    // storage location this transaction deleted, while this one waits on
+    // that delete's tag row. `NO KEY UPDATE` is the lock the final update
+    // takes anyway, and doesn't conflict with foreign-key checks.
+    sqlx::query(sql!(
+        "SELECT 1 FROM templates WHERE name = $1 FOR NO KEY UPDATE"
+    ))
+    .bind(template.as_str())
+    .execute(&mut *tx)
+    .await?;
     if let Some(in_use) = TemplateInUse::check(&mut tx, template).await? {
         return Ok(MarkTemplateDeleted::InUse(in_use));
     }

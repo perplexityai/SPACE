@@ -11,6 +11,7 @@ use pplx_space_node_model::{NodeRole, SubstrateKind};
 
 use std::net::IpAddr;
 
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_sql_locator::sql;
 use serde::Deserialize;
 use sqlx::types::Json;
@@ -28,6 +29,7 @@ pub(super) struct LatestRelease {
     pub(super) runtime: String,
     pub(super) hash: String,
     pub(super) created_at: OffsetDateTime,
+    pub(super) environment: Option<String>,
     pub(super) storage_locations: Vec<LatestReleaseStorage>,
 }
 
@@ -57,6 +59,7 @@ struct LatestReleaseRow {
     runtime: String,
     hash: String,
     created_at: OffsetDateTime,
+    environment: Option<String>,
     storage_locations: Json<Vec<LatestReleaseStorage>>,
 }
 
@@ -99,6 +102,34 @@ impl TemplateReadScope {
             Self::NodeScoped { node_ids } => Some(node_ids),
         }
     }
+}
+
+/// The binds of a lookup's environment selector: the environment matched
+/// against a release's `execution_metadata.environment`, and whether an
+/// unbound release matches too. Nodes cache an unbound build and one bound to
+/// the initial environment in the same legacy partition, so selecting the
+/// initial environment also selects an unbound release, as the registration
+/// writer treats them.
+fn selector_binds(environment: Option<EnvironmentReference>) -> (Option<String>, bool) {
+    match environment {
+        None => (None, false),
+        Some(environment) => (
+            Some(environment.to_string()),
+            pplx_space_execution_catalog::catalog::template_cache_partition(Some(environment))
+                == pplx_space_template_model::TemplateCachePartition::Legacy,
+        ),
+    }
+}
+
+/// What a release lookup asks of the release beyond its name and selector:
+/// the caller-asserted organization, the prefetch generic-only requirement and
+/// the execution environment it selects (`None`: the tagged or original
+/// release). See [`TemplateReleasesStore::find_by_tag`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReleaseLookupFilter {
+    pub(super) caller_org: Option<OrgId>,
+    pub(super) generic_only: bool,
+    pub(super) environment: Option<EnvironmentReference>,
 }
 
 pub(super) enum PublicationNode {
@@ -204,15 +235,30 @@ impl TemplateReleasesStore {
     /// passes both predicates, so asserting the owner's organization grants
     /// nothing its placements do not already justify. `$6` adds the prefetch
     /// generic-only requirement in the same snapshot as the selected release.
+    ///
+    /// `environment` (`$7` scoped, `$4` unscoped) selects, among the releases
+    /// of the tagged release's digest under either spelling (bare or
+    /// `sha256:`), the one bound to that environment: the tagged release
+    /// itself or its twin, which lives under its original's spelling. When
+    /// several match, a release with a storage location answers before one
+    /// without (nothing can pull an artifact-less duplicate), then the tagged
+    /// release, then the one whose storage location is oldest, then the
+    /// earliest registered. `None` selects the tagged release, as before
+    /// twins.
     pub(super) async fn find_by_tag(
         &self,
         name: &str,
         runtime: &str,
         tag: &str,
-        caller_org: Option<OrgId>,
         scope: &TemplateReadScope,
-        generic_only: bool,
+        filter: ReleaseLookupFilter,
     ) -> Result<Vec<super::metadata::FindTemplateReleaseRow>, sqlx::Error> {
+        let ReleaseLookupFilter {
+            caller_org,
+            generic_only,
+            environment,
+        } = filter;
+        let (environment, legacy_selector) = selector_binds(environment);
         if !generic_only && caller_org.is_none() && scope.node_ids().is_none() {
             return sqlx::query_as(sql!(
                 "SELECT FALSE AS generic_authorized,
@@ -221,23 +267,39 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.execution_metadata->>'environment' AS release_environment,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
              FROM template_release_tags t
+             JOIN template_releases tr
+               ON tr.id = t.template_release_id
+              AND tr.template_name = t.template_name
              JOIN template_releases r
-               ON r.id = t.template_release_id
-              AND r.template_name = t.template_name
+               ON r.template_name = tr.template_name
+              AND (r.hash = tr.hash
+                   OR r.hash = 'sha256:' || tr.hash
+                   OR 'sha256:' || r.hash = tr.hash)
              LEFT JOIN template_release_storage_locations s
                ON s.template_release_id = r.id
              WHERE t.template_name = $1
                AND t.tag = $2
                AND r.type = $3
-             ORDER BY s.created_at ASC NULLS LAST"
+               AND (($4::TEXT IS NULL AND r.id = tr.id)
+                    OR r.execution_metadata->>'environment' = $4
+                    OR ($5 AND r.execution_metadata->>'environment' IS NULL))
+             ORDER BY s.id IS NULL,
+                      r.id = tr.id DESC,
+                      s.created_at ASC NULLS LAST,
+                      r.created_at ASC,
+                      r.id ASC,
+                      s.id ASC"
             ))
             .bind(name)
             .bind(tag)
             .bind(runtime)
+            .bind(environment)
+            .bind(legacy_selector)
             .fetch_all(&self.pool)
             .await;
         }
@@ -248,19 +310,28 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.execution_metadata->>'environment' AS release_environment,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
              FROM template_release_tags t
+             JOIN template_releases tr
+               ON tr.id = t.template_release_id
+              AND tr.template_name = t.template_name
              JOIN template_releases r
-               ON r.id = t.template_release_id
-              AND r.template_name = t.template_name
+               ON r.template_name = tr.template_name
+              AND (r.hash = tr.hash
+                   OR r.hash = 'sha256:' || tr.hash
+                   OR 'sha256:' || r.hash = tr.hash)
              JOIN templates tpl ON tpl.name = r.template_name
              LEFT JOIN template_release_storage_locations s
                ON s.template_release_id = r.id
              WHERE t.template_name = $1
                AND t.tag = $2
                AND r.type = $3
+               AND (($7::TEXT IS NULL AND r.id = tr.id)
+                    OR r.execution_metadata->>'environment' = $7
+                    OR ($8 AND r.execution_metadata->>'environment' IS NULL))
                AND (NOT $6 OR tpl.visibility = 'generic')
                AND ($4::UUID IS NULL OR (
                        tpl.desired_state = 'present'
@@ -292,7 +363,12 @@ impl TemplateReleasesStore {
                                 AND g.granted_at > NOW() - INTERVAL '1 hour')
                                OR (g.builder_node_id = bn.id
                                    AND g.granted_at > NOW() - INTERVAL '7 days'))))
-             ORDER BY s.created_at ASC NULLS LAST"
+             ORDER BY s.id IS NULL,
+                      r.id = tr.id DESC,
+                      s.created_at ASC NULLS LAST,
+                      r.created_at ASC,
+                      r.id ASC,
+                      s.id ASC"
         ))
         .bind(name)
         .bind(tag)
@@ -300,21 +376,30 @@ impl TemplateReleasesStore {
         .bind(caller_org.map(|org| org.as_uuid()))
         .bind(scope.node_ids())
         .bind(generic_only)
+        .bind(environment)
+        .bind(legacy_selector)
         .fetch_all(&self.pool)
         .await
     }
 
     /// See [`Self::find_by_tag`] for the two statement shapes and the scope
-    /// parameters.
+    /// parameters. `environment` selects the release of the hash bound to
+    /// it; `None` selects the original release, the first registered for the
+    /// hash under each spelling, so twins never answer an unselected lookup.
     pub(super) async fn find_by_hash(
         &self,
         name: &str,
         hash: &str,
         bare_hash: &str,
-        caller_org: Option<OrgId>,
         scope: &TemplateReadScope,
-        generic_only: bool,
+        filter: ReleaseLookupFilter,
     ) -> Result<Vec<super::metadata::FindTemplateReleaseRow>, sqlx::Error> {
+        let ReleaseLookupFilter {
+            caller_org,
+            generic_only,
+            environment,
+        } = filter;
+        let (environment, legacy_selector) = selector_binds(environment);
         if !generic_only && caller_org.is_none() && scope.node_ids().is_none() {
             return sqlx::query_as(sql!(
                 "SELECT FALSE AS generic_authorized,
@@ -323,6 +408,7 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.execution_metadata->>'environment' AS release_environment,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
@@ -331,11 +417,24 @@ impl TemplateReleasesStore {
                ON s.template_release_id = r.id
              WHERE r.template_name = $1
                AND r.hash IN ($2, $3)
-             ORDER BY s.created_at ASC NULLS LAST"
+               AND (($4::TEXT IS NULL
+                     AND NOT EXISTS (
+                SELECT 1 FROM template_releases o
+                WHERE o.template_name = r.template_name
+                  AND o.hash = r.hash
+                  AND (o.created_at, o.id) < (r.created_at, r.id)))
+                    OR r.execution_metadata->>'environment' = $4
+                    OR ($5 AND r.execution_metadata->>'environment' IS NULL))
+             ORDER BY s.created_at ASC NULLS LAST,
+                      r.created_at ASC,
+                      r.id ASC,
+                      s.id ASC"
             ))
             .bind(name)
             .bind(hash)
             .bind(bare_hash)
+            .bind(environment)
+            .bind(legacy_selector)
             .fetch_all(&self.pool)
             .await;
         }
@@ -346,6 +445,7 @@ impl TemplateReleasesStore {
                     r.type            AS release_type,
                     r.hash            AS release_hash,
                     r.created_at      AS release_created_at,
+                    r.execution_metadata->>'environment' AS release_environment,
                     s.id              AS storage_id,
                     s.storage_connection_string AS storage_connection_string,
                     s.created_at      AS storage_created_at
@@ -355,6 +455,14 @@ impl TemplateReleasesStore {
                ON s.template_release_id = r.id
              WHERE r.template_name = $1
                AND r.hash IN ($2, $3)
+               AND (($7::TEXT IS NULL
+                     AND NOT EXISTS (
+                SELECT 1 FROM template_releases o
+                WHERE o.template_name = r.template_name
+                  AND o.hash = r.hash
+                  AND (o.created_at, o.id) < (r.created_at, r.id)))
+                    OR r.execution_metadata->>'environment' = $7
+                    OR ($8 AND r.execution_metadata->>'environment' IS NULL))
                AND (NOT $6 OR tpl.visibility = 'generic')
                AND ($4::UUID IS NULL OR (
                        tpl.desired_state = 'present'
@@ -386,7 +494,10 @@ impl TemplateReleasesStore {
                                 AND g.granted_at > NOW() - INTERVAL '1 hour')
                                OR (g.builder_node_id = bn.id
                                    AND g.granted_at > NOW() - INTERVAL '7 days'))))
-             ORDER BY s.created_at ASC NULLS LAST"
+             ORDER BY s.created_at ASC NULLS LAST,
+                      r.created_at ASC,
+                      r.id ASC,
+                      s.id ASC"
         ))
         .bind(name)
         .bind(hash)
@@ -394,13 +505,20 @@ impl TemplateReleasesStore {
         .bind(caller_org.map(|org| org.as_uuid()))
         .bind(scope.node_ids())
         .bind(generic_only)
+        .bind(environment)
+        .bind(legacy_selector)
         .fetch_all(&self.pool)
         .await
     }
 
     /// Return the latest `limit` releases for `(template_name,
-    /// runtime)` ordered by `created_at` DESC (ties broken by `id`
-    /// DESC for determinism). Each entry carries its zero-or-more
+    /// runtime)`: those bound to `environment`, or with none, each hash's
+    /// original release and never its twins. Releases rank newest version
+    /// first, by the `created_at` of their hash's earliest release under its
+    /// stored spelling or, with `environment`, under either spelling of the
+    /// digest, so a twin registered late for an older version doesn't
+    /// outrank a newer version; ties break on
+    /// the release's own `created_at` and then `id` DESC for determinism. Each entry carries its zero-or-more
     /// storage locations, aggregated server-side via `json_agg`.
     ///
     /// The store does not validate `limit`; bounds-checking lives in
@@ -414,9 +532,14 @@ impl TemplateReleasesStore {
         runtime: &str,
         limit: i64,
         scope: &TemplateReadScope,
+        environment: Option<EnvironmentReference>,
     ) -> Result<Vec<LatestRelease>, Status> {
+        let (environment, legacy_selector) = selector_binds(environment);
         // Server-side aggregation: inner subquery picks the latest
-        // `limit` releases; outer `LEFT JOIN` plus `GROUP BY` rolls
+        // `limit` releases (a selected listing first keeps one release per
+        // digest, whichever spelling it's stored under, preferring one with
+        // a storage location, so the two spellings of a digest never take
+        // two of the `limit` slots); outer `LEFT JOIN` plus `GROUP BY` rolls
         // each release's storage locations into one JSON array.
         //
         // - `FILTER (WHERE s.id IS NOT NULL)` discards the synthetic
@@ -443,6 +566,7 @@ impl TemplateReleasesStore {
                     r.type AS runtime,
                     r.hash,
                     r.created_at,
+                    r.environment,
                     COALESCE(
                         json_agg(
                             json_build_object(
@@ -458,11 +582,29 @@ impl TemplateReleasesStore {
                         '[]'::json
                     ) AS storage_locations
              FROM (
-                 SELECT rel.id, rel.template_name, rel.type, rel.hash, rel.created_at
+                 SELECT * FROM (
+                 SELECT DISTINCT ON (CASE WHEN $5::TEXT IS NULL THEN rel.id::TEXT
+                                    ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END)
+                        rel.id, rel.template_name, rel.type, rel.hash, rel.created_at,
+                        rel.execution_metadata->>'environment' AS environment,
+                        (SELECT MIN(o.created_at) FROM template_releases o
+                         WHERE o.template_name = rel.template_name
+                           AND (o.hash = rel.hash
+                                OR ($5::TEXT IS NOT NULL
+                                    AND replace(o.hash, 'sha256:', '')
+                                        = replace(rel.hash, 'sha256:', '')))) AS version_created_at
                  FROM template_releases rel
                  JOIN templates tpl ON tpl.name = rel.template_name
                  WHERE rel.template_name = $1
                    AND rel.type = $2
+                   AND (($5::TEXT IS NULL
+                         AND NOT EXISTS (
+                SELECT 1 FROM template_releases o
+                WHERE o.template_name = rel.template_name
+                  AND o.hash = rel.hash
+                  AND (o.created_at, o.id) < (rel.created_at, rel.id)))
+                        OR rel.execution_metadata->>'environment' = $5
+                    OR ($6 AND rel.execution_metadata->>'environment' IS NULL))
                    AND ((tpl.visibility = 'generic' AND tpl.desired_state = 'present')
                         OR EXISTS (
                             SELECT 1
@@ -488,18 +630,29 @@ impl TemplateReleasesStore {
                                     AND g.granted_at > NOW() - INTERVAL '1 hour')
                                    OR (g.builder_node_id = bn.id
                                        AND g.granted_at > NOW() - INTERVAL '7 days'))))
-                 ORDER BY rel.created_at DESC, rel.id DESC
+                 ORDER BY CASE WHEN $5::TEXT IS NULL THEN rel.id::TEXT
+                                    ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END,
+                          EXISTS (
+                              SELECT 1 FROM template_release_storage_locations l
+                              WHERE l.template_release_id = rel.id) DESC,
+                          rel.created_at ASC,
+                          rel.id ASC
+                 ) rel
+                 ORDER BY rel.version_created_at DESC, rel.created_at DESC, rel.id DESC
                  LIMIT $3
              ) r
              LEFT JOIN template_release_storage_locations s
                ON s.template_release_id = r.id
-             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at
-             ORDER BY r.created_at DESC, r.id DESC"
+             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
+                      r.version_created_at
+             ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC"
             ))
             .bind(template_name)
             .bind(runtime)
             .bind(limit)
             .bind(node_ids)
+            .bind(&environment)
+            .bind(legacy_selector)
             .fetch_all(&self.pool)
             .await
         } else {
@@ -509,6 +662,7 @@ impl TemplateReleasesStore {
                     r.type AS runtime,
                     r.hash,
                     r.created_at,
+                    r.environment,
                     COALESCE(
                         json_agg(
                             json_build_object(
@@ -524,20 +678,50 @@ impl TemplateReleasesStore {
                         '[]'::json
                     ) AS storage_locations
              FROM (
-                 SELECT id, template_name, type, hash, created_at
-                 FROM template_releases
-                 WHERE template_name = $1 AND type = $2
-                 ORDER BY created_at DESC, id DESC
+                 SELECT * FROM (
+                 SELECT DISTINCT ON (CASE WHEN $4::TEXT IS NULL THEN rel.id::TEXT
+                                    ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END)
+                        rel.id, rel.template_name, rel.type, rel.hash, rel.created_at,
+                        rel.execution_metadata->>'environment' AS environment,
+                        (SELECT MIN(o.created_at) FROM template_releases o
+                         WHERE o.template_name = rel.template_name
+                           AND (o.hash = rel.hash
+                                OR ($4::TEXT IS NOT NULL
+                                    AND replace(o.hash, 'sha256:', '')
+                                        = replace(rel.hash, 'sha256:', '')))) AS version_created_at
+                 FROM template_releases rel
+                 WHERE rel.template_name = $1
+                   AND rel.type = $2
+                   AND (($4::TEXT IS NULL
+                         AND NOT EXISTS (
+                SELECT 1 FROM template_releases o
+                WHERE o.template_name = rel.template_name
+                  AND o.hash = rel.hash
+                  AND (o.created_at, o.id) < (rel.created_at, rel.id)))
+                        OR rel.execution_metadata->>'environment' = $4
+                    OR ($5 AND rel.execution_metadata->>'environment' IS NULL))
+                 ORDER BY CASE WHEN $4::TEXT IS NULL THEN rel.id::TEXT
+                                    ELSE 'sha256:' || replace(rel.hash, 'sha256:', '') END,
+                          EXISTS (
+                              SELECT 1 FROM template_release_storage_locations l
+                              WHERE l.template_release_id = rel.id) DESC,
+                          rel.created_at ASC,
+                          rel.id ASC
+                 ) rel
+                 ORDER BY rel.version_created_at DESC, rel.created_at DESC, rel.id DESC
                  LIMIT $3
              ) r
              LEFT JOIN template_release_storage_locations s
                ON s.template_release_id = r.id
-             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at
-             ORDER BY r.created_at DESC, r.id DESC"
+             GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
+                      r.version_created_at
+             ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC"
             ))
             .bind(template_name)
             .bind(runtime)
             .bind(limit)
+            .bind(&environment)
+            .bind(legacy_selector)
             .fetch_all(&self.pool)
             .await
         }
@@ -551,12 +735,29 @@ impl TemplateReleasesStore {
                 runtime: row.runtime,
                 hash: row.hash,
                 created_at: row.created_at,
+                environment: row.environment,
                 storage_locations: row.storage_locations.0,
             })
             .collect())
     }
 }
 
+/// Insert the release, or nothing when it conflicts with one already
+/// registered. The conflict target is left out on purpose: Postgres then
+/// treats a violation of any unique index as the conflict, so the statement
+/// works with the `(template_name, hash)` index, which admits no twin, and
+/// with `template_releases_template_name_hash_environment_key`, which admits
+/// one release per environment, together or alone.
+///
+/// The untargeted conflict clause also turns a violation of any other unique
+/// index into "nothing inserted"; today the others all include the generated
+/// `id`, so only the two `(template_name, hash, ..)` indexes can conflict.
+///
+/// `created_at` is the insert's own time, not the transaction's start: the
+/// caller holds the template's publication lock, so insert order is
+/// registration order, and the original release of a hash (the earliest by
+/// `created_at`) is the one inserted first even when a twin's transaction
+/// began earlier.
 pub(super) async fn insert_release(
     executor: impl sqlx::PgExecutor<'_>,
     template_name: &str,
@@ -566,12 +767,14 @@ pub(super) async fn insert_release(
     execution_metadata: Option<&serde_json::Value>,
 ) -> Result<Option<super::TemplateReleaseRow>, sqlx::Error> {
     sqlx::query_as::<_, super::TemplateReleaseRow>(sql!(
-        "INSERT INTO template_releases (template_name, type, hash, org_id, execution_metadata)
-         SELECT $1, $2, $3, COALESCE($4, org_id), $5
+        "INSERT INTO template_releases
+             (template_name, type, hash, org_id, execution_metadata, created_at)
+         SELECT $1, $2, $3, COALESCE($4, org_id), $5, clock_timestamp()
          FROM templates
          WHERE name = $1
-         ON CONFLICT (template_name, hash) DO NOTHING
-         RETURNING id, template_name, type, hash, org_id, created_at"
+         ON CONFLICT DO NOTHING
+         RETURNING id, template_name, type, hash, org_id, created_at,
+                   execution_metadata->>'environment' AS environment"
     ))
     .bind(template_name)
     .bind(runtime)

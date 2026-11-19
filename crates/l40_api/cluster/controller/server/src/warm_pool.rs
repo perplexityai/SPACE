@@ -1419,6 +1419,7 @@ impl Reconciler {
             pool_pod_environment(
                 self.substrate.environment_placement(),
                 self.store.pool(),
+                config.template_release_id,
                 config.template_name.as_str(),
                 &config.content_hash.to_string(),
             )

@@ -1328,6 +1328,7 @@ async fn find_release_with_requirement(
     let resp = if !req_hash.is_empty() {
         let hash = req_hash.to_string();
         let mut request = tonic::Request::new(FindTemplateReleaseByHashRequest {
+            environment: None,
             generic_only,
             caller_org_id: caller_org.map(|org| org.to_string()),
             template_name: name.to_string(),
@@ -1359,6 +1360,7 @@ async fn find_release_with_requirement(
     } else {
         let tag = lookup_tag(req_tag);
         let mut request = tonic::Request::new(FindTemplateReleaseRequest {
+            environment: None,
             generic_only,
             caller_org_id: caller_org.map(|org| org.to_string()),
             template_name: name.to_string(),
@@ -3395,6 +3397,7 @@ pub(crate) async fn list_latest_releases(template_name: &str, limit: u32) -> Lat
 
     let resp = match client
         .list_latest_template_releases(ListLatestTemplateReleasesRequest {
+            environment: None,
             template_name: template_name.to_string(),
             runtime: DEFAULT_RUNTIME.to_string(),
             limit,

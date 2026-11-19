@@ -454,6 +454,9 @@ pub(super) struct TemplateReleaseRow {
     pub(super) hash: String,
     pub(super) org_id: Option<OrgId>,
     pub(super) created_at: OffsetDateTime,
+    /// `execution_metadata->>'environment'`: the environment the release is
+    /// bound to, `None` when unbound.
+    pub(super) environment: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -1066,6 +1069,7 @@ pub(super) struct FindTemplateReleaseRow {
     pub(super) release_type: String,
     pub(super) release_hash: String,
     pub(super) release_created_at: OffsetDateTime,
+    pub(super) release_environment: Option<String>,
     pub(super) storage_id: Option<Uuid>,
     pub(super) storage_connection_string: Option<String>,
     pub(super) storage_created_at: Option<OffsetDateTime>,
@@ -1323,6 +1327,20 @@ pub(super) fn common_auto_lifecycle_to_proto(
 /// enough to dominate the LEFT JOIN expansion to storage locations.
 pub(super) const LIST_LATEST_TEMPLATE_RELEASES_MAX_LIMIT: u32 = 50;
 
+/// The execution environment a release lookup selects, parsed from the
+/// request's optional `environment`; `None` selects the original release.
+pub(super) fn environment_selector(
+    value: Option<&str>,
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, Status> {
+    value
+        .map(|value| {
+            value.parse().map_err(|error| {
+                Status::invalid_argument(format!("invalid environment {value:?}: {error}"))
+            })
+        })
+        .transpose()
+}
+
 pub(super) fn validated_list_limit(value: u32) -> Result<u32, Status> {
     if value == 0 {
         return Err(Status::invalid_argument("limit must be >= 1"));
@@ -1398,155 +1416,6 @@ pub(super) fn validated_storage_connection_strings(
             Ok(uri)
         })
         .collect()
-}
-
-/// Validates and re-serializes the registration's execution metadata into the
-/// JSONB shape stored on `template_releases.execution_metadata` (the same
-/// serialization the node publish path produces, so both writers agree).
-pub(super) fn validated_execution_metadata(
-    execution: Option<&pplx_space_execution_common::proto::ExecutionMetadata>,
-) -> Result<Option<serde_json::Value>, Status> {
-    let Some(execution) = execution else {
-        return Ok(None);
-    };
-    let execution = pplx_space_execution_spec::ExecutionMetadata::try_from(execution)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    serde_json::to_value(&execution)
-        .map(Some)
-        .map_err(|error| Status::internal(format!("serialize execution metadata: {error}")))
-}
-
-pub(super) async fn ensure_template_release(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    template_name: &str,
-    runtime: &str,
-    hash: &str,
-    org_id: Option<OrgId>,
-    execution_metadata: Option<&serde_json::Value>,
-) -> Result<TemplateReleaseRow, Status> {
-    if let Some(existing) = find_template_release_row(tx, template_name, hash).await? {
-        if existing.release_type != runtime {
-            return Err(Status::already_exists(format!(
-                "release '{template_name}@{hash}' already exists with runtime '{}' instead of '{runtime}'",
-                existing.release_type,
-            )));
-        }
-        if existing.org_id != org_id {
-            return Err(Status::permission_denied(
-                "release ownership does not match template ownership",
-            ));
-        }
-        if let Some(metadata) = execution_metadata {
-            check_template_release_execution_metadata(tx, existing.id, metadata).await?;
-        }
-        return Ok(existing);
-    }
-
-    if let Some(inserted) = super::template_releases_store::insert_release(
-        &mut **tx,
-        template_name,
-        runtime,
-        hash,
-        org_id,
-        execution_metadata,
-    )
-    .await
-    .map_err(|error| {
-        crate::template_publication::storage_status("insert template release", &error)
-    })? {
-        return Ok(inserted);
-    }
-
-    let existing = find_template_release_row(tx, template_name, hash)
-        .await?
-        .ok_or_else(|| {
-            Status::internal(format!(
-                "release '{template_name}@{hash}' conflicted on insert but could not be reloaded",
-            ))
-        })?;
-    if existing.release_type != runtime {
-        return Err(Status::already_exists(format!(
-            "release '{template_name}@{hash}' already exists with runtime '{}' instead of '{runtime}'",
-            existing.release_type,
-        )));
-    }
-    if existing.org_id != org_id {
-        return Err(Status::permission_denied(
-            "release ownership does not match template ownership",
-        ));
-    }
-    if let Some(metadata) = execution_metadata {
-        check_template_release_execution_metadata(tx, existing.id, metadata).await?;
-    }
-    Ok(existing)
-}
-
-/// Find the release for `(template_name, hash)` under either spelling of the
-/// hash. `hash` arrives canonical (`sha256:<hex>`); releases registered before
-/// the prefix was required are stored bare, and a republication of one of
-/// those must attach its tags to that row rather than create a second,
-/// artifact-less release beside it.
-///
-/// Where both spellings already exist, the row that owns a recorded storage
-/// location wins regardless of age: tags attached to an artifact-less
-/// duplicate would resolve to a release nothing can pull. Age breaks ties.
-async fn find_template_release_row(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    template_name: &str,
-    hash: &str,
-) -> Result<Option<TemplateReleaseRow>, Status> {
-    let bare_hash = hash.trim_prefix("sha256:");
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash IN ($2, $3)
-         ORDER BY EXISTS (
-                      SELECT 1
-                      FROM template_release_storage_locations l
-                      WHERE l.template_release_id = r.id) DESC,
-                  r.created_at ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(hash)
-    .bind(bare_hash)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
-}
-
-/// Release identity is immutable. A row without evidence may be filled once;
-/// an identical retry is read-only, and contradictory evidence is never acknowledged.
-async fn check_template_release_execution_metadata(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    release_id: Uuid,
-    execution: &serde_json::Value,
-) -> Result<(), Status> {
-    // Fence the check and backfill against node publication and other writers,
-    // including those that do not take the parent-template publication lock.
-    let existing: Option<serde_json::Value> = sqlx::query_scalar(sql!(
-        "SELECT execution_metadata FROM template_releases WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(release_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|error| {
-        crate::template_publication::storage_status("lock release execution metadata", &error)
-    })?;
-    match existing {
-        Some(existing) if &existing != execution => Err(Status::already_exists(
-            "template release already has different execution metadata",
-        )),
-        Some(_) => Ok(()),
-        None => super::template_releases_store::fill_execution_metadata(
-            &mut **tx, release_id, execution,
-        )
-        .await
-        .map_err(|error| {
-            crate::template_publication::storage_status("fill release execution metadata", &error)
-        }),
-    }
 }
 
 pub(super) async fn ensure_template_release_tag(
@@ -1692,6 +1561,7 @@ pub(super) fn template_release_proto(row: TemplateReleaseRow) -> TemplateRelease
         runtime: row.release_type,
         hash: row.hash,
         created_at: format_time(row.created_at),
+        environment: row.environment,
     }
 }
 

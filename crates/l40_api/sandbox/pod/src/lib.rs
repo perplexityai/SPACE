@@ -1952,10 +1952,37 @@ fn slug(value: &str, max_len: usize) -> String {
 
 /// Node label key indicating one exact ready local template build exists.
 pub fn template_build_presence_label_key(template: &str, content_hash: &str) -> String {
+    presence_label_key(template, &format!("{template}\0{content_hash}"))
+}
+
+/// A presence label key: the shared prefix, the template's slug and a digest
+/// of `identity`. Every presence key has this shape, which
+/// [`is_template_presence_metadata_key`] relies on.
+fn presence_label_key(template: &str, identity: &str) -> String {
     format!(
         "{TEMPLATE_LABEL_DOMAIN}/{TEMPLATE_BUILD_LABEL_NAME_PREFIX}-{}-{}",
         slug(template, 18),
-        digest_prefix(&format!("{template}\0{content_hash}"))
+        digest_prefix(identity)
+    )
+}
+
+/// Node label key indicating one exact ready local template build exists in
+/// one node cache `partition`. It's written next to
+/// [`template_build_presence_label_key`], which doesn't tell a release from
+/// its twins: a twin has the same template and content hash and is cached in
+/// the partition of its own environment. It has the same shape and prefix as
+/// that key, so [`is_template_presence_metadata_key`] covers it and a
+/// publisher that doesn't write it removes it as stale. The digest input adds
+/// the partition's key, so it never equals the partition-less key, the
+/// legacy partition included.
+pub fn template_partition_presence_label_key(
+    template: &str,
+    content_hash: &str,
+    partition: pplx_space_template_model::TemplateCachePartition,
+) -> String {
+    presence_label_key(
+        template,
+        &format!("{template}\0{content_hash}\0{}", partition.key()),
     )
 }
 

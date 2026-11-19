@@ -2527,10 +2527,96 @@ migrated database, and its migrator doesn't bundle the migration.
 
 Known limits until the cluster side carries partitions:
 
-- Release identity is `(template_name, hash)` in the control plane, its object
-  store layout and its node inventory, so a twin of a published release can't
-  be registered or published yet. Node-ctl publishes a template's
-  legacy-partition build, and another partition's only when it has none.
+- The control plane gives a release an identity per template, hash and
+  execution environment: a twin, bound to another environment, can be
+  registered and resolved by environment once the old
+  `(template_name, hash)` unique index is dropped. A server that predates
+  the `environment` selector ignores it and answers with the tagged or
+  original release, so a client that sends `environment` to
+  `FindTemplateRelease`, `FindTemplateReleaseByHash` or
+  `ListLatestTemplateReleases` must require `environment_applied` in the
+  response before it uses the release or any storage location in it. No client sends a selector yet. No dedicated writer
+  creates twins yet, but once the old index is gone the build publisher can:
+  while a release has no storage location, a build of the same hash bound to
+  another environment registers its execution metadata, and the registration
+  inserts a twin when every tag it names is already on the hash (a twin
+  writes no tags). An unbound or initial-environment build is a twin too
+  when the hash's original is bound to another environment and no release
+  under the original's spelling of the digest was recorded without
+  execution metadata (one under the other spelling is never filled), so a
+  tag it names that isn't on the hash yet refuses it.
+  After that, recreating the old index fails, so an image rollback past the
+  drop isn't possible. A twin's own `metadata.json`
+  (`<build>/environments/<environment>/metadata.json`) has no writer. Node
+  inventory is still keyed by template and hash: node-ctl publishes a
+  template's legacy-partition build, and another partition's only when it has
+  none, so central inventory can't yet tell which nodes hold a twin's build.
+  Node presence labels already carry a separate label for each partition's
+  build, but readers still use the partition-less one.
+- A twin's build shares its original's `manifest.json` and `metadata.json`
+  keys, since object keys carry only template and hash, and template-manager's
+  pull derives a build's cache partition and execution from those two
+  objects. So the build publisher reads both first and, when one already
+  exists, replaces it only if it names the same execution and guest image (a
+  retry, or a rebuild in the same environment, whose manifest has to match
+  its new rootfs). Otherwise, or when the stored object doesn't parse, it
+  fails the publish before writing either. It creates an absent one with a
+  conditional put (`If-None-Match: *`), and checks again if that finds one
+  another publish created meanwhile, so a refusal never replaces a stored
+  object, and two environments publishing one hash at once, a publisher
+  using static object-store credentials, or a stale release lookup can't
+  repoint the original's pulls at another environment. The publisher vends
+  read and write access to read the stored objects back. The store has to
+  honor conditional puts; AWS S3 does, and so does the versitygw release the
+  Kind stack runs. A build-manager image that predates this check still puts
+  unconditionally, so the guard holds only once every build-manager runs it.
+  A publish from another environment that dies before registering leaves its
+  `manifest.json`, `metadata.json` or both behind, and later publishes of that
+  hash from other environments fail until both are removed. Remove them only
+  after confirming that no release of the hash has a storage location and no
+  publish of it is running; the retry of the interrupted publish completes
+  without removing anything. Two publishes of one hash in the same
+  environment can still interleave, as before, so one's manifest can end up
+  beside the other's rootfs: the publisher doesn't serialize them.
+- Don't drop the old `(template_name, hash)` unique index until the internal
+  API, the API and the cluster controller all run this code, and no rollback
+  target predates it. `scripts/bootstrap-templates.sh` also has to be updated
+  or retired first: its release insert's `ON CONFLICT (template_name, hash)`
+  needs a unique index on exactly those columns, so it fails once the index
+  is gone, even with no twins. It runs with `ON_ERROR_STOP=1` and no
+  transaction, so it stops there, after its template upsert has committed.
+  Its tag and storage-location inserts also pick releases by template and
+  hash alone: with only the release insert fixed, the tag insert fails once
+  a twin exists, which stops the script again, and the storage-location
+  insert, if reached, would add the location to every release of the hash. Recreating the index isn't a
+  rollback once a twin exists: the twin and its original share a template and
+  hash, so the index build fails.
+- Don't drop the old index until the internal API, the API and the cluster
+  pool share one original-release rule, deployed, and no rollback target
+  predates it. Today each spells the rule in its own SQL: the internal API's
+  registration and tag writer prefers, across both spellings of a digest, the
+  original that owns a storage location, the API's statements prefer the
+  canonical `sha256:` spelling and pick its earliest release, and the
+  warm-pool store's count each spelling's earliest release as an original. So
+  a digest stored under both spellings can already resolve to different
+  releases under the old index, as before this change, when the bare one owns
+  the storage location. Once twins exist, each spelling can also hold
+  several releases, and every path has to keep resolving the same original
+  over its twins.
+- Don't run `scripts/admin/prune_cluster_artifacts.py superseded-templates`
+  on a deployment with twins until the script applies the original-release
+  rule. It deletes an old release that no tag, pool config or pool slot names,
+  then the storage that release's locations name. Tags attach to the
+  original, so a twin is never tagged. A twin shares its original's whole
+  build prefix (rootfs, manifest and the shared `metadata.json`); only its
+  own `metadata.json` lives under `<build>/environments/<environment>/`. So
+  deleting either one's storage deletes a build the other still serves, and
+  the script has to protect the shared build prefix, not just the
+  environment directory. Twins can exist
+  only once the old `(template_name, hash)` unique index is dropped, and a
+  run already under way can delete an original whose first twin is
+  registered meanwhile, so let any live run finish before dropping the index,
+  and keep live runs off until the script protects storage a twin shares.
 - A restore of a btrfs-send stream needs the build its stream descends from.
   Its lookup prefers the snapshot's binding but falls back to another
   partition of the digest without pulling, so a node holding only another

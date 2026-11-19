@@ -90,7 +90,20 @@ Build-input resources must name exactly
 `build-inputs/sha256/<subject-digest>`. Exact-object requests additionally
 accept only the maintained artifact filenames. Template reads also accept the
 legacy `rootfs.ext4` artifact because older manifests legitimately publish
-only that filename.
+only that filename. A release's twin, bound to another execution environment,
+shares its original's build directory and has its own metadata at
+`environments/<environment>/metadata.json` under it; that object is the same
+release resource, readable as one and immutable once the release is published.
+That leaves a twin's first metadata write with no path through the exchange
+yet: the exchange refuses any write once a release of the template and hash is
+published, whatever its environment, so writing a twin's metadata after its
+original is published fails with `release_already_published`. A twin writer
+needs the exchange to allow the first write of each twin's
+`environments/<environment>/metadata.json` and refuse rewrites, and that rule
+is part of the twin writer's open design. The build directory's own
+`manifest.json` and `metadata.json` aren't fenced per environment here; the
+build publisher refuses to replace ones another execution put there, and asks
+for read and write access so it can read them back.
 
 ## Issuance and response
 

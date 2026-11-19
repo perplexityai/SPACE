@@ -3996,3 +3996,33 @@ fn a_shadowed_pod_records_its_environment_without_requiring_it() {
         .remove(SANDBOX_ENVIRONMENT_ANNOTATION);
     assert_eq!(shadowed.metadata, unbound.metadata);
 }
+
+/// The partition-less presence key is the one every reader and older
+/// publisher uses: pin its exact value so twin support can't move it.
+#[test]
+fn template_build_label_key_is_unchanged() {
+    assert_eq!(
+        template_build_presence_label_key("seed", "sha256:abc"),
+        "space.pplx.net/template-build-seed-dde61e5dbf96b1909cdf1c6f"
+    );
+}
+
+#[test]
+fn template_partition_label_key_is_a_distinct_presence_key() {
+    use pplx_space_template_model::TemplateCachePartition;
+    let environment: TemplateCachePartition =
+        TemplateCachePartition::from_key(&format!("sha256:{}", "cd".repeat(32))).unwrap();
+    let partition_less = template_build_presence_label_key("seed", "sha256:abc");
+    let legacy =
+        template_partition_presence_label_key("seed", "sha256:abc", TemplateCachePartition::Legacy);
+    let bound = template_partition_presence_label_key("seed", "sha256:abc", environment);
+    assert_ne!(legacy, partition_less);
+    assert_ne!(bound, partition_less);
+    assert_ne!(bound, legacy);
+    for key in [&legacy, &bound] {
+        let (_, name) = key.split_once('/').unwrap();
+        assert!(key.starts_with("space.pplx.net/template-build-seed-"));
+        assert!(name.len() <= 63);
+        assert!(is_template_presence_metadata_key(key));
+    }
+}

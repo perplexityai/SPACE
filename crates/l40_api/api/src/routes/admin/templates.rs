@@ -2533,13 +2533,26 @@ pub async fn tag_template_release(
             NullablePatch::Clear => None,
         });
     let result: Result<TagMove, sqlx::Error> = async {
+        // The template row first, then the release, as `delete_template_release`
+        // takes them, so a tag and a delete of one release queue rather than
+        // deadlock.
+        sqlx::query(sql!(
+            "SELECT 1
+             FROM templates t
+             JOIN template_releases r ON r.template_name = t.name
+             WHERE r.id = $1
+             FOR NO KEY UPDATE OF t"
+        ))
+        .bind(release_id)
+        .execute(&mut *tx)
+        .await?;
         let row = sqlx::query_as::<_, TemplateReleaseRow>(sql!(
             "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
              FROM template_releases r
              JOIN templates t ON t.name = r.template_name
              WHERE r.id = $1
                AND t.desired_state = $2
-             FOR UPDATE"
+             FOR UPDATE OF r"
         ))
         .bind(release_id)
         .bind(TemplateDesiredState::Present.as_str())
@@ -2548,6 +2561,15 @@ pub async fn tag_template_release(
         let Some(row) = row else {
             return Ok(TagMove::ReleaseMissing);
         };
+        // A tag names a template and hash, and resolves to the original
+        // release of it; a lookup with an environment reaches a twin through
+        // the hash. Tagging a twin directly would make tag and digest lookups
+        // disagree, so it's refused in favor of the original.
+        if let Some(original) = original_release_of(&mut tx, &row).await?
+            && original != row.id
+        {
+            return Ok(TagMove::Twin { original });
+        }
         // Not every tag writer locks the template row, so the tag row's own
         // lock is what makes the precondition and the move one step. A tag
         // created between this read and the insert below has committed by the
@@ -2657,6 +2679,11 @@ pub async fn tag_template_release(
         Ok(TagMove::ReleaseMissing) => {
             api_error(StatusCode::NOT_FOUND, "Template release not found").into_response()
         }
+        Ok(TagMove::Twin { original }) => api_error(
+            StatusCode::CONFLICT,
+            format!("template release is a twin bound to another environment; tag its original release {original}"),
+        )
+        .into_response(),
         Err(error) => contention_response(ContentionScope::Writing, &error)
             .unwrap_or_else(|| {
                 tracing::error!(%error, %release_id, "failed to tag template release");
@@ -2683,6 +2710,29 @@ enum TagMove {
     /// The tag was created and removed again by other writers between this
     /// request's reads.
     Raced,
+    /// The release is a twin of `original`, which tags attach to.
+    Twin {
+        original: Uuid,
+    },
+}
+
+/// The original release of `release`'s template and hash: the first
+/// registered, earliest by `(created_at, id)`. A twin bound to another
+/// environment is registered after it.
+async fn original_release_of(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    release: &TemplateReleaseRow,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases
+         WHERE template_name = $1 AND hash = $2
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1"
+    ))
+    .bind(&release.template_name)
+    .bind(&release.content_hash)
+    .fetch_optional(&mut **tx)
+    .await
 }
 
 /// The release a tag points at, locking its row for the rest of the
@@ -2747,6 +2797,12 @@ pub async fn delete_template_release_tag(
     }
 }
 
+/// What `delete_template_release`'s transaction did.
+enum DeleteRelease {
+    Deleted,
+    Refused(&'static str),
+}
+
 pub async fn delete_template_release(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -2755,8 +2811,24 @@ pub async fn delete_template_release(
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    let result: Result<bool, sqlx::Error> = async {
+    let result: Result<DeleteRelease, sqlx::Error> = async {
         let mut tx = state.pool.begin().await?;
+        // Release registration holds the parent template's row lock
+        // (`FOR UPDATE`) while it inserts, so locking it here keeps the twin
+        // check below and the delete from interleaving with a registration
+        // that adds the release's first twin. `NO KEY UPDATE` still conflicts
+        // with that lock, but not with the key-share locks node publications'
+        // foreign-key checks take on the template row.
+        sqlx::query(sql!(
+            "SELECT 1
+             FROM templates t
+             JOIN template_releases r ON r.template_name = t.name
+             WHERE r.id = $1
+             FOR NO KEY UPDATE OF t"
+        ))
+        .bind(release_id)
+        .execute(&mut *tx)
+        .await?;
         let latest_count: i64 = sqlx::query_scalar(sql!(
             "SELECT COUNT(*) FROM template_release_tags
              WHERE template_release_id = $1 AND tag = 'latest'"
@@ -2765,7 +2837,36 @@ pub async fn delete_template_release(
         .fetch_one(&mut *tx)
         .await?;
         if latest_count > 0 {
-            return Ok(false);
+            return Ok(DeleteRelease::Refused(
+                "template release is missing or still tagged latest",
+            ));
+        }
+        // Deleting an original that has twins would make the oldest twin,
+        // bound to another environment, the release every lookup without an
+        // environment resolves. Its twins go first; a twin itself may go.
+        let has_twins: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM template_releases r
+                 JOIN template_releases twin
+                   ON twin.template_name = r.template_name
+                  AND twin.hash = r.hash
+                  AND (twin.created_at, twin.id) > (r.created_at, r.id)
+                 WHERE r.id = $1
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM template_releases older
+                       WHERE older.template_name = r.template_name
+                         AND older.hash = r.hash
+                         AND (older.created_at, older.id) < (r.created_at, r.id)))"
+        ))
+        .bind(release_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_twins {
+            return Ok(DeleteRelease::Refused(
+                "template release has twins bound to other environments; delete them first",
+            ));
         }
         sqlx::query(sql!(
             "DELETE FROM template_release_tags WHERE template_release_id = $1"
@@ -2785,16 +2886,18 @@ pub async fn delete_template_release(
             .await?
             .rows_affected();
         tx.commit().await?;
-        Ok(deleted > 0)
+        Ok(if deleted > 0 {
+            DeleteRelease::Deleted
+        } else {
+            DeleteRelease::Refused("template release is missing or still tagged latest")
+        })
     }
     .await;
     match result {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => api_error(
-            StatusCode::CONFLICT,
-            "template release is missing or still tagged latest",
-        )
-        .into_response(),
+        Ok(DeleteRelease::Deleted) => StatusCode::NO_CONTENT.into_response(),
+        Ok(DeleteRelease::Refused(message)) => {
+            api_error(StatusCode::CONFLICT, message).into_response()
+        }
         Err(error) => {
             if error
                 .as_database_error()

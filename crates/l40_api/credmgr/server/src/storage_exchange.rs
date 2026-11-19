@@ -748,6 +748,16 @@ fn validate_template_resource(
         {
             hash.parse::<ContentHash>().ok()
         }
+        // A twin's own metadata, under the build it shares with its original.
+        (false, [name, hash, environments, environment, file])
+            if *name == template.as_str()
+                && pplx_space_artifact_model::template_environment_metadata_environment(
+                    &format!("{environments}/{environment}/{file}"),
+                )
+                .is_some() =>
+        {
+            hash.parse::<ContentHash>().ok()
+        }
         _ => None,
     };
     hash.ok_or(StorageExchangeError::UnauthorizedResource)

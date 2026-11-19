@@ -411,6 +411,7 @@ async fn resolved_latest_hash(
     template: &TemplateName,
 ) -> Result<Option<String>, RunTemplatePublishError> {
     let request = FindTemplateReleaseRequest {
+        environment: None,
         generic_only: false,
         caller_org_id: None,
         template_name: template.as_str().to_string(),

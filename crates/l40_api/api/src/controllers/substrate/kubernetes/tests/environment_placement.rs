@@ -109,6 +109,15 @@ async fn sandbox(
     })
 }
 
+/// The id of the release [`sandbox`] registers.
+async fn seed_release(pool: &sqlx::PgPool) -> Result<uuid::Uuid, BoxError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE template_name = 'seed'"
+    ))
+    .fetch_one(pool)
+    .await?)
+}
+
 fn restore() -> PodCreateContext<'static> {
     PodCreateContext::Restore(RestoreContext::UserRestore {
         suspend_restore_storage_uri: Some(URI),
@@ -242,14 +251,28 @@ async fn shadow_places_work_with_an_invalid_binding_as_off_would() -> Result<(),
             None
         );
     }
+    let release = seed_release(&db.pool).await?;
     assert_eq!(
-        pool_pod_environment(EnvironmentPlacementGate::Shadow, &db.pool, "seed", HASH).await?,
+        pool_pod_environment(
+            EnvironmentPlacementGate::Shadow,
+            &db.pool,
+            release,
+            "seed",
+            HASH
+        )
+        .await?,
         None
     );
     assert!(
-        pool_pod_environment(EnvironmentPlacementGate::On, &db.pool, "seed", HASH)
-            .await
-            .is_err(),
+        pool_pod_environment(
+            EnvironmentPlacementGate::On,
+            &db.pool,
+            release,
+            "seed",
+            HASH
+        )
+        .await
+        .is_err(),
         "on fails it"
     );
     Ok(())
@@ -261,6 +284,7 @@ async fn a_pool_pod_records_its_release_binding_and_requires_it_only_when_on()
     use crate::controllers::substrate::environment_placement::pool_pod_environment;
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     sandbox(&db.pool, "suspended", Some(E1), None, None).await?;
+    let release = seed_release(&db.pool).await?;
     for (gate, expected) in [
         (EnvironmentPlacementGate::Off, None),
         (
@@ -273,7 +297,7 @@ async fn a_pool_pod_records_its_release_binding_and_requires_it_only_when_on()
         (EnvironmentPlacementGate::On, required(E1)),
     ] {
         assert_eq!(
-            pool_pod_environment(gate, &db.pool, "seed", HASH).await?,
+            pool_pod_environment(gate, &db.pool, release, "seed", HASH).await?,
             expected,
             "{gate}"
         );
@@ -282,12 +306,67 @@ async fn a_pool_pod_records_its_release_binding_and_requires_it_only_when_on()
         pool_pod_environment(
             EnvironmentPlacementGate::On,
             &db.pool,
+            uuid::Uuid::now_v7(),
             "seed",
             "sha256:other"
         )
         .await?,
         None,
         "no such build"
+    );
+    Ok(())
+}
+
+/// A warm pool of a release's twin runs under the twin's environment, while
+/// template work that names no release reads the original's, as before twins.
+/// Twins exist only once `idx_template_releases_template_name_hash_unique` is
+/// dropped, which the test does to stand in for the contract migration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pool_of_a_twin_runs_under_the_twin_binding() -> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let mut substrate = substrate_with_store(db.pool.clone());
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    sandbox(&db.pool, "suspended", Some(E1), None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let twin: uuid::Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('seed', 'fc', $1, jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb))
+         RETURNING id"
+    ))
+    .bind(HASH)
+    .bind(E0)
+    .fetch_one(&db.pool)
+    .await?;
+    // Rewrite the table in environment order, which puts the twin (E0)
+    // before the original (E1) in the heap and in every index's tie order,
+    // so only an explicit original-first order answers with the original.
+    sqlx::query(sql!(
+        "CLUSTER template_releases USING template_releases_template_name_hash_environment_key"
+    ))
+    .execute(&db.pool)
+    .await?;
+
+    let gate = EnvironmentPlacementGate::On;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, twin, "seed", HASH).await?,
+        required(E0),
+        "the twin's pool"
+    );
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(E1),
+        "the original's pool"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(E1),
+        "work that names no release reads the original"
     );
     Ok(())
 }
@@ -309,48 +388,238 @@ async fn a_release_without_a_binding_takes_its_environment_from_the_build_invent
         "nothing records a binding yet"
     );
 
-    let hold = |environment: &'static str| {
-        let pool = db.pool.clone();
-        async move {
-            let holder = NodeId::new();
-            insert_ready_worker_node(&pool, holder).await?;
-            sqlx::query(sql!(
-                "INSERT INTO node_template_inventory (
-                     node_id, template_name, content_hash, runtime, arch,
-                     has_base_snapshot, vcpu, memory_mib, guest_os,
-                     state_format_name, state_format_version, execution_metadata
-                 )
-                 VALUES ($1, 'seed', $2, 'fc', 'aarch64', TRUE, 1, 512, 'linux',
-                         'firecracker-snapshot', '9.0.0',
-                         jsonb_build_object('environment', $3::TEXT))"
-            ))
-            .bind(holder)
-            .bind(HASH)
-            .bind(environment)
-            .execute(&pool)
-            .await?;
-            Ok::<_, BoxError>(())
-        }
-    };
-    hold(E1).await?;
+    hold_build(&db.pool, E1).await?;
     assert_eq!(
         substrate.template_pod_environment("seed", HASH).await?,
         required(E1),
         "a cold create or an on-demand pod"
     );
     assert_eq!(
-        pool_pod_environment(EnvironmentPlacementGate::On, &db.pool, "seed", HASH).await?,
+        pool_pod_environment(
+            EnvironmentPlacementGate::On,
+            &db.pool,
+            seed_release(&db.pool).await?,
+            "seed",
+            HASH
+        )
+        .await?,
         required(E1),
         "a warm-pool pod"
     );
 
     // A pod requires one label, so holders that disagree leave the work
     // unbound on Kubernetes.
-    hold(E0).await?;
+    hold_build(&db.pool, E0).await?;
     assert_eq!(
         substrate.template_pod_environment("seed", HASH).await?,
         None,
         "the holders disagree"
+    );
+    Ok(())
+}
+
+/// Add a ready worker holding the seed build at `HASH`, bound to
+/// `environment`.
+async fn hold_build(pool: &sqlx::PgPool, environment: &str) -> Result<(), BoxError> {
+    hold_build_at(pool, HASH, environment).await
+}
+
+async fn hold_build_at(
+    pool: &sqlx::PgPool,
+    content_hash: &str,
+    environment: &str,
+) -> Result<(), BoxError> {
+    let holder = NodeId::new();
+    insert_ready_worker_node(pool, holder).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (
+             node_id, template_name, content_hash, runtime, arch,
+             has_base_snapshot, vcpu, memory_mib, guest_os,
+             state_format_name, state_format_version, execution_metadata
+         )
+         VALUES ($1, 'seed', $2, 'fc', 'aarch64', TRUE, 1, 512, 'linux',
+                 'firecracker-snapshot', '9.0.0',
+                 jsonb_build_object('environment', $3::TEXT))"
+    ))
+    .bind(holder)
+    .bind(content_hash)
+    .bind(environment)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A twin's build shares its original's template and hash, so a node
+/// holding only the twin's build reports the twin's binding. With the
+/// original recording none, that row mustn't bind the original's pool or
+/// work that names no release: only the original's own holders can.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_holder_doesnt_bind_an_unbound_original() -> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    const E2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let mut substrate = substrate_with_store(db.pool.clone());
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    sandbox(&db.pool, "suspended", None, None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let twin: uuid::Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('seed', 'fc', $1, jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb))
+         RETURNING id"
+    ))
+    .bind(HASH)
+    .bind(E2)
+    .fetch_one(&db.pool)
+    .await?;
+    let gate = EnvironmentPlacementGate::On;
+
+    hold_build(&db.pool, E2).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        None,
+        "the original's pool, with only the twin's holder"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        None,
+        "work that names no release, with only the twin's holder"
+    );
+
+    hold_build(&db.pool, E1).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(E1),
+        "the original's pool takes its own holder's binding"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(E1),
+        "work that names no release takes the original's holder's binding"
+    );
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, twin, "seed", HASH).await?,
+        required(E2),
+        "the twin's pool reads the twin's own binding"
+    );
+    Ok(())
+}
+
+/// A pool's content hash is its release's stored spelling, which is bare for a
+/// release registered before the prefix was required. The holders' exclusion
+/// still reads the bindings of the releases under `sha256:`, so a bare holder
+/// row of a build bound elsewhere doesn't bind the bare original's pool.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bare_originals_pool_excludes_bindings_under_the_prefixed_spelling()
+-> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    const E2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let bare = HASH.trim_start_matches("sha256:");
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    sandbox(&db.pool, "suspended", None, None, None).await?;
+    let prefixed = seed_release(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE template_releases
+         SET execution_metadata = jsonb_build_object('environment', $1::TEXT, 'components', '[]'::jsonb)
+         WHERE id = $2"
+    ))
+    .bind(E2)
+    .bind(prefixed)
+    .execute(&db.pool)
+    .await?;
+    let original: uuid::Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash)
+         VALUES ('seed', 'fc', $1)
+         RETURNING id"
+    ))
+    .bind(bare)
+    .fetch_one(&db.pool)
+    .await?;
+
+    hold_build_at(&db.pool, bare, E2).await?;
+    assert_eq!(
+        pool_pod_environment(
+            EnvironmentPlacementGate::On,
+            &db.pool,
+            original,
+            "seed",
+            bare
+        )
+        .await?,
+        None,
+        "the bare original's pool, with only a holder of the prefixed release's build"
+    );
+    Ok(())
+}
+
+/// An unbound release and one bound to the initial environment share the
+/// legacy cache partition, so a node holding the build bound to the initial
+/// environment holds the unbound release's build. While the old index stands
+/// the two coexist only under the digest's two spellings. That holder still
+/// binds the unbound original; a twin's holder under the other spelling
+/// still doesn't.
+#[tokio::test(flavor = "current_thread")]
+async fn an_initial_environment_release_doesnt_hide_the_originals_holder() -> Result<(), BoxError> {
+    use crate::controllers::substrate::environment_placement::pool_pod_environment;
+    const E2: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let initial =
+        pplx_space_execution_catalog::catalog::initial_environment_reference().to_string();
+    let bare = HASH.trim_start_matches("sha256:");
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let mut substrate = substrate_with_store(db.pool.clone());
+    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
+    sandbox(&db.pool, "suspended", None, None, None).await?;
+    let original = seed_release(&db.pool).await?;
+    let insert_bound = |environment: String| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(sql!(
+                "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+                 VALUES ('seed', 'fc', $1,
+                         jsonb_build_object('environment', $2::TEXT, 'components', '[]'::jsonb))"
+            ))
+            .bind(bare)
+            .bind(environment)
+            .execute(&pool)
+            .await?;
+            Ok::<_, BoxError>(())
+        }
+    };
+    let gate = EnvironmentPlacementGate::On;
+
+    insert_bound(initial.clone()).await?;
+    hold_build(&db.pool, &initial).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(&initial),
+        "the original's pool takes the initial environment's holder"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(&initial),
+        "work that names no release takes the initial environment's holder"
+    );
+
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    insert_bound(E2.to_owned()).await?;
+    hold_build(&db.pool, E2).await?;
+    assert_eq!(
+        pool_pod_environment(gate, &db.pool, original, "seed", HASH).await?,
+        required(&initial),
+        "the original's pool, beside a twin's holder under the other spelling"
+    );
+    assert_eq!(
+        substrate.template_pod_environment("seed", HASH).await?,
+        required(&initial),
+        "work that names no release, beside a twin's holder under the other spelling"
     );
     Ok(())
 }

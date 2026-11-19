@@ -1668,6 +1668,7 @@ mod execution_observation;
 mod metadata;
 mod node_local_backup_pending;
 mod publish;
+mod release_registration;
 mod status;
 mod template_publication;
 mod template_registration_store;

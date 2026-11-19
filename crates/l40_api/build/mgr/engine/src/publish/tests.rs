@@ -9,6 +9,7 @@ use pplx_space_template_manifest::{
 mod republication;
 #[cfg(unix)]
 mod retry;
+mod shared_build_prefix;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()

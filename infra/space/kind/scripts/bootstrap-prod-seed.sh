@@ -112,31 +112,30 @@ stage_artifacts_on_workers() {
   local row
   while read -r row; do
     [[ -z "$row" ]] && continue
-    local pod node hash storage_uri tmp
+    local pod node release hash storage_uri tmp
     pod="$(echo "$row" | awk '{print $1}')"
     node="$(echo "$row" | awk '{print $2}')"
     log "  ${node} (${pod})"
 
     # Pull manifest + metadata fresh from S3, derive the hash + storage prefix
     # to avoid relying on whatever the prior step persisted.
-    hash="$(/bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
-      -tA -v ON_ERROR_STOP=1 -v name="$name" <<'SQL'
-SELECT tr.hash
+    # One statement through the tagged release, so a `latest` move can't
+    # pair one release's hash with another's storage, and never any other
+    # release at its hash: a twin bound to another execution environment
+    # shares the hash.
+    release="$(/bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
+      -tA -F $'\t' -v ON_ERROR_STOP=1 -v name="$name" <<'SQL'
+SELECT tr.hash, l.storage_connection_string
 FROM template_release_tags t
 JOIN template_releases tr ON tr.id = t.template_release_id
-WHERE t.template_name = :'name' AND t.tag = 'latest';
-SQL
-)"
-    [[ -n "$hash" ]] || die "no 'latest' release for $name in control-plane"
-    storage_uri="$(/bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
-      -tA -v ON_ERROR_STOP=1 -v name="$name" -v hash="$hash" <<'SQL'
-SELECT l.storage_connection_string
-FROM template_release_storage_locations l
-JOIN template_releases tr ON tr.id = l.template_release_id
-WHERE tr.template_name = :'name' AND tr.hash = :'hash'
+LEFT JOIN template_release_storage_locations l ON l.template_release_id = tr.id
+WHERE t.template_name = :'name' AND t.tag = 'latest'
+ORDER BY l.created_at NULLS LAST
 LIMIT 1;
 SQL
 )"
+    IFS=$'\t' read -r hash storage_uri <<<"$release"
+    [[ -n "$hash" ]] || die "no 'latest' release for $name in control-plane"
     [[ -n "$storage_uri" ]] || die "no storage_connection_string for $name@$hash"
 
     # storage_uri is `s3://BUCKET/PREFIX/?region=…`. Drop the query string.

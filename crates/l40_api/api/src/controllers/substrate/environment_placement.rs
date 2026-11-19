@@ -248,7 +248,8 @@ pub(crate) enum BindingScope {
     /// The release's binding, else the one every holder whose row names a
     /// binding reports, when they all agree. For a pull candidate that holds
     /// no row of the build: the build a pull fetches is the one those nodes
-    /// fetched.
+    /// fetched. A row bound to a twin's environment doesn't count: it's the
+    /// twin's build, which shares the template and hash.
     ReleaseOrHolders,
 }
 
@@ -260,6 +261,10 @@ pub(crate) enum BindingScope {
 /// which skips the reads. In shadow a failed read is logged and reads as
 /// `None`, so shadow places exactly as off; on, it fails the placement rather
 /// than place bound work as unbound.
+///
+/// The release is the original one for `template` at `content_hash`, the one
+/// a create that names no environment resolves; [`pool_pod_environment`]
+/// reads a chosen one.
 pub(crate) async fn work_environment(
     gate: EnvironmentPlacementGate,
     pool: &PgPool,
@@ -267,10 +272,39 @@ pub(crate) async fn work_environment(
     content_hash: Option<&str>,
     scope: BindingScope,
 ) -> Result<Option<String>, sqlx::Error> {
+    gated_work_environment(
+        gate,
+        pool,
+        BuildRelease::Original,
+        template,
+        content_hash,
+        scope,
+    )
+    .await
+}
+
+/// Which release of a build records its binding.
+#[derive(Debug, Clone, Copy)]
+enum BuildRelease {
+    /// The original release of the template and hash.
+    Original,
+    /// A chosen release, the original or a twin.
+    #[cfg(feature = "kubernetes")]
+    Id(uuid::Uuid),
+}
+
+async fn gated_work_environment(
+    gate: EnvironmentPlacementGate,
+    pool: &PgPool,
+    release: BuildRelease,
+    template: &str,
+    content_hash: Option<&str>,
+    scope: BindingScope,
+) -> Result<Option<String>, sqlx::Error> {
     let Some(content_hash) = content_hash.filter(|_| gate.evaluates()) else {
         return Ok(None);
     };
-    match build_binding(pool, template, content_hash, scope).await {
+    match build_binding(pool, release, template, content_hash, scope).await {
         Err(error) if !gate.refuses() => {
             tracing::warn!(
                 template,
@@ -287,18 +321,40 @@ pub(crate) async fn work_environment(
 
 async fn build_binding(
     pool: &PgPool,
+    release: BuildRelease,
     template: &str,
     content_hash: &str,
     scope: BindingScope,
 ) -> Result<Option<String>, sqlx::Error> {
-    let release =
-        crate::template_releases_store::release_environment(pool, template, content_hash).await?;
+    let release = match release {
+        BuildRelease::Original => {
+            crate::template_releases_store::release_environment(pool, template, content_hash)
+                .await?
+        }
+        #[cfg(feature = "kubernetes")]
+        BuildRelease::Id(release_id) => {
+            crate::template_releases_store::release_environment_by_id(pool, release_id).await?
+        }
+    };
     match (release, scope) {
         (Some(environment), _) => Ok(Some(environment)),
         (None, BindingScope::Release) => Ok(None),
         (None, BindingScope::ReleaseOrHolders) => {
-            crate::template_inventory_store::agreed_build_environment(pool, template, content_hash)
-                .await
+            // A twin's build shares the template and hash, so its holders'
+            // binding is the twin's, not this release's.
+            let twins = crate::template_releases_store::bound_release_environments(
+                pool,
+                template,
+                content_hash,
+            )
+            .await?;
+            crate::template_inventory_store::agreed_build_environment(
+                pool,
+                template,
+                content_hash,
+                &twins,
+            )
+            .await
         }
     }
 }
@@ -375,21 +431,25 @@ pub(crate) fn bound_pod_environment(
     }
 }
 
-/// The environment a warm-pool pod of `template` at `content_hash` renders
-/// under `gate` ([`work_environment`], [`bound_pod_environment`]); `None`
-/// while the gate is off or for unbound work.
+/// The environment a warm-pool pod of the pool's release `release_id`, of
+/// `template` at `content_hash`, renders under `gate`
+/// ([`work_environment`] read from that release, [`bound_pod_environment`]); `None` while
+/// the gate is off or for unbound work. The pool's own release records the
+/// binding, so a pool of a twin runs under the twin's environment.
 #[cfg(feature = "kubernetes")]
 pub async fn pool_pod_environment(
     gate: EnvironmentPlacementGate,
     pool: &sqlx::PgPool,
+    release_id: uuid::Uuid,
     template: &str,
     content_hash: &str,
 ) -> Result<Option<PodEnvironment>, BoundEnvironmentError> {
     // A pod may land on any node, so no candidate's own inventory row can
     // gate it: the build's holders have to agree.
-    let value = work_environment(
+    let value = gated_work_environment(
         gate,
         pool,
+        BuildRelease::Id(release_id),
         template,
         Some(content_hash),
         BindingScope::ReleaseOrHolders,
