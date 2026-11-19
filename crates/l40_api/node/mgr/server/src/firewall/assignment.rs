@@ -1,21 +1,51 @@
 //! The firewall assignment this node durably accepted: [`FirewallAssignments`]
 //! accepts the control plane's assignments in generation order and publishes
-//! each one only after it commits. Accepted is not installed: nothing here
-//! touches nftables.
+//! each one only after its record is durable. Accepted is not installed:
+//! nothing here touches nftables.
+//!
+//! The record is one file, in production
+//! [`NODE_MANAGER_FIREWALL_ASSIGNMENT_FILE`](pplx_space_host_layout::paths::NODE_MANAGER_FIREWALL_ASSIGNMENT_FILE)
+//! beside node-manager's database. A node-manager that predates it ignores it.
 
-use std::path::Path;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwapOption;
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_model::FirewallRuleRevision;
 use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision, encode_revision};
-use pplx_space_node_mgr_store::firewall_assignment::{self as store, AssignmentRow};
-use rusqlite::{Connection, TransactionBehavior};
+use tonic::Status;
 use uuid::Uuid;
+
+use crate::service::artifact_fs::{self, AtomicWriteError};
+use crate::service::trusted_paths;
 
 #[cfg(test)]
 mod tests;
+
+/// As for the execution-policy record: twice node-manager's 4 MiB gRPC request
+/// bound, since an assignment arrives in one request.
+const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+const RECORD_FORMAT_VERSION: u32 = 1;
+
+/// The record file; `revision` is the canonical document.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    format_version: u32,
+    node_id: Uuid,
+    generation: u64,
+    revision_id: Uuid,
+    revision: String,
+}
+
+/// Read first, so a newer format is reported as one.
+#[derive(serde::Deserialize)]
+struct Format {
+    format_version: u32,
+}
 
 /// An assignment as delivered: the node it names is checked, not trusted.
 #[derive(Clone, Copy, Debug)]
@@ -37,79 +67,112 @@ pub struct DesiredAssignment {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Acceptance {
-    /// Committed and published.
+    /// Durable and published.
     Committed,
     /// Already the accepted assignment; nothing was written.
     Replayed,
 }
 
+/// A replacement may be on disk without being durable, so neither acceptance
+/// nor [`FirewallAssignments::current`] is authoritative until reopened.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("the firewall assignment store is unavailable until reopened")]
+pub struct Unavailable;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AcceptError {
     #[error("assignment is for node {incoming}, not this node {expected}")]
     WrongNode { expected: NodeId, incoming: NodeId },
-    /// Permanent for this database: a node that keeps its disk under a new
-    /// `NodeId` recovers only by deleting the assignment row, which the caller owns.
+    /// Permanent for this record: a node that keeps its disk under a new
+    /// `NodeId` recovers only by deleting the record file, which the caller owns.
     #[error("accepted assignments are bound to node {bound}, not {expected}")]
     BoundToOtherNode { bound: NodeId, expected: NodeId },
     #[error(transparent)]
     InvalidRevision(#[from] DecodeError),
+    #[error("firewall assignment record would exceed {MAX_RECORD_BYTES} bytes")]
+    TooLarge,
     #[error("assignment generation {incoming} is older than accepted generation {accepted}")]
     Stale { accepted: u64, incoming: u64 },
     #[error("generation {generation} was already accepted with a different revision")]
     Conflict { generation: u64 },
-    #[error("failed to store the firewall assignment: {0}")]
-    Storage(#[from] rusqlite::Error),
-    #[error("the firewall assignment writer is poisoned")]
-    Poisoned,
+    /// The record wasn't replaced; the accepted assignment is unchanged.
+    #[error("failed to write the firewall assignment record: {0}")]
+    Write(Status),
+    /// The record was replaced but not made durable; the store is now
+    /// [`Unavailable`].
+    #[error("the firewall assignment record may not be durable: {0}")]
+    Unsynced(Status),
+    #[error(transparent)]
+    Unavailable(#[from] Unavailable),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
-    #[error(transparent)]
-    Writer(#[from] store::OpenError),
-    #[error("failed to read the accepted firewall assignment: {0}")]
-    Read(#[from] rusqlite::Error),
+    #[error("read the firewall assignment record: {0}")]
+    Read(#[source] std::io::Error),
+    #[error("open the firewall assignment record: {0}")]
+    Open(Status),
+    #[error("firewall assignment record exceeds {MAX_RECORD_BYTES} bytes")]
+    TooLarge,
+    #[error("decode the firewall assignment record: {0}")]
+    Decode(#[from] serde_json::Error),
+    #[error("unsupported firewall assignment record format {0}")]
+    Format(u32),
     #[error("the accepted firewall assignment does not decode: {0}")]
-    Record(#[from] DecodeError),
+    Revision(#[from] DecodeError),
 }
 
 pub struct FirewallAssignments {
-    writer: Mutex<Connection>,
+    path: PathBuf,
+    /// Spans compare, durable replace and publication.
+    writer: Mutex<()>,
     current: ArcSwapOption<DesiredAssignment>,
+    unavailable: AtomicBool,
+    #[cfg(test)]
+    write: fn(&Path, &[u8]) -> Result<(), AtomicWriteError>,
 }
 
 impl FirewallAssignments {
-    /// Opens the store in node-manager's migrated database with its own
-    /// durable writer, and loads the accepted assignment. Open one per
-    /// database: the mutex serializes acceptance only within an instance.
-    /// A stored document that fails strict decoding, such as a newer
-    /// `schema_version` after a rollback, returns [`OpenError::Record`]; the
-    /// caller decides whether that means no accepted assignment or refusing to start.
-    pub fn open(db_path: &Path) -> Result<Self, OpenError> {
-        let writer = store::open_writer(db_path)?;
-        let current = store::read(&writer)?
-            .map(|row| {
-                Ok::<_, DecodeError>(Arc::new(DesiredAssignment {
-                    node_id: row.node_id,
-                    generation: row.generation,
-                    revision_id: row.revision_id,
-                    revision: decode_revision(&row.document)?,
+    /// Loads the record at `path`; a missing file is no accepted assignment.
+    /// Any other unreadable record, such as a newer format or `schema_version`
+    /// after a rollback, fails and is left in place.
+    ///
+    /// Open one store per file. Its mutex serializes acceptance within the
+    /// process; node-manager's service mutex keeps a second process from
+    /// writing.
+    pub fn open(path: &Path) -> Result<Self, OpenError> {
+        let current = read_record(path)?
+            .map(|record| {
+                Ok::<_, OpenError>(Arc::new(DesiredAssignment {
+                    node_id: NodeId::from_uuid(record.node_id),
+                    generation: record.generation,
+                    revision_id: record.revision_id,
+                    revision: decode_revision(&record.revision)?,
                 }))
             })
             .transpose()?;
         Ok(Self {
-            writer: Mutex::new(writer),
+            path: path.to_owned(),
+            writer: Mutex::new(()),
             current: ArcSwapOption::new(current),
+            unavailable: AtomicBool::new(false),
+            #[cfg(test)]
+            write: write_record,
         })
     }
 
     /// The accepted assignment, or `None` before the first one.
-    pub fn current(&self) -> Option<Arc<DesiredAssignment>> {
-        self.current.load_full()
+    pub fn current(&self) -> Result<Option<Arc<DesiredAssignment>>, Unavailable> {
+        if self.unavailable.load(Ordering::Acquire) {
+            return Err(Unavailable);
+        }
+        Ok(self.current.load_full())
     }
 
     /// Durably accepts `incoming` for `expected_node`, which the trusted local
-    /// caller supplies. Blocks on SQLite; call it from a blocking thread.
+    /// caller supplies. Blocks on file I/O: async callers run it through
+    /// `NodeManagerService::off_runtime`, whose task node-manager drains before
+    /// releasing its service mutex, so a write can't outlive ownership.
     pub fn accept(
         &self,
         expected_node: NodeId,
@@ -121,47 +184,53 @@ impl FirewallAssignments {
                 incoming: incoming.node_id,
             });
         }
-        let revision = decode_revision(incoming.document)?;
-        let row = AssignmentRow {
+        let assignment = DesiredAssignment {
             node_id: expected_node,
             generation: incoming.generation,
             revision_id: incoming.revision_id,
-            document: encode_revision(&revision),
+            revision: decode_revision(incoming.document)?,
         };
 
-        let mut writer = self.writer.lock().map_err(|_| AcceptError::Poisoned)?;
-        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(saved) = store::read(&tx)? {
+        let _writer = self.writer.lock().map_err(|_| Unavailable)?;
+        if let Some(saved) = self.current()? {
             if saved.node_id != expected_node {
                 return Err(AcceptError::BoundToOtherNode {
                     bound: saved.node_id,
                     expected: expected_node,
                 });
             }
-            if row.generation < saved.generation {
+            if assignment.generation < saved.generation {
                 return Err(AcceptError::Stale {
                     accepted: saved.generation,
-                    incoming: row.generation,
+                    incoming: assignment.generation,
                 });
             }
-            if row.generation == saved.generation {
-                return if saved == row {
+            if assignment.generation == saved.generation {
+                return if *saved == assignment {
                     Ok(Acceptance::Replayed)
                 } else {
                     Err(AcceptError::Conflict {
-                        generation: row.generation,
+                        generation: assignment.generation,
                     })
                 };
             }
         }
-        store::replace(&tx, &row)?;
-        tx.commit()?;
-        self.publish(DesiredAssignment {
-            node_id: row.node_id,
-            generation: row.generation,
-            revision_id: row.revision_id,
-            revision,
-        });
+        let bytes = encode_record(&assignment);
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(AcceptError::TooLarge);
+        }
+        #[cfg(test)]
+        let write = self.write;
+        #[cfg(not(test))]
+        let write = write_record;
+        write(&self.path, &bytes).map_err(|error| match error {
+            AtomicWriteError::NotReplaced(status) => AcceptError::Write(status),
+            AtomicWriteError::NotSynced(status) => {
+                self.unavailable.store(true, Ordering::Release);
+                AcceptError::Unsynced(status)
+            }
+        })?;
+        self.publish(assignment);
         Ok(Acceptance::Committed)
     }
 
@@ -176,4 +245,54 @@ impl FirewallAssignments {
             _ => Some(Arc::clone(&assignment)),
         });
     }
+}
+
+fn encode_record(assignment: &DesiredAssignment) -> Vec<u8> {
+    let record = Record {
+        format_version: RECORD_FORMAT_VERSION,
+        node_id: assignment.node_id.as_uuid(),
+        generation: assignment.generation,
+        revision_id: assignment.revision_id,
+        revision: encode_revision(&assignment.revision),
+    };
+    match serde_json::to_vec(&record) {
+        Ok(bytes) => bytes,
+        // Integers, UUIDs and a string always serialize.
+        Err(error) => unreachable!("firewall assignment record serialization failed: {error}"),
+    }
+}
+
+/// Absence is checked by name, then the record is opened beneath its pinned
+/// parent without following links, as the write publishes it.
+fn read_record(path: &Path) -> Result<Option<Record>, OpenError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(OpenError::Read(source)),
+        Ok(_) => {}
+    }
+    let file = artifact_fs::parent(path)
+        .and_then(|(directory, name)| trusted_paths::open_regular_file(&directory, name))
+        .map_err(OpenError::Open)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(OpenError::Read)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(OpenError::TooLarge);
+    }
+    let Format { format_version } = serde_json::from_slice(&bytes)?;
+    if format_version != RECORD_FORMAT_VERSION {
+        return Err(OpenError::Format(format_version));
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+/// Temp file, `sync_all`, rename, parent `sync_all`.
+fn write_record(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
+    artifact_fs::write_durable_atomic(path, |file| {
+        (&*file).write_all(bytes).map_err(|error| {
+            Status::unavailable(format!("write firewall assignment record: {error}"))
+        })
+    })
+    .map(drop)
 }

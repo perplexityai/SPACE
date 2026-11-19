@@ -1,19 +1,19 @@
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision};
-use rusqlite::Connection;
-use rusqlite::types::Value;
-use sqlx::migrate::Migrator;
 use tempfile::TempDir;
+use tonic::Status;
 use uuid::Uuid;
 
-use super::{AcceptError, Acceptance, DesiredAssignment, FirewallAssignments, IncomingAssignment};
-use crate::run::NODE_MANAGER_MIGRATOR;
+use super::{
+    AcceptError, Acceptance, AtomicWriteError, DesiredAssignment, FirewallAssignments,
+    IncomingAssignment, OpenError, Unavailable, write_record,
+};
+use crate::service::artifact_fs;
 
-/// The migration that adds `firewall_rules_assignment`.
-const ASSIGNMENT_MIGRATION: i64 = 20261119205954;
 const NODE: NodeId = NodeId::from_uuid(Uuid::from_u128(1));
 const DNS: &str = r#"{"id":"dns","all_of":[{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}"#;
 const WEB: &str = r#"{"id":"web","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}]}"#;
@@ -40,19 +40,9 @@ fn accepted(generation: u64, revision: u128, document: &str) -> DesiredAssignmen
     }
 }
 
-fn migrate(path: &Path, migrator: &Migrator) {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(pplx_space_sqlite::migrate("node-manager", path, migrator))
-        .unwrap();
-}
-
-fn migrated_db() -> (TempDir, PathBuf) {
+fn record_path() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node-manager.db");
-    migrate(&path, &NODE_MANAGER_MIGRATOR);
+    let path = dir.path().join("firewall-assignment.json");
     (dir, path)
 }
 
@@ -60,102 +50,55 @@ fn open(path: &Path) -> FirewallAssignments {
     FirewallAssignments::open(path).unwrap()
 }
 
-/// Memory, and a fresh open of the file, both hold `expected`.
-fn assert_state(store: &FirewallAssignments, path: &Path, expected: &DesiredAssignment) {
-    assert_eq!(store.current().as_deref(), Some(expected), "in memory");
-    assert_eq!(open(path).current().as_deref(), Some(expected), "on disk");
+fn current(store: &FirewallAssignments) -> Option<DesiredAssignment> {
+    store.current().unwrap().as_deref().cloned()
 }
 
-/// Catches a migration that disturbs slot rows, a fresh table read as an
-/// accepted assignment, a writer left at NORMAL, and an acceptance that
-/// doesn't survive reopening with its ordered rules, empty rules included.
-#[test]
-fn migrated_database_keeps_slots_and_reopens_accepted_assignments() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node-manager.db");
-    let before_assignments = Migrator {
-        migrations: NODE_MANAGER_MIGRATOR
-            .iter()
-            .filter(|migration| migration.version < ASSIGNMENT_MIGRATION)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into(),
-        ..Migrator::DEFAULT
-    };
-    migrate(&path, &before_assignments);
-    let slots = || -> Vec<Vec<Value>> {
-        let conn = Connection::open(&path).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT * FROM network_slots ORDER BY slot_id")
-            .unwrap();
-        let columns = stmt.column_count();
-        stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    Connection::open(&path)
-        .unwrap()
-        .execute(
-            "INSERT INTO network_slots (slot_id, slot_label, generation, schema_version, state,
-                 health, sandbox_id, created_at, updated_at)
-             VALUES (3, 'slot-3', 7, 1, 'leased', 'healthy', 'sbx-a', 10, 20)",
-            [],
-        )
-        .unwrap();
-    let populated = slots();
-    migrate(&path, &NODE_MANAGER_MIGRATOR);
-    assert_eq!(slots(), populated);
+/// Memory, and a fresh open of the file, both hold `expected`.
+fn assert_state(store: &FirewallAssignments, path: &Path, expected: &DesiredAssignment) {
+    assert_eq!(current(store).as_ref(), Some(expected), "in memory");
+    assert_eq!(current(&open(path)).as_ref(), Some(expected), "on disk");
+}
 
+/// Catches a missing file read as anything but no assignment, and an
+/// acceptance that doesn't survive reopening with its ordered rules, empty
+/// rules included.
+#[test]
+fn accepted_assignments_reopen() {
+    let (_dir, path) = record_path();
     let store = open(&path);
-    assert_eq!(store.current(), None);
-    {
-        let writer = store.writer.lock().unwrap();
-        let pragma = |name| writer.pragma_query_value(None, name, |row| row.get::<_, Value>(0));
-        assert_eq!(pragma("journal_mode").unwrap(), Value::Text("wal".into()));
-        assert_eq!(pragma("synchronous").unwrap(), Value::Integer(2));
-    }
+    assert_eq!(current(&store), None);
+
     let rules = document(&[WEB, DNS]);
     assert_eq!(
         store.accept(NODE, incoming(12, 1, &rules)).unwrap(),
         Acceptance::Committed
     );
-    drop(store);
-    let store = open(&path);
-    assert_eq!(store.current().as_deref(), Some(&accepted(12, 1, &rules)));
+    assert_eq!(current(&open(&path)), Some(accepted(12, 1, &rules)));
 
     let empty = document(&[]);
     store.accept(NODE, incoming(13, 2, &empty)).unwrap();
-    drop(store);
-    assert_eq!(
-        open(&path).current().as_deref(),
-        Some(&accepted(13, 2, &empty))
-    );
+    assert_eq!(current(&open(&path)), Some(accepted(13, 2, &empty)));
 }
 
-/// Catches a replay that rewrites the row or compares raw JSON, and a conflict
-/// check that ignores the revision ID or compares rules unordered.
+/// Catches a replay that rewrites the record or compares raw JSON, and a
+/// conflict check that ignores the revision ID or compares rules unordered.
 #[test]
 fn same_generation_replays_exactly_or_conflicts() {
-    let (_dir, path) = migrated_db();
+    let (_dir, path) = record_path();
     let store = open(&path);
     let rules = document(&[WEB, DNS]);
     store.accept(NODE, incoming(12, 1, &rules)).unwrap();
-    let observer = Connection::open(&path).unwrap();
-    // Changes whenever another connection commits a write.
-    let data_version = || -> i64 {
-        observer
-            .pragma_query_value(None, "data_version", |row| row.get(0))
-            .unwrap()
-    };
-    let unwritten = data_version();
+    // Every write renames a new inode into place.
+    let inode = || std::fs::metadata(&path).unwrap().ino();
+    let unwritten = inode();
 
     let reformatted = rules.replace(',', ", ");
     assert_eq!(
         store.accept(NODE, incoming(12, 1, &reformatted)).unwrap(),
         Acceptance::Replayed
     );
-    assert_eq!(data_version(), unwritten, "a replay must not write");
+    assert_eq!(inode(), unwritten, "a replay must not write");
     let conflicts = [
         store.accept(NODE, incoming(12, 2, &rules)),
         store.accept(NODE, incoming(12, 1, &document(&[DNS, WEB]))),
@@ -177,7 +120,7 @@ fn same_generation_replays_exactly_or_conflicts() {
 /// is stale even with the same rules, and a later one may repeat them.
 #[test]
 fn generation_order_decides_acceptance() {
-    let (_dir, path) = migrated_db();
+    let (_dir, path) = record_path();
     let store = open(&path);
     let rules = document(&[DNS]);
     store.accept(NODE, incoming(12, 1, &rules)).unwrap();
@@ -202,11 +145,11 @@ fn generation_order_decides_acceptance() {
 }
 
 /// Catches an assignment that authorizes its own node, a store that rebinds to
-/// another node, and invalid, unsupported or unstorable assignments that
-/// reach disk or memory.
+/// another node, and invalid, unsupported or oversized assignments that reach
+/// disk or memory.
 #[test]
 fn refused_assignments_change_nothing() {
-    let (_dir, path) = migrated_db();
+    let (_dir, path) = record_path();
     let store = open(&path);
     let rules = document(&[DNS]);
     let other = NodeId::from_uuid(Uuid::from_u128(2));
@@ -220,17 +163,26 @@ fn refused_assignments_change_nothing() {
         matches!(unbound, Err(AcceptError::WrongNode { .. })),
         "{unbound:?}"
     );
-    assert_eq!(store.current(), None);
-    assert_eq!(open(&path).current(), None);
+    assert_eq!(current(&store), None);
+    assert!(!path.exists());
 
     store.accept(NODE, incoming(12, 1, &rules)).unwrap();
     let invalid = document(&[r#"{"id":"r","all_of":[]}"#]);
+    let rules_over_bound: Vec<_> = (0..80_000)
+        .map(|i| DNS.replace("dns", &format!("r{i}")))
+        .collect();
+    let too_large = document(
+        &rules_over_bound
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
     let refusals = [
         store.accept(NODE, for_other(13)),
         store.accept(other, for_other(13)),
         store.accept(NODE, incoming(13, 2, &invalid)),
         store.accept(NODE, incoming(13, 2, r#"{"schema_version":2,"rules":[]}"#)),
-        store.accept(NODE, incoming(1 << 63, 2, &rules)),
+        store.accept(NODE, incoming(13, 2, &too_large)),
     ];
     assert!(
         matches!(
@@ -242,7 +194,7 @@ fn refused_assignments_change_nothing() {
                 Err(AcceptError::InvalidRevision(
                     DecodeError::UnsupportedSchemaVersion(2)
                 )),
-                Err(AcceptError::Storage(_)),
+                Err(AcceptError::TooLarge),
             ]
         ),
         "{refusals:?}"
@@ -250,29 +202,103 @@ fn refused_assignments_change_nothing() {
     assert_state(&store, &path, &accepted(12, 1, &rules));
 }
 
-/// Catches publishing or succeeding before the commit returns, and a lost
-/// reply that the identical delivery can't recover.
+/// Catches publishing or succeeding before the record is replaced, a failure
+/// that blocks the old record's replay, and a lost reply that the identical
+/// delivery can't recover.
 #[test]
-fn failed_commit_publishes_nothing_and_lost_reply_replays() {
-    let (_dir, path) = migrated_db();
-    let store = open(&path);
+fn failed_write_publishes_nothing_and_lost_reply_replays() {
+    let (_dir, path) = record_path();
+    let mut store = open(&path);
     let (twelve, thirteen) = (document(&[DNS]), document(&[WEB]));
     store.accept(NODE, incoming(12, 1, &twelve)).unwrap();
 
-    // A commit hook that returns true turns the COMMIT into a rollback.
-    let set_hook = |hook: Option<fn() -> bool>| store.writer.lock().unwrap().commit_hook(hook);
-    set_hook(Some(|| true)).unwrap();
+    store.write = |path, _| {
+        artifact_fs::write_durable_atomic(path, |_| Err(Status::unavailable("injected"))).map(drop)
+    };
     let failed = store.accept(NODE, incoming(13, 2, &thirteen));
-    assert!(matches!(failed, Err(AcceptError::Storage(_))), "{failed:?}");
+    assert!(matches!(failed, Err(AcceptError::Write(_))), "{failed:?}");
     assert_state(&store, &path, &accepted(12, 1, &twelve));
+    assert_eq!(
+        store.accept(NODE, incoming(12, 1, &twelve)).unwrap(),
+        Acceptance::Replayed
+    );
 
-    set_hook(None).unwrap();
+    store.write = write_record;
     let _lost_reply = store.accept(NODE, incoming(13, 2, &thirteen));
     assert_eq!(
         store.accept(NODE, incoming(13, 2, &thirteen)).unwrap(),
         Acceptance::Replayed
     );
     assert_state(&store, &path, &accepted(13, 2, &thirteen));
+}
+
+/// Catches a store that stays authoritative after a replacement it can't
+/// prove durable, or that acknowledges a retry by reading that replacement back.
+#[test]
+fn unsynced_replace_is_unavailable_until_reopened() {
+    let (_dir, path) = record_path();
+    let mut store = open(&path);
+    let (twelve, thirteen) = (document(&[DNS]), document(&[WEB]));
+    store.accept(NODE, incoming(12, 1, &twelve)).unwrap();
+
+    store.write = |path, bytes| {
+        write_record(path, bytes)?;
+        Err(AtomicWriteError::NotSynced(Status::unavailable("injected")))
+    };
+    let unsynced = store.accept(NODE, incoming(13, 2, &thirteen));
+    assert!(
+        matches!(unsynced, Err(AcceptError::Unsynced(_))),
+        "{unsynced:?}"
+    );
+    store.write = write_record;
+    let retry = store.accept(NODE, incoming(13, 2, &thirteen));
+    assert!(
+        matches!(retry, Err(AcceptError::Unavailable(Unavailable))),
+        "{retry:?}"
+    );
+    store.current().unwrap_err();
+
+    let reopened = open(&path);
+    assert_eq!(current(&reopened), Some(accepted(13, 2, &thirteen)));
+    assert_eq!(
+        reopened.accept(NODE, incoming(13, 2, &thirteen)).unwrap(),
+        Acceptance::Replayed
+    );
+}
+
+/// Catches an unreadable record opened as no assignment, or rewritten.
+#[test]
+fn unreadable_records_fail_closed_and_stay() {
+    let (_dir, path) = record_path();
+    let newer_schema = format!(
+        r#"{{"format_version":1,"node_id":"{}","generation":12,"revision_id":"{}","revision":"{{\"schema_version\":2,\"rules\":[]}}"}}"#,
+        NODE.as_uuid(),
+        Uuid::from_u128(1),
+    );
+    let errors = [
+        r#"{"format_version":2}"#,
+        r#"{"format_version":1,"#,
+        &newer_schema,
+    ]
+    .map(|contents| {
+        std::fs::write(&path, contents).unwrap();
+        let error = FirewallAssignments::open(&path).err();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        error
+    });
+    assert!(
+        matches!(
+            errors,
+            [
+                Some(OpenError::Format(2)),
+                Some(OpenError::Decode(_)),
+                Some(OpenError::Revision(DecodeError::UnsupportedSchemaVersion(
+                    2
+                ))),
+            ]
+        ),
+        "{errors:?}"
+    );
 }
 
 fn race<const N: usize>(
@@ -297,7 +323,7 @@ fn race<const N: usize>(
 /// assignments at one generation leave exactly one winner.
 #[test]
 fn racing_accepts_serialize() {
-    let (_dir, path) = migrated_db();
+    let (_dir, path) = record_path();
     let store = open(&path);
     let (dns, web) = (document(&[DNS]), document(&[WEB]));
     for higher in (2..=64).step_by(2) {

@@ -21,7 +21,7 @@ pub(super) fn error(error: impl std::fmt::Display) -> Status {
     Status::failed_precondition(format!("artifact filesystem operation: {error}"))
 }
 
-pub(super) fn parent(path: &Path) -> Result<(File, &OsStr), Status> {
+pub(crate) fn parent(path: &Path) -> Result<(File, &OsStr), Status> {
     let parent = path.parent().ok_or_else(|| error("missing parent"))?;
     let name = path.file_name().ok_or_else(|| error("missing name"))?;
     Ok((trusted_paths::open_directory(parent)?, name))
@@ -55,6 +55,33 @@ pub(super) fn write_atomic_at(
     write: impl FnOnce(&File) -> Result<(), Status>,
 ) -> Result<File, Status> {
     write_atomic_at_with_durability(parent, name, write, Durability::Durable)
+        .map_err(AtomicWriteError::into_status)
+}
+
+/// [`write_atomic`], saying which side of the rename it failed on.
+pub(crate) fn write_durable_atomic(
+    path: &Path,
+    write: impl FnOnce(&File) -> Result<(), Status>,
+) -> Result<File, AtomicWriteError> {
+    let (parent, name) = parent(path).map_err(AtomicWriteError::NotReplaced)?;
+    write_atomic_at_with_durability(&parent, name, write, Durability::Durable)
+}
+
+#[derive(Debug)]
+pub(crate) enum AtomicWriteError {
+    /// Failed before the rename: the destination is unchanged.
+    NotReplaced(Status),
+    /// The rename landed but the directory sync failed: the new file may be
+    /// visible and may not survive a crash.
+    NotSynced(Status),
+}
+
+impl AtomicWriteError {
+    pub(crate) fn into_status(self) -> Status {
+        match self {
+            Self::NotReplaced(status) | Self::NotSynced(status) => status,
+        }
+    }
 }
 
 /// Rebuilt before launch; atomic visibility is required, crash durability is not.
@@ -64,6 +91,7 @@ pub(super) fn write_ephemeral_atomic(
 ) -> Result<File, Status> {
     let (parent, name) = parent(path)?;
     write_atomic_at_with_durability(&parent, name, write, Durability::Ephemeral)
+        .map_err(AtomicWriteError::into_status)
 }
 
 enum Durability {
@@ -76,7 +104,8 @@ fn write_atomic_at_with_durability(
     name: &OsStr,
     write: impl FnOnce(&File) -> Result<(), Status>,
     durability: Durability,
-) -> Result<File, Status> {
+) -> Result<File, AtomicWriteError> {
+    use AtomicWriteError::{NotReplaced, NotSynced};
     let temporary = format!(".artifact-{}.tmp", uuid::Uuid::now_v7());
     let output = File::from(
         openat(
@@ -85,16 +114,21 @@ fn write_atomic_at_with_durability(
             OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0o600),
         )
-        .map_err(error)?,
+        .map_err(|source| NotReplaced(error(source)))?,
     );
     let result = (|| {
-        write(&output)?;
+        write(&output).map_err(NotReplaced)?;
         if matches!(durability, Durability::Durable) {
-            output.sync_all().map_err(error)?;
+            output
+                .sync_all()
+                .map_err(|source| NotReplaced(error(source)))?;
         }
-        nix::fcntl::renameat(parent, temporary.as_str(), parent, name).map_err(error)?;
+        nix::fcntl::renameat(parent, temporary.as_str(), parent, name)
+            .map_err(|source| NotReplaced(error(source)))?;
         if matches!(durability, Durability::Durable) {
-            parent.sync_all().map_err(error)?;
+            parent
+                .sync_all()
+                .map_err(|source| NotSynced(error(source)))?;
         }
         Ok(())
     })();
