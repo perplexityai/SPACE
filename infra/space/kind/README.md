@@ -363,8 +363,9 @@ inventory exactly once: each (surface, scenario) pair has one `=== RUN`, or was
 skipped by a bench's mode after the partition, which counts as covered. The
 script exits as the typed suite ranks a suite: 1 when any scenario failed;
 else 2 when a bench did not come up, a scenario was inconclusive or did not
-finish, a pass exited 2 outside any scenario, or the coverage check failed;
-else 42 when a scenario warned; else 0.
+finish, a pass exited 2 outside any scenario, the coverage check failed, or
+the run's teardown left benches on the host; else 42 when a scenario warned;
+else 0.
 A failure the known-failures list (`SPACE_SMOKE_KNOWN_FAILURES`) excused is
 listed but does not fail the run. Without `--benches` it picks N
 from the host's CPUs, available memory, free disk and a short write-throughput

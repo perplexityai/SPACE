@@ -13,8 +13,8 @@ variables the runner reads.
 summary.md, summary.json and timeline.txt there, and exits as the typed suite
 ranks a suite (space_smoke/suite.py, suite_exit_code): 1 when any scenario
 failed; else 2 when a bench did not come up, a scenario was inconclusive or did
-not finish, a pass exited 2 outside any scenario, or the benches did not cover
-the inventory exactly once; else 42
+not finish, a pass exited 2 outside any scenario, the benches did not cover
+the inventory exactly once, or the run's teardown left benches; else 42
 when a scenario warned; else 0. A failure the known-failures list excused
 (`KNOWN FAILURE <id>` in its pass) is listed and does not count as one, and a
 scenario a bench's mode skipped after the partition counts as covered. It
@@ -371,6 +371,13 @@ def summarize(out: Path) -> int:
             coverage["surfaces"][surface] = entry
             if not entry["exactly_once"]:
                 incomplete = True
+    # The run's own teardown (none under --keep): benches it could not remove
+    # are still on the host, holding its disk and its next run.
+    teardown_failed = any(
+        row["owner"] == "run" and row["phase"] == "teardown" and row["rc"] != 0 for row in timings
+    )
+    if teardown_failed:
+        incomplete = True
     status = 1 if failed else 2 if incomplete else 42 if warned else 0
 
     source = read_json(out / "source.json") or {}
@@ -392,6 +399,7 @@ def summarize(out: Path) -> int:
         "per_bench": per_bench,
         "not_passed": not_passed,
         "coverage": coverage,
+        "teardown_failed": teardown_failed,
         "resource_peaks": resource_peaks(out),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -417,6 +425,13 @@ def summarize(out: Path) -> int:
         f"- Rust image: {source['rust_image'].get('image_id')} built from"
         f" {source['rust_image'].get('built_from')}"
         + (" (main's image for the same input key)" if source["rust_image"]["reused_from_main"] else ""),
+    ]
+    if teardown_failed:
+        md.append(
+            f"- teardown: FAILED, benches are left on the host; see {out / 'teardown.log'},"
+            " then run `smoke-kind-parallel.sh teardown`"
+        )
+    md += [
         "",
         "## Host phases",
         "",

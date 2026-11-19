@@ -37,8 +37,8 @@
 #
 # Exit status: as the typed suite ranks a suite: 1 a scenario failed; else 2
 # a bench did not come up, a scenario was inconclusive or unfinished, a pass
-# exited 2 outside any scenario, or the coverage check failed; else 42 a
-# scenario warned; else 0.
+# exited 2 outside any scenario, the coverage check failed, or the teardown at
+# the end left benches; else 42 a scenario warned; else 0.
 #
 # Env: SPACE_KIND_SUBSTRATE, SPACE_KIND_STORAGE_CREDENTIALS, SPACE_KIND_RUST_BUILD,
 # SPACE_SMOKE_TIERS (default routine), SPACE_SMOKE_INCLUDE_SCENARIOS,
@@ -934,7 +934,10 @@ if (( ! KEEP )); then
   keep_failed_bench_logs || true
   teardown_log="$OUT/teardown.log"
   : >>"$teardown_log" 2>/dev/null || teardown_log=/dev/null
-  phase run teardown teardown_all >"$teardown_log" 2>&1 || true
+  # Its status goes into timings.tsv, where the summary ranks a failed
+  # teardown as an incomplete run.
+  phase run teardown teardown_all >"$teardown_log" 2>&1 \
+    || log "the teardown left benches on the host; see $teardown_log"
   rm -f "$HOST/shared-images.tar" "$HOST/rust/kind-rust.tar.gz"
   KEEP=2
 fi
