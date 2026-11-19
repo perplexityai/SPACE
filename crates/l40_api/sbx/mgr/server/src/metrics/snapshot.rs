@@ -45,10 +45,31 @@ use std::time::Instant;
 
 use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, metric_vocabulary, tag, timing_ms};
 
+/// Bounded `size_bucket:` tag value for a snapshot or artifact of `bytes`.
+/// Callers pass apparent (logical) bytes, the same size vol-mgr reports as an
+/// upload's bytes, so one snapshot lands in the same bucket on create and on
+/// delivery. Sparse holes count, so this tracks VM size rather than bytes
+/// written to disk.
+pub fn size_bucket(bytes: u64) -> &'static str {
+    const GIB: u64 = 1 << 30;
+    match bytes {
+        b if b < GIB / 2 => "lt_512m",
+        b if b < 2 * GIB => "512m_2g",
+        b if b < 8 * GIB => "2g_8g",
+        b if b < 32 * GIB => "8g_32g",
+        _ => "ge_32g",
+    }
+}
+
+/// One stage of delivering a snapshot to durable storage. `size_bucket`
+/// ([`size_bucket`]) is set for the stages that move known bytes: an
+/// artifact stage's artifact, and the snapshot's VM artifacts for
+/// `cluster_finalize` and `remote_total`.
 pub fn delivery_duration_ms(
     stage: &str,
     origin: &str,
     artifact: Option<&str>,
+    bytes: Option<u64>,
     result: &str,
     duration_ms: f64,
 ) {
@@ -59,6 +80,9 @@ pub fn delivery_duration_ms(
     ];
     if let Some(artifact) = artifact {
         tags.push(tag("artifact", artifact));
+    }
+    if let Some(bytes) = bytes {
+        tags.push(tag("size_bucket", size_bucket(bytes)));
     }
     timing_ms("snapshot.delivery.duration_ms", duration_ms.max(0.0), &tags);
 }
@@ -141,14 +165,24 @@ pub fn create_step(kind: &str, codec: &str, encrypted: bool, step: &str, started
     );
 }
 
-/// Emit on successful completion of the create flow.
-pub fn create_completed(kind: &str, codec: &str, encrypted: bool, started_at: Instant) {
-    let tags = [
+/// Emit on successful completion of the create flow. `bytes` is the published
+/// snapshot's apparent size, tagged as its [`size_bucket`] when known.
+pub fn create_completed(
+    kind: &str,
+    codec: &str,
+    encrypted: bool,
+    bytes: Option<u64>,
+    started_at: Instant,
+) {
+    let mut tags = vec![
         create_kind_tag(kind),
         codec_tag(codec),
         encrypted_tag(encrypted),
         tag("result", "success"),
     ];
+    if let Some(bytes) = bytes {
+        tags.push(tag("size_bucket", size_bucket(bytes)));
+    }
     counter("snapshot.create.completed", 1, &tags);
     timing_ms("snapshot.create.duration_ms", elapsed_ms(started_at), &tags);
 }

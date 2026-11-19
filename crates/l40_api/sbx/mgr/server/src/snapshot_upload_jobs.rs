@@ -160,6 +160,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 "snapshot_queue",
                 origin,
                 None,
+                None,
                 "success",
                 duration_ms,
             );
@@ -333,6 +334,7 @@ impl JobExecutor for SnapshotUploadExecutor {
             "cluster_finalize",
             origin,
             None,
+            Some(vm_total_bytes),
             if finalize_result.is_ok() {
                 "success"
             } else {
@@ -387,6 +389,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                     "artifact_queue",
                     origin,
                     Some(artifact_tag),
+                    Some(observation.bytes),
                     "success",
                     duration_ms,
                 );
@@ -396,6 +399,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                     "artifact_transfer",
                     origin,
                     Some(artifact_tag),
+                    Some(observation.bytes),
                     "success",
                     duration_ms,
                 );
@@ -413,6 +417,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                 "remote_total",
                 origin,
                 None,
+                Some(vm_total_bytes),
                 "success",
                 duration_ms,
             );
