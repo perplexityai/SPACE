@@ -54,7 +54,7 @@
 //! pass read. Beside it, the report blocks unless every scan that can reveal
 //! a resident or an artifact succeeded and the seal held, under the call's
 //! generation, from before the walk to its end, and lists the activations
-//! in flight at its first read as pending.
+//! and the artifact producers in flight at its first read as pending.
 //!
 //! One `DrainNode` call runs at a time, drain and cancel alike, its scans
 //! included: a call that arrives while another is in progress fails at once
@@ -63,6 +63,16 @@
 //! and changes nothing. The call's guard is released when the call ends,
 //! however it ends, and the call is bounded by a whole-call timeout, after
 //! which it answers `DeadlineExceeded`.
+//!
+//! A node-local artifact producer (a snapshot, an import, a publication)
+//! asks the seal too, once it holds the sandbox's artifact lock
+//! ([`crate::activation_seal::ActivationSeal::admit_producer`]): sealed, one
+//! for a sandbox without a VM is refused, so nothing appears after a pass
+//! found the node finished. One for a started or paused sandbox runs and is
+//! `pending` ([`planner::Wait::Snapshot`]) until it ends; the drain's suspend
+//! of that VM waits for the same lock, so a producer queued behind the
+//! suspend reads the row after it, finds no VM and is refused. Its artifact
+//! is then uploaded like any other before the drain is finished.
 //!
 //! `PreviewDrainNode` ([`crate::service::SandboxManagerService::finish_preview`])
 //! reports what an evacuating drain would find on this unsealed node now,
@@ -83,5 +93,7 @@ mod rpc;
 
 pub(super) use actions::{DrainActions, drain_node_window_from_env};
 
+#[cfg(test)]
+mod producer_tests;
 #[cfg(test)]
 mod tests;

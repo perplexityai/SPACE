@@ -408,6 +408,22 @@ impl SandboxManagerService {
             }
         }
     }
+
+    /// Admit a node-local artifact producer, `producer` naming it in a
+    /// refusal, for `sandbox`, read holding the sandbox's artifact lock: see
+    /// [`crate::activation_seal::ActivationSeal::admit_producer`]. The caller
+    /// holds the token until its artifact is published or it fails.
+    pub(super) fn admit_artifact_producer(
+        &self,
+        producer: &str,
+        sandbox: &crate::db::SandboxRow,
+    ) -> Result<crate::activation_seal::ArtifactProducerToken, Status> {
+        self.activation_seal.admit_producer(
+            producer,
+            &sandbox.id,
+            crate::activation_seal::has_vm(sandbox.state),
+        )
+    }
 }
 
 /// What [`SandboxManagerService::admit_vm_activation`] admits an activation

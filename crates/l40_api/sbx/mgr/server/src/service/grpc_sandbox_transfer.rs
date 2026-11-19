@@ -1141,6 +1141,10 @@ impl SandboxManagerService {
         };
         self.reject_existing_sandbox_import(validated.sandbox_id)
             .await?;
+        // The sandbox doesn't exist yet, so it has no VM.
+        let _producer =
+            self.activation_seal
+                .admit_producer("sandbox import", &sandbox_id, false)?;
 
         let paths = SandboxImportPaths::new(&sandbox_id);
         let cleanup_id = SandboxCleanupEpisodeId::new();
