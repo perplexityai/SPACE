@@ -42,7 +42,13 @@ fn accepted(generation: u64, revision: u128, document: &str) -> DesiredAssignmen
 
 fn record_path() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("firewall-assignment.json");
+    // The record is opened without following links, so resolve any in the
+    // temporary directory's own path.
+    let path = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("firewall-assignment.json");
     (dir, path)
 }
 
@@ -144,9 +150,9 @@ fn generation_order_decides_acceptance() {
     assert_state(&store, &path, &accepted(15, 1, &rules));
 }
 
-/// Catches an assignment that authorizes its own node, a store that rebinds to
-/// another node, and invalid, unsupported or oversized assignments that reach
-/// disk or memory.
+/// Catches an assignment that authorizes its own node, before or after the
+/// store is bound, a store that rebinds to another node, and invalid,
+/// unsupported or oversized assignments that reach disk or memory.
 #[test]
 fn refused_assignments_change_nothing() {
     let (_dir, path) = record_path();

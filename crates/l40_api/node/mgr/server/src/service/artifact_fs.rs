@@ -27,6 +27,44 @@ pub(crate) fn parent(path: &Path) -> Result<(File, &OsStr), Status> {
     Ok((trusted_paths::open_directory(parent)?, name))
 }
 
+/// Twice the 4 MiB request bound of node-manager's gRPC server (tonic's
+/// default): a record is about the size of the request it came from, so any
+/// accepted one fits, and its writer refuses one that wouldn't.
+pub(crate) const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum BoundedReadError {
+    Open(Status),
+    Sync(io::Error),
+    Read(io::Error),
+    TooLarge,
+}
+
+/// Reads the regular file at `path`, opened beneath its pinned parent without
+/// following links, refusing one over `max_bytes`. With `sync_parent`, the
+/// parent is synced before the read.
+pub(crate) fn read_bounded(
+    path: &Path,
+    max_bytes: u64,
+    sync_parent: bool,
+) -> Result<Vec<u8>, BoundedReadError> {
+    use io::Read as _;
+    let (directory, name) = parent(path).map_err(BoundedReadError::Open)?;
+    let file =
+        trusted_paths::open_regular_file(&directory, name).map_err(BoundedReadError::Open)?;
+    if sync_parent {
+        directory.sync_all().map_err(BoundedReadError::Sync)?;
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(BoundedReadError::Read)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(BoundedReadError::TooLarge);
+    }
+    Ok(bytes)
+}
+
 pub(super) fn directory(parent: &File, name: &OsStr) -> io::Result<File> {
     openat(parent, name, DIRECTORY, Mode::empty())
         .map(File::from)

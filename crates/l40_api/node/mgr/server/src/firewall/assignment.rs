@@ -7,7 +7,7 @@
 //! [`NODE_MANAGER_FIREWALL_ASSIGNMENT_FILE`](pplx_space_host_layout::paths::NODE_MANAGER_FIREWALL_ASSIGNMENT_FILE)
 //! beside node-manager's database. A node-manager that predates it ignores it.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,15 +19,11 @@ use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision, encode_re
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::service::artifact_fs::{self, AtomicWriteError};
-use crate::service::trusted_paths;
+use crate::service::artifact_fs::{self, AtomicWriteError, BoundedReadError, MAX_RECORD_BYTES};
 
 #[cfg(test)]
 mod tests;
 
-/// As for the execution-policy record: twice node-manager's 4 MiB gRPC request
-/// bound, since an assignment arrives in one request.
-const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 const RECORD_FORMAT_VERSION: u32 = 1;
 
 /// The record file; `revision` is the canonical document.
@@ -274,16 +270,13 @@ fn read_record(path: &Path) -> Result<Option<Record>, OpenError> {
         Err(source) => return Err(OpenError::Read(source)),
         Ok(_) => {}
     }
-    let (directory, name) = artifact_fs::parent(path).map_err(OpenError::Open)?;
-    let file = trusted_paths::open_regular_file(&directory, name).map_err(OpenError::Open)?;
-    directory.sync_all().map_err(OpenError::Sync)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(OpenError::Read)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(OpenError::TooLarge);
-    }
+    let bytes =
+        artifact_fs::read_bounded(path, MAX_RECORD_BYTES, true).map_err(|error| match error {
+            BoundedReadError::Open(status) => OpenError::Open(status),
+            BoundedReadError::Sync(source) => OpenError::Sync(source),
+            BoundedReadError::Read(source) => OpenError::Read(source),
+            BoundedReadError::TooLarge => OpenError::TooLarge,
+        })?;
     let Format { format_version } = serde_json::from_slice(&bytes)?;
     if format_version != RECORD_FORMAT_VERSION {
         return Err(OpenError::Format(format_version));
