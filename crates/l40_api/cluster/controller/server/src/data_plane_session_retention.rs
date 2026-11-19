@@ -69,6 +69,10 @@ impl RetentionSink for DataPlaneSessionRetentionStore {
         // session's process id through it for as long as the process runs,
         // which can be long past the session, so it stays until the sandbox
         // is deleted and takes it along. Other guests bind the session id.
+        // A closed terminal or process session is a command that exited; it
+        // stays until it expires, as an open one does, so that reading it,
+        // replaying its create and reattaching to read the exit keep working
+        // for the session's lifetime.
         let rows = sqlx::query_scalar::<_, String>(sql!(
             "WITH candidates AS (
                  SELECT session_id
@@ -79,7 +83,10 @@ impl RetentionSink for DataPlaneSessionRetentionStore {
                             AND expires_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
                             )
                          OR (
-                                state IN ('closed', 'revoked', 'failed')
+                                (
+                                    state IN ('revoked', 'failed')
+                                 OR (state = 'closed' AND kind NOT IN ('terminal', 'process'))
+                                )
                             AND updated_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
                             )
                         )

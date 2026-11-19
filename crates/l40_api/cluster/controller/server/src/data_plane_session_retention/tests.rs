@@ -130,6 +130,90 @@ async fn sweep_keeps_a_binding_to_a_guest_minted_process_id_until_its_sandbox_go
     Ok(())
 }
 
+/// A closed terminal or process session is a command that exited, which a
+/// client may still read, replay or reattach to for the exit, so the sweep
+/// keeps it until it expires. A closed session of another kind, and a
+/// revoked one of any kind, go once the grace has passed.
+#[tokio::test]
+async fn sweep_keeps_a_closed_command_session_until_it_expires() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let sandbox_id = seed_sandbox(pool).await?;
+    // (session, kind, state, expired, kept)
+    let rows = [
+        (
+            "proc_00000000-0000-7000-8000-000000000011",
+            "process",
+            "closed",
+            false,
+            true,
+        ),
+        (
+            "term_00000000-0000-7000-8000-000000000012",
+            "terminal",
+            "closed",
+            false,
+            true,
+        ),
+        (
+            "proc_00000000-0000-7000-8000-000000000013",
+            "process",
+            "closed",
+            true,
+            false,
+        ),
+        (
+            "proc_00000000-0000-7000-8000-000000000014",
+            "process",
+            "revoked",
+            false,
+            false,
+        ),
+        (
+            "port_00000000-0000-7000-8000-000000000015",
+            "port",
+            "closed",
+            false,
+            false,
+        ),
+    ];
+    for (session_id, kind, state, expired, _) in rows {
+        sqlx::query(sql!(
+            "INSERT INTO data_plane_sessions (
+                 session_id, org_id, sandbox_id, kind, state, expires_at, updated_at,
+                 backend_process_id
+             )
+             SELECT $1, org_id, id, $2, $3,
+                    NOW() + CASE WHEN $4 THEN INTERVAL '-2 hours' ELSE INTERVAL '20 hours' END,
+                    NOW() - INTERVAL '2 hours',
+                    CASE WHEN $2 = 'port' THEN NULL ELSE $1 END
+               FROM sandboxes
+              WHERE id = $5"
+        ))
+        .bind(session_id)
+        .bind(kind)
+        .bind(state)
+        .bind(expired)
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+    }
+    let store = DataPlaneSessionRetentionStore::new(pool.clone());
+
+    let report = store
+        .gc_expired_sessions(Duration::from_secs(3600), 100)
+        .await?;
+
+    let mut expected: Vec<&str> = rows.iter().filter(|row| row.4).map(|row| row.0).collect();
+    expected.sort_unstable();
+    assert_eq!(remaining_sessions(pool).await?, expected);
+    assert_eq!(
+        report.sessions_deleted,
+        (rows.len() - expected.len()) as u64
+    );
+    Ok(())
+}
+
 async fn remaining_sessions(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(sql!(
         "SELECT session_id FROM data_plane_sessions ORDER BY session_id"
