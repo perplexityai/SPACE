@@ -1,5 +1,6 @@
 use crate::routes::public::error::database_error;
 use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_public_api_http::PublicJson;
 use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_sql_locator::sql;
@@ -92,7 +93,7 @@ pub async fn create_sandbox(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     federated: Option<Extension<AuthFederatedOwner>>,
     headers: HeaderMap,
-    Json(request): Json<CreateSandboxRequest>,
+    PublicJson(request): PublicJson<CreateSandboxRequest>,
 ) -> Result<impl IntoResponse, PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     let template_name = request.template.name().as_str().to_owned();
@@ -816,7 +817,7 @@ pub async fn update_sandbox(
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
-    Json(request): Json<UpdateSandboxRequest>,
+    PublicJson(request): PublicJson<UpdateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxOperationResponse>), PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     validate_update_request(&request)?;

@@ -272,8 +272,12 @@ macro_rules! closed_wire_enum_impls {
             where
                 D: Deserializer<'de>,
             {
+                // serde's own unknown-variant error, which names the values
+                // it expected; the API answers it without the value sent.
                 let value = String::deserialize(deserializer)?;
-                value.parse().map_err(de::Error::custom)
+                value
+                    .parse()
+                    .map_err(|_| de::Error::unknown_variant(&value, Self::KNOWN_VALUES))
             }
         }
     };
@@ -2147,7 +2151,11 @@ pub struct PublicErrorEnvelope {
     /// with a `pty` carries `{"key": "field", "value": "pty"}`. An
     /// `invalid_request` for a sandbox create or update field outside its limit
     /// carries `{"key": "field", "value": "<field>"}`, such as `metadata` or
-    /// `resources.vcpu`.
+    /// `resources.vcpu`, and so does a 422 for a body value of the wrong
+    /// type when the body's decoder reports its path (`command[1]`,
+    /// `env.NAME`). A missing field, or one inside an internally tagged object
+    /// such as a credential reference, carries no field detail; the message
+    /// says what is wrong.
     pub details: Vec<PublicErrorDetail>,
 }
 
