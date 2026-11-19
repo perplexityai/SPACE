@@ -275,9 +275,15 @@ pub(super) async fn read_file(
                 .spaced_read(request)
                 .await
         },
-        raw_file_read_error,
+        file_read_open_error,
     )
     .await?;
+    let stream = pplx_space_native_files::start_read(
+        stream,
+        NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
+    )
+    .await
+    .map_err(file_read_start_error)?;
 
     let mut bytes_read = 0usize;
     let stream = stream.map(move |chunk| {
@@ -1741,6 +1747,64 @@ fn raw_file_read_error(status: tonic::Status) -> EcwProxyError {
             .with_classification(ResponseOrigin::Spaced, ResponseKind::BackendStatus);
     }
     error
+}
+
+/// A read the guest refused for its path, as envd answers a read of a
+/// directory: 400 with the guest's reason. Anything else reads as
+/// [`raw_file_read_error`] does, which answers every other 409 as the
+/// sandbox not running.
+fn refused_file_read(status: tonic::Status) -> EcwProxyError {
+    EcwProxyError::new(
+        StatusCode::BAD_REQUEST,
+        status.message(),
+        ResponseOrigin::Spaced,
+        ResponseKind::Validation,
+    )
+    .with_backend_status(status)
+}
+
+/// The reason the guest gave a FAILED_PRECONDITION, if it gave one.
+fn guest_precondition_reason(status: &tonic::Status) -> Option<&str> {
+    if status.code() != tonic::Code::FailedPrecondition {
+        return None;
+    }
+    status
+        .metadata()
+        .get(pplx_space_guest_process::status::ERROR_REASON_METADATA_KEY)
+        .and_then(|reason| reason.to_str().ok())
+}
+
+/// The answer to a read whose open failed: one the guest marked as its
+/// refusal of the path's kind (a FIFO, a socket) is [`refused_file_read`],
+/// and one it marked as the file being held by another of its processes is
+/// a 409 with the guest's reason, which can clear on retry.
+fn file_read_open_error(status: tonic::Status) -> EcwProxyError {
+    match guest_precondition_reason(&status) {
+        Some(pplx_space_guest_process::status::GUEST_PATH_REFUSED) => refused_file_read(status),
+        Some(pplx_space_guest_process::status::GUEST_FILE_IN_USE) => EcwProxyError::new(
+            StatusCode::CONFLICT,
+            status.message(),
+            ResponseOrigin::Spaced,
+            ResponseKind::BackendStatus,
+        )
+        .with_backend_status(status),
+        _ => raw_file_read_error(status),
+    }
+}
+
+/// The answer to a read that failed before its first chunk, after the guest
+/// opened the path. Only the guest's filesystem fails a stream there with
+/// FAILED_PRECONDITION (a directory's first read; a lifecycle fence ends one
+/// ABORTED). One it did not mark otherwise is [`refused_file_read`], from a
+/// guest of any release; the Windows guest reports even a failed open there.
+fn file_read_start_error(status: tonic::Status) -> EcwProxyError {
+    let unmarked_refusal = status.code() == tonic::Code::FailedPrecondition
+        && guest_precondition_reason(&status).is_none();
+    if unmarked_refusal {
+        refused_file_read(status)
+    } else {
+        file_read_open_error(status)
+    }
 }
 
 pub(super) fn raw_file_write_error(status: tonic::Status) -> EcwProxyError {

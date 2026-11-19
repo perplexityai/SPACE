@@ -2,7 +2,7 @@
 use super::{identity::Identity, path::LocalPath};
 use pplx_space_guest_process::{
     IdempotencyKey,
-    status::{ERROR_REASON_METADATA_KEY, GUEST_STORAGE_FULL},
+    status::{ERROR_REASON_METADATA_KEY, GUEST_FILE_IN_USE, GUEST_STORAGE_FULL},
 };
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::*;
 use std::os::windows::fs::{FileTypeExt, MetadataExt};
@@ -181,7 +181,12 @@ pub(super) fn io_status(e: io::Error) -> Status {
         e.raw_os_error().and_then(|code| u32::try_from(code).ok()),
         Some(ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION)
     ) {
-        return Status::failed_precondition("guest file is in use");
+        let mut status = Status::failed_precondition("guest file is in use");
+        status.metadata_mut().insert(
+            ERROR_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(GUEST_FILE_IN_USE),
+        );
+        return status;
     }
     if e.kind() == io::ErrorKind::StorageFull {
         let mut status = Status::resource_exhausted("guest storage is full");

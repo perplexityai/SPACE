@@ -369,6 +369,27 @@ Stdin input and signals have no such protection, and resending them can
 deliver them twice. A sandbox at capacity still refuses before starting
 anything with `429` and `Retry-After`.
 
+`GET /files` starts its `200` once the guest sends the file's first bytes, or
+ends the read of an empty file, so a read that fails before then answers with
+that failure instead of an aborted body. It waits up to 120 seconds for the
+sandbox to open the read, then up to another 120 seconds for those first bytes
+or that end, so a response can take up to about four minutes. A directory
+answers `400` with the guest's reason, as envd answers it, except on a Windows
+guest, which cannot open a directory as a file and answers `403`. A FIFO and a
+socket also answer `400` with the guest's reason. On a Windows guest, a file
+that another process opened without sharing read access, or locked, answers
+`409` with the guest's reason; a file another process holds open but shares for
+reading is read as usual. Other failures keep their own status, such as `403`
+for a file the user may not read.
+
+While a release rolls out, a sandbox from an older template answers a FIFO or
+a socket with another error, and an older Windows template answers a file in
+use `400`. An older data plane answers a newer guest's FIFO or socket refusal
+`502` "Sandbox is not running". When the guest reports the failure on the
+read's stream rather than refusing the read, as it does for a directory and
+for a Windows file in use, an older data plane answers `200` and then aborts
+the body.
+
 `POST /files` accepts `multipart/form-data` and `application/octet-stream`
 uploads of up to 256 MiB per request, which the data plane streams to a spool
 file rather than holding in memory. For multipart, the 256 MiB includes part
