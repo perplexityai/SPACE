@@ -128,17 +128,19 @@ MNG through the cluster-controller drain reconciler, which evacuates each
 sandbox onto the target instead of evicting it. The target MNG declares a
 cohort taint that only evacuation pods tolerate. As each source node
 terminates, the script removes the taint from one Ready target node, which
-then accepts user creates; it always keeps `H` Ready target nodes tainted
+then accepts user creates. It aims to keep `H` Ready target nodes tainted
 for incoming evacuations, and untaints those last ones when the source is
-empty. The target module and taint are described in
-[`rollout-mng`](../../../infra/space/aws/eks/modules/rollout-mng/README.md).
+empty. `H` is intended headroom, not a guarantee: the drain gate counts
+every Ready target node, tainted or not, so it can start a drain while
+fewer than `H` of them are tainted. The target module and taint are
+described in [`rollout-mng`](../../../infra/space/aws/eks/modules/rollout-mng/README.md).
 
 The script's two knobs:
 
 - `K`, `--max-concurrent-node-drains`, caps how many source nodes drain at
   once.
-- `H`, `--headroom-count`, is the number of extra target nodes kept ahead of
-  the drains. The script requires `1 <= K <= H`.
+- `H`, `--headroom-count`, is the number of extra target nodes the script
+  aims to keep ahead of the drains. The script requires `1 <= K <= H`.
 
 The script holds the two groups' combined desired size at `N + H`, where
 `N` is the source's starting size: the target's desired size starts at `H`
@@ -148,17 +150,18 @@ a source terminate lowers the source at once and the target node takes
 time to become Ready.
 
 The target must carry the `space.pplx.net/rollout-cohort` taint and its
-matching node label, as `rollout-mng` declares them. The script refuses to
-start drains when target nodes lack the taint at startup, but it does not
-re-check the taints of target nodes that join later. For a custom-AMI node
-group, EKS applies node group taints after the node registers, unless the
+matching node label, as `rollout-mng` declares them. The script reads
+target taints on every tick. Its sanity check fails the run when target
+nodes lack the taint, except that on a resumed rollout it allows one
+untainted target node per source node already terminated. It repeats that
+check each tick only until it sees one tainted Ready target node, and does
+not re-check the taints of target nodes that join after that. For a
+custom-AMI node group, EKS applies node group taints after the node registers, unless the
 bootstrap passes them to kubelet with `--register-with-taints`; the shared
 worker bootstrap does not. A new target node can therefore accept a user
 pod before its taint arrives, and an operator check cannot close that
-window. Use a
-`rollout-mng` or
-`workers_rollout_cohorts` target. A `worker_capacity_groups` entry does not
-set either today, so it can be a rollout source but not a target.
+window. Use a `rollout-mng` or `workers_rollout_cohorts` target. A
+`worker_capacity_groups` entry does not set either today, so it can be a rollout source but not a target.
 
 The target must also be able to grow to `N + H`. A `rollout-mng` or
 `workers_rollout_cohorts` target takes its `max_size` from the caller. The
