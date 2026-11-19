@@ -1,21 +1,16 @@
 //! Starting a rollout: saving the exact reviewed revision and the fixed set
-//! of nodes that should receive it. A start adopts nothing and delivers
-//! nothing: the enrollment default stays as it was, and no assignment,
-//! observation, lease or wakeup is written. A completion that proves the
-//! rollout adopts its revision with [`adopt_rollout_revision`]; an abort
-//! leaves the default alone.
+//! of nodes that should receive it. A start adopts nothing and writes no
+//! assignment, observation, lease or wakeup; the completion that proves the
+//! rollout adopts it with [`adopt_rollout_revision`].
 //!
-//! Firewall writers serialize on the `firewall_rules_control` row, locked
-//! first. A start then checks the slot, freezes its targets, and inserts the
-//! revision, the header and the items. An enrollment writer must lock the
-//! row `FOR SHARE` or stronger before it enrolls a node, so a node is either
-//! in a start's targets or enrolled after that start commits. A start locks
-//! no existing header or item, and the lease, renewal and operator verbs
-//! never take the control row, so none of them waits on a start in a cycle.
+//! Firewall writers lock the `firewall_rules_control` row first. An
+//! enrollment writer must lock it `FOR SHARE` or stronger, so a node is
+//! either in a start's targets or enrolled after the start commits. A start
+//! locks no existing header or item, and leasing, renewal and the operator
+//! verbs never take the control row, so none waits on a start in a cycle.
 //!
-//! A lost response is an unknown outcome. Nothing records a receipt or
-//! retries; repeating a start while the first is unfinished is refused by
-//! the slot.
+//! A lost response is an unknown outcome: there's no receipt or retry, and a
+//! repeated start is refused by the slot while the first is unfinished.
 
 use std::fmt;
 
@@ -30,9 +25,6 @@ use crate::{ItemPhase, RevisionId, RolloutId, end_transaction, rollout_phase};
 
 #[cfg(test)]
 mod tests;
-
-/// The unique key that admits one unfinished rollout per database.
-const UNFINISHED_SLOT_KEY: &str = "firewall_rules_rollouts_unfinished_slot_key";
 
 /// The enrollment default a start expects, or the one it found. Neither is a
 /// wildcard: [`Self::NoRevision`] matches only an unset default.
@@ -120,7 +112,7 @@ impl StartError {
     fn from_header_insert(error: sqlx::Error) -> Self {
         if let sqlx::Error::Database(db) = &error
             && db.is_unique_violation()
-            && db.constraint() == Some(UNFINISHED_SLOT_KEY)
+            && db.constraint() == Some("firewall_rules_rollouts_unfinished_slot_key")
         {
             return Self::RolloutInProgress;
         }
@@ -302,14 +294,13 @@ pub enum AdoptError {
     Database(#[from] sqlx::Error),
 }
 
-/// Make `rollout`'s revision the enrollment default within the caller's
+/// Make `rollout`'s revision the enrollment default in the caller's
 /// transaction, which this neither commits nor rolls back. For the
-/// completion that has proved the rollout: it must also finish the header
-/// in the same transaction, after this, since a finished rollout is never
-/// adopted and so an aborted or superseded one can't roll the default back.
-/// Locks the control row, then the header, as a start does, so call it
+/// completion that proved the rollout, which then finishes the header in
+/// the same transaction. Locks the control row, then the header, so call it
 /// before locking the header. `None`, writing nothing, when the rollout is
-/// missing or finished: then don't complete.
+/// missing or finished (an aborted or superseded revision is never
+/// adopted): then don't complete.
 pub async fn adopt_rollout_revision(
     tx: &mut Transaction<'_, Postgres>,
     rollout: RolloutId,

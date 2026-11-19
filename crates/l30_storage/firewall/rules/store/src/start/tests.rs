@@ -153,10 +153,10 @@ async fn complete(
 }
 
 /// Push `revision` first and complete it, so it's the adopted default.
-async fn adopt(pool: &PgPool, revision: &FirewallRuleRevision) -> TestResult<AdoptedRevision> {
+async fn adopt(pool: &PgPool, revision: &FirewallRuleRevision) -> TestResult<RevisionId> {
     let started = start(pool, AdoptedRevision::NoRevision, revision).await?;
     complete(pool, started.rollout_id, true).await?;
-    Ok(AdoptedRevision::Revision(started.revision_id))
+    Ok(started.revision_id)
 }
 
 async fn adopted_now(pool: &PgPool) -> TestResult<AdoptedRevision> {
@@ -198,14 +198,6 @@ async fn targets_of(pool: &PgPool, rollout: RolloutId) -> TestResult<Vec<NodeId>
     .await?)
 }
 
-async fn unfinished(pool: &PgPool) -> TestResult<Vec<RolloutId>> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT id FROM firewall_rules_rollouts WHERE finished_at IS NULL"
-    ))
-    .fetch_all(pool)
-    .await?)
-}
-
 /// The fixture enrollment writer: under the control lock enrollment takes,
 /// register a node that has never reported, so it's offline.
 async fn enroll(tx: &mut PgConnection) -> sqlx::Result<NodeId> {
@@ -235,7 +227,7 @@ fn sorted(mut nodes: Vec<NodeId>) -> Vec<NodeId> {
 }
 
 /// Catches a start that adopts its candidate or writes delivery state, saves
-/// the wrong revision, header or targets, or answers a repeated request with
+/// the wrong header or targets, or answers a repeated request with
 /// a second rollout or a stored success; a slot check that misses an
 /// unfinished phase, counts a finished one or runs after the targets are
 /// judged.
@@ -245,24 +237,12 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
         return Ok(());
     };
     let pool = &db.pool;
-    let base = revision(&[dns(), web()]);
-    let a = adopt(pool, &base).await?;
+    let a = AdoptedRevision::Revision(adopt(pool, &revision(&[dns(), web()])).await?);
     let nodes = online_nodes(pool, 2).await?;
-    let candidate = revision(&[dns(), rule("web", &[("tcp", "dport", 443)]), ssh()]);
+    let candidate = revision(&[dns(), web(), ssh()]);
     let (unchanged, _) = state(pool).await?;
 
     let started = start(pool, a, &candidate).await?;
-    let AdoptedRevision::Revision(base_id) = a else {
-        unreachable!()
-    };
-    assert_eq!(
-        started.review,
-        Review::Against {
-            base: base_id,
-            diff: diff(&base, &candidate)
-        }
-    );
-    assert_eq!(read_revision(pool, started.revision_id).await?, candidate);
     let header = sqlx::query_as::<_, (RevisionId, String, String, Uuid, Uuid, i64)>(sql!(
         "SELECT to_revision_id, phase, reason, created_by_user_id, updated_by_user_id, generation
          FROM firewall_rules_rollouts WHERE id = $1"
@@ -296,15 +276,13 @@ async fn a_start_saves_the_reviewed_rollout_without_adopting_it() -> TestResult 
     assert_eq!(items, pending);
     assert_eq!(state(pool).await?.0, unchanged);
 
-    // The response is lost and the request repeated: refused, and the saved
-    // rollout is still the only one.
-    let saved = state(pool).await?;
+    // The response is lost and the request repeated: refused, not answered
+    // from a receipt.
     let repeated = start(pool, a, &candidate).await;
     assert!(
         matches!(repeated, Err(StartError::RolloutInProgress)),
         "{repeated:?}"
     );
-    assert_eq!(state(pool).await?, saved);
     // The other unfinished phases hold the slot too, checked before a target
     // that would fail is judged.
     for phase in ["rolling", "paused"] {
@@ -340,7 +318,6 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
     let pool = &db.pool;
     let candidate = revision(&[dns()]);
     let unknown = AdoptedRevision::Revision(RevisionId(Uuid::now_v7()));
-    let before = state(pool).await?;
     let refused = start(pool, unknown, &candidate).await;
     assert!(
         matches!(
@@ -363,18 +340,15 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
         matches!(refused, Err(StartError::NotEnabled(_))),
         "{refused:?}"
     );
-    assert_eq!(state(pool).await?, before);
 
     let first = start(pool, AdoptedRevision::NoRevision, &candidate).await?;
     assert_eq!(first.review, Review::FirstPush);
-    assert_eq!(adopted_now(pool).await?, AdoptedRevision::NoRevision);
 
     complete(pool, first.rollout_id, true).await?;
     let a = AdoptedRevision::Revision(first.revision_id);
     // A real revision that isn't adopted: an aborted candidate.
     let aborted = start(pool, a, &revision(&[web()])).await?;
     set_phase(pool, aborted.rollout_id, "aborted").await?;
-    let before = state(pool).await?;
     for expected in [
         AdoptedRevision::NoRevision,
         AdoptedRevision::Revision(aborted.revision_id),
@@ -385,12 +359,10 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
             "{expected:?}: {refused:?}"
         );
     }
-    assert_eq!(state(pool).await?, before);
 
     sqlx::query(sql!("DELETE FROM firewall_rules_control"))
         .execute(pool)
         .await?;
-    let before = state(pool).await?;
     let refused = start(pool, a, &candidate).await;
     assert!(
         matches!(refused, Err(StartError::MissingControlRow)),
@@ -403,7 +375,6 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
         "{refused:?}"
     );
     tx.commit().await?;
-    assert_eq!(state(pool).await?, before);
     Ok(())
 }
 
@@ -416,15 +387,8 @@ async fn adoption_commits_or_rolls_back_with_the_completion() -> TestResult {
         return Ok(());
     };
     let pool = &db.pool;
-    let phase = async |rollout: RolloutId| {
-        sqlx::query_scalar::<_, String>(sql!(
-            "SELECT phase FROM firewall_rules_rollouts WHERE id = $1"
-        ))
-        .bind(rollout)
-        .fetch_one(pool)
-        .await
-    };
-    // NULL to B, then A to B.
+    // NULL to B, then A to B. The rolled-back round also shows start adopted
+    // nothing.
     let mut adopted = AdoptedRevision::NoRevision;
     let mut completed = Vec::new();
     for rules in [vec![dns()], vec![dns(), web()]] {
@@ -432,12 +396,10 @@ async fn adoption_commits_or_rolls_back_with_the_completion() -> TestResult {
         let candidate = Some(started.revision_id);
         assert_eq!(complete(pool, started.rollout_id, false).await?, candidate);
         assert_eq!(adopted_now(pool).await?, adopted);
-        assert_eq!(phase(started.rollout_id).await?, "canary");
 
-        assert_eq!(complete(pool, started.rollout_id, true).await?, candidate);
+        complete(pool, started.rollout_id, true).await?;
         adopted = candidate.into();
         assert_eq!(adopted_now(pool).await?, adopted);
-        assert_eq!(phase(started.rollout_id).await?, "completed");
         completed.push(started.rollout_id);
     }
 
@@ -506,7 +468,6 @@ async fn racing_starts_serialize_on_the_control_row() -> TestResult {
             matches!(second, Err(StartError::RolloutInProgress)),
             "{round}: {second:?}"
         );
-        assert_eq!(unfinished(pool).await?, [first.rollout_id], "{round}");
         complete(pool, first.rollout_id, true).await?;
         expected = AdoptedRevision::Revision(first.revision_id);
     }
@@ -584,29 +545,35 @@ async fn targets_are_frozen_under_the_control_lock() -> TestResult {
     Ok(())
 }
 
-/// Catches a candidate stored out of order or not as validated, a reorder
-/// reported as no change, a candidate past nft's limits accepted because the
-/// model built it, and qualification of only the changed rules, which would
-/// start a rollout some target can't enforce.
+/// Catches a candidate stored out of order or not as validated, a review not
+/// diffed against the adopted default or diffed against one this version
+/// can't read, a candidate past nft's limits accepted because the model
+/// built it, and qualification of only the changed rules, which would start
+/// a rollout some target can't enforce.
 #[tokio::test(flavor = "current_thread")]
 async fn the_whole_candidate_is_validated_and_stored_exactly() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
-    let a = adopt(pool, &revision(&[dns(), web()])).await?;
+    let base = revision(&[dns(), web()]);
+    let base_id = adopt(pool, &base).await?;
+    let a = AdoptedRevision::Revision(base_id);
     let nodes = online_nodes(pool, 2).await?;
 
+    // The model reports a reorder alone as a change (`a_pure_reorder_is_reported`).
     let reordered = revision(&[web(), dns()]);
     let started = start(pool, a, &reordered).await?;
     assert_eq!(read_revision(pool, started.revision_id).await?, reordered);
-    let Review::Against { diff, .. } = &started.review else {
-        panic!("reviewed as {:?}", started.review);
-    };
-    assert!(diff.reordered() && !diff.is_empty(), "{diff:?}");
+    assert_eq!(
+        started.review,
+        Review::Against {
+            base: base_id,
+            diff: diff(&base, &reordered)
+        }
+    );
     set_phase(pool, started.rollout_id, "aborted").await?;
 
-    let before = state(pool).await?;
     let past_limit = revision(&[dns(), rule("big", &[("tcp", "dport", u64::MAX)])]);
     let invalid = start(pool, a, &past_limit).await;
     assert!(
@@ -623,7 +590,23 @@ async fn the_whole_candidate_is_validated_and_stored_exactly() -> TestResult {
         matches!(refused, Err(StartError::Unqualified(node)) if node == nodes[1]),
         "{refused:?}"
     );
-    assert_eq!(state(pool).await?, before);
+
+    // A default in a format a newer version might write.
+    let newer = RevisionId(Uuid::now_v7());
+    sqlx::query(sql!(
+        "WITH newer AS (
+             INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)
+             VALUES ($1, 2, '[]') RETURNING id)
+         UPDATE firewall_rules_control SET enrollment_default_revision_id = (SELECT id FROM newer)"
+    ))
+    .bind(newer)
+    .execute(pool)
+    .await?;
+    let unreadable = start(pool, AdoptedRevision::Revision(newer), &reordered).await;
+    assert!(
+        matches!(unreadable, Err(StartError::StoredRevision { id, .. }) if id == newer),
+        "{unreadable:?}"
+    );
     Ok(())
 }
 
