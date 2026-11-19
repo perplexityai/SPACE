@@ -51,6 +51,16 @@ fn sandbox_artifact_metadata_in(
     }
 }
 
+/// The guest memory a sandbox's activation recorded on the node, if its
+/// artifact metadata names one.
+#[cfg(test)]
+pub(super) fn sandbox_guest_memory(sandbox_id: &str) -> Option<pplx_space_byte_size::MemorySize> {
+    sandbox_artifact_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
+        .ok()
+        .flatten()
+        .and_then(|metadata| metadata.guest_memory)
+}
+
 pub(super) fn sandbox_execution_metadata(
     sandbox_id: &str,
 ) -> Result<pplx_space_execution_spec::ExecutionMetadata, RuntimeArtifactReadError> {
