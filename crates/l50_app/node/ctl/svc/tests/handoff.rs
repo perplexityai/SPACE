@@ -51,6 +51,30 @@ fn nodectl_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_space-nodectl-svc")))
 }
 
+/// Where a node's files live: under /dev/shm, normally a tmpfs, when a
+/// directory can be made there. Each instance migrates the node's SQLite
+/// database as it activates, and SQLite fsyncs every commit; on a CI runner
+/// whose disk the rest of the suite is writing to, migrating a fresh
+/// database took most of a second and the activations of one test added up
+/// to several. On a tmpfs an fsync is a no-op. Nothing a test observes
+/// depends on the filesystem: flocks, socket inodes, peer credentials and
+/// exit statuses behave the same on tmpfs. A node takes under 1 MB, but a CI
+/// container's /dev/shm can be as small as 64 MiB, so large fixtures must
+/// not go there.
+fn node_dir() -> tempfile::TempDir {
+    const TMPFS: &str = "/dev/shm";
+    tempfile::Builder::new()
+        .prefix("nodectl-handoff-")
+        .tempdir_in(TMPFS)
+        .or_else(|error| {
+            // Without a tmpfs the test still works, only slower on a busy
+            // disk; say why, so a slow run can be diagnosed.
+            eprintln!("cannot make a node directory in {TMPFS} ({error}); using the default temporary directory");
+            tempfile::tempdir()
+        })
+        .expect("tempdir")
+}
+
 /// One simulated node: the production socket, database and service mutex
 /// that every instance started from it shares.
 struct Node {
@@ -63,7 +87,7 @@ struct Node {
 
 impl Node {
     fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = node_dir();
         // The production socket's group must be one this test's user can give
         // it without privilege: its own effective group.
         let socket_group = nix::unistd::Group::from_gid(nix::unistd::getegid())
@@ -560,7 +584,9 @@ async fn passive_instance_exits_cleanly_on_sigterm() {
 
 #[tokio::test]
 async fn successor_fails_visibly_behind_a_stuck_predecessor() {
-    const MUTEX_BUDGET: Duration = Duration::from_secs(2);
+    // The shortest non-zero budget the whole-second flag can express, so
+    // the wait stays well inside the suite's per-test time limit.
+    const MUTEX_BUDGET: Duration = Duration::from_secs(1);
 
     let node = Node::new();
     let a = node.start("a");
