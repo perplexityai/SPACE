@@ -750,18 +750,14 @@ async fn a_lease_runs_on_the_database_clock() -> TestResult {
     pending_on(&db, campaign, None, 1).await?;
     // Inside a transaction whose now() is a tenth of a second old, a lease
     // on the transaction clock would end before an hour from the lease.
-    // Instants in whole microseconds, Postgres's resolution, so the renewal
-    // bounds compare exactly.
+    // Instants in whole microseconds, Postgres's resolution, so the bounds
+    // compare exactly.
     let mut caller = db.pool.begin().await?;
     let started = sqlx::query_scalar::<_, i64>(sql!(
         "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::int8 FROM pg_sleep(0.1)"
     ))
     .fetch_one(&mut *caller)
     .await?;
-    // Longer than MAX_LEASE: clamped.
-    let leased = lease_items(&mut *caller, campaign, Duration::from_secs(10 * 3600), SCAN)
-        .await?
-        .remove(0);
     let expires_at = async |caller: &mut sqlx::PgConnection| {
         sqlx::query_scalar::<_, i64>(sql!(
             "SELECT (extract(epoch FROM lease_expires_at) * 1000000)::int8
@@ -778,14 +774,18 @@ async fn a_lease_runs_on_the_database_clock() -> TestResult {
         .fetch_one(caller)
         .await
     };
+    // Longer than MAX_LEASE: clamped.
+    let leased = lease_items(&mut *caller, campaign, Duration::from_secs(10 * 3600), SCAN)
+        .await?
+        .remove(0);
+    let leased_by = clock(&mut caller).await?;
     let expires = expires_at(&mut caller).await?;
     // An hour, the documented bound.
     assert_eq!(MAX_LEASE, Duration::from_secs(3600));
     let hour = 3_600_000_000;
-    let remaining = expires - started;
     assert!(
-        (hour..hour + 60_000_000).contains(&remaining),
-        "lease runs {remaining}us from a clock read just before it"
+        (started + hour..=leased_by + hour).contains(&expires),
+        "lease expires at {expires}us, not an hour after a clock read in [{started}, {leased_by}]us"
     );
     // A renewal is clamped the same way, and writes a new expiry: from a
     // shorter live lease, one that writes nothing stays a minute out.
