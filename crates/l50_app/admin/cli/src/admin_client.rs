@@ -201,7 +201,10 @@ impl AdminClient {
                 "could not parse /admin/api/v1/warm-pools response: {err}"
             ))
         })?;
-        Ok(render_warm_pool_config(&config))
+        Ok(render_warm_pool_config(
+            &config,
+            &format!("PUT {ADMIN_API_PREFIX}/warm-pools"),
+        ))
     }
 
     pub(crate) async fn list_warm_pools(&self, json: bool) -> Result<String, CliError> {
@@ -209,12 +212,7 @@ impl AdminClient {
         if json {
             return Ok(pretty_json_or_raw(&body));
         }
-        let configs: Vec<WarmPoolConfigResponse> = serde_json::from_str(&body).map_err(|err| {
-            CliError::Decode(format!(
-                "could not parse /admin/api/v1/warm-pools response: {err}"
-            ))
-        })?;
-        Ok(render_warm_pool_table(&configs))
+        Ok(render_warm_pool_table(&decode_warm_pools(&body)?))
     }
 
     pub(crate) async fn get_warm_pool(
@@ -222,18 +220,43 @@ impl AdminClient {
         pool_ref: &str,
         json: bool,
     ) -> Result<String, CliError> {
-        let body = self.get(&warm_pools_url(&self.base_url)).await?;
-        let configs: Vec<WarmPoolConfigResponse> = serde_json::from_str(&body).map_err(|err| {
-            CliError::Decode(format!(
-                "could not parse /admin/api/v1/warm-pools response: {err}"
-            ))
-        })?;
+        let configs = decode_warm_pools(&self.get(&warm_pools_url(&self.base_url)).await?)?;
         let config = resolve_warm_pool_ref(pool_ref, &configs)?;
         if json {
             return serde_json::to_string_pretty(config)
                 .map_err(|err| CliError::Decode(format!("could not encode warm pool: {err}")));
         }
-        Ok(render_warm_pool_config(config))
+        Ok(render_warm_pool_config(
+            config,
+            &format!("GET {ADMIN_API_PREFIX}/warm-pools"),
+        ))
+    }
+
+    /// Disable one warm-pool config through
+    /// `DELETE /admin/api/v1/warm-pools/{pool_id}`. `pool_ref` must be the
+    /// config's full UUID (see [`parse_warm_pool_id`]); the server disables
+    /// that one row and returns it, or answers 404 when no config has the ID.
+    pub(crate) async fn disable_warm_pool(
+        &self,
+        pool_ref: &str,
+        json: bool,
+    ) -> Result<String, CliError> {
+        let id = parse_warm_pool_id(pool_ref)?;
+        let body = self
+            .send(self.http.delete(warm_pool_url(&self.base_url, id)))
+            .await?;
+        if json {
+            return Ok(body);
+        }
+        let config: WarmPoolConfigResponse = serde_json::from_str(&body).map_err(|err| {
+            CliError::Decode(format!(
+                "could not parse /admin/api/v1/warm-pools/{{pool_id}} response: {err}"
+            ))
+        })?;
+        Ok(render_warm_pool_config(
+            &config,
+            &format!("DELETE {ADMIN_API_PREFIX}/warm-pools/{id}"),
+        ))
     }
 
     /// Send `request` with a 30-second budget and return its pretty-printed
@@ -523,6 +546,11 @@ pub(crate) fn single_node_url(base_url: &str, node: &str, diagnostics: bool) -> 
 pub(crate) fn warm_pools_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     format!("{base}{ADMIN_API_PREFIX}/warm-pools")
+}
+
+/// Build `{base}/admin/api/v1/warm-pools/{pool_id}`.
+pub(crate) fn warm_pool_url(base_url: &str, pool_id: Uuid) -> String {
+    format!("{}/{pool_id}", warm_pools_url(base_url))
 }
 
 /// Build `{base}/admin/api/v1/nodes` with the optional list filters appended as
@@ -930,7 +958,16 @@ pub(crate) struct WarmPoolConfigResponse {
     pub(crate) updated_at: String,
 }
 
-pub(crate) fn render_warm_pool_config(config: &WarmPoolConfigResponse) -> String {
+fn decode_warm_pools(body: &str) -> Result<Vec<WarmPoolConfigResponse>, CliError> {
+    serde_json::from_str(body).map_err(|err| {
+        CliError::Decode(format!(
+            "could not parse /admin/api/v1/warm-pools response: {err}"
+        ))
+    })
+}
+
+/// Render `config` with `endpoint` naming the call that produced it.
+pub(crate) fn render_warm_pool_config(config: &WarmPoolConfigResponse, endpoint: &str) -> String {
     let fields: [(&str, String); 17] = [
         ("ID", config.id.to_string()),
         ("Template Release", config.template_release_id.to_string()),
@@ -948,7 +985,7 @@ pub(crate) fn render_warm_pool_config(config: &WarmPoolConfigResponse) -> String
         ("Claimed Slots", config.claimed_slots.to_string()),
         ("Created At", config.created_at.clone()),
         ("Updated At", config.updated_at.clone()),
-        ("Endpoint", "PUT /admin/api/v1/warm-pools".to_string()),
+        ("Endpoint", endpoint.to_string()),
     ];
     let width = fields
         .iter()
@@ -1039,6 +1076,21 @@ pub(crate) fn resolve_warm_pool_ref<'a>(
             )))
         }
     }
+}
+
+/// Parse `pool_ref` as the full UUID of one config. Prefixes and template
+/// references are refused: config IDs are UUIDv7, so configs created close
+/// together share their leading characters, and a prefix that names one
+/// config today can name another after the first is deleted.
+pub(crate) fn parse_warm_pool_id(pool_ref: &str) -> Result<Uuid, CliError> {
+    let trimmed = pool_ref.trim();
+    Uuid::parse_str(trimmed).map_err(|_| {
+        CliError::Argument(format!(
+            "{trimmed:?} is not a full warm-pool config UUID; find it with \
+             `warm-pool get <id-prefix|template-reference> --json` or \
+             `warm-pool list --json`"
+        ))
+    })
 }
 
 fn template_reference_matches(
