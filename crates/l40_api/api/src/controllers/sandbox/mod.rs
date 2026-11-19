@@ -39,8 +39,7 @@ use pplx_space_semver::SemVer;
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
 use pplx_space_template_model::{
-    DEFAULT_TEMPLATE_TAG, TemplateDesiredState, TemplateName, TemplateReference, TemplateTag,
-    TemplateVisibility,
+    TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
@@ -339,32 +338,12 @@ async fn resolve_template_release(
     let tag = template
         .tag()
         .ok_or_else(|| ControllerError::bad_request("template must use a tag or full digest"))?;
-    let runtime_alias = runtime.alias();
+    // An unknown tag is a miss, never another tag's release: running `latest`
+    // in its place would boot something the caller did not ask for.
     if let Some(release) =
         resolve_template_release_by_tag(pool, template.name(), tag, runtime, caller_org).await?
     {
         return Ok(release);
-    }
-
-    if tag.as_str() != DEFAULT_TEMPLATE_TAG {
-        tracing::warn!(
-            template_name_len = template_name.len(),
-            runtime = runtime_alias,
-            requested_tag_len = tag.as_str().len(),
-            fallback_tag = DEFAULT_TEMPLATE_TAG,
-            "template tag not found; falling back to latest",
-        );
-        if let Some(release) = resolve_template_release_by_tag(
-            pool,
-            template.name(),
-            &TemplateTag::latest(),
-            runtime,
-            caller_org,
-        )
-        .await?
-        {
-            return Ok(release);
-        }
     }
 
     Err(release_miss(pool, template, runtime, caller_org, access, miss_report).await?)
