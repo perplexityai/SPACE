@@ -55,7 +55,7 @@ pub fn open_writer(db_path: &Path) -> Result<Connection, OpenError> {
 
 /// Refuses a connection whose effective settings are weaker than WAL and FULL,
 /// since SQLite can leave a requested journal mode unchanged without an error.
-pub fn require_durable(conn: &Connection) -> Result<(), OpenError> {
+pub(crate) fn require_durable(conn: &Connection) -> Result<(), OpenError> {
     let journal_mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
         return Err(OpenError::NotDurable {

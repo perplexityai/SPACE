@@ -47,10 +47,10 @@ pub enum Acceptance {
 pub enum AcceptError {
     #[error("assignment is for node {incoming}, not this node {expected}")]
     WrongNode { expected: NodeId, incoming: NodeId },
+    /// Permanent for this database: a node that keeps its disk under a new
+    /// `NodeId` recovers only by deleting the assignment row, which the caller owns.
     #[error("accepted assignments are bound to node {bound}, not {expected}")]
     BoundToOtherNode { bound: NodeId, expected: NodeId },
-    #[error("assignment generation {0} is too large to store")]
-    GenerationOutOfRange(u64),
     #[error(transparent)]
     InvalidRevision(#[from] DecodeError),
     #[error("assignment generation {incoming} is older than accepted generation {accepted}")]
@@ -82,6 +82,9 @@ impl FirewallAssignments {
     /// Opens the store in node-manager's migrated database with its own
     /// durable writer, and loads the accepted assignment. Open one per
     /// database: the mutex serializes acceptance only within an instance.
+    /// A stored document that fails strict decoding, such as a newer
+    /// `schema_version` after a rollback, returns [`OpenError::Record`]; the
+    /// caller decides whether that means no accepted assignment or refusing to start.
     pub fn open(db_path: &Path) -> Result<Self, OpenError> {
         let writer = store::open_writer(db_path)?;
         let current = store::read(&writer)?
@@ -118,9 +121,6 @@ impl FirewallAssignments {
                 incoming: incoming.node_id,
             });
         }
-        if i64::try_from(incoming.generation).is_err() {
-            return Err(AcceptError::GenerationOutOfRange(incoming.generation));
-        }
         let revision = decode_revision(incoming.document)?;
         let row = AssignmentRow {
             node_id: expected_node,
@@ -156,21 +156,24 @@ impl FirewallAssignments {
         }
         store::replace(&tx, &row)?;
         tx.commit()?;
-        self.publish(
-            &writer,
-            DesiredAssignment {
-                node_id: row.node_id,
-                generation: row.generation,
-                revision_id: row.revision_id,
-                revision,
-            },
-        );
+        self.publish(DesiredAssignment {
+            node_id: row.node_id,
+            generation: row.generation,
+            revision_id: row.revision_id,
+            revision,
+        });
         Ok(Acceptance::Committed)
     }
 
-    /// Takes the locked writer so that publication stays serialized with the
-    /// commit: otherwise an older generation could publish over a newer one.
-    fn publish(&self, _locked_writer: &Connection, assignment: DesiredAssignment) {
-        self.current.store(Some(Arc::new(assignment)));
+    /// Moves the published assignment only to a higher generation, so an older
+    /// one can never replace a newer one.
+    fn publish(&self, assignment: DesiredAssignment) {
+        let assignment = Arc::new(assignment);
+        self.current.rcu(|current| match current {
+            Some(current) if current.generation >= assignment.generation => {
+                Some(Arc::clone(current))
+            }
+            _ => Some(Arc::clone(&assignment)),
+        });
     }
 }

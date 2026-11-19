@@ -242,7 +242,7 @@ fn refused_assignments_change_nothing() {
                 Err(AcceptError::InvalidRevision(
                     DecodeError::UnsupportedSchemaVersion(2)
                 )),
-                Err(AcceptError::GenerationOutOfRange(_)),
+                Err(AcceptError::Storage(_)),
             ]
         ),
         "{refusals:?}"
