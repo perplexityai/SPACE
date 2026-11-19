@@ -11,6 +11,7 @@ use super::{FAMILY, TABLE, TableConstruction};
 
 /// What nft reported for one submission, which is not what Linux holds.
 #[derive(Debug)]
+#[must_use = "read the table back to verify"]
 pub enum InstallOutcome {
     /// nft reported that the whole transaction committed.
     Committed,
@@ -62,14 +63,33 @@ fn outcome(result: std::io::Result<Output>) -> InstallOutcome {
         // nft exits 1 when it reports a failure; any other exit, such as a
         // signal, is no report at all.
         Ok(output) if output.status.code() == Some(1) => InstallOutcome::Rejected {
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            stderr: stderr(&output),
         },
         Ok(output) => InstallOutcome::Unknown {
-            error: std::io::Error::other(format!("nft ended with {}", output.status)),
+            error: std::io::Error::other(format!(
+                "nft ended with {}: {}",
+                output.status,
+                stderr(&output)
+            )),
         },
         // The error does not say whether nft received the batch.
         Err(error) => InstallOutcome::Unknown { error },
     }
+}
+
+/// nft's trimmed stderr, cut to a size an error message can carry.
+fn stderr(output: &Output) -> String {
+    const LIMIT: usize = 4096;
+    let mut text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if text.len() > LIMIT {
+        let mut end = LIMIT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
 }
 
 #[cfg(test)]

@@ -156,7 +156,7 @@ fn timeout_after_dispatch_is_unknown_and_reaps_the_child() {
         &udp_port(53),
         &pinned(&target),
         fake.to_str().unwrap(),
-        Duration::from_secs(2),
+        Duration::from_millis(500),
     );
     let InstallOutcome::Unknown { error } = outcome else {
         panic!("expected Unknown, got {outcome:?}");
