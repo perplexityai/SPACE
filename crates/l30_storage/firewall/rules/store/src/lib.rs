@@ -10,3 +10,9 @@
 //! * `firewall_rules_node_observations`: each node's accepted observations.
 //! * `firewall_rules_mutation_receipts`: idempotent responses to operator
 //!   requests.
+
+mod fingerprint;
+mod receipt;
+
+pub use fingerprint::{MutationRequest, RequestFingerprint};
+pub use receipt::{Claim, ReceiptRequest, claim_receipt, insert_receipt};

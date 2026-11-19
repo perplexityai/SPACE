@@ -6101,6 +6101,17 @@ dependencies = [
 [[package]]
 name = "pplx-space-firewall-rules-store"
 version = "0.8.2"
+dependencies = [
+ "hex",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "pplx-space-grpc-lb"
