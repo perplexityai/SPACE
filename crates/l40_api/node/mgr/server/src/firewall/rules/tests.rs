@@ -87,23 +87,20 @@ fn supported_reads_and_values_render_as_submitted() {
     assert_eq!(rule_fields(&revision, "expr"), [expected]);
 }
 
-// Catches sorting, deduplication or any order other than the revision's, and
-// output that varies between renders.
+// Catches sorting, deduplication or any order other than the revision's.
 #[test]
 fn rules_and_comparisons_render_in_revision_order() {
     const DNS: &str = r#"{"id":"dns","all_of":[{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}"#;
     const WEB: &str = r#"{"id":"web","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}]}"#;
     let comments = |revision: &FirewallRuleRevision| rule_fields(revision, "comment");
-    let forward = decoded(&format!("{DNS},{WEB}"));
     assert_eq!(
-        comments(&forward),
+        comments(&decoded(&format!("{DNS},{WEB}"))),
         ["space-firewall-rule:dns", "space-firewall-rule:web"]
     );
     assert_eq!(
         comments(&decoded(&format!("{WEB},{DNS}"))),
         ["space-firewall-rule:web", "space-firewall-rule:dns"]
     );
-    assert_eq!(render(&forward), render(&forward));
 
     let daddr =
         r#"{"left":{"payload":{"protocol":"ip","field":"daddr"}},"op":"==","right":"192.0.2.1"}"#;

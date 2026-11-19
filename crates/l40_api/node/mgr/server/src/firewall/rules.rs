@@ -8,9 +8,8 @@ use serde_json::{Value, json};
 const FAMILY: &str = "ip";
 const TABLE: &str = "space_firewall_rules";
 const CHAIN: &str = "guest_drop";
-// After conntrack (-200) and ahead of the baseline pre-TPROXY guardrails (-175).
-const PRIORITY: i32 = -176;
-const GUEST_IFNAME: &str = "tap0";
+// After conntrack (-200) and just ahead of the baseline pre-TPROXY guardrails.
+const PRIORITY: i32 = super::PRE_TPROXY_GUARDRAILS_PRIO - 1;
 
 /// The comment that ties an installed rule to its reviewed ID. `RuleId` admits
 /// no `:`, so the prefix never collides with an ID.
@@ -20,7 +19,7 @@ fn rule_comment(id: &RuleId) -> String {
 
 /// The ordered nft JSON commands that construct the owned table. Built only by
 /// [`render`], so no caller can pass raw JSON in its place.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct TableConstruction(Vec<Value>);
 
 impl TableConstruction {
@@ -38,7 +37,7 @@ pub fn render(revision: &FirewallRuleRevision) -> TableConstruction {
     }}});
     let rules = revision.rules().iter().map(|rule| {
         let guard = json!({"match": {
-            "left": {"meta": {"key": "iifname"}}, "op": "==", "right": GUEST_IFNAME,
+            "left": {"meta": {"key": "iifname"}}, "op": "==", "right": crate::net::TAP_DEVICE,
         }});
         let comparisons = rule
             .all_of()
