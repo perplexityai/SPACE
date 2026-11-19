@@ -63,6 +63,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_STUCK_CONTAINER_CREATING_GC_MAX_DELETES_PER_MINUTE` | built-in | |
 | `SPACE_WARM_POOL_ORPHAN_GC_ENABLED` | off | Runs dry by default. |
 | `SPACE_ORPHANED_RESTORE_POD_GC_ENABLED` | off | |
+| `SPACE_ORPHANED_RESTORE_POD_GC_TERMINAL_PODS` | off | Also deletes `Succeeded` or `Failed` sandbox pods outside the warm pool whose sandbox was deleted, or is `suspended` with no active execution: the pods an idle or timeout delete or suspend leaves behind. Takes effect only with `SPACE_ORPHANED_RESTORE_POD_GC_ENABLED`, and only reports while `SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN` is on. |
 | `SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN` | true | Classifies and reports orphaned restore pods without deleting them. Only `0`, `false`, `False` or `FALSE` turns it off; any other value keeps it on. |
 | `SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS`, `SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS` | 60, 45 | Tick cadence and per-tick time budget. A budget at or above the interval lets ticks run back to back. Seconds; a value above one day clamps to it, and `0` or a non-number keeps the default. |
 | `SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS` | 300 | How long a pod must stay superseded before it's deleted. Seconds; a value above one day clamps to it, and `0` or a non-number keeps the default. |

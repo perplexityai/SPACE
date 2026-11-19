@@ -268,6 +268,18 @@ fn restore_pod(
         node_name: node.map(str::to_string),
         terminating: false,
         is_restore: true,
+        terminal: false,
+        warm_pool: false,
+    }
+}
+
+/// A fresh-create pod whose VM has exited: phase `Succeeded`, no restore
+/// annotation, outside the warm pool.
+fn terminal_pod(name: &str, uid: &str, sandbox_id: SandboxId) -> RestorePodSnapshot {
+    RestorePodSnapshot {
+        is_restore: false,
+        terminal: true,
+        ..restore_pod(name, uid, sandbox_id, Some("node-1"))
     }
 }
 
@@ -305,6 +317,7 @@ fn retired_state(lifecycle: SandboxLifecycle, replaced: bool) -> SandboxRestoreS
 fn config(dry_run: bool) -> ReconcilerConfig {
     ReconcilerConfig {
         enabled: true,
+        terminal_pods: false,
         dry_run,
         interval: Duration::from_secs(60),
         threshold: PositiveDuration::new_panic(Duration::from_secs(300)),
@@ -340,6 +353,7 @@ fn config_from(vars: &[(&str, &str)]) -> ReconcilerConfig {
 fn config_defaults_to_disabled_dry_run() {
     let config = config_from(&[]);
     assert!(!config.enabled);
+    assert!(!config.terminal_pods);
     assert!(config.dry_run);
     assert_eq!(config, ReconcilerConfig::default());
 }
@@ -348,6 +362,7 @@ fn config_defaults_to_disabled_dry_run() {
 fn config_reads_every_variable_from_the_environment() {
     let config = config_from(&[
         ("SPACE_ORPHANED_RESTORE_POD_GC_ENABLED", "true"),
+        ("SPACE_ORPHANED_RESTORE_POD_GC_TERMINAL_PODS", "true"),
         ("SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN", "false"),
         ("SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS", "30"),
         ("SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS", "600"),
@@ -363,6 +378,7 @@ fn config_reads_every_variable_from_the_environment() {
         config,
         ReconcilerConfig {
             enabled: true,
+            terminal_pods: true,
             dry_run: false,
             interval: Duration::from_secs(30),
             threshold: PositiveDuration::new_panic(Duration::from_secs(600)),
@@ -2064,4 +2080,302 @@ mod postgres_backed {
         assert_eq!(a.active_generation(), Some(2));
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal pods
+// ---------------------------------------------------------------------------
+
+fn terminal_config(dry_run: bool) -> ReconcilerConfig {
+    ReconcilerConfig {
+        terminal_pods: true,
+        ..config(dry_run)
+    }
+}
+
+/// A terminal pod is reaped exactly when nothing owns it: no row, or a
+/// `suspended` row with no active execution.
+#[test]
+fn a_terminal_pod_is_orphaned_only_when_nothing_owns_it() {
+    use SandboxLifecycle as L;
+    assert_eq!(
+        classify_terminal_pod(None),
+        Disposition::Orphaned(OrphanReason::SandboxMissing)
+    );
+    for replaced in [false, true] {
+        assert_eq!(
+            classify_terminal_pod(Some(&retired_state(L::Suspended, replaced))),
+            Disposition::Orphaned(OrphanReason::SuspendedTerminalPod),
+            "replaced={replaced}"
+        );
+    }
+    assert_eq!(
+        classify_terminal_pod(Some(&state(L::Suspended, None))),
+        Disposition::Orphaned(OrphanReason::SuspendedTerminalPod)
+    );
+    for lifecycle in [
+        L::Created,
+        L::Creating,
+        L::Started,
+        L::Starting,
+        L::Stopped,
+        L::Stopping,
+        L::Paused,
+        L::Pausing,
+        L::Resuming,
+        L::Suspending,
+        L::Restoring,
+        L::Deleting,
+        L::Checkpointing,
+        L::Failed,
+        L::Quarantined,
+    ] {
+        for active in [None, Some(POD_GEN)] {
+            assert_eq!(
+                classify_terminal_pod(Some(&state(lifecycle, active))),
+                Disposition::Skip(SkipClass::TerminalPodOwned),
+                "{lifecycle:?} active={active:?}"
+            );
+        }
+    }
+    // A suspended row whose execution is still active: the suspend hasn't
+    // finished retiring it.
+    assert_eq!(
+        classify_terminal_pod(Some(&state(L::Suspended, Some(POD_GEN)))),
+        Disposition::Skip(SkipClass::TerminalPodOwned)
+    );
+    assert_eq!(
+        classify_terminal_pod(Some(&SandboxRestoreState {
+            lifecycle: RowLifecycle::Unrecognized,
+            executions: Vec::new(),
+        })),
+        Disposition::Skip(SkipClass::UnrecognizedRow)
+    );
+}
+
+/// A restore pod whose VM exited after a later suspend is the capture-admitted
+/// shape for a running pod, but holds nothing once terminal: with
+/// `terminal_pods` on it is reaped, and off it keeps the restore verdict.
+#[test]
+fn a_terminal_restore_pod_on_a_suspended_row_is_reaped_only_with_terminal_pods() {
+    let sid = sandbox_id();
+    let pod = RestorePodSnapshot {
+        terminal: true,
+        ..restore_pod("sbx-a", "uid-a", sid, Some("node-1"))
+    };
+    let suspended = retired_state(SandboxLifecycle::Suspended, false);
+    assert_eq!(
+        classify_pod(Some(&suspended), &pod, POD_GEN, false),
+        Disposition::Skip(SkipClass::CaptureAdmitted)
+    );
+    assert_eq!(
+        classify_pod(Some(&suspended), &pod, POD_GEN, true),
+        Disposition::Orphaned(OrphanReason::SuspendedTerminalPod)
+    );
+    // A running restore pod keeps the restore verdict either way.
+    let running = restore_pod("sbx-a", "uid-a", sid, Some("node-1"));
+    assert_eq!(
+        classify_pod(Some(&suspended), &running, POD_GEN, true),
+        Disposition::Skip(SkipClass::CaptureAdmitted)
+    );
+    // A restore pod the restore verdict reaps is reaped whatever the switch.
+    let missing = classify_pod(None, &running, POD_GEN, false);
+    assert_eq!(missing, Disposition::Orphaned(OrphanReason::SandboxMissing));
+}
+
+#[test]
+fn from_pod_reads_the_phase_and_the_warm_pool_label() {
+    use k8s_openapi::api::core::v1::{Pod, PodStatus};
+    use pplx_space_sandbox_pod::{SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_ROLE_WARM};
+    let pod_with = |phase: &str, warm: bool| {
+        let mut pod = Pod::default();
+        pod.metadata.name = Some("sbx-a".to_string());
+        pod.metadata.uid = Some("uid-a".to_string());
+        if warm {
+            pod.metadata.labels = Some(
+                [(
+                    SANDBOX_POOL_ROLE_KEY.to_string(),
+                    SANDBOX_POOL_ROLE_WARM.to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            );
+        }
+        pod.status = Some(PodStatus {
+            phase: Some(phase.to_string()),
+            ..PodStatus::default()
+        });
+        RestorePodSnapshot::from_pod(&SandboxPodView::from(pod))
+    };
+    for (phase, terminal) in [
+        ("Succeeded", true),
+        ("Failed", true),
+        ("Running", false),
+        ("Pending", false),
+    ] {
+        let snap = pod_with(phase, false);
+        assert_eq!(snap.terminal, terminal, "{phase}");
+        assert!(!snap.warm_pool, "{phase}");
+        assert_eq!(snap.is_scanned(true), terminal, "{phase}");
+        assert!(!snap.is_scanned(false), "{phase}");
+    }
+    let warm = pod_with("Succeeded", true);
+    assert!(warm.terminal && warm.warm_pool);
+    assert!(!warm.is_scanned(true), "the warm-pool sweep owns warm pods");
+}
+
+/// The idle or timeout delete: the row is gone and the pod stays `Completed`.
+#[tokio::test]
+async fn a_terminal_pod_whose_sandbox_was_deleted_is_reaped() {
+    let sid = sandbox_id();
+    let pods = FakePods::new(vec![terminal_pod("sbx-a", "uid-a", sid)]);
+    let base = Instant::now();
+    let mut r = reconciler(
+        terminal_config(false),
+        pods,
+        FakeStore::default(),
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-a", base - Duration::from_secs(301));
+
+    let report = r.tick().await;
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.delete_requested, 1);
+    let deletes = r.pod_backend.deletes();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].pod_name, "sbx-a");
+    assert_eq!(deletes[0].pod_uid.as_str(), "uid-a");
+    assert_eq!(deletes[0].resource_version.as_deref(), Some("100"));
+}
+
+/// The idle or timeout suspend: the row is `suspended`, its execution retired
+/// as `suspended`, and the pod stays `Completed`.
+#[tokio::test]
+async fn a_terminal_pod_whose_sandbox_suspended_is_reaped() {
+    let sid = sandbox_id();
+    let pods = FakePods::new(vec![terminal_pod("sbx-a", "uid-a", sid)]);
+    let store = FakeStore::default().with(sid, retired_state(SandboxLifecycle::Suspended, false));
+    let base = Instant::now();
+    let mut r = reconciler(
+        terminal_config(false),
+        pods,
+        store,
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-a", base - Duration::from_secs(301));
+
+    let report = r.tick().await;
+
+    assert_eq!(report.delete_requested, 1);
+    assert_eq!(r.pod_backend.deletes().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_pods_are_left_alone_with_the_switch_off() {
+    let sid = sandbox_id();
+    let pods = FakePods::new(vec![terminal_pod("sbx-a", "uid-a", sid)]);
+    let base = Instant::now();
+    let mut r = reconciler(
+        config(false),
+        pods,
+        FakeStore::default(),
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-a", base - Duration::from_secs(301));
+
+    let report = r.tick().await;
+
+    assert_eq!(report.scanned, 0);
+    assert!(r.pod_backend.deletes().is_empty());
+}
+
+/// A terminal pod something still owns, and a terminal pod of the warm pool,
+/// are never deleted; nor is one too young to have outlasted the threshold.
+#[tokio::test]
+async fn owned_warm_or_young_terminal_pods_are_never_reaped() {
+    let stopped = sandbox_id();
+    let warm = sandbox_id();
+    let young = sandbox_id();
+    let pods = FakePods::new(vec![
+        terminal_pod("sbx-stopped", "uid-stopped", stopped),
+        RestorePodSnapshot {
+            warm_pool: true,
+            ..terminal_pod("sbx-warm", "uid-warm", warm)
+        },
+        terminal_pod("sbx-young", "uid-young", young),
+    ]);
+    let store = FakeStore::default().with(stopped, state(SandboxLifecycle::Stopped, Some(POD_GEN)));
+    let base = Instant::now();
+    let mut r = reconciler(
+        terminal_config(false),
+        pods,
+        store,
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-stopped", base - Duration::from_secs(301));
+    r.observe_since("uid-warm", base - Duration::from_secs(301));
+
+    let report = r.tick().await;
+
+    assert_eq!(report.scanned, 2, "the warm pod isn't scanned");
+    assert_eq!(report.skipped.get(&SkipClass::TerminalPodOwned), Some(&1));
+    assert_eq!(report.too_young, 1);
+    assert!(r.pod_backend.deletes().is_empty());
+}
+
+/// A terminal pod the re-read finds is no longer one this loop scans (here,
+/// the warm pool took it over) is a changed identity: it is left alone before
+/// the owning row is read again.
+#[tokio::test]
+async fn a_terminal_pod_whose_identity_changed_on_the_fresh_read_is_left_alone() {
+    let sid = sandbox_id();
+    let pod = terminal_pod("sbx-a", "uid-a", sid);
+    let pods = FakePods::new(vec![pod.clone()]).with_fresh(
+        "sbx-a",
+        FreshRead::Replace(Box::new(RestorePodSnapshot {
+            warm_pool: true,
+            ..pod
+        })),
+    );
+    let base = Instant::now();
+    let mut r = reconciler(
+        terminal_config(false),
+        pods,
+        FakeStore::default(),
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-a", base - Duration::from_secs(301));
+
+    r.tick().await;
+
+    assert!(r.pod_backend.deletes().is_empty());
+    assert_eq!(
+        r.store.calls.lock().expect("calls lock").get(&sid),
+        Some(&1),
+        "only the scan reads the row; a changed identity is never rechecked"
+    );
+}
+
+/// A row recreated or resumed between the scan and the delete stops the
+/// delete: the recheck classifies the terminal pod from Postgres again.
+#[tokio::test]
+async fn a_terminal_pod_whose_row_reappears_on_recheck_is_left_alone() {
+    let sid = sandbox_id();
+    let pods = FakePods::new(vec![terminal_pod("sbx-a", "uid-a", sid)]);
+    let store = FakeStore::default()
+        .with(sid, retired_state(SandboxLifecycle::Suspended, false))
+        .with_recheck(sid, state(SandboxLifecycle::Restoring, Some(POD_GEN + 1)));
+    let base = Instant::now();
+    let mut r = reconciler(
+        terminal_config(false),
+        pods,
+        store,
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-a", base - Duration::from_secs(301));
+
+    r.tick().await;
+
+    assert!(r.pod_backend.deletes().is_empty());
 }
