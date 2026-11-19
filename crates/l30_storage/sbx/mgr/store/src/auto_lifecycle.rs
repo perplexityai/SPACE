@@ -156,6 +156,11 @@ pub struct AutoLifecycleCoordinator {
     /// sandbox's artifact lock held, just before the upload job is persisted.
     #[cfg(any(test, feature = "test-support"))]
     pub backup_admission_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    /// A test's two-phase rendezvous in a rollback that doesn't restart, with
+    /// the sandbox's artifact lock and its producer token held, just after
+    /// the activation seal admitted it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub rollback_admission_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     /// A test's two-phase rendezvous in a suspended row's eviction, with the
     /// sandbox's artifact lock held, just before the claim.
     #[cfg(any(test, feature = "test-support"))]

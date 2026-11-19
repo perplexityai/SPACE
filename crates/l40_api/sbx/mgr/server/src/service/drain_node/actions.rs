@@ -7,7 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::planner::*;
 use crate::proto::EnqueueArtifactBackupRequest;
-use crate::service::grpc_lifecycle::SuspendRequestContext;
+use crate::service::grpc_lifecycle::{BackupCaller, SuspendRequestContext};
 use crate::service::*;
 use pplx_space_events::SandboxEventTrigger;
 
@@ -365,15 +365,18 @@ impl SandboxManagerService {
                 // counts as one failure of the drain's, and the enqueue below
                 // starts it again.
                 let gave_up = self.failed_upload(&artifact_id)?;
-                self.enqueue_artifact_backup_authorized(EnqueueArtifactBackupRequest {
-                    sandbox_id,
-                    expected_artifact_kind: crate::proto::ArtifactKind::from(kind) as i32,
-                    source: Some(
-                        crate::proto::enqueue_artifact_backup_request::Source::LocalArtifactId(
-                            artifact_id,
+                self.enqueue_artifact_backup_authorized(
+                    EnqueueArtifactBackupRequest {
+                        sandbox_id,
+                        expected_artifact_kind: crate::proto::ArtifactKind::from(kind) as i32,
+                        source: Some(
+                            crate::proto::enqueue_artifact_backup_request::Source::LocalArtifactId(
+                                artifact_id,
+                            ),
                         ),
-                    ),
-                })
+                    },
+                    BackupCaller::NodeDrain,
+                )
                 .await?;
                 gave_up.map_or(Ok(()), |error| Err(upload_gave_up(error)))
             }
@@ -384,15 +387,18 @@ impl SandboxManagerService {
     /// as a full artifact: the backup adopts the unpinned suspend snapshot as
     /// the row's full artifact and enqueues its upload.
     async fn publish_unpinned_snapshot(&self, sandbox_id: String) -> Result<(), Status> {
-        self.enqueue_artifact_backup_authorized(EnqueueArtifactBackupRequest {
-            sandbox_id,
-            expected_artifact_kind: crate::proto::ArtifactKind::Full as i32,
-            source: Some(
-                crate::proto::enqueue_artifact_backup_request::Source::CurrentInstance(
-                    crate::proto::CurrentInstanceSource::default(),
+        self.enqueue_artifact_backup_authorized(
+            EnqueueArtifactBackupRequest {
+                sandbox_id,
+                expected_artifact_kind: crate::proto::ArtifactKind::Full as i32,
+                source: Some(
+                    crate::proto::enqueue_artifact_backup_request::Source::CurrentInstance(
+                        crate::proto::CurrentInstanceSource::default(),
+                    ),
                 ),
-            ),
-        })
+            },
+            BackupCaller::NodeDrain,
+        )
         .await
         .map(|_| ())
     }

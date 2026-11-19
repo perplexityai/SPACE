@@ -583,7 +583,9 @@ fn seal_name(sealed: Option<u64>) -> String {
 
 /// Put what the scans outside the rows found ahead of what the rows gave:
 /// each blocks, and an orphan directory only when no row in `rows` accounts
-/// for it. The activations in flight at `first` go ahead of the pending.
+/// for it. The activations and the artifact producers in flight at `first`
+/// go ahead of the pending: until a producer ends, its artifact isn't there
+/// for a pass to see.
 pub(super) fn fold_scans(
     plan: &mut DrainPlan,
     rows: &BTreeSet<String>,
@@ -599,14 +601,20 @@ pub(super) fn fold_scans(
         .splice(0..0, scans.blocked.into_iter().chain(orphan_dirs));
     // An activation admitted before the seal can still launch or resume a
     // VM until it settles.
-    plan.pending.splice(
-        0..0,
-        first.in_flight.iter().map(|sandbox_id| DrainWait {
+    let activations = first.in_flight.iter().map(|sandbox_id| DrainWait {
+        sandbox_id: sandbox_id.clone(),
+        wait: Wait::Activation,
+        reason: None,
+    });
+    let producers = first
+        .producers_in_flight
+        .iter()
+        .map(|sandbox_id| DrainWait {
             sandbox_id: sandbox_id.clone(),
-            wait: Wait::Activation,
+            wait: Wait::Snapshot,
             reason: None,
-        }),
-    );
+        });
+    plan.pending.splice(0..0, activations.chain(producers));
 }
 
 /// The report of `plan`: each pending entry is `running` when its row was a

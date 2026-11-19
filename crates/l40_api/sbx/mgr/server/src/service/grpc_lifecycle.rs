@@ -45,6 +45,7 @@ mod suspend;
 mod suspend_snapshot;
 mod teardown_suspend;
 
+pub(super) use self::artifact_backup::BackupCaller;
 use self::artifact_backup::reupload_format_from_sidecar;
 #[cfg(test)]
 use self::artifact_backup::{
