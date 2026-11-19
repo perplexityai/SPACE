@@ -1152,13 +1152,6 @@ NATIVE_OPERATION_READY_ENVS = (
     "SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS",
     "SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS",
 )
-# The data plane's Native upload admission (NativeUploadAdmissionArgs,
-# crates/l40_api/data/plane/server/src/native_files/admission.rs).
-NATIVE_FILE_UPLOAD_ADMISSION_ENVS = (
-    "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION",
-    "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_SANDBOX",
-    "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS",
-)
 
 
 class KindHarness:
@@ -3483,18 +3476,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             expected_uid=expected_uid,
             remove=remove,
             what="controller budget",
-        )
-
-    def set_native_file_upload_admission_env(self, expected: list[dict], desired: list[dict], *, expected_uid: str, remove: bool = False) -> None:
-        """Change only the data plane's upload admission literals."""
-        self._patch_owned_deployment_env(
-            "space-data-plane",
-            set(NATIVE_FILE_UPLOAD_ADMISSION_ENVS),
-            expected,
-            desired,
-            expected_uid=expected_uid,
-            remove=remove,
-            what="data-plane upload admission",
         )
 
     def _patch_owned_deployment_env(

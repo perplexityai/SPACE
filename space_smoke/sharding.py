@@ -142,7 +142,9 @@ _DURATION_SECONDS = {
         "native_contract.file_idempotency_conflict": 4,
         "native_contract.file_op_wakes_idle_suspended_sandbox": 26,
         "native_contract.file_operations_match_on_the_data_plane": 4,
-        "native_contract.file_upload_admission_429": 86,
+        # Local Kind runs (about 9 s); replace with the Main CI median once
+        # one exists.
+        "native_contract.file_upload_admission_429": 10,
         "native_contract.file_write_size_boundary_on_the_data_plane": 5,
         "native_contract.permanent_command_error": 4,
         "native_contract.process_session_wakes_idle_suspended_sandbox": 25,
