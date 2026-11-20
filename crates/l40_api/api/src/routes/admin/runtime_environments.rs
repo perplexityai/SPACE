@@ -396,9 +396,13 @@ enum BlockCheck {
     /// blocked, or had no state under a cluster default. The block stops
     /// nothing new, unless another write lands before this one.
     AlreadyStopped { generation: u64 },
-    /// What the block would stop, if anything.
+    /// What the block would stop, if anything, read at `generation`;
+    /// `None` when the policy was unreadable.
     /// Boxed: an `AtRisk` is large next to the other variant.
-    Checked(Option<Box<AtRisk>>),
+    Checked {
+        at_risk: Option<Box<AtRisk>>,
+        generation: Option<u64>,
+    },
 }
 
 /// What blocking `environment` would stop. A block of an environment that
@@ -408,13 +412,16 @@ enum BlockCheck {
 async fn block_check(
     pool: &sqlx::PgPool,
     environment: EnvironmentReference,
+    boots_template_twins: bool,
 ) -> Result<BlockCheck, Box<Response>> {
     let mut conn = pool
         .acquire()
         .await
         .map_err(|err| Box::new(read_db_error(err)))?;
+    let mut generation = None;
     match policy_store::get(&mut *conn).await {
         Ok(policy) => {
+            generation = Some(policy.generation);
             let executes = match policy.environments.get(&environment) {
                 Some(state) => state.executes(),
                 None => policy.default_environment.is_none(),
@@ -433,13 +440,14 @@ async fn block_check(
             tracing::warn!(%error, "runtime environment policy unreadable; checking the block in full");
         }
     }
-    let population = read_population(&mut conn)
+    let population = read_population(&mut conn, boots_template_twins)
         .await
         .map_err(|err| Box::new(read_db_error(err)))?;
-    Ok(BlockCheck::Checked(
-        Some(Box::new(AtRisk::of_block(&population, environment)))
+    Ok(BlockCheck::Checked {
+        at_risk: Some(Box::new(AtRisk::of_block(&population, environment)))
             .filter(|at_risk| !at_risk.is_empty()),
-    ))
+        generation,
+    })
 }
 
 /// What a default write would stop, when it's the cluster's first: `None`
@@ -448,6 +456,7 @@ async fn block_check(
 async fn first_default_at_risk(
     pool: &sqlx::PgPool,
     default: EnvironmentReference,
+    boots_template_twins: bool,
 ) -> Result<Option<AtRisk>, Box<Response>> {
     let mut conn = pool
         .acquire()
@@ -466,7 +475,7 @@ async fn first_default_at_risk(
     let policy = policy_store::get(&mut *conn)
         .await
         .map_err(|error| Box::new(policy_read_error(error)))?;
-    let population = read_population(&mut conn)
+    let population = read_population(&mut conn, boots_template_twins)
         .await
         .map_err(|err| Box::new(read_db_error(err)))?;
     Ok(
@@ -520,7 +529,12 @@ pub(super) async fn set_default_runtime_environment(
     let at_risk = if request.strand || already_stale(&state.pool, expected).await {
         Ok(None)
     } else {
-        first_default_at_risk(&state.pool, environment).await
+        first_default_at_risk(
+            &state.pool,
+            environment,
+            state.sandbox_controller.boots_template_twins(),
+        )
+        .await
     };
 
     let mut tx = match state.pool.begin().await {
@@ -645,6 +659,7 @@ pub(super) async fn set_runtime_environment_state(
         strand: request.strand,
     };
 
+    let boots_template_twins = state.sandbox_controller.boots_template_twins();
     // Read before the write's transaction, so a scan of every sandbox doesn't
     // hold the policy row lock and stall other policy writers. Sandboxes keep
     // changing either way: this is an acknowledgement, not a guarantee that
@@ -654,14 +669,60 @@ pub(super) async fn set_runtime_environment_state(
         && !request.strand
         && !already_stale(&state.pool, expected).await
     {
-        block_check(&state.pool, environment).await
+        block_check(&state.pool, environment, boots_template_twins).await
     } else {
-        Ok(BlockCheck::Checked(None))
+        Ok(BlockCheck::Checked {
+            at_risk: None,
+            generation: None,
+        })
     };
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(err) => return audit.fail("the write failed", db_error(err).into_response()),
+    };
+    // A block rechecks if another write landed since its check: one that
+    // read its environment as already stopped, since the write may have let
+    // it execute again, and, where creates boot the twin they resolve to, any
+    // other, since which release a tag keeps in use then depends on the
+    // policy. The recheck takes the policy row lock, so it waits for a write
+    // in flight, and reads before this write, on this transaction's
+    // connection: once the block is written, resolution no longer picks a
+    // release in the environment, so a tag's twin there would read as
+    // unused, and a second connection could wait forever on a pool this
+    // transaction has exhausted. A rare path, so the scan's time under the
+    // lock is acceptable. Unlike the check's, a failed recheck is answered
+    // before the store's refusals, since it runs first.
+    let checked_at = match &check {
+        Ok(BlockCheck::AlreadyStopped { generation }) => Some(Some(*generation)),
+        Ok(BlockCheck::Checked { generation, .. })
+            if boots_template_twins
+                && requested == RuntimeEnvironmentState::Blocked
+                && !request.strand =>
+        {
+            Some(*generation)
+        }
+        _ => None,
+    };
+    let recheck = match checked_at {
+        Some(checked_at) => {
+            match recheck_block(
+                &mut tx,
+                environment,
+                checked_at,
+                expected,
+                boots_template_twins,
+            )
+            .await
+            {
+                Ok(recheck) => recheck,
+                Err(response) => {
+                    drop(tx);
+                    return audit.fail("couldn't check what the write would stop", *response);
+                }
+            }
+        }
+        None => None,
     };
     let generation =
         match policy_store::set_environment_state(&mut tx, environment, requested, &change).await {
@@ -713,20 +774,14 @@ pub(super) async fn set_runtime_environment_state(
     // work for a block that would be refused anyway. Dropping the transaction
     // rolls the write back.
     let at_risk = match check {
-        Ok(BlockCheck::Checked(at_risk)) => at_risk.map(|at_risk| *at_risk),
-        Ok(BlockCheck::AlreadyStopped { .. }) if stops_nothing_new => None,
-        // Another write landed in between, possibly letting the environment
-        // execute again. Check now, under the policy row lock this write holds; a
-        // rare path, so the scan's time under the lock is acceptable.
-        // The other write may have changed only some other environment, so
-        // this can ask for an acknowledgement a retry wouldn't need.
-        Ok(BlockCheck::AlreadyStopped { .. }) => match read_population(&mut tx).await {
-            Ok(population) => Some(AtRisk::of_block(&population, environment))
-                .filter(|at_risk| !at_risk.is_empty()),
-            Err(err) => {
-                return audit.fail(
-                    "couldn't check what the write would stop",
-                    db_error(err).into_response(),
+        Ok(check) => match block_at_risk(check, recheck, generation) {
+            Ok(at_risk) => at_risk,
+            Err(PolicyMovedDuringRecheck) => {
+                drop(tx);
+                return audit.refuse(
+                    StatusCode::CONFLICT,
+                    "the cluster policy changed while this block was being checked; retry"
+                        .to_owned(),
                 );
             }
         },
@@ -1113,9 +1168,93 @@ impl Population {
     }
 }
 
-async fn read_population(conn: &mut sqlx::PgConnection) -> Result<Population, sqlx::Error> {
+/// What a block's recheck read before the write: the generation it read at,
+/// and what blocking the environment would stop then.
+struct Recheck {
+    generation: u64,
+    at_risk: Option<Box<AtRisk>>,
+}
+
+/// The recheck of a block checked at `checked_at`, read in `tx` under the
+/// policy row lock before the block is written. `None` when no write landed
+/// since, so the check stands; else what blocking `environment` would stop
+/// under the policy as it stands. A check that couldn't read the policy
+/// (`None`) is always rechecked. A write conditional on another generation
+/// (`expected`) is refused with 412 before the recheck's result is used, so
+/// it isn't rechecked.
+async fn recheck_block(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    environment: EnvironmentReference,
+    checked_at: Option<u64>,
+    expected: Option<u64>,
+    boots_template_twins: bool,
+) -> Result<Option<Recheck>, Box<Response>> {
+    let generation = policy_store::lock_generation(tx)
+        .await
+        .map_err(|error| Box::new(policy_read_error(error)))?;
+    if checked_at == Some(generation) || expected.is_some_and(|expected| expected != generation) {
+        return Ok(None);
+    }
+    let population = read_population(tx, boots_template_twins)
+        .await
+        .map_err(|err| Box::new(read_db_error(err)))?;
+    Ok(Some(Recheck {
+        generation,
+        at_risk: Some(AtRisk::of_block(&population, environment))
+            .filter(|at_risk| !at_risk.is_empty())
+            .map(Box::new),
+    }))
+}
+
+/// The block was written at a generation the recheck doesn't account for.
+/// The recheck holds the policy row lock until the write, so this can't
+/// happen; the handler refuses rather than guess if it does.
+#[derive(Debug, PartialEq, Eq)]
+struct PolicyMovedDuringRecheck;
+
+/// What a block written at `generation` stops, given its `check` and, when
+/// another write landed since the check, its `recheck`.
+fn block_at_risk(
+    check: BlockCheck,
+    recheck: Option<Recheck>,
+    generation: u64,
+) -> Result<Option<AtRisk>, PolicyMovedDuringRecheck> {
+    match (check, recheck) {
+        // A write landed since the check: the recheck read what the block
+        // stops just before this write. That other write may have changed
+        // only some other environment, so this can ask for an acknowledgement
+        // a retry wouldn't need.
+        (
+            _,
+            Some(Recheck {
+                generation: read_at,
+                at_risk,
+            }),
+        ) if generation == read_at + 1 => Ok(at_risk.map(|at_risk| *at_risk)),
+        (_, Some(_)) => Err(PolicyMovedDuringRecheck),
+        (BlockCheck::Checked { at_risk, .. }, None) => Ok(at_risk.map(|at_risk| *at_risk)),
+        // This write raised the generation by exactly one, so nothing changed
+        // the policy since it read the environment as stopped.
+        (
+            BlockCheck::AlreadyStopped {
+                generation: stopped_at,
+            },
+            None,
+        ) if generation == stopped_at + 1 => Ok(None),
+        (BlockCheck::AlreadyStopped { .. }, None) => Err(PolicyMovedDuringRecheck),
+    }
+}
+
+/// `boots_template_twins`: whether this deployment's creates boot the twin
+/// they resolve to ([`crate::controllers::substrate::Substrate::boots_template_twins`]),
+/// so a tag stops counting for a release that has one.
+async fn read_population(
+    conn: &mut sqlx::PgConnection,
+    boots_template_twins: bool,
+) -> Result<Population, sqlx::Error> {
     let sandboxes = store::sandbox_population(&mut *conn).await?;
-    let template_releases = store::template_release_population(&mut *conn).await?;
+    let template_releases =
+        store::template_release_population(&mut *conn, boots_template_twins).await?;
     Ok(Population::from_rows(sandboxes, template_releases))
 }
 
@@ -1124,8 +1263,9 @@ async fn read_population(conn: &mut sqlx::PgConnection) -> Result<Population, sq
 /// environment this server can't tell, because they have no binding, an
 /// unreadable one, or no record.
 ///
-/// A template release counts only while it's in use: a tag points to it or
-/// an enabled pool config pins it. A superseded release stays until its
+/// A template release counts only while it's in use: creates by tag run it
+/// (where creates boot the twin they resolve to, the release the tagged build
+/// resolves to) or an enabled pool config pins it. A superseded release stays until its
 /// template is deleted, so counting it would make blocking an old environment
 /// need `strand` long after every template was rebuilt; sandboxes already
 /// made from it count on their own. An in-use release counts when it's bound
@@ -1286,7 +1426,7 @@ pub(super) async fn get_runtime_environment_population(
         Ok(conn) => conn,
         Err(err) => return read_db_error(err),
     };
-    match read_population(&mut conn).await {
+    match read_population(&mut conn, state.sandbox_controller.boots_template_twins()).await {
         Ok(population) => Json(population_response(&policy, population)).into_response(),
         Err(err) => read_db_error(err),
     }

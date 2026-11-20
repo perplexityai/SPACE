@@ -329,6 +329,24 @@ pub async fn get_generation(executor: impl sqlx::PgExecutor<'_>) -> Result<u64, 
     u64::try_from(generation).map_err(|_| GetPolicyError::InvalidGeneration(generation))
 }
 
+/// [`get_generation`] under the policy row lock, which every write here takes
+/// first and holds until `tx` ends. A caller that reads before writing in the
+/// same transaction takes it first, so no other policy write lands between
+/// its read and its write.
+pub async fn lock_generation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<u64, GetPolicyError> {
+    let row = sqlx::query_as::<_, (i64,)>(sql!(
+        "SELECT generation FROM runtime_environment_policy WHERE singleton FOR UPDATE"
+    ))
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((generation,)) = row else {
+        return Err(GetPolicyError::PolicyRowMissing);
+    };
+    u64::try_from(generation).map_err(|_| GetPolicyError::InvalidGeneration(generation))
+}
+
 fn parse_environment(value: &str) -> Result<EnvironmentReference, GetPolicyError> {
     value
         .parse()

@@ -262,9 +262,12 @@ pub(crate) enum BindingScope {
 /// `None`, so shadow places exactly as off; on, it fails the placement rather
 /// than place bound work as unbound.
 ///
-/// The release is the original one for `template` at `content_hash`, the one
-/// a create that names no environment resolves; [`pool_pod_environment`]
-/// reads a chosen one.
+/// The release is the original one for `template` at `content_hash`. The
+/// direct substrate's worker boots the build a create without an environment
+/// preference resolves, the legacy partition's, so its placement reads the
+/// original's binding. A Kubernetes pod reads `resolved_work_environment`
+/// with the gate `on` and this otherwise, and `pool_pod_environment` a
+/// chosen release.
 pub(crate) async fn work_environment(
     gate: EnvironmentPlacementGate,
     pool: &PgPool,
@@ -283,11 +286,39 @@ pub(crate) async fn work_environment(
     .await
 }
 
+/// [`work_environment`] for the release a create of `template` at
+/// `content_hash` resolves (`pplx_space_template_release_store::resolved_release_sql`),
+/// else the original. A Kubernetes pod boots the environment its pod
+/// requires, so its binding follows the create's resolution.
+#[cfg(feature = "kubernetes")]
+pub(crate) async fn resolved_work_environment(
+    gate: EnvironmentPlacementGate,
+    pool: &PgPool,
+    template: &str,
+    content_hash: Option<&str>,
+    scope: BindingScope,
+) -> Result<Option<String>, sqlx::Error> {
+    gated_work_environment(
+        gate,
+        pool,
+        BuildRelease::Resolved,
+        template,
+        content_hash,
+        scope,
+    )
+    .await
+}
+
 /// Which release of a build records its binding.
 #[derive(Debug, Clone, Copy)]
 enum BuildRelease {
     /// The original release of the template and hash.
     Original,
+    /// The release a create of the template and hash resolves
+    /// (`pplx_space_template_release_store::resolved_release_sql`), else the
+    /// original.
+    #[cfg(feature = "kubernetes")]
+    Resolved,
     /// A chosen release, the original or a twin.
     #[cfg(feature = "kubernetes")]
     Id(uuid::Uuid),
@@ -330,6 +361,27 @@ async fn build_binding(
         BuildRelease::Original => {
             crate::template_releases_store::release_environment(pool, template, content_hash)
                 .await?
+        }
+        #[cfg(feature = "kubernetes")]
+        BuildRelease::Resolved => {
+            match pplx_space_template_release_store::resolved_release(
+                pool,
+                template,
+                content_hash,
+                pplx_space_execution_catalog::catalog::initial_environment_reference(),
+            )
+            .await?
+            {
+                Some((_, environment)) => environment,
+                None => {
+                    crate::template_releases_store::release_environment(
+                        pool,
+                        template,
+                        content_hash,
+                    )
+                    .await?
+                }
+            }
         }
         #[cfg(feature = "kubernetes")]
         BuildRelease::Id(release_id) => {

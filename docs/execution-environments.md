@@ -1156,8 +1156,16 @@ have keeps the pin, with kubelet as the backstop.
 With the gate `on`, a create adopts a warm pod only from a node that publishes
 the environment of the pod's build: a warm pod built while the gate was off
 carries no requirement, and a node can lose its label under a pod it already
-runs. A refused slot leaves the pool, and the warm pool replaces it with a pod
-that requires the label.
+runs. The pod must also have booted that environment: it must carry
+`space.pplx.net/environment-required: "true"` and name the environment in
+`space.pplx.net/environment`. A node's labels say where a pod may run, not what
+its worker booted, and a pod warmed before the gate went `on` booted what the
+worker boots with the gate off. A refused slot leaves the pool, and the warm
+pool replaces it with a pod that requires both. The create tries the next slot,
+and a create that finds none misses the pool as it would otherwise: it boots
+cold, or, with `boot_mode=pool`, gets a 503. A pod that booted the environment
+on a node the Node reflector doesn't have isn't refused: its slot goes back to
+the pool as `ready`, so a cache miss doesn't replace it.
 
 The labels say what node-ctl last observed, not how fresh that is: a node
 whose node-ctl stops reconciling keeps its labels. They also don't drop
@@ -1276,8 +1284,12 @@ are bound to an environment it stops, or while any sandbox has no environment
 binding, an unreadable one, or no binding record. Unbound legacy sandboxes count
 because they execute as the environment they match, which only a node can
 resolve, and a sandbox with no observation from its node may be bound to one
-that stops. A release is in use while a tag points to it, which creates by tag
-resolve to, or an enabled pool config pins it, which keeps creating slots. An
+that stops. A release is in use while creates by tag run it, or an enabled
+pool config pins it, which keeps creating slots. Where creates boot the twin
+they resolve to ([Resolving creates to template
+twins](#resolving-creates-to-template-twins)), a tag keeps in use the release
+its build resolves to, which may be a twin, not the tagged release; anywhere
+else, the tagged release. An
 in-use release counts when it's bound to an environment that stops, or when its
 environment can't be told, since new creates from it may run there. A superseded
 release doesn't count: it strands work only through the sandboxes made from it,
@@ -1457,6 +1469,75 @@ could keep a different policy that happened to share a number. The generation
 orders and identifies policy versions only within one schema lifetime. `updated_at`
 on either table isn't policy history: deleting a user changes it through the
 `ON DELETE SET NULL` cascade.
+
+### Resolving creates to template twins
+
+A template release can have *twins*: other `template_releases` rows with the
+same template name and hash, each bound to another environment in
+`execution_metadata`. A create by tag, digest or digest prefix finds the build
+as before, then runs one of its releases, picked in this order:
+
+1. the release bound to the cluster default;
+2. else a twin in an `allowed` environment, the one whose catalog entry
+   (`runtime_environments.version_sort_key`) sorts highest;
+3. else a twin in a `deprecated` environment, the same way;
+4. else the original.
+
+A release in a `blocked` environment is never picked, nor a twin in an
+environment with no policy state. An unbound release counts as the initial
+environment's. When nothing qualifies, the create keeps the release its tag or
+digest names, as before twins, and the node's policy decides. So with E1 twins
+in place, moving the default to E2 keeps creates on a build's E1 twin until its
+E2 twin exists, as long as E1 still sorts highest among the build's twins in
+`allowed` environments; an `allowed` E3 twin that sorts higher takes them.
+
+One definition of that order
+(`pplx_space_template_release_store::resolved_release_sql`) serves create
+resolution, pod placement, pool claims, the warm-pool autoscaler and the block
+check above. It applies only where creates boot the twin they resolve to: a
+Kubernetes substrate with the placement gate `on`
+(`Substrate::boots_template_twins`), which the substrate refuses at startup
+today. The API and the cluster controller each read the gate
+(`SPACE_ENVIRONMENT_PLACEMENT_GATE`, [configuration.md](configuration.md)):
+creates and pool claims follow the API's, and the warm-pool autoscaler the
+controller's, so set it the same on both. Anywhere else all of them keep the
+release a tag or digest names, whose build the worker boots, so twins left
+from an earlier configuration don't take its creates or its pools.
+
+A Kubernetes pod of the create renders the release its build resolves to when
+the pod is built, which may differ from the create's if a twin, the default or
+a state changes between the two reads. It requires that environment while the
+placement gate is `on`, and a pool claim takes only that release's slots. The
+Direct substrate still places and boots on the original's binding: its worker
+boots the build a create without an environment preference resolves. The
+warm-pool autoscaler credits a build's demand and its retained slot to the same
+release, so when resolution picks a twin its pools move there and the
+original's autoscaled pools retire. The original's manual pools stay enabled
+for a rollback that resolves the original. A twin takes nothing while
+resolution still picks the original, as it does while the original is bound to
+the default. Once resolution picks a twin, creates claim only its pools, which
+start empty, so a template with a warm pool boots cold until the twin's pool
+fills. For a template with no enabled warm-pool policy, a fallthrough cold
+create of a twin with no enabled plaintext pool config of its own takes its
+shape, disk size and disk I/O limits from the original's, so the operator's
+shape survives a twin that got no copy. With a policy, the policy shapes it, as
+for any release without a config. An operator's upsert of a release's manual
+pool config through the admin API changes the config of the twin creates pick
+too, since creates claim that twin's slots. Like the original's, the twin's
+config becomes operator-managed, so the autoscaler stops adjusting it, and it
+takes the original's disk size and disk I/O limits. The response reports the
+original's. The upsert reaches only the twin resolution picks when it runs: a
+twin picked later, after the default moves, gets no copy. An upsert that names
+a release (`template_release_id`, which the admin console sends when it edits or
+detaches an existing pool) changes exactly that release's config, so an edit of
+an earlier twin's pool stays on that twin after the default moves; named or
+resolved, only an original's upsert reaches a twin. Disabling an
+original's config by its id disables the config for the same shape on every one
+of its twins, whether or not creates boot twins, so an earlier twin's
+operator-managed config doesn't keep warming slots; disabling a twin's config
+changes only that config, though without a policy the twin's cold creates then
+take the original's shape. An autoscaler-owned config that's disabled is
+enabled again on the autoscaler's next pass, as an original's is.
 
 ### Selecting a restore consumer
 

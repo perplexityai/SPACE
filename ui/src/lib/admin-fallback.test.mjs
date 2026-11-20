@@ -9,6 +9,7 @@ import {
   pageRows,
   sendWithOptionalField,
   tagMoveFailureMessage,
+  upsertWarmPool,
 } from './admin-fallback.ts';
 
 // The shape `ApiError` gives the console: status, message, parsed JSON body
@@ -203,4 +204,21 @@ test("another organization's snapshot card has no timed read: the page's reloads
   assert.deepEqual(await reads(false), { admin: 2, public: 0 });
   // The own organization's card lists through the public routes on every reload.
   assert.deepEqual(await reads(true), { admin: 0, public: triggers.length });
+});
+
+test("an existing pool's save names its release, and an older API gets the request without it", async () => {
+  const sent = [];
+  await upsertWarmPool(async (path, body) => { sent.push([path, body]); }, { template_name: 'seed' }, 'rel-b');
+  await upsertWarmPool(async (path, body) => { sent.push([path, body]); }, { template_name: 'seed' }, null);
+  assert.deepEqual(sent, [
+    ['/v1/warm-pools', { template_name: 'seed', template_release_id: 'rel-b' }],
+    ['/v1/warm-pools', { template_name: 'seed' }],
+  ]);
+
+  const older = [];
+  await upsertWarmPool(async (path, body) => {
+    older.push(body);
+    if ('template_release_id' in body) throw unknownField('template_release_id', '`template_name`');
+  }, { template_name: 'seed' }, 'rel-b');
+  assert.deepEqual(older, [{ template_name: 'seed', template_release_id: 'rel-b' }, { template_name: 'seed' }]);
 });

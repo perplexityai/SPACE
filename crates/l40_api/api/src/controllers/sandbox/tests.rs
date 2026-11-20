@@ -1160,6 +1160,137 @@ mod template_release_resolution_postgres_tests {
         Ok(())
     }
 
+    /// A create finds the build its tag or digest names, then runs the
+    /// release `resolved_release_sql` picks. With no default the twin's
+    /// environment has no policy state, and with E0 the default the original
+    /// is default-bound, so both stay on the original; with E1 the default
+    /// it's the twin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_create_resolves_the_twin_bound_to_the_default() -> TestResult {
+        use pplx_space_runtime_environment_policy_store::{
+            PolicyChange, PolicyChangeReason, set_default,
+        };
+
+        let db = pg_test_db().await?;
+        let original = Uuid::now_v7();
+        let content_hash =
+            "sha256:7171717171717171717171717171717171717171717171717171717171717171";
+        let e0 = "sha256:".to_owned() + &"0".repeat(64);
+        let e1 = "sha256:".to_owned() + &"1".repeat(64);
+        insert_org_specific_template(&db.pool, "tenant-twin", Uuid::parse_str(TENANT_ORG)?).await?;
+        insert_release_with_latest_tag(
+            &db.pool,
+            "tenant-twin",
+            original,
+            content_hash,
+            Some(Uuid::parse_str(TENANT_ORG)?),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE template_releases
+             SET execution_metadata = jsonb_build_object('environment', $2::TEXT)
+             WHERE id = $1",
+        )
+        .bind(original)
+        .bind(&e0)
+        .execute(&db.pool)
+        .await?;
+        // Twins exist only once the `(template_name, hash)` unique index is
+        // dropped; the test drops it to stand in for the contract migration.
+        sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+            .execute(&db.pool)
+            .await?;
+        let twin: Uuid = sqlx::query_scalar(
+            "INSERT INTO template_releases
+                 (template_name, type, hash, org_id, execution_metadata, created_at)
+             SELECT template_name, type, hash, org_id,
+                    jsonb_build_object('environment', $2::TEXT), clock_timestamp()
+             FROM template_releases WHERE id = $1
+             RETURNING id",
+        )
+        .bind(original)
+        .bind(&e1)
+        .fetch_one(&db.pool)
+        .await?;
+        let by_tag = "tenant-twin:latest".parse::<TemplateReference>()?;
+        let by_digest = format!("tenant-twin@{content_hash}").parse::<TemplateReference>()?;
+        let resolve = |template: TemplateReference| {
+            let pool = db.pool.clone();
+            async move {
+                resolve_template_release(
+                    &pool,
+                    &template,
+                    RuntimeKind::Firecracker,
+                    org(TENANT_ORG),
+                    ReleaseMissReport::Classified,
+                )
+                .await
+            }
+        };
+        let set = |environment: &str| {
+            let pool = db.pool.clone();
+            let environment = environment.parse().expect("environment reference");
+            async move {
+                let mut tx = pool.begin().await?;
+                set_default(
+                    &mut tx,
+                    environment,
+                    &PolicyChange {
+                        actor: None,
+                        reason: PolicyChangeReason::new("test").expect("reason"),
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+                TestResult::Ok(())
+            }
+        };
+
+        for template in [by_tag.clone(), by_digest.clone()] {
+            assert_eq!(
+                resolve(template).await?,
+                (original, content_hash.to_string())
+            );
+        }
+        set(&e0).await?;
+        for template in [by_tag.clone(), by_digest.clone()] {
+            assert_eq!(
+                resolve(template).await?,
+                (original, content_hash.to_string())
+            );
+        }
+        set(&e1).await?;
+        for template in [by_tag.clone(), by_digest.clone()] {
+            assert_eq!(
+                resolve(template).await?,
+                (twin, content_hash.to_string()),
+                "the twin bound to the default answers, with its original's hash"
+            );
+        }
+        // Where creates don't boot the twin they resolve to, they run the
+        // named release, whose build the worker boots.
+        for (template, boots, expected) in [
+            (by_tag.clone(), true, twin),
+            (by_digest.clone(), true, twin),
+            (by_tag, false, original),
+            (by_digest, false, original),
+        ] {
+            assert_eq!(
+                resolve_create_release(
+                    &db.pool,
+                    &template,
+                    RuntimeKind::Firecracker,
+                    org(TENANT_ORG),
+                    ReleaseMissReport::Classified,
+                    boots,
+                )
+                .await?,
+                (expected, content_hash.to_string())
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn org_specific_template_without_owner_is_rejected_by_check() -> TestResult {
         let db = pg_test_db().await?;

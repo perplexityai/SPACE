@@ -550,8 +550,35 @@ async fn harness_with_connections(max_connections: u32) -> TestResult<Option<Har
 }
 
 async fn harness_on(db: Fixture) -> TestResult<Option<Harness>> {
-    let (user_id, token) = insert_session_user(&db.pool, "organization_admin").await?;
     let state = AppState::from_pool(db.pool.clone()).await?;
+    harness_with_state(db, state).await
+}
+
+/// A harness on a deployment whose creates boot the twin they resolve to: a
+/// Kubernetes substrate with the environment placement gate `on`.
+#[cfg(feature = "kubernetes")]
+async fn harness_booting_twins() -> TestResult<Option<Harness>> {
+    use crate::controllers::substrate::kubernetes::tests::{
+        mock_kubernetes_client, substrate_with_store_and_client,
+    };
+    let Some(db) = postgres_fixture().await? else {
+        return Ok(None);
+    };
+    let mut kubernetes = substrate_with_store_and_client(
+        db.pool.clone(),
+        mock_kubernetes_client(std::sync::Arc::default()),
+    );
+    kubernetes.k8s.environment_placement =
+        crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+    let substrate = crate::controllers::substrate::Substrate::from_kubernetes(kubernetes);
+    assert!(substrate.boots_template_twins());
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(substrate);
+    harness_with_state(db, state).await
+}
+
+async fn harness_with_state(db: Fixture, state: AppState) -> TestResult<Option<Harness>> {
+    let (user_id, token) = insert_session_user(&db.pool, "organization_admin").await?;
     let app = crate::routes::admin::shared_host_router(state.clone()).with_state(state);
     Ok(Some(Harness {
         db,

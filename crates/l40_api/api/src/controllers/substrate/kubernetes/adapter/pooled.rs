@@ -3,6 +3,9 @@
 //! an adopted pod.
 
 use super::*;
+use crate::controllers::substrate::environment_placement::pool_pod_environment;
+use crate::controllers::substrate::kubernetes::SandboxPodKey;
+use pplx_space_execution_spec::EnvironmentReference;
 
 pub(in crate::controllers::substrate::kubernetes) fn pooled_route_identity_adoption_request(
     claim: &PooledExecutionClaim,
@@ -148,29 +151,55 @@ impl KubernetesSubstrate {
 
 impl KubernetesSubstrate {
     /// With the environment placement gate on, whether warm pod `pod`'s node
-    /// publishes the environment the slot's build of `template` at
-    /// `content_hash` is bound to, as a cold-built pod would require. A pod
-    /// built while the gate was off or shadow carries no requirement, and node
-    /// affinity is ignored once a pod runs, so a node can lose the label under
-    /// a pod it already holds. Unbound work, and every mode but on, admits.
-    /// A node the cache doesn't have is [`PooledPodEnvironment::Unknown`], as
-    /// for the node-group check: a cold Node reflector says nothing about the
-    /// node.
-    pub(super) async fn pooled_pod_environment(
+    /// publishes the environment `claim`'s slot runs under: its pool's
+    /// release's binding, which the pool rendered the pod for
+    /// ([`pool_pod_environment`]), not the release a create resolves to now,
+    /// which a default move can change after the claim. A claim with no
+    /// slot release reads the binding of the build of `template` at its
+    /// content hash, as a cold-built pod would require. A pod built while the
+    /// gate was off or shadow carries no requirement, and node affinity is
+    /// ignored once a pod runs, so a node can lose the label under a pod it
+    /// already holds. Unbound work, and every mode but on, admits. A node the
+    /// cache doesn't have is [`PooledPodEnvironment::Unknown`], as for the
+    /// node-group check: a cold Node reflector says nothing about the node.
+    pub(in crate::controllers::substrate::kubernetes) async fn pooled_pod_environment(
         &self,
         template: &str,
-        content_hash: &str,
+        claim: &PooledExecutionClaim,
         pod: Option<&SandboxPodView>,
     ) -> Result<PooledPodEnvironment, SubstrateError> {
-        if !self.k8s.environment_placement.refuses() {
+        let gate = self.k8s.environment_placement;
+        if !gate.refuses() {
             return Ok(PooledPodEnvironment::Admitted);
         }
-        let Some(environment) = self
-            .template_pod_environment(template, content_hash)
-            .await?
-        else {
+        let environment = match claim.template_release_id {
+            Some(release_id) => pool_pod_environment(
+                gate,
+                self.store.pool(),
+                release_id,
+                template,
+                &claim.content_hash,
+            )
+            .await
+            .map_err(|error| SubstrateError::Failed {
+                message: error.to_string(),
+            })?,
+            None => {
+                self.template_pod_environment(template, &claim.content_hash)
+                    .await?
+            }
+        };
+        let Some(environment) = environment else {
             return Ok(PooledPodEnvironment::Admitted);
         };
+        // The node's labels say where the pod may run, not what its worker
+        // booted: a pod warmed before the gate went `on` carries no
+        // requirement, so its worker booted what it would with the gate off.
+        if environment.required
+            && pod.is_some_and(|pod| !pod_boots_environment(pod, &environment.reference))
+        {
+            return Ok(PooledPodEnvironment::NotBooted);
+        }
         let Some(node) = pod
             .and_then(SandboxPodView::node_name)
             .and_then(|name| self.k8s.caches.node_by_name(name))
@@ -188,14 +217,29 @@ impl KubernetesSubstrate {
     }
 }
 
+/// Whether warm pod `pod`'s worker booted a build of `environment`: the pod
+/// records it as its environment and tells the shim to require it
+/// (`CreateRequest.required_environment`), as a pod rendered with the gate
+/// `on` does. A pod without the requirement booted what the worker boots with
+/// the gate off.
+fn pod_boots_environment(pod: &SandboxPodView, environment: &EnvironmentReference) -> bool {
+    pod.annotation(SandboxPodKey::EnvironmentRequired)
+        == Some(pplx_space_sandbox_pod::ENVIRONMENT_REQUIRED_ANNOTATION_VALUE)
+        && pod.annotation(SandboxPodKey::Environment) == Some(environment.to_string().as_str())
+}
+
 /// What [`KubernetesSubstrate::pooled_pod_environment`] says of a warm pod's
-/// node.
+/// worker and node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PooledPodEnvironment {
+pub(in crate::controllers::substrate::kubernetes) enum PooledPodEnvironment {
     /// The node publishes the work's environment, or nothing is gated.
     Admitted,
     /// The node's labels don't publish the work's environment.
     NotPublished,
+    /// The pod's worker wasn't told to boot the work's environment: the pod
+    /// carries no requirement, as one warmed before the gate went `on` does,
+    /// or requires another environment.
+    NotBooted,
     /// The cache doesn't have the pod's node.
     Unknown,
 }

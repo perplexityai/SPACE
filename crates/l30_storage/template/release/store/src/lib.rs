@@ -174,6 +174,100 @@ pub async fn release_subject(
     .await
 }
 
+/// The original of release `release_id` when it's a twin, as registration
+/// finds it: of the earliest release under each spelling of its hash (bare
+/// or `sha256:<hex>`), the one owning a storage location, then the earliest,
+/// when `release_id` is bound to an environment other than that original's.
+/// A twin copies its original's hash and is registered after it, so it's
+/// never one, even with a storage location its original lacks. `None` when
+/// `release_id` is in its original's environment (an original, or the
+/// build's other spelling beside it) or gone. `initial_environment` is the
+/// initial environment, which unbound releases count as. Takes no lock.
+pub async fn twin_original(
+    executor: impl PgExecutor<'_>,
+    release_id: Uuid,
+    initial_environment: EnvironmentReference,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT o.id
+         FROM template_releases r
+         CROSS JOIN LATERAL (
+             SELECT o.id, o.execution_metadata
+             FROM template_releases o
+             WHERE o.template_name = r.template_name
+               AND o.hash IN (
+                   r.hash,
+                   CASE
+                       WHEN r.hash ~ '^sha256:[0-9a-f]{64}$' THEN substr(r.hash, 8)
+                       ELSE r.hash
+                   END,
+                   CASE
+                       WHEN r.hash ~ '^[0-9a-f]{64}$' THEN 'sha256:' || r.hash
+                       ELSE r.hash
+                   END)
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM template_releases e
+                   WHERE e.template_name = o.template_name
+                     AND e.hash = o.hash
+                     AND (e.created_at, e.id) < (o.created_at, o.id))
+             ORDER BY
+                 EXISTS (
+                     SELECT 1
+                     FROM template_release_storage_locations l
+                     WHERE l.template_release_id = o.id) DESC,
+                 o.created_at,
+                 o.id
+             LIMIT 1) o
+         WHERE r.id = $1
+           AND COALESCE(r.execution_metadata->>'environment', $2)
+               IS DISTINCT FROM COALESCE(o.execution_metadata->>'environment', $2)"
+    ))
+    .bind(release_id)
+    .bind(initial_environment.to_string())
+    .fetch_optional(executor)
+    .await
+}
+
+/// The twins of release `original`: the releases of its template at its
+/// hash, under either spelling, bound to an environment other than its own,
+/// in id order. `initial_environment` is the initial environment, which
+/// unbound releases count as, so a release of the build in the original's
+/// own environment (the build's other spelling, registered before the prefix
+/// was required) isn't one. Empty when `original` is gone or has no twins.
+/// The caller decides that `original` is an original; of a twin, this
+/// returns the other releases outside the twin's environment. Takes no lock.
+pub async fn twin_releases(
+    executor: impl PgExecutor<'_>,
+    original: Uuid,
+    initial_environment: EnvironmentReference,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT r.id
+         FROM template_releases o
+         JOIN template_releases r
+           ON r.template_name = o.template_name
+          AND r.hash IN (
+              o.hash,
+              CASE
+                  WHEN o.hash ~ '^sha256:[0-9a-f]{64}$' THEN substr(o.hash, 8)
+                  ELSE o.hash
+              END,
+              CASE
+                  WHEN o.hash ~ '^[0-9a-f]{64}$' THEN 'sha256:' || o.hash
+                  ELSE o.hash
+              END)
+          AND COALESCE(r.execution_metadata->>'environment', $2)
+              IS DISTINCT FROM COALESCE(o.execution_metadata->>'environment', $2)
+         WHERE o.id = $1
+         ORDER BY r.id"
+    ))
+    .bind(original)
+    .bind(initial_environment.to_string())
+    .fetch_all(executor)
+    .await
+}
+
 /// The release of `template_name` at `hash` that `selector` selects, under
 /// either spelling of the hash, bare or `sha256:<hex>`, whichever `hash` is
 /// (a release registered before the prefix was required is stored bare, and

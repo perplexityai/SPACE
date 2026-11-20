@@ -668,6 +668,103 @@ async fn a_release_of_a_hash_matches_either_spelling() -> TestResult {
     Ok(())
 }
 
+/// An original's twins are its build's releases in other environments,
+/// under either spelling of the hash, and never a release in its own
+/// environment: an unbound release of the other spelling counts as the
+/// initial environment's, as the original does.
+#[tokio::test(flavor = "current_thread")]
+async fn an_originals_twins_are_its_builds_releases_in_other_environments() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let original = seeded(&db.pool, None).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let other_spelling = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+    let bound_to_initial =
+        insert_release(&db.pool, TEMPLATE, bare, Some(metadata(environment(0)))).await?;
+    let e1 = twin_of(&db.pool, original, environment(1)).await?;
+    let e2_other_spelling =
+        insert_release(&db.pool, TEMPLATE, bare, Some(metadata(environment(2)))).await?;
+    insert_template(&db.pool, "other").await?;
+    insert_release(&db.pool, "other", HASH, Some(metadata(environment(1)))).await?;
+
+    let mut expected = vec![e1, e2_other_spelling];
+    expected.sort();
+    assert_eq!(
+        twin_releases(&db.pool, original, environment(0)).await?,
+        expected,
+        "neither {other_spelling} nor {bound_to_initial} is in another environment"
+    );
+    assert_eq!(
+        twin_releases(&db.pool, Uuid::now_v7(), environment(0)).await?,
+        Vec::<Uuid>::new()
+    );
+    Ok(())
+}
+
+/// A twin's original is the one registration finds: of the earliest release
+/// under each spelling of the hash, one owning a storage location over one
+/// without. Releases in that original's environment, under either spelling,
+/// have none.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twins_original_spans_both_hash_spellings() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    insert_template(&db.pool, TEMPLATE).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let unattached =
+        insert_release(&db.pool, TEMPLATE, HASH, Some(metadata(environment(1)))).await?;
+    let original = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+    insert_location(&db.pool, original, LOCATION).await?;
+    let sibling = insert_release(&db.pool, TEMPLATE, HASH, None).await?;
+    insert_location(&db.pool, sibling, LOCATION).await?;
+    let twin = twin_of(&db.pool, original, environment(2)).await?;
+
+    for (release, expected) in [
+        (unattached, Some(original)),
+        (twin, Some(original)),
+        (original, None),
+        (sibling, None),
+        (Uuid::now_v7(), None),
+    ] {
+        assert_eq!(
+            twin_original(&db.pool, release, environment(0)).await?,
+            expected,
+            "release {release}"
+        );
+    }
+    Ok(())
+}
+
+/// A twin with a storage location its original lacks is still a twin: it
+/// copies the original's hash, so it's never the earliest release under it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_with_storage_its_original_lacks_is_still_a_twin() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let original = seeded(&db.pool, None).await?;
+    let twin = twin_of(&db.pool, original, environment(1)).await?;
+    sqlx::query("DELETE FROM template_release_storage_locations WHERE template_release_id = $1")
+        .bind(original)
+        .execute(&db.pool)
+        .await?;
+    assert!(
+        !storage_locations(&db.pool, twin).await?.is_empty(),
+        "the twin copies its original's storage locations"
+    );
+    assert_eq!(
+        twin_original(&db.pool, twin, environment(0)).await?,
+        Some(original)
+    );
+    assert_eq!(
+        twin_original(&db.pool, original, environment(0)).await?,
+        None
+    );
+    Ok(())
+}
+
 /// Records every write; reads answer from `objects`.
 #[derive(Default)]
 struct RecordingStore {

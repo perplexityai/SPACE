@@ -677,7 +677,8 @@ fn validate_inherited_pool_disk(disk_mib: Option<u32>) -> Result<(), ControllerE
 // `pplx-space-cluster-pool`. `retain_releases` controls which releases receive
 // warm slots; it must not limit miss sizing. Any enabled template policy
 // supplies the shape for every cold fallthrough create so the persisted shape
-// counts as demand for that policy.
+// counts as demand for that policy. Without a policy, a twin with no config
+// takes its original's ([`original_pool_assignment`]).
 async fn resolve_kubernetes_pool_configured_resources(
     pool: &PgPool,
     template_name: &str,
@@ -692,7 +693,7 @@ async fn resolve_kubernetes_pool_configured_resources(
         .await
         .map_err(|err| pool_store_error("failed to load warm-pool policy resources", &err))?;
     let Some(policy_assignment) = policy_assignment else {
-        return Ok(None);
+        return original_pool_assignment(pool, template_release_id).await;
     };
 
     // Prefer a config materialized while the policy lookups were in flight.
@@ -700,6 +701,32 @@ async fn resolve_kubernetes_pool_configured_resources(
         return Ok(Some(assignment));
     }
     parse_kubernetes_pool_assignment(policy_assignment, CreateShapeSource::Policy).map(Some)
+}
+
+/// For a template with no enabled warm-pool policy, the enabled plaintext
+/// config of `template_release_id`'s original when the release is a twin
+/// with none of its own: its shape, disk size and disk I/O limits. The pool config upsert writes a twin's config only
+/// when an operator upserts while that twin resolves, and without a policy
+/// the autoscaler gives it none, so a twin that won resolution later would
+/// otherwise drop the operator's shape for the request's or the build's.
+/// With a policy, the policy shapes the create instead, as for any release
+/// without a config, so its demand counts for the policy, and the twin gets a
+/// policy-shaped config when the autoscaler selects it as for any release.
+async fn original_pool_assignment(
+    pool: &PgPool,
+    template_release_id: Uuid,
+) -> Result<Option<KubernetesPoolAssignment>, ControllerError> {
+    let original = pplx_space_template_release_store::twin_original(
+        pool,
+        template_release_id,
+        pplx_space_execution_catalog::catalog::initial_environment_reference(),
+    )
+    .await
+    .map_err(|err| db_contention_error("failed to read the release's original", &err))?;
+    match original {
+        Some(original) => enabled_pool_assignment(pool, original).await,
+        None => Ok(None),
+    }
 }
 
 async fn enabled_pool_assignment(
@@ -2899,8 +2926,15 @@ impl SandboxController {
         miss_report: ReleaseMissReport,
     ) -> Result<ResolvedCreateTemplate, ControllerError> {
         let runtime_alias = runtime.alias();
-        let (template_release_id, content_hash) =
-            resolve_template_release(pool, template, runtime, caller_org, miss_report).await?;
+        let (template_release_id, content_hash) = resolve_create_release(
+            pool,
+            template,
+            runtime,
+            caller_org,
+            miss_report,
+            self.boots_template_twins(),
+        )
+        .await?;
         let defaults = load_create_template_defaults(
             pool,
             template.name().as_str(),

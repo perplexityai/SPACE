@@ -6,24 +6,42 @@ use crate::controllers::substrate::environment_placement::EnvironmentPlacementGa
 
 impl K8sStore {
     /// The environment work that boots `template` at `content_hash` runs
-    /// under `gate`, unparsed
-    /// ([`crate::controllers::substrate::environment_placement::work_environment`]).
+    /// under `gate`, unparsed: with the gate on, the binding of the release a
+    /// create resolves
+    /// ([`crate::controllers::substrate::environment_placement::resolved_work_environment`]),
+    /// else the named release's.
     pub(in crate::controllers::substrate::kubernetes) async fn work_environment(
         &self,
         gate: EnvironmentPlacementGate,
         template: &str,
         content_hash: &str,
     ) -> Result<Option<String>, SubstrateError> {
-        crate::controllers::substrate::environment_placement::work_environment(
-            gate,
-            &self.pool,
-            template,
-            Some(content_hash),
-            // A pod may land on any node, so no candidate's own inventory row
-            // can gate it: the build's holders have to agree.
-            crate::controllers::substrate::environment_placement::BindingScope::ReleaseOrHolders,
-        )
-        .await
+        // A pod may land on any node, so no candidate's own inventory row can
+        // gate it: the build's holders have to agree.
+        let scope =
+            crate::controllers::substrate::environment_placement::BindingScope::ReleaseOrHolders;
+        // A pod requires its work's environment only with the gate on, so
+        // only then does it boot the twin a create resolves to; otherwise it
+        // boots the named release's build, whose binding it renders.
+        if gate.refuses() {
+            crate::controllers::substrate::environment_placement::resolved_work_environment(
+                gate,
+                &self.pool,
+                template,
+                Some(content_hash),
+                scope,
+            )
+            .await
+        } else {
+            crate::controllers::substrate::environment_placement::work_environment(
+                gate,
+                &self.pool,
+                template,
+                Some(content_hash),
+                scope,
+            )
+            .await
+        }
         .db_context("failed to read the template build's environment")
     }
 

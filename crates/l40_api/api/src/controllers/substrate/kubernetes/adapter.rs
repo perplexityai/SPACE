@@ -49,6 +49,8 @@ pub(super) use node_eligibility::{
     node_services_not_ready,
 };
 #[cfg(test)]
+pub(super) use pooled::PooledPodEnvironment;
+#[cfg(test)]
 use pooled::pooled_metadata_update_error_is_reclaimable;
 pub(super) use pooled::pooled_route_identity_adoption_request;
 use pooled::{pooled_wake_request, wait_for_pooled_split_receipt_capability};

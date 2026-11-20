@@ -13,7 +13,7 @@ import {
 } from '@/lib/template-format';
 import { isDigestTag, visibleTemplateTags } from '@/lib/template-list';
 import { singleFlight } from '@/lib/single-flight';
-import { TAG_PRECONDITION_UNCHECKED, moveReleaseTag, tagMoveFailureMessage } from '@/lib/admin-fallback';
+import { TAG_PRECONDITION_UNCHECKED, moveReleaseTag, tagMoveFailureMessage, upsertWarmPool } from '@/lib/admin-fallback';
 import { runMutation } from '@/lib/mutation-refresh';
 import NetworkPolicyDesigner, { networkPoliciesEqual } from '@/components/network-policy-designer';
 import {
@@ -300,7 +300,7 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
     if (!release) return;
 
     await change({
-      mutate: () => adminApi.put('/v1/warm-pools', {
+      mutate: () => upsertWarmPool((path, body) => adminApi.put(path, body), {
         template_name: release.template_name,
         content_hash: release.content_hash,
         vcpu: values.vcpu,
@@ -318,7 +318,7 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
         max_warming_slots: values.max_warming_slots,
         namespace: values.namespace?.trim() || undefined,
         enabled: values.enabled ?? true,
-      }),
+      }, clusterPoolModal.config?.template_release_id ?? null),
       succeeded: () => {
         closeClusterPoolModal();
         message.success('Cluster pool config saved');
@@ -336,7 +336,7 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
 
     await change({
       mutate: () => existing.managed_by === 'autoscaler'
-        ? adminApi.put('/v1/warm-pools', {
+        ? upsertWarmPool((path, body) => adminApi.put(path, body), {
           template_name: existing.template_name,
           content_hash: existing.content_hash,
           vcpu: existing.vcpu,
@@ -347,7 +347,7 @@ export function useTemplateActions(data: TemplatesData, { onTemplateDeleted }: O
           max_warming_slots: existing.max_warming_slots,
           namespace: existing.namespace,
           enabled: false,
-        })
+        }, existing.template_release_id)
         : adminApi.delete(`/v1/warm-pools/${existing.id}`),
       succeeded: () => {
         closeClusterPoolModal();

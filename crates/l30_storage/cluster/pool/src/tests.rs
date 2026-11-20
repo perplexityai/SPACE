@@ -633,7 +633,7 @@ async fn autoscale_configs_prepares_new_release_without_observed_demand() -> Tes
     let (release_id, _content_hash) = seed_release(&fixture.pool, "seed", 0x45).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config = sqlx::query_as::<_, (i32, i32, i32, String, bool, String)>(
         "SELECT target_ready_slots, refill_per_tick, max_warming_slots,
@@ -674,7 +674,7 @@ async fn autoscale_configs_materializes_warm_pool_disk_io_policy() -> TestResult
     .execute(&fixture.pool)
     .await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let limits = sqlx::query_as::<_, (Option<i32>, i64, i64)>(
         "SELECT disk_mib, disk_io_max_operations_per_sec,
@@ -739,7 +739,7 @@ async fn autoscale_configs_prepares_republished_exact_release_without_observed_d
     .bind(previous_release_id)
     .execute(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let previous_config_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
          FROM kubernetes_pool_configs
@@ -780,7 +780,7 @@ async fn autoscale_configs_prepares_republished_exact_release_without_observed_d
     .bind(republished_hash.to_string())
     .execute(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let configs = sqlx::query_as::<_, (Uuid, i32, bool, String)>(
         "SELECT template_release_id, target_ready_slots, enabled, managed_by
@@ -803,7 +803,7 @@ async fn autoscale_configs_uses_policy_refill_and_warming_slots() -> TestResult 
     let (release_id, _content_hash) = seed_release(&fixture.pool, "seed", 0x46).await?;
     upsert_warm_pool_policy_with_pacing(&fixture.pool, "seed", 5, 100, 20, 40, 1).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config = sqlx::query_as::<_, (i32, i32, i32)>(
         "SELECT target_ready_slots, refill_per_tick, max_warming_slots
@@ -838,7 +838,7 @@ async fn autoscale_ignores_templates_without_policy() -> TestResult {
     .bind(config_id)
     .fetch_one(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
@@ -878,7 +878,7 @@ async fn autoscale_uses_per_template_min_and_max_when_set() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, content_hash, None, None).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target_ready_slots = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -900,7 +900,7 @@ async fn autoscale_prepares_multiple_retained_releases_without_demand() -> TestR
     seed_release(&fixture.pool, "seed", 0x43).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 4, 7, 2).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let targets = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -925,7 +925,7 @@ async fn autoscale_keeps_unretained_release_with_recent_demand() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, old_hash, None, None).await?;
     }
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let old_target = sqlx::query_scalar::<_, i32>(
@@ -949,7 +949,7 @@ async fn autoscale_requires_sustained_demand_for_unretained_release() -> TestRes
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
 
     insert_k8s_sandbox(&fixture.pool, old_hash, None, None).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let config_below_threshold = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
          FROM kubernetes_pool_configs
@@ -962,7 +962,7 @@ async fn autoscale_requires_sustained_demand_for_unretained_release() -> TestRes
     for _ in 1..10 {
         insert_k8s_sandbox(&fixture.pool, old_hash, None, None).await?;
     }
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let target_at_threshold = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
          FROM kubernetes_pool_configs
@@ -988,7 +988,7 @@ async fn autoscale_ignores_unretained_demand_for_unsupported_shape() -> TestResu
         insert_k8s_sandbox(&fixture.pool, old_hash, Some(4), Some(2048)).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let old_config = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
@@ -1019,7 +1019,7 @@ async fn autoscale_bounds_demand_selected_releases_per_policy() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, second_demanded_hash, None, None).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let selected_releases = sqlx::query_scalar::<_, Uuid>(
         "SELECT template_release_id
@@ -1062,7 +1062,7 @@ async fn autoscale_bounds_demand_selected_releases_per_policy() -> TestResult {
     for _ in 0..11 {
         insert_k8s_sandbox(&fixture.pool, second_demanded_hash, None, None).await?;
     }
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let configs_after_demand_shift = sqlx::query_as::<_, (Uuid, bool, i32)>(
         "SELECT template_release_id, enabled, target_ready_slots
          FROM kubernetes_pool_configs
@@ -1103,7 +1103,7 @@ async fn autoscale_counts_fallthrough_space_sandboxes_as_recent_demand() -> Test
     }
 
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let old_target = sqlx::query_scalar::<_, i32>(
@@ -1145,7 +1145,7 @@ async fn autoscale_matches_prefixed_sandbox_demand_to_bare_release_hash() -> Tes
     }
 
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let old_target = sqlx::query_scalar::<_, i32>(
@@ -1193,7 +1193,7 @@ async fn autoscale_deletes_empty_policy_owned_pool_when_policy_is_removed() -> T
 
     let retired_configs = fixture
         .store
-        .autoscale_configs("sandboxes")
+        .autoscale_configs("sandboxes", None)
         .await?
         .retired
         .configs;
@@ -1303,7 +1303,7 @@ async fn autoscale_keeps_retired_config_until_open_slots_are_drained() -> TestRe
         })
         .await?;
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let config_enabled = sqlx::query_scalar::<_, bool>(
         "SELECT enabled
          FROM kubernetes_pool_configs
@@ -1313,7 +1313,7 @@ async fn autoscale_keeps_retired_config_until_open_slots_are_drained() -> TestRe
     .fetch_one(&fixture.pool)
     .await?;
     fixture.store.delete_open_slot(slot.id).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     assert!(!config_enabled);
@@ -1397,7 +1397,7 @@ async fn autoscale_disables_all_autoscaler_configs_when_all_policies_are_disable
         .execute(&fixture.pool)
         .await?;
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let configs = sqlx::query_as::<_, (bool, i32)>(
@@ -1419,7 +1419,7 @@ async fn autoscale_drains_old_shape_when_policy_shape_changes() -> TestResult {
     let template = TemplateName::parse("seed")?;
     let (release_id, content_hash) = seed_release(&fixture.pool, "seed", 0x53).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let old_config_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
          FROM kubernetes_pool_configs
@@ -1460,7 +1460,7 @@ async fn autoscale_drains_old_shape_when_policy_shape_changes() -> TestResult {
     .await?;
 
     // act
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     // assert
     let configs = sqlx::query_as::<_, (i32, i32, bool, i32)>(
@@ -1571,7 +1571,7 @@ async fn autoscale_configs_grows_target_when_traffic_increases() -> TestResult {
         insert_k8s_sandbox(&fixture.pool, content_hash, None, None).await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target_ready_slots = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -1613,7 +1613,7 @@ async fn autoscale_configs_shrinks_target_when_traffic_decreases_but_keeps_min()
 
     insert_k8s_sandbox(&fixture.pool, content_hash, None, None).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target_ready_slots = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -1655,7 +1655,7 @@ async fn autoscale_configs_deletes_empty_unretained_pool_after_lookback_with_no_
     seed_release(&fixture.pool, "seed", 0x58).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 1, 10, 1).await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
@@ -1705,7 +1705,7 @@ async fn autoscale_disables_demand_selected_pool_after_demand_expires() -> TestR
         })
         .await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     sqlx::query(
         "UPDATE sandboxes
          SET created_at = NOW() - INTERVAL '25 hours'
@@ -1715,7 +1715,7 @@ async fn autoscale_disables_demand_selected_pool_after_demand_expires() -> TestR
     .bind(old_hash.to_string())
     .execute(&fixture.pool)
     .await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let retired = sqlx::query_as::<_, (bool, i32)>(
         "SELECT enabled, target_ready_slots
@@ -1728,7 +1728,7 @@ async fn autoscale_disables_demand_selected_pool_after_demand_expires() -> TestR
     assert_eq!(retired, (false, 0));
 
     fixture.store.delete_open_slot(slot.id).await?;
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
          FROM kubernetes_pool_configs
@@ -1763,7 +1763,7 @@ async fn autoscale_configs_does_not_touch_manual_configs() -> TestResult {
     .fetch_one(&fixture.pool)
     .await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let after = sqlx::query_as::<_, (i32, i32, i32, String, bool, String)>(
         "SELECT target_ready_slots, refill_per_tick, max_warming_slots,
@@ -4211,7 +4211,7 @@ async fn autoscale_merges_hash_spellings_and_default_shapes_into_one_demand_grou
             .await?;
     }
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
 
     let target = sqlx::query_scalar::<_, i32>(
         "SELECT target_ready_slots
@@ -4268,7 +4268,7 @@ async fn config_reads_decode_blake3_release_hashes() -> TestResult {
 
     let retired = fixture
         .store
-        .autoscale_configs("space")
+        .autoscale_configs("space", None)
         .await?
         .retired
         .configs;
@@ -4341,7 +4341,11 @@ async fn config_reads_keep_valid_rows_when_one_row_is_invalid() -> TestResult {
 
     // The autoscaler deletes the empty, disabled row although it is invalid,
     // and reports it. The valid manual config stays.
-    let retired = fixture.store.autoscale_configs("space").await?.retired;
+    let retired = fixture
+        .store
+        .autoscale_configs("space", None)
+        .await?
+        .retired;
     assert!(retired.configs.is_empty());
     assert_eq!(retired.invalid_rows.len(), 1);
     assert_eq!(retired.invalid_rows[0].id, bad_config_id);
@@ -4405,7 +4409,7 @@ async fn autoscale_skips_an_invalid_demand_row_and_holds_only_its_release() -> T
     )
     .await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(run.invalid_rows.len(), 1);
     assert_eq!(run.invalid_rows[0].read, AutoscaleRead::ObservedDemand);
@@ -4434,7 +4438,7 @@ async fn autoscale_skips_an_invalid_demand_row_and_holds_only_its_release() -> T
     sqlx::query("DELETE FROM sandboxes WHERE template_id = 'held'")
         .execute(&fixture.pool)
         .await?;
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert!(run.invalid_rows.is_empty());
     assert_eq!(
@@ -4491,7 +4495,7 @@ async fn autoscale_skips_an_invalid_policy_row_and_holds_its_releases() -> TestR
     )
     .await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(run.invalid_rows.len(), 1);
     assert_eq!(
@@ -4577,7 +4581,7 @@ async fn autoscale_writes_the_other_candidates_when_one_write_fails() -> TestRes
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
     refuse_config_writes_for_refused_template(&fixture.pool).await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(
         run.failed_candidates
@@ -4629,7 +4633,7 @@ async fn autoscale_holds_a_failed_candidates_old_shape_config() -> TestResult {
     upsert_warm_pool_policy(&fixture.pool, "refused", 2, 10, 1).await?;
     refuse_config_writes_for_refused_template(&fixture.pool).await?;
 
-    let run = fixture.store.autoscale_configs("sandboxes").await?;
+    let run = fixture.store.autoscale_configs("sandboxes", None).await?;
 
     assert_eq!(
         run.failed_candidates
@@ -4828,7 +4832,7 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
             .await?;
         }
 
-        fixture.store.autoscale_configs("sandboxes").await?;
+        fixture.store.autoscale_configs("sandboxes", None).await?;
 
         let demanded = sqlx::query_scalar::<_, Uuid>(
             "SELECT template_release_id
@@ -4902,7 +4906,7 @@ async fn retention_and_demand_ignore_twins() -> TestResult {
         )
         .await?;
     }
-    fixture.store.autoscale_configs("sandboxes").await?;
+    fixture.store.autoscale_configs("sandboxes", None).await?;
     let demanded = sqlx::query_scalar::<_, Uuid>(
         "SELECT template_release_id
          FROM kubernetes_pool_configs
@@ -4915,6 +4919,117 @@ async fn retention_and_demand_ignore_twins() -> TestResult {
         demanded,
         vec![w.bare],
         "demand for `bare` stays on the original"
+    );
+    Ok(())
+}
+
+/// A twin of `original` bound to the environment `environment_ref`,
+/// registered after it. Twins exist only once the `(template_name, hash)`
+/// unique index is dropped, which this does to stand in for the contract
+/// migration.
+async fn insert_twin_of(pool: &PgPool, original: Uuid, environment_ref: &str) -> TestResult<Uuid> {
+    sqlx::query("DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique")
+        .execute(pool)
+        .await?;
+    Ok(sqlx::query_scalar(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata, created_at)
+         SELECT template_name, type, hash, jsonb_build_object('environment', $2::TEXT),
+                clock_timestamp()
+         FROM template_releases WHERE id = $1
+         RETURNING id",
+    )
+    .bind(original)
+    .bind(environment_ref)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The autoscaler gives a build's retained slot and demand to the release
+/// creates of it resolve to (`pplx_space_template_release_store::resolved_release_sql`),
+/// and retires the original's pools once a twin takes over. Without
+/// resolution, or while the twin's environment has no policy state, they
+/// stay on the original; with the twin's environment the default, they move.
+#[tokio::test(flavor = "current_thread")]
+async fn autoscaling_follows_the_release_creates_resolve_to() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, content_hash) = seed_release(&fixture.pool, "seed", 0x72).await?;
+    let initial = format!("sha256:{}", "0".repeat(64));
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    let twin = insert_twin_of(&fixture.pool, original, &e1).await?;
+    upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
+    // 21 recent creates set a demand target of 3, above the floor of 2.
+    for _ in 0..21 {
+        insert_sandbox_for_template(
+            &fixture.pool,
+            "seed",
+            "k8s",
+            &content_hash.to_string(),
+            None,
+            None,
+        )
+        .await?;
+    }
+    let enabled_releases = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT DISTINCT template_release_id
+             FROM kubernetes_pool_configs
+             WHERE enabled AND managed_by = 'autoscaler'",
+        )
+        .fetch_all(&pool)
+        .await
+    };
+
+    fixture.store.autoscale_configs("sandboxes", None).await?;
+    assert_eq!(
+        enabled_releases(fixture.pool.clone()).await?,
+        vec![original]
+    );
+    fixture
+        .store
+        .autoscale_configs("sandboxes", Some(&initial))
+        .await?;
+    assert_eq!(
+        enabled_releases(fixture.pool.clone()).await?,
+        vec![original],
+        "a twin whose environment has no policy state isn't resolved"
+    );
+
+    sqlx::query(
+        "INSERT INTO runtime_environment_states (environment_ref, state, reason)
+         VALUES ($1, 'allowed', 'test')",
+    )
+    .bind(&e1)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE runtime_environment_policy
+         SET default_environment_ref = $1, generation = generation + 1
+         WHERE singleton",
+    )
+    .bind(&e1)
+    .execute(&fixture.pool)
+    .await?;
+    fixture
+        .store
+        .autoscale_configs("sandboxes", Some(&initial))
+        .await?;
+    assert_eq!(
+        enabled_releases(fixture.pool.clone()).await?,
+        vec![twin],
+        "the twin creates resolve to takes the pool; the original's is retired"
+    );
+    let twin_targets = sqlx::query_scalar::<_, i32>(
+        "SELECT target_ready_slots
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = $1 AND enabled AND managed_by = 'autoscaler'",
+    )
+    .bind(twin)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(
+        twin_targets,
+        vec![3],
+        "the twin takes the original's demand"
     );
     Ok(())
 }
