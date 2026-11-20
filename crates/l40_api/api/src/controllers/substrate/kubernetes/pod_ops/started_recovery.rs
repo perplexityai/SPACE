@@ -110,7 +110,10 @@ impl KubernetesSubstrate {
     /// Whether the API already sees `source_node` as lost: its row is deleted,
     /// or the warm Node cache doesn't list it, or lists it not Ready or
     /// cordoned. A cold cache answers `false`.
-    fn started_recovery_source_node_looks_lost(&self, source_node: &StaleRecoverySourceNode) -> bool {
+    fn started_recovery_source_node_looks_lost(
+        &self,
+        source_node: &StaleRecoverySourceNode,
+    ) -> bool {
         match source_node {
             StaleRecoverySourceNode::RowDeleted => true,
             StaleRecoverySourceNode::Unknown => false,
@@ -184,14 +187,12 @@ impl KubernetesSubstrate {
                 StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { .. }
                 | StartedRecoveryUnavailableCause::SameNodeUploadPastSettle { .. }
                 | StartedRecoveryUnavailableCause::NoDurableSource,
-            ) => {
-                SubstrateError::RestoreContextUnavailable {
-                    message: format!(
-                        "sandbox {sandbox_id} generation {generation} has no verified local or \
-                         remote restore source; leaving the execution unchanged"
-                    ),
-                }
-            }
+            ) => SubstrateError::RestoreContextUnavailable {
+                message: format!(
+                    "sandbox {sandbox_id} generation {generation} has no verified local or \
+                     remote restore source; leaving the execution unchanged"
+                ),
+            },
             // The classification is advisory. Failing to read it must not turn
             // a possibly recoverable sandbox into a terminal answer.
             Err(error) => error,

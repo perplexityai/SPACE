@@ -492,7 +492,9 @@ pub(super) enum StartedRecoveryUnavailableCause {
     /// the cluster controller to prove that node gone; it then rolls the
     /// sandbox back to that snapshot. Whether a retry can ever succeed
     /// depends on `source_node`, which the caller checks.
-    StaleSourceAwaitingNodeLoss { source_node: StaleRecoverySourceNode },
+    StaleSourceAwaitingNodeLoss {
+        source_node: StaleRecoverySourceNode,
+    },
     /// No durable copy of the sandbox exists.
     NoDurableSource,
 }

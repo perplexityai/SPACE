@@ -1324,7 +1324,11 @@ mod postgres_backed {
         let query = format!("SELECT {absent} FROM sandboxes s WHERE s.id = $1");
         let (source_absent,): (bool,) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
             .bind(seeded.sandbox_id)
-            .bind(pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
+            .bind(
+                pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
+                    .as_secs()
+                    .cast_signed(),
+            )
             .fetch_one(&db.pool)
             .await?;
         assert!(
