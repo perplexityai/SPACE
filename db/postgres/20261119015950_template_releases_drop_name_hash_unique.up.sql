@@ -1,0 +1,44 @@
+-- no-transaction
+-- squawk-disable-assume-in-transaction
+-- idx_template_releases_template_name_hash_unique admits one release per
+-- (template_name, hash), so a twin of a release, a second row with the same
+-- template_name and hash bound to another execution environment, can't be
+-- inserted while it stands. template_releases_template_name_hash_environment_key
+-- (20261118041620_template_releases_environment_unique) keeps one release per
+-- template, hash and execution_metadata environment, and takes over uniqueness
+-- once this index is gone.
+--
+-- This must not run while any deployed binary, or any kept as a rollback
+-- target, relies on the old uniqueness in one of the ways that migration lists.
+-- The one that fails at once is INSERT ... ON CONFLICT (template_name, hash):
+-- Postgres infers the arbiter index from that target and refuses the statement
+-- when no unique index matches it, so every template registration from such a
+-- binary would fail. An ON CONFLICT DO NOTHING with no target checks every
+-- unique index, so writers that leave the target out keep working. The others,
+-- reads keyed by template and hash that ignore the environment and UPDATEs that
+-- bind an unbound row's execution_metadata, go wrong only once a twin exists.
+--
+-- CONCURRENTLY because template_releases is read on template lookups: a plain
+-- DROP INDEX takes ACCESS EXCLUSIVE on the table, so it waits behind every
+-- transaction using the table and blocks every read and write queued after it
+-- until it has dropped the index. That makes this a single-statement
+-- `-- no-transaction` migration, which the migrator does not retry. IF EXISTS
+-- so a rerun, or a database whose index was already dropped by hand, drops
+-- nothing and still records the migration. A failure leaves no history row,
+-- so the next migrator run drops the index again. The drop marks the index
+-- INVALID, commits and waits, then stops maintaining it, commits and waits
+-- again, so a failure can leave it INVALID and still maintained, refusing
+-- twins, or INVALID and no longer maintained. Neither can arbitrate an
+-- ON CONFLICT (template_name, hash), so a binary still writing that fails
+-- until the rerun; one more reason the drop waits for those binaries to be
+-- gone. After a failed run, rerun the up. Don't run the migrator's down: with
+-- no history row for this migration, it rolls back the newest recorded
+-- migration instead and leaves this index as the failure left it.
+--
+-- The statement must be the file's only one, so it cannot set its own lock or
+-- statement timeout and runs under the session's (see db/README.md). Dropping
+-- concurrently takes SHARE UPDATE EXCLUSIVE, which does not block writers. It
+-- waits for every transaction that holds a lock on template_releases, so a
+-- long-running one can hold the drop past the session's lock timeout.
+-- squawk-ignore require-lock-timeout, require-statement-timeout
+DROP INDEX CONCURRENTLY IF EXISTS public.idx_template_releases_template_name_hash_unique;

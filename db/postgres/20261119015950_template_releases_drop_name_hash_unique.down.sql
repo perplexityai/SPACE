@@ -1,0 +1,65 @@
+-- no-transaction
+-- squawk-disable-assume-in-transaction
+-- Rebuilds idx_template_releases_template_name_hash_unique as the baseline
+-- created it: one release per (template_name, hash).
+--
+-- The build fails with a unique violation once any twin exists: two rows with
+-- the same template_name and hash whose execution_metadata environments
+-- differ, one of them possibly unbound. Find them with
+--
+--   SELECT template_name, hash, count(*)
+--     FROM template_releases
+--    GROUP BY template_name, hash
+--   HAVING count(*) > 1;
+--
+-- Running this down once twins exist is a maintenance procedure, not part of
+-- this migration, and it can lose data:
+-- 1. Stop every writer that can insert a twin first: release registrations
+--    bound to an execution environment the hash has no release for, which
+--    template publishers send, and runtime upgrade campaigns. A twin inserted
+--    during the build fails the build. Once the index takes writes, a plain or
+--    targeted insert of a twin fails with a unique violation, and a
+--    target-less ON CONFLICT DO NOTHING inserts nothing.
+-- 2. Keep each (template_name, hash)'s original, the earliest row by
+--    (created_at, id), whatever environment it's bound to: that's the release
+--    tags and lookups without an environment resolve. Remove its twins.
+--    Older binaries read by template and hash alone and can't tell twins
+--    apart. If the original owns no storage location and a twin does,
+--    removing that twin leaves no row naming the build's storage, so settle
+--    which row keeps the location first.
+-- 3. Pool configs, pool slots, sandbox archives, storage locations and tags
+--    reference a release ON DELETE RESTRICT, so a twin they reference can't be
+--    deleted until they no longer do. Deleting a sandbox archive loses the
+--    suspended sandbox, and repointing it at the kept row changes the release
+--    it restores from. runtime_upgrade_items.subject_id also names
+--    releases, with no foreign key, so a removed twin leaves its campaign item
+--    dangling.
+-- Don't roll the binary back to one that writes ON CONFLICT (template_name,
+-- hash) until this down has succeeded: until then no index can arbitrate that
+-- statement.
+--
+-- CONCURRENTLY because a plain build holds SHARE on template_releases and
+-- would block release registration for its duration. That makes this a
+-- single-statement `-- no-transaction` migration, which the migrator doesn't
+-- retry. A failed build can leave an INVALID index behind while this
+-- migration stays recorded as applied:
+-- * A twin that's already there fails the first scan, before the index takes
+--   writes, so that index neither refuses new twins nor arbitrates.
+-- * A failure in a later wait, such as a timeout, can leave the index INVALID
+--   but maintained. It refuses new twins, but still can't arbitrate an
+--   ON CONFLICT (template_name, hash).
+-- There is no IF NOT EXISTS so that a rerun fails on that index instead of
+-- skipping it and removing the history row. To recover, run this migration's
+-- up statement by hand, remove the twins as above, and rerun the down.
+--
+-- The statement must be the file's only one, so it cannot set its own lock or
+-- statement timeout and runs under the session's (see db/README.md). Building
+-- concurrently takes SHARE UPDATE EXCLUSIVE, which does not block writers. It
+-- waits twice for transactions holding a lock on template_releases that
+-- conflicts with SHARE (writers, and maintenance such as VACUUM or another
+-- index build), and then for every
+-- transaction in the database whose snapshot is older than its second scan,
+-- whatever tables that transaction reads. A long-running one can hold the
+-- build past the session's lock timeout and leave an INVALID index.
+CREATE UNIQUE INDEX CONCURRENTLY idx_template_releases_template_name_hash_unique
+    ON public.template_releases USING btree (template_name, hash);

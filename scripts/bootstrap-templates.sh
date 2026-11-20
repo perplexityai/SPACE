@@ -112,6 +112,8 @@ register_template_in_postgres() {
   psql "$POSTGRES_CONNECTION_STRING" -v ON_ERROR_STOP=1 \
     -v name="$name" -v hash="$hash" -v storage_uri="$storage_uri" \
     -v digest_original="$DIGEST_ORIGINAL" <<'SQL'
+BEGIN;
+
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM clusters WHERE singleton) THEN
@@ -144,11 +146,18 @@ ON CONFLICT (name) DO UPDATE
 SET org_id = COALESCE(templates.org_id, EXCLUDED.org_id)
 WHERE templates.org_id IS NULL;
 
--- A digest already stored under its other spelling (bare `<hex>` beside
--- `sha256:<hex>`) gets no second release: the tag and storage location below
--- go to the digest's original, whichever spelling it's stored under.
-INSERT INTO template_releases (template_name, type, hash, org_id)
-SELECT :'name', 'fc', :'hash', org_id
+-- A release is unique per template, hash and execution environment, so a hash
+-- can have twins bound to other environments. This registration carries no
+-- execution metadata, so it inserts a release only when the digest has none
+-- under either spelling (bare `<hex>` beside `sha256:<hex>`). The tag and
+-- storage location below go to the digest's original, whichever spelling it's
+-- stored under. The internal API registers under this same template row lock
+-- and stamps created_at with clock_timestamp(), so the existence check can't
+-- race its insert and insert order is registration order.
+SELECT 1 FROM templates WHERE name = :'name' FOR UPDATE;
+
+INSERT INTO template_releases (template_name, type, hash, org_id, created_at)
+SELECT :'name', 'fc', :'hash', org_id, clock_timestamp()
 FROM templates
 WHERE name = :'name'
   AND NOT EXISTS (
@@ -157,14 +166,21 @@ WHERE name = :'name'
     WHERE other.template_name = :'name'
       AND other.hash IN (replace(:'hash', 'sha256:', ''),
                          'sha256:' || replace(:'hash', 'sha256:', ''))
-      AND other.hash <> :'hash'
   )
-ON CONFLICT (template_name, hash) DO UPDATE
-SET org_id = COALESCE(template_releases.org_id, EXCLUDED.org_id)
-WHERE template_releases.org_id IS NULL;
+ON CONFLICT DO NOTHING;
 
--- That insert skips a digest stored under its other spelling, ownership
--- backfill included, so give the digest original the template's owner here.
+-- An owner filled in later goes to every release of this spelling that has
+-- none, twins included.
+UPDATE template_releases
+SET org_id = templates.org_id
+FROM templates
+WHERE templates.name = :'name'
+  AND template_releases.template_name = :'name'
+  AND template_releases.hash = :'hash'
+  AND template_releases.org_id IS NULL;
+
+-- The digest's original can be stored under the other spelling, which the
+-- update above doesn't reach, so give it the template's owner here too.
 UPDATE template_releases r
 SET org_id = t.org_id
 FROM templates t
@@ -202,6 +218,8 @@ SET org_id = COALESCE(
   EXCLUDED.org_id
 )
 WHERE template_release_storage_locations.org_id IS NULL;
+
+COMMIT;
 SQL
 }
 
