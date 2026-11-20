@@ -35,8 +35,9 @@ struct PermitInner {
 /// held for the rest of the work.
 #[derive(Debug)]
 enum Held {
-    Payload(#[allow(dead_code)] OwnedSemaphorePermit),
-    Exchanged(#[allow(dead_code)] OwnedSemaphorePermit),
+    // Each permit is held only to return its slots when dropped.
+    Payload { _slots: OwnedSemaphorePermit },
+    Exchanged { _slots: OwnedSemaphorePermit },
 }
 
 impl PermitInner {
@@ -57,18 +58,18 @@ impl PermitInner {
     }
 
     fn holds_slots(&self) -> bool {
-        matches!(*self.held(), Held::Payload(_))
+        matches!(*self.held(), Held::Payload { .. })
     }
 
     /// Swap the payload slots for `other`, for every clone, unless they are
     /// already gone; then `other` comes back.
     fn exchange(&self, other: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
         let mut held = self.held();
-        if !matches!(*held, Held::Payload(_)) {
+        if !matches!(*held, Held::Payload { .. }) {
             return Err(other);
         }
         // The payload slots drop here, returning to their budget.
-        *held = Held::Exchanged(other);
+        *held = Held::Exchanged { _slots: other };
         drop(held);
         self.record_cancelled_release();
         Ok(())
@@ -147,7 +148,7 @@ impl RequestPermit {
             inner: Arc::new(PermitInner {
                 semaphore: Arc::clone(permit.semaphore()),
                 slots: permit.num_permits(),
-                permit: Mutex::new(Held::Payload(permit)),
+                permit: Mutex::new(Held::Payload { _slots: permit }),
                 acquired_at: Instant::now(),
                 observation,
                 cancelled_at: OnceLock::new(),
