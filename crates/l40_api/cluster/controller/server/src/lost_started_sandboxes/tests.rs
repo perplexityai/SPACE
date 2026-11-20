@@ -805,7 +805,10 @@ mod postgres_backed {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source_node, SourceNode::RowDeleted);
 
-        assert_eq!(store.mark_lost(&candidates[0]).await?, LostDisposition::Failed);
+        assert_eq!(
+            store.mark_lost(&candidates[0]).await?,
+            LostDisposition::Failed
+        );
         assert_eq!(
             sandbox_state(&db.pool, seeded.sandbox_id).await?,
             ("failed".to_string(), None, 0)
@@ -891,7 +894,10 @@ mod postgres_backed {
         .await?;
         let candidates = listed(&store).await?;
         assert_eq!(candidates.len(), 1);
-        assert_eq!(store.mark_lost(&candidates[0]).await?, LostDisposition::Failed);
+        assert_eq!(
+            store.mark_lost(&candidates[0]).await?,
+            LostDisposition::Failed
+        );
         let state: String = sqlx::query_scalar(sql!("SELECT state FROM snapshots WHERE id = $1"))
             .bind(dead)
             .fetch_one(&db.pool)
@@ -950,7 +956,10 @@ mod postgres_backed {
             source_node: SourceNode::RowDeleted,
             ..candidate.clone()
         };
-        assert_eq!(store.mark_lost(&deleted_row).await?, LostDisposition::Refused);
+        assert_eq!(
+            store.mark_lost(&deleted_row).await?,
+            LostDisposition::Refused
+        );
         assert_eq!(
             sandbox_state(&db.pool, seeded.sandbox_id).await?.0,
             "started"
@@ -1033,7 +1042,11 @@ mod postgres_backed {
             .bind(seeded.sandbox_id)
             .execute(&db.pool)
             .await?;
-            assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Refused, "{pod_column}");
+            assert_eq!(
+                store.mark_lost(&candidate).await?,
+                LostDisposition::Refused,
+                "{pod_column}"
+            );
             assert!(listed(&store).await?.is_empty(), "{pod_column}");
             sqlx::query(sql!(
                 "UPDATE sandbox_k8s_executions
@@ -1107,7 +1120,11 @@ mod postgres_backed {
                 .bind(seeded.sandbox_id)
                 .execute(&db.pool)
                 .await?;
-            assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Refused, "{change}");
+            assert_eq!(
+                store.mark_lost(&candidate).await?,
+                LostDisposition::Refused,
+                "{change}"
+            );
             sqlx::query(sqlx::AssertSqlSafe(undo))
                 .bind(seeded.sandbox_id)
                 .execute(&db.pool)
@@ -1274,8 +1291,8 @@ mod postgres_backed {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn p13_newer_live_snapshot_refuses_the_rollback_but_a_dead_upload_does_not()
-    -> TestResult {
+    async fn p13_newer_live_snapshot_refuses_the_rollback_but_a_dead_upload_does_not() -> TestResult
+    {
         let Some(db) = try_pg_test_db().await? else {
             return Ok(());
         };
@@ -1308,16 +1325,20 @@ mod postgres_backed {
         // so the give-up falls back to failing the sandbox.
         let newer_ready = seed_stuck(&db.pool, false).await?;
         mark_newest_snapshot_current(&db.pool, newer_ready.sandbox_id).await?;
-        insert_snapshot(&db.pool, newer_ready.sandbox_id, "ready", "90 minutes", None).await?;
+        insert_snapshot(
+            &db.pool,
+            newer_ready.sandbox_id,
+            "ready",
+            "90 minutes",
+            None,
+        )
+        .await?;
         let candidate = listed(&store)
             .await?
             .into_iter()
             .find(|candidate| candidate.sandbox_id == newer_ready.sandbox_id)
             .expect("listed");
-        assert_eq!(
-            store.mark_lost(&candidate).await?,
-            LostDisposition::Failed
-        );
+        assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Failed);
         Ok(())
     }
 
@@ -1338,10 +1359,7 @@ mod postgres_backed {
         let store = LostStartedDbStore::new(db.pool.clone());
         let candidate = listed(&store).await?.remove(0);
 
-        assert_eq!(
-            store.mark_lost(&candidate).await?,
-            LostDisposition::Failed
-        );
+        assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Failed);
         assert_eq!(
             sandbox_state(&db.pool, seeded.sandbox_id).await?,
             ("failed".to_string(), None, 0)

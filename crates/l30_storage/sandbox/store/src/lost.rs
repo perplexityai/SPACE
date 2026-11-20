@@ -199,12 +199,14 @@ pub async fn roll_back_started_to_suspend(
             .bind(SubstrateKind::Kubernetes)
             .fetch_optional(&mut **tx)
             .await?;
-    Ok(row.map(|(snapshot_timestamp, last_activity_at)| LostStartedRollback {
-        // The UPDATE only matches when `rollback_source` found this row, so
-        // the subselect can't come back empty under the same snapshot.
-        snapshot_timestamp: snapshot_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-        last_activity_at,
-    }))
+    Ok(row.map(
+        |(snapshot_timestamp, last_activity_at)| LostStartedRollback {
+            // The UPDATE only matches when `rollback_source` found this row, so
+            // the subselect can't come back empty under the same snapshot.
+            snapshot_timestamp: snapshot_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            last_activity_at,
+        },
+    ))
 }
 
 /// Unplace sandboxes just flipped to `failed` as lost: `unplaced` with no

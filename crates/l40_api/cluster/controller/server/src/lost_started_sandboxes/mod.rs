@@ -353,7 +353,8 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                             "restore_mode=stale_after_node_loss snapshot_timestamp={} \
                              lost_window_secs={}",
                             rollback.snapshot_timestamp,
-                            lost_window_secs.map_or_else(|| "unknown".to_string(), |s| s.to_string()),
+                            lost_window_secs
+                                .map_or_else(|| "unknown".to_string(), |s| s.to_string()),
                         ))
                         .reason(candidate.source_node.gone_reason())
                         .sandbox_id(candidate.sandbox_id)

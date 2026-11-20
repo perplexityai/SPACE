@@ -891,10 +891,7 @@ impl OutcomeEvent {
     /// sandbox had no activity clocks), `snapshot_age_secs` how old the
     /// snapshot was at rollback. Both are distributions so their tails are
     /// visible, not only the count.
-    pub fn stale_restore_after_node_loss(
-        lost_window_secs: Option<u64>,
-        snapshot_age_secs: u64,
-    ) {
+    pub fn stale_restore_after_node_loss(lost_window_secs: Option<u64>, snapshot_age_secs: u64) {
         let tags = [
             tag("loop", Loop::LostStartedSandboxes.as_str()),
             tag("restore_mode", "stale_after_node_loss"),
