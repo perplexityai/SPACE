@@ -3,6 +3,7 @@ use pplx_space_node_mgr_client::NodeResourceStatusReader;
 use pplx_space_sandbox_pod::SPACE_K8S_NODE_NAME_ENV;
 use tokio_util::sync::CancellationToken;
 
+mod cache_encryption;
 mod environment_labels;
 mod host_cpu;
 mod network_slots;
@@ -119,6 +120,18 @@ impl Controller {
             &self.node_name,
         )
         .await
+    }
+
+    pub async fn reconcile_cache_encryption(
+        &mut self,
+    ) -> Result<(), cache_encryption::CacheEncryptionReconcileError> {
+        if self.node_cache.metadata().is_none() {
+            tracing::debug!(node_name = %self.node_name, "Kubernetes Node metadata cache is not ready; skipping cache-encryption reconcile");
+            return Ok(());
+        }
+
+        cache_encryption::reconcile_cache_encryption(&self.kube, &self.node_cache, &self.node_name)
+            .await
     }
 
     pub async fn reconcile_network_slot_capacity(

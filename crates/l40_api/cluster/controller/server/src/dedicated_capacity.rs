@@ -27,6 +27,21 @@
 //!    pool. An excess node SPACE never registered (no `nodes` row) is
 //!    terminated directly.
 //!
+//! **Encrypted groups (BYOK).** A group with `cache_kms_key_arn` claims in
+//! three steps instead of one, so a tenant sandbox never lands on a plaintext
+//! cache:
+//!
+//! a. *Reserve.* The node is annotated with the group and its current boot ID.
+//!    It keeps the `unassigned` taint and gets no group label yet.
+//! b. *Rekey.* The instance is tagged `SpaceCacheEncryptionKmsKeyArn=<key>` and
+//!    rebooted. Instance store survives the reboot; the AMI's cache unit reads
+//!    the tag, rebuilds `/space/cache` on LUKS under a data key from the
+//!    tenant's key, turns swap off and starts the key watchdog. A node tagged
+//!    for encryption that can't do that never starts kubelet.
+//! c. *Claim.* Once the node is Ready on a new boot and node-ctl reports that
+//!    boot's cache encrypted under the group's key, it gets the label and the
+//!    `dedicated-org` taint as above.
+//!
 //! PoC scope: EKS only, one tick-driven loop, no leader fencing beyond the
 //! controller's own, and no per-tenant metrics.
 
@@ -54,6 +69,17 @@ const EKS_NODEGROUP_LABEL: &str = "eks.amazonaws.com/nodegroup";
 /// counts as leaving, so the terminate (and its decrement) is issued once.
 const TERMINATING_ANNOTATION: &str = "space.pplx.net/terminating";
 const DEFAULT_TICK: Duration = Duration::from_secs(15);
+/// Encrypted claims: the group a node is reserved for, before it's labeled.
+pub(crate) const CLAIM_GROUP_ANNOTATION: &str = "space.pplx.net/cache-encryption-claim";
+/// The node's boot ID when it was reserved. A claim needs a later boot.
+pub(crate) const CLAIM_BOOT_ANNOTATION: &str = "space.pplx.net/cache-encryption-claim-boot";
+/// Set once the instance was tagged with the key and rebooted.
+pub(crate) const REKEYED_ANNOTATION: &str = "space.pplx.net/cache-encryption-rekeyed";
+/// Published by node-ctl: the boot ID whose cache is on LUKS, and its key.
+pub(crate) const ENCRYPTED_BOOT_ANNOTATION: &str = "space.pplx.net/cache-encrypted-boot";
+pub(crate) const ENCRYPTED_KEY_ANNOTATION: &str = "space.pplx.net/cache-encrypted-key";
+/// Instance tag the AMI's cache unit reads at boot.
+const CACHE_KEY_INSTANCE_TAG: &str = "SpaceCacheEncryptionKmsKeyArn";
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
@@ -83,6 +109,8 @@ pub(crate) struct Group {
     pub(crate) pool: String,
     pub(crate) desired_nodes: i32,
     pub(crate) created_at: time::OffsetDateTime,
+    /// The tenant's KMS key; `None` for an unencrypted group.
+    pub(crate) cache_kms_key_arn: Option<String>,
 }
 
 /// One kube Node in a pool, reduced to what the plan reads.
@@ -98,6 +126,36 @@ pub(crate) struct PoolNode {
     /// Whether SPACE has a `nodes` row for it (only those can be drained).
     pub(crate) registered: bool,
     pub(crate) instance_id: Option<String>,
+    /// Encrypted claim in progress (see the module docs).
+    pub(crate) encryption: EncryptionClaim,
+}
+
+/// Where a node is in an encrypted claim, from its annotations and status.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EncryptionClaim {
+    /// Group the node is reserved for ([`CLAIM_GROUP_ANNOTATION`]).
+    pub(crate) group: Option<String>,
+    /// Boot ID at reservation ([`CLAIM_BOOT_ANNOTATION`]).
+    pub(crate) claim_boot: Option<String>,
+    pub(crate) rekeyed: bool,
+    /// The kubelet's current boot ID (`status.nodeInfo.bootID`).
+    pub(crate) boot_id: Option<String>,
+    pub(crate) ready: bool,
+    /// node-ctl's report: the boot whose cache is encrypted, and its key.
+    pub(crate) encrypted_boot: Option<String>,
+    pub(crate) encrypted_key: Option<String>,
+}
+
+impl EncryptionClaim {
+    /// The node rebooted since its reservation, is Ready, and its own report
+    /// says this boot's cache is on LUKS under `key`.
+    fn encrypted_under(&self, key: &str) -> bool {
+        self.ready
+            && self.boot_id.is_some()
+            && self.boot_id != self.claim_boot
+            && self.encrypted_boot == self.boot_id
+            && self.encrypted_key.as_deref() == Some(key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +167,18 @@ pub(crate) enum Action {
         node: String,
         group: String,
         org_id: OrgId,
+    },
+    /// Encrypted claim, step a: reserve the node for the group.
+    Reserve {
+        node: String,
+        group: String,
+        boot_id: String,
+    },
+    /// Encrypted claim, step b: tag the instance with the key and reboot it.
+    Rekey {
+        node: String,
+        instance_id: String,
+        key_arn: String,
     },
     Drain {
         node: String,
@@ -138,7 +208,9 @@ pub(crate) fn plan(groups: &[Group], nodes: &[PoolNode]) -> Vec<Action> {
         let mut free: Vec<&PoolNode> = pool_nodes
             .iter()
             .copied()
-            .filter(|node| node.group.is_none() && !node.leaving)
+            .filter(|node| {
+                node.group.is_none() && node.encryption.group.is_none() && !node.leaving
+            })
             .collect();
         free.sort_by(|a, b| a.name.cmp(&b.name));
         for node in &free {
@@ -157,18 +229,43 @@ pub(crate) fn plan(groups: &[Group], nodes: &[PoolNode]) -> Vec<Action> {
             let mut live: Vec<&PoolNode> = pool_nodes
                 .iter()
                 .copied()
-                .filter(|node| node.group.as_deref() == Some(group.name.as_str()) && !node.leaving)
+                .filter(|node| {
+                    let name = Some(group.name.as_str());
+                    (node.group.as_deref() == name || node.encryption.group.as_deref() == name)
+                        && !node.leaving
+                })
                 .collect();
             live.sort_by(|a, b| a.name.cmp(&b.name));
             let have = live.len() as i64;
+            if have <= desired {
+                if let Some(key) = group.cache_kms_key_arn.as_deref() {
+                    for node in live.iter().filter(|node| node.group.is_none()) {
+                        if let Some(action) = advance_encrypted_claim(node, group, key) {
+                            actions.push(action);
+                        }
+                    }
+                }
+            }
             if have < desired {
                 for _ in have..desired {
                     let Some(node) = free.next() else { break };
-                    actions.push(Action::Claim {
-                        node: node.name.clone(),
-                        group: group.name.clone(),
-                        org_id: group.org_id,
-                    });
+                    match &group.cache_kms_key_arn {
+                        None => actions.push(Action::Claim {
+                            node: node.name.clone(),
+                            group: group.name.clone(),
+                            org_id: group.org_id,
+                        }),
+                        // Without a boot ID or instance there's no way to tell
+                        // the rekeyed boot apart or to reboot it; leave it free.
+                        Some(_) => match (&node.encryption.boot_id, &node.instance_id) {
+                            (Some(boot_id), Some(_)) => actions.push(Action::Reserve {
+                                node: node.name.clone(),
+                                group: group.name.clone(),
+                                boot_id: boot_id.clone(),
+                            }),
+                            _ => continue,
+                        },
+                    }
                 }
             } else {
                 for node in live.into_iter().skip(usize::try_from(desired).unwrap_or(0)) {
@@ -194,6 +291,23 @@ pub(crate) fn plan(groups: &[Group], nodes: &[PoolNode]) -> Vec<Action> {
         }
     }
     actions
+}
+
+/// Next step for a node reserved for an encrypted group, if any.
+fn advance_encrypted_claim(node: &PoolNode, group: &Group, key: &str) -> Option<Action> {
+    let claim = &node.encryption;
+    if !claim.rekeyed {
+        return Some(Action::Rekey {
+            node: node.name.clone(),
+            instance_id: node.instance_id.clone()?,
+            key_arn: key.to_string(),
+        });
+    }
+    claim.encrypted_under(key).then(|| Action::Claim {
+        node: node.name.clone(),
+        group: group.name.clone(),
+        org_id: group.org_id,
+    })
 }
 
 fn release(node: &PoolNode) -> Action {
@@ -235,6 +349,7 @@ pub async fn run(
         kube,
         eks: pplx_space_aws_client::eks::Client::from_config(&aws),
         asg: pplx_space_aws_client::autoscaling::Client::from_config(&aws),
+        ec2: pplx_space_aws_client::ec2::Client::from_config(&aws),
         eks_cluster,
     };
     tracing::info!(
@@ -260,6 +375,7 @@ struct Backend {
     kube: Arc<KubernetesSubstrate>,
     eks: pplx_space_aws_client::eks::Client,
     asg: pplx_space_aws_client::autoscaling::Client,
+    ec2: pplx_space_aws_client::ec2::Client,
     eks_cluster: String,
 }
 
@@ -272,7 +388,7 @@ struct NodeRow {
 impl Backend {
     async fn tick(&self) -> Result<(), String> {
         let groups: Vec<Group> = sqlx::query_as(sql!(
-            "SELECT name, org_id, pool, desired_nodes, created_at
+            "SELECT name, org_id, pool, desired_nodes, created_at, cache_kms_key_arn
                FROM node_groups
               WHERE pool IS NOT NULL AND org_id IS NOT NULL AND desired_nodes IS NOT NULL"
         ))
@@ -326,6 +442,7 @@ impl Backend {
                         || row.is_some_and(|phase| phase.is_some()),
                     registered: row.is_some(),
                     instance_id: instance_id(node),
+                    encryption: encryption_claim(node),
                     name,
                 })
             })
@@ -362,13 +479,24 @@ impl Backend {
                     Ok(kube_node) => {
                         self.patch_node(kube_node, Some(group), |taints| {
                             set_taint(taints, DEDICATED_NODE_TAINT_KEY, &org_id.to_string());
-                            // An encrypted group would keep `unassigned` until the
-                            // node's encrypted cache is ready (track B).
                             taints.retain(|taint| taint.key != UNASSIGNED_TAINT_KEY);
                         })
                         .await
                     }
                 },
+                Action::Reserve {
+                    node,
+                    group,
+                    boot_id,
+                } => match kube_node(node) {
+                    Err(err) => Err(err),
+                    Ok(kube_node) => self.reserve(kube_node, group, boot_id).await,
+                },
+                Action::Rekey {
+                    node,
+                    instance_id,
+                    key_arn,
+                } => self.rekey(node, instance_id, key_arn).await,
                 Action::Drain { node } => self.drain(node).await,
                 Action::Terminate { node, instance_id } => {
                     match self.mark_terminating(node).await {
@@ -415,6 +543,49 @@ impl Backend {
         let patch = serde_json::json!({ "metadata": metadata, "spec": { "taints": taints } });
         Api::<Node>::all(self.kube.k8s.client.clone())
             .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    /// Encrypted claim, step a. Guarded by `resourceVersion`, like a claim, so
+    /// two ticks can't reserve one node for two groups.
+    async fn reserve(&self, node: &Node, group: &str, boot_id: &str) -> Result<(), String> {
+        let name = node.metadata.name.as_deref().unwrap_or_default();
+        let patch = serde_json::json!({
+            "metadata": {
+                "resourceVersion": node.metadata.resource_version,
+                "annotations": {
+                    CLAIM_GROUP_ANNOTATION: group,
+                    CLAIM_BOOT_ANNOTATION: boot_id,
+                },
+            }
+        });
+        Api::<Node>::all(self.kube.k8s.client.clone())
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    /// Encrypted claim, step b. Tag, reboot, then record it. A failure before
+    /// the record retries on the next tick, and a second reboot only rebuilds
+    /// the (still unclaimed) cache again.
+    async fn rekey(&self, node: &str, instance_id: &str, key_arn: &str) -> Result<(), String> {
+        self.ec2
+            .create_instance_tag(instance_id, CACHE_KEY_INSTANCE_TAG, key_arn)
+            .await
+            .map_err(|err| format!("tag {instance_id}: {err}"))?;
+        self.ec2
+            .reboot_instance(instance_id)
+            .await
+            .map_err(|err| format!("reboot {instance_id}: {err}"))?;
+        tracing::info!(node, instance_id, "dedicated_capacity: rebooting to encrypt the cache");
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { REKEYED_ANNOTATION: "true" } }
+        });
+        Api::<Node>::all(self.kube.k8s.client.clone())
+            .patch(node, &PatchParams::default(), &Patch::Merge(&patch))
             .await
             .map(|_| ())
             .map_err(|err| err.to_string())
@@ -492,6 +663,30 @@ fn annotation<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
         .as_ref()
         .and_then(|annotations| annotations.get(key))
         .map(String::as_str)
+}
+
+fn encryption_claim(node: &Node) -> EncryptionClaim {
+    let status = node.status.as_ref();
+    EncryptionClaim {
+        group: annotation(node, CLAIM_GROUP_ANNOTATION)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        claim_boot: annotation(node, CLAIM_BOOT_ANNOTATION).map(str::to_string),
+        rekeyed: annotation(node, REKEYED_ANNOTATION) == Some("true"),
+        boot_id: status
+            .and_then(|status| status.node_info.as_ref())
+            .map(|info| info.boot_id.clone())
+            .filter(|boot_id| !boot_id.is_empty()),
+        ready: status
+            .and_then(|status| status.conditions.as_ref())
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+            }),
+        encrypted_boot: annotation(node, ENCRYPTED_BOOT_ANNOTATION).map(str::to_string),
+        encrypted_key: annotation(node, ENCRYPTED_KEY_ANNOTATION).map(str::to_string),
+    }
 }
 
 fn has_taint(node: &Node, key: &str) -> bool {

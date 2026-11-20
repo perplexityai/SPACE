@@ -6,7 +6,9 @@
 //!
 //! A tenant may ask for dedicated capacity. That is a `node_groups` row owned
 //! by the tenant org, drawn from a generic pool (`SPACE_DEDICATED_CAPACITY_POOL`,
-//! an EKS managed node group on AWS). The cluster controller's
+//! an EKS managed node group on AWS), or from
+//! `SPACE_DEDICATED_CAPACITY_ENCRYPTED_POOL` when the tenant brings a cache
+//! key. The cluster controller's
 //! `dedicated_capacity` reconciler grows the pool and assigns nodes to it;
 //! this module only records intent.
 
@@ -29,15 +31,29 @@ use crate::{e2b::errors::E2bApiError, middleware::auth::AuthApiKey};
 /// dedicated capacity, and a request for it is refused.
 pub(crate) const DEDICATED_CAPACITY_POOL_ENV: &str = "SPACE_DEDICATED_CAPACITY_POOL";
 
+/// Pool that groups with a cache key draw from: nodes whose AMI rebuilds the
+/// instance-store cache on LUKS when tagged with a key. Unset means this
+/// cluster offers no encrypted dedicated capacity.
+pub(crate) const DEDICATED_CAPACITY_ENCRYPTED_POOL_ENV: &str =
+    "SPACE_DEDICATED_CAPACITY_ENCRYPTED_POOL";
+
+fn pool_from_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn dedicated_capacity_pool() -> Option<&'static str> {
     static POOL: OnceLock<Option<String>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        std::env::var(DEDICATED_CAPACITY_POOL_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
-    .as_deref()
+    POOL.get_or_init(|| pool_from_env(DEDICATED_CAPACITY_POOL_ENV))
+        .as_deref()
+}
+
+fn dedicated_capacity_encrypted_pool() -> Option<&'static str> {
+    static POOL: OnceLock<Option<String>> = OnceLock::new();
+    POOL.get_or_init(|| pool_from_env(DEDICATED_CAPACITY_ENCRYPTED_POOL_ENV))
+        .as_deref()
 }
 
 /// Upper bound on nodes per tenant for the PoC.
@@ -53,6 +69,11 @@ pub(crate) struct RegisterTenantRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct DedicatedNodeGroupRequest {
     nodes: i32,
+    /// The tenant's KMS key (BYOK). When set, each node is claimed only after
+    /// it reboots with its instance-store cache on LUKS under a data key from
+    /// this key. Fixed at registration: a later call can't change or drop it.
+    #[serde(default)]
+    cache_kms_key_arn: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +90,8 @@ pub(crate) struct DedicatedNodeGroupStatus {
     desired_nodes: i32,
     ready_nodes: i64,
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_kms_key_arn: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -78,6 +101,7 @@ struct TenantRow {
     group_name: Option<String>,
     desired_nodes: Option<i32>,
     ready_nodes: i64,
+    cache_kms_key_arn: Option<String>,
 }
 
 impl TenantRow {
@@ -93,6 +117,7 @@ impl TenantRow {
                 name,
                 desired_nodes,
                 ready_nodes: self.ready_nodes,
+                cache_kms_key_arn: self.cache_kms_key_arn,
             }),
             _ => None,
         };
@@ -104,13 +129,31 @@ impl TenantRow {
     }
 }
 
+/// `arn:<partition>:kms:<region>:<12-digit account>:key/<key id>`. Aliases are
+/// refused: an alias can be repointed after the nodes are keyed.
+fn is_kms_key_arn(arn: &str) -> bool {
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    matches!(
+        parts.as_slice(),
+        ["arn", partition, "kms", region, account, resource]
+            if partition.starts_with("aws")
+                && !region.is_empty()
+                && account.len() == 12
+                && account.bytes().all(|b| b.is_ascii_digit())
+                && resource.strip_prefix("key/").is_some_and(|id| {
+                    !id.is_empty()
+                        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+    )
+}
+
 /// The node group name for a tenant: stable, unique, and a valid label value.
 fn group_name(tenant: OrgId) -> String {
     format!("t-{tenant}")
 }
 
 const SELECT_TENANT: &str = sql!(
-    "SELECT o.id, o.external_id, g.name AS group_name, g.desired_nodes,
+    "SELECT o.id, o.external_id, g.name AS group_name, g.desired_nodes, g.cache_kms_key_arn,
             (SELECT count(*) FROM nodes n
               WHERE g.id IS NOT NULL AND n.node_group_id = g.id
                 AND n.state = 'ready' AND n.drain_phase IS NULL) AS ready_nodes
@@ -151,18 +194,40 @@ pub(crate) async fn register_tenant(
     }
     let dedicated = match request.dedicated_node_group {
         None => None,
-        Some(DedicatedNodeGroupRequest { nodes }) => {
+        Some(DedicatedNodeGroupRequest {
+            nodes,
+            cache_kms_key_arn,
+        }) => {
             if !(1..=MAX_DEDICATED_NODES).contains(&nodes) {
                 return Err(E2bApiError::bad_request(format!(
                     "dedicated_node_group.nodes must be 1 to {MAX_DEDICATED_NODES}"
                 )));
             }
-            let Some(pool) = dedicated_capacity_pool() else {
+            let cache_kms_key_arn = cache_kms_key_arn
+                .map(|arn| arn.trim().to_string())
+                .filter(|arn| !arn.is_empty());
+            if let Some(arn) = &cache_kms_key_arn
+                && !is_kms_key_arn(arn)
+            {
                 return Err(E2bApiError::bad_request(
-                    "this cluster does not offer dedicated node groups",
+                    "dedicated_node_group.cache_kms_key_arn must be a KMS key ARN \
+                     (arn:aws:kms:<region>:<account>:key/<id>)",
                 ));
+            }
+            // An encrypted group never draws from the plain pool: those nodes
+            // can't build the LUKS cache, so they would never be claimable.
+            let pool = if cache_kms_key_arn.is_some() {
+                dedicated_capacity_encrypted_pool().ok_or_else(|| {
+                    E2bApiError::bad_request(
+                        "this cluster does not offer encrypted dedicated node groups",
+                    )
+                })?
+            } else {
+                dedicated_capacity_pool().ok_or_else(|| {
+                    E2bApiError::bad_request("this cluster does not offer dedicated node groups")
+                })?
             };
-            Some((pool, nodes))
+            Some((pool, nodes, cache_kms_key_arn))
         }
     };
 
@@ -186,10 +251,10 @@ pub(crate) async fn register_tenant(
     .await
     .map_err(db_error)?;
 
-    if let Some((pool, nodes)) = dedicated {
+    if let Some((pool, nodes, cache_kms_key_arn)) = dedicated {
         sqlx::query(sql!(
-            "INSERT INTO node_groups (id, name, org_id, pool, desired_nodes)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO node_groups (id, name, org_id, pool, desired_nodes, cache_kms_key_arn)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (name) DO UPDATE SET desired_nodes = EXCLUDED.desired_nodes"
         ))
         .bind(Uuid::now_v7())
@@ -197,6 +262,7 @@ pub(crate) async fn register_tenant(
         .bind(tenant)
         .bind(pool)
         .bind(nodes)
+        .bind(cache_kms_key_arn)
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
