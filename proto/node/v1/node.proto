@@ -174,9 +174,9 @@ service NodeManager {
   rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
 
   // Durably accept the node's firewall assignment, then apply it to one slot
-  // bound by a test fixture. Acceptance and that slot's dispatch are reported
-  // separately; neither is node-wide. Without a binding, which every
-  // production node lacks, FAILED_PRECONDITION after authorization.
+  // a test fixture names. Acceptance and that slot's dispatch are reported
+  // separately; neither is node-wide. A production node, which has no such
+  // slot, answers FAILED_PRECONDITION after authorization.
   rpc SyncFirewallRules(SyncFirewallRulesRequest) returns (SyncFirewallRulesResponse);
 
   // ─── Node artifact store ─────────────────────────────────────────────
@@ -449,18 +449,20 @@ enum FirewallSlotDispatchOutcome {
   FIREWALL_SLOT_DISPATCH_OUTCOME_PENDING = 1;
   // A newer generation was accepted before this one's result.
   FIREWALL_SLOT_DISPATCH_OUTCOME_SUPERSEDED = 2;
-  // Nothing reached nft, as for a busy slot; redelivery may retry.
+  // Nothing reached nft. Redelivery retries a busy slot; a changed or missing
+  // slot or namespace ends sync until node-manager restarts.
   FIREWALL_SLOT_DISPATCH_OUTCOME_NOT_RUN = 3;
   // Submitted once, and the slot's readback listed exactly this revision.
   // A point-in-time observation of one slot, not node-wide verification.
   FIREWALL_SLOT_DISPATCH_OUTCOME_MATCHED = 4;
   // Submitted once; the readback listed something else.
   FIREWALL_SLOT_DISPATCH_OUTCOME_MISMATCHED = 5;
-  // Submitted once; the readback could not tell. Ends the binding.
+  // Submitted once; the readback could not tell. Ends sync until restart.
   FIREWALL_SLOT_DISPATCH_OUTCOME_INCONCLUSIVE = 6;
   // Submitted once, but what it was made for changed before the final check.
+  // Unless a newer generation was accepted, ends sync until restart.
   FIREWALL_SLOT_DISPATCH_OUTCOME_STALE = 7;
-  // The apply failed and nft may have run. Ends the binding.
+  // The apply failed and nft may have run. Ends sync until restart.
   FIREWALL_SLOT_DISPATCH_OUTCOME_UNKNOWN = 8;
 }
 

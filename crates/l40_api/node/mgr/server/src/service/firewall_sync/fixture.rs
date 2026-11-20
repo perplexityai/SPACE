@@ -26,7 +26,7 @@ use crate::proto::{
     SyncFirewallRulesRequest, SyncFirewallRulesResponse,
 };
 use crate::slot_pool::firewall_rules::SlotHost;
-use crate::slot_pool::{NetworkPool, SlotFirewallReport, SlotFirewallRequest};
+use crate::slot_pool::{NetworkPool, NotRun, SlotFirewallReport, SlotFirewallRequest, Stale};
 
 #[cfg(test)]
 mod tests;
@@ -64,7 +64,8 @@ enum Run {
 }
 
 impl NodeManagerService {
-    /// Opens the binding's one assignment store and starts its worker.
+    /// Opens the binding's one assignment store and starts its worker. Tests
+    /// hold no service mutex; the store's path is theirs alone.
     pub(crate) fn with_firewall_sync(
         mut self,
         fixture: FirewallSyncFixture,
@@ -142,19 +143,19 @@ impl FirewallSync {
             _ = tokio::time::timeout(self.fixture.wait, settled) => {}
             () = self.ended.cancelled() => {}
         }
-        let dispatch = |outcome: Outcome, detail: &str| FirewallSlotDispatch {
+        let reply = |outcome: Outcome, detail: &str| FirewallSlotDispatch {
             outcome: outcome.into(),
             detail: detail.into(),
         };
         match self.wanted.borrow().as_ref() {
-            Some(wanted) if wanted.generation > generation => dispatch(Outcome::Superseded, ""),
+            Some(wanted) if wanted.generation > generation => reply(Outcome::Superseded, ""),
             Some(Wanted {
                 run: Run::Done(done),
                 ..
             }) => done.clone(),
             // The worker ended before claiming it.
-            _ if self.ended.is_cancelled() => dispatch(Outcome::NotRun, "the binding ended"),
-            _ => dispatch(Outcome::Pending, ""),
+            _ if self.ended.is_cancelled() => reply(Outcome::NotRun, "the binding ended"),
+            _ => reply(Outcome::Pending, ""),
         }
     }
 
@@ -187,6 +188,10 @@ impl FirewallSync {
                 detail = done.detail,
                 "fixture firewall slot dispatch finished"
             );
+            // Before the result shows, so no delivery that sees it is admitted.
+            if ends {
+                self.ended.cancel();
+            }
             // A newer generation replaced this one, so its result is dropped.
             self.wanted.send_if_modified(|wanted| match wanted {
                 Some(wanted) if wanted.generation == generation => {
@@ -239,14 +244,25 @@ fn arm(wanted: &mut Option<Wanted>, generation: u64) -> bool {
 }
 
 /// The reply for `report`, and whether it ends the binding: nothing runs again
-/// once the slot's kernel state is unknown.
+/// once the slot's kernel state is unknown or the slot is no longer the bound one.
 fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDispatch, bool) {
     let (outcome, detail, ends) = match report {
         Err(error) => (Outcome::Unknown, error.to_string(), true),
-        Ok(SlotFirewallReport::NotRun(not_run)) => (Outcome::NotRun, not_run.to_string(), false),
+        Ok(SlotFirewallReport::NotRun(not_run)) => {
+            let drifted = matches!(
+                not_run,
+                NotRun::NoSlot | NotRun::Ineligible { .. } | NotRun::Changed | NotRun::Namespace(_)
+            );
+            (Outcome::NotRun, not_run.to_string(), drifted)
+        }
         Ok(SlotFirewallReport::Attempted(attempt)) => match (&attempt.readback, &attempt.current) {
             (Verification::Inconclusive(why), _) => (Outcome::Inconclusive, why.clone(), true),
-            (_, Err(stale)) => (Outcome::Stale, format!("{stale:?}"), false),
+            // A newer generation is ordinary supersession; anything else is drift.
+            (_, Err(stale)) => (
+                Outcome::Stale,
+                format!("{stale:?}"),
+                !matches!(stale, Stale::Assignment(_)),
+            ),
             (Verification::Match, Ok(())) => (Outcome::Matched, String::new(), false),
             (Verification::Mismatch(why), Ok(())) => (Outcome::Mismatched, why.clone(), false),
         },

@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io;
 
 use pplx_space_host_layout::identities::users;
-use pplx_space_uds_peer_auth::PeerIdentity;
+use pplx_space_uds_peer_auth::{LocalRole, PeerIdentity, UdsPeerAccount, UdsPeerAuthorizer};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::{Code, Request, Response};
@@ -143,6 +143,11 @@ async fn armed(service: &NodeManagerService, generation: u64) {
         .unwrap();
 }
 
+fn nothing_armed(service: &NodeManagerService) -> bool {
+    let sync = service.firewall_sync.clone().unwrap();
+    sync.wanted.borrow().is_none()
+}
+
 /// Until the slot apply's job returns.
 async fn applied(service: &NodeManagerService) {
     service.pool.task_tracker.close();
@@ -154,6 +159,12 @@ async fn applied(service: &NodeManagerService) {
 async fn only_node_ctl_reaches_the_binding() {
     let bound = bind(None, None, WAIT).await;
     let unbound = service_for_unit_tests().await;
+    // Unbound, so an admin let through fails later with FAILED_PRECONDITION.
+    let mut admin = service_for_unit_tests().await;
+    let admin_uid = 4242;
+    let account =
+        UdsPeerAccount::role_with_fallback_uid("space-test-admin", LocalRole::Admin, admin_uid);
+    admin.peer_authorizer = UdsPeerAuthorizer::new("space-node-manager", [account]);
     let ctl_group = users::SPACE_NODECTL.primary_group.gid;
     let peer = |uid, gid| Some(PeerIdentity::new(uid, gid, None));
     for (service, peer, code) in [
@@ -171,6 +182,7 @@ async fn only_node_ctl_reaches_the_binding() {
             peer(users::SPACE_SBXMGR.uid, ctl_group),
             Code::PermissionDenied,
         ),
+        (&admin, peer(admin_uid, admin_uid), Code::PermissionDenied),
         (&unbound, Some(node_ctl()), Code::FailedPrecondition),
     ] {
         let mut request = Request::new(delivery(12));
@@ -228,6 +240,10 @@ async fn refused_deliveries_neither_write_nor_apply() {
         assert_eq!(error.code(), code, "{body:?}");
     }
     assert!(!bound.path.exists(), "a refused delivery was written");
+    assert!(
+        nothing_armed(&bound.service),
+        "a refused delivery was dispatched"
+    );
 
     sync(&bound.service, delivery(12)).await.unwrap();
     let record = std::fs::read(&bound.path).unwrap();
@@ -245,7 +261,7 @@ async fn refused_deliveries_neither_write_nor_apply() {
     std::fs::remove_dir(unwritable.path.parent().unwrap()).unwrap();
     let error = sync(&unwritable.service, delivery(12)).await.unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
-    assert_eq!(unwritable.host.calls(), []);
+    assert!(nothing_armed(&unwritable.service));
 }
 
 // Catches an apply before the record is durable, one to a slot other than the
@@ -276,22 +292,26 @@ async fn a_fresh_assignment_is_durable_before_the_bound_slot_applies_it() {
     assert_eq!(bound.host.installs(), [bound.namespace]);
 }
 
-// Catches a dispatch tied to its caller, a replay taken as proof of an
-// attempt, an unbounded wait, or a second submission for one generation.
+// Catches a dispatch tied to its caller, a joining delivery that starts a
+// second attempt, an unbounded wait, or a completed attempt submitted again.
 #[tokio::test]
 async fn deliveries_of_a_generation_share_its_one_attempt() {
-    // Accepted by an earlier owner, so every delivery here is a replay.
-    let bound = bind(None, Some(12), Duration::from_millis(100)).await;
-    let record = std::fs::read(&bound.path).unwrap();
-    let (entered, release) = gate(&bound.host.looked_up);
-    let first = tokio::spawn({
-        let service = bound.service.clone();
-        async move { sync(&service, delivery(12)).await }
-    });
-    // Accepted and claimed, but nothing submitted.
+    let bound = bind(None, None, Duration::from_millis(100)).await;
+    let (entered, release) = gate(&bound.host.installed);
+    let mut request = Request::new(delivery(12));
+    request.extensions_mut().insert(node_ctl());
+    // Polled once, which starts the acceptance, then dropped.
+    {
+        let mut first = std::pin::pin!(bound.service.sync_firewall_rules(request));
+        let waker = std::task::Waker::noop();
+        let polled = first
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(waker));
+        assert!(polled.is_pending());
+    }
+    // No caller waits, yet the accepted generation reaches nft.
     bounded(entered).await.unwrap();
-    first.abort();
-    assert!(bounded(first).await.unwrap_err().is_cancelled());
+    let record = std::fs::read(&bound.path).unwrap();
 
     let replayed = FirewallAssignmentAcceptance::Replayed;
     let waiting = reply(sync(&bound.service, delivery(12)).await);
@@ -304,12 +324,15 @@ async fn deliveries_of_a_generation_share_its_one_attempt() {
     assert_eq!(std::fs::read(&bound.path).unwrap(), record);
 }
 
-// Catches a busy slot reported as attempted, or not retried on redelivery.
+// Catches a replay taken as proof of an attempt, a busy slot reported as
+// attempted, or one not retried on redelivery.
 #[tokio::test]
 async fn a_busy_slot_runs_nothing_until_redelivery() {
-    let bound = bind(None, None, WAIT).await;
+    // Accepted by an earlier owner, so every delivery here is a replay.
+    let bound = bind(None, Some(12), WAIT).await;
     let held = busy(&bound.service.pool, SLOT);
     let refused = sync(&bound.service, delivery(12)).await.unwrap();
+    assert_eq!(refused.acceptance(), FirewallAssignmentAcceptance::Replayed);
     let dispatch = refused.dispatch.unwrap();
     assert_eq!(dispatch.outcome(), Outcome::NotRun);
     assert!(
@@ -327,27 +350,47 @@ async fn a_busy_slot_runs_nothing_until_redelivery() {
     assert_eq!(bound.host.installs(), [bound.namespace]);
 }
 
-// Catches a submitted generation submitted again, an outcome misreported, or
-// work after an attempt whose kernel state is unknown.
+/// What happens to the bound slot during a test's first attempt.
+#[derive(Clone, Copy, Debug)]
+enum Drift {
+    None,
+    /// Reset while nft runs.
+    Reset,
+    /// Re-leased between lookup and ownership.
+    Released,
+}
+
+// Catches a generation submitted again, an outcome misreported, or work after
+// an unknown kernel state or a slot that is no longer the bound one.
 #[tokio::test]
-async fn an_attempt_is_never_resubmitted() {
-    for (fault, reset, outcome, ends) in [
-        (Some(Fault::Drops), false, Outcome::Mismatched, false),
-        (None, true, Outcome::Stale, false),
-        (Some(Fault::Unlistable), false, Outcome::Inconclusive, true),
-        (Some(Fault::Panics), false, Outcome::Unknown, true),
+async fn a_generation_is_attempted_once_and_drift_ends_the_binding() {
+    for (fault, drift, outcome, ends) in [
+        (Some(Fault::Drops), Drift::None, Outcome::Mismatched, false),
+        (None, Drift::Reset, Outcome::Stale, true),
+        (None, Drift::Released, Outcome::NotRun, true),
+        (
+            Some(Fault::Unlistable),
+            Drift::None,
+            Outcome::Inconclusive,
+            true,
+        ),
+        (Some(Fault::Panics), Drift::None, Outcome::Unknown, true),
     ] {
         let bound = bind(fault, None, WAIT).await;
-        if reset {
-            let pool = bound.service.pool.clone();
-            hook(&bound.host.installed, move || {
+        let pool = bound.service.pool.clone();
+        match drift {
+            Drift::None => {}
+            Drift::Reset => hook(&bound.host.installed, move || {
                 set_slot(&pool, SLOT, SlotState::Dirty, 1);
-            });
+            }),
+            Drift::Released => hook(&bound.host.looked_up, move || {
+                set_slot(&pool, SLOT, SlotState::Leased, 2);
+            }),
         }
         let committed = FirewallAssignmentAcceptance::Committed;
         let first = reply(sync(&bound.service, delivery(12)).await);
-        assert_eq!(first, (12, committed, outcome));
-        let record = std::fs::read(&bound.path).unwrap();
+        assert_eq!(first, (12, committed, outcome), "{drift:?}");
+        let (record, installs) = (std::fs::read(&bound.path).unwrap(), bound.host.installs());
         let again = sync(&bound.service, delivery(12)).await;
         if ends {
             assert_eq!(again.unwrap_err().code(), Code::FailedPrecondition);
@@ -358,7 +401,7 @@ async fn an_attempt_is_never_resubmitted() {
             assert_eq!(reply(again), (12, replayed, outcome));
         }
         assert_eq!(std::fs::read(&bound.path).unwrap(), record, "{outcome:?}");
-        assert_eq!(bound.host.installs().len(), 1, "{outcome:?}");
+        assert_eq!(bound.host.installs(), installs, "{outcome:?}");
     }
 }
 
