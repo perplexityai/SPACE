@@ -16,10 +16,14 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 - A new RPC that acts for a node identifies it as the registered node whose
   address equals the caller's remote IP (except publication above and template
   catalog reads, which use reviewed node name/UID when supplied and retain
-  address matching for missing claims, and `FetchFirewallRules`, which
-  requires reviewed node name/UID and never matches the address), never by a
+  address matching for missing claims), never by a
   request field alone; one that names a node uses `authenticated_origin_node_id`. Existing exception:
   `TouchArtifactBackup` binds no node.
+- `FetchFirewallRules` binds the caller by reviewed Kubernetes node name and
+  UID only. The peer IP can belong to a different registered worker; using
+  it as a fallback could return that worker's firewall instructions. Require
+  fetch authority, exactly one matching live worker, and enrollment before
+  reading instructions. This exception does not apply to other RPCs.
 - ClusterApi never creates a node registration. `nodes` and `node_k8s` rows
   come from the cluster controller's Kubernetes node sync, sandbox pod
   placement and Direct admin registration; a request naming an unregistered
@@ -48,9 +52,12 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 
 Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
-- Address-bound RPCs deny a request with no remote address. Give the test
-  request a peer address equal to the node's registered one.
-  `FetchFirewallRules` tests supply reviewed node name/UID claims instead.
+- Node-bound RPCs deny a request with no remote address. Give the test request
+  a peer address equal to the node's registered one.
+- For the `FetchFirewallRules` exception, give the peer address to worker B
+  and supply reviewed claims for worker A. Assert that A gets only A's
+  instructions and that missing or invalid claims are denied, not resolved
+  to B.
 
 Module moves change log targets and `sql!` locators: see "Log targets" in
 `docs/rust/space-conventions.md`.
