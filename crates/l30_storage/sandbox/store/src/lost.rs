@@ -29,6 +29,16 @@ use time::OffsetDateTime;
 /// `failed` so the reap converges.
 pub const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
 
+/// Heartbeat age (`COALESCE(last_attempt_at, timestamp)`) past which a
+/// `creating` suspend upload is provably abandoned even when its node looks
+/// live. The on-node worker's full retry window is
+/// `5 × 7200s + (5 + 30 + 120 + 300)s ≈ 10.13h`; 24h leaves >2× margin for a
+/// slow-but-alive or node-restarted (and therefore resumed) upload. The
+/// cluster controller's stuck-snapshot reaper fails rows past it by default,
+/// and started recovery stops treating such an upload as possibly landing
+/// whether or not the reaper is enabled.
+pub const ABANDONED_UPLOAD_AGE: Duration = Duration::from_secs(86_400);
+
 /// The guarded flip of `sandboxes` from `started` to `failed`. Returns
 /// whether the row flipped.
 ///

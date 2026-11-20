@@ -477,8 +477,10 @@ pub(super) enum StartedRecoveryUnavailableCause {
     /// Retry; nothing is wrong.
     SourcePublishing,
     /// A full snapshot from the sandbox's own node is still `creating`, past
-    /// the settle window. That upload is only dead once its node is lost: a
-    /// slow upload on a live node can still finalize. The caller answers
+    /// the settle window but inside
+    /// `pplx_space_sandbox_store::lost::ABANDONED_UPLOAD_AGE`. That upload is
+    /// only dead once its node is lost: a slow upload on a live node can
+    /// still finalize. Past the abandoned age it is ignored here. The caller answers
     /// pending until `source_node` looks lost, then decides as if the upload
     /// were absent, using `stale_rollback_source` (the
     /// [`Self::StaleSourceAwaitingNodeLoss`] condition).

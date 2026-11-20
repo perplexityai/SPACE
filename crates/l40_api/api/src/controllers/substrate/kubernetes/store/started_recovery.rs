@@ -294,13 +294,20 @@ impl K8sStore {
     /// Past that window the loop only treats the upload as dead because it
     /// has proven the node gone, so such an upload is reported separately
     /// ([`StartedRecoveryUnavailableCause::SameNodeUploadPastSettle`]) and
-    /// the caller keeps it pending until the API sees that node as lost.
+    /// the caller keeps it pending until the API sees that node as lost. That
+    /// wait is bounded: past
+    /// [`pplx_space_sandbox_store::lost::ABANDONED_UPLOAD_AGE`] without a
+    /// heartbeat the upload counts as abandoned, as the stuck-snapshot reaper
+    /// counts it, even with the reaper disabled.
     pub(in crate::controllers::substrate::kubernetes) async fn started_recovery_unavailable_cause(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<StartedRecoveryUnavailableCause, SubstrateError> {
         let rollback_source = rollback_marker_suspend_backup_exists("s");
-        // Same clause as the upload half of `started_restore_source_absent`.
+        // The upload half of `started_restore_source_absent`, plus a bound
+        // the loop doesn't need (it answers no client): an upload quiet past
+        // the abandoned age never counts as landing, so a 503 can't last
+        // beyond it.
         let query = format!(
             "SELECT EXISTS (
                         SELECT 1
@@ -313,6 +320,8 @@ impl K8sStore {
                                OR COALESCE(sn.last_attempt_at, sn.timestamp)
                                   >= NOW() - make_interval(secs => $2::BIGINT)
                            )
+                           AND COALESCE(sn.last_attempt_at, sn.timestamp)
+                               >= NOW() - make_interval(secs => $3::BIGINT)
                     ) AS publishing,
                     EXISTS (
                         SELECT 1
@@ -321,6 +330,8 @@ impl K8sStore {
                            AND sn.type = 'full'
                            AND sn.state = 'creating'
                            AND sn.source_node_id = s.active_node_id
+                           AND COALESCE(sn.last_attempt_at, sn.timestamp)
+                               >= NOW() - make_interval(secs => $3::BIGINT)
                     ) AS same_node_upload,
                     {rollback_source} AS stale_rollback_source,
                     s.active_node_id IS NOT NULL AND n.id IS NULL AS node_row_deleted,
@@ -336,6 +347,11 @@ impl K8sStore {
         .bind(sandbox_id.as_uuid())
         .bind(
             pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
+                .as_secs()
+                .cast_signed(),
+        )
+        .bind(
+            pplx_space_sandbox_store::lost::ABANDONED_UPLOAD_AGE
                 .as_secs()
                 .cast_signed(),
         )

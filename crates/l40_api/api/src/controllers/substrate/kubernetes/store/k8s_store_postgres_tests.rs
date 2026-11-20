@@ -548,11 +548,12 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
         StartedRecoveryUnavailableCause::SourcePublishing
     );
 
-    // Act: that same-node upload is now past the settle window.
+    // Act: that same-node upload's heartbeat is now past the settle window.
+    // Settle is keyed on `COALESCE(last_attempt_at, timestamp)`, the
+    // rollback veto on `timestamp`, which stays newer than the marker.
     sqlx::query(sql!(
         "UPDATE snapshots
-            SET timestamp = NOW() - INTERVAL '1 day',
-                last_attempt_at = NOW() - INTERVAL '1 day'
+            SET last_attempt_at = NOW() - INTERVAL '1 hour'
           WHERE sandbox_id = $1 AND state = 'creating'"
     ))
     .bind(sandbox_id)
@@ -571,6 +572,36 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
             source_node: StaleRecoverySourceNode::Named("source-node".to_string()),
             stale_rollback_source: false,
         }
+    );
+
+    // Act: the upload goes quiet past the abandoned age. Keep it newer than
+    // the marker, as a post-wake upload is.
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET timestamp = NOW() - INTERVAL '4 days'
+          WHERE id = $1"
+    ))
+    .bind(snapshot_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET timestamp = NOW() - INTERVAL '3 days',
+                last_attempt_at = NOW() - INTERVAL '2 days'
+          WHERE sandbox_id = $1 AND state = 'creating'"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    // Assert: no longer waited on, even with the stuck-snapshot reaper off.
+    // It still vetoes the rollback, so there is no durable source: 412.
+    assert_eq!(
+        fixture
+            .store
+            .started_recovery_unavailable_cause(sandbox_id)
+            .await?,
+        StartedRecoveryUnavailableCause::NoDurableSource
     );
     Ok(())
 }
