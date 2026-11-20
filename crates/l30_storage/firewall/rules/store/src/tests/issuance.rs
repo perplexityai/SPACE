@@ -127,7 +127,8 @@ async fn revision_of(pool: &PgPool, rollout: RolloutId) -> TestResult<Uuid> {
     .await?)
 }
 
-/// Give `node` a current assignment at `generation` on a revision of its own.
+/// Give unassigned `node` an assignment at `generation` on a revision of its
+/// own.
 async fn assign(pool: &PgPool, node: NodeId, generation: i64) -> TestResult {
     let revision = Uuid::now_v7();
     sqlx::query(sql!(
@@ -139,8 +140,7 @@ async fn assign(pool: &PgPool, node: NodeId, generation: i64) -> TestResult {
     .await?;
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (node_id) DO UPDATE SET assignment_generation = $2"
+         VALUES ($1, $2, $3)"
     ))
     .bind(node)
     .bind(generation)
@@ -236,8 +236,9 @@ async fn a_first_issue_advances_the_nodes_own_generation_and_wakes_it_once() -> 
     Ok(())
 }
 
-/// Catches a replay, a lost commit response or a crash before the release
-/// that issues again, with a second generation, wakeup or first check; a
+/// Catches a wakeup that drops the node's other reasons; a replay, a lost
+/// commit response or a crash before the release that issues again, with a
+/// second generation, wakeup or first check, or refreshes the wakeup; a
 /// check lease, or a check carrying a stale first-assignment hint, that
 /// issues; and a node a later rollout can't move.
 #[tokio::test(flavor = "current_thread")]
@@ -249,9 +250,17 @@ async fn an_issued_target_is_resolved_from_its_stamp() -> TestResult {
     let nodes = online_nodes(&db.pool, 1).await?;
     let node = nodes[0];
     save_targets(&db.pool, first, &nodes).await?;
+    enqueue_triggers(&db.pool, [node], ReconcileReason::NodeUpdated).await?;
     let target = lease(&db.pool, first, 1).await?.remove(0);
     let stamp = issued(&db.pool, &target).await?;
     let issued_effects = effects(&db.pool, first, node).await?;
+    assert_eq!(
+        issued_effects
+            .trigger
+            .as_ref()
+            .map(|trigger| trigger.0.clone()),
+        Some(vec![FIREWALL.to_owned(), "node_updated".to_owned()])
+    );
 
     // Called again under the same lease, as after a lost commit response.
     assert_eq!(
@@ -311,7 +320,7 @@ async fn an_issued_target_is_resolved_from_its_stamp() -> TestResult {
         moved.assignment,
         Some((2, revision_of(&db.pool, later).await?))
     );
-    assert_eq!(moved.trigger.map(|trigger| trigger.1), Some(1));
+    assert_eq!(moved.trigger.map(|trigger| trigger.1), Some(2));
     Ok(())
 }
 
@@ -406,60 +415,44 @@ async fn the_first_to_lock_the_header_wins_pause_or_abort_against_issuance() -> 
     Ok(())
 }
 
-/// Catches a canary pinned by its first lease rather than its first
-/// issuance; a pin that looks only at online or due items, which would issue
-/// a second canary once the first goes offline; and canary decisions not
-/// serialized on the header, which would let two leases both issue.
+/// Catches canary decisions not serialized on the header, which would let
+/// two leases both issue; a pin taken from the other lease rather than an
+/// issuance, which would refuse both; and a pin that looks only at in-flight,
+/// online or due items, which would issue a second canary once the first is
+/// released and offline.
 #[tokio::test(flavor = "current_thread")]
 async fn in_canary_the_first_committed_issuance_pins_the_canary() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(5).await? else {
         return Ok(());
     };
-    let first = rollout(&db.pool, "canary").await?;
-    let nodes = online_nodes(&db.pool, 4).await?;
+    let rollout = rollout(&db.pool, "canary").await?;
+    let nodes = online_nodes(&db.pool, 2).await?;
     let (a, b) = (nodes[0], nodes[1]);
-    save_targets(&db.pool, first, &nodes[..2]).await?;
-
-    let released = lease(&db.pool, first, 10).await?.remove(0);
-    assert_eq!(released.node_id, a);
-    assert!(requeue(&db.pool, &released, &RELEASE).await?);
-    set_status(&db.pool, a, false, 60.0).await?;
-    let canary = lease(&db.pool, first, 10).await?.remove(0);
-    assert_eq!(canary.node_id, b);
-    issued(&db.pool, &canary).await?;
-    assert!(requeue(&db.pool, &canary, &RELEASE).await?);
-
-    // B is offline and not due; A is back, under a lease the pin should have
-    // kept it from.
-    set_status(&db.pool, b, false, 60.0).await?;
-    set_status(&db.pool, a, true, 60.0).await?;
-    let second = held(&db.pool, first, a).await?;
-    assert_eq!(
-        issue_with(&db.pool, &second, Queue::Wake).await?,
-        Issuance::Refused(Refusal::CanaryChosen)
+    save_targets(&db.pool, rollout, &nodes).await?;
+    let (a_target, b_target) = (
+        held(&db.pool, rollout, a).await?,
+        held(&db.pool, rollout, b).await?,
     );
-    assert_eq!(effects(&db.pool, first, a).await?, Effects::NONE);
 
-    // Two unissued canaries under lease: the one that reaches the header
-    // first, then waits on its trigger row, is the only one issued.
-    set_phase(&db.pool, first, "aborted").await?;
-    let racing = rollout(&db.pool, "canary").await?;
-    let (c, d) = (nodes[2], nodes[3]);
-    save_targets(&db.pool, racing, &[c, d]).await?;
-    let (c_target, d_target) = (
-        held(&db.pool, racing, c).await?,
-        held(&db.pool, racing, d).await?,
-    );
-    enqueue_triggers(&db.pool, [c], ReconcileReason::NodeUpdated).await?;
-    let locker = hold_trigger(&db.pool, c).await?;
-    let issuing_c = spawn_issue(&db.pool, &c_target);
+    // A reaches the header first, then waits on its trigger row.
+    enqueue_triggers(&db.pool, [a], ReconcileReason::NodeUpdated).await?;
+    let locker = hold_trigger(&db.pool, a).await?;
+    let issuing_a = spawn_issue(&db.pool, &a_target);
     wait_for_lock_waiters(&db.pool, 1).await?;
-    let issuing_d = spawn_issue(&db.pool, &d_target);
+    let issuing_b = spawn_issue(&db.pool, &b_target);
     wait_for_lock_waiters(&db.pool, 2).await?;
     locker.commit().await?;
-    assert!(matches!(issuing_c.await??, Issuance::Issued(_)));
-    assert_eq!(issuing_d.await??, Issuance::Refused(Refusal::CanaryChosen));
-    assert_eq!(effects(&db.pool, racing, d).await?, Effects::NONE);
+    assert!(matches!(issuing_a.await??, Issuance::Issued(_)));
+    assert_eq!(issuing_b.await??, Issuance::Refused(Refusal::CanaryChosen));
+
+    // A is released, offline and not due; it still holds the rollout.
+    assert!(requeue(&db.pool, &a_target, &RELEASE).await?);
+    set_status(&db.pool, a, false, 60.0).await?;
+    assert_eq!(
+        issue_with(&db.pool, &b_target, Queue::Wake).await?,
+        Issuance::Refused(Refusal::CanaryChosen)
+    );
+    assert_eq!(effects(&db.pool, rollout, b).await?, Effects::NONE);
     Ok(())
 }
 
@@ -569,9 +562,7 @@ async fn ineligible_targets_issue_nothing() -> TestResult {
 /// Catches a failure that commits part of an issuance: a wakeup that fails,
 /// is rejected, queues no node or several, or is followed by a refused stamp,
 /// or a generation that overflows, leaving an assignment, a trigger change or
-/// a stamp behind; a wakeup that drops the node's other reasons; and a
-/// replay that refreshes them. The lease check must read the clock at the
-/// stamp.
+/// a stamp behind. The lease check must read the clock at the stamp.
 #[tokio::test(flavor = "current_thread")]
 async fn any_failure_rolls_back_the_whole_issuance() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -584,7 +575,6 @@ async fn any_failure_rolls_back_the_whole_issuance() -> TestResult {
     let (target, rejected) = (&leased[0], &leased[1]);
     let node = target.node_id;
     assign(&db.pool, node, 7).await?;
-    enqueue_triggers(&db.pool, [node], ReconcileReason::NodeUpdated).await?;
     let before = effects(&db.pool, rollout, node).await?;
 
     for queue in [
@@ -619,26 +609,19 @@ async fn any_failure_rolls_back_the_whole_issuance() -> TestResult {
         Effects::NONE
     );
 
-    assign(&db.pool, node, i64::MAX).await?;
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_node_assignments SET assignment_generation = $2
+         WHERE node_id = $1"
+    ))
+    .bind(node)
+    .bind(i64::MAX)
+    .execute(&db.pool)
+    .await?;
     let at_max = effects(&db.pool, rollout, node).await?;
     let outcome = issue_with(&db.pool, target, Queue::Wake).await;
     let Err(_) = outcome else {
         panic!("an overflowing generation didn't fail: {outcome:?}");
     };
     assert_eq!(effects(&db.pool, rollout, node).await?, at_max);
-
-    assign(&db.pool, node, 7).await?;
-    let stamp = issued(&db.pool, target).await?;
-    assert_eq!(stamp.assignment_generation, 8);
-    let issued = effects(&db.pool, rollout, node).await?;
-    assert_eq!(
-        issued.trigger.as_ref().map(|trigger| trigger.0.clone()),
-        Some(vec![FIREWALL.to_owned(), "node_updated".to_owned()])
-    );
-    assert_eq!(
-        issue_with(&db.pool, target, Queue::Wake).await?,
-        Issuance::AlreadyIssued(stamp)
-    );
-    assert_eq!(effects(&db.pool, rollout, node).await?, issued);
     Ok(())
 }
