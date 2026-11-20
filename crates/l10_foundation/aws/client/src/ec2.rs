@@ -6,10 +6,27 @@ use crate::query::{
 };
 
 const DESCRIBE_INSTANCES_ACTION: &str = "DescribeInstances";
-const CREATE_TAGS_ACTION: &str = "CreateTags";
-const REBOOT_INSTANCES_ACTION: &str = "RebootInstances";
 const EC2_API_VERSION: &str = "2016-11-15";
 const DESCRIBE_PAGE_SIZE: &str = "1000";
+const CREATE_LAUNCH_TEMPLATE_VERSION_ACTION: &str = "CreateLaunchTemplateVersion";
+
+/// A launch template version derived from an existing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchTemplateVersionRequest {
+    pub launch_template_id: String,
+    pub source_version: String,
+    /// Idempotency token (≤ 64 chars): the same token with the same request
+    /// returns the version it created before.
+    pub client_token: String,
+    pub description: String,
+    /// Root volume, encrypted under this key.
+    pub root_device_name: String,
+    pub root_volume_gib: u32,
+    pub root_volume_kms_key_id: String,
+    /// Replace the source's tag specifications: these go on the instance and
+    /// its volumes.
+    pub tags: Vec<(String, String)>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
@@ -45,39 +62,6 @@ impl<T: QueryTransport> Client<T> {
                 transport,
             ),
         }
-    }
-
-    /// `CreateTags` with one tag on one instance. Overwrites an existing value.
-    pub async fn create_instance_tag(
-        &self,
-        instance_id: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), AwsClientError> {
-        self.query
-            .send_action(
-                CREATE_TAGS_ACTION,
-                EC2_API_VERSION,
-                vec![
-                    ("ResourceId.1", instance_id.to_string()),
-                    ("Tag.1.Key", key.to_string()),
-                    ("Tag.1.Value", value.to_string()),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// `RebootInstances` for one instance. Instance store survives a reboot.
-    pub async fn reboot_instance(&self, instance_id: &str) -> Result<(), AwsClientError> {
-        self.query
-            .send_action(
-                REBOOT_INSTANCES_ACTION,
-                EC2_API_VERSION,
-                vec![("InstanceId.1", instance_id.to_string())],
-            )
-            .await?;
-        Ok(())
     }
 
     pub async fn describe_instances_by_private_dns(
@@ -121,6 +105,89 @@ impl<T: QueryTransport> Client<T> {
             .await?;
         parse_describe_instances_response(&body).map_err(AwsClientError::from)
     }
+}
+
+impl<T: QueryTransport> Client<T> {
+    /// `CreateLaunchTemplateVersion` from `source_version`. Returns the new
+    /// version number.
+    pub async fn create_launch_template_version(
+        &self,
+        request: &LaunchTemplateVersionRequest,
+    ) -> Result<i64, AwsClientError> {
+        let body = self
+            .query
+            .send_action(
+                CREATE_LAUNCH_TEMPLATE_VERSION_ACTION,
+                EC2_API_VERSION,
+                launch_template_version_params(request),
+            )
+            .await?;
+        parse_version_number(&body)
+    }
+}
+
+fn launch_template_version_params(request: &LaunchTemplateVersionRequest) -> Vec<(String, String)> {
+    let mut params = vec![
+        (
+            "LaunchTemplateId".to_string(),
+            request.launch_template_id.clone(),
+        ),
+        ("SourceVersion".to_string(), request.source_version.clone()),
+        ("ClientToken".to_string(), request.client_token.clone()),
+        (
+            "VersionDescription".to_string(),
+            request.description.clone(),
+        ),
+    ];
+    let bdm = "LaunchTemplateData.BlockDeviceMapping.1";
+    params.extend([
+        (
+            format!("{bdm}.DeviceName"),
+            request.root_device_name.clone(),
+        ),
+        (format!("{bdm}.Ebs.VolumeType"), "gp3".to_string()),
+        (
+            format!("{bdm}.Ebs.VolumeSize"),
+            request.root_volume_gib.to_string(),
+        ),
+        (format!("{bdm}.Ebs.Encrypted"), "true".to_string()),
+        (
+            format!("{bdm}.Ebs.KmsKeyId"),
+            request.root_volume_kms_key_id.clone(),
+        ),
+        (format!("{bdm}.Ebs.DeleteOnTermination"), "true".to_string()),
+    ]);
+    for (spec_index, resource_type) in ["instance", "volume"].into_iter().enumerate() {
+        let spec = format!("LaunchTemplateData.TagSpecification.{}", spec_index + 1);
+        params.push((format!("{spec}.ResourceType"), resource_type.to_string()));
+        for (tag_index, (key, value)) in request.tags.iter().enumerate() {
+            params.push((format!("{spec}.Tag.{}.Key", tag_index + 1), key.clone()));
+            params.push((format!("{spec}.Tag.{}.Value", tag_index + 1), value.clone()));
+        }
+    }
+    params
+}
+
+fn parse_version_number(body: &str) -> Result<i64, AwsClientError> {
+    let mut document = Document::new(body);
+    let mut root = document.root_element()?;
+    while let Some(mut tag) = root.next_tag() {
+        if !tag.start_el().matches("launchTemplateVersion") {
+            continue;
+        }
+        while let Some(mut field) = tag.next_tag() {
+            if field.start_el().matches("versionNumber") {
+                let text = try_data(&mut field)?;
+                return text
+                    .trim()
+                    .parse()
+                    .map_err(|_| AwsClientError::Xml(format!("bad versionNumber {text:?}")));
+            }
+        }
+    }
+    Err(AwsClientError::Xml(
+        "launchTemplateVersion.versionNumber missing".to_string(),
+    ))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

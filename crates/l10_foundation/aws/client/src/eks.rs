@@ -1,5 +1,6 @@
-//! The two EKS managed-node-group calls SPACE makes: read a node group's
-//! scaling config, and set its desired size.
+//! The EKS managed-node-group calls SPACE makes: read a node group's scaling
+//! config and set its desired size, and create, describe and delete the
+//! per-tenant node groups the cluster controller owns.
 
 use aws_types::SdkConfig;
 use serde_json::{Value, json};
@@ -61,6 +62,218 @@ impl Client {
     }
 }
 
+/// What a per-tenant managed node group is created with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewNodegroup {
+    pub name: String,
+    pub node_role_arn: String,
+    pub subnet_ids: Vec<String>,
+    pub instance_types: Vec<String>,
+    pub launch_template_id: String,
+    pub launch_template_version: String,
+    pub max_size: i64,
+    pub labels: Vec<(String, String)>,
+    /// `(key, value)`, all `NO_SCHEDULE`.
+    pub taints: Vec<(String, String)>,
+    pub tags: Vec<(String, String)>,
+}
+
+/// `DescribeNodegroup`, reduced to what the controller reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodegroupStatus {
+    /// `CREATING`, `ACTIVE`, `DELETING`, `CREATE_FAILED`, `DEGRADED`, ...
+    pub status: String,
+    pub scaling: Option<NodegroupScaling>,
+    /// `code: message` of each health issue.
+    pub issues: Vec<String>,
+}
+
+impl Client {
+    /// `DescribeNodegroup`. `Ok(None)` when the node group doesn't exist.
+    pub async fn describe_nodegroup(
+        &self,
+        cluster: &str,
+        nodegroup: &str,
+    ) -> Result<Option<NodegroupStatus>, AwsClientError> {
+        let result = self
+            .query
+            .send_rest_json(
+                "GET",
+                &format!("clusters/{cluster}/node-groups/{nodegroup}"),
+                String::new(),
+            )
+            .await;
+        match result {
+            Ok(body) => parse_status(&body).map(Some),
+            Err(err) if err.service_status() == Some(http::StatusCode::NOT_FOUND) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// `CreateNodegroup` with a launch template, starting empty (min 0,
+    /// desired 0): the dedicated-capacity reconciler sizes it.
+    pub async fn create_nodegroup(
+        &self,
+        cluster: &str,
+        nodegroup: &NewNodegroup,
+    ) -> Result<(), AwsClientError> {
+        let map = |pairs: &[(String, String)]| {
+            Value::Object(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                    .collect(),
+            )
+        };
+        let taints: Vec<Value> = nodegroup
+            .taints
+            .iter()
+            .map(|(key, value)| json!({ "key": key, "value": value, "effect": "NO_SCHEDULE" }))
+            .collect();
+        let body = json!({
+            "nodegroupName": nodegroup.name,
+            "nodeRole": nodegroup.node_role_arn,
+            "subnets": nodegroup.subnet_ids,
+            "instanceTypes": nodegroup.instance_types,
+            "capacityType": "ON_DEMAND",
+            "launchTemplate": {
+                "id": nodegroup.launch_template_id,
+                "version": nodegroup.launch_template_version,
+            },
+            "scalingConfig": { "minSize": 0, "maxSize": nodegroup.max_size, "desiredSize": 0 },
+            "updateConfig": { "maxUnavailable": 1 },
+            "labels": map(&nodegroup.labels),
+            "taints": taints,
+            "tags": map(&nodegroup.tags),
+            "clientRequestToken": format!("{}-{}", nodegroup.name, nodegroup.launch_template_version),
+        });
+        self.query
+            .send_rest_json(
+                "POST",
+                &format!("clusters/{cluster}/node-groups"),
+                body.to_string(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `DeleteNodegroup`. A node group that's already gone is not an error.
+    pub async fn delete_nodegroup(
+        &self,
+        cluster: &str,
+        nodegroup: &str,
+    ) -> Result<(), AwsClientError> {
+        let result = self
+            .query
+            .send_rest_json(
+                "DELETE",
+                &format!("clusters/{cluster}/node-groups/{nodegroup}"),
+                String::new(),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if err.service_status() == Some(http::StatusCode::NOT_FOUND) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Client {
+    /// `CreateAccessEntry` of type `EC2_LINUX` for a node role. EKS creates
+    /// this itself for managed node groups; an existing entry is not an error.
+    pub async fn create_node_access_entry(
+        &self,
+        cluster: &str,
+        principal_arn: &str,
+    ) -> Result<(), AwsClientError> {
+        let result = self
+            .query
+            .send_rest_json(
+                "POST",
+                &format!("clusters/{cluster}/access-entries"),
+                json!({ "principalArn": principal_arn, "type": "EC2_LINUX" }).to_string(),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if err.service_status() == Some(http::StatusCode::CONFLICT) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// `DeleteAccessEntry`. An entry that's already gone is not an error.
+    pub async fn delete_access_entry(
+        &self,
+        cluster: &str,
+        principal_arn: &str,
+    ) -> Result<(), AwsClientError> {
+        let result = self
+            .query
+            .send_rest_json(
+                "DELETE",
+                &format!(
+                    "clusters/{cluster}/access-entries/{}",
+                    percent_encode_segment(principal_arn)
+                ),
+                String::new(),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if err.service_status() == Some(http::StatusCode::NOT_FOUND) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Percent-encodes everything outside RFC 3986's unreserved set, so an ARN
+/// fits in one path segment.
+fn percent_encode_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn parse_status(body: &str) -> Result<NodegroupStatus, AwsClientError> {
+    let value: Value =
+        serde_json::from_str(body).map_err(|err| AwsClientError::Xml(err.to_string()))?;
+    let nodegroup = value.get("nodegroup");
+    let status = nodegroup
+        .and_then(|nodegroup| nodegroup.get("status"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| AwsClientError::Xml("nodegroup.status missing".to_string()))?
+        .to_string();
+    let issues = nodegroup
+        .and_then(|nodegroup| nodegroup.get("health"))
+        .and_then(|health| health.get("issues"))
+        .and_then(Value::as_array)
+        .map(|issues| {
+            issues
+                .iter()
+                .map(|issue| {
+                    format!(
+                        "{}: {}",
+                        issue.get("code").and_then(Value::as_str).unwrap_or("?"),
+                        issue.get("message").and_then(Value::as_str).unwrap_or("")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(NodegroupStatus {
+        status,
+        scaling: parse_scaling(body).ok(),
+        issues,
+    })
+}
+
 fn parse_scaling(body: &str) -> Result<NodegroupScaling, AwsClientError> {
     let value: Value =
         serde_json::from_str(body).map_err(|err| AwsClientError::Xml(err.to_string()))?;
@@ -95,6 +308,28 @@ mod tests {
                 max_size: 99,
                 desired_size: 2
             }
+        );
+    }
+
+    #[test]
+    fn an_arn_is_one_path_segment() {
+        assert_eq!(
+            percent_encode_segment("arn:aws:iam::1:role/a-b"),
+            "arn%3Aaws%3Aiam%3A%3A1%3Arole%2Fa-b"
+        );
+    }
+
+    #[test]
+    fn parses_the_status_and_health_issues() {
+        let body = r#"{"nodegroup":{"status":"DEGRADED",
+            "scalingConfig":{"minSize":0,"maxSize":4,"desiredSize":1},
+            "health":{"issues":[{"code":"AsgInstanceLaunchFailures","message":"kms"}]}}}"#;
+        let status = parse_status(body).unwrap();
+        assert_eq!(status.status, "DEGRADED");
+        assert_eq!(status.scaling.unwrap().desired_size, 1);
+        assert_eq!(
+            status.issues,
+            vec!["AsgInstanceLaunchFailures: kms".to_string()]
         );
     }
 

@@ -928,6 +928,61 @@ fn session_policy_is_exact_and_enforces_the_sts_size_limit() {
 }
 
 #[test]
+fn org_vend_role_sessions_may_use_kms_only_through_s3_for_their_bucket() {
+    let template = TemplateName::parse("seed").unwrap();
+    let parsed = parse_request(
+        &caller(ClientService::BuildManager, "builder", "builder-uid"),
+        template_request(
+            &template,
+            &format!("{STORAGE_READ_SCOPE} {STORAGE_WRITE_SCOPE}"),
+        ),
+    )
+    .unwrap();
+    let shared = AuthorizedExchange {
+        actor: parsed.actor,
+        subject: parsed.subject,
+        resource: parsed.resource,
+        actions: parsed.actions,
+        ttl_seconds: parsed.ttl_seconds,
+        organization_id: None,
+        role_override: None,
+        copy_source: None,
+    };
+    assert!(
+        !shared.session_policy().unwrap().contains("kms:"),
+        "the shared vend role never receives KMS"
+    );
+
+    let org_owned = AuthorizedExchange {
+        role_override: Some(
+            VendRoleArn::parse("arn:aws:iam::123456789012:role/org-snapshots".to_string()).unwrap(),
+        ),
+        ..shared
+    };
+    let raw = org_owned.session_policy().unwrap();
+    assert!(raw.len() < 1_200, "{} bytes", raw.len());
+    let policy: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let statements = policy["Statement"].as_array().unwrap();
+    assert_eq!(
+        statements.last().unwrap(),
+        &serde_json::json!({
+            "Effect": "Allow",
+            "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+            "Resource": "*",
+            "Condition": {
+                "StringLike": {
+                    "kms:ViaService": "s3.*.amazonaws.com",
+                    "kms:EncryptionContext:aws:s3:arn": [
+                        "arn:aws:s3:::space-snapshots/*",
+                        "arn:aws:s3:::space-snapshots",
+                    ],
+                },
+            },
+        })
+    );
+}
+
+#[test]
 fn ambient_or_static_credentials_are_never_a_vend_result() {
     let template = TemplateName::parse("seed").unwrap();
     let parsed = parse_request(

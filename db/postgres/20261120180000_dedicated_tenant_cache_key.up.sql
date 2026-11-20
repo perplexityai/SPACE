@@ -1,9 +1,9 @@
 SET LOCAL lock_timeout = '1s';
 SET LOCAL statement_timeout = '5s';
 
--- The tenant's KMS key (BYOK) for a dedicated group's node caches. A node is
--- claimed for the group only after it reboots with its instance-store cache
--- on LUKS under a data key from this key. NULL for unencrypted groups.
+-- The tenant's KMS key (BYOK) for a dedicated group. The cluster controller
+-- creates the group's own EKS node group with its root volume and
+-- instance-store cache encrypted under this key. NULL for unencrypted groups.
 ALTER TABLE node_groups
     ADD COLUMN cache_kms_key_arn TEXT;
 
