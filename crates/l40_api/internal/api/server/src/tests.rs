@@ -82,6 +82,85 @@ struct ClusterFixture {
     _db: TestDb,
 }
 
+/// The static token the reviewed ClusterApi also accepts.
+#[cfg(feature = "kubernetes")]
+const REVIEWED_STATIC_TOKEN: &str = "synthetic-static-token";
+
+/// ClusterApi served behind the real node-api auth layer.
+#[cfg(feature = "kubernetes")]
+struct ReviewedClusterApi {
+    client: crate::proto::cluster_api_client::ClusterApiClient<tonic::transport::Channel>,
+    _server: tokio_util::task::AbortOnDropHandle<Result<(), tonic::transport::Error>>,
+    _reviewer: tokio_util::task::AbortOnDropHandle<std::io::Result<()>>,
+}
+
+/// Serve `service` with TokenReview answered by `review`, admitting the
+/// `allowed` service accounts (comma-separated). With `firewall_rules_fetch`,
+/// that account holds the fetch authority production withholds.
+#[cfg(feature = "kubernetes")]
+async fn serve_reviewed(
+    service: ClusterApiService,
+    allowed: &str,
+    firewall_rules_fetch: Option<&str>,
+    review: impl Fn(
+        k8s_openapi::api::authentication::v1::TokenReviewSpec,
+    ) -> pplx_space_rpc_auth::test_support::TokenReviewStatus
+    + Clone
+    + Send
+    + Sync
+    + 'static,
+) -> TestResult<ReviewedClusterApi> {
+    use pplx_space_rpc_auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
+
+    let review_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let kube_config =
+        kube::Config::new(format!("http://{}", review_listener.local_addr()?).parse()?);
+    let reviewer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        pplx_space_rpc_auth::test_support::serve_token_reviews(
+            review_listener,
+            review,
+            tokio_util::sync::CancellationToken::new(),
+        ),
+    ));
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (key, value) in [
+        ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
+        ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "true"),
+        ("SPACE_K8S_TOKEN_AUTH_NAMESPACE", "space"),
+        ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
+        ("SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS", allowed),
+    ] {
+        env.set(key, value);
+    }
+    let mut config = NodeApiAuthConfig::from_environment(
+        &env,
+        NodeRole::Cluster,
+        REVIEWED_STATIC_TOKEN.into(),
+        None,
+    )?;
+    if let Some(service_account) = firewall_rules_fetch {
+        config = config.grant_firewall_rules_fetch_for_test(service_account);
+    }
+    let auth =
+        NodeApiAuthLayer::with_k8s_client_for_test(config, kube::Client::try_from(kube_config)?);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(auth)
+            .add_service(crate::proto::cluster_api_server::ClusterApiServer::new(
+                service,
+            ))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+    }));
+    Ok(ReviewedClusterApi {
+        client: crate::proto::cluster_api_client::ClusterApiClient::connect(endpoint).await?,
+        _server: server,
+        _reviewer: reviewer,
+    })
+}
+
 #[tokio::test]
 async fn transfer_registry_covers_kubernetes_sources() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {

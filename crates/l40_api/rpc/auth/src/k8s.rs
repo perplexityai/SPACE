@@ -811,10 +811,7 @@ impl AuthPolicy<'_> {
             caller.template_transfer_authority =
                 super::template_transfer::TemplateTransferAuthority::Granted;
         }
-        if self.role == NodeRole::Cluster
-            && self.firewall_rules_fetch_usernames.contains(username)
-            && !self.guest_bridge_usernames.contains(username)
-        {
+        if self.firewall_rules_fetch_usernames.contains(username) {
             caller.firewall_rules_fetch_authority = super::FirewallRulesFetchAuthority::Granted;
         }
         caller

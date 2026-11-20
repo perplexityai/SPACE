@@ -25,9 +25,8 @@ const DENIED: &str = "the caller may not fetch firewall rules";
 
 /// The workers that may fetch. Production enrolls none until an enrollment
 /// predicate is approved; tests name their fixture workers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) enum Enrollment {
-    #[default]
     Unapproved,
     #[cfg(all(test, feature = "kubernetes"))]
     Fixture(Vec<NodeId>),

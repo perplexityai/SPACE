@@ -227,8 +227,8 @@ service ClusterApi {
   // read from one snapshot. The server resolves the worker from the caller's
   // reviewed node identity; the request names nothing. Read-only: fetching
   // twice changes nothing. PERMISSION_DENIED unless the caller is node-ctl on
-  // exactly one live, enrolled worker; FAILED_PRECONDITION while no
-  // enrollment predicate is approved.
+  // exactly one live, enrolled worker; FAILED_PRECONDITION for such a caller
+  // while no enrollment predicate is approved.
   rpc FetchFirewallRules(FetchFirewallRulesRequest) returns (FetchFirewallRulesResponse);
 
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
