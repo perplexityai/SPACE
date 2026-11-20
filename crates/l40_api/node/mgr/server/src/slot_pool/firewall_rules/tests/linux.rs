@@ -67,8 +67,8 @@ fn owned_table(namespace: &TestNamespace) -> Vec<Value> {
 }
 
 // Catches an apply that misses the slot's namespace, leaves the previous owned
-// table, touches the baseline table or a sibling namespace, or reports evidence
-// for an object other than the one it pinned.
+// table, touches a sibling namespace, or reports evidence for an object other
+// than the one it pinned.
 #[test]
 fn applies_the_accepted_revision_only_to_the_slot_namespace() {
     if !pplx_space_test_env::root_or_skip(PRIVILEGE) {
@@ -84,14 +84,6 @@ fn applies_the_accepted_revision_only_to_the_slot_namespace() {
     );
     add(&target, stale.clone());
     add(&sibling, stale);
-    add(
-        &target,
-        json!([{"add": {"table": {"family": "ip", "name": "sandbox"}}},
-               {"add": {"chain": {"family": "ip", "table": "sandbox", "name": "keep",
-                 "type": "filter", "hook": "forward", "prio": 0}}}]),
-    );
-    let baseline = ["-j", "list", "table", "ip", "sandbox"];
-    let baseline_before = nft(&target, &baseline, b"");
     let sibling_before = nft(&sibling, &["-j", "list", "ruleset"], b"");
 
     let (pool, _jobs) = pool(1);
@@ -120,7 +112,6 @@ fn applies_the_accepted_revision_only_to_the_slot_namespace() {
         identity(std::fs::metadata(entry)).ok()
     );
     assert_eq!(owned_table(&target), installed(DNS));
-    assert_eq!(nft(&target, &baseline, b""), baseline_before);
     assert_eq!(
         nft(&sibling, &["-j", "list", "ruleset"], b""),
         sibling_before

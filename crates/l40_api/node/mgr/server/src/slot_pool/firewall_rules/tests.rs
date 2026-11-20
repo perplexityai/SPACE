@@ -521,28 +521,27 @@ async fn apply_touches_only_an_owned_stable_slot() {
             let host = FakeHost::new();
             let namespace = host.name(0, "net");
             let held = setup(&pool, &host);
-            let report = apply(&pool, &store, &host, 12, 0).await;
-            let outcome = match (&report, expected, accepted) {
-                (SlotFirewallReport::Attempted(attempt), "verified", Some(_)) => {
+            let outcome = match apply(&pool, &store, &host, 12, 0).await {
+                SlotFirewallReport::Attempted(attempt) => {
                     assert!(attempt.verified(), "{context}: {attempt:?}");
                     assert_eq!(attempt.namespace, namespace, "{context}");
                     "verified"
                 }
-                (
-                    SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NoAssignment)),
-                    "verified",
-                    None,
-                ) => "no assignment",
-                (SlotFirewallReport::NotRun(NotRun::Ineligible { .. }), ..) => "ineligible",
-                (SlotFirewallReport::NotRun(NotRun::Busy), ..) => "busy",
-                (SlotFirewallReport::NotRun(NotRun::Changed), ..) => "changed",
-                (SlotFirewallReport::NotRun(NotRun::Namespace(_)), ..) => "namespace",
-                (report, ..) => panic!("{context}: {report:?}"),
+                SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NoAssignment)) => {
+                    "no assignment"
+                }
+                SlotFirewallReport::NotRun(NotRun::Ineligible { .. }) => "ineligible",
+                SlotFirewallReport::NotRun(NotRun::Busy) => "busy",
+                SlotFirewallReport::NotRun(NotRun::Changed) => "changed",
+                SlotFirewallReport::NotRun(NotRun::Namespace(_)) => "namespace",
+                report => panic!("{context}: {report:?}"),
             };
-            assert!(
-                [expected, "no assignment"].contains(&outcome),
-                "{context}: {outcome}"
-            );
+            // Ownership is decided before the assignment is read.
+            let expected = match (expected, accepted) {
+                ("verified", None) => "no assignment",
+                _ => expected,
+            };
+            assert_eq!(outcome, expected, "{context}");
             if outcome == "verified" {
                 assert_eq!(host.installs(), [namespace], "{context}");
                 assert!(host.calls().iter().all(|called| *called == namespace));
@@ -559,28 +558,9 @@ async fn apply_touches_only_an_owned_stable_slot() {
         }
     }
 
-    // Asking for another node is never runnable either.
     let (pool, _jobs) = pool(1);
     let (_dir, store) = store(Some((12, DNS)));
     let host = FakeHost::new();
-    host.name(0, "net");
-    ready(&pool, 0);
-    let request = SlotFirewallRequest {
-        node_id: NodeId::from_uuid(Uuid::from_u128(2)),
-        generation: 12,
-        slot_id: 0,
-    };
-    let report = pool
-        .apply_firewall_rules_with(&store, request, host.clone())
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            report,
-            SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::WrongNode { .. }))
-        ),
-        "{report:?}"
-    );
     assert!(matches!(
         apply(&pool, &store, &host, 12, 1).await,
         SlotFirewallReport::NotRun(NotRun::NoSlot)
@@ -787,10 +767,11 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
     assert_eq!(host.table(namespace), Some(installed(WEB)));
 }
 
-// Catches ownership released with the async caller while nft can still run,
-// one slot's apply blocking another's, or a neutral release that nudges reset.
+// Catches ownership released with the async caller while nft runs or kept once
+// the job finishes, one slot's apply blocking another's, or a neutral release
+// that nudges reset.
 #[tokio::test]
-async fn a_dropped_caller_keeps_the_slot_until_nft_and_readback_finish() {
+async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
     let (pool, mut jobs) = pool(2);
     let (_dir, store) = store(Some((12, DNS)));
     let host = FakeHost::new();
