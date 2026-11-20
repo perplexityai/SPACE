@@ -1,5 +1,5 @@
 use super::{
-    NodeDrainState, SandboxAction, post_wake_lifecycle_allows_started_update,
+    NodeDrain, SandboxAction, post_wake_lifecycle_allows_started_update,
     wake_lifecycle_allows_started_update,
 };
 use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase};
@@ -211,8 +211,8 @@ fn wake_entry_accepts_recoverable_states_and_rejects_teardown_states() {
     }
 }
 
-fn state(phase: NodeDrainPhase, mode: NodeDrainMode) -> NodeDrainState {
-    NodeDrainState { phase, mode }
+fn state(phase: NodeDrainPhase, mode: NodeDrainMode) -> NodeDrain {
+    NodeDrain::V1 { phase, mode }
 }
 
 #[test]
