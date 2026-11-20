@@ -18,7 +18,8 @@ enum Queue {
     Fails,
     /// Queues, then reports this count.
     Reports(u64),
-    /// Queues, then lapses the item's lease on the same transaction.
+    /// Queues, then expires the item's lease at the current clock reading, so
+    /// the check must read the clock at the stamp to refuse.
     ThenLapses,
 }
 
@@ -37,7 +38,7 @@ impl Wakeup for Queue {
             Self::ThenLapses => {
                 sqlx::query(sql!(
                     "UPDATE firewall_rules_rollout_items
-                     SET lease_expires_at = clock_timestamp() - interval '1 second'
+                     SET lease_expires_at = clock_timestamp()
                      WHERE node_id = $1 AND phase = 'in_flight'"
                 ))
                 .bind(node)
@@ -314,13 +315,12 @@ async fn an_issued_target_is_resolved_from_its_stamp() -> TestResult {
     Ok(())
 }
 
-/// Catches a node or lease judged only before issuance waits: a node that
-/// goes offline, or a lease that lapses, while the wakeup waits on the
-/// node's trigger row would still be stamped, with the assignment and wakeup
-/// committed; and an old token that issues or releases once another
-/// controller took the item over.
+/// Catches a node judged only before issuance waits: a node that goes
+/// offline while the wakeup waits on the node's trigger row would still be
+/// stamped, with the assignment and wakeup committed; and an old token that
+/// issues or releases once another controller took the item over.
 #[tokio::test(flavor = "current_thread")]
-async fn a_node_or_lease_that_lapses_while_issuance_waits_issues_nothing() -> TestResult {
+async fn a_node_that_goes_offline_while_issuance_waits_issues_nothing() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
         return Ok(());
     };
@@ -342,39 +342,7 @@ async fn a_node_or_lease_that_lapses_while_issuance_waits_issues_nothing() -> Te
     assert_eq!(effects(&db.pool, rollout, node).await?, before);
     set_status(&db.pool, node, true, 60.0).await?;
 
-    sqlx::query(sql!(
-        "UPDATE firewall_rules_rollout_items
-         SET lease_expires_at = clock_timestamp() + interval '1 second'
-         WHERE rollout_id = $1"
-    ))
-    .bind(rollout)
-    .execute(&db.pool)
-    .await?;
-    let locker = hold_trigger(&db.pool, node).await?;
-    let issuing = spawn_issue(&db.pool, &old);
-    wait_for_lock_waiters(&db.pool, 1).await?;
-    let live = || {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT lease_expires_at > clock_timestamp()
-             FROM firewall_rules_rollout_items WHERE rollout_id = $1"
-        ))
-        .bind(rollout)
-        .fetch_one(&db.pool)
-    };
-    // Live while issuance waits, so it passed every check before the wait.
-    assert!(live().await?, "the lease lapsed before issuance waited");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while live().await? {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the lease didn't lapse"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    locker.commit().await?;
-    assert_eq!(issuing.await??, Issuance::Refused(Refusal::Lapsed));
-    assert_eq!(effects(&db.pool, rollout, node).await?, before);
-
+    lapse(&db.pool, rollout, node).await?;
     redrive_expired(&db.pool, rollout, MAX_ATTEMPTS).await?;
     let new = lease(&db.pool, rollout, 1).await?.remove(0);
     assert_eq!(
@@ -602,7 +570,8 @@ async fn ineligible_targets_issue_nothing() -> TestResult {
 /// is rejected, queues no node or several, or is followed by a refused stamp,
 /// or a generation that overflows, leaving an assignment, a trigger change or
 /// a stamp behind; a wakeup that drops the node's other reasons; and a
-/// replay that refreshes them.
+/// replay that refreshes them. The lease check must read the clock at the
+/// stamp.
 #[tokio::test(flavor = "current_thread")]
 async fn any_failure_rolls_back_the_whole_issuance() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
