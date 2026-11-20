@@ -27,6 +27,8 @@
 //! - S5 `s5_census_lookups_are_capped_per_tick`
 //! - S6 `s6_cold_reflector_skips_the_census`
 //! - S7 `s7_census_reuses_the_give_up_verdict`
+//! - S8 `s8_census_lookups_resume_after_the_last_judged_node`
+//! - S9 `s9_deleted_node_at_rest_counts_only_within_the_window`
 //!
 //! ## P - Postgres-backed sink
 //! - P1 `p1_stale_snapshot_and_terminated_source_ends_lost`
@@ -41,6 +43,8 @@
 //! - P10 `p10_flip_rechecks_restore_sources_and_generation`
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
 //! - P12 `p12_census_counts_running_and_at_rest_residents`
+//! - P13 `p13_old_deleted_node_with_a_durable_suspend_is_not_a_suspect`
+//! - P14 `p14_recently_deleted_node_with_a_local_only_suspend_counts_at_rest`
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -222,8 +226,30 @@ impl FakeSink {
             node_id,
             source_node,
             residents: counts.running + counts.at_rest_without_copy,
+            recent_residents: counts.running + counts.at_rest_without_copy,
         });
         state.stranded.insert(node_id, counts);
+    }
+
+    /// Like [`Self::with_node`], but every resident is a suspend or upload
+    /// older than [`DELETED_NODE_AT_REST_WINDOW`].
+    fn with_old_node(&self, node_id: NodeId, source_node: SourceNode, counts: StrandedCounts) {
+        self.with_node(node_id, source_node, counts);
+        let mut state = self.0.lock().unwrap();
+        state.residents.last_mut().unwrap().recent_residents = 0;
+    }
+
+    fn set_source_node(&self, node_id: NodeId, source_node: SourceNode) {
+        let mut state = self.0.lock().unwrap();
+        for row in &mut state.residents {
+            if row.node_id == node_id {
+                row.source_node = source_node.clone();
+            }
+        }
+    }
+
+    fn clear_count_calls(&self) {
+        self.0.lock().unwrap().count_calls.clear();
     }
 
     fn count_calls(&self) -> Vec<NodeId> {
@@ -1105,6 +1131,7 @@ mod postgres_backed {
                     k8s_node_uid: None,
                 },
                 residents: 1,
+                recent_residents: 1,
             })
         );
         assert_eq!(
@@ -1186,6 +1213,122 @@ mod postgres_backed {
         assert!(residents.iter().all(
             |row| row.node_id != registered_node.node_id && row.node_id != deleted_row.node_id
         ));
+        Ok(())
+    }
+
+    /// Give the suspend's local artifact a ready, stored snapshot, so it
+    /// restores from object storage.
+    async fn make_durable(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        node_id: NodeId,
+        artifact_id: uuid::Uuid,
+    ) -> TestResult {
+        let snapshot_id = SnapshotId::new();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                (id, sandbox_id, org_id, type, state, timestamp, source_node_id,
+                 local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, $3::uuid, 'full', 'ready', NOW(), $4,
+                     $5, 'full', 'suspend')"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox_id)
+        .bind(SEED_ORG_ID)
+        .bind(node_id)
+        .bind(artifact_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://bucket/snapshot')"
+        ))
+        .bind(snapshot_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Move the suspend's `lifecycle_changed_at` past the window. The
+    /// trigger only touches it when `lifecycle` changes.
+    async fn age_suspend(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle_changed_at = NOW() - make_interval(secs => $2::DOUBLE PRECISION)
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(DELETED_NODE_AT_REST_WINDOW.as_secs_f64() + 3600.0)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p13_old_deleted_node_with_a_durable_suspend_is_not_a_suspect() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        // A node whose row is long gone, still named by a durable suspend.
+        let node_id = NodeId::new();
+        let (sandbox_id, artifact_id) = seed_suspended_local_only(&db.pool, node_id).await?;
+        make_durable(&db.pool, sandbox_id, node_id, artifact_id).await?;
+        age_suspend(&db.pool, sandbox_id).await?;
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
+
+        let row = store
+            .node_residents()
+            .await?
+            .into_iter()
+            .find(|row| row.node_id == node_id);
+        assert_eq!(
+            row.map(|row| (row.source_node, row.residents, row.recent_residents)),
+            Some((SourceNode::RowDeleted, 1, 0)),
+            "counted, but not as recent"
+        );
+
+        let lookup = Arc::new(FakeLookup::default());
+        let report = Reconciler::new(config(), store, lookup.clone(), presence())
+            .tick()
+            .await;
+        assert_eq!(gone(&report), (0, 0));
+        assert!(lookup.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p14_recently_deleted_node_with_a_local_only_suspend_counts_at_rest() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
+
+        // Suspended on a node deleted just now: the suspend itself is recent.
+        let fresh_node = NodeId::new();
+        seed_suspended_local_only(&db.pool, fresh_node).await?;
+        let mut reconciler = Reconciler::new(
+            config(),
+            store,
+            Arc::new(FakeLookup::default()),
+            Arc::new(FakePresence::listing(&[NODE_NAME])),
+        );
+        let report = reconciler.tick().await;
+        assert_eq!(gone(&report), (1, 1));
+
+        // An old suspend on a live node, then the row is deleted outside a
+        // drain: the census saw it registered, so it still counts.
+        let watched = NodeId::new();
+        insert_node(&db.pool, watched, NODE_NAME).await?;
+        let (old_id, _) = seed_suspended_local_only(&db.pool, watched).await?;
+        age_suspend(&db.pool, old_id).await?;
+        let report = reconciler.tick().await;
+        assert_eq!(gone(&report), (1, 1), "the listed node is live");
+        sqlx::query(sql!("DELETE FROM nodes WHERE id = $1"))
+            .bind(watched)
+            .execute(&db.pool)
+            .await?;
+        let report = reconciler.tick().await;
+        assert_eq!(gone(&report), (2, 2));
         Ok(())
     }
 
@@ -1578,4 +1721,70 @@ async fn s7_census_reuses_the_give_up_verdict() {
         "one EC2 call per node"
     );
     assert_eq!(presence.direct_calls(), vec!["dead".to_string()]);
+}
+
+#[tokio::test]
+async fn s8_census_lookups_resume_after_the_last_judged_node() {
+    let sink = FakeSink::new(Vec::new());
+    for name in ["dead-a", "dead-b", "dead-c"] {
+        sink.with_node(NodeId::new(), registered(name, None), counts(1, 0));
+    }
+    let lookup = Arc::new(FakeLookup::default());
+    let config = ReconcilerConfig {
+        max_census_lookups_per_tick: 2,
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(config, sink, lookup.clone(), presence());
+
+    reconciler.tick().await;
+    let first: HashSet<String> = lookup.calls().into_iter().collect();
+    assert_eq!(first.len(), 2);
+    reconciler.tick().await;
+
+    let calls = lookup.calls();
+    assert_eq!(calls.len(), 4, "the cap still holds per tick");
+    let skipped = ["dead-a", "dead-b", "dead-c"]
+        .into_iter()
+        .find(|name| !first.contains(*name))
+        .unwrap();
+    assert_eq!(
+        calls[2], skipped,
+        "the second tick starts with the node the first one skipped"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn s9_deleted_node_at_rest_counts_only_within_the_window() {
+    let sink = FakeSink::new(Vec::new());
+    // Deleted before this controller saw it, holding only old suspends.
+    let long_gone = NodeId::new();
+    sink.with_old_node(long_gone, SourceNode::RowDeleted, counts(0, 1));
+    // Seen registered, then deleted, holding the same old suspends.
+    let watched = NodeId::new();
+    sink.with_old_node(watched, registered("listed", None), counts(0, 1));
+    let presence = Arc::new(FakePresence::listing(&["listed"]));
+    let mut reconciler = Reconciler::new(
+        config(),
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        presence,
+    );
+
+    reconciler.tick().await;
+    assert!(
+        !sink.count_calls().contains(&long_gone),
+        "a node deleted before the window is not a suspect"
+    );
+
+    sink.set_source_node(watched, SourceNode::RowDeleted);
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert_eq!(sink.count_calls(), vec![watched]);
+    assert_eq!(gone(&report), (1, 1), "a node seen deleted counts at rest");
+
+    tokio::time::advance(DELETED_NODE_AT_REST_WINDOW).await;
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert!(sink.count_calls().is_empty(), "past the window it stops");
+    assert_eq!(gone(&report), (0, 0));
 }

@@ -23,7 +23,10 @@ use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use super::{LostCandidate, LostStartedSink, NodeResidents, SourceNode, StrandedCounts};
+use super::{
+    DELETED_NODE_AT_REST_WINDOW, LostCandidate, LostStartedSink, NodeResidents, SourceNode,
+    StrandedCounts,
+};
 use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
 
 type CandidateRow = (SandboxId, i64, NodeId, bool, Option<String>, Option<String>);
@@ -74,9 +77,11 @@ static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// `$1` = [`SubstrateKind::Kubernetes`]. The stranded-sandbox census's cheap
-/// first pass: per node outside a drain, including nodes whose row is gone,
-/// how many Kubernetes sandboxes it may still hold state for.
+/// `$1` = [`SubstrateKind::Kubernetes`], `$2` =
+/// [`super::DELETED_NODE_AT_REST_WINDOW`] seconds. The stranded-sandbox
+/// census's cheap first pass: per node outside a drain, including nodes whose
+/// row is gone, how many Kubernetes sandboxes it may still hold state for,
+/// ordered by node id.
 ///
 /// Three populations, each keyed on the column that names its node:
 ///
@@ -86,6 +91,13 @@ static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
 ///   `admin_occupancy` and the drain gate look for a local snapshot;
 /// - in-flight full uploads by `source_node_id`, the admin console's other
 ///   local-snapshot source.
+///
+/// `recent_residents` counts the residents plus only the suspends and
+/// uploads from within the window: the suspend's `lifecycle_changed_at`, the
+/// upload's heartbeat. `target_node_id` has no foreign key and nothing clears
+/// it, so most suspended rows name nodes deleted long ago, nearly all of them
+/// durable. The census uses `recent_residents` for a deleted node it didn't
+/// see deleted, so those nodes don't become suspects every tick.
 ///
 /// The count is an upper bound with no durability check, only used to skip
 /// nodes holding nothing; the second pass applies the real definitions.
@@ -97,19 +109,23 @@ static NODE_RESIDENTS: LazyLock<String> = LazyLock::new(|| {
     sql!(
         format!(
             "WITH held AS (
-                 SELECT s.active_node_id AS node_id
+                 SELECT s.active_node_id AS node_id, TRUE AS recent
                    FROM sandboxes s
                   WHERE s.managed_by = $1
                     AND s.active_node_id IS NOT NULL
                     AND ({resident} OR s.lifecycle = 'stopped')
                  UNION ALL
-                 SELECT s.target_node_id
+                 SELECT s.target_node_id,
+                        s.lifecycle_changed_at
+                            >= NOW() - make_interval(secs => $2::DOUBLE PRECISION)
                    FROM sandboxes s
                   WHERE s.managed_by = $1
                     AND s.target_node_id IS NOT NULL
                     AND s.lifecycle = 'suspended'
                  UNION ALL
-                 SELECT sn.source_node_id
+                 SELECT sn.source_node_id,
+                        COALESCE(sn.last_attempt_at, sn.timestamp)
+                            >= NOW() - make_interval(secs => $2::DOUBLE PRECISION)
                    FROM snapshots sn
                    JOIN sandboxes s ON s.id = sn.sandbox_id
                   WHERE sn.type = 'full'
@@ -120,12 +136,14 @@ static NODE_RESIDENTS: LazyLock<String> = LazyLock::new(|| {
              SELECT h.node_id,
                     n.id IS NOT NULL AS node_row_exists,
                     nk.k8s_node_name,
-                    COUNT(*) AS residents
+                    COUNT(*) AS residents,
+                    COUNT(*) FILTER (WHERE h.recent) AS recent_residents
                FROM held h
                LEFT JOIN nodes n ON n.id = h.node_id
                LEFT JOIN node_k8s nk ON nk.node_id = n.id
               WHERE n.id IS NULL OR (n.managed_by = $1 AND n.drain_phase IS NULL)
-              GROUP BY h.node_id, n.id, nk.k8s_node_name"
+              GROUP BY h.node_id, n.id, nk.k8s_node_name
+              ORDER BY h.node_id"
         )
         .as_str()
     )
@@ -226,15 +244,16 @@ impl LostStartedSink for LostStartedDbStore {
     }
 
     async fn node_residents(&self) -> Result<Vec<NodeResidents>, sqlx::Error> {
-        let rows: Vec<(NodeId, bool, Option<String>, i64)> =
+        let rows: Vec<(NodeId, bool, Option<String>, i64, i64)> =
             sqlx::query_as(sqlx::AssertSqlSafe(NODE_RESIDENTS.as_str()))
                 .bind(SubstrateKind::Kubernetes)
+                .bind(DELETED_NODE_AT_REST_WINDOW.as_secs_f64())
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows
             .into_iter()
             .map(
-                |(node_id, node_row_exists, name, residents)| NodeResidents {
+                |(node_id, node_row_exists, name, residents, recent_residents)| NodeResidents {
                     node_id,
                     source_node: match (node_row_exists, name) {
                         (false, _) => SourceNode::RowDeleted,
@@ -245,6 +264,7 @@ impl LostStartedSink for LostStartedDbStore {
                         (true, None) => SourceNode::Unverifiable,
                     },
                     residents: residents.unsigned_abs(),
+                    recent_residents: recent_residents.unsigned_abs(),
                 },
             )
             .collect())

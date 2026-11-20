@@ -62,8 +62,13 @@
 //! for them. It groups Kubernetes sandboxes by the node holding them: live
 //! residents and `stopped` rows by `active_node_id`, `suspended` rows by
 //! `target_node_id` (a suspend clears `active_node_id`), and in-flight full
-//! uploads by their source node. Nodes in a drain phase are excluded; the
-//! drain reports those. It judges each node that the reflector doesn't list
+//! uploads by their source node. Other lifecycles, `quarantined`, `created`
+//! and `deleting` included, are not counted. Nodes in a drain phase are
+//! excluded; the drain reports those. A deleted node's suspends and uploads
+//! count for [`DELETED_NODE_AT_REST_WINDOW`] after this controller sees its
+//! row go, or, for a node it never saw registered, only those from within
+//! the window: `target_node_id` is never cleared, so most suspended rows
+//! name long-deleted nodes. It judges each node that the reflector doesn't list
 //! as live and ready with the same verdict the give-up uses, and publishes,
 //! per node:
 //!
@@ -73,7 +78,8 @@
 //!   `verdict:not_ready` is a listed Node whose `Ready` condition has not been
 //!   `True` for the grace. `verdict:unverifiable` is everything the checks
 //!   couldn't settle (still inside the grace, a failed lookup, no Kubernetes
-//!   name, the lookup budget spent). A monitor should page on `gone` only.
+//!   name, the lookup budget spent; the next census resumes after the last
+//!   node it looked up). A monitor should page on `gone` only.
 //!   `residency:running` counts the node's residents as the drain gate
 //!   defines them (`pplx_space_sandbox_residency::resident_lifecycle` and
 //!   `occupies_node_predicate`), whose state lived only on the node.
@@ -132,6 +138,13 @@ pub(crate) const DEFAULT_MAX_LOST_PER_TICK: u32 = 25;
 /// Cap on EC2 lookups the census may add to a tick. Nodes past it read as
 /// `unverifiable` with `reason:lookup_budget` until a later tick.
 pub(crate) const DEFAULT_MAX_CENSUS_LOOKUPS_PER_TICK: u32 = 25;
+/// How long the census keeps counting a deleted node's suspends and uploads.
+/// The clock starts when this controller first sees the row gone, after
+/// having seen it registered. For a node it never saw registered, such as one
+/// deleted before a restart, it counts only suspends and upload heartbeats
+/// from within the window. `target_node_id` is never cleared, so without a
+/// bound every node that ever held a suspend would be checked every tick.
+pub(crate) const DELETED_NODE_AT_REST_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
@@ -227,6 +240,9 @@ pub struct NodeResidents {
     pub node_id: NodeId,
     pub source_node: SourceNode,
     pub residents: u64,
+    /// `residents` less the suspends and uploads older than
+    /// [`DELETED_NODE_AT_REST_WINDOW`].
+    pub recent_residents: u64,
 }
 
 /// A suspect node's residents that lose state with it.
@@ -273,7 +289,7 @@ struct StrandedSeries {
 
 pub trait LostStartedSink: Send + Sync + 'static {
     /// The census's first pass: per-node resident counts for every node
-    /// outside a drain, deleted node rows included.
+    /// outside a drain, deleted node rows included, ordered by node id.
     fn node_residents(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<NodeResidents>, sqlx::Error>> + Send;
@@ -351,6 +367,16 @@ pub struct Reconciler<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence
     not_ready_since: HashMap<String, tokio::time::Instant>,
     /// The `sandbox.stranded` series the last census published nonzero.
     published_stranded: HashSet<StrandedSeries>,
+    /// Nodes the last census found registered and holding something, so the
+    /// next one can tell that a missing row was deleted in between.
+    census_registered: HashSet<NodeId>,
+    /// When the census first found each such node's row deleted. Dropped once
+    /// past [`DELETED_NODE_AT_REST_WINDOW`] or once the node holds nothing.
+    census_row_gone_since: HashMap<NodeId, tokio::time::Instant>,
+    /// The last node a census spent an EC2 lookup on, when the budget ran
+    /// out. The next census starts after it, so every absent node gets
+    /// judged in turn.
+    census_lookup_after: Option<NodeId>,
 }
 
 impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L, P> {
@@ -364,6 +390,9 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             absent_since: HashMap::new(),
             not_ready_since: HashMap::new(),
             published_stranded: HashSet::new(),
+            census_registered: HashSet::new(),
+            census_row_gone_since: HashMap::new(),
+            census_lookup_after: None,
         }
     }
 
@@ -534,18 +563,53 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             Some(names) => self.not_ready_since.retain(|name, _| names.contains(name)),
             None => self.not_ready_since.clear(),
         }
-        let nodes = match self.sink.node_residents().await {
+        let mut nodes = match self.sink.node_residents().await {
             Ok(nodes) => nodes,
             Err(err) => {
                 tracing::warn!(error = %err, "lost_started_sandboxes: census scan failed");
                 return;
             }
         };
+        // Resume after the node the last census stopped at, so a lookup
+        // budget smaller than the absent nodes still reaches all of them.
+        nodes.sort_by_key(|node| node.node_id);
+        if let Some(after) = self.census_lookup_after {
+            let split = nodes.partition_point(|node| node.node_id <= after);
+            nodes.rotate_left(split);
+        }
 
+        let now = tokio::time::Instant::now();
+        let mut registered = HashSet::new();
+        let mut row_gone_since = HashMap::new();
         let mut lookups_left = self.config.max_census_lookups_per_tick;
+        let mut last_lookup = None;
+        let mut budget_spent = false;
         let mut suspects = Vec::new();
         for node in nodes {
-            if node.residents == 0 {
+            let residents = match &node.source_node {
+                SourceNode::RowDeleted => {
+                    let since = self
+                        .census_row_gone_since
+                        .get(&node.node_id)
+                        .copied()
+                        .or_else(|| self.census_registered.contains(&node.node_id).then_some(now))
+                        .filter(|since| {
+                            now.saturating_duration_since(*since) < DELETED_NODE_AT_REST_WINDOW
+                        });
+                    match since {
+                        Some(since) => {
+                            row_gone_since.insert(node.node_id, since);
+                            node.residents
+                        }
+                        None => node.recent_residents,
+                    }
+                }
+                SourceNode::Registered { .. } | SourceNode::Unverifiable => {
+                    registered.insert(node.node_id);
+                    node.residents
+                }
+            };
+            if residents == 0 {
                 continue;
             }
             let (verdict, reason, tag_node) = match &node.source_node {
@@ -560,7 +624,8 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                     node.node_id.to_string(),
                 ),
                 SourceNode::Registered { k8s_node_name, .. } => {
-                    let Some(judged) = self
+                    let budget_before = lookups_left;
+                    let judged = self
                         .census_registered_verdict(
                             k8s_node_name,
                             live_nodes,
@@ -569,15 +634,24 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                             verdicts,
                             &mut lookups_left,
                         )
-                        .await
-                    else {
+                        .await;
+                    if lookups_left < budget_before {
+                        last_lookup = Some(node.node_id);
+                    }
+                    let Some(judged) = judged else {
                         continue;
                     };
+                    if judged.1 == "lookup_budget" {
+                        budget_spent = true;
+                    }
                     (judged.0, judged.1, k8s_node_name.clone())
                 }
             };
             suspects.push((node.node_id, verdict, reason, tag_node));
         }
+        self.census_registered = registered;
+        self.census_row_gone_since = row_gone_since;
+        self.census_lookup_after = if budget_spent { last_lookup } else { None };
 
         let suspect_ids: Vec<NodeId> = suspects.iter().map(|suspect| suspect.0).collect();
         let stranded_by_node = if suspect_ids.is_empty() {
