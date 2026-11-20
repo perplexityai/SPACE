@@ -98,9 +98,10 @@ spec:
       expression: {{ toJson $fence.allowedAnnotationKeys | quote }}
     - name: allowedAnnotationKeyPrefixes
       expression: {{ toJson $fence.allowedAnnotationKeyPrefixes | quote }}
-    # Removable but not writable. node-ctl's template-write handler only ever
-    # *clears* a satisfied key (`clear_template_write_annotation_patch` patches
-    # it to null); the writer is the cluster-controller's warm pool, a different
+    # Removable but not writable. node-ctl's template-write handler, which
+    # also serves `template-environment-write-*` requests, only ever *clears* a
+    # satisfied key (`clear_template_write_annotation_patch` patches it to
+    # null); the writer is the cluster-controller's warm pool, a different
     # identity this policy does not match. Permitting an *add* would make
     # node-ctl a confused deputy: it reads any well-formed value as a pull
     # request and materializes it through the template-manager `GetTemplate`

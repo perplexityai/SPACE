@@ -96,7 +96,9 @@ pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 
 [dev-dependencies]
+http-body-util = { workspace = true }
 pplx-space-internal-api-server = { workspace = true }
+prost = { workspace = true }
 pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 nix = { workspace = true, features = ["user"] }

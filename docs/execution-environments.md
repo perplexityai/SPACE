@@ -1191,8 +1191,11 @@ build it gets is bound to that environment's partition: a node holding a
 digest under E0 and E1 boots the E1 build for an E1 pod, and an E0 pod boots
 the legacy-partition build, which unbound builds share. A node holding the
 digest only under another environment pulls the release, which its manifest
-places; a release that lands in another partition leaves the lookup
-`NOT_FOUND`, and the create fails rather than boot the build that's there. An
+places. A release that lands in another partition leaves the lookup
+`NOT_FOUND`. One that lands in the legacy partition while it holds an adopted
+build bound to another environment leaves it `FAILED_PRECONDITION` ("Template
+caches per environment" below). Either way the create fails rather than boot
+the build that's there. An
 older template-manager answers with its preferred build, which the
 partition check refuses. The
 sandbox runs the build's own binding, which the node admits first when it
@@ -1202,9 +1205,9 @@ another environment. A restore, fork or stopped start
 pod boots through Start, not Create, and doesn't send it. In `shadow` the
 annotation is absent and the create names no environment.
 
-On Kubernetes, `on` fails startup for now (see "Not covered"), so what
-follows describes what it does once it's supported. It has no fleet-wide
-fallback and no E0 exemption. If every node lacks the
+On Kubernetes, `on` runs while resume-time runtime upgrades are off; with
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` on it fails startup (see "Not
+covered"). It has no fleet-wide fallback and no E0 exemption. If every node lacks the
 labels at once, as on a new cluster or after node-managers roll out an
 observation this node-ctl can't decode, kube-scheduler can place no new bound
 pod, E0 included, and every restore pinned to its source node is refused: by
@@ -1219,9 +1222,11 @@ gate to `shadow` stops new pods from requiring the label.
 
 #### Not covered
 
-On Kubernetes, `on` fails startup with `SubstrateError::Unsupported`: a
-runtime-upgrade activation's pod requires the recorded environment rather than
-the upgrade's target. Lifting it also needs every worker on a shim that reads
+On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` while
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` is on: a runtime-upgrade
+activation's pod requires the recorded environment rather than the upgrade's
+target. With resume-time upgrades off no activation upgrades, so `on` runs.
+It also needs every worker on a shim that reads
 `space.pplx.net/environment-required`, since an older shim ignores it.
 `shadow` runs: it records, labels and counts without changing placement.
 
@@ -2412,8 +2417,12 @@ template-cache eviction disabled.
 the selected environment's partition, else the legacy build, else any other
 build of the digest. Absent, it prefers the legacy build, so
 environment-unaware callers keep their behavior; E0 selects the legacy
-partition. A lookup of a template's latest build returns the newest build of
-any partition, as before partitions existed. New tie-breaks send same-date
+partition. A lookup of a template's latest build that names an environment
+returns the newest ready build bound to that environment's partition, however
+old: for the legacy partition an unbound or initial-environment build, for
+another partition a build in it or an adopted legacy-layout build bound to it.
+With no such build on the node, or with no environment named, it returns the
+newest build of any partition, as before partitions existed. New tie-breaks send same-date
 builds to the larger content hash, and builds of one digest to the preferred
 partition, then the legacy one. The caller checks the build it gets as a
 compatible cold-boot source for the environment it runs under, which keeps
@@ -2432,8 +2441,18 @@ to it. It needs an exact digest and excludes `cached_only`. A node holding no
 such build pulls the release even when another partition holds the digest,
 since the pull's fast path then counts only a build bound to the required
 partition. If the release's manifest places it in a partition that already
-holds the digest, the pull writes nothing, and the lookup is `NOT_FOUND`.
-Pulls of one digest share a flight whatever they require. A required pull
+holds the digest's build bound to that partition, the pull writes nothing, and
+the lookup is `NOT_FOUND`. If that partition is the legacy one and its build
+is an adopted one bound to another environment, or one whose stored metadata
+doesn't parse, which reads as unbound, the pull fails instead, and the lookup
+is `FAILED_PRECONDITION` (fetch-error reason
+`partition_held_by_another_environment`). The build stays.
+A pull of a release bound to an environment has a flight per cache partition
+and shares only a pull of the same partition. It waits out a claim, or any
+pull of the digest whose partition its manifest decides, and then pulls again.
+Pulls whose partition their manifest decides share one flight per digest and
+wait out every partition's pull, so an environment-less pull waits for each
+twin's. A required pull
 that joins a flight whose owner found the digest cached in another partition
 goes round again, and pulls as the owner when nobody else has started one.
 `ListTemplates` reports each build's partition key in
@@ -2628,7 +2647,22 @@ Known limits until the cluster side carries partitions:
   original release, so a client that sends `environment` to
   `FindTemplateRelease`, `FindTemplateReleaseByHash` or
   `ListLatestTemplateReleases` must require `environment_applied` in the
-  response before it uses the release or any storage location in it. No client sends a selector yet. No dedicated writer
+  response before it uses the release or any storage location in it.
+  Template-manager is the one client that sends it. An on-demand pull that
+  requires an environment (`environment_required`, which takes an exact
+  digest) names it on `FindTemplateReleaseByHash`; when a server ignores
+  it, the pull drops that answer and asks again without a selector. It takes
+  the second answer when its release is unbound, and the partition check
+  decides, as before twins, or bound to the environment; one bound elsewhere
+  isn't found. Environment prefetch
+  (`SPACE_TEMPLATE_ENVIRONMENT_PREFETCH_ENABLED`) names it on tag lookups,
+  `ListLatestTemplateReleases` and the digest lookups of the pulls it starts.
+  To prefetch, an ignored selector makes the answer unknown, so it warms
+  nothing. On a tag lookup or `ListLatestTemplateReleases`, it also holds that
+  lookup's pins for up to 10 minutes after the lookup's last acknowledged
+  answer (or after the prefetch loop started), then prunes them as before
+  environments; an answer that says the template is org-specific drops its
+  pins at once. No dedicated writer
   creates twins yet, but once the old index is gone the build publisher can:
   while a release has no storage location, a build of the same hash bound to
   another environment registers its execution metadata, and the registration
@@ -2645,7 +2679,8 @@ Known limits until the cluster side carries partitions:
   template's legacy-partition build, and another partition's only when it has
   none, so central inventory can't yet tell which nodes hold a twin's build.
   Node presence labels already carry a separate label for each partition's
-  build, but readers still use the partition-less one.
+  build. The warm pool reads that label when its pods require an environment;
+  other readers still use the partition-less one.
 - A twin's build shares its original's `manifest.json` and `metadata.json`
   keys, since object keys carry only template and hash, and template-manager's
   pull derives a build's cache partition and execution from those two
@@ -2740,7 +2775,8 @@ Known limits until the cluster side carries partitions:
   partition's build of that digest can't restore a stream whose parent it
   lacks, and nothing pulls that build for it: the restore keeps failing. Twins
   exist only where a node admits an environment besides the initial one.
-- Prefetch names no environment: it pulls without a selector, counts a build
+- With `SPACE_TEMPLATE_ENVIRONMENT_PREFETCH_ENABLED` off, prefetch names no
+  environment: it pulls without a selector, counts a build
   in any partition of a digest as cached, and its tag pins use the legacy
   partition key.
 

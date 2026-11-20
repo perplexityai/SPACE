@@ -8,10 +8,13 @@
 //!   so one tag can pin a different build per environment. The prefetch
 //!   tag pass writes the current resolution; the GC unions it with the
 //!   release pins to decide what not to evict. Pins protect a digest in
-//!   every cache partition. Cluster tag resolution names no environment
-//!   yet, so the prefetcher pins the legacy partition.
+//!   every cache partition. The environment-less tag pass pins the legacy
+//!   partition and the environment pass each runnable environment's.
 //! - `template_pinned_releases` — keyed on `(name, content_hash)`.
-//!   The latest-N release pass writes one row per recent release.
+//!   The latest-N release pass writes one row per recent release, and the
+//!   environment pass one per release bound to a runnable environment. A
+//!   release and its twin share the digest, and so the row: a pin protects
+//!   the digest in every partition, so the partition adds nothing to it.
 //!
 //! Both tables are owned by [`PinnedDigestsStore`]. The store mirrors
 //! [`WarmPoolStore`] in `pplx-space-cluster-pool`: per-domain struct
@@ -115,6 +118,46 @@ impl PinnedDigestsStore {
         }
         stmt.execute(rusqlite::params_from_iter(params_vec.iter().copied()))?;
         Ok(())
+    }
+
+    /// Delete `tag`'s pin in `cache_partition`, as when the tag's release has
+    /// no build bound to that partition's environment any more: the pin
+    /// would otherwise keep protecting the digest it pinned before.
+    pub fn delete_tag(
+        &self,
+        name: &str,
+        tag: &str,
+        cache_partition: crate::db::TemplateCachePartition,
+    ) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM template_pinned_tags WHERE name = ?1 AND tag = ?2 AND cache_partition = ?3",
+            params![name, tag, cache_partition.key()],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every tag-pin row of a cache partition outside `keep`, the
+    /// partitions of the environments the node can still run, so a pin an
+    /// environment's pass wrote stops protecting its digest once the node
+    /// no longer runs it. The legacy partition is always kept: the
+    /// environment-less tag pass writes it.
+    pub fn prune_tag_partitions_outside(
+        &self,
+        keep: &[crate::db::TemplateCachePartition],
+    ) -> Result<usize> {
+        let conn = self.lock_conn()?;
+        let keep: Vec<String> = keep.iter().map(|partition| partition.key()).collect();
+        // `json_each` binds the whole list as one value, so the statement
+        // stays whole however many partitions the node has.
+        let keep = serde_json::to_string(&keep)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        conn.execute(
+            "DELETE FROM template_pinned_tags
+              WHERE cache_partition != ''
+                AND cache_partition NOT IN (SELECT value FROM json_each(?1))",
+            params![keep],
+        )
     }
 
     pub fn prune_without_local_builds(&self) -> Result<usize> {

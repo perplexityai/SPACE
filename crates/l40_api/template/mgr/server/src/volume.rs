@@ -68,6 +68,7 @@ use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{StorageUri, TEMPLATE_ROOTFS_FILE};
 use pplx_space_common_grpc::GrpcClientTrace;
 use pplx_space_content_digest::ContentHash;
+use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_host_layout::paths::{TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE};
 use pplx_space_node_api_client::cluster::connect_from_env as connect_cluster_api_from_env;
 use pplx_space_node_api_client::proto::{
@@ -122,7 +123,7 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, context: &'static str) -> MutexGu
 /// new caller forces a compile-time decision about which bucket it
 /// falls into. Keep the variant set small — this is a
 /// cardinality-bounded metric dimension, not free-form.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PullTrigger {
     /// A user-facing request hit the local-miss path and is waiting on
     /// the pull. Latency here is what the caller experiences.
@@ -229,6 +230,13 @@ pub enum PullFailure {
     ManifestCompressedDigestMissing,
     #[error("template execution metadata is invalid")]
     ExecutionMetadataInvalid,
+    /// The release's cache partition holds the digest's build bound to
+    /// another partition: one bound to another environment, which startup
+    /// recovery adopted in place from the pre-partition layout, or a row of
+    /// another partition whose stored metadata doesn't parse, which reads as
+    /// legacy. The pull keeps that build and writes nothing.
+    #[error("the release's cache partition holds the digest's build bound to another partition")]
+    PartitionHeldByAnotherEnvironment,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,6 +271,7 @@ impl PullFailure {
             Self::ManifestDigestMissing => "manifest_digest_missing",
             Self::ManifestCompressedDigestMissing => "manifest_compressed_digest_missing",
             Self::ExecutionMetadataInvalid => "execution_metadata_invalid",
+            Self::PartitionHeldByAnotherEnvironment => "partition_held_by_another_environment",
         }
     }
 
@@ -270,9 +279,9 @@ impl PullFailure {
         match self {
             Self::ClusterMetadataMissing | Self::StorageObjectMissing => PullFailureClass::Missing,
             Self::InvalidTemplateName => PullFailureClass::InvalidInput,
-            Self::NoStorageLocations | Self::TemplateNotGeneric => {
-                PullFailureClass::FailedPrecondition
-            }
+            Self::NoStorageLocations
+            | Self::TemplateNotGeneric
+            | Self::PartitionHeldByAnotherEnvironment => PullFailureClass::FailedPrecondition,
             Self::ClusterMetadataInvalid
             | Self::InvalidContentHash
             | Self::NoUsableStorageLocations
@@ -425,10 +434,38 @@ impl VolumePuller {
                 req_tag,
                 trigger,
                 required: None,
+                environment: None,
             },
             Some(TemplateLookupScope::Cluster),
         )
         .await
+    }
+
+    /// [`Self::pull`] of the release of `req_hash` bound to `environment`: a
+    /// twin, or the release itself when it's bound there. The lookup names
+    /// the environment, the release's own metadata decides its partition,
+    /// which must be `environment`'s, and the build lands only there. A
+    /// cluster that applied the selector and found no release bound there is
+    /// `ClusterMetadataMissing`: nothing to warm. One that didn't apply it,
+    /// as one that predates twins doesn't, is `ClusterMetadataUnavailable`.
+    pub(crate) async fn pull_in_environment(
+        &self,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        name: &str,
+        req_hash: &str,
+        environment: EnvironmentReference,
+        trigger: PullTrigger,
+    ) -> PullOutcome {
+        let spec = PullSpec {
+            name,
+            req_hash,
+            req_tag: "",
+            trigger,
+            required: None,
+            environment: Some(environment),
+        };
+        self.pull_in_scope(db, spec, Some(TemplateLookupScope::Cluster))
+            .await
     }
 
     #[tracing::instrument(
@@ -438,6 +475,7 @@ impl VolumePuller {
             trigger = spec.trigger.as_tag(),
             req_hash = spec.req_hash,
             req_tag = spec.req_tag,
+            environment = ?spec.environment,
             content_hash = tracing::field::Empty,
         )
     )]
@@ -484,7 +522,7 @@ impl VolumePuller {
                 release.hash,
                 release.storage_uris,
                 &tags,
-                spec.required,
+                PullTarget::of(&spec, release.environment),
             )
             .await;
         let outcome = result.outcome.into_outcome();
@@ -501,17 +539,30 @@ impl VolumePuller {
         resolved_hash: String,
         storage_uris: Vec<String>,
         base_tags: &[String],
-        required: Option<TemplateCachePartition>,
+        target: PullTarget,
     ) -> PullTaskResult {
-        // One flight per digest whatever a caller requires: they all pull
-        // the one release, which lands where its manifest says. A caller that
-        // requires a partition and joins a flight whose owner checked another
-        // requirement and found the digest cached goes round again, as the
-        // owner if nobody else has started a flight, so its own fast path
-        // decides. Joiners requiring the owner's partition take its answer.
-        let key = PullKey::new(name.clone(), resolved_hash.clone());
+        let PullTarget {
+            required,
+            environment,
+            served_environment,
+        } = target;
+        // One flight per partition a pull of a release bound to an
+        // environment writes, and one per digest for every other pull: those
+        // pull the one release, which lands where its manifest says. A caller
+        // that requires a partition and joins a flight whose owner checked
+        // another requirement and found the digest cached goes round again,
+        // as the owner if nobody else has started a flight, so its own fast
+        // path decides. Joiners requiring the owner's partition take its
+        // answer.
+        let partition = environment_partition(environment);
+        let key = PullKey::in_partition(name.clone(), resolved_hash.clone(), partition);
         loop {
             let (flight, started) = self.start_or_join_flight(key.clone());
+            // Only a pull of the same partition answers for this one: another
+            // partition's, or one whose manifest picks its partition, may
+            // materialize a build this caller didn't ask for. Such a holder
+            // is waited out like a claim, and the pull retried.
+            let shares_result = !flight.claim && flight.key.as_ref() == Some(&key);
             if started {
                 let guard = PullFlightGuard::new(
                     key.clone(),
@@ -536,6 +587,8 @@ impl VolumePuller {
                                 resolved_hash: &resolved_hash,
                                 storage_uris: &storage_uris,
                                 required,
+                                environment,
+                                served_environment,
                             },
                             &base_tags,
                             background_worker.as_ref(),
@@ -552,6 +605,13 @@ impl VolumePuller {
                     content_hash = %resolved_hash,
                     "waiting for a digest claim before pulling"
                 );
+            } else if !shares_result {
+                info!(
+                    template = %name,
+                    content_hash = %resolved_hash,
+                    cache_partition = ?partition,
+                    "waiting for another cache partition's pull of the digest"
+                );
             } else {
                 info!(
                     template = %name,
@@ -561,6 +621,16 @@ impl VolumePuller {
             }
 
             match flight.wait_for_result().await {
+                Some(_) if !started && !shares_result => {
+                    debug!(
+                        template = %name,
+                        content_hash = %resolved_hash,
+                        "another cache partition's pull ended; retrying this one"
+                    );
+                    // A finished pull reports its result just before it
+                    // leaves the map; yield rather than spin through that.
+                    tokio::task::yield_now().await;
+                }
                 Some(result)
                     if !started
                         && result.path == PullPath::DbHit
@@ -610,7 +680,8 @@ impl VolumePuller {
     /// refuses under one.
     pub(crate) fn is_claimed(&self, name: &str, content_hash: &str) -> bool {
         lock_or_recover(&self.in_flight, "template pull in-flight map")
-            .contains_key(&PullKey::new(name, content_hash))
+            .keys()
+            .any(|held| held.name == name && held.content_hash.as_deref() == Some(content_hash))
     }
 
     /// Claim `(name, content_hash)` the way a pull does, for work that must
@@ -659,6 +730,36 @@ impl VolumePuller {
         })
     }
 
+    /// Wait until no pull or claim holds `partition`'s pull of the digest:
+    /// one of the same partition, one whose manifest picks its partition (as
+    /// an environment-less pull's does), a claim, or the template's. A
+    /// prefetch pull waits here before taking a pull permit, so it doesn't
+    /// hold one while another pull of the digest runs.
+    pub(crate) async fn wait_for_digest_flights(
+        &self,
+        name: &str,
+        content_hash: &str,
+        partition: Option<TemplateCachePartition>,
+    ) {
+        let key = PullKey::in_partition(name, content_hash, partition);
+        loop {
+            let holder = {
+                let in_flight = lock_or_recover(&self.in_flight, "template pull in-flight map");
+                in_flight
+                    .iter()
+                    .find(|(held, _)| key.is_held_by(held))
+                    .map(|(_, flight)| Arc::clone(flight))
+            };
+            let Some(holder) = holder else {
+                return;
+            };
+            holder.wait_for_result().await;
+            // A finished flight reports its result just before it leaves the
+            // map; yield rather than spin through that.
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Join whatever holds `key`, or start a flight that owns it. A digest is
     /// held by its own entry or by its template's; a template, by its own
     /// entry or by any of its digests'.
@@ -670,21 +771,21 @@ impl VolumePuller {
     /// when `claim` is set.
     fn start_or_join_flight_as(&self, key: PullKey, claim: bool) -> (Arc<InFlightPull>, bool) {
         let mut in_flight = lock_or_recover(&self.in_flight, "template pull in-flight map");
-        let holder = match key.content_hash {
-            Some(_) => in_flight
-                .get(&key)
-                .or_else(|| in_flight.get(&PullKey::template(&key.name))),
-            None => in_flight
+        // The exact key first, so a caller of one partition joins that
+        // partition's pull rather than waiting on another that also holds it.
+        let holder = in_flight.get(&key).or_else(|| {
+            in_flight
                 .iter()
-                .find(|(held, _)| held.name == key.name)
-                .map(|(_, flight)| flight),
-        };
+                .find(|(held, _)| key.is_held_by(held))
+                .map(|(_, flight)| flight)
+        });
         if let Some(existing) = holder {
             return (Arc::clone(existing), false);
         }
 
         let flight = Arc::new(InFlightPull {
             claim,
+            key: Some(key.clone()),
             ..InFlightPull::default()
         });
         in_flight.insert(key, Arc::clone(&flight));
@@ -697,6 +798,10 @@ struct PullKey {
     name: String,
     /// `None` keys the whole template, for `DeleteTemplate`.
     content_hash: Option<String>,
+    /// The one cache partition a pull of a release bound to an environment
+    /// writes. `None` holds every partition of the digest: a claim, or a
+    /// pull whose partition its manifest decides.
+    partition: Option<TemplateCachePartition>,
 }
 
 impl PullKey {
@@ -704,6 +809,20 @@ impl PullKey {
         Self {
             name: name.into(),
             content_hash: Some(content_hash.into()),
+            partition: None,
+        }
+    }
+
+    /// The key of a pull of the digest that writes only `partition`, or, with
+    /// `None`, whichever partition its manifest decides.
+    fn in_partition(
+        name: impl Into<String>,
+        content_hash: impl Into<String>,
+        partition: Option<TemplateCachePartition>,
+    ) -> Self {
+        Self {
+            partition,
+            ..Self::new(name, content_hash)
         }
     }
 
@@ -711,6 +830,27 @@ impl PullKey {
         Self {
             name: name.into(),
             content_hash: None,
+            partition: None,
+        }
+    }
+
+    /// Whether a flight holding `held` keeps one under `self` from starting.
+    /// A template holds, and is held by, each of its digests; a digest's
+    /// flight holds another of the digest unless both write one partition
+    /// and the partitions differ, as a release's pull and its twin's do.
+    fn is_held_by(&self, held: &Self) -> bool {
+        if held.name != self.name {
+            return false;
+        }
+        match (&self.content_hash, &held.content_hash) {
+            (None, _) | (_, None) => true,
+            (Some(mine), Some(theirs)) => {
+                mine == theirs
+                    && match (self.partition, held.partition) {
+                        (Some(mine), Some(theirs)) => mine == theirs,
+                        _ => true,
+                    }
+            }
         }
     }
 }
@@ -798,6 +938,9 @@ struct InFlightPull {
     state: Mutex<InFlightPullState>,
     /// A [`DigestClaim`], which ends without a result, rather than a pull.
     claim: bool,
+    /// The flight's own key: a caller shares a pull's result only when it
+    /// asked for the same partition.
+    key: Option<PullKey>,
 }
 
 impl InFlightPull {
@@ -917,9 +1060,15 @@ pub(crate) struct PullSpec<'a> {
     /// The partition a lookup requires the build in
     /// (`GetTemplateRequest.environment_required`): the owner's fast path
     /// then skips the pull only for a build bound to it, so a digest held
-    /// under another environment is still pulled. The release's manifest
-    /// still decides where the build lands.
+    /// under another environment is still pulled. Without [`Self::environment`]
+    /// the release's manifest still decides where the build lands.
     pub(crate) required: Option<TemplateCachePartition>,
+    /// The environment the release must be bound to; `None` takes the
+    /// release a lookup without one resolves, in whichever partition its
+    /// metadata binds. A pull naming one requires that environment's
+    /// partition, whatever [`Self::required`] says. See
+    /// [`VolumePuller::pull_in_environment`].
+    pub(crate) environment: Option<EnvironmentReference>,
 }
 
 async fn pull_inner(
@@ -937,10 +1086,10 @@ async fn pull_inner(
         Err(FindReleaseError::NotFound) => {
             return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
         }
-        Err(FindReleaseError::Unavailable) => {
+        Err(FindReleaseError::Unavailable | FindReleaseError::SelectorIgnored { .. }) => {
             return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
         }
-        Err(FindReleaseError::InvalidResponse) => {
+        Err(FindReleaseError::InvalidResponse | FindReleaseError::InvalidBinding { .. }) => {
             return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
         }
         Err(FindReleaseError::Status(status)) => {
@@ -968,6 +1117,7 @@ async fn pull_inner(
     let ResolvedRelease {
         hash: resolved_hash,
         storage_uris,
+        environment: served_environment,
         ..
     } = release;
 
@@ -990,7 +1140,7 @@ async fn pull_inner(
             resolved_hash,
             storage_uris,
             base_tags,
-            spec.required,
+            PullTarget::of(&spec, served_environment),
         )
         .await;
     *path_taken = result.path;
@@ -1120,6 +1270,28 @@ async fn refuse_pull_during_eviction(
     Ok(())
 }
 
+/// Which build of a resolved digest a pull is for: [`PullSpec::required`] and
+/// [`PullSpec::environment`].
+#[derive(Clone, Copy, Debug, Default)]
+struct PullTarget {
+    required: Option<TemplateCachePartition>,
+    environment: Option<EnvironmentReference>,
+    /// [`ResolvedPull::served_environment`].
+    served_environment: Option<EnvironmentReference>,
+}
+
+impl PullTarget {
+    /// `served` is the environment the cluster reports the resolved release
+    /// bound to.
+    fn of(spec: &PullSpec<'_>, served: Option<EnvironmentReference>) -> Self {
+        Self {
+            required: spec.required,
+            environment: spec.environment,
+            served_environment: spec.environment.and(served),
+        }
+    }
+}
+
 /// The resolved digest a flight's owner pulls, and the partition its caller
 /// requires the build in ([`PullSpec::required`]).
 struct OwnedPull<'a> {
@@ -1127,6 +1299,42 @@ struct OwnedPull<'a> {
     resolved_hash: &'a str,
     storage_uris: &'a [String],
     required: Option<TemplateCachePartition>,
+    /// The environment the release is bound to, when the lookup named one
+    /// ([`PullSpec::environment`]).
+    environment: Option<EnvironmentReference>,
+    /// [`ResolvedPull::served_environment`].
+    served_environment: Option<EnvironmentReference>,
+}
+
+/// The release one pull owner materializes: a digest and, for a release a
+/// lookup named an environment for, that environment.
+#[derive(Clone, Copy)]
+struct ResolvedPull<'a> {
+    name: &'a str,
+    content_hash: &'a str,
+    environment: Option<EnvironmentReference>,
+    /// For a lookup that named an environment, the one the cluster reports
+    /// the release it served bound to: the requested one, or none for an
+    /// unbound release of an environment cached in the legacy partition. It
+    /// picks which `metadata.json` is the served release's own.
+    served_environment: Option<EnvironmentReference>,
+}
+
+impl ResolvedPull<'_> {
+    /// The one partition the pull writes, when its lookup named an
+    /// environment; otherwise its manifest decides.
+    fn partition(&self) -> Option<TemplateCachePartition> {
+        environment_partition(self.environment)
+    }
+}
+
+/// The cache partition of builds bound to `environment`, when there is one.
+fn environment_partition(
+    environment: Option<EnvironmentReference>,
+) -> Option<TemplateCachePartition> {
+    environment.map(|environment| {
+        pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
+    })
 }
 
 /// The owner's work for one resolved digest.
@@ -1146,7 +1354,17 @@ async fn pull_resolved_owner(
         resolved_hash,
         storage_uris,
         required,
+        environment,
+        served_environment,
     } = pull;
+    let pull = ResolvedPull {
+        name,
+        content_hash: resolved_hash,
+        environment,
+        served_environment,
+    };
+    // A pull naming an environment requires its partition.
+    let required = pull.partition().or(required);
     // A build of this digest mid-eviction refuses the pull, retryably,
     // before the fast path: its row still counts as present, and its dir is
     // the one being deleted. `do_pull` checks again for an eviction that
@@ -1182,8 +1400,7 @@ async fn pull_resolved_owner(
     let mut path = PullPath::FreshPull;
     let outcome = match do_pull(
         db,
-        name,
-        resolved_hash,
+        pull,
         storage_uris,
         base_tags,
         background_worker,
@@ -1192,9 +1409,9 @@ async fn pull_resolved_owner(
     .await
     {
         Ok(PullWrite::Written) => PullOutcome::Materialized,
-        // Nothing was pulled: the release's partition already held the
-        // build, which a pull that required a partition finds past the fast
-        // path when that build isn't bound to the required one. Reported as
+        // Nothing was pulled: the release's partition already held its
+        // build, bound to it, which a pull that required another partition
+        // finds past the fast path. Reported as
         // the fast path's hit, so metrics and a required pull that joined
         // this one see that nothing was pulled.
         Ok(PullWrite::AlreadyPresent) => {
@@ -1230,16 +1447,31 @@ async fn find_release(
         req_tag,
         trigger,
         required: _,
+        environment,
     } = spec;
     let generic_only = trigger.is_prefetch();
-    let result =
-        find_release_with_requirement(name, req_hash, req_tag, None, generic_only, scope).await;
+    let result = find_pull_release(trigger, environment, req_hash, |environment| {
+        find_release_with_requirement(
+            ReleaseLookup {
+                name,
+                req_hash,
+                req_tag,
+                environment,
+            },
+            None,
+            generic_only,
+            scope,
+        )
+    })
+    .await;
     let result_label = match &result {
         Ok(_) => "ok",
         Err(FindReleaseError::NotFound) => "not_found",
         Err(
             FindReleaseError::Unavailable
+            | FindReleaseError::SelectorIgnored { .. }
             | FindReleaseError::InvalidResponse
+            | FindReleaseError::InvalidBinding { .. }
             | FindReleaseError::Status(_),
         ) => "error",
     };
@@ -1251,14 +1483,56 @@ async fn find_release(
     result
 }
 
+/// The release a pull resolves with `lookup`. An on-demand pull naming an
+/// environment asks again without a selector when the cluster ignores it, and
+/// falls back to its digest's unbound release, as
+/// [`find_release_in_environment`] does for the authorized lookup, so a
+/// create or a pool's environment write requiring an environment that a
+/// release registered before releases recorded their binding is bound to
+/// by its manifest still finds it; see
+/// [`find_bound_release_or_unbound_digest`]. Prefetch doesn't: the
+/// environment-less passes warm unbound releases, and an unbound release
+/// whose build lands in another partition would be probed again on every
+/// tick.
+async fn find_pull_release<F, Fut>(
+    trigger: PullTrigger,
+    environment: Option<EnvironmentReference>,
+    req_hash: &str,
+    lookup: F,
+) -> Result<ResolvedRelease, FindReleaseError>
+where
+    F: Fn(Option<EnvironmentReference>) -> Fut,
+    Fut: std::future::Future<Output = Result<ResolvedRelease, FindReleaseError>>,
+{
+    if trigger.is_prefetch() {
+        lookup(environment).await
+    } else {
+        find_bound_release_or_unbound_digest(environment, req_hash, lookup).await
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FindReleaseError {
     #[error("template release not found")]
     NotFound,
     #[error("cluster metadata service is unavailable")]
     Unavailable,
+    /// The cluster didn't apply the lookup's environment selector, as one
+    /// that predates it doesn't, and the lookup doesn't take such an answer.
+    /// `org_specific` keeps the answer's visibility verdict, which doesn't
+    /// depend on the selector: prefetch flushes the template's pins on it.
+    #[error("cluster didn't apply the environment selector")]
+    SelectorIgnored { org_specific: bool },
     #[error("cluster metadata service returned an invalid release")]
     InvalidResponse,
+    /// The release served to a lookup naming an environment reports a
+    /// binding that doesn't parse: an invalid response, as with
+    /// `InvalidResponse`, except that `org_specific` keeps the answer's
+    /// visibility verdict, which doesn't depend on the binding. Prefetch
+    /// flushes the template's pins on it, as the latest-N pass does for a
+    /// malformed entry (`latest_releases_from`).
+    #[error("cluster metadata service returned an invalid release binding")]
+    InvalidBinding { org_specific: bool },
     #[error("cluster metadata lookup failed: {0}")]
     Status(#[source] Status),
 }
@@ -1277,6 +1551,9 @@ pub(crate) struct ResolvedRelease {
     pub(crate) hash: String,
     pub(crate) storage_uris: Vec<String>,
     pub(crate) visibility: TemplateVisibility,
+    /// The environment the cluster reports the release bound to; `None` for
+    /// an unbound release and from clusters that predate twins.
+    pub(crate) environment: Option<EnvironmentReference>,
 }
 
 pub(crate) async fn find_release_inner(
@@ -1302,17 +1579,134 @@ pub(crate) async fn find_release_in_scope(
     caller_org: Option<OrgId>,
     scope: Option<TemplateLookupScope>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
-    find_release_with_requirement(name, req_hash, req_tag, caller_org, false, scope).await
+    find_release_in_environment(name, req_hash, req_tag, caller_org, scope, None).await
 }
 
-async fn find_release_with_requirement(
+/// [`find_release_in_scope`] of the release bound to `environment`, a twin
+/// or the release itself, when one is named; see
+/// [`find_bound_release_or_unbound_digest`].
+pub(crate) async fn find_release_in_environment(
     name: &str,
     req_hash: &str,
     req_tag: &str,
     caller_org: Option<OrgId>,
+    scope: Option<TemplateLookupScope>,
+    environment: Option<EnvironmentReference>,
+) -> Result<ResolvedRelease, FindReleaseError> {
+    find_bound_release_or_unbound_digest(environment, req_hash, |environment| {
+        find_release_with_requirement(
+            ReleaseLookup {
+                name,
+                req_hash,
+                req_tag,
+                environment,
+            },
+            caller_org,
+            false,
+            scope,
+        )
+    })
+    .await
+}
+
+/// `lookup` of the release bound to `environment`. When the cluster doesn't
+/// apply the selector (`SelectorIgnored`), as one that predates twins
+/// doesn't, its answer isn't used: the lookup asks again without one, by
+/// digest or tag, and takes that answer only if its release is unbound, so
+/// the pull's partition check decides as it did before twins, or bound to the
+/// environment. One bound elsewhere isn't the environment's, so it's
+/// `NotFound`.
+///
+/// Otherwise it falls back, for a digest
+/// the cluster has no release bound there for, to that digest's unbound
+/// release. The cluster's selector matches an unbound release only for an
+/// environment cached in the legacy partition, but an unbound release's build
+/// can still be bound to another one by its own manifest, as a release
+/// registered before releases recorded their binding is: its holders report
+/// that environment, so a lookup requiring it names it. The fallback's
+/// release is served with no binding, so the pull's partition check decides, as it did before twins: a build that
+/// lands in the environment's partition is pulled there, and any other is
+/// `NotFound`. A release bound to another environment isn't the
+/// environment's, so it stays `NotFound`.
+///
+/// A twin bound to the environment with no storage location falls back the
+/// same way, since such an original may hold the only copy of the build. The
+/// twin stays the answer unless the fallback finds an unbound release that
+/// has a location: a node holding the twin's build still takes it from its
+/// cache, which the pull checks by partition, not by the served release.
+///
+/// `lookup` is a plain closure returning a future rather than an async
+/// closure: the gRPC handler's future must be `Send`, which the compiler
+/// can't yet prove through an async closure's higher-ranked future.
+async fn find_bound_release_or_unbound_digest<F, Fut>(
+    environment: Option<EnvironmentReference>,
+    req_hash: &str,
+    lookup: F,
+) -> Result<ResolvedRelease, FindReleaseError>
+where
+    F: Fn(Option<EnvironmentReference>) -> Fut,
+    Fut: std::future::Future<Output = Result<ResolvedRelease, FindReleaseError>>,
+{
+    let found = lookup(environment).await;
+    let Some(requested) = environment else {
+        return found;
+    };
+    if let Err(FindReleaseError::SelectorIgnored { .. }) = found {
+        let release = lookup(None).await?;
+        return match release.environment {
+            Some(bound) if bound != requested => Err(FindReleaseError::NotFound),
+            _ => Ok(release),
+        };
+    }
+    if req_hash.is_empty() {
+        return found;
+    }
+    match found {
+        Err(FindReleaseError::NotFound) => {}
+        // `twin` is moved into the arm, and the `if` guard only borrows it,
+        // so a location-less twin can still be returned below by value.
+        Ok(twin) if twin.environment.is_some() && twin.storage_uris.is_empty() => {
+            return match lookup(None).await {
+                Ok(original)
+                    if original.environment.is_none() && !original.storage_uris.is_empty() =>
+                {
+                    Ok(original)
+                }
+                _ => Ok(twin),
+            };
+        }
+        found => return found,
+    }
+    let release = lookup(None).await?;
+    if release.environment.is_some() {
+        return Err(FindReleaseError::NotFound);
+    }
+    Ok(release)
+}
+
+/// What a cluster release lookup selects: a release by digest or tag and,
+/// optionally, the one of its hash bound to an environment.
+#[derive(Clone, Copy)]
+struct ReleaseLookup<'a> {
+    name: &'a str,
+    req_hash: &'a str,
+    req_tag: &'a str,
+    environment: Option<EnvironmentReference>,
+}
+
+async fn find_release_with_requirement(
+    lookup: ReleaseLookup<'_>,
+    caller_org: Option<OrgId>,
     generic_only: bool,
     scope: Option<TemplateLookupScope>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
+    let ReleaseLookup {
+        name,
+        req_hash,
+        req_tag,
+        environment,
+        ..
+    } = lookup;
     let mut client = connect_cluster_api_from_env().await.map_err(|error| {
         warn!(error = %error, "cluster api connect failed");
         FindReleaseError::Unavailable
@@ -1328,7 +1722,7 @@ async fn find_release_with_requirement(
     let resp = if !req_hash.is_empty() {
         let hash = req_hash.to_string();
         let mut request = tonic::Request::new(FindTemplateReleaseByHashRequest {
-            environment: None,
+            environment: environment.map(|environment| environment.to_string()),
             generic_only,
             caller_org_id: caller_org.map(|org| org.to_string()),
             template_name: name.to_string(),
@@ -1360,7 +1754,7 @@ async fn find_release_with_requirement(
     } else {
         let tag = lookup_tag(req_tag);
         let mut request = tonic::Request::new(FindTemplateReleaseRequest {
-            environment: None,
+            environment: environment.map(|environment| environment.to_string()),
             generic_only,
             caller_org_id: caller_org.map(|org| org.to_string()),
             template_name: name.to_string(),
@@ -1389,16 +1783,21 @@ async fn find_release_with_requirement(
             .map_err(FindReleaseError::Status)?;
     }
     let resp = resp.into_inner();
-    parse_release_response(name, req_hash, caller_org, generic_only, resp)
+    parse_release_response(lookup, caller_org, generic_only, resp)
 }
 
 fn parse_release_response(
-    name: &str,
-    req_hash: &str,
+    lookup: ReleaseLookup<'_>,
     caller_org: Option<OrgId>,
     generic_only: bool,
     resp: pplx_space_node_api_client::proto::FindTemplateReleaseResponse,
 ) -> Result<ResolvedRelease, FindReleaseError> {
+    let ReleaseLookup {
+        name,
+        req_hash,
+        environment: requested_environment,
+        ..
+    } = lookup;
     // Read the enum accessor before destructuring `resp.release` — taking
     // the release out of the struct is a partial move, after which `resp`
     // can no longer be borrowed as a whole.
@@ -1408,6 +1807,7 @@ fn parse_release_response(
         return Err(FindReleaseError::InvalidResponse);
     }
     let visibility = resp.template_visibility();
+    let selector_applied = resp.environment_applied;
     let release = match resp.release {
         Some(r) => r,
         None => {
@@ -1425,6 +1825,57 @@ fn parse_release_response(
     {
         return Err(FindReleaseError::InvalidResponse);
     }
+    // The reported binding, read only where it's trusted. One that doesn't
+    // parse is an invalid response: an environment-less lookup can't tell it
+    // from no binding, and the digest fallback
+    // (`find_bound_release_or_unbound_digest`) takes only an unbound release.
+    // The closure borrows `release` and the borrow ends at its last call.
+    let reported = || {
+        release
+            .environment
+            .as_deref()
+            .map(str::parse::<EnvironmentReference>)
+            .transpose()
+            .map_err(|_| FindReleaseError::InvalidResponse)
+    };
+    let environment = match requested_environment {
+        // A lookup naming an environment can use only a release bound to it.
+        Some(_) if selector_applied => {
+            let environment = reported().map_err(|_| FindReleaseError::InvalidBinding {
+                org_specific: visibility == TemplateVisibility::OrgSpecific,
+            })?;
+            if !serves_requested_environment(requested_environment, environment) {
+                debug!(
+                    template = name,
+                    hash = %release.hash,
+                    requested = ?requested_environment,
+                    served = ?environment,
+                    "cluster served no release bound to the requested environment"
+                );
+                return Err(FindReleaseError::NotFound);
+            }
+            environment
+        }
+        // The cluster ignored the selector, as one that predates twins does,
+        // so nothing in its answer is used, storage locations included: it
+        // may be another environment's release. Prefetch reads this as
+        // unknown, never "nothing is bound there", so it warms nothing and,
+        // unless the answer says the template is org-specific, holds the
+        // lookup's pins for the grace period (`ENVIRONMENT_PIN_GRACE`) before
+        // they age out; an on-demand pull asks again without a selector
+        // (`find_bound_release_or_unbound_digest`).
+        Some(_) => {
+            debug!(
+                template = name,
+                requested = ?requested_environment,
+                "cluster didn't apply the environment selector"
+            );
+            return Err(FindReleaseError::SelectorIgnored {
+                org_specific: visibility == TemplateVisibility::OrgSpecific,
+            });
+        }
+        None => reported()?,
+    };
     let storage_uris: Vec<String> = resp
         .storage_locations
         .into_iter()
@@ -1442,6 +1893,7 @@ fn parse_release_response(
         hash: hash.to_string(),
         storage_uris,
         visibility,
+        environment,
     })
 }
 
@@ -1521,8 +1973,7 @@ fn finish_pull_failures(classified: PullFailure, downstream_status: Option<Statu
 
 async fn do_pull(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    name: &str,
-    content_hash: &str,
+    pull: ResolvedPull<'_>,
     storage_uris: &[String],
     base_tags: &[String],
     background_worker: Option<
@@ -1532,6 +1983,9 @@ async fn do_pull(
     >,
     backing_policy: RootfsBackingPolicy,
 ) -> Result<PullWrite, PullError> {
+    let ResolvedPull {
+        name, content_hash, ..
+    } = pull;
     // Validate name + hash once — both are URI-independent.
     pplx_space_template_model::TemplateName::parse(name.to_string()).map_err(|err| {
         warn!(error = %err, name, "invalid template name; volume pull skipped");
@@ -1568,79 +2022,105 @@ async fn do_pull(
         return Err(PullError::Failure(PullFailure::NoStorageLocations));
     }
 
-    // Iterate every parseable storage_location so replication / failover
-    // entries get a real chance. A failure on URI[0] falls through to URI[1],
-    // except for admission rejection and hash mismatch. HashMismatch is fatal
-    // because it means the cluster metadata disagrees with content-addressed
-    // bytes; trying further URIs would mask that corruption.
-    let mut tried_any = false;
-    let mut last_failure = PullFailure::NoUsableStorageLocations;
-    let mut last_downstream_status = None;
     let cleanup = PullCleanupSlot::default();
-    let result = async {
-        for uri in storage_uris {
-            // A failed attempt's build dir must be gone before the next one
-            // starts: a pull refuses a build dir that exists when it starts.
-            cleanup.finish().await;
-            let parts = match StorageUri::parse(uri) {
-                Ok(p) => p,
-                Err(err) => {
-                    warn!(uri = %uri, error = %err, "skipping unusable storage_location");
-                    continue;
-                }
-            };
-            tried_any = true;
-            match try_pull_from(
-                Arc::clone(&db),
-                name,
-                content_hash,
+    // `move` copies the references (and `pull`, which is `Copy`) into the
+    // closure, so each attempt's future owns what it borrows rather than
+    // borrowing from the closure, which an `FnMut` can't lend out.
+    let (db, cleanup_slot) = (&db, &cleanup);
+    let result = pull_from_locations(storage_uris, &cleanup, move |parts| {
+        let db = Arc::clone(db);
+        async move {
+            try_pull_from(
+                db,
+                pull,
                 &parts,
                 base_tags,
                 background_worker,
                 backing_policy,
-                &cleanup,
+                cleanup_slot,
             )
             .await
-            {
-                Ok(written) => return Ok(written),
-                Err(PullError::HashMismatch { expected, actual }) => {
-                    return Err(PullError::HashMismatch { expected, actual });
-                }
-                Err(error @ PullError::Retryable(_)) => return Err(error),
-                Err(PullError::Failed(status)) => {
-                    warn!(
-                        uri = %uri,
-                        error = %status,
-                        "pull from storage_location returned a permanent status; trying next location",
-                    );
-                    last_downstream_status = Some(status);
-                }
-                Err(PullError::Failure(failure)) => {
-                    last_failure = prefer_retryable_failure(last_failure, failure);
-                    warn!(
-                        uri = %uri,
-                        reason = failure.metric_reason(),
-                        error = %failure,
-                        "pull from storage_location failed; trying next location",
-                    );
-                }
-            }
         }
-
-        if !tried_any {
-            warn!(
-                ?storage_uris,
-                "no usable storage_location; skipping object-store pull"
-            );
-        }
-        Err(finish_pull_failures(last_failure, last_downstream_status))
-    }
+    })
     .await;
     // On every exit, including an early one: the owner releases the digest
     // when this returns, and a retry that takes it must not meet the failed
     // attempt's dir mid-delete.
     cleanup.finish().await;
     result
+}
+
+/// Pull from each parseable storage location in turn, with `attempt`, until
+/// one succeeds or a failure ends the pull.
+///
+/// Iterate every parseable storage_location so replication / failover
+/// entries get a real chance. A failure on URI[0] falls through to URI[1],
+/// except for hash mismatch, a retryable failure, and a cache partition held
+/// by another environment's build. HashMismatch is fatal because it means the
+/// cluster metadata disagrees with content-addressed bytes; trying further
+/// URIs would mask that corruption. The held partition is a local conflict:
+/// every location's copy of the digest lands in the same partition, so a
+/// later location can only fail differently, and would hide the conflict
+/// behind its own failure (a missing manifest's `NotFound`, say).
+async fn pull_from_locations<Attempt>(
+    storage_uris: &[String],
+    cleanup: &PullCleanupSlot,
+    mut attempt: impl FnMut(StorageUri) -> Attempt,
+) -> Result<PullWrite, PullError>
+where
+    Attempt: Future<Output = Result<PullWrite, PullError>>,
+{
+    let mut tried_any = false;
+    let mut last_failure = PullFailure::NoUsableStorageLocations;
+    let mut last_downstream_status = None;
+    for uri in storage_uris {
+        // A failed attempt's build dir must be gone before the next one
+        // starts: a pull refuses a build dir that exists when it starts.
+        cleanup.finish().await;
+        let parts = match StorageUri::parse(uri) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(uri = %uri, error = %err, "skipping unusable storage_location");
+                continue;
+            }
+        };
+        tried_any = true;
+        match attempt(parts).await {
+            Ok(written) => return Ok(written),
+            Err(PullError::HashMismatch { expected, actual }) => {
+                return Err(PullError::HashMismatch { expected, actual });
+            }
+            Err(error @ PullError::Retryable(_)) => return Err(error),
+            Err(error @ PullError::Failure(PullFailure::PartitionHeldByAnotherEnvironment)) => {
+                return Err(error);
+            }
+            Err(PullError::Failed(status)) => {
+                warn!(
+                    uri = %uri,
+                    error = %status,
+                    "pull from storage_location returned a permanent status; trying next location",
+                );
+                last_downstream_status = Some(status);
+            }
+            Err(PullError::Failure(failure)) => {
+                last_failure = prefer_retryable_failure(last_failure, failure);
+                warn!(
+                    uri = %uri,
+                    reason = failure.metric_reason(),
+                    error = %failure,
+                    "pull from storage_location failed; trying next location",
+                );
+            }
+        }
+    }
+
+    if !tried_any {
+        warn!(
+            ?storage_uris,
+            "no usable storage_location; skipping object-store pull"
+        );
+    }
+    Err(finish_pull_failures(last_failure, last_downstream_status))
 }
 
 /// Cache partition of the environment a build is bound to; see
@@ -1663,10 +2143,15 @@ async fn probe_release_partition(
     client: &VolmgrClient,
     subject: &SubjectId,
     parts: &StorageUri,
-    name: &str,
-    content_hash: &str,
+    pull: ResolvedPull<'_>,
     base_tags: &[String],
 ) -> Result<ProbedRelease, PullError> {
+    let ResolvedPull {
+        name,
+        content_hash,
+        environment,
+        served_environment,
+    } = pull;
     let probe_dir = PathBuf::from(format!(
         "{TEMPLATE_DIR}/{name}/{}",
         partition_probe_dir_name(content_hash, uuid::Uuid::now_v7())
@@ -1714,7 +2199,60 @@ async fn probe_release_partition(
         })
     };
     let manifest_bytes = read(&manifest_path).await?;
-    let metadata_bytes = read(&metadata_path).await?;
+    let mut metadata_bytes = read(&metadata_path).await?;
+    // The partition, the twin check and a partition miss all read the shared
+    // files leniently, so refuse them here as the full pull would, before
+    // any of them can answer for a corrupt release.
+    read_shared_documents(&manifest_bytes, &metadata_bytes).map_err(|failure| {
+        warn!(
+            template = name,
+            content_hash,
+            reason = failure.metric_reason(),
+            "partition probe found unreadable or inconsistent shared files"
+        );
+        PullError::Failure(failure)
+    })?;
+    // A release served bound to an environment whose shared files bind it
+    // elsewhere is that environment's twin: it shares its original's
+    // hash-addressed manifest and `metadata.json`, and carries its own
+    // metadata under `environments/<environment>/metadata.json`. Only then is
+    // that key read, so a release without one is never asked for it: object
+    // storage can answer a missing key with AccessDenied rather than
+    // NotFound. The local manifest takes the twin's binding, which the rest
+    // of the pull and the build's row record; the file digests, and so the
+    // content hash, are untouched.
+    let manifest_bytes = match served_environment {
+        Some(served) if is_twin_of_shared_files(&manifest_bytes, &metadata_bytes, served) => {
+            let twin_metadata_path = probe_dir.join("environment-metadata.json");
+            let pulled = pull_one(
+                client.clone(),
+                subject,
+                build_object_uri(
+                    parts,
+                    &pplx_space_artifact_model::template_environment_metadata_relative_key(served),
+                ),
+                twin_metadata_path.display().to_string(),
+                PullOptions::control("metadata"),
+                base_tags,
+            )
+            .await?;
+            crate::metrics::pull_s3_bytes(base_tags, Some(&parts.region), pulled);
+            let twin_metadata = read(&twin_metadata_path).await?;
+            let bound = bind_manifest_to_metadata(&manifest_bytes, &metadata_bytes, &twin_metadata)
+                .map_err(|failure| {
+                warn!(
+                    template = name,
+                    content_hash,
+                    reason = failure.metric_reason(),
+                    "a twin's metadata doesn't bind an environment that can cold-boot its shared build"
+                );
+                PullError::Failure(failure)
+            })?;
+            metadata_bytes = twin_metadata;
+            bound
+        }
+        _ => manifest_bytes,
+    };
     let partition = release_partition(&manifest_bytes, &metadata_bytes).map_err(|failure| {
         warn!(
             template = name,
@@ -1724,11 +2262,212 @@ async fn probe_release_partition(
         );
         PullError::Failure(failure)
     })?;
+    // A lookup that named an environment has to land in its partition, or
+    // the build would go where nothing asked for it. A release the cluster
+    // reported bound to the environment that lands elsewhere is inconsistent
+    // metadata; one it reported with no environment just isn't the release
+    // bound there, as when a cluster API that predates twins answers with
+    // the original, so the lookup finds nothing.
+    if let Some(expected) = pull.partition()
+        && partition != expected
+    {
+        warn!(
+            template = name,
+            content_hash,
+            requested = ?environment,
+            served = ?served_environment,
+            cache_partition = %partition,
+            "release metadata binds another environment than the lookup asked for"
+        );
+        return Err(PullError::Failure(if served_environment.is_some() {
+            PullFailure::ExecutionMetadataInvalid
+        } else {
+            PullFailure::ClusterMetadataMissing
+        }));
+    }
     Ok(ProbedRelease {
         partition,
         manifest: manifest_bytes,
         metadata: metadata_bytes,
     })
+}
+
+/// A release's shared `manifest.json` and `metadata.json`, read as the
+/// full pull reads them (`service::validate_guest_documents` and
+/// `service::normalize_template_manifest`).
+struct SharedDocuments {
+    manifest: pplx_space_template_manifest::TemplateManifest,
+    metadata: pplx_space_template_manifest::TemplateMetadata,
+    manifest_execution: Option<pplx_space_execution_spec::ExecutionMetadata>,
+    metadata_execution: Option<pplx_space_execution_spec::ExecutionMetadata>,
+}
+
+/// Reads a release's shared files, refusing them as the full pull would: a
+/// manifest that doesn't parse or whose execution fails its schema is
+/// `ManifestMalformed`. Metadata that doesn't parse, whose execution fails
+/// its schema, that disagrees with the manifest on the execution, or that
+/// fails the original's guest-document checks
+/// (`service::validate_guest_documents`, and no metadata guest image) is
+/// `ExecutionMetadataInvalid`, whether or not the manifest is bound. Empty
+/// metadata is no metadata, as the full pull and startup recovery read it.
+/// The partition probe runs it before anything reads the files leniently,
+/// so a corrupt release never answers as a partition miss, and a twin's
+/// rebind runs it before replacing both documents' executions would hide
+/// a fault. The executions are cloned, so the result owns everything and
+/// borrows nothing from the caller's bytes.
+fn read_shared_documents(
+    manifest_bytes: &[u8],
+    metadata_bytes: &[u8],
+) -> Result<SharedDocuments, PullFailure> {
+    use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
+    let manifest: TemplateManifest =
+        serde_json::from_slice(manifest_bytes).map_err(|_| PullFailure::ManifestMalformed)?;
+    let metadata: TemplateMetadata = if metadata_bytes.is_empty() {
+        TemplateMetadata::default()
+    } else {
+        serde_json::from_slice(metadata_bytes).map_err(|_| PullFailure::ExecutionMetadataInvalid)?
+    };
+    let manifest_execution = manifest
+        .execution_metadata()
+        .map_err(|_| PullFailure::ManifestMalformed)?
+        .cloned();
+    let metadata_execution = metadata
+        .execution_metadata()
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?
+        .cloned();
+    if let (Some(manifest_execution), Some(metadata_execution)) =
+        (&manifest_execution, &metadata_execution)
+        && manifest_execution != metadata_execution
+    {
+        return Err(PullFailure::ExecutionMetadataInvalid);
+    }
+    // The guest contracts, refused exactly as the original's own pull
+    // (`try_pull_from`) refuses them, so a twin's rebind, which replaces both
+    // documents' guest contract, can't hide a difference and materialize a
+    // twin of a release whose own pull fails.
+    crate::service::validate_guest_documents(metadata_bytes, manifest_bytes)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    if metadata.guest_image.is_some() {
+        return Err(PullFailure::ExecutionMetadataInvalid);
+    }
+    Ok(SharedDocuments {
+        manifest,
+        metadata,
+        manifest_execution,
+        metadata_execution,
+    })
+}
+
+/// Whether a release the cluster served bound to `served` is a twin of the
+/// build whose shared `manifest.json` and `metadata.json` these are: their
+/// binding doesn't land in `served`'s partition. An original bound there, or
+/// an unbound release the initial environment's partition holds, isn't, and
+/// neither are shared files that don't parse: the pull refuses those as
+/// malformed rather than reading an environment key that may not exist.
+fn is_twin_of_shared_files(
+    manifest_bytes: &[u8],
+    metadata_bytes: &[u8],
+    served: EnvironmentReference,
+) -> bool {
+    release_partition(manifest_bytes, metadata_bytes).is_ok_and(|partition| {
+        partition != pplx_space_node_runtime_core::catalog::template_cache_partition(Some(served))
+    })
+}
+
+/// A twin's local manifest: the shared manifest's artifacts, with the twin
+/// metadata's execution and guest image. The shared files stay as
+/// published, and the rebind happens only in the build this node writes.
+///
+/// A twin boots its original's rootfs under another environment, so that
+/// environment must take the shared build as a cold-boot source, as a create
+/// selecting it checks: the twin's environment comes from the node catalog,
+/// its definition checks the twin's execution, and then the shared build's
+/// own execution as the source (the manifest's, else the shared metadata's,
+/// else, for an unbound build, the initial environment's for the
+/// architecture the build's row records, as the catalog reads unbound
+/// metadata, which is also what an unbound execution with no boot
+/// components the catalog reads as initial stands for). Unreadable shared
+/// metadata fails closed. A twin metadata with
+/// no binding, one naming an environment the catalog doesn't know or not
+/// matching its definition, or one whose environment can't cold-boot the
+/// shared build is `ExecutionMetadataInvalid`.
+fn bind_manifest_to_metadata(
+    manifest_bytes: &[u8],
+    shared_metadata_bytes: &[u8],
+    twin_metadata_bytes: &[u8],
+) -> Result<Vec<u8>, PullFailure> {
+    use pplx_space_execution_catalog::catalog::CompiledEnvironment;
+    use pplx_space_template_manifest::TemplateMetadata;
+    let SharedDocuments {
+        mut manifest,
+        metadata: shared,
+        manifest_execution,
+        metadata_execution: shared_execution,
+    } = read_shared_documents(manifest_bytes, shared_metadata_bytes)?;
+    let twin: TemplateMetadata = serde_json::from_slice(twin_metadata_bytes)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    let execution = twin
+        .execution_metadata()
+        .ok()
+        .flatten()
+        .filter(|execution| execution.environment().is_some())
+        .ok_or(PullFailure::ExecutionMetadataInvalid)?
+        .clone();
+    let source = match manifest_execution.or(shared_execution) {
+        Some(execution) => execution,
+        None => {
+            let architecture = crate::service::template_arch(&shared, &manifest)
+                .parse::<pplx_space_cpu_arch::Arch>()
+                .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+            CompiledEnvironment::cached_for_architecture(architecture)
+                .map_err(|_| PullFailure::ExecutionMetadataInvalid)?
+                .iter()
+                .find(|entry| entry.is_initial())
+                .ok_or(PullFailure::ExecutionMetadataInvalid)?
+                .definition()
+                .execution_requirements()
+                .map_err(|_| PullFailure::ExecutionMetadataInvalid)?
+        }
+    };
+    let source = cold_boot_source_requirements(source)?;
+    let catalog = CompiledEnvironment::cached_for_architecture(execution.guest().architecture)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    let definition = CompiledEnvironment::of_execution(catalog, &execution)
+        .ok_or(PullFailure::ExecutionMetadataInvalid)?
+        .definition();
+    definition
+        .check_execution(&execution)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    definition
+        .check_cold_boot_source(&source)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    manifest.set_execution_metadata(execution);
+    manifest.set_guest_image(twin.guest_image);
+    serde_json::to_vec(&manifest).map_err(|_| PullFailure::ManifestMalformed)
+}
+
+/// The execution a twin's environment checks as its cold-boot source. An
+/// unbound one the node catalog reads as the initial environment's, as a
+/// build from a template without execution metadata records (its runtime
+/// and guest, no boot components), stands for that environment's full
+/// requirements, as an absent one does: compared as is, its missing
+/// components would refuse every twin of it.
+fn cold_boot_source_requirements(
+    source: pplx_space_execution_spec::ExecutionMetadata,
+) -> Result<pplx_space_execution_spec::ExecutionMetadata, PullFailure> {
+    use pplx_space_execution_catalog::catalog::CompiledEnvironment;
+    if source.environment().is_some() {
+        return Ok(source);
+    }
+    let catalog = CompiledEnvironment::cached_for_architecture(source.guest().architecture)
+        .map_err(|_| PullFailure::ExecutionMetadataInvalid)?;
+    match CompiledEnvironment::of_execution(catalog, &source) {
+        Some(entry) if entry.is_initial() => entry
+            .definition()
+            .execution_requirements()
+            .map_err(|_| PullFailure::ExecutionMetadataInvalid),
+        _ => Ok(source),
+    }
 }
 
 /// Cache partition of a release from its manifest and metadata bytes. The
@@ -1779,14 +2518,9 @@ impl Drop for ProbeDirGuard {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one storage location's attempt: the pull's inputs plus its cleanup slot"
-)]
 async fn try_pull_from(
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    name: &str,
-    content_hash: &str,
+    pull: ResolvedPull<'_>,
     parts: &StorageUri,
     base_tags: &[String],
     background_worker: Option<
@@ -1797,6 +2531,9 @@ async fn try_pull_from(
     backing_policy: RootfsBackingPolicy,
     cleanup: &PullCleanupSlot,
 ) -> Result<PullWrite, PullError> {
+    let ResolvedPull {
+        name, content_hash, ..
+    } = pull;
     // Parse the template name into the typed identity that becomes the
     // SubjectId we hand to volume-manager. This is also the *only* boundary
     // parse we need on the local-input side; credmgr-side identity (AWS STS
@@ -1854,7 +2591,7 @@ async fn try_pull_from(
         partition,
         manifest: probed_manifest,
         metadata: probed_metadata,
-    } = probe_release_partition(&client, &subject, parts, name, content_hash, base_tags).await?;
+    } = probe_release_partition(&client, &subject, parts, pull, base_tags).await?;
     let digest_dir = pplx_space_artifact_model::template_build_dir(name, content_hash, partition);
     match probed_partition_action(&db, Path::new(TEMPLATE_DIR), name, content_hash, partition)? {
         ProbedPartition::Present => {
@@ -1865,6 +2602,19 @@ async fn try_pull_from(
                 "the release's build is already in its cache partition; no pull needed"
             );
             return Ok(PullWrite::AlreadyPresent);
+        }
+        ProbedPartition::HeldByAnotherEnvironment(bound) => {
+            warn!(
+                template = name,
+                content_hash,
+                cache_partition = %partition,
+                bound_partition = %bound,
+                dir = %digest_dir,
+                "the release's cache partition holds the digest's build bound to another partition; keeping it"
+            );
+            return Err(PullError::Failure(
+                PullFailure::PartitionHeldByAnotherEnvironment,
+            ));
         }
         ProbedPartition::Refuse(refusal) => {
             warn!(
@@ -3209,11 +3959,21 @@ enum PullWrite {
 /// What a pull does once it has probed the partition its release lands in.
 #[derive(Debug, PartialEq, Eq)]
 enum ProbedPartition {
-    /// The partition has a row of the digest: the release's build is on the
-    /// node already. A pull that required a partition gets here past the
-    /// owner's fast path when that build isn't bound to the required one;
-    /// the caller's own lookup then decides.
+    /// The partition has a row of the digest bound to it: the release's
+    /// build is on the node already. A pull that required another partition
+    /// gets here past the owner's fast path; the caller's own lookup then
+    /// decides.
     Present,
+    /// The partition has a row of the digest bound to the carried partition
+    /// instead. Only the legacy partition holds one: startup recovery adopts
+    /// a pre-partition build bound to another environment in place. (A row
+    /// of another partition whose stored metadata doesn't parse reads as
+    /// unbound, so it lands here bound to the legacy partition.) Its dir
+    /// is the one the release would land in, so the release's build can't be
+    /// written there, and the row isn't the release's build either, as a
+    /// lookup of the release's partition skips it. The pull fails rather
+    /// than report a hit that lookup can't find, and keeps the adopted build.
+    HeldByAnotherEnvironment(TemplateCachePartition),
     /// The partition has the digest's build dir but no row
     /// ([`probed_partition_refusal`]); the pull refuses retryably.
     Refuse(String),
@@ -3233,7 +3993,7 @@ fn probed_partition_action(
     content_hash: &str,
     partition: TemplateCachePartition,
 ) -> Result<ProbedPartition, PullError> {
-    let present = db
+    let row = db
         .lock()
         .map_err(|_| "template DB mutex poisoned".to_string())
         .and_then(|conn| {
@@ -3243,10 +4003,16 @@ fn probed_partition_action(
         .map_err(|error| {
             warn!(template = name, content_hash, %error, "checking the release's partition failed");
             PullError::Failure(PullFailure::LocalDatabaseUnavailable)
-        })?
-        .is_some();
-    if present {
-        return Ok(ProbedPartition::Present);
+        })?;
+    if let Some(row) = row {
+        // A row counts as the release's build only when it's bound to the
+        // partition, as the caller's lookup reads it.
+        let bound = row.bound_partition();
+        return Ok(if bound == partition {
+            ProbedPartition::Present
+        } else {
+            ProbedPartition::HeldByAnotherEnvironment(bound)
+        });
     }
     Ok(
         match probed_partition_refusal(template_root, name, content_hash, partition) {
@@ -3283,9 +4049,21 @@ pub(crate) enum TagResolveOutcome {
         /// the release. The prefetch loop only warms `Generic`
         /// templates; see the visibility gate in `prefetch::tick`.
         visibility: TemplateVisibility,
+        /// The environment the cluster reports the release bound to;
+        /// `None` for an unbound release.
+        environment: Option<EnvironmentReference>,
     },
     Unresolved,
     Error,
+    /// The cluster didn't apply the environment selector: what's bound to
+    /// the environment is unknown. `org_specific` keeps the answer's
+    /// visibility verdict, which doesn't depend on the selector.
+    SelectorIgnored {
+        org_specific: bool,
+    },
+    /// The answer's release can't be used, as its binding doesn't parse,
+    /// but its visibility verdict says the template is org-specific.
+    InvalidOrgSpecific,
 }
 
 /// Resolve `(template_name, tag) → artifact_digest` via
@@ -3300,15 +4078,51 @@ pub(crate) enum TagResolveOutcome {
 /// double-counting under both `template.pull.find_release_ms` and the
 /// prefetch metric would muddy on-demand find-release latency.
 pub(crate) async fn resolve_tag(template_name: &str, tag: &str) -> TagResolveOutcome {
-    match find_release_inner(template_name, "", tag, None).await {
+    resolve_tag_in(template_name, tag, None).await
+}
+
+/// [`resolve_tag`] for the release of the tag's hash bound to `environment`,
+/// a twin or the tagged release itself. `Unresolved` when none is; `Error`
+/// from a cluster that didn't apply the selector, as one that predates twins
+/// doesn't.
+pub(crate) async fn resolve_tag_in(
+    template_name: &str,
+    tag: &str,
+    environment: Option<EnvironmentReference>,
+) -> TagResolveOutcome {
+    let lookup = ReleaseLookup {
+        name: template_name,
+        req_hash: "",
+        req_tag: tag,
+        environment,
+    };
+    tag_resolve_outcome(
+        find_release_with_requirement(lookup, None, false, Some(TemplateLookupScope::Cluster))
+            .await,
+    )
+}
+
+/// The [`TagResolveOutcome`] of a scoped tag lookup's answer.
+fn tag_resolve_outcome(found: Result<ResolvedRelease, FindReleaseError>) -> TagResolveOutcome {
+    match found {
         Ok(release) => TagResolveOutcome::Resolved {
             hash: release.hash,
             visibility: release.visibility,
+            environment: release.environment,
         },
         Err(FindReleaseError::NotFound) => TagResolveOutcome::Unresolved,
+        Err(FindReleaseError::SelectorIgnored { org_specific }) => {
+            TagResolveOutcome::SelectorIgnored { org_specific }
+        }
+        Err(FindReleaseError::InvalidBinding { org_specific: true }) => {
+            TagResolveOutcome::InvalidOrgSpecific
+        }
         Err(
             FindReleaseError::Unavailable
             | FindReleaseError::InvalidResponse
+            | FindReleaseError::InvalidBinding {
+                org_specific: false,
+            }
             | FindReleaseError::Status(_),
         ) => TagResolveOutcome::Error,
     }
@@ -3325,6 +4139,40 @@ pub(crate) struct LatestRelease {
     pub(crate) release_id: String,
     pub(crate) content_hash: String,
     pub(crate) created_at: String,
+    /// The environment the cluster reports the release bound to; `None`
+    /// for an unbound release.
+    pub(crate) environment: Option<EnvironmentReference>,
+}
+
+/// Whether a latest-releases entry, from a cluster that applied the
+/// selector, is one a lookup for `requested` can use; see
+/// [`serves_requested_environment`].
+fn latest_entry_serves(requested: Option<EnvironmentReference>, served: Option<&str>) -> bool {
+    match served.map(str::parse::<EnvironmentReference>).transpose() {
+        Ok(served) => serves_requested_environment(requested, served),
+        // A binding that doesn't parse names no environment a lookup asked for.
+        Err(_) => requested.is_none(),
+    }
+}
+
+/// Whether a release the cluster reports bound to `served`, having applied
+/// the selector, is one a lookup for `requested` can use: any, when the
+/// lookup named no environment; otherwise one bound to it, or an unbound one
+/// when the environment's builds are cached in the legacy partition, as the
+/// initial environment's are. That's the cluster's own selector rule: nodes
+/// keep an unbound build and one bound to the initial environment in the
+/// same partition. A release bound elsewhere isn't the one asked for.
+fn serves_requested_environment(
+    requested: Option<EnvironmentReference>,
+    served: Option<EnvironmentReference>,
+) -> bool {
+    requested.is_none_or(|requested| match served {
+        Some(served) => served == requested,
+        None => {
+            pplx_space_node_runtime_core::catalog::template_cache_partition(Some(requested))
+                == TemplateCachePartition::Legacy
+        }
+    })
 }
 
 pub(crate) enum LatestReleasesOutcome {
@@ -3347,6 +4195,12 @@ pub(crate) enum LatestReleasesOutcome {
     /// counted as `resolve_error` and skipped without touching the
     /// pin table for this template.
     Error,
+    /// The lookup named an environment and the cluster didn't apply the
+    /// selector (`environment_applied`), as one that predates twins doesn't:
+    /// what's bound there is unknown. `org_specific` keeps the answer's
+    /// visibility verdict, from the response or any entry, which doesn't
+    /// depend on the selector.
+    SelectorIgnored { org_specific: bool },
 }
 
 /// Fold two visibility reports for the *same* template into the most
@@ -3387,6 +4241,16 @@ pub(crate) fn combine_response_visibility(
 /// tick emits its own per-template counter and we don't want this
 /// path to skew on-demand find-release latency.
 pub(crate) async fn list_latest_releases(template_name: &str, limit: u32) -> LatestReleasesOutcome {
+    list_latest_releases_in(template_name, limit, None).await
+}
+
+/// [`list_latest_releases`] of the releases bound to `environment`; see
+/// [`latest_entry_serves`].
+pub(crate) async fn list_latest_releases_in(
+    template_name: &str,
+    limit: u32,
+    environment: Option<EnvironmentReference>,
+) -> LatestReleasesOutcome {
     let mut client = match connect_cluster_api_from_env().await {
         Ok(client) => client,
         Err(error) => {
@@ -3397,7 +4261,7 @@ pub(crate) async fn list_latest_releases(template_name: &str, limit: u32) -> Lat
 
     let resp = match client
         .list_latest_template_releases(ListLatestTemplateReleasesRequest {
-            environment: None,
+            environment: environment.map(|environment| environment.to_string()),
             template_name: template_name.to_string(),
             runtime: DEFAULT_RUNTIME.to_string(),
             limit,
@@ -3415,38 +4279,120 @@ pub(crate) async fn list_latest_releases(template_name: &str, limit: u32) -> Lat
             return LatestReleasesOutcome::Error;
         }
     };
+    latest_releases_from(template_name, environment, resp)
+}
 
-    let response_visibility = resp.template_visibility();
+/// What a `ListLatestTemplateReleases` answer says for `environment`. Each
+/// release's hash is its canonical `sha256:<hex>` spelling, which the pull
+/// stores its build under, so a pin and a cache check of a hash the cluster
+/// spelled bare still name that build. An entry with no release, or whose
+/// hash doesn't parse, is skipped. For a lookup naming an environment, such
+/// an entry, or one whose binding doesn't parse, makes the answer an `Error`,
+/// as a malformed answer is for a tag lookup: skipping it could leave a list
+/// read as nothing bound there, and prefetch would drop the pin of a release
+/// that is. An org-specific verdict, from the response or any entry, still
+/// stands over a malformed entry, with no releases.
+fn latest_releases_from(
+    template_name: &str,
+    environment: Option<EnvironmentReference>,
+    resp: pplx_space_node_api_client::proto::ListLatestTemplateReleasesResponse,
+) -> LatestReleasesOutcome {
+    // Folded over every entry before any is read, so an entry that ends
+    // the read early can't hide a later entry's org-specific verdict, and an
+    // ignored selector doesn't hide one either.
+    let visibility = combine_response_visibility(
+        resp.template_visibility(),
+        resp.entries
+            .iter()
+            .map(|entry| entry.template_visibility())
+            .reduce(fold_visibility),
+    );
+    // A cluster that didn't apply the selector, as one that predates twins
+    // doesn't, can list any release of each hash: its answer is unknown, not
+    // "nothing bound there".
+    if environment.is_some() && !resp.environment_applied {
+        debug!(
+            template = template_name,
+            requested = ?environment,
+            "ListLatestTemplateReleases didn't apply the environment selector",
+        );
+        return LatestReleasesOutcome::SelectorIgnored {
+            org_specific: visibility == TemplateVisibility::OrgSpecific,
+        };
+    }
+    // A malformed entry fails a lookup naming an environment, unless the
+    // answer is org-specific: that verdict needs no release, and prefetch
+    // flushes the template's pins on it.
+    let malformed = || {
+        if visibility == TemplateVisibility::OrgSpecific {
+            LatestReleasesOutcome::Resolved {
+                visibility,
+                releases: Vec::new(),
+            }
+        } else {
+            LatestReleasesOutcome::Error
+        }
+    };
     let mut releases = Vec::with_capacity(resp.entries.len());
-    let mut entry_fold: Option<TemplateVisibility> = None;
     for entry in resp.entries {
-        let entry_visibility = entry.template_visibility();
-        entry_fold = Some(match entry_fold {
-            Some(folded) => fold_visibility(folded, entry_visibility),
-            None => entry_visibility,
-        });
         let Some(release) = entry.release else {
             warn!(
                 template = template_name,
-                "ListLatestTemplateReleases entry missing release; skipping",
+                "ListLatestTemplateReleases entry missing release",
             );
+            if environment.is_some() {
+                return malformed();
+            }
             continue;
         };
-        if release.hash.is_empty() {
+        let Ok(content_hash) = release.hash.parse::<ContentHash>() else {
             warn!(
                 template = template_name,
-                "ListLatestTemplateReleases entry has empty hash; skipping",
+                hash = %release.hash,
+                "ListLatestTemplateReleases entry has no valid hash",
+            );
+            if environment.is_some() {
+                return malformed();
+            }
+            continue;
+        };
+        if environment.is_some()
+            && release
+                .environment
+                .as_deref()
+                .is_some_and(|served| served.parse::<EnvironmentReference>().is_err())
+        {
+            warn!(
+                template = template_name,
+                hash = %release.hash,
+                served = ?release.environment,
+                "ListLatestTemplateReleases entry has no valid environment binding",
+            );
+            return malformed();
+        }
+        if !latest_entry_serves(environment, release.environment.as_deref()) {
+            debug!(
+                template = template_name,
+                hash = %release.hash,
+                requested = ?environment,
+                served = ?release.environment,
+                "ListLatestTemplateReleases entry isn't bound to the requested environment; skipping",
             );
             continue;
         }
         releases.push(LatestRelease {
             release_id: release.id,
-            content_hash: release.hash,
+            content_hash: content_hash.to_string(),
             created_at: release.created_at,
+            // Checked to parse above when an environment was asked for.
+            environment: release
+                .environment
+                .as_deref()
+                .and_then(|served| served.parse().ok()),
         });
     }
     LatestReleasesOutcome::Resolved {
-        visibility: combine_response_visibility(response_visibility, entry_fold),
+        visibility,
         releases,
     }
 }

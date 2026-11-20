@@ -222,6 +222,12 @@ pub const NODE_GROUP_LABEL: &str = "node-restriction.kubernetes.io/space-node-gr
 const TEMPLATE_BUILD_LABEL_NAME_PREFIX: &str = "template-build";
 const TEMPLATE_BUILD_LABEL_KEY_PREFIX: &str = "space.pplx.net/template-build-";
 pub const TEMPLATE_WRITE_ANNOTATION_KEY: &str = "space.pplx.net/template-write";
+/// Node annotation key prefix requesting one exact template build in one
+/// environment's cache partition; see [`TemplateEnvironmentWrite`]. Outside the
+/// `template-write-*` prefix on purpose: a node-ctl that predates it ignores
+/// it rather than report every such request as a malformed template write.
+pub const TEMPLATE_ENVIRONMENT_WRITE_ANNOTATION_KEY: &str =
+    "space.pplx.net/template-environment-write";
 
 /// Environment variable used by Kubernetes DaemonSets to expose the node name
 /// via `spec.nodeName`.
@@ -1396,8 +1402,21 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
     // and this renderer has no cluster reads with which to tell the two cases
     // apart.
     let single_target_node = direct_node_name.is_some() || !required_source_node_names.is_empty();
+    // A pod that requires its environment prefers a node holding the build
+    // in that environment's partition: a release's twin shares its digest, so
+    // the partition-less label would also match a node holding only the
+    // original. Other pods take any partition's build, as before twins; a
+    // shadowed pod records its environment but places exactly as off.
     let preferred_template_label = if prefer_template_cache && !single_target_node {
-        content_hash.map(|content_hash| template_build_presence_label_key(template, content_hash))
+        content_hash.map(|content_hash| {
+            template_presence_label_key_for(
+                template,
+                content_hash,
+                environment
+                    .filter(|environment| environment.required)
+                    .map(|environment| environment.reference),
+            )
+        })
     } else {
         None
     };
@@ -1986,6 +2005,26 @@ pub fn template_partition_presence_label_key(
     )
 }
 
+/// The presence label saying a node holds the build a pod boots: with
+/// `required_environment`, the one bound to that environment, in its cache
+/// partition ([`template_partition_presence_label_key`]); otherwise the
+/// digest in any partition ([`template_build_presence_label_key`]). Pods
+/// prefer it, and the warm pool asks nodes lacking it to write that build.
+pub fn template_presence_label_key_for(
+    template: &str,
+    content_hash: &str,
+    required_environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+) -> String {
+    match required_environment {
+        Some(environment) => template_partition_presence_label_key(
+            template,
+            content_hash,
+            pplx_space_execution_catalog::catalog::template_cache_partition(Some(environment)),
+        ),
+        None => template_build_presence_label_key(template, content_hash),
+    }
+}
+
 pub fn is_template_presence_metadata_key(key: &str) -> bool {
     key.starts_with(TEMPLATE_BUILD_LABEL_KEY_PREFIX)
 }
@@ -2014,10 +2053,64 @@ pub fn is_template_write_annotation_key(key: &str) -> bool {
     // The `template-write-*` prefix is reserved for per-reference pull
     // requests. Do not add unrelated annotation keys under it: node-local
     // controllers will parse every matching annotation as a template write.
-    key == TEMPLATE_WRITE_ANNOTATION_KEY
-        || key
-            .strip_prefix(TEMPLATE_WRITE_ANNOTATION_KEY)
-            .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+    key == TEMPLATE_WRITE_ANNOTATION_KEY || has_keyed_suffix(key, TEMPLATE_WRITE_ANNOTATION_KEY)
+}
+
+/// A request that a node hold one exact template build bound to one
+/// environment, in that environment's cache partition: a twin of a release, or
+/// the release itself when it's bound there. Its annotation value is
+/// `<environment> <template>@<digest>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateEnvironmentWrite {
+    pub reference: TemplateReference,
+    pub environment: pplx_space_execution_spec::EnvironmentReference,
+}
+
+impl TemplateEnvironmentWrite {
+    /// `None` unless `reference` names an exact digest: the node asks
+    /// template-manager for that environment's build of the digest.
+    pub fn new(
+        reference: TemplateReference,
+        environment: pplx_space_execution_spec::EnvironmentReference,
+    ) -> Option<Self> {
+        reference.artifact_digest().is_some().then_some(Self {
+            reference,
+            environment,
+        })
+    }
+
+    pub fn annotation_key(&self) -> String {
+        format!(
+            "{TEMPLATE_ENVIRONMENT_WRITE_ANNOTATION_KEY}-{}",
+            digest_prefix(&self.annotation_value())
+        )
+    }
+
+    pub fn annotation_value(&self) -> String {
+        format!("{} {}", self.environment, self.reference)
+    }
+}
+
+pub fn is_template_environment_write_annotation_key(key: &str) -> bool {
+    has_keyed_suffix(key, TEMPLATE_ENVIRONMENT_WRITE_ANNOTATION_KEY)
+}
+
+/// Whether `key` is `<prefix>-<something>`.
+fn has_keyed_suffix(key: &str, prefix: &str) -> bool {
+    key.strip_prefix(prefix)
+        .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+}
+
+pub fn parse_template_environment_write_annotation(
+    key: &str,
+    value: &str,
+) -> Option<TemplateEnvironmentWrite> {
+    is_template_environment_write_annotation_key(key).then_some(())?;
+    let (environment, reference) = value.trim().split_once(' ')?;
+    TemplateEnvironmentWrite::new(
+        TemplateReference::from_str(reference.trim()).ok()?,
+        environment.parse().ok()?,
+    )
 }
 
 pub fn parse_template_write_annotation(key: &str, value: &str) -> Option<TemplateReference> {

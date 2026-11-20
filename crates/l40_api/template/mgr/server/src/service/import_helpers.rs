@@ -944,7 +944,7 @@ pub(super) fn normalize_arch(arch: &str) -> &str {
     }
 }
 
-pub(super) fn template_arch(
+pub(crate) fn template_arch(
     metadata: &pplx_space_template_manifest::TemplateMetadata,
     manifest: &pplx_space_template_manifest::TemplateManifest,
 ) -> String {

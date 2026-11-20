@@ -65,6 +65,8 @@ mod unanswered_templates;
 use cluster_deleted_eviction::*;
 pub(crate) use inbound_sandbox_listing::InboundSandboxListing;
 use inventory_publish::*;
+#[cfg(feature = "kubernetes")]
+pub(crate) use local_state::adopted_partition;
 use local_state::*;
 pub use network_policy::*;
 use port_exposure::*;

@@ -50,6 +50,15 @@ pub struct PodEnvironment {
     pub required: bool,
 }
 
+impl PodEnvironment {
+    /// The node template cache partition holding builds bound to this
+    /// environment, which a node's partition presence label names
+    /// ([`crate::template_partition_presence_label_key`]).
+    pub fn cache_partition(&self) -> pplx_space_template_model::TemplateCachePartition {
+        pplx_space_execution_catalog::catalog::template_cache_partition(Some(self.reference))
+    }
+}
+
 /// The longest name part (after the `/`) a Kubernetes label key may have.
 const LABEL_NAME_MAX: usize = 63;
 
