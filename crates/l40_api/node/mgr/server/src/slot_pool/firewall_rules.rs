@@ -136,8 +136,8 @@ struct OwnedSlot {
 impl NetworkPool {
     /// Installs `request`'s generation, if it is still the accepted one, in
     /// the slot's sandbox namespace and reads it back. A busy, transitional or
-    /// changed slot is left alone. `Err` means the job panicked after nft may
-    /// have run.
+    /// changed slot is left alone. `Err` means the job panicked; nft may have
+    /// run.
     pub async fn apply_firewall_rules(
         self: &Arc<Self>,
         assignments: &Arc<FirewallAssignments>,
@@ -154,19 +154,12 @@ impl NetworkPool {
         host: Arc<dyn SlotHost>,
         nft: Arc<Nft<'static>>,
     ) -> Result<SlotFirewallReport, tokio::task::JoinError> {
-        let owned = self.lookup_eligible(request.slot_id).and_then(|record| {
-            host.looked_up();
-            self.own(record)
-        });
-        let owned = match owned {
-            Ok(owned) => owned,
-            Err(not_run) => return Ok(SlotFirewallReport::NotRun(not_run)),
-        };
         let (pool, assignments) = (self.clone(), assignments.clone());
-        // Ownership moves into the tracked job, so dropping this future
-        // cannot release it while nft can still run.
+        // Ownership is taken and released inside the tracked job, so a busy
+        // pool.db cannot block the runtime and dropping this future cannot
+        // release the slot while nft can still run.
         self.task_tracker
-            .spawn_blocking(move || apply_owned(&pool, &assignments, request, &*host, &*nft, owned))
+            .spawn_blocking(move || apply_blocking(&pool, &assignments, request, &*host, &*nft))
             .await
     }
 
@@ -236,14 +229,21 @@ fn same_lifecycle(now: &SlotRecord, owned: &SlotRecord) -> bool {
     key(now) == key(owned)
 }
 
-fn apply_owned(
-    pool: &NetworkPool,
+fn apply_blocking(
+    pool: &Arc<NetworkPool>,
     assignments: &FirewallAssignments,
     request: SlotFirewallRequest,
     host: &dyn SlotHost,
     nft: &Nft<'_>,
-    owned: OwnedSlot,
 ) -> SlotFirewallReport {
+    let owned = pool.lookup_eligible(request.slot_id).and_then(|record| {
+        host.looked_up();
+        pool.own(record)
+    });
+    let owned = match owned {
+        Ok(owned) => owned,
+        Err(not_run) => return SlotFirewallReport::NotRun(not_run),
+    };
     let path = host.namespace_path(&owned.record.info);
     let (netns, namespace) = match pin(&path) {
         Ok(pinned) => pinned,
