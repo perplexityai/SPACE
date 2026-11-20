@@ -91,7 +91,9 @@ pub(crate) async fn tick(pool: &PgPool, config: &Config) -> Result<Option<Issuan
 }
 
 /// Tick under `config` until `shutdown`. With no config, wait for shutdown
-/// without touching the database.
+/// without touching the database. Leader-only: `run_reconcilers` starts it
+/// once elected (or on the single replica election skips) and stops it with
+/// the lease.
 pub(crate) async fn run(config: Option<Config>, pool: PgPool, shutdown: CancellationToken) {
     let Some(config) = config else {
         tracing::info!("firewall rules canary issuance is off; waiting for shutdown");

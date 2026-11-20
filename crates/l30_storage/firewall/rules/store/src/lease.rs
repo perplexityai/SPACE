@@ -40,7 +40,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
-use crate::{ItemPhase, Path, RolloutId, end_transaction, rollout_phase};
+use crate::{ItemPhase, RolloutId, Scope, end_transaction, rollout_phase};
 
 /// Firewall rollouts don't pause on failures, and the shared claim refuses
 /// once `failed >= failure_budget`, so the budget is one no count reaches.
@@ -103,7 +103,7 @@ pub async fn lease_targets(
         active_limit,
         held: Vec::new(),
         unverified: 0,
-        path: Path::Any,
+        scope: Scope::Any,
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
     end_transaction(tx, leased).await
@@ -154,7 +154,7 @@ pub async fn lease_first_canary(
             return Ok(false);
         }
         // Never failed, which is the later driver's call; the attempts stay.
-        redrive(&mut *tx, rollout_id, u64::MAX, Path::FirstCanary).await?;
+        redrive(&mut *tx, rollout_id, u64::MAX, Scope::FirstCanary).await?;
         Ok::<_, sqlx::Error>(true)
     }
     .await;
@@ -170,7 +170,7 @@ pub async fn lease_first_canary(
         active_limit: 1,
         held: Vec::new(),
         unverified: 0,
-        path: Path::FirstCanary,
+        scope: Scope::FirstCanary,
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
     // A canary leases one target at a time.
@@ -186,8 +186,8 @@ struct Claiming<'c> {
     /// Nodes leased or holding an unverified assignment, as `candidates`
     /// counted them, plus the first assignments `claim` has leased since.
     unverified: u64,
-    /// [`Path::FirstCanary`] leases only a canary's first assignments.
-    path: Path,
+    /// [`Scope::FirstCanary`] leases only a canary's first assignments.
+    scope: Scope,
 }
 
 impl FailedItems for Claiming<'_> {
@@ -222,7 +222,7 @@ impl ClaimStore for Claiming<'_> {
         .await?;
         // The rollout may leave canary after recovery commits. No test
         // catches its removal.
-        let canary = canary.filter(|&canary| canary || self.path == Path::Any);
+        let canary = canary.filter(|&canary| canary || self.scope == Scope::Any);
         Ok(canary.map(|canary| {
             (
                 canary,
@@ -320,7 +320,6 @@ impl ClaimStore for Claiming<'_> {
                                    AND nss.reachable
                                    AND nss.stale_after > clock_timestamp()
                                    AND i.node_id <> ALL ($6)
-                                   AND NOT $7
                                  OFFSET 0) due
                            ORDER BY node_id
                            LIMIT $5),
@@ -357,7 +356,6 @@ impl ClaimStore for Claiming<'_> {
             .bind(canary)
             .bind(i64::from(scan_limit))
             .bind(&self.held)
-            .bind(self.path == Path::FirstCanary)
             .fetch_one(&mut *self.tx)
             .await?;
         self.unverified = u64::try_from(unverified).unwrap_or(0);
@@ -367,6 +365,9 @@ impl ClaimStore for Claiming<'_> {
                 .into_iter()
                 .map(|node| (node, false))
                 .chain(first.into_iter().map(|node| (node, true)))
+                // In canary a due check means one is issued, so there are no
+                // first assignments for it to crowd out.
+                .filter(|&(_, first)| first || self.scope == Scope::Any)
                 .take(scan_limit as usize)
                 .map(|(node, first)| (NodeId::from_uuid(node), first))
                 .collect(),
@@ -659,15 +660,15 @@ pub async fn redrive_expired(
     rollout_id: RolloutId,
     max_attempts: u64,
 ) -> Result<RedriveReport, sqlx::Error> {
-    redrive(executor, rollout_id, max_attempts, Path::Any).await
+    redrive(executor, rollout_id, max_attempts, Scope::Any).await
 }
 
-/// [`redrive_expired`]; [`Path::FirstCanary`] redrives only unissued items.
+/// [`redrive_expired`]; [`Scope::FirstCanary`] redrives only unissued items.
 async fn redrive(
     executor: impl sqlx::PgExecutor<'_>,
     rollout_id: RolloutId,
     max_attempts: u64,
-    path: Path,
+    scope: Scope,
 ) -> Result<RedriveReport, sqlx::Error> {
     let phases = sqlx::query_scalar::<_, String>(sql!(
         "UPDATE firewall_rules_rollout_items
@@ -687,7 +688,7 @@ async fn redrive(
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(ItemPhase::InFlight.as_str())
-    .bind(path == Path::FirstCanary)
+    .bind(scope == Scope::FirstCanary)
     .fetch_all(executor)
     .await?;
     let failed = phases

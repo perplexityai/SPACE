@@ -105,7 +105,7 @@ impl ItemPhase {
 /// Which verbs a statement serves: all of them, or only
 /// [`lease_first_canary`] and [`issue_canary_and_release`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Path {
+enum Scope {
     Any,
     FirstCanary,
 }
