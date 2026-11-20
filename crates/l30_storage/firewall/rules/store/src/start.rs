@@ -57,13 +57,16 @@ impl From<Option<RevisionId>> for AdoptedRevision {
 pub struct StartRollout {
     /// The trusted operator, recorded as the header's creator and updater.
     pub actor: UserId,
-    /// Why: 1 to 1024 characters, which the schema checks.
+    /// Why: 1 to [`REASON_MAX_CHARS`] characters with no NUL.
     pub reason: String,
     /// The complete candidate. It must pass the protocol's strict decoder.
     pub revision: FirewallRuleRevision,
     /// The default the operator reviewed the candidate against.
     pub expected_adopted: AdoptedRevision,
 }
+
+/// The most characters a reason may hold, matching the schema's `CHECK`.
+pub const REASON_MAX_CHARS: usize = 1024;
 
 /// A committed start. Its rollout proves nothing yet, and one with no
 /// targets never will: completing it isn't evidence for adoption.
@@ -93,6 +96,8 @@ pub enum Review {
 pub enum StartError {
     #[error(transparent)]
     Invalid(DecodeError),
+    #[error("the reason must be 1 to {REASON_MAX_CHARS} characters with no NUL")]
+    InvalidReason,
     /// The default isn't the one expected; nothing was written.
     #[error("the adopted firewall default is {adopted}, not the expected one")]
     Stale { adopted: AdoptedRevision },
@@ -173,6 +178,11 @@ async fn start_with(
     start: &StartRollout,
     targets: &mut impl Targets,
 ) -> Result<StartedRollout, StartError> {
+    // Refused before any lock, so a bad request isn't reported as disabled.
+    let chars = start.reason.chars().count();
+    if !(1..=REASON_MAX_CHARS).contains(&chars) || start.reason.contains('\0') {
+        return Err(StartError::InvalidReason);
+    }
     // A revision built in code may break nft's limits, which only the
     // decoder checks.
     let document = encode_revision(&start.revision);

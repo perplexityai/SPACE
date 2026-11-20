@@ -597,3 +597,32 @@ async fn a_failed_write_leaves_nothing_behind() -> TestResult {
     start(pool, AdoptedRevision::NoRevision, &candidate).await?;
     Ok(())
 }
+
+/// Catches a reason the schema refuses reaching the write as a database
+/// error, or checked after the production gate, which would report a bad
+/// request as disabled; and a bound counted in bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reason_the_schema_refuses_is_invalid_before_anything_else() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let mut conn = pool.acquire().await?;
+    let start = |reason: String| StartRollout {
+        actor: UserId::from_uuid(SEED_USER_ID),
+        reason,
+        revision: revision(&[dns()]),
+        expected_adopted: AdoptedRevision::NoRevision,
+    };
+    let longest = "é".repeat(REASON_MAX_CHARS);
+    for reason in [String::new(), format!("{longest}é"), "a\0b".to_owned()] {
+        let refused = start_rollout(&mut conn, &start(reason)).await;
+        assert!(
+            matches!(refused, Err(StartError::InvalidReason)),
+            "{refused:?}"
+        );
+    }
+    // The schema stores the longest reason.
+    start_with(&mut conn, &start(longest), &mut Fixture::default()).await?;
+    Ok(())
+}

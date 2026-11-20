@@ -13,6 +13,12 @@ expression: paths_by_method
   "/debug/sandbox/{sandbox_id}": [
     "get"
   ],
+  "/firewall-rollouts": [
+    "post"
+  ],
+  "/firewall-rules": [
+    "get"
+  ],
   "/nodes": [
     "get",
     "post"
