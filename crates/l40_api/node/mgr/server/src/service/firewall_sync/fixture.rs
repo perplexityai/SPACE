@@ -4,6 +4,13 @@
 //! generation supersedes older work. The attempt state lives in memory only;
 //! it is no receipt and does not survive a restart. A production binding is
 //! meant to promote this worker as is; only where the binding comes from changes.
+//!
+//! Each result is one of three cases. Retry: nothing was applied and the
+//! target isn't known to have changed, so redelivery runs it again. Target
+//! changed: the slot number no longer proves it's the same sandbox. Unknown:
+//! what the attempt did can't be told. The last two end the binding for this
+//! process, so waiting work never runs against a new occupant and a later
+//! success can't hide the uncertainty. A completed attempt is never resubmitted.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -247,8 +254,7 @@ fn arm(wanted: &mut Option<Wanted>, generation: u64) -> bool {
     }
 }
 
-/// The reply for `report`, and whether it ends the binding: only a changed
-/// target or an unknown result does.
+/// The reply for `report`, and whether it ends the binding.
 fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDispatch, bool) {
     let (outcome, detail, ends) = match report {
         Err(error) => (Outcome::Unknown, error.to_string(), true),
