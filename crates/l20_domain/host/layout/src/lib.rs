@@ -62,6 +62,11 @@ pub mod paths {
     /// The cluster execution policy node-manager last applied, kept across restarts.
     pub const NODE_MANAGER_EXECUTION_POLICY_FILE: &str =
         "/space/run/node-manager/execution-policy.json";
+    /// The firewall assignment node-manager last accepted, kept across
+    /// restarts. Resetting or deprovisioning a node must delete it with
+    /// `NODE_MANAGER_DB`; no code does either yet.
+    pub const NODE_MANAGER_FIREWALL_ASSIGNMENT_FILE: &str =
+        "/space/run/node-manager/firewall-assignment.json";
     pub const RUNTIME_SUPERVISOR_SOCKET: &str =
         "/space/run/runtime-supervisor/runtime-supervisor.sock";
     pub const RUNTIME_SUPERVISOR_STATE_DIR: &str = "/space/run/runtime-supervisor";

@@ -21,10 +21,48 @@ pub(super) fn error(error: impl std::fmt::Display) -> Status {
     Status::failed_precondition(format!("artifact filesystem operation: {error}"))
 }
 
-pub(super) fn parent(path: &Path) -> Result<(File, &OsStr), Status> {
+pub(crate) fn parent(path: &Path) -> Result<(File, &OsStr), Status> {
     let parent = path.parent().ok_or_else(|| error("missing parent"))?;
     let name = path.file_name().ok_or_else(|| error("missing name"))?;
     Ok((trusted_paths::open_directory(parent)?, name))
+}
+
+/// Twice the 4 MiB request bound of node-manager's gRPC server (tonic's
+/// default): a record is about the size of the request it came from, so any
+/// accepted one fits, and its writer refuses one that wouldn't.
+pub(crate) const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum BoundedReadError {
+    Open(Status),
+    Sync(io::Error),
+    Read(io::Error),
+    TooLarge,
+}
+
+/// Reads the regular file at `path`, opened beneath its pinned parent without
+/// following links, refusing one over `max_bytes`. With `sync_parent`, the
+/// parent is synced before the read.
+pub(crate) fn read_bounded(
+    path: &Path,
+    max_bytes: u64,
+    sync_parent: bool,
+) -> Result<Vec<u8>, BoundedReadError> {
+    use io::Read as _;
+    let (directory, name) = parent(path).map_err(BoundedReadError::Open)?;
+    let file =
+        trusted_paths::open_regular_file(&directory, name).map_err(BoundedReadError::Open)?;
+    if sync_parent {
+        directory.sync_all().map_err(BoundedReadError::Sync)?;
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(BoundedReadError::Read)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(BoundedReadError::TooLarge);
+    }
+    Ok(bytes)
 }
 
 pub(super) fn directory(parent: &File, name: &OsStr) -> io::Result<File> {
@@ -55,6 +93,33 @@ pub(super) fn write_atomic_at(
     write: impl FnOnce(&File) -> Result<(), Status>,
 ) -> Result<File, Status> {
     write_atomic_at_with_durability(parent, name, write, Durability::Durable)
+        .map_err(AtomicWriteError::into_status)
+}
+
+/// [`write_atomic`], saying which side of the rename it failed on.
+pub(crate) fn write_durable_atomic(
+    path: &Path,
+    write: impl FnOnce(&File) -> Result<(), Status>,
+) -> Result<File, AtomicWriteError> {
+    let (parent, name) = parent(path).map_err(AtomicWriteError::NotReplaced)?;
+    write_atomic_at_with_durability(&parent, name, write, Durability::Durable)
+}
+
+#[derive(Debug)]
+pub(crate) enum AtomicWriteError {
+    /// Failed before the rename: the destination is unchanged.
+    NotReplaced(Status),
+    /// The rename landed but the directory sync failed: the new file may be
+    /// visible and may not survive a crash.
+    NotSynced(Status),
+}
+
+impl AtomicWriteError {
+    pub(crate) fn into_status(self) -> Status {
+        match self {
+            Self::NotReplaced(status) | Self::NotSynced(status) => status,
+        }
+    }
 }
 
 /// Rebuilt before launch; atomic visibility is required, crash durability is not.
@@ -64,6 +129,7 @@ pub(super) fn write_ephemeral_atomic(
 ) -> Result<File, Status> {
     let (parent, name) = parent(path)?;
     write_atomic_at_with_durability(&parent, name, write, Durability::Ephemeral)
+        .map_err(AtomicWriteError::into_status)
 }
 
 enum Durability {
@@ -76,7 +142,8 @@ fn write_atomic_at_with_durability(
     name: &OsStr,
     write: impl FnOnce(&File) -> Result<(), Status>,
     durability: Durability,
-) -> Result<File, Status> {
+) -> Result<File, AtomicWriteError> {
+    use AtomicWriteError::{NotReplaced, NotSynced};
     let temporary = format!(".artifact-{}.tmp", uuid::Uuid::now_v7());
     let output = File::from(
         openat(
@@ -85,16 +152,21 @@ fn write_atomic_at_with_durability(
             OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0o600),
         )
-        .map_err(error)?,
+        .map_err(|source| NotReplaced(error(source)))?,
     );
     let result = (|| {
-        write(&output)?;
+        write(&output).map_err(NotReplaced)?;
         if matches!(durability, Durability::Durable) {
-            output.sync_all().map_err(error)?;
+            output
+                .sync_all()
+                .map_err(|source| NotReplaced(error(source)))?;
         }
-        nix::fcntl::renameat(parent, temporary.as_str(), parent, name).map_err(error)?;
+        nix::fcntl::renameat(parent, temporary.as_str(), parent, name)
+            .map_err(|source| NotReplaced(error(source)))?;
         if matches!(durability, Durability::Durable) {
-            parent.sync_all().map_err(error)?;
+            parent
+                .sync_all()
+                .map_err(|source| NotSynced(error(source)))?;
         }
         Ok(())
     })();
