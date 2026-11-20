@@ -125,6 +125,34 @@ fn invalid_disk_configuration_rejects_build(#[case] rules: &str) {
     assert_eq!(error.status.as_u16(), 500);
 }
 
+#[rstest]
+#[case(
+    "aster-host",
+    Some(r#"{"mode":"report","stats_polling_interval_s":1}"#)
+)]
+#[case("aster-host-debug", None)]
+#[case("aster-task", Some(r#"{"mode":"hint"}"#))]
+#[case("other", None)]
+fn configured_balloon_defaults(#[case] template_id: &str, #[case] expected: Option<&str>) {
+    let rules = r#"{"aster-*":{"mode":"hint"},"aster-host":{"mode":"report","stats_polling_interval_s":1},"aster-host-debug":null}"#;
+    let expected = expected.map(|raw| serde_json::from_str::<BalloonConfig>(raw).unwrap());
+
+    assert_eq!(
+        balloon_for_template(template_id, Some(rules)).unwrap(),
+        expected
+    );
+}
+
+#[rstest]
+#[case(r#"{"aster-host":{"mode":"inflate"}}"#)]
+#[case(r#"{"aster-host":{"mode":"report","unknown":1}}"#)]
+#[case(r#"{"bad*pattern":{"mode":"report"}}"#)]
+fn invalid_balloon_configuration_rejects_build(#[case] rules: &str) {
+    let error = balloon_for_template("aster-host", Some(rules)).unwrap_err();
+
+    assert_eq!(error.status.as_u16(), 500);
+}
+
 #[test]
 fn disk_override_rejects_byte_overflow() {
     let error =
