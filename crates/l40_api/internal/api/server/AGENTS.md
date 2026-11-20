@@ -19,11 +19,6 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   address matching for missing claims), never by a
   request field alone; one that names a node uses `authenticated_origin_node_id`. Existing exception:
   `TouchArtifactBackup` binds no node.
-- `FetchFirewallRules` binds the caller by reviewed Kubernetes node name and
-  UID only. The peer IP can belong to a different registered worker; using
-  it as a fallback could return that worker's firewall instructions. Require
-  fetch authority, exactly one matching live worker, and enrollment before
-  reading instructions. This exception does not apply to other RPCs.
 - ClusterApi never creates a node registration. `nodes` and `node_k8s` rows
   come from the cluster controller's Kubernetes node sync, sandbox pod
   placement and Direct admin registration; a request naming an unregistered
@@ -54,10 +49,6 @@ Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
 - Node-bound RPCs deny a request with no remote address. Give the test request
   a peer address equal to the node's registered one.
-- For the `FetchFirewallRules` exception, give the peer address to worker B
-  and supply reviewed claims for worker A. Assert that A gets only A's
-  instructions and that missing or invalid claims are denied, not resolved
-  to B.
 
 Module moves change log targets and `sql!` locators: see "Log targets" in
 `docs/rust/space-conventions.md`.
