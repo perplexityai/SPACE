@@ -48,8 +48,9 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 
 Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
-- Node-bound RPCs deny a request with no remote address. Give the test request
-  a peer address equal to the node's registered one.
+- Address-bound RPCs deny a request with no remote address. Give the test
+  request a peer address equal to the node's registered one.
+  `FetchFirewallRules` tests supply reviewed node name/UID claims instead.
 
 Module moves change log targets and `sql!` locators: see "Log targets" in
 `docs/rust/space-conventions.md`.
