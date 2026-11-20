@@ -97,14 +97,12 @@ impl KubernetesSubstrate {
             StartedRecoveryReplacement::Pending => {
                 Err(SubstrateError::restore_source_pending(sandbox_id))
             }
-            StartedRecoveryReplacement::Unavailable => {
-                Err(SubstrateError::RestoreContextUnavailable {
-                    message: format!(
-                        "sandbox {sandbox_id} generation {generation} lost its verified restore \
-                         source before execution handoff; leaving the execution unchanged"
-                    ),
-                })
-            }
+            // A newer activity clock or upload can land between the
+            // pre-check and the handoff transaction; classify the answer the
+            // same way so the same state can't get a different status.
+            StartedRecoveryReplacement::Unavailable => Err(self
+                .started_recovery_unavailable_error(sandbox_id, generation)
+                .await),
             StartedRecoveryReplacement::OwnershipLost => Ok(None),
         }
     }
@@ -134,7 +132,10 @@ impl KubernetesSubstrate {
     /// The error for a recovery with no verified restore source.
     ///
     /// - A newer upload that may still land: `RestoreUploadSettling`, a
-    ///   retryable 503 that still completes the attempt as failed.
+    ///   retryable 503 that still completes the attempt as failed. That
+    ///   includes a same-node upload past the settle window while the API
+    ///   doesn't yet see that node as lost; once it does, the upload is
+    ///   treated as absent, as the cluster controller's loop treats it.
     /// - Only a stale durable suspend: `RestoreAwaitingSourceNodeLoss`, also
     ///   retryable, but only when the retry can resolve, that is
     ///   [`stale_source_retry_can_resolve`] holds. Otherwise the node is live
@@ -153,18 +154,23 @@ impl KubernetesSubstrate {
             .await
         {
             Ok(StartedRecoveryUnavailableCause::SourcePublishing) => {
-                SubstrateError::RestoreUploadSettling {
-                    message: format!(
-                        "sandbox {sandbox_id} generation {generation}: a newer snapshot upload \
-                         may still land; retry"
-                    ),
-                }
+                upload_settling(sandbox_id, generation)
             }
-            Ok(StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { source_node })
-                if stale_source_retry_can_resolve(
-                    self.k8s.lost_started_give_up_enabled,
-                    self.started_recovery_source_node_looks_lost(&source_node),
-                ) =>
+            Ok(StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
+                source_node, ..
+            }) if !self.started_recovery_source_node_looks_lost(&source_node) => {
+                upload_settling(sandbox_id, generation)
+            }
+            Ok(
+                StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { source_node }
+                | StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
+                    source_node,
+                    stale_rollback_source: true,
+                },
+            ) if stale_source_retry_can_resolve(
+                self.k8s.lost_started_give_up_enabled,
+                self.started_recovery_source_node_looks_lost(&source_node),
+            ) =>
             {
                 SubstrateError::RestoreAwaitingSourceNodeLoss {
                     message: format!(
@@ -176,6 +182,7 @@ impl KubernetesSubstrate {
             }
             Ok(
                 StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { .. }
+                | StartedRecoveryUnavailableCause::SameNodeUploadPastSettle { .. }
                 | StartedRecoveryUnavailableCause::NoDurableSource,
             ) => {
                 SubstrateError::RestoreContextUnavailable {
@@ -248,6 +255,15 @@ impl KubernetesSubstrate {
         *pod_name = claim.row.pod_name.clone();
         *restore_source = Some(source);
         Ok(true)
+    }
+}
+
+fn upload_settling(sandbox_id: SandboxId, generation: ExecutionGeneration) -> SubstrateError {
+    SubstrateError::RestoreUploadSettling {
+        message: format!(
+            "sandbox {sandbox_id} generation {generation}: a newer snapshot upload may still \
+             land; retry"
+        ),
     }
 }
 

@@ -476,6 +476,16 @@ pub(super) enum StartedRecoveryUnavailableCause {
     /// A full snapshot is still uploading: the source is being published.
     /// Retry; nothing is wrong.
     SourcePublishing,
+    /// A full snapshot from the sandbox's own node is still `creating`, past
+    /// the settle window. That upload is only dead once its node is lost: a
+    /// slow upload on a live node can still finalize. The caller answers
+    /// pending until `source_node` looks lost, then decides as if the upload
+    /// were absent, using `stale_rollback_source` (the
+    /// [`Self::StaleSourceAwaitingNodeLoss`] condition).
+    SameNodeUploadPastSettle {
+        source_node: StaleRecoverySourceNode,
+        stale_rollback_source: bool,
+    },
     /// The only durable copy is the suspend the sandbox last woke from, and
     /// it predates the last command or access. Restoring it now could roll
     /// back writes that still exist on the source node, so recovery waits for

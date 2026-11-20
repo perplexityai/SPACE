@@ -547,6 +547,31 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
             .await?,
         StartedRecoveryUnavailableCause::SourcePublishing
     );
+
+    // Act: that same-node upload is now past the settle window.
+    sqlx::query(sql!(
+        "UPDATE snapshots
+            SET timestamp = NOW() - INTERVAL '1 day',
+                last_attempt_at = NOW() - INTERVAL '1 day'
+          WHERE sandbox_id = $1 AND state = 'creating'"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    // Assert: reported separately, with its node, so the API keeps it
+    // pending until it sees that node as lost. The unfinished upload also
+    // vetoes the rollback, as it does in the cluster controller's loop.
+    assert_eq!(
+        fixture
+            .store
+            .started_recovery_unavailable_cause(sandbox_id)
+            .await?,
+        StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
+            source_node: StaleRecoverySourceNode::Named("source-node".to_string()),
+            stale_rollback_source: false,
+        }
+    );
     Ok(())
 }
 

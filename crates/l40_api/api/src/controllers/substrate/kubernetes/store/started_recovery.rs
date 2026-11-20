@@ -291,6 +291,10 @@ impl K8sStore {
     ///
     /// The settle window for a `creating` upload from the sandbox's own node
     /// is the loop's ([`pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE`]).
+    /// Past that window the loop only treats the upload as dead because it
+    /// has proven the node gone, so such an upload is reported separately
+    /// ([`StartedRecoveryUnavailableCause::SameNodeUploadPastSettle`]) and
+    /// the caller keeps it pending until the API sees that node as lost.
     pub(in crate::controllers::substrate::kubernetes) async fn started_recovery_unavailable_cause(
         &self,
         sandbox_id: SandboxId,
@@ -310,6 +314,14 @@ impl K8sStore {
                                   >= NOW() - make_interval(secs => $2::BIGINT)
                            )
                     ) AS publishing,
+                    EXISTS (
+                        SELECT 1
+                          FROM snapshots sn
+                         WHERE sn.sandbox_id = s.id
+                           AND sn.type = 'full'
+                           AND sn.state = 'creating'
+                           AND sn.source_node_id = s.active_node_id
+                    ) AS same_node_upload,
                     {rollback_source} AS stale_rollback_source,
                     s.active_node_id IS NOT NULL AND n.id IS NULL AS node_row_deleted,
                     nk.k8s_node_name
@@ -318,9 +330,9 @@ impl K8sStore {
                LEFT JOIN node_k8s nk ON nk.node_id = n.id
               WHERE s.id = $1"
         );
-        let row = sqlx::query_as::<_, (bool, bool, bool, Option<String>)>(sqlx::AssertSqlSafe(
-            sql!(query.as_str()),
-        ))
+        let row = sqlx::query_as::<_, (bool, bool, bool, bool, Option<String>)>(
+            sqlx::AssertSqlSafe(sql!(query.as_str())),
+        )
         .bind(sandbox_id.as_uuid())
         .bind(
             pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
@@ -330,18 +342,34 @@ impl K8sStore {
         .fetch_optional(&self.pool)
         .await
         .db_context("failed to classify unavailable started recovery source")?;
-        Ok(match row {
-            Some((true, ..)) => StartedRecoveryUnavailableCause::SourcePublishing,
-            Some((false, true, node_row_deleted, k8s_node_name)) => {
-                StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss {
-                    source_node: match (node_row_deleted, k8s_node_name) {
-                        (true, _) => StaleRecoverySourceNode::RowDeleted,
-                        (false, Some(name)) => StaleRecoverySourceNode::Named(name),
-                        (false, None) => StaleRecoverySourceNode::Unknown,
-                    },
-                }
+        let Some((
+            publishing,
+            same_node_upload,
+            stale_rollback_source,
+            node_row_deleted,
+            k8s_node_name,
+        )) = row
+        else {
+            return Ok(StartedRecoveryUnavailableCause::NoDurableSource);
+        };
+        let source_node = match (node_row_deleted, k8s_node_name) {
+            (true, _) => StaleRecoverySourceNode::RowDeleted,
+            (false, Some(name)) => StaleRecoverySourceNode::Named(name),
+            (false, None) => StaleRecoverySourceNode::Unknown,
+        };
+        Ok(if publishing {
+            StartedRecoveryUnavailableCause::SourcePublishing
+        } else if same_node_upload {
+            // Only reached past the settle window: a fresher same-node
+            // upload answers `publishing` above.
+            StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
+                source_node,
+                stale_rollback_source,
             }
-            Some((false, false, ..)) | None => StartedRecoveryUnavailableCause::NoDurableSource,
+        } else if stale_rollback_source {
+            StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { source_node }
+        } else {
+            StartedRecoveryUnavailableCause::NoDurableSource
         })
     }
 
