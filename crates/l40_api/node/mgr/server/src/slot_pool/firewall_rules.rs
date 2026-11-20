@@ -105,8 +105,8 @@ pub struct SlotFirewallAttempt {
 
 impl SlotFirewallAttempt {
     /// The pinned namespace listed exactly this revision, and the assignment,
-    /// slot and namespace entry were still the attempted ones afterwards. It
-    /// admits no traffic; a later reader revalidates.
+    /// slot and namespace entry were still the attempted ones as of the final
+    /// check. It admits no traffic; a later reader revalidates.
     pub fn verified(&self) -> bool {
         self.readback == Verification::Match && self.current.is_ok()
     }
@@ -295,7 +295,8 @@ fn identity(metadata: io::Result<std::fs::Metadata>) -> io::Result<NamespaceIden
 }
 
 /// Within one store a generation names one revision, so the generation is
-/// enough to tell the assignment apart.
+/// enough to tell the assignment apart. It is read last, since the slot read
+/// can wait on pool.db.
 fn still_current(
     pool: &NetworkPool,
     assignments: &FirewallAssignments,
@@ -304,15 +305,16 @@ fn still_current(
     path: &Path,
     namespace: NamespaceIdentity,
 ) -> Result<(), Stale> {
-    runnable(assignments.current(), desired.node_id, desired.generation)
-        .map_err(Stale::Assignment)?;
     match pool.record(owned.info.slot) {
         Ok(Some(now)) if same_lifecycle(&now, owned) => {}
         Ok(_) => return Err(Stale::Slot),
         Err(error) => return Err(Stale::SlotStore(error)),
     }
     match identity(std::fs::metadata(path)) {
-        Ok(now) if now == namespace => Ok(()),
-        now => Err(Stale::Namespace(now)),
+        Ok(now) if now == namespace => {}
+        now => return Err(Stale::Namespace(now)),
     }
+    runnable(assignments.current(), desired.node_id, desired.generation)
+        .map_err(Stale::Assignment)?;
+    Ok(())
 }
