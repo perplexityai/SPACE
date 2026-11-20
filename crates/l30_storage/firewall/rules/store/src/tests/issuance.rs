@@ -7,6 +7,8 @@ use pplx_space_state_reconciliation::ReconcileReason;
 
 use super::*;
 
+mod canary;
+
 /// Bound for tests only: there is no production first-check delay yet.
 const FIRST_CHECK_IN: Duration = Duration::from_secs(90);
 const FIREWALL: &str = "firewall_rules_changed";
@@ -21,6 +23,12 @@ enum Queue {
     /// Queues, then expires the item's lease at the current clock reading, so
     /// the check must read the clock at the stamp to refuse.
     ThenLapses,
+    /// Queues, then gives the item another token, so a release matches
+    /// nothing.
+    ThenStealsLease,
+    /// Queues, then adds a check, rolled back with the issuance, that a
+    /// release violates.
+    ThenBlocksRelease,
 }
 
 impl Wakeup for Queue {
@@ -42,6 +50,26 @@ impl Wakeup for Queue {
                      WHERE node_id = $1 AND phase = 'in_flight'"
                 ))
                 .bind(node)
+                .execute(&mut **tx)
+                .await?;
+                Ok(queued)
+            }
+            Self::ThenStealsLease => {
+                sqlx::query(sql!(
+                    "UPDATE firewall_rules_rollout_items
+                     SET lease_token = gen_random_uuid()
+                     WHERE node_id = $1 AND phase = 'in_flight'"
+                ))
+                .bind(node)
+                .execute(&mut **tx)
+                .await?;
+                Ok(queued)
+            }
+            Self::ThenBlocksRelease => {
+                sqlx::query(sql!(
+                    "ALTER TABLE firewall_rules_rollout_items
+                     ADD CONSTRAINT test_no_release CHECK (lease_token IS NOT NULL) NOT VALID"
+                ))
                 .execute(&mut **tx)
                 .await?;
                 Ok(queued)
