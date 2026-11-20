@@ -47,10 +47,11 @@ pub(super) fn hex(c: char) -> String {
 /// tag. Two digests are stored in both forms, laid out opposite ways:
 /// `dual_prefixed` (`sha256:99…`, 8d) is inserted before `dual_bare` (`99…`,
 /// 7d), and `early_bare` (`88…`, 9d) before `late_prefixed` (`sha256:88…`,
-/// 2d). The prefixed row is the older one with the smaller id in the first
-/// pair and the newer one with the larger id in the second, so newest first,
-/// oldest first, id order and insertion order each miss it in one pair; only
-/// an exact-form preference picks it in both.
+/// 2d). Neither pair owns a storage location, so the shared original-release
+/// rule picks each pair's older row, which is also the one inserted first
+/// and with the smaller id: the prefixed one in the first pair, the bare one
+/// in the second. Newest first and a preference for either spelling each
+/// miss it in one pair.
 /// `RESOLVER_PRIVATE_TEMPLATE` is org-specific to `RESOLVER_OWNER_ORG` with
 /// `private` (`sha256:ff…`) tagged `latest`. `RESOLVER_UNTAGGED_TEMPLATE` has
 /// no tags and three releases in insertion order: `untagged_older`
@@ -67,9 +68,8 @@ pub(super) struct ResolverWorld {
     pub(super) prefixed: Uuid,
     pub(super) blake3: Uuid,
     pub(super) latest_holder: Uuid,
-    pub(super) dual_bare: Uuid,
     pub(super) dual_prefixed: Uuid,
-    pub(super) late_prefixed: Uuid,
+    pub(super) early_bare: Uuid,
     pub(super) private: Uuid,
     pub(super) untagged_older: Uuid,
     pub(super) untagged_newest: Uuid,
@@ -150,7 +150,7 @@ pub(super) async fn seed_resolver_world(pool: &PgPool) -> TestDbResult<ResolverW
     let t = RESOLVER_TEMPLATE;
     let newest_created = release(pool, t, format!("sha256:{}", hex('e')), "1 hour", None).await?;
     let dual_prefixed = release(pool, t, format!("sha256:{}", hex('9')), "8 days", None).await?;
-    release(pool, t, hex('8'), "9 days", None).await?;
+    let early_bare = release(pool, t, hex('8'), "9 days", None).await?;
     let untagged_older = release(
         pool,
         RESOLVER_UNTAGGED_TEMPLATE,
@@ -164,8 +164,8 @@ pub(super) async fn seed_resolver_world(pool: &PgPool) -> TestDbResult<ResolverW
         prefixed: release(pool, t, format!("sha256:{}", hex('b')), "4 days", None).await?,
         blake3: release(pool, t, format!("blake3:{}", hex('c')), "3 days", None).await?,
         latest_holder: release(pool, t, format!("sha256:{}", hex('d')), "6 days", None).await?,
-        dual_bare: release(pool, t, hex('9'), "7 days", None).await?,
         dual_prefixed,
+        early_bare,
         private: release(
             pool,
             RESOLVER_PRIVATE_TEMPLATE,
@@ -191,8 +191,10 @@ pub(super) async fn seed_resolver_world(pool: &PgPool) -> TestDbResult<ResolverW
             None,
         )
         .await?,
-        late_prefixed: release(pool, t, format!("sha256:{}", hex('8')), "2 days", None).await?,
     };
+    // The other spelling of each both-forms digest, inserted after the first.
+    release(pool, t, hex('9'), "7 days", None).await?;
+    release(pool, t, format!("sha256:{}", hex('8')), "2 days", None).await?;
     release(
         pool,
         RESOLVER_UNTAGGED_TEMPLATE,

@@ -13,9 +13,11 @@ use std::net::IpAddr;
 
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::{digest_original, spelling_original};
 use serde::Deserialize;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
+use std::sync::LazyLock;
 use time::OffsetDateTime;
 use tonic::Status;
 use uuid::Uuid;
@@ -243,8 +245,10 @@ impl TemplateReleasesStore {
     /// several match, a release with a storage location answers before one
     /// without (nothing can pull an artifact-less duplicate), then the tagged
     /// release, then the one whose storage location is oldest, then the
-    /// earliest registered. `None` selects the tagged release, as before
-    /// twins.
+    /// earliest registered. `None` selects the digest original
+    /// (`pplx_space_template_release_original::digest_original`) of the
+    /// tagged release's digest, which a tag written before the shared rule
+    /// may not point at.
     pub(super) async fn find_by_tag(
         &self,
         name: &str,
@@ -260,8 +264,11 @@ impl TemplateReleasesStore {
         } = filter;
         let (environment, legacy_selector) = selector_binds(environment);
         if !generic_only && caller_org.is_none() && scope.node_ids().is_none() {
-            return sqlx::query_as(sql!(
-                "SELECT FALSE AS generic_authorized,
+            return {
+                /// Built once: every input is a literal or a bind placeholder.
+                static UNSCOPED: LazyLock<String> = LazyLock::new(|| {
+                    sql!(format!(
+                        "SELECT FALSE AS generic_authorized,
                     r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
@@ -285,7 +292,7 @@ impl TemplateReleasesStore {
              WHERE t.template_name = $1
                AND t.tag = $2
                AND r.type = $3
-               AND (($4::TEXT IS NULL AND r.id = tr.id)
+               AND (($4::TEXT IS NULL AND {digest_original})
                     OR r.execution_metadata->>'environment' = $4
                     OR ($5 AND r.execution_metadata->>'environment' IS NULL))
              ORDER BY s.id IS NULL,
@@ -293,18 +300,25 @@ impl TemplateReleasesStore {
                       s.created_at ASC NULLS LAST,
                       r.created_at ASC,
                       r.id ASC,
-                      s.id ASC"
-            ))
-            .bind(name)
-            .bind(tag)
-            .bind(runtime)
-            .bind(environment)
-            .bind(legacy_selector)
-            .fetch_all(&self.pool)
-            .await;
+                      s.id ASC",
+                        digest_original = digest_original("r"),
+                    ))
+                });
+                sqlx::query_as(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
+                    .bind(name)
+                    .bind(tag)
+                    .bind(runtime)
+                    .bind(environment)
+                    .bind(legacy_selector)
+                    .fetch_all(&self.pool)
+                    .await
+            };
         }
-        sqlx::query_as(sql!(
-            "SELECT ($6 AND tpl.visibility = 'generic') AS generic_authorized,
+        {
+            /// Built once: every input is a literal or a bind placeholder.
+            static SCOPED: LazyLock<String> = LazyLock::new(|| {
+                sql!(format!(
+                    "SELECT ($6 AND tpl.visibility = 'generic') AS generic_authorized,
                     r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
@@ -329,7 +343,7 @@ impl TemplateReleasesStore {
              WHERE t.template_name = $1
                AND t.tag = $2
                AND r.type = $3
-               AND (($7::TEXT IS NULL AND r.id = tr.id)
+               AND (($7::TEXT IS NULL AND {digest_original})
                     OR r.execution_metadata->>'environment' = $7
                     OR ($8 AND r.execution_metadata->>'environment' IS NULL))
                AND (NOT $6 OR tpl.visibility = 'generic')
@@ -368,24 +382,33 @@ impl TemplateReleasesStore {
                       s.created_at ASC NULLS LAST,
                       r.created_at ASC,
                       r.id ASC,
-                      s.id ASC"
-        ))
-        .bind(name)
-        .bind(tag)
-        .bind(runtime)
-        .bind(caller_org.map(|org| org.as_uuid()))
-        .bind(scope.node_ids())
-        .bind(generic_only)
-        .bind(environment)
-        .bind(legacy_selector)
-        .fetch_all(&self.pool)
-        .await
+                      s.id ASC",
+                    digest_original = digest_original("r"),
+                ))
+            });
+            sqlx::query_as(sqlx::AssertSqlSafe(SCOPED.as_str()))
+                .bind(name)
+                .bind(tag)
+                .bind(runtime)
+                .bind(caller_org.map(|org| org.as_uuid()))
+                .bind(scope.node_ids())
+                .bind(generic_only)
+                .bind(environment)
+                .bind(legacy_selector)
+                .fetch_all(&self.pool)
+                .await
+        }
     }
 
     /// See [`Self::find_by_tag`] for the two statement shapes and the scope
     /// parameters. `environment` selects the release of the hash bound to
-    /// it; `None` selects the original release, the first registered for the
-    /// hash under each spelling, so twins never answer an unselected lookup.
+    /// it; `None` selects each spelling's original release, the first
+    /// registered for the hash under that spelling, so twins never answer an
+    /// unselected lookup. The digest's original
+    /// (`pplx_space_template_release_original::digest_original`, the release
+    /// every caller resolves the digest to) comes first, so it's the release
+    /// an unselected lookup answers with; the other spelling's original only
+    /// contributes storage locations.
     pub(super) async fn find_by_hash(
         &self,
         name: &str,
@@ -401,8 +424,10 @@ impl TemplateReleasesStore {
         } = filter;
         let (environment, legacy_selector) = selector_binds(environment);
         if !generic_only && caller_org.is_none() && scope.node_ids().is_none() {
-            return sqlx::query_as(sql!(
-                "SELECT FALSE AS generic_authorized,
+            /// Built once: every input is a literal or a bind placeholder.
+            static UNSCOPED: LazyLock<String> = LazyLock::new(|| {
+                sql!(format!(
+                    "SELECT FALSE AS generic_authorized,
                     r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
@@ -417,29 +442,31 @@ impl TemplateReleasesStore {
                ON s.template_release_id = r.id
              WHERE r.template_name = $1
                AND r.hash IN ($2, $3)
-               AND (($4::TEXT IS NULL
-                     AND NOT EXISTS (
-                SELECT 1 FROM template_releases o
-                WHERE o.template_name = r.template_name
-                  AND o.hash = r.hash
-                  AND (o.created_at, o.id) < (r.created_at, r.id)))
+               AND (($4::TEXT IS NULL AND {spelling_original})
                     OR r.execution_metadata->>'environment' = $4
                     OR ($5 AND r.execution_metadata->>'environment' IS NULL))
-             ORDER BY s.created_at ASC NULLS LAST,
+             ORDER BY ($4::TEXT IS NULL AND {digest_original}) DESC,
+                      s.created_at ASC NULLS LAST,
                       r.created_at ASC,
                       r.id ASC,
-                      s.id ASC"
-            ))
-            .bind(name)
-            .bind(hash)
-            .bind(bare_hash)
-            .bind(environment)
-            .bind(legacy_selector)
-            .fetch_all(&self.pool)
-            .await;
+                      s.id ASC",
+                    spelling_original = spelling_original("r"),
+                    digest_original = digest_original("r"),
+                ))
+            });
+            return sqlx::query_as(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
+                .bind(name)
+                .bind(hash)
+                .bind(bare_hash)
+                .bind(environment)
+                .bind(legacy_selector)
+                .fetch_all(&self.pool)
+                .await;
         }
-        sqlx::query_as(sql!(
-            "SELECT ($6 AND tpl.visibility = 'generic') AS generic_authorized,
+        /// Built once: every input is a literal or a bind placeholder.
+        static SCOPED: LazyLock<String> = LazyLock::new(|| {
+            sql!(format!(
+                "SELECT ($6 AND tpl.visibility = 'generic') AS generic_authorized,
                     r.id              AS release_id,
                     r.template_name   AS release_template_name,
                     r.type            AS release_type,
@@ -455,12 +482,7 @@ impl TemplateReleasesStore {
                ON s.template_release_id = r.id
              WHERE r.template_name = $1
                AND r.hash IN ($2, $3)
-               AND (($7::TEXT IS NULL
-                     AND NOT EXISTS (
-                SELECT 1 FROM template_releases o
-                WHERE o.template_name = r.template_name
-                  AND o.hash = r.hash
-                  AND (o.created_at, o.id) < (r.created_at, r.id)))
+               AND (($7::TEXT IS NULL AND {spelling_original})
                     OR r.execution_metadata->>'environment' = $7
                     OR ($8 AND r.execution_metadata->>'environment' IS NULL))
                AND (NOT $6 OR tpl.visibility = 'generic')
@@ -494,30 +516,35 @@ impl TemplateReleasesStore {
                                 AND g.granted_at > NOW() - INTERVAL '1 hour')
                                OR (g.builder_node_id = bn.id
                                    AND g.granted_at > NOW() - INTERVAL '7 days'))))
-             ORDER BY s.created_at ASC NULLS LAST,
+             ORDER BY ($7::TEXT IS NULL AND {digest_original}) DESC,
+                      s.created_at ASC NULLS LAST,
                       r.created_at ASC,
                       r.id ASC,
-                      s.id ASC"
-        ))
-        .bind(name)
-        .bind(hash)
-        .bind(bare_hash)
-        .bind(caller_org.map(|org| org.as_uuid()))
-        .bind(scope.node_ids())
-        .bind(generic_only)
-        .bind(environment)
-        .bind(legacy_selector)
-        .fetch_all(&self.pool)
-        .await
+                      s.id ASC",
+                spelling_original = spelling_original("r"),
+                digest_original = digest_original("r"),
+            ))
+        });
+        sqlx::query_as(sqlx::AssertSqlSafe(SCOPED.as_str()))
+            .bind(name)
+            .bind(hash)
+            .bind(bare_hash)
+            .bind(caller_org.map(|org| org.as_uuid()))
+            .bind(scope.node_ids())
+            .bind(generic_only)
+            .bind(environment)
+            .bind(legacy_selector)
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Return the latest `limit` releases for `(template_name,
-    /// runtime)`: those bound to `environment`, or with none, each hash's
-    /// original release and never its twins. Releases rank newest version
-    /// first, by the `created_at` of their hash's earliest release under its
-    /// stored spelling or, with `environment`, under either spelling of the
-    /// digest, so a twin registered late for an older version doesn't
-    /// outrank a newer version; ties break on
+    /// runtime)`: those bound to `environment`, or with none, each digest's
+    /// original release (`pplx_space_template_release_original::digest_original`,
+    /// one per digest under either spelling) and never its twins. Releases rank newest version
+    /// first, by the `created_at` of their digest's earliest release under
+    /// either spelling, so a twin registered late for an older version
+    /// doesn't outrank a newer version; ties break on
     /// the release's own `created_at` and then `id` DESC for determinism. Each entry carries its zero-or-more
     /// storage locations, aggregated server-side via `json_agg`.
     ///
@@ -536,10 +563,11 @@ impl TemplateReleasesStore {
     ) -> Result<Vec<LatestRelease>, Status> {
         let (environment, legacy_selector) = selector_binds(environment);
         // Server-side aggregation: inner subquery picks the latest
-        // `limit` releases (a selected listing first keeps one release per
-        // digest, whichever spelling it's stored under, preferring one with
-        // a storage location, so the two spellings of a digest never take
-        // two of the `limit` slots); outer `LEFT JOIN` plus `GROUP BY` rolls
+        // `limit` releases (one release per digest, whichever spelling it's
+        // stored under, preferring one with a storage location, so the two
+        // spellings of a digest never take two of the `limit` slots: an
+        // unselected listing keeps only the digest's original, and a selected
+        // one the first of its bound releases); outer `LEFT JOIN` plus `GROUP BY` rolls
         // each release's storage locations into one JSON array.
         //
         // - `FILTER (WHERE s.id IS NOT NULL)` discards the synthetic
@@ -560,7 +588,9 @@ impl TemplateReleasesStore {
         // is the caller's node ids); the unscoped statement stays off
         // that table for the same schema-skew reason.
         let rows = if let Some(node_ids) = scope.node_ids() {
-            sqlx::query_as::<_, LatestReleaseRow>(sql!(
+            /// Built once: every input is a literal or a bind placeholder.
+            static NODE_SCOPED: LazyLock<String> = LazyLock::new(|| {
+                sql!(format!(
                 "SELECT r.id,
                     r.template_name,
                     r.type AS runtime,
@@ -589,20 +619,13 @@ impl TemplateReleasesStore {
                         rel.execution_metadata->>'environment' AS environment,
                         (SELECT MIN(o.created_at) FROM template_releases o
                          WHERE o.template_name = rel.template_name
-                           AND (o.hash = rel.hash
-                                OR ($5::TEXT IS NOT NULL
-                                    AND replace(o.hash, 'sha256:', '')
-                                        = replace(rel.hash, 'sha256:', '')))) AS version_created_at
+                           AND o.hash IN (replace(rel.hash, 'sha256:', ''),
+                                          'sha256:' || replace(rel.hash, 'sha256:', ''))) AS version_created_at
                  FROM template_releases rel
                  JOIN templates tpl ON tpl.name = rel.template_name
                  WHERE rel.template_name = $1
                    AND rel.type = $2
-                   AND (($5::TEXT IS NULL
-                         AND NOT EXISTS (
-                SELECT 1 FROM template_releases o
-                WHERE o.template_name = rel.template_name
-                  AND o.hash = rel.hash
-                  AND (o.created_at, o.id) < (rel.created_at, rel.id)))
+                   AND (($5::TEXT IS NULL AND {digest_original})
                         OR rel.execution_metadata->>'environment' = $5
                     OR ($6 AND rel.execution_metadata->>'environment' IS NULL))
                    AND ((tpl.visibility = 'generic' AND tpl.desired_state = 'present')
@@ -645,8 +668,11 @@ impl TemplateReleasesStore {
                ON s.template_release_id = r.id
              GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
                       r.version_created_at
-             ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC"
+             ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC",
+                digest_original = digest_original("rel"),
             ))
+            });
+            sqlx::query_as::<_, LatestReleaseRow>(sqlx::AssertSqlSafe(NODE_SCOPED.as_str()))
             .bind(template_name)
             .bind(runtime)
             .bind(limit)
@@ -656,7 +682,9 @@ impl TemplateReleasesStore {
             .fetch_all(&self.pool)
             .await
         } else {
-            sqlx::query_as::<_, LatestReleaseRow>(sql!(
+            /// Built once: every input is a literal or a bind placeholder.
+            static UNSCOPED: LazyLock<String> = LazyLock::new(|| {
+                sql!(format!(
                 "SELECT r.id,
                     r.template_name,
                     r.type AS runtime,
@@ -685,19 +713,12 @@ impl TemplateReleasesStore {
                         rel.execution_metadata->>'environment' AS environment,
                         (SELECT MIN(o.created_at) FROM template_releases o
                          WHERE o.template_name = rel.template_name
-                           AND (o.hash = rel.hash
-                                OR ($4::TEXT IS NOT NULL
-                                    AND replace(o.hash, 'sha256:', '')
-                                        = replace(rel.hash, 'sha256:', '')))) AS version_created_at
+                           AND o.hash IN (replace(rel.hash, 'sha256:', ''),
+                                          'sha256:' || replace(rel.hash, 'sha256:', ''))) AS version_created_at
                  FROM template_releases rel
                  WHERE rel.template_name = $1
                    AND rel.type = $2
-                   AND (($4::TEXT IS NULL
-                         AND NOT EXISTS (
-                SELECT 1 FROM template_releases o
-                WHERE o.template_name = rel.template_name
-                  AND o.hash = rel.hash
-                  AND (o.created_at, o.id) < (rel.created_at, rel.id)))
+                   AND (($4::TEXT IS NULL AND {digest_original})
                         OR rel.execution_metadata->>'environment' = $4
                     OR ($5 AND rel.execution_metadata->>'environment' IS NULL))
                  ORDER BY CASE WHEN $4::TEXT IS NULL THEN rel.id::TEXT
@@ -715,8 +736,11 @@ impl TemplateReleasesStore {
                ON s.template_release_id = r.id
              GROUP BY r.id, r.template_name, r.type, r.hash, r.created_at, r.environment,
                       r.version_created_at
-             ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC"
+             ORDER BY r.version_created_at DESC, r.created_at DESC, r.id DESC",
+                digest_original = digest_original("rel"),
             ))
+            });
+            sqlx::query_as::<_, LatestReleaseRow>(sqlx::AssertSqlSafe(UNSCOPED.as_str()))
             .bind(template_name)
             .bind(runtime)
             .bind(limit)

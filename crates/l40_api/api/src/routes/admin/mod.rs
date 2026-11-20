@@ -38,6 +38,7 @@ mod api_key_store;
 mod api_keys;
 pub mod audit;
 mod docs;
+mod firewall_rules;
 mod identity;
 mod node_group_store;
 pub mod node_groups;
@@ -163,6 +164,11 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             get(operations::get_admin_operation),
         )
         .route("/audit-events", get(audit::list_audit_events))
+        .route("/firewall-rules", get(firewall_rules::get_adopted))
+        .route(
+            "/firewall-rollouts",
+            axum::routing::post(firewall_rules::start_rollout),
+        )
         .route(
             "/runtime-environments",
             get(runtime_environments::get_runtime_environments),

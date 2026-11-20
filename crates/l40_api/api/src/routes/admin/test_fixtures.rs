@@ -114,6 +114,42 @@ impl AdminRouterHarness {
         headers: &[(&str, &str)],
         body: Option<serde_json::Value>,
     ) -> (axum::http::StatusCode, serde_json::Value) {
+        self.send(
+            token,
+            method,
+            path,
+            headers,
+            body.map(|body| body.to_string()),
+        )
+        .await
+    }
+
+    /// [`Self::call`] as the operator with a literal body, for bytes a JSON
+    /// value can't hold, such as a duplicate key.
+    pub(super) async fn as_operator_raw(
+        &self,
+        method: axum::http::Method,
+        path: &str,
+        body: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        self.send(
+            Some(&self.operator_token),
+            method,
+            path,
+            &[],
+            Some(body.to_owned()),
+        )
+        .await
+    }
+
+    async fn send(
+        &self,
+        token: Option<&str>,
+        method: axum::http::Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<String>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
         use tower::ServiceExt as _;
 
         let mut request = axum::http::Request::builder()
@@ -126,9 +162,7 @@ impl AdminRouterHarness {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let body = body.map_or_else(axum::body::Body::empty, |body| {
-            axum::body::Body::from(body.to_string())
-        });
+        let body = body.map_or_else(axum::body::Body::empty, axum::body::Body::from);
         let response = self
             .app
             .clone()

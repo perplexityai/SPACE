@@ -98,6 +98,34 @@ async fn a_pull_takes_the_builds_binding_when_its_release_records_none() -> Test
         .map(|node| node.id)
         .collect();
     assert_eq!(pulled, BTreeSet::from([puller]));
+
+    // And one recorded under the `sha256:` spelling binds a pull that names
+    // the legacy unprefixed one, as a tag left on a legacy release reports.
+    let unprefixed = "2222333344445555666677778888999900001111bbbbccccddddeeeeffff0000";
+    insert_template_inventory(
+        &fixture.pool,
+        holder,
+        "canonical-spelled",
+        &format!("sha256:{unprefixed}"),
+        "9.0.0",
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE node_template_inventory
+         SET execution_metadata = jsonb_build_object('environment', $2::TEXT)
+         WHERE node_id = $1 AND template_name = 'canonical-spelled'"
+    ))
+    .bind(holder)
+    .bind(E1)
+    .execute(&fixture.pool)
+    .await?;
+    let pulled: BTreeSet<NodeId> = gated(&fixture, On)
+        .pull_on_create_worker_candidates("canonical-spelled", Some(unprefixed), "fc")
+        .await?
+        .into_iter()
+        .map(|node| node.id)
+        .collect();
+    assert_eq!(pulled, BTreeSet::from([puller]));
     Ok(())
 }
 

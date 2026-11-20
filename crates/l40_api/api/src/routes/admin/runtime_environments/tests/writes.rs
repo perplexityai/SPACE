@@ -687,11 +687,16 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     let Some(h) = harness().await? else {
         return Ok(());
     };
-    let (e0, e1) = (environment(0), environment(1));
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
     h.set_default(e1).await;
     let allow_e0 = || h.set_state(e0, json!({"state": "allowed", "reason": "back"}));
     let block_e0 = || h.set_state(e0, json!({"state": "blocked", "reason": "0-day"}));
+    let block_e2 = || h.set_state(e2, json!({"state": "blocked", "reason": "0-day"}));
     let (status, _) = allow_e0().await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .set_state(e2, json!({"state": "allowed", "reason": "new"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
 
     // Superseded: untagged and unpooled, so reachable only by its exact hash.
@@ -719,6 +724,44 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     .await?;
     let (status, body) = block_e0().await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    allow_e0().await;
+
+    // Tagged through the other spelling: a tag written before the shared
+    // original-release rule names the canonical release, and creates by tag
+    // resolve to the digest's original, the older bare one bound to e0.
+    let bare = insert_template_release(&h.db.pool, "spelled", Some(metadata(Some(e0)))).await?;
+    let hash: String = sqlx::query_scalar(sql!(
+        "UPDATE template_releases
+         SET hash = replace(hash, 'sha256:', ''), created_at = NOW() - INTERVAL '1 hour'
+         WHERE id = $1
+         RETURNING 'sha256:' || hash"
+    ))
+    .bind(bare)
+    .fetch_one(&h.db.pool)
+    .await?;
+    let canonical: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('spelled', 'fc', $1, $2)
+         RETURNING id"
+    ))
+    .bind(&hash)
+    .bind(sqlx::types::Json(metadata(Some(e2))))
+    .fetch_one(&h.db.pool)
+    .await?;
+    tag_release(&h.db.pool, canonical, "spelled", "latest").await?;
+    let (status, body) = block_e0().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    // An API image that predates the rule creates from the tagged release
+    // itself, so its environment can't be blocked either while one may serve.
+    let (status, body) = block_e2().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    sqlx::query(sql!(
+        "DELETE FROM template_release_tags WHERE template_name = 'spelled'"
+    ))
+    .execute(&h.db.pool)
+    .await?;
     allow_e0().await;
 
     // Tagged: creates by tag resolve to it.

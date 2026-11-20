@@ -1139,8 +1139,9 @@ async fn resolution_spans_both_hash_spellings() -> TestResult {
 
 /// An unbound release takes the initial environment's catalog entry too:
 /// while the initial environment is the default, it ties with an initial-bound
-/// release of the build under the other hash spelling and the query's spelling
-/// breaks the tie, so a bare tagged release keeps its creates. Once the
+/// release of the build under the other hash spelling, and the digest
+/// original's spelling breaks the tie whichever spelling the query names, so
+/// creates by either spelling run the release the warm pool warms. Once the
 /// default moves on, both initial-environment releases fall to the
 /// original-environment fallback tier (even with `e0` still `allowed`), so the
 /// `deprecated` campaign twin serves both spellings.
@@ -1160,13 +1161,13 @@ async fn an_unbound_release_ranks_with_the_initial_environments_catalog_entry() 
     let bound_e0 = insert_release(&db.pool, TEMPLATE, HASH, Some(metadata(e0))).await?;
     insert_location(&db.pool, bound_e0, LOCATION).await?;
     set_default(&db.pool, e0).await?;
-    for (hash, expected) in [(bare, unbound), (HASH, bound_e0)] {
+    for hash in [bare, HASH] {
         assert_eq!(
             resolved_release(&db.pool, TEMPLATE, hash, e0)
                 .await?
                 .map(|(id, _)| id),
-            Some(expected),
-            "{hash}"
+            Some(unbound),
+            "{hash}: the older storage-backed spelling is the digest original, not {bound_e0}"
         );
     }
     let twin_e1 = twin_of(&db.pool, unbound, e1).await?;
