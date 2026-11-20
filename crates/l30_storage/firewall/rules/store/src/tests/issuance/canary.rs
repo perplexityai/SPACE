@@ -90,12 +90,13 @@ async fn only_a_canary_is_claimed_and_issued() -> TestResult {
 }
 
 /// Catches a dead claimant's unissued claim that holds the canary forever;
-/// a stale claimant that issues under, or changes, its successor's lease; and a
-/// lapsed lease on an issued item taken back as if its issuance were
-/// abandoned, when it may be a check's.
+/// a lapsed claim taken back after a pause that committed while recovery
+/// waited for the header; a stale claimant that issues under, or changes, its
+/// successor's lease; and a lapsed lease on an issued item taken back as if
+/// its issuance were abandoned, when it may be a check's.
 #[tokio::test(flavor = "current_thread")]
 async fn only_an_unissued_lapsed_claim_is_taken_back() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
         return Ok(());
     };
     let rollout = rollout(&db.pool, "canary").await?;
@@ -105,6 +106,29 @@ async fn only_an_unissued_lapsed_claim_is_taken_back() -> TestResult {
     assert_eq!(claim(&db.pool).await?, None, "a second claim in flight");
 
     lapse(&db.pool, rollout, stale.node_id).await?;
+    let row = || async {
+        sqlx::query_scalar::<_, String>(sql!(
+            "SELECT to_jsonb(i)::text
+             FROM firewall_rules_rollout_items i
+             WHERE rollout_id = $1 AND node_id = $2"
+        ))
+        .bind(rollout)
+        .bind(stale.node_id)
+        .fetch_one(&db.pool)
+        .await
+    };
+    let lapsed = row().await?;
+    let mut pausing = hold_header(&db.pool, rollout).await?;
+    let pool = db.pool.clone();
+    let claiming = tokio::spawn(async move { claim(&pool).await });
+    wait_for_lock_waiters(&db.pool, 1).await?;
+    set_phase(&mut *pausing, rollout, "paused").await?;
+    pausing.commit().await?;
+    let raced = tokio::time::timeout(Duration::from_secs(10), claiming).await;
+    assert_eq!(raced???, None);
+    assert_eq!(row().await?, lapsed, "recovered after the pause");
+
+    set_phase(&db.pool, rollout, "canary").await?;
     let successor = claim(&db.pool).await?.expect("the lapsed claim taken back");
     assert_eq!((successor.node_id, successor.attempts), (stale.node_id, 2));
     let held = lease_of(&db.pool, rollout, successor.node_id).await?;
