@@ -690,24 +690,27 @@ pub async fn let_go_v2_node(
         == 1)
 }
 
+/// The `drain_status` id set `key` with the ids of the `TEXT[]` parameter
+/// `param` added, sorted and without repeats.
+fn id_set_union(key: &str, param: &str) -> String {
+    format!(
+        "(SELECT COALESCE(jsonb_agg(ids.sandbox_id ORDER BY ids.sandbox_id), '[]'::JSONB)
+            FROM (
+                  SELECT jsonb_array_elements_text(
+                             COALESCE(drain_status->'{key}', '[]'::JSONB)
+                         ) AS sandbox_id
+                  UNION
+                  SELECT unnest({param}::TEXT[])
+                 ) AS ids)"
+    )
+}
+
 /// `$1` = node id, `$2` = generation, `$3` = report, `$4` = the sandboxes it
 /// lists running, `$5` = the evacuations recorded. Stores the report and
 /// adds to the two id sets, each kept sorted and without repeats.
 static RECORD_V2_REPORT_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let union = |key: &str, param: &str| {
-        format!(
-            "(SELECT COALESCE(jsonb_agg(ids.sandbox_id ORDER BY ids.sandbox_id), '[]'::JSONB)
-                FROM (
-                      SELECT jsonb_array_elements_text(
-                                 COALESCE(drain_status->'{key}', '[]'::JSONB)
-                             ) AS sandbox_id
-                      UNION
-                      SELECT unnest({param}::TEXT[])
-                     ) AS ids)"
-        )
-    };
-    let observed_running = union("observed_running", "$4");
-    let evacuated_total = union("evacuated_total", "$5");
+    let observed_running = id_set_union("observed_running", "$4");
+    let evacuated_total = id_set_union("evacuated_total", "$5");
     sql!(format!(
         "UPDATE nodes
             SET drain_status = drain_status || jsonb_build_object(
@@ -745,6 +748,48 @@ pub async fn record_v2_report(
             .bind(running)
             .bind(evacuated)
             .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+/// `$1` = node id, `$2` = generation, `$3` = the sandboxes evacuated.
+static ADD_V2_EVACUATED_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let evacuated_total = id_set_union("evacuated_total", "$3");
+    sql!(format!(
+        "UPDATE nodes
+            SET drain_status = drain_status
+                    || jsonb_build_object('evacuated_total', {evacuated_total})
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND {GENERATION} = $2
+            AND EXISTS (
+                SELECT 1 FROM UNNEST($3::TEXT[]) AS added(id)
+                 WHERE NOT COALESCE(drain_status->'evacuated_total', '[]'::JSONB) ? added.id
+            )"
+    ))
+});
+
+/// Add `evacuated`, the sandboxes the drain under `generation` finds
+/// durable and still homed on its `drained` node, to
+/// `drain_status.evacuated_total`, which only grows. A sandbox the node
+/// evicted before a report named it evacuated is counted this way. The row
+/// is written only when one of them isn't in the set yet. Run it under the
+/// node's row lock. Returns whether it wrote: false when every one was
+/// counted already, or the row is no longer that generation's v2 drain.
+pub async fn add_v2_evacuated(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    generation: i64,
+    evacuated: &[String],
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(ADD_V2_EVACUATED_STATEMENT.as_str()))
+            .bind(node_id)
+            .bind(generation)
+            .bind(evacuated)
+            .execute(executor)
             .await?
             .rows_affected()
             == 1,

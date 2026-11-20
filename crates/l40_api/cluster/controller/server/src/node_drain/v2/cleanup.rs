@@ -1,4 +1,5 @@
-//! Cleanup: the terminate transaction's fence, dispatch, delete and let-go.
+//! Cleanup: the drained tick's count, the terminate transaction's fence,
+//! dispatch, delete and let-go.
 
 use super::*;
 
@@ -103,6 +104,18 @@ impl V2Node {
     /// recorded instance.
     pub(super) fn asked_instance(&self) -> Option<&str> {
         self.fenced().or(self.instance_id.as_deref())
+    }
+}
+
+/// Add every durably suspended row still homed on a `drained` node to its drain's
+/// `evacuated_total`: a `drain_status` write only.
+pub(super) async fn count_drained<S: DrainV2Sink>(sink: &S, node_id: NodeId, generation: u64) {
+    if let Err(error) = sink.count_drained_evacuations(node_id, generation).await {
+        sink.record_error(
+            node_id,
+            &format!("counting the drained node's durable rows evacuated failed: {error}"),
+        )
+        .await;
     }
 }
 
