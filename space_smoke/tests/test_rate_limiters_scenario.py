@@ -10,25 +10,44 @@ Those are pinned here.
 
 from __future__ import annotations
 
+import threading
 import unittest
+from threading import BrokenBarrierError
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest import mock
 
-from space_smoke.adapters import KindConfig, KindHarness
-from space_smoke.capabilities import LimiterProbeOutcome
+from space_smoke.adapters import (
+    LIMITER_ENV_VALUE_MAX,
+    KindConfig,
+    KindHarness,
+)
+from space_smoke.capabilities import EcwSandboxState, LimiterProbeOutcome
 from space_smoke.rate_limiters import (
+    LIMITER_ENV_KEYS,
+    LIVE_CAP_MESSAGE,
     PER_CLIENT_LIMIT_MESSAGE,
     SERVER_LIMIT_MESSAGE,
     RateLimiterAssertions,
     has_retry_after_seconds,
     is_limiter_rejection,
+    limiter_tightenings,
     status_histogram,
 )
-from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
+from space_smoke.runtime import (
+    CommandResult,
+    InvariantViolation,
+    ResourceScope,
+    SmokeConfigurationError,
+)
 
 
 def _outcome(status: int, message: str = "", retry_after: str | None = None) -> LimiterProbeOutcome:
     return LimiterProbeOutcome(status, retry_after, message, None, 0.0)
+
+
+def _created(sandbox_id: str = "sbx-1") -> LimiterProbeOutcome:
+    return LimiterProbeOutcome(201, None, "", sandbox_id, 0.0)
 
 
 class LimiterRejectionClassification(unittest.TestCase):
@@ -49,6 +68,38 @@ class LimiterRejectionClassification(unittest.TestCase):
             {"429 Server rate limit": 1, "429 Per-client rate limit": 1, "201": 1},
         )
 
+    def test_every_recognized_refusal_gets_its_own_histogram_key(self) -> None:
+        # A refusal the histogram does not know records as a bare status: a
+        # live-cap 429 would read like a placement 429, and a capacity 503 like
+        # any other unavailability. The phases whose verdicts turn on *which*
+        # limiter answered record that histogram as their evidence, so a
+        # missing entry costs the evidence rather than the verdict -- which is
+        # worse, because the run still passes.
+        # Written out rather than read from `LIMITER_MESSAGES`, so dropping an
+        # entry there fails here instead of shrinking the input with it.
+        refusals = [
+            _outcome(429, "Server rate limit: activation bucket empty", "1"),
+            _outcome(429, "Per-client rate limit: too many in flight", "1"),
+            _outcome(429, "Client live sandbox cap reached: at its cap", "1"),
+            _outcome(503, "Server capacity limit: no free slot", "1"),
+            _outcome(429, "Server capacity limit: no eligible activation nodes", "1"),
+        ]
+        histogram = status_histogram(
+            refusals + [_outcome(429, "no eligible node has capacity", "5"), _outcome(503, "down")]
+        )
+        self.assertEqual(
+            histogram,
+            {
+                "429 Server rate limit": 1,
+                "429 Per-client rate limit": 1,
+                "429 Client live sandbox cap reached": 1,
+                "503 Server capacity limit": 1,
+                "429 Server capacity limit": 1,
+                "429": 1,
+                "503": 1,
+            },
+        )
+
     def test_retry_after_must_be_delta_seconds(self) -> None:
         self.assertTrue(has_retry_after_seconds(_outcome(429, "", "7")))
         self.assertTrue(has_retry_after_seconds(_outcome(429, "", " 12 ")))
@@ -58,9 +109,21 @@ class LimiterRejectionClassification(unittest.TestCase):
 
 
 class _Fixture:
+    # Zero timeout so a bounded poll reads once and then judges that read:
+    # these tests are about the verdicts, not about the waiting.
+    lifecycle_transition_timeout = 0
+    lifecycle_poll_interval = 0
+
     def __init__(self) -> None:
         self.sandbox = SimpleNamespace(sandbox_id="sbx_x")
         self.records: dict[str, object] = {}
+
+    def wait(self, seconds: float, *, reason: str | None = None) -> None:
+        return None
+
+    def sandbox_template_name(self) -> str:
+        return "seed"
+
 
     def record(self, name: str, value: object) -> None:
         self.records[name] = value
@@ -126,6 +189,17 @@ class PerClientVerdict(unittest.TestCase):
             assertions.sweep_admitted()
         self.assertEqual(probe.kills, 1)
 
+    def test_an_unanswered_create_is_reconciled_and_finding_nothing_is_fine(self) -> None:
+        # The API may have committed a create whose answer was lost, so the
+        # sweep looks; `_Probe.kill_matching` finds nothing and raises.
+        probe = _Probe(_outcome(0, "timed out"))
+        assertions = self._assertions(probe)
+        assertions.create_once()
+        assertions.sweep_admitted()
+        self.assertEqual(probe.kills, 1)
+        records = cast(Any, assertions)._fixture.records
+        self.assertEqual(records["unanswered_creates_unmatched"]["count"], 1)
+
     def test_redis_restoration_is_armed_before_the_scale_to_zero(self) -> None:
         control = _RedisControl()
         scope = ResourceScope()
@@ -172,6 +246,835 @@ class PerClientVerdict(unittest.TestCase):
             ):
                 assertions.expect_fail_open(rejected)
 
+    def test_a_flood_that_admitted_nothing_is_not_evidence_of_no_caps(self) -> None:
+        # By this phase the earlier ones have left the cluster holding a good
+        # many sandboxes, so "no limiter refused anything" is also true of a
+        # flood where every create failed for capacity. An assertion of
+        # absence needs a possible presence.
+        assertions = self._assertions()
+        with self.assertRaisesRegex(InvariantViolation, "admitting nothing at all"):
+            assertions.expect_admitted_by_default(
+                [_outcome(503, "Server capacity limit: no free slot"), _outcome(0, "timed out")]
+            )
+
+    def test_the_default_configuration_must_admit_what_it_admitted_before(self) -> None:
+        # The converse of the other verdicts: those prove the limiters reject
+        # once configured, this proves an unconfigured cluster still admits.
+        # Both limiter messages count, since either cap shipping on by
+        # accident is the regression; a placement 429 or a 500 does not,
+        # because neither says anything about the caps.
+        assertions = self._assertions()
+        assertions.expect_admitted_by_default(
+            [_created(), _outcome(429, "no eligible node has capacity", "5"), _outcome(500)]
+        )
+        # A request with no answer could have been a limiter refusal.
+        with self.assertRaisesRegex(InvariantViolation, "got no answer"):
+            assertions.expect_admitted_by_default([_created(), _outcome(0, "timed out")])
+        # A 201 whose body named no sandbox isn't an admission.
+        with self.assertRaisesRegex(InvariantViolation, "admitting nothing at all"):
+            assertions.expect_admitted_by_default([_outcome(201), _outcome(500)])
+        # Every 429 limiter refusal, the live cap included: a default that
+        # started refusing through any of them is the regression this phase is
+        # for.
+        for refused in (SERVER_LIMIT_MESSAGE, PER_CLIENT_LIMIT_MESSAGE, LIVE_CAP_MESSAGE):
+            with self.subTest(message=refused):
+                with self.assertRaisesRegex(InvariantViolation, "at the release defaults"):
+                    assertions.expect_admitted_by_default(
+                        [_created(), _outcome(429, f"{refused} x", "2")]
+                    )
+
+
+def _stock_env(**overrides: str | None) -> dict[str, str | None]:
+    # What the kind chart renders: the two env masters present and the rest
+    # unset (`space-api-local` deployment template and values).
+    env: dict[str, str | None] = dict.fromkeys(LIMITER_ENV_KEYS)
+    env["SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"] = ""
+    env["SPACE_API_CLIENT_CONCURRENCY_MODE"] = "observe"
+    env.update(overrides)
+    return env
+
+
+class ReleaseDefaultGate(unittest.TestCase):
+    """The default-admission verdict runs only on an env it can judge.
+
+    A stock bench always renders the release defaults, so the case this gate
+    exists for -- a standing env that tightens a limiter, and would refuse
+    part of the burst correctly -- never reaches a bench run.
+    """
+
+    def test_the_stock_env_tightens_nothing(self) -> None:
+        self.assertEqual(limiter_tightenings(_stock_env()), [])
+
+    def test_each_stricter_setting_is_named(self) -> None:
+        for key, value in (
+            ("SPACE_API_CLIENT_CONCURRENCY_MODE", " Enforce "),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST", "3"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS", "0.1"),
+            ("SPACE_API_CLIENT_LIVE_CAP_PER_CLIENT", "1"),
+            ("SPACE_API_CLIENT_LIVE_CAP_UNKNOWN", "+4"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED", " Yes "),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    limiter_tightenings(_stock_env(**{key: value})), [f"{key}={value}"]
+                )
+
+    def test_values_the_api_ignores_read_as_the_default(self) -> None:
+        # Each falls back to the release default in the API's own parsing, so
+        # none makes a limiter stricter.
+        for key, value in (
+            ("SPACE_API_CLIENT_CONCURRENCY_MODE", "enforcing"),
+            ("SPACE_API_CLIENT_CONCURRENCY_MODE", "off"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST", "0.5"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST", "1_0"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST", "nan"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST", "120"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS", "0"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS", "-1"),
+            ("SPACE_API_CLIENT_LIVE_CAP_PER_CLIENT", "0"),
+            ("SPACE_API_CLIENT_LIVE_CAP_PER_CLIENT", "-1"),
+            ("SPACE_API_CLIENT_LIVE_CAP_UNKNOWN", str(2**64)),
+            ("SPACE_API_CLIENT_LIVE_CAP_UNKNOWN", "one"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED", "off"),
+            ("SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED", "maybe"),
+        ):
+            with self.subTest(key=key, value=value):
+                self.assertEqual(limiter_tightenings(_stock_env(**{key: value})), [])
+
+    def test_a_disabled_activation_limiter_cannot_be_tightened(self) -> None:
+        env = _stock_env(
+            SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED="Off",
+            SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST="1",
+        )
+        self.assertEqual(limiter_tightenings(env), [])
+        # The slot check isn't behind that switch: the API runs it either way.
+        env["SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED"] = "true"
+        self.assertEqual(
+            limiter_tightenings(env), ["SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED=true"]
+        )
+        del env["SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED"]
+        # An unrecognized value keeps the default, which is on.
+        env["SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"] = "maybe"
+        self.assertEqual(limiter_tightenings(env), ["SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST=1"])
+
+    def test_the_gate_judges_the_captured_env_and_records_why(self) -> None:
+        fixture = _Fixture()
+        assertions = RateLimiterAssertions(
+            cast(Any, fixture), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+        with self.assertRaisesRegex(RuntimeError, "enable_limiters"):
+            assertions.judges_release_defaults()
+        assertions._standing = _stock_env()
+        self.assertTrue(assertions.judges_release_defaults())
+        assertions._standing = _stock_env(SPACE_API_CLIENT_CONCURRENCY_MODE="enforce")
+        self.assertFalse(assertions.judges_release_defaults())
+        self.assertEqual(
+            fixture.records["default_admission_tightened_env"],
+            ["SPACE_API_CLIENT_CONCURRENCY_MODE=enforce"],
+        )
+        # An unset key may come back from `envFrom` after the restore.
+        assertions._standing = _stock_env()
+        assertions._standing_env_from = True
+        self.assertFalse(assertions.judges_release_defaults())
+        self.assertIn(
+            "SPACE_API_CLIENT_LIVE_CAP_PER_CLIENT",
+            cast(list[str], fixture.records["default_admission_unread_env_from"]),
+        )
+
+
+class ControlIsolationVerdict(unittest.TestCase):
+    """The isolation verdict only passes on control reconnects that worked.
+
+    A bench run cannot show this: on a healthy cluster the control arm
+    succeeds, so the cases that matter — a control arm that answered only
+    404, 500, or a cluster-level 429 — never occur there. Each is a response
+    set the per-client gate stays quiet through, which is exactly why
+    "no per-client 429" was never evidence that a second client kept working.
+    """
+
+    def _assertions(self) -> RateLimiterAssertions:
+        return RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+
+    @staticmethod
+    def _saturated_noisy() -> list[LimiterProbeOutcome]:
+        # 200, not 201: these stand in for reconnects, and `/connect` answers
+        # 200. A fixture status the path cannot produce is a fixture that has
+        # drifted from what it claims to represent.
+        rejected = _outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")
+        return [rejected] * 17 + [_outcome(200)] * 3
+
+    def test_a_successful_control_arm_passes_and_records_both_arms(self) -> None:
+        # The recorded evidence is the assertion: without it this passes with
+        # `expect_control_isolated` replaced by `pass`.
+        assertions = self._assertions()
+        control = [_outcome(200)] * 3
+        assertions.expect_control_isolated(self._saturated_noisy(), control)
+        records = cast(Any, assertions)._fixture.records
+        self.assertEqual(records["isolation_control_statuses"], {"200": 3})
+        self.assertEqual(
+            records["isolation_noisy_statuses"], {"200": 3, "429 Per-client rate limit": 17}
+        )
+
+    def test_a_control_arm_that_never_succeeded_fails_whatever_it_answered(self) -> None:
+        # Every response set the per-client gate stays quiet through: not
+        # found, a server error, and the *cluster* limiter's own 429. Each
+        # passes all four per-client verdicts, so only the success verdict
+        # bites — which is the whole reason it exists.
+        for answer in (
+            _outcome(404, "sandbox not found"),
+            _outcome(500, "internal error"),
+            _outcome(429, f"{SERVER_LIMIT_MESSAGE} shedding", "6"),
+        ):
+            with self.subTest(status=answer.status, message=answer.message):
+                with self.assertRaisesRegex(InvariantViolation, "control reconnects succeeded"):
+                    self._assertions().expect_control_isolated(
+                        self._saturated_noisy(), [answer] * 3
+                    )
+
+    def test_a_partly_successful_control_arm_fails(self) -> None:
+        control = [_outcome(200), _outcome(404, "gone"), _outcome(200)]
+        with self.assertRaisesRegex(InvariantViolation, "only 2 of 3"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_a_noisy_arm_that_only_ever_lost_fails(self) -> None:
+        # A shape a shared bucket wears when every other verdict holds: the
+        # control requests take all of the bucket's slots, so the noisy arm
+        # sees nothing but per-client 429s while the control arm succeeds.
+        # Requiring one noisy admission rejects that reading. It does not make
+        # the round a proof — slots churn while a wave is in flight, so one
+        # bucket can still satisfy every verdict on favourable timings (see
+        # `expect_control_isolated`); it removes the shape a broken limiter
+        # most often produces.
+        noisy = [_outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")] * 20
+        control = [_outcome(200)] * 3
+        with self.assertRaisesRegex(InvariantViolation, "distinguishes one shared bucket"):
+            self._assertions().expect_control_isolated(noisy, control)
+
+    def test_a_bucket_both_arms_share_names_isolation_not_starvation(self) -> None:
+        # A shared bucket rejects both arms, which satisfies neither the
+        # isolation verdict nor the noisy-admitted one. The round has to fail
+        # on the first of those: "not on separate buckets" is the true
+        # statement, and "admitted nothing" would describe the noisy arm as
+        # starved and say nothing about the two clients sharing.
+        rejected = _outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")
+        with self.assertRaisesRegex(InvariantViolation, "not on separate buckets"):
+            self._assertions().expect_control_isolated([rejected] * 20, [rejected] * 3)
+
+    def test_an_empty_arm_fails_rather_than_passing_by_vacuity(self) -> None:
+        # An empty *control* arm satisfies three verdicts for the wrong
+        # reason: nothing unanswered, nothing rejected, and all zero of its
+        # requests succeeded. An empty *noisy* arm would instead reach the
+        # saturation verdict, which is a true-but-unhelpful reading of the
+        # same mistake. Both mean the round asked the limiter nothing, so the
+        # guard refuses them up front and neither reaches a verdict at all.
+        with self.assertRaisesRegex(InvariantViolation, "an arm was empty"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), [])
+        with self.assertRaisesRegex(InvariantViolation, "an arm was empty"):
+            self._assertions().expect_control_isolated([], [_outcome(200)] * 3)
+
+    def test_an_idle_limiter_fails_even_with_a_clean_control_arm(self) -> None:
+        # Nothing metered: the control arm's success says nothing about
+        # isolation because no client was ever over cap.
+        noisy = [_outcome(200)] * 20
+        control = [_outcome(200)] * 3
+        with self.assertRaisesRegex(InvariantViolation, "drew no 429"):
+            self._assertions().expect_control_isolated(noisy, control)
+
+    def test_an_unanswered_control_request_is_not_a_clean_one(self) -> None:
+        control = [_outcome(200), _outcome(0, "connection refused"), _outcome(200)]
+        with self.assertRaisesRegex(InvariantViolation, "no status at all"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+
+class _LiveCapControl:
+    def __init__(self, live: int) -> None:
+        self._live = live
+
+    def live_client_sandboxes(self, client_id: str) -> list[str]:
+        return [f"sbx-{index}" for index in range(self._live)]
+
+
+class LiveCapPlateauVerdict(unittest.TestCase):
+    """The plateau verdicts. A healthy bench produces none of the failures.
+
+    On a working build the cap admits up to itself and refuses past it, so a
+    cap that admits nothing, one that never refuses, one that overshoots, and
+    a refusal with no `Retry-After` never occur there.
+    """
+
+    def _assertions(self, *, cap: int = 1, live: int = 1) -> RateLimiterAssertions:
+        assertions = RateLimiterAssertions(
+            cast(Any, _Fixture()),
+            cast(Any, _LiveCapControl(live)),
+            cast(Any, None),
+            ResourceScope(),
+        )
+        cast(Any, assertions)._live_cap = cap
+        return assertions
+
+    @staticmethod
+    def _refusal() -> LimiterProbeOutcome:
+        return _outcome(429, f"{LIVE_CAP_MESSAGE} client key is at its cap", "3")
+
+    def test_a_cap_that_admitted_nothing_is_not_a_cap(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "admitting up to it"):
+            self._assertions().expect_live_cap_plateau(
+                [self._refusal(), self._refusal()], [_outcome(200)]
+            )
+
+    def test_a_cap_that_never_refused_fails(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "never fired"):
+            self._assertions().expect_live_cap_plateau([_outcome(200)], [_outcome(200)])
+
+    def test_a_live_cap_429_without_retry_after_fails(self) -> None:
+        bare = _outcome(429, f"{LIVE_CAP_MESSAGE} client key is at its cap")
+        with self.assertRaisesRegex(InvariantViolation, "no Retry-After"):
+            self._assertions().expect_live_cap_plateau([_outcome(200), bare], [_outcome(200)])
+
+    def test_more_admissions_than_the_cap_fails(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "against a cap of 1"):
+            self._assertions().expect_live_cap_plateau(
+                [_outcome(200), _outcome(200), self._refusal()], [_outcome(200)]
+            )
+
+    def test_more_pods_than_the_cap_fails(self) -> None:
+        # The API refused past the cap, but the sandboxes it already admitted
+        # outnumber it, so the cap guarded the answers and not the cluster.
+        with self.assertRaisesRegex(InvariantViolation, "live sandboxes against"):
+            self._assertions(live=3).expect_live_cap_plateau(
+                [_outcome(200), self._refusal()], [_outcome(200)]
+            )
+
+    def test_an_admission_that_produced_no_pod_fails(self) -> None:
+        # The direction `<= cap` alone cannot see: one wake answered 200 and
+        # placed nothing, so every answer-side verdict passes while the cap
+        # guards an empty cluster. `0 <= 1` would have called this a plateau.
+        with self.assertRaisesRegex(InvariantViolation, "live sandboxes against"):
+            self._assertions(live=0).expect_live_cap_plateau(
+                [_outcome(200), self._refusal()], [_outcome(200)]
+            )
+
+    def test_a_refused_control_reconnect_fails(self) -> None:
+        for refusal in (self._refusal(), _outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} x", "2")):
+            with self.subTest(message=refusal.message):
+                with self.assertRaisesRegex(InvariantViolation, "already-running sandbox"):
+                    self._assertions().expect_live_cap_plateau(
+                        [_outcome(200), self._refusal()], [_outcome(200), refusal]
+                    )
+
+    def test_a_refusal_before_the_client_held_anything_fails(self) -> None:
+        # The totals match a plateau, one admitted and one refused, but the
+        # cap answered the first wake while the client held nothing.
+        with self.assertRaisesRegex(InvariantViolation, "before the client held 1"):
+            self._assertions().expect_live_cap_plateau(
+                [self._refusal(), _outcome(200)], [_outcome(200)]
+            )
+
+    def test_an_admitted_target_missing_from_the_live_sandboxes_fails(self) -> None:
+        # One live sandbox, `sbx-0`, but the admitted wake was `sbx-1`: the count
+        # came from some other sandbox.
+        with self.assertRaisesRegex(InvariantViolation, "isn't among the client's live"):
+            self._assertions().expect_live_cap_plateau(
+                [_outcome(200), self._refusal()], [_outcome(200)], targets=["sbx-1", "sbx-0"]
+            )
+
+    def test_the_admitted_target_among_the_live_sandboxes_passes(self) -> None:
+        self._assertions().expect_live_cap_plateau(
+            [_outcome(200), self._refusal()], [_outcome(200)], targets=["sbx-0", "sbx-1"]
+        )
+
+    def test_targets_that_do_not_pair_with_the_wakes_fail(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "1 targets for 2 wakes"):
+            self._assertions().expect_live_cap_plateau(
+                [_outcome(200), self._refusal()], [_outcome(200)], targets=["sbx-0"]
+            )
+
+    def test_a_refused_reconnect_by_the_capped_client_fails(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "capped client's reconnect"):
+            self._assertions().expect_live_cap_plateau(
+                [_outcome(200), self._refusal()],
+                [_outcome(200)],
+                capped_reconnects=[self._refusal()],
+            )
+
+    def test_an_empty_arm_fails_rather_than_passing_by_vacuity(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "asked the cap nothing"):
+            self._assertions().expect_live_cap_plateau([], [_outcome(200)])
+
+    def test_a_plateau_passes_and_records_both_the_answers_and_the_pods(self) -> None:
+        assertions = self._assertions()
+        assertions.expect_live_cap_plateau([_outcome(200), self._refusal()], [_outcome(200)])
+        records = cast(Any, assertions)._fixture.records
+        self.assertEqual(records["live_cap_statuses"], {"200": 1, "429 Client live sandbox cap reached": 1})
+        self.assertEqual(records["live_cap_live_sandboxes"], 1)
+
+
+class _AttributionControl:
+    def __init__(self, labels: list[str], row: str | None, *, column: bool = True) -> None:
+        self._labels = labels
+        self._row = row
+        self._column = column
+
+    def activation_attribution_available(self) -> bool:
+        return self._column
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        return list(self._labels)
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str | None:
+        return self._row
+
+
+class ClientAttributionVerdict(unittest.TestCase):
+    """The attribution verdicts.
+
+    A bench cannot produce the cases that matter: on a working build every pod
+    is labelled and the row agrees, so an unlabelled pod, a pod naming another
+    client, and a row that disagrees never occur there.
+    """
+
+    def _assertions(self, labels: list[str], row: str | None) -> RateLimiterAssertions:
+        return RateLimiterAssertions(
+            cast(Any, _Fixture()),
+            cast(Any, _AttributionControl(labels, row)),
+            cast(Any, None),
+            ResourceScope(),
+        )
+
+    def test_a_sandbox_with_no_pod_fails_rather_than_passing_by_vacuity(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "nothing"):
+            self._assertions([], "space-smoke").expect_client_attributed("sbx-1")
+
+    def test_an_unlabelled_pod_reads_as_never_written_not_as_written_wrong(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "never written"):
+            self._assertions(["space-smoke", ""], "space-smoke").expect_client_attributed("sbx-1")
+
+    def test_a_pod_naming_another_client_fails(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "other than"):
+            self._assertions(["someone-else"], "space-smoke").expect_client_attributed("sbx-1")
+
+    def test_a_missing_row_reads_as_missing_not_as_an_unset_column(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "has no row"):
+            self._assertions(["space-smoke"], None).expect_client_attributed("sbx-1")
+
+    def test_an_unset_column_reads_as_never_written_not_as_written_wrong(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "never written"):
+            self._assertions(["space-smoke"], "").expect_client_attributed("sbx-1")
+
+    def test_a_row_that_disagrees_with_the_pods_fails(self) -> None:
+        with self.assertRaisesRegex(InvariantViolation, "not 'space-smoke'"):
+            self._assertions(["space-smoke"], "someone-else").expect_client_attributed("sbx-1")
+
+    def test_a_fully_attributed_sandbox_passes_and_records_both_surfaces(self) -> None:
+        assertions = self._assertions(["space-smoke", "space-smoke"], "space-smoke")
+        assertions.expect_client_attributed("sbx-1")
+        recorded = cast(Any, assertions)._fixture.records["client_attribution"]
+        self.assertEqual(recorded["pod_labels"], ["space-smoke", "space-smoke"])
+        self.assertEqual(recorded["row"], "space-smoke")
+
+
+class WakeFloodTargets(unittest.TestCase):
+    """The control arm has to stay on the one request that takes no token.
+
+    A bench run cannot show this either: pointing the control arm at a
+    suspended sandbox still produces a round, and on a healthy cluster it may
+    well pass. What it would no longer be is a statement about the per-client
+    limiter -- the control requests would be queueing behind the shrunk
+    cluster activation bucket -- so the guard is what keeps the phase's
+    verdict about the thing it names.
+    """
+
+    def _assertions(self) -> RateLimiterAssertions:
+        return RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+
+    def test_a_control_target_that_is_itself_suspended_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cluster activation bucket"):
+            self._assertions().wake_flood(["sbx-a", "sbx-b"], "sbx-b")
+
+    def test_a_flood_with_nothing_suspended_is_refused(self) -> None:
+        # Otherwise the phase degrades into the reconnect round that already
+        # runs beside it, and passes while exercising no restore at all.
+        with self.assertRaisesRegex(ValueError, "no suspended targets"):
+            self._assertions().wake_flood([], "sbx-running")
+
+    def test_a_distinct_running_target_is_accepted_and_spread_over_the_fleet(self) -> None:
+        # The positive case, so the two refusals above are not the only thing
+        # the guard can do. The probe raises as soon as a request is built, so
+        # the round dies past the guards with the paths it would have sent.
+        assertions = self._assertions()
+        probe = _RecordingProbe()
+        cast(Any, assertions)._probe = probe
+        with self.assertRaises(_ProbeStop):
+            assertions.wake_flood(["sbx-a", "sbx-b"], "sbx-running", noisy=4, control=2)
+        self.assertEqual(
+            sorted(probe.paths),
+            sorted(
+                [
+                    "/sandboxes/sbx-a/connect",
+                    "/sandboxes/sbx-b/connect",
+                    "/sandboxes/sbx-a/connect",
+                    "/sandboxes/sbx-b/connect",
+                    "/sandboxes/sbx-running/connect",
+                    "/sandboxes/sbx-running/connect",
+                ]
+            ),
+        )
+
+
+class _FleetMember:
+    def __init__(self, sandbox_id: str, state: object) -> None:
+        self.sandbox_id = sandbox_id
+        self._state = state
+
+    def try_get_info(self):
+        return None if self._state is None else SimpleNamespace(state=self._state)
+
+
+class WakeFloodRestoredSomething(unittest.TestCase):
+    """The flood has to prove it took the restore path.
+
+    A `/connect` that answered 200 without restoring produces exactly the
+    statuses one that restored produces, so every status verdict in
+    `expect_control_isolated` passes either way. Statuses alone therefore
+    cannot separate this phase from the reconnect round beside it; only the
+    targets' own state can.
+    """
+
+    def _assertions(
+        self, members: list[_FleetMember], pod_phases: dict[str, list[str]] | None = None
+    ) -> RateLimiterAssertions:
+        pod_phases = pod_phases or {}
+        assertions = RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+        cast(Any, assertions)._wake_fleet = members
+        cast(Any, assertions)._control = SimpleNamespace(
+            sandbox_live_pod_phases=lambda sid: list(pod_phases.get(sid, ["Running"]))
+        )
+        return assertions
+
+    def test_a_member_ecw_calls_running_without_a_running_pod_has_not_woken(self) -> None:
+        # ECW renders `running` for a member still restoring, so the state
+        # alone would pass a flood whose restores never finished.
+        members = [_FleetMember("a", EcwSandboxState.RUNNING)]
+        with self.assertRaisesRegex(InvariantViolation, "reconnect storm, not a"):
+            cast(Any, self._assertions(members, {"a": ["Pending"]})).expect_flood_restored(
+                ["a"], label="wake_flood"
+            )
+
+    def test_a_flood_the_cluster_bucket_refused_says_so(self) -> None:
+        members = [_FleetMember("a", EcwSandboxState.PAUSED)]
+        refused = [_outcome(429, "Server rate limit: activation budget exhausted")] * 3
+        with self.assertRaisesRegex(InvariantViolation, "no noisy wake was admitted"):
+            cast(Any, self._assertions(members)).expect_flood_restored(
+                ["a"], refused, label="wake_flood"
+            )
+
+    def test_a_flood_that_restored_nothing_fails(self) -> None:
+        members = [_FleetMember("a", EcwSandboxState.PAUSED), _FleetMember("b", EcwSandboxState.PAUSED)]
+        with self.assertRaisesRegex(InvariantViolation, "reconnect storm, not a"):
+            cast(Any, self._assertions(members)).expect_flood_restored(["a", "b"], label="wake_flood")
+
+    def test_one_target_leaving_paused_is_enough(self) -> None:
+        members = [_FleetMember("a", EcwSandboxState.PAUSED), _FleetMember("b", EcwSandboxState.RUNNING)]
+        assertions = self._assertions(members)
+        cast(Any, assertions).expect_flood_restored(["a", "b"], label="wake_flood")
+        self.assertEqual(
+            cast(Any, assertions)._fixture.records["wake_flood_target_states"]["b"],
+            str(EcwSandboxState.RUNNING),
+        )
+
+    def test_a_reaped_target_does_not_count_as_woken(self) -> None:
+        # `try_get_info` answers None once a sandbox is gone, and a staged
+        # member can be reaped by its own timeout while the flood is being
+        # refused. Counting "deleted" as "left paused" would pass the verdict
+        # on a round that restored nothing -- the one case it exists to catch.
+        members = [_FleetMember("a", EcwSandboxState.PAUSED), _FleetMember("b", None)]
+        with self.assertRaisesRegex(InvariantViolation, "reconnect storm, not a"):
+            cast(Any, self._assertions(members)).expect_flood_restored(["a", "b"], label="wake_flood")
+
+    def test_flooding_ids_that_are_not_staged_fails_rather_than_passing_blind(self) -> None:
+        members = [_FleetMember("a", EcwSandboxState.RUNNING)]
+        with self.assertRaisesRegex(InvariantViolation, "staged fleet member"):
+            cast(Any, self._assertions(members)).expect_flood_restored(["z"], label="wake_flood")
+
+
+class _PausableMember(_FleetMember):
+    def __init__(self, sandbox_id: str, state: object) -> None:
+        super().__init__(sandbox_id, state)
+        self.pauses = 0
+
+    def pause(self) -> None:
+        self.pauses += 1
+        self._state = EcwSandboxState.PAUSED
+
+
+class ResuspendFleet(unittest.TestCase):
+    def test_only_members_the_flood_woke_are_suspended_again(self) -> None:
+        # The flood only has to restore one member. Suspending one it left
+        # suspended has no execution to stop, and the API refuses it.
+        woke = _PausableMember("a", EcwSandboxState.RUNNING)
+        stayed = _PausableMember("b", EcwSandboxState.PAUSED)
+        members = {"a": woke, "b": stayed}
+        assertions = RateLimiterAssertions(
+            cast(Any, _Fixture()),
+            cast(
+                Any,
+                SimpleNamespace(
+                    live_client_sandboxes=lambda _client: [],
+                    sandbox_live_pod_phases=lambda _sid: ["Running"],
+                    sandbox_lifecycle=lambda sid: (
+                        "suspended" if members[sid]._state is EcwSandboxState.PAUSED else "started"
+                    ),
+                ),
+            ),
+            cast(Any, None),
+            ResourceScope(),
+        )
+        cast(Any, assertions)._wake_fleet = [woke, stayed]
+        assertions.resuspend_fleet()
+        self.assertEqual((woke.pauses, stayed.pauses), (1, 0))
+
+
+
+class _WaitingFixture(_Fixture):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: list[float] = []
+
+    def wait(self, seconds: float, *, reason: str | None = None) -> None:
+        self.waits.append(seconds)
+
+
+class ActivationTokenWait(unittest.TestCase):
+    def _assertions(self, fixture: _WaitingFixture, refill: float) -> RateLimiterAssertions:
+        assertions = RateLimiterAssertions(
+            cast(Any, fixture), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+        cast(Any, assertions)._refill_rps = refill
+        return assertions
+
+    def test_waits_out_one_refill_interval_since_the_last_create(self) -> None:
+        fixture = _WaitingFixture()
+        assertions = self._assertions(fixture, 0.1)
+        cast(Any, assertions)._last_spend_at = 100.0
+        with mock.patch("space_smoke.rate_limiters.time.monotonic", return_value=103.0):
+            assertions.await_activation_token()
+        self.assertEqual(fixture.waits, [7.0])
+        self.assertEqual(fixture.records["activation_refill_wait_seconds"], 7.0)
+
+    def test_no_wait_once_the_interval_has_passed(self) -> None:
+        fixture = _WaitingFixture()
+        assertions = self._assertions(fixture, 0.1)
+        cast(Any, assertions)._last_spend_at = 100.0
+        with mock.patch("space_smoke.rate_limiters.time.monotonic", return_value=111.0):
+            assertions.await_activation_token()
+        self.assertEqual(fixture.waits, [])
+        self.assertEqual(fixture.records["activation_refill_wait_seconds"], 0.0)
+
+
+class _LeaseControl:
+    def __init__(self) -> None:
+        self.acquired = 0
+        self.released = 0
+
+    def acquire_public_api_mutation(self):
+        self.acquired += 1
+
+        def release() -> None:
+            self.released += 1
+
+        return release
+
+
+class MutationLease(unittest.TestCase):
+    def test_the_lease_is_taken_once_and_released_once(self) -> None:
+        # The scenario takes it before staging and `enable_limiters` asks
+        # again; a second acquire would contend with this run's own Lease.
+        control = _LeaseControl()
+        assertions = RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, control), cast(Any, None), ResourceScope()
+        )
+        assertions.acquire_mutation_lease()
+        assertions.acquire_mutation_lease()
+        self.assertEqual(control.acquired, 1)
+        assertions.release_mutation_lease()
+        self.assertEqual(control.released, 1)
+
+
+class _ScriptedProbe:
+    def __init__(self, outcomes: list[LimiterProbeOutcome]) -> None:
+        self.outcomes = list(outcomes)
+
+    def race_ecw_request(self, method, path, body, *, client_id, timeout, gate=None):
+        return self.outcomes.pop(0)
+
+
+class CreateUntilAdmitted(unittest.TestCase):
+    def _assertions(self, fixture: _WaitingFixture, outcomes) -> RateLimiterAssertions:
+        assertions = RateLimiterAssertions(
+            cast(Any, fixture), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+        cast(Any, assertions)._probe = _ScriptedProbe(outcomes)
+        return assertions
+
+    def test_waits_out_the_activation_429_and_returns_the_admitted_create(self) -> None:
+        fixture = _WaitingFixture()
+        throttled = _outcome(429, f"{SERVER_LIMIT_MESSAGE} bucket empty", "3")
+        admitted = _created("sbx-9")
+        got = self._assertions(fixture, [throttled, admitted]).create_until_admitted()
+        self.assertEqual(got.sandbox_id, "sbx-9")
+        self.assertEqual(fixture.waits, [3])
+
+    def test_another_failure_is_not_retried(self) -> None:
+        fixture = _WaitingFixture()
+        assertions = self._assertions(fixture, [_outcome(500, "boom"), _created()])
+        with self.assertRaisesRegex(InvariantViolation, "no create was admitted"):
+            assertions.create_until_admitted()
+        self.assertEqual(fixture.waits, [])
+
+    def test_gives_up_after_its_attempts(self) -> None:
+        fixture = _WaitingFixture()
+        throttled = _outcome(429, f"{SERVER_LIMIT_MESSAGE} bucket empty", "1")
+        assertions = self._assertions(fixture, [throttled] * 3)
+        with self.assertRaisesRegex(InvariantViolation, "in 3 attempts"):
+            assertions.create_until_admitted(attempts=3)
+        self.assertEqual(fixture.waits, [1, 1])
+
+
+class _ProbeStop(Exception):
+    """Raised by `_RecordingProbe` so a round dies before any barrier wait."""
+
+
+class _RecordingProbe:
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+        self.clients: set[str] = set()
+        self._lock = threading.Lock()
+
+    def race_ecw_request(self, method, path, body, *, client_id, timeout, gate=None):
+        with self._lock:
+            self.paths.append(path)
+            self.clients.add(client_id)
+        raise _ProbeStop(path)
+
+
+class RoundClientIds(unittest.TestCase):
+    def test_the_reconnect_round_runs_under_ids_the_wake_flood_never_used(self) -> None:
+        # A slot the wake flood still holds, released by a spawned task after
+        # its handler returned, mustn't be one the reconnect round's
+        # control arm, sized to the cap, needs.
+        assertions = RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+        cast(Any, assertions)._per_client_cap = 3
+        flood, reconnect = _RecordingProbe(), _RecordingProbe()
+        cast(Any, assertions)._probe = flood
+        with self.assertRaises(_ProbeStop):
+            assertions.wake_flood(["sbx-a"], "sbx-running", noisy=4, control=2)
+        cast(Any, assertions)._probe = reconnect
+        with self.assertRaises(_ProbeStop):
+            assertions.isolation_round("sbx-running", noisy=4, control=2)
+        self.assertEqual(len(flood.clients), 2)
+        self.assertEqual(len(reconnect.clients), 2)
+        self.assertFalse(flood.clients & reconnect.clients)
+
+
+class _RecordingBarrier:
+    """A `threading.Barrier` stand-in that records when it was aborted.
+
+    `abort_calls` holds, per abort, whether the barrier had already tripped.
+    An abort after the trip is the one that can break a party still leaving
+    `wait`, so the tests judge the contract from that record rather than by
+    trying to win the race.
+    """
+
+    instances: list[_RecordingBarrier] = []
+
+    def __init__(self, parties, action=None, timeout=None) -> None:
+        self._parties = parties
+        self._action = action
+        self._timeout = timeout
+        self._arrived = 0
+        self._tripped = False
+        self._broken = False
+        self._cond = threading.Condition()
+        self.abort_calls: list[bool] = []
+        self.timed_out = False
+        _RecordingBarrier.instances.append(self)
+
+    def wait(self) -> int:
+        with self._cond:
+            if self._broken:
+                raise BrokenBarrierError
+            self._arrived += 1
+            if self._arrived == self._parties:
+                if self._action is not None:
+                    self._action()
+                self._tripped = True
+                self._cond.notify_all()
+                return 0
+            if not self._cond.wait_for(lambda: self._tripped or self._broken, self._timeout):
+                self.timed_out = True
+            if not self._tripped:
+                self._broken = True
+                raise BrokenBarrierError
+            return 0
+
+    def abort(self) -> None:
+        with self._cond:
+            self.abort_calls.append(self._tripped)
+            self._broken = True
+            self._cond.notify_all()
+
+
+class _GateProbe:
+    """Every request passes the gate except `/early`, which raises before it;
+    `/boom` raises after it."""
+
+    def race_ecw_request(self, method, path, body, *, client_id, timeout, gate=None):
+        if path == "/early":
+            raise ValueError("before the gate")
+        gate()
+        if path == "/boom":
+            raise ValueError("after the gate")
+        return _outcome(200)
+
+
+class ReleaseTogetherAbort(unittest.TestCase):
+    def _round(self, first: str) -> _RecordingBarrier:
+        _RecordingBarrier.instances = []
+        assertions = RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+        cast(Any, assertions)._probe = _GateProbe()
+        with mock.patch("space_smoke.rate_limiters.Barrier", _RecordingBarrier):
+            with self.assertRaises(ValueError):
+                cast(Any, assertions)._release_together(
+                    [("a", "client-a", [(first, {})] + [("/ok", {})] * 3)],
+                    timeout=5,
+                    label="round",
+                    what="round",
+                )
+        (barrier,) = _RecordingBarrier.instances
+        return barrier
+
+    def test_a_raise_after_the_gate_never_aborts_the_tripped_barrier(self) -> None:
+        self.assertEqual(self._round("/boom").abort_calls, [])
+
+    def test_a_raise_before_the_gate_aborts_so_the_peers_are_not_stranded(self) -> None:
+        # The peers it breaks abort on their way out too; none of it is after
+        # a trip, because the barrier never tripped.
+        barrier = self._round("/early")
+        self.assertTrue(barrier.abort_calls)
+        self.assertNotIn(True, barrier.abort_calls)
+        # Released by the abort, not by sitting out the timeout.
+        self.assertFalse(barrier.timed_out)
+
 
 class _ScriptedKubectl:
     def __init__(self, results) -> None:
@@ -183,7 +1086,89 @@ class _ScriptedKubectl:
         return self.results.pop(0)
 
 
+class LiveClientSandboxCount(unittest.TestCase):
+    """The read has to count what the cap counts: sandboxes, not pods.
+
+    The cap's index maps a client-id label to *the sandboxes that have at
+    least one qualifying pod* -- a sandbox or restore pod that is neither
+    terminal nor being deleted. Counting pod names instead gets it wrong in
+    both directions, and a bench cannot show either: a wake legitimately has
+    a restore pod and a sandbox pod at once, so one capped sandbox reads as
+    two and reds a working cap; and a leftover terminating pod, which the cap
+    deliberately ignores, satisfies the "something was actually placed" bound
+    that exists to catch an admission which placed nothing.
+    """
+
+    def test_two_pods_of_one_sandbox_count_once_and_dead_pods_not_at_all(self) -> None:
+        kubectl = _ScriptedKubectl([CommandResult((), 0, '{"items": [{"metadata": {"name": "sbx-pod", "labels": {"space.pplx.net/sandbox-id": "0198a8a6-0000-7000-8000-000000000001"}}, "status": {"phase": "Running"}}, {"metadata": {"name": "restore-pod", "labels": {"space.pplx.net/sandbox-id": "0198a8a6-0000-7000-8000-000000000001"}}, "status": {"phase": "Running"}}, {"metadata": {"name": "leftover", "deletionTimestamp": "2026-11-16T00:00:00Z", "labels": {"space.pplx.net/sandbox-id": "0198a8a6-0000-7000-8000-000000000002"}}, "status": {"phase": "Running"}}, {"metadata": {"name": "done", "labels": {"space.pplx.net/sandbox-id": "0198a8a6-0000-7000-8000-000000000003"}}, "status": {"phase": "Succeeded"}}, {"metadata": {"name": "materialize", "annotations": {"space.pplx.net/checkpoint": "stopped-materialization"}, "labels": {"space.pplx.net/sandbox-id": "0198a8a6-0000-7000-8000-000000000004"}}, "status": {"phase": "Running"}}, {"metadata": {"name": "annotated", "annotations": {"space.pplx.net/sandbox-id": "0198a8a6-0000-7000-8000-000000000005"}}, "status": {"phase": "Running"}}, {"metadata": {"name": "empty-annotation", "annotations": {"space.pplx.net/sandbox-id": ""}, "labels": {"space.pplx.net/sandbox-id": "0198a8a6-0000-7000-8000-000000000006"}}, "status": {"phase": "Running"}}, {"metadata": {"name": "not-a-uuid", "labels": {"space.pplx.net/sandbox-id": "sbx-7"}}, "status": {"phase": "Running"}}]}', "")])
+        harness = KindHarness(kubectl, KindConfig())
+        # sbx-1 has both a sandbox pod and a restore pod; sbx-2's only pod is
+        # terminating; sbx-3's has gone terminal; sbx-4's is a stopped
+        # sandbox's materialization pod; sbx-5's id is only on the annotation;
+        # sbx-6's annotation is present but empty, which the cap reads instead
+        # of the label and drops; and sbx-7 isn't a UUID.
+        live = harness.live_client_sandboxes("space-smoke")
+        # Pinned so a query for the wrong client or without the managed-by
+        # selector fails here, since the scripted LIST answers any selector.
+        self.assertIn(
+            "space.pplx.net/managed-by=space-api,space.pplx.net/client-id=space-smoke",
+            kubectl.calls[0],
+        )
+        self.assertEqual(live, ["0198a8a6-0000-7000-8000-000000000001", "0198a8a6-0000-7000-8000-000000000005"])
+
+
+class SandboxPodClientIds(unittest.TestCase):
+    def test_an_unlabelled_live_pod_reads_empty_and_dead_pods_are_skipped(self) -> None:
+        # An unlabelled live pod is the defect and must surface as "", while a
+        # prior execution's terminating or terminal pod predates the
+        # activation being judged and must not red it.
+        kubectl = _ScriptedKubectl([CommandResult((), 0, '{"items": [{"metadata": {"name": "live", "labels": {"space.pplx.net/client-id": "space-smoke"}}, "status": {"phase": "Running"}}, {"metadata": {"name": "unlabelled"}, "status": {"phase": "Pending"}}, {"metadata": {"name": "old", "deletionTimestamp": "2026-11-16T00:00:00Z"}, "status": {"phase": "Running"}}, {"metadata": {"name": "done"}, "status": {"phase": "Succeeded"}}]}', "")])
+        harness = KindHarness(kubectl, KindConfig())
+        self.assertEqual(harness.sandbox_pod_client_ids("0198a8a6-0000-7000-8000-000000000001"), ["space-smoke", ""])
+        self.assertIn(
+            "space.pplx.net/managed-by=space-api,"
+            "space.pplx.net/sandbox-id=0198a8a6-0000-7000-8000-000000000001",
+            kubectl.calls[0],
+        )
+
+    def test_live_phases_skip_a_prior_generation_s_dead_and_deleting_pods(self) -> None:
+        # kubectl sorts by name, so a lingering g1 comes ahead of the restored
+        # g2; reading the first pod would judge the wrong generation.
+        kubectl = _ScriptedKubectl([CommandResult((), 0, '{"items": [{"metadata": {"name": "space-sbx-a-g1"}, "status": {"phase": "Succeeded"}}, {"metadata": {"name": "space-sbx-a-g2", "deletionTimestamp": "2026-11-16T00:00:00Z"}, "status": {"phase": "Running"}}, {"metadata": {"name": "space-sbx-a-g3"}, "status": {"phase": "Pending"}}]}', "")])
+        harness = KindHarness(kubectl, KindConfig())
+        self.assertEqual(harness.sandbox_live_pod_phases("0198a8a6-0000-7000-8000-000000000001"), ["Pending"])
+
+
 class PublicApiEnvOverride(unittest.TestCase):
+    def test_accepts_a_comma_separated_allowlist_and_still_refuses_the_rest(self) -> None:
+        # The class already admits the comma that `KNOWN_CLIENTS` needs — it is
+        # there for `SPACE_NATIVE_INLINE_KINDS` too — so this pins that it
+        # stays admitted and that nothing else rides in beside it. Without the
+        # comma the kind bench refuses `a,b,c` outright, which is what the
+        # allowlist's own grammar requires it to accept.
+        harness = KindHarness(_ScriptedKubectl([]), KindConfig())
+        for refused in (
+            "space smoke",
+            "space-smoke;rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "a\nb",
+            "'quoted'",
+            "x" * (LIMITER_ENV_VALUE_MAX + 1),
+            "",
+        ):
+            with self.subTest(value=refused), self.assertRaisesRegex(ValueError, "refusing"):
+                harness.set_public_api_env({"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": refused})
+        # The accepted shape clears both gates the value could fail: the value
+        # class, then the closed key list. `set_public_api_env` checks those in
+        # that order and only then demands the caller's mutation Lease, which
+        # this bare harness does not hold — so being turned away for the Lease,
+        # and not for the value, is what proves the comma got through.
+        with self.assertRaisesRegex(SmokeConfigurationError, "mutation Lease"):
+            harness.set_public_api_env(
+                {"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": "space-smoke,space-smoke-noisy"}
+            )
+
     def test_refuses_keys_outside_the_limiter_list(self) -> None:
         harness = KindHarness(_ScriptedKubectl([]), KindConfig())
         with self.assertRaisesRegex(ValueError, "refusing"):

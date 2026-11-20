@@ -753,7 +753,40 @@ SELECT state FROM snapshots WHERE sandbox_id = '{sandbox_id}'::uuid AND type = '
 """
 KIND_REDIS_POD_SELECTOR = "app.kubernetes.io/name=space-redis"
 SANDBOX_ID_LABEL = "space.pplx.net/sandbox-id"
+# The label the activating client's id is carried on, and the column it is
+# recorded in. Both are read-only here: the smoke asserts what the API wrote,
+# and writing either from the harness would be asserting its own value back.
+ACTIVATION_CLIENT_LABEL = "space.pplx.net/client-id"
+# The selector the API's own pod reflector watches. The live cap counts from
+# that reflector, so a count taken here has to carry this label too: the
+# client-id label alone would also match a pod the API does not manage, and the
+# whole point of the count is to be the one the cap is working from.
+SANDBOX_MANAGED_BY_SELECTOR = "space.pplx.net/managed-by=space-api"
+# Whether the sandbox row can hold an activating client at all. Necessary for
+# the capability, never sufficient for it: migrations land in their own change
+# ahead of the code that reads them, so a tree can carry this column and none
+# of the writer. The phase runs unconditionally and uses this only to report
+# a missing column as a precondition rather than as an attribution failure.
+ACTIVATION_ATTRIBUTION_COLUMN_SQL = """
+SELECT count(*)
+  FROM information_schema.columns
+ WHERE table_schema = current_schema()
+   AND table_name = 'sandboxes'
+   AND column_name = 'activating_client_id';
+"""
+SANDBOX_LIFECYCLE_SQL = """
+SELECT 'row:' || lifecycle
+  FROM sandboxes
+ WHERE id = '{sandbox_id}'::uuid;
+"""
+SANDBOX_ACTIVATING_CLIENT_SQL = """
+SELECT 'row:' || coalesce(activating_client_id, '')
+  FROM sandboxes
+ WHERE id = '{sandbox_id}';
+"""
 CHECKPOINT_ANNOTATION = "space.pplx.net/checkpoint"
+# The checkpoint value a stopped sandbox's materialization pod carries.
+STOPPED_MATERIALIZATION_CHECKPOINT = "stopped-materialization"
 RESTORE_SOURCE_NODE_ANNOTATION = "space.pplx.net/suspend-restore-source-node"
 RESTORE_STORAGE_URI_ANNOTATION = "space.pplx.net/suspend-restore-storage-uri"
 SANDBOX_EXECUTIONS_SQL = """\
@@ -1053,9 +1086,55 @@ _RETENTION_BOOLEAN_ENV_VALUES = {
 }
 _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
 # Limiter values: booleans, small numbers, a redis:// URL, a client id, and
-# a comma-separated list (SPACE_NATIVE_INLINE_KINDS).
-_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@,-]{1,64}")
+# comma-separated lists — `SPACE_NATIVE_INLINE_KINDS`, and
+# `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS`, which is an allowlist by the
+# limiter's own grammar, so any value naming more than one client needs the
+# comma. One class covers every limiter key, so this admits a comma in the
+# others too; that is safe rather than intended — `_apply_public_api_env`
+# hands each value to `kubectl set env` as one `key=value` argv element, and
+# kubectl splits that on the first `=` and never on a comma, with no shell in
+# between. Everything this guard exists to refuse — whitespace, quotes, `$`,
+# backticks, newlines — stays out.
+LIMITER_ENV_VALUE_MAX = 64
+_LIMITER_ENV_VALUE = re.compile(rf"[A-Za-z0-9._:/@,-]{{1,{LIMITER_ENV_VALUE_MAX}}}")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
+
+
+def _live_cap_counts_pod(pod: Mapping[str, Any]) -> bool:
+    """Whether the live cap's index would count this pod (`client_live_pods.rs`).
+
+    Neither terminal, nor being deleted, nor a stopped-materialization
+    checkpoint pod.
+    """
+
+    metadata = pod.get("metadata") or {}
+    if metadata.get("deletionTimestamp"):
+        return False
+    if (pod.get("status") or {}).get("phase") in ("Succeeded", "Failed"):
+        return False
+    annotations = metadata.get("annotations") or {}
+    return annotations.get(CHECKPOINT_ANNOTATION) != STOPPED_MATERIALIZATION_CHECKPOINT
+
+
+def _live_cap_sandbox_id(pod: Mapping[str, Any]) -> str | None:
+    """The sandbox a qualifying pod counts for, read as the cap's index reads it.
+
+    `annotation_or_label` takes the annotation whenever the key is present,
+    even empty, and the index drops a value that doesn't parse as a
+    `SandboxId` (a UUID), so a census that fell back to the label or kept an
+    unparseable id would count a pod the cap doesn't.
+    """
+
+    metadata = pod.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    if SANDBOX_ID_LABEL in annotations:
+        value = annotations[SANDBOX_ID_LABEL]
+    else:
+        value = (metadata.get("labels") or {}).get(SANDBOX_ID_LABEL)
+    try:
+        return str(uuid.UUID(str(value))) if value is not None else None
+    except ValueError:
+        return None
 
 
 def _env_flag_default(value: str | None, default: bool) -> bool:
@@ -4739,6 +4818,13 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         return self._deployment_env_literals(self._public_api_deployment(), keys)
 
+    def public_api_has_env_from(self) -> bool:
+        result = self.kubectl(
+            "get", "deploy", self._public_api_deployment(), "-o",
+            "jsonpath={.spec.template.spec.containers[0].envFrom}", timeout=15,
+        )
+        return bool(json.loads(_require_ok(result, "read the public API envFrom") or "[]"))
+
     def _apply_public_api_env(
         self, values: Mapping[str, str | None], action: str, ownership: _LeaseOwnership | None = None
     ) -> None:
@@ -4774,7 +4860,13 @@ ON CONFLICT (key_hash) DO NOTHING;
         record: dict[str, str | None] = {}
         if self._lease_annotation(ownership, LIMITER_ENV_ANNOTATION) is None:
             standing = self.public_api_env(LIMITER_ENV_KEYS)
-            record[LIMITER_ENV_ANNOTATION] = json.dumps(standing, sort_keys=True)
+            recorded = json.dumps(standing, sort_keys=True)
+            # Refused here, before anything is written, if the orphan repair
+            # couldn't restore it: a run that died after the override would
+            # otherwise leave a record the next run refuses, and the
+            # overrides in place.
+            _recorded_limiter_env(recorded)
+            record[LIMITER_ENV_ANNOTATION] = recorded
         self._renew_lease(ownership, action, record)
         self._apply_public_api_env(overrides, "set the public API limiter env")
 
@@ -4809,6 +4901,127 @@ ON CONFLICT (key_hash) DO NOTHING;
             if time.monotonic() > deadline:
                 raise RuntimeError(f"the public API did not report /readyz=200 within {timeout:g}s")
             time.sleep(1)
+
+    def activation_attribution_available(self) -> bool:
+        """Whether this build records the activating client on the sandbox row.
+
+        Reads `information_schema`, so it answers for the schema the running
+        API is actually against rather than for the source tree the bench was
+        built from -- the two can differ when a rollout is stale.
+        """
+
+        count = self._psql(
+            ACTIVATION_ATTRIBUTION_COLUMN_SQL,
+            action="probe for the activating-client column",
+        )
+        return count.strip() == "1"
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str | None:
+        """The activating client recorded on the sandbox row, empty when unset.
+
+        `None` when there's no row, which an unset column must not read as.
+        """
+
+        value = self._psql(
+            SANDBOX_ACTIVATING_CLIENT_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's activating client",
+        ).strip()
+        return value.removeprefix("row:") if value.startswith("row:") else None
+
+    def sandbox_lifecycle(self, sandbox_id: str) -> str | None:
+        """The lifecycle stored on the sandbox row, `None` when there's no row."""
+
+        value = self._psql(
+            SANDBOX_LIFECYCLE_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's lifecycle",
+        ).strip()
+        return value.removeprefix("row:") if value.startswith("row:") else None
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        """The activating-client label of each of the sandbox's live pods.
+
+        Live as the live cap counts them: terminal, deleting and
+        stopped-materialization pods are dropped, so an empty list can mean
+        the sandbox has only dead pods.
+
+        A pod carrying no such label contributes an empty string rather than
+        being dropped, so a caller can tell "no pod" from "a pod the API never
+        labelled" -- the second is the defect, and silently filtering it out
+        would make the verdict pass by having nothing to judge.
+        """
+
+        return [
+            str(((pod.get("metadata") or {}).get("labels") or {}).get(ACTIVATION_CLIENT_LABEL, ""))
+            for pod in self._live_sandbox_pods(sandbox_id)
+        ]
+
+    def sandbox_live_pod_phases(self, sandbox_id: str) -> list[str]:
+        """The phase of each of the sandbox's live pods, filtered as above."""
+
+        return [
+            str((pod.get("status") or {}).get("phase") or "")
+            for pod in self._live_sandbox_pods(sandbox_id)
+        ]
+
+    def _live_sandbox_pods(self, sandbox_id: str) -> list[Mapping[str, Any]]:
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "read the sandbox's live pods")
+        # Only the pods the live cap would count: a prior execution's pod that
+        # is terminating or terminal can predate the activation being judged,
+        # and its label or phase would misjudge a build that worked.
+        return [
+            pod
+            for pod in json.loads(result.stdout or "{}").get("items", [])
+            if _live_cap_counts_pod(pod)
+        ]
+
+    def live_client_sandboxes(self, client_id: str) -> list[str]:
+        """The client's live *sandboxes*, as the live cap counts them.
+
+        Not pod names, and not every pod: the cap's index maps a client-id
+        label to "the sandboxes that have at least one qualifying pod
+        carrying it: a sandbox or restore pod that's neither terminal nor
+        being deleted" (`client_live_pods.rs`). Two things follow, and both
+        are easy to get wrong in the direction that breaks a verdict:
+
+        * **Deduplicate by sandbox.** A wake is exactly the case that has a
+          restore pod and a sandbox pod at once, so counting pods would read
+          one capped sandbox as two and red a working cap.
+        * **Drop deleting pods.** The cap excludes them deliberately -- one
+          stuck terminating on a lost node must not hold its client's slot --
+          so counting them lets a leftover satisfy a verdict that is supposed
+          to prove something was placed. Terminal pods and stopped-
+          materialization checkpoint pods are dropped for the same reason.
+        """
+
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},{ACTIVATION_CLIENT_LABEL}={client_id}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "count the client's live sandboxes")
+        sandboxes: set[str] = set()
+        for pod in json.loads(result.stdout or "{}").get("items", []):
+            if not _live_cap_counts_pod(pod):
+                continue
+            sandbox_id = _live_cap_sandbox_id(pod)
+            if sandbox_id:
+                sandboxes.add(sandbox_id)
+        return sorted(sandboxes)
 
     def redis_replicas(self) -> int:
         previous = _require_ok(
