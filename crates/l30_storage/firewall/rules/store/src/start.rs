@@ -24,6 +24,7 @@ use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 
+use crate::read::{StoredStateError, read_revision};
 use crate::{ItemPhase, RevisionId, RolloutId, end_transaction, rollout_phase};
 
 #[cfg(test)]
@@ -57,13 +58,16 @@ impl From<Option<RevisionId>> for AdoptedRevision {
 pub struct StartRollout {
     /// The trusted operator, recorded as the header's creator and updater.
     pub actor: UserId,
-    /// Why: 1 to 1024 characters, which the schema checks.
+    /// Why: 1 to [`REASON_MAX_CHARS`] characters with no NUL.
     pub reason: String,
     /// The complete candidate. It must pass the protocol's strict decoder.
     pub revision: FirewallRuleRevision,
     /// The default the operator reviewed the candidate against.
     pub expected_adopted: AdoptedRevision,
 }
+
+/// The most characters a reason may hold, matching the schema's `CHECK`.
+pub const REASON_MAX_CHARS: usize = 1024;
 
 /// A committed start. Its rollout proves nothing yet, and one with no
 /// targets never will: completing it isn't evidence for adoption.
@@ -93,6 +97,8 @@ pub enum Review {
 pub enum StartError {
     #[error(transparent)]
     Invalid(DecodeError),
+    #[error("the reason must be 1 to {REASON_MAX_CHARS} characters with no NUL")]
+    InvalidReason,
     /// The default isn't the one expected; nothing was written.
     #[error("the adopted firewall default is {adopted}, not the expected one")]
     Stale { adopted: AdoptedRevision },
@@ -109,12 +115,14 @@ pub enum StartError {
          qualification is approved"
     )]
     NotEnabled,
-    #[error("stored firewall revision {id} doesn't decode: {source}")]
-    StoredRevision { id: RevisionId, source: DecodeError },
-    #[error("the firewall_rules_control row is missing")]
-    MissingControlRow,
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Stored(#[from] StoredStateError),
+}
+
+impl From<sqlx::Error> for StartError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Stored(error.into())
+    }
 }
 
 impl StartError {
@@ -126,7 +134,7 @@ impl StartError {
         {
             return Self::SlotTaken;
         }
-        Self::Database(error)
+        error.into()
     }
 }
 
@@ -173,6 +181,11 @@ async fn start_with(
     start: &StartRollout,
     targets: &mut impl Targets,
 ) -> Result<StartedRollout, StartError> {
+    // Refused before any lock, so a bad request isn't reported as disabled.
+    let chars = start.reason.chars().count();
+    if !(1..=REASON_MAX_CHARS).contains(&chars) || start.reason.contains('\0') {
+        return Err(StartError::InvalidReason);
+    }
     // A revision built in code may break nft's limits, which only the
     // decoder checks.
     let document = encode_revision(&start.revision);
@@ -195,7 +208,7 @@ async fn start_in(
 ) -> Result<StartedRollout, StartError> {
     let adopted = lock_control(&mut *tx)
         .await?
-        .ok_or(StartError::MissingControlRow)?;
+        .ok_or(StoredStateError::MissingControlRow)?;
     let adopted = AdoptedRevision::from(adopted);
     if adopted != start.expected_adopted {
         return Err(StartError::Stale { adopted });
@@ -281,21 +294,4 @@ async fn lock_control(tx: &mut PgConnection) -> Result<Option<Option<RevisionId>
     ))
     .fetch_optional(tx)
     .await
-}
-
-/// Read revision `id` back through the protocol's strict decoder.
-async fn read_revision(
-    executor: impl sqlx::PgExecutor<'_>,
-    id: RevisionId,
-) -> Result<FirewallRuleRevision, StartError> {
-    let document = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT jsonb_build_object(
-                    'schema_version', ruleset_format_version, 'rules', ruleset)::text
-         FROM firewall_rules_revisions
-         WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_one(executor)
-    .await?;
-    decode_revision(&document).map_err(|source| StartError::StoredRevision { id, source })
 }

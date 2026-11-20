@@ -24,7 +24,7 @@ const RELEASE: Requeue = Requeue::Release { error: None };
 
 /// A rollout header in `phase`, with the revision it references, created by
 /// the seeded user. The schema admits one unfinished header per database.
-async fn rollout(pool: &PgPool, phase: &str) -> TestResult<RolloutId> {
+pub(crate) async fn rollout(pool: &PgPool, phase: &str) -> TestResult<RolloutId> {
     let revision = Uuid::now_v7();
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)

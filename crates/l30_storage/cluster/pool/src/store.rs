@@ -1,6 +1,8 @@
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::digest_original;
 use std::{
     collections::{HashMap, HashSet},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -734,7 +736,7 @@ impl WarmPoolStore {
         &self,
         initial_environment: Option<&str>,
     ) -> Result<Vec<PoolPolicyReleaseRow>> {
-        static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        static STATEMENT: LazyLock<String> = LazyLock::new(|| {
             sql!(format!(
                 "SELECT
                  COALESCE(twin.id, retained.id) AS template_release_id,
@@ -761,21 +763,24 @@ impl WarmPoolStore {
                           (
                               SELECT MAX(published.modified_at)
                               FROM template_release_tags published
-                              WHERE published.template_release_id = release.id
+                              JOIN template_releases tagged
+                                ON tagged.id = published.template_release_id
+                              -- Tags on either spelling of the digest: one written
+                              -- before the shared rule can sit on the other spelling.
+                              WHERE tagged.template_name = release.template_name
+                                AND replace(tagged.hash, 'sha256:', '')
+                                  = replace(release.hash, 'sha256:', '')
                           ),
                           release.created_at
                       ) AS published_at
                   FROM template_releases release
                   WHERE release.template_name = p.template_name
                     AND release.type = p.runtime
-                    -- Originals only: a twin of a retained release, bound to
-                    -- another environment, would use up a retain slot.
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM template_releases o
-                        WHERE o.template_name = release.template_name
-                          AND o.hash = release.hash
-                          AND (o.created_at, o.id) < (release.created_at, release.id))
+                    -- Digest originals only: a twin of a retained release,
+                    -- bound to another environment, or the other spelling's
+                    -- original of its digest would use up a retain slot and
+                    -- warm slots no create claims.
+                    AND {digest_original}
                   ORDER BY published_at DESC, release.id DESC
                   LIMIT p.retain_releases
              ) retained ON TRUE
@@ -787,6 +792,7 @@ impl WarmPoolStore {
              WHERE p.enabled
              ORDER BY p.template_name, p.vcpu, p.memory_mib,
                       retained.published_at DESC, retained.id DESC",
+                digest_original = digest_original("release"),
                 resolved = pplx_space_template_release_store::resolved_release_sql(
                     "p.template_name",
                     "retained.hash",
@@ -840,7 +846,13 @@ impl WarmPoolStore {
                             (
                                 SELECT MAX(published.modified_at)
                                 FROM template_release_tags published
-                                WHERE published.template_release_id = release.id
+                                JOIN template_releases tagged
+                                  ON tagged.id = published.template_release_id
+                                -- Tags on either spelling of the digest: one written
+                                -- before the shared rule can sit on the other spelling.
+                                WHERE tagged.template_name = release.template_name
+                                  AND replace(tagged.hash, 'sha256:', '')
+                                    = replace(release.hash, 'sha256:', '')
                             ),
                             release.created_at
                         ) AS published_at
@@ -876,7 +888,7 @@ impl WarmPoolStore {
     ) -> Result<Vec<PoolObservedDemand>> {
         let lookback_secs =
             i64::try_from(AUTOSCALE_LOOKBACK.as_secs()).expect("autoscale lookback fits i64");
-        static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        static STATEMENT: LazyLock<String> = LazyLock::new(|| {
             sql!(format!(
                 // Aggregate BEFORE the release lateral. The lateral's inputs
                 // (template_id, content_hash and its bare form) are constant
@@ -921,21 +933,17 @@ impl WarmPoolStore {
                        OR r.hash = s.bare_content_hash
                        OR r.hash = 'sha256:' || s.bare_content_hash
                    )
-                   -- Originals only: a twin registered after its original
-                   -- would otherwise take the original's demand.
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM template_releases o
-                       WHERE o.template_name = r.template_name
-                         AND o.hash = r.hash
-                         AND (o.created_at, o.id) < (r.created_at, r.id))
-                 ORDER BY (r.hash = s.content_hash) DESC, r.created_at DESC, r.id DESC
-                 LIMIT 1
+                   -- The digest's original, whichever spelling the create
+                   -- named: the release creates claim slots of. A twin
+                   -- registered after its original, or the other spelling's
+                   -- original, would otherwise take the original's demand.
+                   AND {digest_original}
              ) release_by_hash ON TRUE
              LEFT JOIN LATERAL (
                  SELECT CASE WHEN $4::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
              ) twin ON TRUE
              GROUP BY 1, 2, 3",
+                digest_original = digest_original("r"),
                 resolved = pplx_space_template_release_store::resolved_release_sql(
                     "release_by_hash.template_name",
                     "release_by_hash.hash",

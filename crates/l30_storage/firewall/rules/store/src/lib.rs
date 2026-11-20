@@ -9,6 +9,7 @@
 //! * `firewall_rules_node_assignments`: each node's current intent.
 //! * `firewall_rules_node_observations`: each node's accepted observations.
 //!
+//! [`read_adopted`] reads the default a candidate is reviewed against, and
 //! [`start_rollout`] saves a reviewed revision and the nodes it targets
 //! without adopting it.
 //!
@@ -24,6 +25,7 @@ use pplx_space_rollout_queue::HeaderPhase;
 
 mod issue;
 mod lease;
+mod read;
 mod start;
 
 pub use issue::{Issuance, Refusal, Stamp, Wakeup, issue_first_assignment};
@@ -31,7 +33,11 @@ pub use lease::{
     LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
-pub use start::{AdoptedRevision, Review, StartError, StartRollout, StartedRollout, start_rollout};
+pub use read::{StoredStateError, read_adopted};
+pub use start::{
+    AdoptedRevision, REASON_MAX_CHARS, Review, StartError, StartRollout, StartedRollout,
+    start_rollout,
+};
 
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,13 @@
 //! The nft JSON that builds SPACE's owned table for a reviewed firewall rule
-//! revision. Construction only: replacing an installed table is the caller's
-//! job, and nothing here touches the baseline tables.
+//! revision, and the nft runner `install` and `verify` share. Rendering
+//! replaces nothing, and nothing here touches the baseline tables.
+
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::process::Output;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use pplx_space_firewall_rules_model::{FirewallRuleRevision, RuleId};
 use serde_json::{Value, json};
@@ -15,6 +22,22 @@ const TABLE: &str = "space_firewall_rules";
 const CHAIN: &str = "guest_drop";
 // After conntrack (-200) and just ahead of the baseline pre-TPROXY guardrails.
 const PRIORITY: i32 = super::PRE_TPROXY_GUARDRAILS_PRIO - 1;
+
+/// Runs nft with these arguments and stdin, within the budget, in the
+/// namespace the descriptor pins.
+#[cfg(target_os = "linux")]
+pub(crate) type Nft<'a> =
+    dyn Fn(&File, &[&str], &[u8], Duration) -> std::io::Result<Output> + Send + Sync + 'a;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn nft(
+    netns: &File,
+    args: &[&str],
+    stdin: &[u8],
+    budget: Duration,
+) -> std::io::Result<Output> {
+    crate::net::command_output_in_pinned_ns(netns, "nft", args, stdin, budget)
+}
 
 /// The comment that ties an installed rule to its reviewed ID. `RuleId` admits
 /// no `:`, so the prefix never collides with an ID.

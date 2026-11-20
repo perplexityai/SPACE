@@ -27,6 +27,11 @@
 //!    pool. An excess node SPACE never registered (no `nodes` row) is
 //!    terminated directly.
 //!
+//! A tenant with a cache key is its own pool: `tenant_node_groups` creates
+//! and deletes an EKS managed node group per such group, born with the
+//! group's label and taint and keyed to the tenant, and the steps above size
+//! it like any pool.
+//!
 //! PoC scope: EKS only, one tick-driven loop, no leader fencing beyond the
 //! controller's own, and no per-tenant metrics.
 
@@ -47,6 +52,8 @@ use tokio_util::sync::CancellationToken;
 use crate::env_config;
 
 /// Taint on a pool node no group has claimed yet.
+mod tenant_node_groups;
+
 pub(crate) const UNASSIGNED_TAINT_KEY: &str = "space.pplx.net/unassigned";
 /// Label EKS sets on every node of a managed node group.
 const EKS_NODEGROUP_LABEL: &str = "eks.amazonaws.com/nodegroup";
@@ -230,7 +237,25 @@ pub async fn run(
         return;
     };
     let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let tenant_node_groups = match tenant_node_groups::Config::from_env() {
+        Ok(None) => None,
+        Ok(Some(tenant_config)) => Some(tenant_node_groups::TenantNodeGroups::new(
+            tenant_config,
+            eks_cluster.clone(),
+            &aws,
+        )),
+        Err(err) => {
+            tracing::error!(error = %err, "tenant node groups are misconfigured; not starting");
+            shutdown_token.cancelled().await;
+            return;
+        }
+    };
+    tracing::info!(
+        enabled = tenant_node_groups.is_some(),
+        "dedicated-capacity: per-tenant encrypted node groups"
+    );
     let backend = Backend {
+        tenant_node_groups,
         pool,
         kube,
         eks: pplx_space_aws_client::eks::Client::from_config(&aws),
@@ -256,6 +281,7 @@ pub async fn run(
 }
 
 struct Backend {
+    tenant_node_groups: Option<tenant_node_groups::TenantNodeGroups>,
     pool: PgPool,
     kube: Arc<KubernetesSubstrate>,
     eks: pplx_space_aws_client::eks::Client,
@@ -285,6 +311,20 @@ impl Backend {
         let caches = &self.kube.k8s.caches;
         if !caches.nodes_ready() {
             return Err("node cache not ready".to_string());
+        }
+        if let Some(tenant_node_groups) = &self.tenant_node_groups {
+            let mut nodes_by_group: HashMap<String, usize> = HashMap::new();
+            for node in caches.nodes.state() {
+                if let Some(nodegroup) = label(&node, EKS_NODEGROUP_LABEL) {
+                    *nodes_by_group.entry(nodegroup.to_string()).or_default() += 1;
+                }
+            }
+            if let Err(err) = tenant_node_groups
+                .reconcile(&self.pool, &nodes_by_group)
+                .await
+            {
+                tracing::warn!(error = %err, "tenant_node_groups: reconcile failed");
+            }
         }
         let pools: Vec<&str> = groups.iter().map(|group| group.pool.as_str()).collect();
         let kube_nodes: Vec<Arc<Node>> = caches

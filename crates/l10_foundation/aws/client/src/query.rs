@@ -40,6 +40,24 @@ pub enum AwsClientError {
     Xml(String),
 }
 
+impl AwsClientError {
+    /// HTTP status of an AWS service error, if this is one.
+    pub fn service_status(&self) -> Option<StatusCode> {
+        match self {
+            Self::AwsService { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// AWS error code (`NoSuchEntity`, `EntityAlreadyExists`, ...), if any.
+    pub fn service_code(&self) -> Option<&str> {
+        match self {
+            Self::AwsService { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+}
+
 impl From<XmlDecodeError> for AwsClientError {
     fn from(value: XmlDecodeError) -> Self {
         Self::Xml(value.to_string())
@@ -120,6 +138,8 @@ pub(crate) enum AwsQueryService {
     Ec2,
     AutoScaling,
     Eks,
+    /// IAM is global: one endpoint, signed for us-east-1.
+    Iam,
 }
 
 impl AwsQueryService {
@@ -128,6 +148,7 @@ impl AwsQueryService {
             Self::Ec2 => "ec2",
             Self::AutoScaling => "autoscaling",
             Self::Eks => "eks",
+            Self::Iam => "iam",
         }
     }
 
@@ -142,6 +163,7 @@ impl AwsQueryService {
             Self::Ec2 => "EC2",
             Self::AutoScaling => "Auto Scaling",
             Self::Eks => "EKS",
+            Self::Iam => "IAM",
         }
     }
 }
@@ -210,16 +232,20 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         }
     }
 
-    pub(crate) async fn send_action(
+    pub(crate) async fn send_action<K: AsRef<str>>(
         &self,
         action: &'static str,
         version: &'static str,
-        params: Vec<(&'static str, String)>,
+        params: Vec<(K, String)>,
     ) -> Result<String, AwsClientError> {
-        let mut all_params = Vec::with_capacity(params.len() + 2);
+        let mut all_params: Vec<(&str, String)> = Vec::with_capacity(params.len() + 2);
         all_params.push(("Action", action.to_string()));
         all_params.push(("Version", version.to_string()));
-        all_params.extend(params);
+        all_params.extend(
+            params
+                .iter()
+                .map(|(key, value)| (key.as_ref(), value.clone())),
+        );
 
         let body = encode_form(&all_params);
         let request = self
@@ -286,10 +312,13 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             .await
             .map_err(|err| AwsClientError::Credentials(err.to_string()))?;
         let identity: Identity = credentials.into();
-        let region = self
-            .region
-            .as_deref()
-            .ok_or(AwsClientError::MissingRegion)?;
+        let region = match self.service {
+            AwsQueryService::Iam => "us-east-1",
+            _ => self
+                .region
+                .as_deref()
+                .ok_or(AwsClientError::MissingRegion)?,
+        };
         let settings = SigningSettings::default();
         let signing_params = v4::SigningParams::builder()
             .identity(&identity)
@@ -329,6 +358,9 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             return Ok(format!("{}/", endpoint_url.trim_end_matches('/')));
         }
 
+        if matches!(self.service, AwsQueryService::Iam) {
+            return Ok("https://iam.amazonaws.com/".to_string());
+        }
         let region = self
             .region
             .as_deref()

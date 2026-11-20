@@ -141,3 +141,48 @@ async fn aws_error_response_includes_code_and_message() {
     assert!(msg.contains("InvalidParameterValue"));
     assert!(msg.contains("bad private dns"));
 }
+
+#[test]
+fn parses_the_created_launch_template_version() {
+    let body = r#"<CreateLaunchTemplateVersionResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+        <requestId>r</requestId>
+        <launchTemplateVersion>
+            <launchTemplateId>lt-1</launchTemplateId>
+            <launchTemplateData><blockDeviceMappingSet/></launchTemplateData>
+            <versionNumber>7</versionNumber>
+        </launchTemplateVersion>
+    </CreateLaunchTemplateVersionResponse>"#;
+    assert_eq!(super::parse_version_number(body).unwrap(), 7);
+}
+
+#[test]
+fn launch_template_version_tags_the_instance_and_volume() {
+    let params = super::launch_template_version_params(&super::LaunchTemplateVersionRequest {
+        launch_template_id: "lt-1".into(),
+        source_version: "3".into(),
+        client_token: "t".into(),
+        description: "d".into(),
+        root_device_name: "/dev/xvda".into(),
+        root_volume_gib: 100,
+        root_volume_kms_key_id: "arn:key".into(),
+        tags: vec![("SpaceCacheEncryptionKmsKeyArn".into(), "arn:key".into())],
+    });
+    let get = |key: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(
+        get("LaunchTemplateData.BlockDeviceMapping.1.Ebs.KmsKeyId"),
+        Some("arn:key")
+    );
+    assert_eq!(
+        get("LaunchTemplateData.TagSpecification.2.ResourceType"),
+        Some("volume")
+    );
+    assert_eq!(
+        get("LaunchTemplateData.TagSpecification.1.Tag.1.Key"),
+        Some("SpaceCacheEncryptionKmsKeyArn")
+    );
+}

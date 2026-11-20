@@ -16,6 +16,11 @@ use tokio::task::JoinSet;
 use crate::memory_admission::ActiveLeaseMemoryReservation;
 use crate::net::{self, NetId, SlotInfo};
 pub use crate::node_state_sync::{NodeCtlNodeStatusDirtySink, NodeStatusDirtySink};
+#[cfg(target_os = "linux")]
+pub use firewall_rules::{
+    NamespaceIdentity, NotRun, NotRunnable, SlotFirewallAttempt, SlotFirewallReport,
+    SlotFirewallRequest, Stale,
+};
 
 pub const NETWORK_POOL_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_NETWORK_POOL_TARGET: u32 = 100;
@@ -2079,6 +2084,8 @@ fn retire_stale_pod_namespace_lease(
 mod claim_contention_tests;
 mod db;
 mod execution;
+#[cfg(target_os = "linux")]
+mod firewall_rules;
 mod liveness;
 #[cfg(test)]
 mod node_status_tests;
