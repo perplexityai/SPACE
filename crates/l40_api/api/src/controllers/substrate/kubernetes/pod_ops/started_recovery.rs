@@ -367,11 +367,19 @@ mod tests {
             UnavailableAnswer::ContextUnavailable
         );
         assert_eq!(
-            unavailable_answer(&StartedRecoveryUnavailableCause::SourcePublishing, false, |_| false),
+            unavailable_answer(
+                &StartedRecoveryUnavailableCause::SourcePublishing,
+                false,
+                |_| false
+            ),
             UnavailableAnswer::UploadSettling
         );
         assert_eq!(
-            unavailable_answer(&StartedRecoveryUnavailableCause::NoDurableSource, true, |_| true),
+            unavailable_answer(
+                &StartedRecoveryUnavailableCause::NoDurableSource,
+                true,
+                |_| true
+            ),
             UnavailableAnswer::ContextUnavailable
         );
     }
