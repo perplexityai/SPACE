@@ -41,6 +41,7 @@ use std::{collections::BTreeMap, str::FromStr};
 use oci_spec::distribution::Reference as OciReference;
 use pplx_space_accounts::OrgId;
 use pplx_space_build_mgr_client::proto as build_proto;
+use pplx_space_execution_spec::BalloonConfig;
 use pplx_space_template_model::{TemplateName, TemplateReference, TemplateSelector};
 
 use super::state::TemplateBuildState;
@@ -88,6 +89,9 @@ fn base_template_defaults(base: &str) -> (String, Option<String>) {
 /// The SDK has no disk-size field, so deployments supply exact-name or trailing-`*`
 /// prefix rules as a JSON object. Unconfigured templates use build-manager defaults.
 const TEMPLATE_BUILD_DISK_MIB_ENV: &str = "SPACE_TEMPLATE_BUILD_DISK_MIB";
+/// The SDK has no balloon field either, so deployments supply the device a
+/// template is built with using the same exact-name or trailing-`*` rules.
+const TEMPLATE_BUILD_BALLOON_ENV: &str = "SPACE_TEMPLATE_BUILD_BALLOON";
 const MIB: u64 = 1024 * 1024;
 
 pub(super) async fn build_recipe(
@@ -165,7 +169,8 @@ pub(super) async fn build_recipe(
             vcpu: cpu_count,
             memory_bytes: memory_mb.map(|mb| u64::from(mb) * MIB),
             disk_bytes: default_disk_mib(template_name.as_str())?.map(|disk_mib| disk_mib * MIB),
-            balloon: None,
+            balloon: default_balloon(template_name.as_str())?
+                .map(pplx_space_build_mgr::recipe::balloon_proto),
         }),
         origin: Some(build_proto::recipe::Origin { kind: Some(origin) }),
         steps,
@@ -232,34 +237,66 @@ fn disk_mib_with_override(
         return Ok(Some(override_mib));
     }
 
-    let rules: BTreeMap<String, Option<u64>> =
-        serde_json::from_str(template_disks.unwrap_or("{}")).map_err(|_| {
-            E2bApiError::internal(format!("{TEMPLATE_BUILD_DISK_MIB_ENV} must be a JSON object of template names or prefixes ending in * to MiB sizes or null"))
-        })?;
-    for (pattern, disk_mib) in &rules {
-        TemplateName::parse(pattern.trim_suffix('*')).map_err(|_| {
+    let rules = template_rules::<u64>(TEMPLATE_BUILD_DISK_MIB_ENV, template_disks)?;
+    for disk_mib in rules.values().flatten() {
+        validate_disk_mib(*disk_mib)?;
+    }
+    Ok(matching_rule(&rules, template_id).copied())
+}
+
+fn default_balloon(template_id: &str) -> Result<Option<BalloonConfig>, E2bApiError> {
+    balloon_for_template(
+        template_id,
+        std::env::var(TEMPLATE_BUILD_BALLOON_ENV).ok().as_deref(),
+    )
+}
+
+fn balloon_for_template(
+    template_id: &str,
+    template_balloons: Option<&str>,
+) -> Result<Option<BalloonConfig>, E2bApiError> {
+    let rules = template_rules::<BalloonConfig>(TEMPLATE_BUILD_BALLOON_ENV, template_balloons)?;
+    Ok(matching_rule(&rules, template_id).copied())
+}
+
+/// Parses a deployment's JSON object of exact template names or trailing-`*`
+/// prefixes to a value or `null`.
+fn template_rules<T: serde::de::DeserializeOwned>(
+    env: &str,
+    raw: Option<&str>,
+) -> Result<BTreeMap<String, Option<T>>, E2bApiError> {
+    let rules: BTreeMap<String, Option<T>> = serde_json::from_str(raw.unwrap_or("{}"))
+        .map_err(|_| {
             E2bApiError::internal(format!(
-                "invalid template pattern in {TEMPLATE_BUILD_DISK_MIB_ENV}"
+                "{env} must be a JSON object of template names or prefixes ending in * to values or null"
             ))
         })?;
-        if let Some(disk_mib) = disk_mib {
-            validate_disk_mib(*disk_mib)?;
-        }
+    for pattern in rules.keys() {
+        TemplateName::parse(pattern.trim_suffix('*'))
+            .map_err(|_| E2bApiError::internal(format!("invalid template pattern in {env}")))?;
     }
-    // Exact names (including explicit nulls) take precedence over family rules.
-    if let Some(disk_mib) = rules.get(template_id) {
-        return Ok(*disk_mib);
+    Ok(rules)
+}
+
+/// An exact name (including an explicit null) takes precedence over the
+/// longest matching prefix rule.
+fn matching_rule<'a, T>(
+    rules: &'a BTreeMap<String, Option<T>>,
+    template_id: &str,
+) -> Option<&'a T> {
+    if let Some(value) = rules.get(template_id) {
+        return value.as_ref();
     }
-    Ok(rules
+    rules
         .iter()
-        .filter_map(|(pattern, disk_mib)| {
+        .filter_map(|(pattern, value)| {
             let prefix = pattern.strip_suffix('*')?;
             template_id
                 .starts_with(prefix)
-                .then_some((prefix.len(), *disk_mib))
+                .then_some((prefix.len(), value))
         })
         .max_by_key(|(len, _)| *len)
-        .and_then(|(_, disk_mib)| disk_mib))
+        .and_then(|(_, value)| value.as_ref())
 }
 
 fn validate_disk_mib(disk_mib: u64) -> Result<(), E2bApiError> {
