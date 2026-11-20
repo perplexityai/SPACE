@@ -84,6 +84,8 @@
 //!   seeds the default `node_groups` row.
 //! - `node_group_mirror`: copies each Node's node-group label into
 //!   `nodes.node_group_id`.
+//! - `dedicated_capacity`: assigns pool Nodes to tenants' dedicated node
+//!   groups (label and taint), grows the pool, and drains released nodes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,6 +102,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::admin_audit_retention;
 use crate::data_plane_session_retention;
+use crate::dedicated_capacity;
 use crate::drained_node_terminator;
 use crate::environment_edge_recompute;
 use crate::failed_restorable_repair;
@@ -629,6 +632,16 @@ pub async fn run_reconcilers(
             // labels the shared worker pool.
             handles.push(tokio::spawn(node_group_mirror::run(
                 node_group_mirror::ReconcilerConfig::from_env(),
+                pool.clone(),
+                kube.clone(),
+                shutdown_token.child_token(),
+            )));
+
+            // Dedicated capacity: assigns nodes from generic Terraform pools
+            // to tenants' dedicated node groups, and grows or releases them.
+            // Default-disabled via `SPACE_DEDICATED_CAPACITY_ENABLED`.
+            handles.push(tokio::spawn(dedicated_capacity::run(
+                dedicated_capacity::ReconcilerConfig::from_env(),
                 pool.clone(),
                 kube.clone(),
                 shutdown_token.child_token(),

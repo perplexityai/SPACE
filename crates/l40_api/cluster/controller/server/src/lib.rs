@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 mod admin_audit_retention;
 mod data_plane_session_retention;
+mod dedicated_capacity;
 mod drained_node_terminator;
 mod env_config;
 mod environment_edge_recompute;

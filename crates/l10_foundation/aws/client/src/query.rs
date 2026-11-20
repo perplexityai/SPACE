@@ -100,9 +100,9 @@ impl QueryTransport for ReqwestTransport {
     ) -> Pin<Box<dyn Future<Output = Result<QueryResponse, AwsClientError>> + Send + '_>> {
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let mut builder = self
-                .client
-                .request(reqwest::Method::POST, parts.uri.to_string());
+            let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+                .unwrap_or(reqwest::Method::POST);
+            let mut builder = self.client.request(method, parts.uri.to_string());
             for (name, value) in &parts.headers {
                 builder = builder.header(name.as_str(), value.as_bytes());
             }
@@ -119,6 +119,7 @@ impl QueryTransport for ReqwestTransport {
 pub(crate) enum AwsQueryService {
     Ec2,
     AutoScaling,
+    Eks,
 }
 
 impl AwsQueryService {
@@ -126,6 +127,7 @@ impl AwsQueryService {
         match self {
             Self::Ec2 => "ec2",
             Self::AutoScaling => "autoscaling",
+            Self::Eks => "eks",
         }
     }
 
@@ -139,6 +141,7 @@ impl AwsQueryService {
         match self {
             Self::Ec2 => "EC2",
             Self::AutoScaling => "Auto Scaling",
+            Self::Eks => "EKS",
         }
     }
 }
@@ -219,7 +222,9 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         all_params.extend(params);
 
         let body = encode_form(&all_params);
-        let request = self.sign_request(body).await?;
+        let request = self
+            .sign_request("POST", "", "application/x-www-form-urlencoded", body)
+            .await?;
         let response = self.transport.send(request).await?;
         if !response.status.is_success() {
             return Err(service_error(self.service, response.status, &response.body));
@@ -227,13 +232,49 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         Ok(response.body)
     }
 
-    async fn sign_request(&self, body: String) -> Result<Request<Vec<u8>>, AwsClientError> {
-        let endpoint = self.endpoint()?;
+    /// A REST-JSON call (EKS): `path` is appended to the service endpoint, and
+    /// the response body is returned as JSON text. AWS REST-JSON errors carry
+    /// the code in `x-amzn-errortype` and the body; only the body is kept.
+    pub(crate) async fn send_rest_json(
+        &self,
+        method: &'static str,
+        path: &str,
+        body: String,
+    ) -> Result<String, AwsClientError> {
+        let request = self
+            .sign_request(
+                method,
+                path.trim_start_matches('/'),
+                "application/json",
+                body,
+            )
+            .await?;
+        let response = self.transport.send(request).await?;
+        if !response.status.is_success() {
+            let excerpt: String = response.body.chars().take(512).collect();
+            return Err(AwsClientError::AwsService {
+                service: self.service.signing_name(),
+                status: response.status,
+                code: "RestJsonError".to_string(),
+                message: excerpt,
+            });
+        }
+        Ok(response.body)
+    }
+
+    async fn sign_request(
+        &self,
+        method: &'static str,
+        path: &str,
+        content_type: &'static str,
+        body: String,
+    ) -> Result<Request<Vec<u8>>, AwsClientError> {
+        let endpoint = format!("{}{path}", self.endpoint()?);
         let bytes = body.into_bytes();
         let mut request = Request::builder()
-            .method("POST")
+            .method(method)
             .uri(endpoint.as_str())
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::CONTENT_TYPE, content_type)
             .body(bytes)?;
 
         let credentials_provider = self
@@ -272,7 +313,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let signable_request = SignableRequest::new(
-            "POST",
+            method,
             endpoint,
             header_pairs.into_iter(),
             SignableBody::Bytes(request.body()),

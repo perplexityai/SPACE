@@ -41,6 +41,7 @@ mod hosts;
 mod lifecycle;
 mod router;
 mod template_build;
+pub(crate) mod tenants;
 mod translate;
 mod types;
 

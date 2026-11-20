@@ -63,6 +63,28 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
+pub(crate) const TENANT_HEADER: &str = "x-tenant-id";
+
+enum TenantHeader {
+    Absent,
+    Invalid,
+    Present(OrgId),
+}
+
+fn tenant_header(headers: &HeaderMap) -> TenantHeader {
+    let Some(value) = headers.get(TENANT_HEADER) else {
+        return TenantHeader::Absent;
+    };
+    match value
+        .to_str()
+        .ok()
+        .and_then(|value| value.trim().parse::<uuid::Uuid>().ok())
+    {
+        Some(id) => TenantHeader::Present(OrgId::from_uuid(id)),
+        None => TenantHeader::Invalid,
+    }
+}
+
 fn api_key(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("x-api-key")
@@ -458,8 +480,38 @@ pub async fn require_e2b_api_key(
                 }
             }
 
+            // `x-tenant-id`: run as a tenant the key's org registered. The
+            // tenant must be a child of the key's org; anything else is
+            // indistinguishable from an unknown tenant.
+            let mut org = context.org;
+            match tenant_header(request.headers()) {
+                TenantHeader::Absent => {}
+                TenantHeader::Invalid => {
+                    return E2bApiError::bad_request("x-tenant-id must be a tenant id")
+                        .into_response();
+                }
+                TenantHeader::Present(tenant) => {
+                    if federated_owner.is_some() {
+                        return E2bApiError::bad_request(
+                            "x-tenant-id cannot be combined with federated owner headers",
+                        )
+                        .into_response();
+                    }
+                    match crate::routes::e2b::tenants::resolve_tenant_org(pool, tenant, org.id)
+                        .await
+                    {
+                        Ok(Some(tenant_org)) => org = tenant_org,
+                        Ok(None) => return E2bApiError::not_found("tenant").into_response(),
+                        Err(error) => {
+                            tracing::error!(%error, "tenant lookup failed");
+                            return E2bApiError::internal("Internal server error").into_response();
+                        }
+                    }
+                }
+            }
+
             request.extensions_mut().insert(AuthApiKey(context.api_key));
-            request.extensions_mut().insert(AuthOrg(context.org));
+            request.extensions_mut().insert(AuthOrg(org));
             request.extensions_mut().insert(AuthEcwActor(context.actor));
             if let Some(owner) = federated_owner {
                 request.extensions_mut().insert(AuthFederatedOwner(owner));

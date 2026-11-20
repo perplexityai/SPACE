@@ -290,6 +290,15 @@ fn authenticated_e2b_api_routes() -> Router<AppState> {
             "/sandboxes/{sandboxID}/refreshes",
             axum::routing::post(refresh_sandbox),
         )
+        // ── Tenants (SPACE extension, not part of the E2B API) ──────────────
+        .route(
+            "/v1/tenants",
+            axum::routing::post(super::tenants::register_tenant),
+        )
+        .route(
+            "/v1/tenants/{tenantID}",
+            axum::routing::get(super::tenants::get_tenant).delete(super::tenants::delete_tenant),
+        )
         // ── Template build (e2b SDK compatible) ─────────────────────────────
         //
         // Mirror the URLs the e2b Python/JS SDK actually calls so existing

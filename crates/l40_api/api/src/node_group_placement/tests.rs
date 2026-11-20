@@ -186,11 +186,10 @@ async fn generic_template_admits_every_generic_group_not_just_the_default() -> T
     Ok(())
 }
 
-/// An org that owns dedicated capacity gets `{all generic} ∪ {its own
-/// compatible dedicated}` for a generic template, with only its own groups in
-/// the dedicated subset the preferred term biases toward.
+/// An org that owns dedicated capacity is hard-pinned: its set is only its own
+/// compatible dedicated groups, even for a generic template.
 #[tokio::test(flavor = "current_thread")]
-async fn caller_dedicated_groups_join_the_generic_set() -> TestResult {
+async fn caller_dedicated_groups_replace_the_generic_set() -> TestResult {
     let Some(fixture) = fixture().await? else {
         return Ok(());
     };
@@ -229,8 +228,13 @@ async fn caller_dedicated_groups_join_the_generic_set() -> TestResult {
         )
         .await?;
     let placement = placed(&resolved);
-    assert_eq!(candidate_names(placement), vec!["org-a-1", "workers"]);
+    assert_eq!(
+        candidate_names(placement),
+        vec!["org-a-1"],
+        "an org with dedicated capacity is hard-pinned to it"
+    );
     assert!(placement.targets_dedicated_capacity());
+    assert!(!placement.admits_group("workers"));
     assert!(placement.admits_group("org-a-1"));
     assert!(
         !placement.admits_group("org-b-1"),

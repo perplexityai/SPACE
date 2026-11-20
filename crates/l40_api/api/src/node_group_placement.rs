@@ -11,11 +11,11 @@
 //! templates row + node_groups rows --> NodeGroup::compatible --> NodeGroupPlacement
 //! ```
 //!
-//! [`NodeGroup::compatible`] is the whole definition of the set and this module
-//! adds nothing to it. In particular the query is unfiltered: a generic
-//! template is compatible with **every** generic-policy group, not just the
-//! `is_default` one, and a caller that owns dedicated capacity gets
-//! `{all generic groups} ∪ {its own compatible dedicated groups}`. Nothing
+//! [`NodeGroup::compatible`] defines the set, with one narrowing: a caller that
+//! owns compatible dedicated capacity is hard-pinned to its own dedicated
+//! groups and never spills onto shared ones. Otherwise the query is
+//! unfiltered: a generic template is compatible with **every** generic-policy
+//! group, not just the `is_default` one. Nothing
 //! downstream would catch a narrower query — `compatible` never reads
 //! `is_default`, so "all generic groups" and "the default generic group" both
 //! satisfy the predicate — which is why this module's test module pins a
@@ -349,10 +349,17 @@ impl NodeGroupPlacementResolver {
             });
         };
         let NodeGroupCatalog { template, groups } = catalog;
-        let candidates: Vec<NodeGroup> = groups
+        let mut candidates: Vec<NodeGroup> = groups
             .into_iter()
             .filter(|group| group.compatible(caller_org, &template))
             .collect();
+        // Hard pin: an org that owns compatible dedicated capacity places only
+        // on it, never on shared groups.
+        if let Some(org) = caller_org
+            && candidates.iter().any(|group| group.org_id() == Some(org))
+        {
+            candidates.retain(|group| group.org_id() == Some(org));
+        }
         if candidates.is_empty() {
             return Self::empty_candidate_set(path, caller_org, template.visibility, template_name);
         }
