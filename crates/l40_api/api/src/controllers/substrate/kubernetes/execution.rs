@@ -2664,5 +2664,7 @@ pub(super) fn restore_failure_should_revert_to_suspended(
         && wake_failure_should_revert_to_suspended(err, dispatch)
 }
 
+mod drain_restore;
+
 #[cfg(test)]
 mod tests;
