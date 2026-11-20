@@ -45,7 +45,7 @@ pub enum NotRun {
     Store(#[from] SlotStoreError),
     #[error("the network slot does not exist")]
     NoSlot,
-    #[error("the network slot is {state}/{health}, not a healthy ready or leased slot")]
+    #[error("the network slot is {state}/{health}, not a healthy ready or a leased slot")]
     Ineligible {
         state: SlotState,
         health: SlotHealth,
@@ -193,12 +193,12 @@ impl NetworkPool {
     }
 }
 
-/// A healthy ready slot no sandbox holds, or a healthy leased one a sandbox does.
+/// A healthy ready slot no sandbox holds, or a leased one a sandbox does at
+/// any health, since it still carries guest traffic.
 fn eligible(state: SlotState, health: SlotHealth, sandbox_id: &str) -> bool {
     matches!(
         (state, health, sandbox_id.is_empty()),
-        (SlotState::Ready, SlotHealth::Healthy, true)
-            | (SlotState::Leased, SlotHealth::Healthy, false)
+        (SlotState::Ready, SlotHealth::Healthy, true) | (SlotState::Leased, _, false)
     )
 }
 
@@ -222,14 +222,13 @@ fn runnable(
     Ok(accepted)
 }
 
-/// `pid` is published during a lease without changing its lifecycle.
+/// `pid` and health change during a lease without changing its lifecycle.
 fn same_lifecycle(now: &SlotRecord, owned: &SlotRecord) -> bool {
     let key = |record: &SlotRecord| {
         (
             record.info.slot,
             record.info.generation,
             record.state,
-            record.health,
             record.info.sandbox_id.clone(),
         )
     };

@@ -271,7 +271,8 @@ fn only_the_requested_accepted_assignment_is_runnable() {
     ));
 }
 
-// Catches any slot eligible but healthy Ready without an ID or Leased with one.
+// Catches any slot eligible but healthy Ready without an ID or Leased with one
+// at any health.
 #[test]
 fn only_healthy_ready_or_leased_slots_are_eligible() {
     use SlotHealth::*;
@@ -296,7 +297,14 @@ fn only_healthy_ready_or_leased_slots_are_eligible() {
             }
         }
     }
-    assert_eq!(passed, [(Ready, Healthy, ""), (Leased, Healthy, "sandbox")]);
+    let expected = [
+        (Ready, Healthy, ""),
+        (Leased, Unknown, "sandbox"),
+        (Leased, Healthy, "sandbox"),
+        (Leased, Degraded, "sandbox"),
+        (Leased, Invalid, "sandbox"),
+    ];
+    assert_eq!(passed, expected);
 }
 
 // Catches nft run, ownership skipped or kept, or the assignment read early.
@@ -322,12 +330,11 @@ async fn refusals_never_run_nft() {
 
     accept(&store, 12);
     assert!(matches!(refused(1).await, NotRun::NoSlot));
-    let degrade = "UPDATE network_slots SET health = 'degraded' WHERE slot_id = 0";
-    pool.db.lock().unwrap().execute(degrade, []).unwrap();
+    set_slot(&pool, 0, SlotState::Dirty, 1);
     assert!(matches!(
         refused(0).await,
         NotRun::Ineligible {
-            health: SlotHealth::Degraded,
+            state: SlotState::Dirty,
             ..
         }
     ));
