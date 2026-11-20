@@ -8,7 +8,10 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import urllib.parse
 import uuid
 from pathlib import Path
 from unittest import mock
@@ -382,6 +385,130 @@ INSERT INTO sandboxes (
         ACTIVE_OLD_STORAGE,
         "2026-01-01 00:00:00+00",
     )
+
+
+TEMPLATE_PRUNE_TEMPLATE = "code-runtime"
+TEMPLATE_PRUNE_BUCKET = "s3://example-template-artifacts/code-runtime"
+# Each release: id, hash, created_at, storage prefix. With
+# --keep-latest-per-template 1, only the lone release is safe to delete.
+TEMPLATE_PRUNE_RELEASES = {
+    # An original and its twin, bound to another environment, which names the
+    # original's storage prefix. The twin is the newest row of the template.
+    "twinned_original": ("019e5f38-cd2e-7400-b3c8-e33ae3669301", "sha256:aa", "2026-01-01", "aa/"),
+    "twin": ("019e5f38-cd2e-7400-b3c8-e33ae3669302", "sha256:aa", "2026-01-06", "aa/"),
+    # Nothing else shares its digest or storage: the one deletable release.
+    "lone": ("019e5f38-cd2e-7400-b3c8-e33ae3669303", "sha256:bb", "2026-01-02", "bb/"),
+    # Two releases whose storage prefixes nest.
+    "parent_prefix": ("019e5f38-cd2e-7400-b3c8-e33ae3669304", "sha256:cc", "2026-01-03", "shared/"),
+    "nested_prefix": ("019e5f38-cd2e-7400-b3c8-e33ae3669305", "sha256:dd", "2026-01-04", "shared/dd/"),
+    # Both spellings of one digest.
+    "bare_spelling": ("019e5f38-cd2e-7400-b3c8-e33ae3669306", "ee", "2026-01-02 12:00", "ee-bare/"),
+    "prefixed_spelling": ("019e5f38-cd2e-7400-b3c8-e33ae3669307", "sha256:ee", "2026-01-03 12:00", "ee/"),
+    # Two prefixes that differ only in the query, which deletion drops: both
+    # releases resolve to one deletion target.
+    "region_west": ("019e5f38-cd2e-7400-b3c8-e33ae3669309", "sha256:gg", "2026-01-02 06:00", "regional/?region=us-west-2"),
+    "region_east": ("019e5f38-cd2e-7400-b3c8-e33ae366930a", "sha256:hh", "2026-01-02 07:00", "regional/?region=us-east-1"),
+    # One key is a string prefix of the other without sharing a path segment.
+    "short_key": ("019e5f38-cd2e-7400-b3c8-e33ae366930b", "sha256:ii", "2026-01-02 08:00", "split"),
+    "longer_key": ("019e5f38-cd2e-7400-b3c8-e33ae366930c", "sha256:jj", "2026-01-02 09:00", "split-two/"),
+    # Nested prefixes whose schemes differ in case, which deletion lowercases.
+    "lower_scheme": ("019e5f38-cd2e-7400-b3c8-e33ae366930d", "sha256:kk", "2026-01-02 10:00", "cased/"),
+    "upper_scheme": (
+        "019e5f38-cd2e-7400-b3c8-e33ae366930e",
+        "sha256:ll",
+        "2026-01-02 11:00",
+        "S3://example-template-artifacts/code-runtime/cased/ll/",
+    ),
+    # The newest original, kept by --keep-latest-per-template 1 even though the
+    # twin was registered after it.
+    "newest_original": ("019e5f38-cd2e-7400-b3c8-e33ae3669308", "sha256:ff", "2026-01-05", "ff/"),
+}
+
+
+def setup_minimal_template_pruning_schema(runner: PostgresRunner) -> None:
+    runner.execute_script(
+        """
+CREATE TYPE state_reconciliation_reason AS ENUM ('template_desired_state_updated');
+CREATE TABLE templates (name text PRIMARY KEY);
+CREATE TABLE template_releases (
+    id uuid PRIMARY KEY,
+    template_name text NOT NULL REFERENCES templates(name),
+    type text NOT NULL,
+    hash text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE template_release_storage_locations (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    template_release_id uuid NOT NULL REFERENCES template_releases(id),
+    storage_connection_string text NOT NULL
+);
+CREATE TABLE template_release_storage_location_encrypted_fields (
+    template_release_storage_location_id uuid NOT NULL
+);
+CREATE TABLE template_release_tags (
+    template_release_id uuid NOT NULL REFERENCES template_releases(id),
+    tag text NOT NULL
+);
+CREATE TABLE kubernetes_pool_configs (template_release_id uuid);
+CREATE TABLE kubernetes_pool_slots (template_release_id uuid);
+CREATE TABLE nodes (id uuid PRIMARY KEY, role text NOT NULL, managed_by text NOT NULL);
+CREATE TABLE node_direct (node_id uuid PRIMARY KEY, deleted_at timestamptz);
+CREATE TABLE node_reconcile_queue (
+    node_id uuid NOT NULL,
+    facet text NOT NULL,
+    element text NOT NULL,
+    generation bigint NOT NULL DEFAULT 0,
+    requested_at timestamptz NOT NULL,
+    next_attempt_at timestamptz,
+    attempts integer NOT NULL DEFAULT 0,
+    last_error text NOT NULL DEFAULT '',
+    dead_at timestamptz,
+    dead_reason text NOT NULL DEFAULT '',
+    updated_at timestamptz NOT NULL,
+    UNIQUE (node_id, facet, element)
+);
+CREATE TABLE node_reconcile_triggers (
+    node_id uuid PRIMARY KEY,
+    generation bigint NOT NULL DEFAULT 0,
+    reason text NOT NULL,
+    reasons state_reconciliation_reason[] NOT NULL,
+    requested_at timestamptz NOT NULL,
+    next_attempt_at timestamptz,
+    attempts integer NOT NULL DEFAULT 0,
+    last_error text NOT NULL DEFAULT '',
+    dead_at timestamptz,
+    dead_reason text NOT NULL DEFAULT '',
+    updated_at timestamptz NOT NULL
+);
+"""
+    )
+    runner.execute("INSERT INTO templates (name) VALUES (%s)", (TEMPLATE_PRUNE_TEMPLATE,))
+    for release_id, digest, created_at, prefix in TEMPLATE_PRUNE_RELEASES.values():
+        runner.execute(
+            """
+INSERT INTO template_releases (id, template_name, type, hash, created_at)
+VALUES (%s, %s, 'fc', %s, %s::timestamptz)
+""",
+            (release_id, TEMPLATE_PRUNE_TEMPLATE, digest, created_at),
+        )
+        runner.execute(
+            """
+INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+VALUES (%s, %s)
+""",
+            (release_id, prefix if "://" in prefix else f"{TEMPLATE_PRUNE_BUCKET}/{prefix}"),
+        )
+
+
+def execute_script_with_copy(runner: PostgresRunner, script: str) -> str:
+    before_copy, found, copy_and_suffix = script.partition("COPY (")
+    assert found
+    copy_body, found, suffix = copy_and_suffix.partition(") TO STDOUT WITH CSV HEADER;")
+    assert found
+    runner.execute_script(before_copy)
+    output = runner.copy_stdout(f"COPY ({copy_body}) TO STDOUT WITH CSV HEADER;")
+    runner.execute_script(suffix)
+    return output
 
 
 def execute_snapshot_mutation_with_activation_race(
@@ -940,6 +1067,101 @@ WHERE id = %s
         self.assertIn("s.lifecycle = 'suspended'", script)
         self.assertNotIn("'failed'", script)
 
+    def test_template_delete_sql_locks_the_template_before_its_checks(self) -> None:
+        runner = postgres_runner_or_skip(self)
+        registrar = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        worker: threading.Thread | None = None
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            registrar.execute(f"SET search_path TO {schema}")
+            setup_minimal_template_pruning_schema(runner)
+            args = make_args("/tmp")
+            cutoff = "2100-01-01 00:00:00+00"
+            lone_id, lone_digest, _, _ = TEMPLATE_PRUNE_RELEASES["lone"]
+            candidate = prune.TemplateCandidate(
+                **{
+                    **template_candidate().__dict__,
+                    "template_release_id": lone_id,
+                    "template_name": TEMPLATE_PRUNE_TEMPLATE,
+                }
+            )
+
+            # A registration holds the template's row lock, as the internal API
+            # takes it, while it inserts a twin of the candidate.
+            registrar.execute("BEGIN")
+            registrar.execute(
+                "SELECT name FROM templates WHERE name = %s FOR UPDATE",
+                (TEMPLATE_PRUNE_TEMPLATE,),
+            )
+            registrar.execute(
+                """
+INSERT INTO template_releases (id, template_name, type, hash, created_at)
+VALUES (%s, %s, 'fc', %s, '2026-01-09'::timestamptz)
+""",
+                (str(uuid.uuid4()), TEMPLATE_PRUNE_TEMPLATE, lone_digest),
+            )
+
+            delete_pid = runner.fetchone("SELECT pg_backend_pid()")[0]
+            outcome: dict[str, object] = {}
+
+            def delete() -> None:
+                try:
+                    with mock.patch.object(
+                        prune,
+                        "psql_script",
+                        side_effect=lambda _args, script: execute_script_with_copy(runner, script),
+                    ):
+                        outcome["rows"] = prune.delete_template_release_db(args, candidate, cutoff)
+                except Exception as error:  # surfaced by the assertion below
+                    outcome["error"] = error
+
+            worker = threading.Thread(target=delete)
+            worker.start()
+            # Without a template lock taken before its checks, the delete
+            # finishes here, before the twin commits.
+            waited = False
+            deadline = time.monotonic() + 30
+            while worker.is_alive() and time.monotonic() < deadline:
+                waited = bool(
+                    registrar.fetchone(
+                        "SELECT count(*) FROM pg_stat_activity"
+                        " WHERE pid = %s AND wait_event_type = 'Lock'",
+                        (delete_pid,),
+                    )[0]
+                )
+                if waited:
+                    break
+                time.sleep(0.05)
+            registrar.execute("COMMIT")
+            worker.join(30)
+            self.assertFalse(worker.is_alive(), "the delete didn't finish")
+            self.assertTrue(waited, "the delete never waited for the registration's lock")
+            self.assertNotIn("error", outcome)
+            self.assertEqual(outcome["rows"], [])
+            self.assertEqual(
+                runner.fetchone("SELECT count(*) FROM template_releases WHERE id = %s", (lone_id,))[0],
+                1,
+            )
+        finally:
+            # Release the registration first, so a delete still waiting on its
+            # lock can finish before its connection is reused.
+            try:
+                registrar.execute("ROLLBACK")
+            except Exception:
+                pass
+            if worker is not None:
+                worker.join(30)
+            for connection in (registrar.connection, runner.connection):
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            registrar.connection.close()
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
+
     def test_sandbox_delete_sql_refuses_unclassified_storage_rows(self) -> None:
         args = make_args("/tmp")
         candidate = prune.SandboxCandidate(
@@ -1228,6 +1450,315 @@ CREATE TABLE template_release_storage_location_encrypted_fields (
                 self.assertEqual(prune.run_superseded_templates(args), 2)
 
             self.assertEqual(s3_calls, [])
+
+    def test_superseded_template_prune_spares_releases_that_share_artifacts(self) -> None:
+        runner = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            setup_minimal_template_pruning_schema(runner)
+            args = make_args("/tmp")
+            args.mode = "superseded-templates"
+            args.keep_latest_per_template = 1
+            cutoff = "2100-01-01 00:00:00+00"
+            ids = {name: release[0] for name, release in TEMPLATE_PRUNE_RELEASES.items()}
+
+            def run_query(_args: argparse.Namespace, query: str) -> list[dict[str, str]]:
+                return prune.parse_csv(
+                    runner.copy_stdout(f"COPY ({query}) TO STDOUT WITH CSV HEADER")
+                )
+
+            with mock.patch.object(prune, "psql_csv_query", side_effect=run_query):
+                rows = prune.template_candidate_rows(args, cutoff)
+            self.assertEqual([row["template_release_id"] for row in rows], [ids["lone"]])
+
+            # The report refuses a location with an empty canonical form, but
+            # the delete doesn't, so there it has to overlap nothing.
+            runner.execute(
+                """
+INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+VALUES (%s, '?region=us-west-2')
+""",
+                (TEMPLATE_PRUNE_RELEASES["newest_original"][0],),
+            )
+
+            # The delete re-checks under lock, so it refuses every other release
+            # even when asked for it directly.
+            deleted: list[str] = []
+            for name, release_id in ids.items():
+                candidate = prune.TemplateCandidate(
+                    **{
+                        **template_candidate().__dict__,
+                        "template_release_id": release_id,
+                        "template_name": TEMPLATE_PRUNE_TEMPLATE,
+                    }
+                )
+                with mock.patch.object(
+                    prune,
+                    "psql_script",
+                    side_effect=lambda _args, script: execute_script_with_copy(runner, script),
+                ):
+                    rows = prune.delete_template_release_db(args, candidate, cutoff)
+                deleted.extend(row["template_release_id"] for row in rows)
+            self.assertEqual(deleted, [ids["lone"]])
+
+            remaining = runner.fetchone(
+                "SELECT ARRAY_AGG(id::text ORDER BY id) FROM template_releases"
+            )[0]
+            self.assertEqual(
+                sorted(remaining),
+                sorted(release_id for name, release_id in ids.items() if name != "lone"),
+            )
+        finally:
+            try:
+                runner.connection.rollback()
+            except Exception:
+                pass
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
+
+    def test_superseded_template_ranking_counts_both_spellings_of_a_digest_once(self) -> None:
+        runner = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            setup_minimal_template_pruning_schema(runner)
+            runner.execute("DELETE FROM template_release_storage_locations")
+            runner.execute("DELETE FROM template_releases")
+            # Two versions of the template: an older one, and a newer one
+            # registered under both spellings of its digest.
+            releases = {
+                "older": ("019e5f38-cd2e-7400-b3c8-e33ae3669401", "sha256:mm", "2026-01-01"),
+                "bare": ("019e5f38-cd2e-7400-b3c8-e33ae3669402", "nn", "2026-01-02"),
+                "prefixed": ("019e5f38-cd2e-7400-b3c8-e33ae3669403", "sha256:nn", "2026-01-03"),
+            }
+            for name, (release_id, digest, created_at) in releases.items():
+                runner.execute(
+                    """
+INSERT INTO template_releases (id, template_name, type, hash, created_at)
+VALUES (%s, %s, 'fc', %s, %s::timestamptz)
+""",
+                    (release_id, TEMPLATE_PRUNE_TEMPLATE, digest, created_at),
+                )
+                runner.execute(
+                    """
+INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+VALUES (%s, %s)
+""",
+                    (release_id, f"{TEMPLATE_PRUNE_BUCKET}/{name}/"),
+                )
+            args = make_args("/tmp")
+            args.mode = "superseded-templates"
+
+            def run_query(_args: argparse.Namespace, query: str) -> list[dict[str, str]]:
+                return prune.parse_csv(
+                    runner.copy_stdout(f"COPY ({query}) TO STDOUT WITH CSV HEADER")
+                )
+
+            selected = {}
+            for keep in (1, 2):
+                args.keep_latest_per_template = keep
+                with mock.patch.object(prune, "psql_csv_query", side_effect=run_query):
+                    rows = prune.template_candidate_rows(args, "2100-01-01 00:00:00+00")
+                selected[keep] = [row["template_release_id"] for row in rows]
+            self.assertEqual(selected, {1: [releases["older"][0]], 2: []})
+        finally:
+            try:
+                runner.connection.rollback()
+            except Exception:
+                pass
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
+
+    def test_superseded_template_listing_refuses_a_bucket_root_location(self) -> None:
+        runner = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            setup_minimal_template_pruning_schema(runner)
+            # The bucket root is a prefix of every location in the bucket, so
+            # without the refusal every release would be spared silently.
+            runner.execute(
+                """
+INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+VALUES (%s, 'S3://example-template-artifacts?region=us-west-2')
+""",
+                (TEMPLATE_PRUNE_RELEASES["newest_original"][0],),
+            )
+            args = make_args("/tmp")
+            args.mode = "superseded-templates"
+            args.keep_latest_per_template = 1
+
+            def run_query(_args: argparse.Namespace, query: str) -> list[dict[str, str]]:
+                return prune.parse_csv(
+                    runner.copy_stdout(f"COPY ({query}) TO STDOUT WITH CSV HEADER")
+                )
+
+            with mock.patch.object(prune, "psql_csv_query", side_effect=run_query):
+                with self.assertRaises(SystemExit) as raised:
+                    prune.template_candidate_rows(args, "2100-01-01 00:00:00+00")
+            message = str(raised.exception)
+            self.assertIn(
+                "'S3://example-template-artifacts?region=us-west-2' (refusing bucket-root S3 URI)",
+                message,
+            )
+            self.assertIn(TEMPLATE_PRUNE_RELEASES["newest_original"][0], message)
+        finally:
+            try:
+                runner.connection.rollback()
+            except Exception:
+                pass
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
+
+    def test_superseded_template_listing_refuses_a_location_the_s3_parser_rejects(self) -> None:
+        runner = postgres_runner_or_skip(self)
+        # None is a bucket root, but each names no bucket or no s3:// URI at
+        # all, and the first two are string prefixes of every s3:// location,
+        # so the storage check would spare every release in silence.
+        malformed = [
+            "s3:",
+            "s3:/",
+            "s3:///key",
+            "example-template-artifacts/code-runtime/x",
+            "?region=us-west-2",
+        ]
+        for uri in malformed:
+            with self.subTest(uri=uri):
+                schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+                try:
+                    runner.execute(f"CREATE SCHEMA {schema}")
+                    runner.execute(f"SET search_path TO {schema}")
+                    setup_minimal_template_pruning_schema(runner)
+                    runner.execute(
+                        """
+INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+VALUES (%s, %s)
+""",
+                        (TEMPLATE_PRUNE_RELEASES["newest_original"][0], uri),
+                    )
+                    args = make_args("/tmp")
+                    args.mode = "superseded-templates"
+                    args.keep_latest_per_template = 1
+
+                    def run_query(_args: argparse.Namespace, query: str) -> list[dict[str, str]]:
+                        return prune.parse_csv(
+                            runner.copy_stdout(f"COPY ({query}) TO STDOUT WITH CSV HEADER")
+                        )
+
+                    with mock.patch.object(prune, "psql_csv_query", side_effect=run_query):
+                        with self.assertRaises(SystemExit) as raised:
+                            prune.template_candidate_rows(args, "2100-01-01 00:00:00+00")
+                    message = str(raised.exception)
+                    self.assertIn("refusing to list superseded templates", message)
+                    self.assertIn(TEMPLATE_PRUNE_RELEASES["newest_original"][0], message)
+                    self.assertIn(repr(uri), message)
+                finally:
+                    try:
+                        runner.connection.rollback()
+                    except Exception:
+                        pass
+                    runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        runner.connection.close()
+
+    def test_verify_refuses_to_count_superseded_templates_with_a_bucket_root_location(self) -> None:
+        runner = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            setup_minimal_template_pruning_schema(runner)
+            runner.execute(
+                """
+INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+VALUES (%s, 's3://example-template-artifacts/?region=us-west-2')
+""",
+                (TEMPLATE_PRUNE_RELEASES["newest_original"][0],),
+            )
+
+            def run_query(_args: argparse.Namespace, query: str) -> list[dict[str, str]]:
+                return prune.parse_csv(
+                    runner.copy_stdout(f"COPY ({query}) TO STDOUT WITH CSV HEADER")
+                )
+
+            with tempfile.TemporaryDirectory() as tmp:
+                args = make_args(tmp)
+                args.mode = "verify"
+                with mock.patch.multiple(
+                    prune,
+                    psql_csv_query=mock.Mock(side_effect=run_query),
+                    db_cutoff=mock.Mock(return_value={"cutoff": "2100-01-01 00:00:00+00"}),
+                    load_live_pods=mock.Mock(return_value={}),
+                    current_generation_pod_refs=mock.Mock(return_value=set()),
+                    classify_stale_pods=mock.Mock(return_value=[]),
+                ):
+                    with self.assertRaises(SystemExit) as raised:
+                        prune.run_verify(args)
+                self.assertFalse((Path(tmp) / "verify.json").exists())
+            message = str(raised.exception)
+            self.assertIn("refusing to count superseded templates", message)
+            self.assertIn(TEMPLATE_PRUNE_RELEASES["newest_original"][0], message)
+            self.assertIn("'s3://example-template-artifacts/?region=us-west-2'", message)
+        finally:
+            try:
+                runner.connection.rollback()
+            except Exception:
+                pass
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
+
+    def test_canonical_storage_locations_match_the_deletion_target(self) -> None:
+        runner = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        uris = [
+            "s3://bucket/key",
+            "s3://bucket//key/",
+            "s3://bucket/key/?region=us-west-2",
+            "s3://bucket/key#fragment",
+            "s3://bucket/key?x#y",
+            "s3://bucket/key#y?x",
+            "S3://bucket/key",
+            "s3://bucket/ke\ty\r\n",
+            "s3://user@bucket:9000/key;p",
+        ]
+        # urlsplit strips leading C0 controls and spaces only where it has the
+        # CVE-2023-24329 fix (3.11.4 and the matching 3.7 to 3.10 patch
+        # releases). Without it such a URI isn't an s3:// URI at all, so
+        # deletion refuses it and there's no target to match.
+        if urllib.parse.urlsplit(" \x01s3://bucket/key").scheme == "s3":
+            uris.append(" \x01s3://bucket/key")
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            setup_minimal_template_pruning_schema(runner)
+            release_id = next(iter(TEMPLATE_PRUNE_RELEASES.values()))[0]
+            runner.execute("DELETE FROM template_release_storage_locations")
+            for uri in uris:
+                runner.execute(
+                    """
+INSERT INTO template_release_storage_locations (template_release_id, storage_connection_string)
+VALUES (%s, %s)
+""",
+                    (release_id, uri),
+                )
+            pairs = runner.fetchone(
+                f"""
+SELECT ARRAY_AGG(ARRAY[storage.storage_connection_string, canonical.uri])
+FROM ({prune.canonical_storage_locations_sql()}
+) canonical
+JOIN template_release_storage_locations storage ON storage.id = canonical.location_id
+"""
+            )[0]
+            self.assertEqual(
+                dict(pairs),
+                {uri: prune.canonical_s3_prefix_uri(uri) for uri in uris},
+            )
+        finally:
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
 
 
 if __name__ == "__main__":

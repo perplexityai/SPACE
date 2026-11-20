@@ -2739,36 +2739,60 @@ Known limits until the cluster side carries partitions:
   the traffic. Mixed versions can
   still disagree: an image that predates the rule resolves a digest stored
   under both spellings as it did before (the API preferring the canonical
-  spelling, the warm pool counting each spelling's original), so don't drop
-  the old index until the internal API, the API and the cluster controller
-  all run the shared rule and no rollback target predates it. Until the API
+  spelling, the warm pool counting each spelling's original), so don't
+  deploy the migration that drops the old index (below) until the internal
+  API, the API and the cluster controller all run the shared rule and no
+  rollback target predates it. Until the API
   and the cluster controller have both rolled, creates for such a digest can
   miss the warm pool in either order: an old controller ranks each spelling's
   original separately for retention and maps demand to the spelling a
   sandbox records.
-- Don't drop the old `(template_name, hash)` unique index until
-  `scripts/bootstrap-templates.sh` is updated or retired too: its release
-  insert's `ON CONFLICT (template_name, hash)` needs a unique index on exactly
-  those columns, so it fails once the index is gone, even with no twins. It
-  runs with `ON_ERROR_STOP=1` and no transaction, so it stops there, after its
-  template upsert has committed. Its tag and storage-location inserts already
-  pick the digest's original, so they stay correct once twins exist.
-  Recreating the index isn't a rollback once a twin exists: the twin and its
-  original share a template and hash, so the index build fails.
-- Don't run `scripts/admin/prune_cluster_artifacts.py superseded-templates`
-  on a deployment with twins until the script applies the original-release
-  rule. It deletes an old release that no tag, pool config or pool slot names,
-  then the storage that release's locations name. Tags attach to the
-  original, so a twin is never tagged. A twin shares its original's whole
-  build prefix (rootfs, manifest and the shared `metadata.json`); only its
-  own `metadata.json` lives under `<build>/environments/<environment>/`. So
-  deleting either one's storage deletes a build the other still serves, and
-  the script has to protect the shared build prefix, not just the
-  environment directory. Twins can exist
-  only once the old `(template_name, hash)` unique index is dropped, and a
-  run already under way can delete an original whose first twin is
-  registered meanwhile, so let any live run finish before dropping the index,
-  and keep live runs off until the script protects storage a twin shares.
+- Migration `20261119015950` drops the old `(template_name, hash)` unique
+  index. The migration job applies it on deploy, so don't deploy a release
+  that contains it until every SPACE service image that's deployed on a
+  cluster, or kept as a rollback target, registers twins without that index
+  and runs the shared original-release rule above: api, worker,
+  cluster-controller, data-plane and builder-bundle.
+  `scripts/bootstrap-templates.sh` doesn't depend on the index: under the
+  `templates` row lock it inserts a release only when the digest has none
+  under either spelling, and puts the `latest` tag and the storage location
+  on the digest's original. A
+  checkout of the script from before that change still uses `ON CONFLICT
+  (template_name, hash)`, which fails once the index is gone, after its
+  template upsert has committed. Recreating the index isn't a rollback once a
+  twin exists: the twin and its original share a template and hash, so the
+  index build fails.
+- `scripts/admin/prune_cluster_artifacts.py superseded-templates` ranks
+  each digest once, by its first release under either spelling, and
+  never selects a release that shares its template and digest, under either
+  spelling, with another release, or whose storage location equals another
+  release's or is a string prefix of it, either way round. While any storage
+  location isn't an `s3://<bucket>/<key>` URI, it refuses to list anything,
+  and `scan` and `verify` stop without a report: a bucket root such as
+  `s3://bucket/`, or a malformed location such as `s3:`, would count as a
+  prefix of every location in its bucket, or of every location. The internal
+  API accepts a bucket-root location, so such a row has to be corrected in the
+  database before any of the three runs. A twin shares its original's whole build prefix
+  (rootfs, manifest and the shared `metadata.json`), so deleting either
+  one's storage would delete a build the other still serves. The delete
+  transaction locks the candidate's `templates` row in a mode that conflicts
+  with the lock registration under that template takes, but not with
+  foreign-key checks, and re-checks these rules under it, so no
+  twin or other release of that template can appear before its row deletes
+  commit. A registration under another template doesn't take that lock: one
+  whose storage location falls under the candidate's prefix can commit while
+  the check runs, and the check doesn't see it. The transaction also commits
+  the row deletes before it deletes the storage, and nothing fences a prefix
+  in between, so a registration of any template in that window that attaches
+  a storage location under the pruned prefix loses its artifacts. These rules
+  never prune an original that has a twin, the twin itself, or releases that
+  share a storage prefix, however superseded they are, so their storage stays
+  until a twin-aware rule exists. A run of the script from before these rules
+  can delete an original whose first twin is registered meanwhile, so let any
+  such run finish before dropping the index. Once twins exist, don't run a
+  checkout from before these rules at all: it ranks twins as the newest
+  releases, so it can select a superseded original and delete the build
+  prefix its twin still serves.
 - A restore of a btrfs-send stream needs the build its stream descends from.
   Its lookup prefers the snapshot's binding but falls back to another
   partition of the digest without pulling, so a node holding only another
