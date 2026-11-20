@@ -8589,6 +8589,121 @@ mod kubernetes_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn started_recovery_racing_an_upload_is_retryable_and_completes_failed()
+    -> Result<(), BoxError> {
+        // Arrange: a started recovery with no restore source while the node
+        // is still uploading a newer suspend, the auto-suspend race.
+        use crate::controllers::substrate::kubernetes::store::{
+            StartedRecoveryRestoreContext, StartedRecoveryRestoreSource,
+        };
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET current_local_artifact_id = $2,
+                    current_local_artifact_kind = 'full',
+                    current_local_artifact_origin = 'suspend'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, state, active)
+             VALUES ($1, 2, 'space-sbx-race-g2', 'space', 'recovering', TRUE)"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let upload_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                 (id, sandbox_id, type, state, timestamp, org_id,
+                  local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, 'full', 'creating', NOW(),
+                     '00000000-0000-0000-0000-000000000001',
+                     $3, 'full', 'suspend')"
+        ))
+        .bind(upload_id)
+        .bind(sandbox_id)
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await?;
+        let substrate = substrate_with_store(pool.clone());
+        let generation = ExecutionGeneration::new(2)?;
+        // Skips the pre-check, so the handoff transaction's own lookup is the
+        // one that finds no source.
+        let past_pre_check = || {
+            Some(StartedRecoveryRestoreContext::Ready(
+                StartedRecoveryRestoreSource::Remote {
+                    storage_uri: pplx_space_artifact_model::ExactStorageUri::parse(
+                        "s3://test-bucket/suspend_snapshots/stale?region=us-east-1",
+                    )
+                    .expect("valid storage uri"),
+                },
+            ))
+        };
+
+        // Act / Assert: both Unavailable branches answer RestoreUploadSettling
+        // while the upload is within settle.
+        let pre_check = substrate
+            .handoff_started_recovery_execution(sandbox_id, generation, None)
+            .await
+            .expect_err("no restore source yet");
+        assert!(matches!(pre_check, SubstrateError::RestoreUploadSettling { .. }));
+        let handoff = substrate
+            .handoff_started_recovery_execution(sandbox_id, generation, past_pre_check())
+            .await
+            .expect_err("no restore source yet");
+        assert!(matches!(handoff, SubstrateError::RestoreUploadSettling { .. }));
+
+        // It maps to a retryable 503 with Retry-After.
+        let response = crate::controllers::ControllerError::from(handoff.clone());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.retry_after().is_some());
+        assert_eq!(
+            response.retry_after_cause(),
+            Some(crate::controllers::ControllerRetryAfterCause::RestoreInFlight)
+        );
+
+        // Once the upload is quiet past settle, both answer the 412 as before.
+        sqlx::query(sql!(
+            "UPDATE snapshots
+                SET timestamp = NOW() - INTERVAL '2 hours',
+                    last_attempt_at = NOW() - INTERVAL '1 hour'
+              WHERE id = $1"
+        ))
+        .bind(upload_id)
+        .execute(&pool)
+        .await?;
+        for restore_context in [None, past_pre_check()] {
+            let error = substrate
+                .handoff_started_recovery_execution(sandbox_id, generation, restore_context)
+                .await
+                .expect_err("no restore source");
+            assert!(matches!(error, SubstrateError::RestoreContextUnavailable { .. }));
+        }
+
+        // The settling error still completes the attempt as failed.
+        substrate
+            .publish_started_recovery_result::<()>(sandbox_id, Some(2), None, &Err(handoff))
+            .await;
+        let state: String = sqlx::query_scalar(sql!(
+            "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state, "recovery_failed");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn unavailable_started_recovery_source_preserves_claim_across_retries()
     -> Result<(), BoxError> {
         // Arrange.

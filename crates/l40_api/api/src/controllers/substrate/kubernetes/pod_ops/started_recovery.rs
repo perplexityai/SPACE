@@ -48,7 +48,7 @@ impl KubernetesSubstrate {
         })
     }
 
-    async fn handoff_started_recovery_execution(
+    pub(in crate::controllers::substrate::kubernetes) async fn handoff_started_recovery_execution(
         &self,
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,

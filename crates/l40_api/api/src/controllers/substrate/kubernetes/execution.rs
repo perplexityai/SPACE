@@ -429,7 +429,7 @@ impl KubernetesSubstrate {
         }
     }
 
-    async fn publish_started_recovery_result<T>(
+    pub(in crate::controllers::substrate::kubernetes) async fn publish_started_recovery_result<T>(
         &self,
         sandbox_id: SandboxId,
         generation: Option<i64>,
