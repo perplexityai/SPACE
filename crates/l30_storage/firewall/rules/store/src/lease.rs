@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use jiff::Timestamp;
 use pplx_space_accounts::NodeId;
 use pplx_space_rollout_queue::{
     Candidates, ClaimStore, FailedItems, HeaderPhase, LEASE_EXPIRED, Pacing, RedriveReport,
@@ -69,7 +70,7 @@ pub enum Work {
     /// says what was issued, not that the node received or enforces it.
     Check {
         assignment_generation: u64,
-        issued_at: OffsetDateTime,
+        issued_at: Timestamp,
     },
 }
 
@@ -361,7 +362,8 @@ impl ClaimStore for Claiming<'_> {
             self.unverified += 1;
         }
         // The schema keeps these non-negative and the stamp's pair together;
-        // report a violation as a decode error rather than guess.
+        // report a violation, or a time jiff can't hold, as a decode error
+        // rather than guess.
         let rollout_id = self.rollout_id;
         let invalid = |what: &str| {
             sqlx::Error::Decode(
@@ -373,7 +375,8 @@ impl ClaimStore for Claiming<'_> {
             (Some(generation), Some(issued_at)) => Work::Check {
                 assignment_generation: u64::try_from(generation)
                     .map_err(|_| invalid("a negative generation"))?,
-                issued_at,
+                issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
+                    .map_err(|_| invalid("an out-of-range issuance time"))?,
             },
             _ => return Err(invalid("half an issuance stamp")),
         };

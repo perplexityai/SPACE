@@ -52,7 +52,7 @@ async fn rollout(pool: &PgPool, phase: &str) -> TestResult<RolloutId> {
 }
 
 /// Move `rollout` to `phase`, keeping the slot and finish time consistent.
-async fn set_phase(pool: &PgPool, rollout: RolloutId, phase: &str) -> TestResult {
+pub(crate) async fn set_phase(pool: &PgPool, rollout: RolloutId, phase: &str) -> TestResult {
     sqlx::query(sql!(
         "UPDATE firewall_rules_rollouts
          SET phase = $2,
@@ -69,7 +69,7 @@ async fn set_phase(pool: &PgPool, rollout: RolloutId, phase: &str) -> TestResult
 
 /// `count` registered nodes with a reachable, fresh status snapshot, in the
 /// order a claim scans them.
-async fn online_nodes(pool: &PgPool, count: usize) -> TestResult<Vec<NodeId>> {
+pub(crate) async fn online_nodes(pool: &PgPool, count: usize) -> TestResult<Vec<NodeId>> {
     let mut nodes = Vec::new();
     for _ in 0..count {
         let node = NodeId::new();
@@ -120,8 +120,8 @@ async fn issue(
     node: NodeId,
     generation: i64,
     check_in_secs: Option<f64>,
-) -> TestResult<OffsetDateTime> {
-    Ok(sqlx::query_scalar::<_, OffsetDateTime>(sql!(
+) -> TestResult<jiff::Timestamp> {
+    let issued_at = sqlx::query_scalar::<_, OffsetDateTime>(sql!(
         "UPDATE firewall_rules_rollout_items
          SET issued_assignment_generation = $3,
              issued_at = date_trunc('second', now()) - interval '1 hour',
@@ -134,7 +134,10 @@ async fn issue(
     .bind(generation)
     .bind(check_in_secs)
     .fetch_one(pool)
-    .await?)
+    .await?;
+    Ok(jiff::Timestamp::from_nanosecond(
+        issued_at.unix_timestamp_nanos(),
+    )?)
 }
 
 async fn lease(
@@ -184,7 +187,7 @@ async fn lapse(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult {
 /// Wait, for at most ten seconds, until `count` sessions on this test
 /// database wait for a lock: each racing statement is then known to be
 /// blocked rather than not started yet.
-async fn wait_for_lock_waiters(pool: &PgPool, count: i64) -> TestResult {
+pub(crate) async fn wait_for_lock_waiters(pool: &PgPool, count: i64) -> TestResult {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let waiting = sqlx::query_scalar::<_, i64>(sql!(

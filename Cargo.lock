@@ -6123,13 +6123,17 @@ dependencies = [
 name = "pplx-space-firewall-rules-store"
 version = "0.8.2"
 dependencies = [
+ "jiff",
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
+ "pplx-space-firewall-rules-model",
+ "pplx-space-firewall-rules-protocol",
  "pplx-space-node-status-store",
  "pplx-space-rollout-queue",
  "pplx-space-sql-locator",
  "pplx-space-test-env",
  "sqlx",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tracing",
