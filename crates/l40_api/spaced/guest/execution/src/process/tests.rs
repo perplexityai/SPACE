@@ -1716,7 +1716,19 @@ async fn the_detached_start_cap_keeps_admission_with_starts_past_it() {
     let stalled = [start("stalled-1"), start("stalled-2")];
     wait_for_owners(2).await;
     let slots = &service.inner.process_payload_slots;
-    wait_for_permits(&detached, 0, "one start detaches at the hold limit").await;
+    // The exchange takes the detached slot before it returns the payload
+    // slots, so once these are back the detached slot is taken.
+    wait_for_permits(
+        slots,
+        process_limits::START_PAYLOAD_SLOTS as usize,
+        "one start returns its payload slots at the hold limit",
+    )
+    .await;
+    assert_eq!(
+        detached.available_permits(),
+        0,
+        "the detached slot is taken"
+    );
     assert_eq!(
         slots.available_permits(),
         process_limits::START_PAYLOAD_SLOTS as usize,
