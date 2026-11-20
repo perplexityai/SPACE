@@ -6,7 +6,7 @@ use crate::netns_tests::{TestNamespace, contained};
 
 const PRIVILEGE: &str = "create network namespaces and nftables tables";
 
-/// Production nft, with the slot's namespace entry redirected to a test one.
+/// The slot's namespace entry, redirected to a test one.
 struct Redirected(String);
 
 impl SlotHost for Redirected {

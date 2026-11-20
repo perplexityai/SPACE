@@ -115,7 +115,7 @@ impl SlotFirewallAttempt {
 /// What the operation reaches beyond the pool and nft; tests substitute it.
 pub(super) trait SlotHost: Send + Sync + 'static {
     fn namespace_path(&self, slot: &SlotInfo) -> PathBuf;
-    /// Between the lookup and taking ownership.
+    /// Test seam between the lookup and taking ownership.
     fn looked_up(&self) {}
 }
 

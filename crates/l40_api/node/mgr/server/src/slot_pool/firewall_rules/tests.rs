@@ -522,7 +522,7 @@ async fn apply_touches_only_an_owned_stable_slot() {
                 SlotFirewallReport::NotRun(NotRun::Namespace(_)) => "namespace",
                 report => panic!("{context}: {report:?}"),
             };
-            // Ownership is decided before the assignment is read.
+            // Eligibility, ownership and the pin come before the assignment.
             let expected = match (expected, accepted) {
                 ("verified", None) => "no assignment",
                 _ => expected,

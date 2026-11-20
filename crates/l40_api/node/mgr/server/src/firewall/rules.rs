@@ -1,6 +1,6 @@
 //! The nft JSON that builds SPACE's owned table for a reviewed firewall rule
-//! revision. Construction only: replacing an installed table is the caller's
-//! job, and nothing here touches the baseline tables.
+//! revision, and the nft runner `install` and `verify` share. Rendering
+//! replaces nothing, and nothing here touches the baseline tables.
 
 #[cfg(target_os = "linux")]
 use std::fs::File;
