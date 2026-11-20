@@ -64,6 +64,8 @@ pub enum Fence {
     /// Rows or executions still name the node; the blockers are in
     /// `drain_last_error`.
     Held(String),
+    /// The node records no instance to terminate.
+    NoInstance,
     /// The row is no longer the generation's unfenced `terminating` v2
     /// node.
     Moved,
@@ -80,6 +82,8 @@ pub enum TerminatedDelete {
     /// The row no longer carries the fence: a registration took it for
     /// another instance. Nothing to do.
     Unfenced,
+    /// Not yet, and why: a fresh heartbeat, a moved identity or phase.
+    Wait(String),
 }
 
 impl V2Node {
@@ -138,6 +142,11 @@ pub(super) async fn fence<S: DrainV2Sink>(
             Some(NodeStep::Fenced)
         }
         Ok(Fence::Held(_) | Fence::Moved) => None,
+        Ok(Fence::NoInstance) => {
+            sink.record_error(node_id, "the node records no EC2 instance to terminate")
+                .await;
+            None
+        }
         Err(error) => {
             sink.record_error(
                 node_id,
@@ -371,6 +380,15 @@ pub(super) async fn terminated_or_dispatch<S: DrainV2Sink, A: V2InstanceAuthorit
             Some(NodeStep::LetGo)
         }
         Ok(TerminatedDelete::Unfenced) => None,
+        Ok(TerminatedDelete::Wait(why)) => {
+            backoff.defer(node.id, now);
+            sink.record_error(
+                node.id,
+                &format!("fenced instance {fence} is terminated; not deleting the row yet: {why}"),
+            )
+            .await;
+            None
+        }
         Err(error) => {
             backoff.defer(node.id, now);
             sink.record_error(
