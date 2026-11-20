@@ -4668,7 +4668,6 @@ struct ResolverReleases {
     blake3: Uuid,
     latest_holder: Uuid,
     dual_bare: Uuid,
-    dual_prefixed: Uuid,
 }
 
 const RESOLVER_TEMPLATE: &str = "resolver-fixture";
@@ -4717,8 +4716,9 @@ async fn seed_resolver_releases(pool: &PgPool) -> TestResult<ResolverReleases> {
         blake3: release(pool, format!("blake3:{}", hex('c')), "3 days").await?,
         latest_holder: release(pool, format!("sha256:{}", hex('d')), "6 days").await?,
         dual_bare: release(pool, hex('9'), "8 days").await?,
-        dual_prefixed: release(pool, format!("sha256:{}", hex('9')), "7 days").await?,
     };
+    // `dual_bare`'s other spelling: never the digest's original.
+    release(pool, format!("sha256:{}", hex('9')), "7 days").await?;
     tag(pool, releases.bare, "legacy", "0 seconds").await?;
     tag(pool, releases.bare, "legacy", "2 days").await?;
     tag(pool, releases.bare, "archived", "0 seconds").await?;
@@ -4775,8 +4775,8 @@ async fn retained_policy_release_ranking_characterization() -> TestResult {
 }
 
 /// Characterization of observed-demand matching: a recent sandbox's
-/// `content_hash` names the release stored in the same form first, else the
-/// one stored in the other of the bare and `sha256:` forms. Each case records
+/// `content_hash` names its digest's original, stored in either of the bare
+/// and `sha256:` forms. Each case records
 /// enough demand for one unretained release and reports every release the
 /// autoscaler gave a pool beside the retained `latest_holder`. Matching never
 /// reads `templates`, so demand for a template being deleted still gets a pool.
@@ -4789,14 +4789,14 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
         (hex('a'), "present", Some(|w| w.bare)),
         (sha('a'), "present", Some(|w| w.bare)),
         (sha('b'), "present", Some(|w| w.prefixed)),
-        // The pool config upsert answers not found for this bare request.
         (hex('b'), "present", Some(|w| w.prefixed)),
         (blake('c'), "present", Some(|w| w.blake3)),
         (hex('c'), "present", None),
         (blake('a'), "present", None),
-        // The exact form wins over the newer `dual_prefixed`.
+        // Both forms stored, neither with a storage location: the older
+        // `dual_bare` is the digest's original whichever form names it.
         (hex('9'), "present", Some(|w| w.dual_bare)),
-        (sha('9'), "present", Some(|w| w.dual_prefixed)),
+        (sha('9'), "present", Some(|w| w.dual_bare)),
         // A template being deleted still gets a pool. Pinned as today's
         // behaviour, not a contract: consolidating the resolvers is expected
         // to stop that.
@@ -5031,5 +5031,109 @@ async fn autoscaling_follows_the_release_creates_resolve_to() -> TestResult {
         vec![3],
         "the twin takes the original's demand"
     );
+    Ok(())
+}
+
+/// A digest stored under both spellings: retention protects only its
+/// original, ranked by a tag on either spelling, and demand under either
+/// spelling goes to its original, the
+/// release creates resolve and the pool config upsert targets, with twins and
+/// without.
+#[rstest::rstest]
+#[case::without_twins(false)]
+#[case::with_twins(true)]
+#[tokio::test(flavor = "current_thread")]
+async fn retention_and_demand_pick_the_digest_original(#[case] twins: bool) -> TestResult {
+    use pplx_space_template_release_store::spelling_pairs::{
+        OLD_INDEX, seed_spelling_pairs, tag_release,
+    };
+    const TEMPLATE: &str = "spelling-pairs";
+    let fixture = postgres_fixture().await?;
+    let pool = &fixture.pool;
+    insert_template(pool, TEMPLATE).await?;
+    if twins {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX IF EXISTS {OLD_INDEX}"
+        )))
+        .execute(pool)
+        .await?;
+    }
+    let twin_metadata = twins.then_some(r#"{"environment": "fixture-twin"}"#);
+    let pairs = seed_spelling_pairs(pool, TEMPLATE, twin_metadata).await?;
+
+    upsert_warm_pool_policy(pool, TEMPLATE, 1, 10, 20).await?;
+    let mut protected = fixture
+        .store
+        .protected_template_releases()
+        .await?
+        .into_iter()
+        .map(|release| release.content_hash)
+        .collect::<Vec<_>>();
+    protected.sort();
+    let mut expected = pairs
+        .iter()
+        .map(|pair| pair.original_hash().to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(protected, expected, "one retained release per digest");
+
+    // With one retain slot, a `latest` tag left on the other spelling's
+    // original, as one written before the shared rule can be, publishes its
+    // digest: the slot goes to that digest's original.
+    upsert_warm_pool_policy(pool, TEMPLATE, 1, 10, 1).await?;
+    for pair in &pairs {
+        tag_release(pool, TEMPLATE, pair.other(), "latest").await?;
+        let protected = fixture
+            .store
+            .protected_template_releases()
+            .await?
+            .into_iter()
+            .map(|release| release.content_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            protected,
+            vec![pair.original_hash().to_owned()],
+            "latest on {}",
+            pair.other()
+        );
+    }
+
+    // The newest release holds the one retain slot, so demand alone decides
+    // which of the pairs' releases gets a pool.
+    let retained = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, $2, 'fc', $3)",
+    )
+    .bind(retained)
+    .bind(TEMPLATE)
+    .bind(format!("sha256:{}", hex('e')))
+    .execute(pool)
+    .await?;
+    upsert_warm_pool_policy(pool, TEMPLATE, 2, 10, 1).await?;
+    for pair in &pairs {
+        for hash in [&pair.canonical_hash, &pair.bare_hash] {
+            sqlx::query("DELETE FROM sandboxes WHERE template_id = $1")
+                .bind(TEMPLATE)
+                .execute(pool)
+                .await?;
+            sqlx::query("DELETE FROM kubernetes_pool_configs")
+                .execute(pool)
+                .await?;
+            for _ in 0..10 {
+                insert_sandbox_for_template(pool, TEMPLATE, "k8s", hash, None, None).await?;
+            }
+            fixture.store.autoscale_configs("sandboxes", None).await?;
+            let demanded = sqlx::query_scalar::<_, Uuid>(
+                "SELECT template_release_id
+                 FROM kubernetes_pool_configs
+                 WHERE template_release_id <> $1",
+            )
+            .bind(retained)
+            .fetch_all(pool)
+            .await?;
+            assert_eq!(demanded, vec![pair.original], "demand={hash}");
+        }
+    }
     Ok(())
 }

@@ -1046,6 +1046,167 @@ WHERE id = %s
             script.index("DELETE FROM template_release_storage_locations"),
         )
 
+    def test_the_release_delete_waits_for_a_tag_on_the_other_spelling(self) -> None:
+        # A tag writer's foreign-key check holds a key-share lock on the
+        # release it tags until it commits. The delete locks every release of
+        # the candidate's digest before its tag guard, so a tag being written
+        # on the other spelling's release makes it wait instead of deleting
+        # the release that tag resolves to.
+        runner = postgres_runner_or_skip(self)
+        writer = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        bare, canonical = (str(uuid.uuid4()) for _ in range(2))
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            writer.execute(f"SET search_path TO {schema}")
+            runner.execute_script(
+                """
+CREATE TABLE templates (name text PRIMARY KEY);
+INSERT INTO templates VALUES ('code-runtime');
+CREATE TABLE template_releases (
+    id uuid PRIMARY KEY,
+    template_name text NOT NULL,
+    type text NOT NULL,
+    hash text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE template_release_tags (
+    template_release_id uuid NOT NULL REFERENCES template_releases (id),
+    template_name text NOT NULL,
+    tag text NOT NULL
+);
+CREATE TABLE kubernetes_pool_configs (template_release_id uuid);
+CREATE TABLE kubernetes_pool_slots (template_release_id uuid)
+"""
+            )
+            digest = "c" * 64
+            for release, hash_ in [(bare, digest), (canonical, f"sha256:{digest}")]:
+                runner.execute(
+                    "INSERT INTO template_releases VALUES "
+                    "(%s, 'code-runtime', 'fc', %s, NOW() - INTERVAL '30 days')",
+                    (release, hash_),
+                )
+            scripts: list[str] = []
+
+            def capture_script(_args: argparse.Namespace, script: str) -> str:
+                scripts.append(script)
+                return ""
+
+            args = make_args("/tmp")
+            args.keep_latest_per_template = 0
+            candidate = prune.TemplateCandidate(
+                template_release_id=bare,
+                template_name="code-runtime",
+                runtime="fc",
+                content_hash=digest,
+                created_at="",
+                newest_rank="2",
+                storage_location_count="0",
+                storage_uris="",
+                has_encrypted_storage="false",
+                decision="delete",
+                decision_reason="",
+            )
+            with mock.patch.object(prune, "psql_script", side_effect=capture_script):
+                prune.delete_template_release_db(args, candidate, "2099-01-01 00:00:00+00")
+            # Through the tag guard: the statements that lock rows.
+            prefix = scripts[0].split("CREATE TEMP TABLE locked_template_storage")[0]
+            statements = [
+                statement
+                for statement in prefix.split(";")
+                if statement.strip() and statement.strip() != "BEGIN"
+            ]
+
+            writer.execute("BEGIN")
+            writer.execute(
+                "SELECT 1 FROM template_releases WHERE id = %s FOR KEY SHARE",
+                (canonical,),
+            )
+            runner.execute("BEGIN")
+            runner.execute("SET LOCAL lock_timeout = '500ms'")
+            with self.assertRaises(Exception) as raised:
+                for statement in statements:
+                    runner.execute(f"{statement};")
+            self.assertIn("lock timeout", str(raised.exception))
+            runner.execute("ROLLBACK")
+            writer.execute("ROLLBACK")
+        finally:
+            writer.connection.close()
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
+
+    def test_a_tag_on_either_spelling_protects_the_digest(self) -> None:
+        # A tag written before the shared original-release rule can name the
+        # other spelling's release of a digest, and lookups resolve it to the
+        # digest original, so neither spelling's release is a candidate.
+        runner = postgres_runner_or_skip(self)
+        schema = f"prune_cluster_artifacts_test_{uuid.uuid4().hex}"
+        bare, canonical, untagged = (str(uuid.uuid4()) for _ in range(3))
+        try:
+            runner.execute(f"CREATE SCHEMA {schema}")
+            runner.execute(f"SET search_path TO {schema}")
+            runner.execute_script(
+                """
+CREATE TABLE template_releases (
+    id uuid PRIMARY KEY,
+    template_name text NOT NULL,
+    type text NOT NULL,
+    hash text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE template_release_tags (
+    template_release_id uuid NOT NULL,
+    template_name text NOT NULL,
+    tag text NOT NULL
+);
+CREATE TABLE kubernetes_pool_configs (template_release_id uuid);
+CREATE TABLE kubernetes_pool_slots (template_release_id uuid);
+CREATE TABLE template_release_storage_locations (
+    id uuid PRIMARY KEY,
+    template_release_id uuid NOT NULL,
+    storage_connection_string text NOT NULL
+);
+CREATE TABLE template_release_storage_location_encrypted_fields (
+    template_release_storage_location_id uuid NOT NULL
+)
+"""
+            )
+            digest = "a" * 64
+            for release, hash_, days in [
+                (bare, digest, 30),
+                (canonical, f"sha256:{digest}", 20),
+                (untagged, "sha256:" + "b" * 64, 30),
+            ]:
+                runner.execute(
+                    "INSERT INTO template_releases VALUES "
+                    "(%s, 'code-runtime', 'fc', %s, NOW() - %s * INTERVAL '1 day')",
+                    (release, hash_, days),
+                )
+            runner.execute(
+                "INSERT INTO template_release_tags VALUES (%s, 'code-runtime', 'latest')",
+                (canonical,),
+            )
+
+            def query(_args: argparse.Namespace, script: str) -> str:
+                body = script.strip().removesuffix(";")
+                return runner.copy_stdout(body)
+
+            args = make_args("/tmp")
+            args.mode = "superseded-templates"
+            args.keep_latest_per_template = 0
+            with mock.patch.object(prune, "psql_script", side_effect=query):
+                rows = prune.template_candidate_rows(
+                    args, str(runner.fetchone("SELECT NOW()")[0])
+                )
+            self.assertEqual(
+                [row["template_release_id"] for row in rows],
+                [untagged],
+            )
+        finally:
+            runner.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            runner.connection.close()
+
     def test_superseded_template_prune_skips_s3_when_db_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = make_args(tmp)

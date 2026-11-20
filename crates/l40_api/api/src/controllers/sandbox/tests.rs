@@ -1453,9 +1453,9 @@ mod template_release_resolution_postgres_tests {
                 OTHER,
                 None,
             ),
-            // Both forms stored: the row stored in the requested form wins over
-            // the newer bare row with the larger id, and over the older bare
-            // row with the smaller id.
+            // Both forms stored, neither with a storage location: the digest's
+            // original is the older row whichever form the request names,
+            // answered in the requested canonical form.
             (
                 format!("resolver-fixture@{}", sha('9')),
                 fc,
@@ -1466,7 +1466,7 @@ mod template_release_resolution_postgres_tests {
                 format!("resolver-fixture@{}", sha('8')),
                 fc,
                 OTHER,
-                hit(w.late_prefixed, sha('8')),
+                hit(w.early_bare, sha('8')),
             ),
             // `latest` moved from `newest_created` to `latest_holder`.
             (

@@ -1,7 +1,9 @@
 use pplx_space_accounts::{NodeId, OrgId};
 
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::{digest_original, spelling_original};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::{
@@ -2563,7 +2565,8 @@ pub async fn tag_template_release(
         };
         // A tag names a template and hash, and resolves to the original
         // release of it; a lookup with an environment reaches a twin through
-        // the hash. Tagging a twin directly would make tag and digest lookups
+        // the hash. Tagging a twin, or the other spelling's original of a
+        // digest stored under both, would make tag and digest lookups
         // disagree, so it's refused in favor of the original.
         if let Some(original) = original_release_of(&mut tx, &row).await?
             && original != row.id
@@ -2681,7 +2684,7 @@ pub async fn tag_template_release(
         }
         Ok(TagMove::Twin { original }) => api_error(
             StatusCode::CONFLICT,
-            format!("template release is a twin bound to another environment; tag its original release {original}"),
+            format!("template release isn't its digest's original (it's a twin bound to another environment, or the digest's other spelling); tag its original release {original}"),
         )
         .into_response(),
         Err(error) => contention_response(ContentionScope::Writing, &error)
@@ -2710,29 +2713,39 @@ enum TagMove {
     /// The tag was created and removed again by other writers between this
     /// request's reads.
     Raced,
-    /// The release is a twin of `original`, which tags attach to.
+    /// The release isn't its digest's original, `original`, which tags
+    /// attach to: it's a twin, or the other spelling's original.
     Twin {
         original: Uuid,
     },
 }
 
-/// The original release of `release`'s template and hash: the first
-/// registered, earliest by `(created_at, id)`. A twin bound to another
-/// environment is registered after it.
+/// The original release of `release`'s template and digest under either
+/// spelling (`pplx_space_template_release_original::digest_original`), the
+/// release the internal API's tag writer and every lookup without an
+/// environment resolve the digest to. A twin bound to another environment is
+/// registered after its original and never is one; neither is the other
+/// spelling's original where the digest is stored under both.
 async fn original_release_of(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     release: &TemplateReleaseRow,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
-        "SELECT id FROM template_releases
-         WHERE template_name = $1 AND hash = $2
-         ORDER BY created_at ASC, id ASC
-         LIMIT 1"
-    ))
-    .bind(&release.template_name)
-    .bind(&release.content_hash)
-    .fetch_optional(&mut **tx)
-    .await
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id FROM template_releases r
+             WHERE r.template_name = $1
+               AND r.hash IN (replace($2, 'sha256:', ''),
+                              'sha256:' || replace($2, 'sha256:', ''))
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(&release.template_name)
+        .bind(&release.content_hash)
+        .fetch_optional(&mut **tx)
+        .await
 }
 
 /// The release a tag points at, locking its row for the rest of the
@@ -2829,40 +2842,86 @@ pub async fn delete_template_release(
         .bind(release_id)
         .execute(&mut *tx)
         .await?;
-        let latest_count: i64 = sqlx::query_scalar(sql!(
-            "SELECT COUNT(*) FROM template_release_tags
-             WHERE template_release_id = $1 AND tag = 'latest'"
+        // A writer that predates the shared rule can tag the other
+        // spelling's release without the template lock; its insert only
+        // key-share locks the release it names. Locking every release of the
+        // digest makes that insert wait, so the tag check below sees it. A
+        // release of the digest inserted after this lock can't make a tag
+        // resolve to the deleted release: once the delete commits, the
+        // digest original is one of the surviving releases.
+        sqlx::query(sql!(
+            "SELECT 1
+             FROM template_releases r
+             JOIN template_releases digest
+               ON digest.template_name = r.template_name
+              AND replace(digest.hash, 'sha256:', '')
+                = replace(r.hash, 'sha256:', '')
+             WHERE r.id = $1
+             FOR UPDATE OF digest"
         ))
         .bind(release_id)
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        if latest_count > 0 {
+        // A tag resolves to the digest original of the release it names, and
+        // a tag written before the shared rule can name the other spelling's
+        // original. The release's own tags go with it, except `latest`, which
+        // keeps the template's default. Any tag on another release of the
+        // digest outlives the delete and would resolve to a different
+        // release, so it guards the digest original too.
+        /// Built once: every input is a literal or a bind placeholder.
+        static SERVES_A_TAG: LazyLock<String> = LazyLock::new(|| {
+            sql!(format!(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM template_release_tags t
+                     WHERE t.template_release_id = $1
+                       AND t.tag = 'latest')
+                 OR EXISTS (
+                     SELECT 1
+                     FROM template_releases r
+                     JOIN template_releases tagged
+                       ON tagged.template_name = r.template_name
+                      AND replace(tagged.hash, 'sha256:', '')
+                        = replace(r.hash, 'sha256:', '')
+                     JOIN template_release_tags t
+                       ON t.template_release_id = tagged.id
+                     WHERE r.id = $1
+                       AND tagged.id <> r.id
+                       AND {digest_original})",
+                digest_original = digest_original("r"),
+            ))
+        });
+        let serves_a_tag: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(SERVES_A_TAG.as_str()))
+            .bind(release_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if serves_a_tag {
             return Ok(DeleteRelease::Refused(
-                "template release is missing or still tagged latest",
+                "template release is missing, still tagged latest, or serving a tag on its other spelling",
             ));
         }
         // Deleting an original that has twins would make the oldest twin,
         // bound to another environment, the release every lookup without an
         // environment resolves. Its twins go first; a twin itself may go.
-        let has_twins: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1
-                 FROM template_releases r
-                 JOIN template_releases twin
-                   ON twin.template_name = r.template_name
-                  AND twin.hash = r.hash
-                  AND (twin.created_at, twin.id) > (r.created_at, r.id)
-                 WHERE r.id = $1
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM template_releases older
-                       WHERE older.template_name = r.template_name
-                         AND older.hash = r.hash
-                         AND (older.created_at, older.id) < (r.created_at, r.id)))"
-        ))
-        .bind(release_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        /// Built once: every input is a literal or a bind placeholder.
+        static HAS_TWINS: LazyLock<String> = LazyLock::new(|| {
+            sql!(format!(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM template_releases r
+                     JOIN template_releases twin
+                       ON twin.template_name = r.template_name
+                      AND twin.hash = r.hash
+                      AND (twin.created_at, twin.id) > (r.created_at, r.id)
+                     WHERE r.id = $1
+                       AND {spelling_original})",
+                spelling_original = spelling_original("r"),
+            ))
+        });
+        let has_twins: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(HAS_TWINS.as_str()))
+            .bind(release_id)
+            .fetch_one(&mut *tx)
+            .await?;
         if has_twins {
             return Ok(DeleteRelease::Refused(
                 "template release has twins bound to other environments; delete them first",

@@ -1289,7 +1289,19 @@ pool config pins it, which keeps creating slots. Where creates boot the twin
 they resolve to ([Resolving creates to template
 twins](#resolving-creates-to-template-twins)), a tag keeps in use the release
 its build resolves to, which may be a twin, not the tagged release; anywhere
-else, the tagged release. An
+else, or when no release of the build qualifies, the tagged digest's original
+release, whichever spelling the tag sits on. Until no API image that predates
+that rule can serve or be rolled back to, the tagged release counts there too,
+since such an image creates from it. The reverse doesn't hold while API
+images are mixed, in a rollout or a partial rollback: an older image's guard
+counts only the tagged release, so a block or default change it serves can stop
+the environment of a digest original that newer images create from by tag.
+Make those writes only while every API replica runs the same image. That's
+not enough for a block an older image already allowed: before this rule
+serves, check that no environment that's blocked, or stopped by the default,
+holds the digest original of a tagged digest whose tag sits on the other
+spelling's release, and allow that environment or retag the digest original
+first, since creates by that tag will run it. An
 in-use release counts when it's bound to an environment that stops, or when its
 environment can't be told, since new creates from it may run there. A superseded
 release doesn't count: it strands work only through the sandboxes made from it,
@@ -2659,31 +2671,55 @@ Known limits until the cluster side carries partitions:
   without removing anything. Two publishes of one hash in the same
   environment can still interleave, as before, so one's manifest can end up
   beside the other's rootfs: the publisher doesn't serialize them.
-- Don't drop the old `(template_name, hash)` unique index until the internal
-  API, the API and the cluster controller all run this code, and no rollback
-  target predates it. `scripts/bootstrap-templates.sh` also has to be updated
-  or retired first: its release insert's `ON CONFLICT (template_name, hash)`
-  needs a unique index on exactly those columns, so it fails once the index
-  is gone, even with no twins. It runs with `ON_ERROR_STOP=1` and no
-  transaction, so it stops there, after its template upsert has committed.
-  Its tag and storage-location inserts also pick releases by template and
-  hash alone: with only the release insert fixed, the tag insert fails once
-  a twin exists, which stops the script again, and the storage-location
-  insert, if reached, would add the location to every release of the hash. Recreating the index isn't a
-  rollback once a twin exists: the twin and its original share a template and
-  hash, so the index build fails.
-- Don't drop the old index until the internal API, the API and the cluster
-  pool share one original-release rule, deployed, and no rollback target
-  predates it. Today each spells the rule in its own SQL: the internal API's
-  registration and tag writer prefers, across both spellings of a digest, the
-  original that owns a storage location, the API's statements prefer the
-  canonical `sha256:` spelling and pick its earliest release, and the
-  warm-pool store's count each spelling's earliest release as an original. So
-  a digest stored under both spellings can already resolve to different
-  releases under the old index, as before this change, when the bare one owns
-  the storage location. Once twins exist, each spelling can also hold
-  several releases, and every path has to keep resolving the same original
-  over its twins.
+- One rule picks a digest's original release, owned by
+  `crates/l30_storage/template/release/original`: among the releases of a
+  template whose hash spells the digest either way (`sha256:<hex>` or bare
+  `<hex>`), each spelling's original is its earliest release by
+  `(created_at, id)`, and the digest's original is the spelling original that
+  owns a storage location, or the earlier one when both or neither do. The
+  internal API's registration, tag writer, hash and tag lookups and listing,
+  the API's create-by-digest, create-by-tag and placement lookups, the admin
+  tag refusal and delete guard, the runtime environment in-use count, the
+  warm-pool store's retention and demand reads, and
+  `scripts/bootstrap-templates.sh` all interpolate that one predicate. Twin
+  resolution (`resolved_release_sql`, above) breaks a tie between a build's
+  releases under the two spellings with it too, so a create naming either
+  spelling runs the release the warm pool warms. It still ranks the original
+  tier by the build's earliest storage-owning release, twins included, so the
+  two can differ when a twin owns a storage location its spelling's original
+  lacks. A tag
+  written before the rule can sit on the other spelling's original; tag
+  lookups, the pool's `latest` preference and retention's publish time read
+  it as a tag on the digest, so it resolves to the digest original. A manual
+  pool config upserted before the rule can still name the other spelling's
+  original and keeps warming it until it's disabled with
+  `DELETE /admin/api/v1/warm-pools/{id}`. Upserting the same config again
+  doesn't retire it: the upsert adds a config on the digest original and
+  leaves the old one enabled. A rollback to an image that predates the rule
+  half-strands a config the new API upserted on a bare digest original:
+  old creates by digest resolve to its `sha256:` spelling and miss it, while
+  old creates by a tag on the bare release still hit it. Disabling it and
+  upserting again with the `sha256:` hash, which the old API matches
+  exactly, swaps which of the two goes cold, so keep the one that carries
+  the traffic. Mixed versions can
+  still disagree: an image that predates the rule resolves a digest stored
+  under both spellings as it did before (the API preferring the canonical
+  spelling, the warm pool counting each spelling's original), so don't drop
+  the old index until the internal API, the API and the cluster controller
+  all run the shared rule and no rollback target predates it. Until the API
+  and the cluster controller have both rolled, creates for such a digest can
+  miss the warm pool in either order: an old controller ranks each spelling's
+  original separately for retention and maps demand to the spelling a
+  sandbox records.
+- Don't drop the old `(template_name, hash)` unique index until
+  `scripts/bootstrap-templates.sh` is updated or retired too: its release
+  insert's `ON CONFLICT (template_name, hash)` needs a unique index on exactly
+  those columns, so it fails once the index is gone, even with no twins. It
+  runs with `ON_ERROR_STOP=1` and no transaction, so it stops there, after its
+  template upsert has committed. Its tag and storage-location inserts already
+  pick the digest's original, so they stay correct once twins exist.
+  Recreating the index isn't a rollback once a twin exists: the twin and its
+  original share a template and hash, so the index build fails.
 - Don't run `scripts/admin/prune_cluster_artifacts.py superseded-templates`
   on a deployment with twins until the script applies the original-release
   rule. It deletes an old release that no tag, pool config or pool slot names,

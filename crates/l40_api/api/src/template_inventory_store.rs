@@ -57,9 +57,10 @@ pub(crate) async fn release_build_shape(
 /// `template` with a binding reports it bound to, unparsed. `None` when no
 /// node reports one, or when nodes report different ones: one hash can be
 /// cached bound to several environments, and then no single binding is the
-/// build's. A row without a binding doesn't count either way. A legacy
-/// unprefixed hash matches its `sha256:` spelling, as the template release
-/// lookups match it.
+/// build's. A row without a binding doesn't count either way. Either spelling
+/// of the digest matches the other, as the template release lookups match
+/// it: a tag on a legacy unprefixed release reports that spelling while the
+/// digest's holders record the `sha256:` one.
 ///
 /// A row bound to one of `excluded` doesn't count either way: the caller
 /// passes the bindings of the hash's other releases, its twins, whose
@@ -78,7 +79,8 @@ pub(crate) async fn agreed_build_environment(
              SELECT nti.execution_metadata->>'environment' AS environment
              FROM node_template_inventory nti
              WHERE nti.template_name = $1
-               AND nti.content_hash IN ($2, replace($2, 'sha256:', ''))
+               AND nti.content_hash IN (replace($2, 'sha256:', ''),
+                                        'sha256:' || replace($2, 'sha256:', ''))
                AND nti.execution_metadata->>'environment' IS NOT NULL
                AND NOT (nti.execution_metadata->>'environment' = ANY($3))
          ) bindings"
