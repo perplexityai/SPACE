@@ -133,8 +133,9 @@ The builders group spans every private subnet, so two builders in one AZ
 to terminate one of them, and EKS drains that termination without honoring
 PodDisruptionBudgets. With `MINIMAL`, set `builders_az_rebalance_suspended`
 to suspend the process on the builders ASG. It changes no node group, and
-needs the `aws` CLI with `autoscaling:SuspendProcesses` and
-`autoscaling:ResumeProcesses` where the apply runs. `DEFAULT` places each
+needs the `aws` CLI with `autoscaling:SuspendProcesses`,
+`autoscaling:ResumeProcesses` and `autoscaling:DescribeAutoScalingGroups`
+where the apply runs. `DEFAULT` places each
 surge node through `AZRebalance`, so the module refuses the two together.
 With the process suspended nothing evens the zones out, so check builder
 placement after a launch.

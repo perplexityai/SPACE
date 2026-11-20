@@ -15,8 +15,9 @@
 # EKS managed node groups don't expose the ASG's suspended processes and the
 # AWS provider can only set them on an ASG it creates, so the suspension is a
 # call to the AWS CLI from the machine running the apply. That machine needs
-# the `aws` CLI and `autoscaling:SuspendProcesses` and
-# `autoscaling:ResumeProcesses` on the builders ASG. The call runs when the
+# the `aws` CLI and `autoscaling:SuspendProcesses`,
+# `autoscaling:ResumeProcesses` and `autoscaling:DescribeAutoScalingGroups` on
+# the builders ASG. The call runs when the
 # resource is created and again whenever the builders ASG changes (a replaced
 # group), and nothing else re-runs it. Turning the variable off resumes the
 # process. Something else that resumes it out of band, such as the end of an
