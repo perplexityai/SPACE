@@ -233,6 +233,8 @@ pub struct NodeManagerService {
     snapshot_inventory: snapshot_inventory::SnapshotInventory,
     #[cfg(test)]
     encrypted_capture_io: Option<snapshots::EncryptedCaptureTestIo>,
+    #[cfg(all(test, target_os = "linux"))]
+    firewall_sync: Option<std::sync::Arc<firewall_sync::FirewallSync>>,
 }
 
 type SandboxCgroupGateLock = std::sync::Arc<tokio::sync::RwLock<()>>;
@@ -457,6 +459,8 @@ impl NodeManagerService {
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
             #[cfg(test)]
             encrypted_capture_io: None,
+            #[cfg(all(test, target_os = "linux"))]
+            firewall_sync: None,
         })
     }
 
@@ -761,6 +765,7 @@ mod encrypted_volumes;
 mod endpoint_attestation;
 mod execution_fence;
 mod execution_policy;
+mod firewall_sync;
 mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;

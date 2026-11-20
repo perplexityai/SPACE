@@ -5,7 +5,7 @@ use super::*;
 use crate::netns_tests::{TestNamespace, contained};
 
 /// The slot's namespace entry, redirected to a test one.
-struct Redirected(String);
+pub(crate) struct Redirected(pub(crate) String);
 
 impl SlotHost for Redirected {
     fn namespace_path(&self, _: &SlotInfo) -> PathBuf {
@@ -13,12 +13,24 @@ impl SlotHost for Redirected {
     }
 }
 
-fn list(namespace: &TestNamespace, args: &[&str]) -> Value {
+pub(crate) fn list(namespace: &TestNamespace, args: &[&str]) -> Value {
     let netns = File::open(format!("/run/netns/{}", namespace.name())).unwrap();
     let budget = crate::host_command::PROBE_BUDGET;
     let output = contained(|| crate::firewall::rules::nft(&netns, args, b"", budget)).unwrap();
     assert!(output.status.success(), "nft {args:?}: {output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// The owned table in `namespace`, without the handles nft assigns.
+pub(crate) fn owned_table(namespace: &TestNamespace) -> Vec<Value> {
+    let table = ["-j", "list", "table", "ip", "space_firewall_rules"];
+    let mut listed = list(namespace, &table)["nftables"].as_array().unwrap()[1..].to_vec();
+    for object in &mut listed {
+        for body in object.as_object_mut().unwrap().values_mut() {
+            body.as_object_mut().unwrap().remove("handle");
+        }
+    }
+    listed
 }
 
 // Catches an apply that misses the slot's namespace or touches a sibling one.
@@ -60,13 +72,6 @@ fn applies_the_accepted_revision_only_to_the_slot_namespace() {
         identity(std::fs::metadata(entry)).ok()
     );
 
-    let table = ["-j", "list", "table", "ip", "space_firewall_rules"];
-    let mut listed = list(&target, &table)["nftables"].as_array().unwrap()[1..].to_vec();
-    for object in &mut listed {
-        for body in object.as_object_mut().unwrap().values_mut() {
-            body.as_object_mut().unwrap().remove("handle");
-        }
-    }
-    assert_eq!(listed, installed(12));
+    assert_eq!(owned_table(&target), installed(12));
     assert_eq!(list(&sibling, &["-j", "list", "ruleset"]), sibling_before);
 }

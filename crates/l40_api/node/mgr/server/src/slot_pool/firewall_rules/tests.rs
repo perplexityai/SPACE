@@ -19,21 +19,21 @@ use super::*;
 use crate::firewall::assignment::IncomingAssignment;
 use crate::slot_pool::NetworkPoolConfig;
 
-mod linux;
+pub(crate) mod linux;
 
-const NODE: NodeId = NodeId::from_uuid(Uuid::from_u128(1));
+pub(crate) const NODE: NodeId = NodeId::from_uuid(Uuid::from_u128(1));
 /// Far beyond any wait a passing run makes, so it never trips on a slow runner.
-const BOUND: Duration = Duration::from_secs(10);
+pub(crate) const BOUND: Duration = Duration::from_secs(10);
 
 /// Fails the test instead of letting a wait that should end hang it.
-async fn bounded<T>(future: impl Future<Output = T>) -> T {
+pub(crate) async fn bounded<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(BOUND, future)
         .await
         .expect("waited past the bound")
 }
 
 /// Generation `generation` drops TCP to the port of that number.
-fn document(generation: u64) -> String {
+pub(crate) fn document(generation: u64) -> String {
     let rule = json!({"id": "port", "all_of": [{
         "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": generation,
     }]});
@@ -62,7 +62,7 @@ fn accept(store: &FirewallAssignments, generation: u64) {
 }
 
 /// The owned table the fake holds once `generation` is installed.
-fn installed(generation: u64) -> Vec<Value> {
+pub(crate) fn installed(generation: u64) -> Vec<Value> {
     let revision = decode_revision(&document(generation)).unwrap();
     render(&revision)
         .commands()
@@ -80,7 +80,7 @@ fn pool(slots: u32) -> (Arc<NetworkPool>, mpsc::Receiver<()>) {
 }
 
 /// A healthy slot, held by `sandbox-{slot_id}` unless it is ready.
-fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, generation: i64) {
+pub(crate) fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, generation: i64) {
     let update = "UPDATE network_slots SET state = ?1, generation = ?2, health = 'healthy',
                   sandbox_id = CASE ?1 WHEN 'ready' THEN NULL ELSE 'sandbox-' || ?3 END
                   WHERE slot_id = ?3";
@@ -88,9 +88,14 @@ fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, generation: i64)
     pool.db.lock().unwrap().execute(update, params).unwrap();
 }
 
+/// Holds the slot as other work would, until dropped.
+pub(crate) fn busy(pool: &Arc<NetworkPool>, slot_id: u32) -> impl Send {
+    SlotGuard::try_acquire(pool, slot_id).unwrap()
+}
+
 /// How the fake nft departs from a healthy one.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Fault {
+pub(crate) enum Fault {
     /// Commits, then reports failure, as nft can after an ACK overflow.
     Rejects,
     /// Commits, then times out.
@@ -99,11 +104,13 @@ enum Fault {
     Drops,
     /// Commits, then fails every listing.
     Unlistable,
+    /// Commits, then panics, failing the apply's job.
+    Panics,
 }
 
-type Hook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
+pub(crate) type Hook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
 
-fn hook(slot: &Hook, hook: impl FnOnce() + Send + 'static) {
+pub(crate) fn hook(slot: &Hook, hook: impl FnOnce() + Send + 'static) {
     *slot.lock().unwrap() = Some(Box::new(hook));
 }
 
@@ -114,20 +121,20 @@ fn fire(slot: &Hook) {
     }
 }
 
-struct FakeHost {
+pub(crate) struct FakeHost {
     links: TempDir,
     fault: Option<Fault>,
-    tables: Mutex<HashMap<NamespaceIdentity, Vec<Value>>>,
+    pub(crate) tables: Mutex<HashMap<NamespaceIdentity, Vec<Value>>>,
     installs: Mutex<Vec<NamespaceIdentity>>,
     calls: Mutex<Vec<NamespaceIdentity>>,
     /// Fired once, after the next lookup.
-    looked_up: Hook,
+    pub(crate) looked_up: Hook,
     /// Fired once, after the next install commits.
-    installed: Hook,
+    pub(crate) installed: Hook,
 }
 
 impl FakeHost {
-    fn new(fault: Option<Fault>) -> Arc<Self> {
+    pub(crate) fn new(fault: Option<Fault>) -> Arc<Self> {
         Arc::new(Self {
             links: tempfile::tempdir().unwrap(),
             fault,
@@ -144,23 +151,23 @@ impl FakeHost {
     }
 
     /// Points the slot's namespace entry at one of this process's namespaces.
-    fn name(&self, slot_id: u32, kind: &str) -> NamespaceIdentity {
+    pub(crate) fn name(&self, slot_id: u32, kind: &str) -> NamespaceIdentity {
         let link = self.link(slot_id);
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(format!("/proc/self/ns/{kind}"), &link).unwrap();
         identity(std::fs::metadata(&link)).unwrap()
     }
 
-    fn installs(&self) -> Vec<NamespaceIdentity> {
+    pub(crate) fn installs(&self) -> Vec<NamespaceIdentity> {
         self.installs.lock().unwrap().clone()
     }
 
-    fn calls(&self) -> Vec<NamespaceIdentity> {
+    pub(crate) fn calls(&self) -> Vec<NamespaceIdentity> {
         self.calls.lock().unwrap().clone()
     }
 
     /// nft's reply, or None once it timed out.
-    fn reply(&self, netns: &File, args: &[&str], stdin: &[u8]) -> Option<Output> {
+    pub(crate) fn reply(&self, netns: &File, args: &[&str], stdin: &[u8]) -> Option<Output> {
         let namespace = identity(netns.metadata()).unwrap();
         self.calls.lock().unwrap().push(namespace);
         if args == ["-j", "-f", "-"] {
@@ -170,6 +177,7 @@ impl FakeHost {
             }
             fire(&self.installed);
             return match self.fault {
+                Some(Fault::Panics) => panic!("the fake nft panics after committing"),
                 Some(Fault::Rejects) => Some(output(1, Vec::new())),
                 Some(Fault::TimesOut) => None,
                 _ => Some(output(0, Vec::new())),

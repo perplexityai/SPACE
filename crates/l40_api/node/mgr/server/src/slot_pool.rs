@@ -2085,7 +2085,7 @@ mod claim_contention_tests;
 mod db;
 mod execution;
 #[cfg(target_os = "linux")]
-mod firewall_rules;
+pub(crate) mod firewall_rules;
 mod liveness;
 #[cfg(test)]
 mod node_status_tests;

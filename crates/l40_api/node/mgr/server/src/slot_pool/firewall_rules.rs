@@ -21,7 +21,7 @@ use crate::firewall::rules::{Nft, nft, render};
 use crate::net::SlotInfo;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SlotFirewallRequest {
@@ -117,7 +117,7 @@ impl SlotFirewallAttempt {
 }
 
 /// What the operation reaches beyond the pool and nft; tests substitute it.
-pub(super) trait SlotHost: Send + Sync + 'static {
+pub(crate) trait SlotHost: Send + Sync + 'static {
     fn namespace_path(&self, slot: &SlotInfo) -> PathBuf;
     /// Test seam between the lookup and taking ownership.
     fn looked_up(&self) {}
@@ -153,7 +153,7 @@ impl NetworkPool {
             .await
     }
 
-    pub(super) async fn apply_firewall_rules_with(
+    pub(crate) async fn apply_firewall_rules_with(
         self: &Arc<Self>,
         assignments: &Arc<FirewallAssignments>,
         request: SlotFirewallRequest,

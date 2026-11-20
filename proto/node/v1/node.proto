@@ -173,6 +173,12 @@ service NodeManager {
   // Deny inbound traffic to a guest port (remove from sandbox allowlist).
   rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
 
+  // Durably accept the node's firewall assignment, then apply it to one slot
+  // bound by a test fixture. Acceptance and that slot's dispatch are reported
+  // separately; neither is node-wide. Without a binding, which every
+  // production node lacks, FAILED_PRECONDITION after authorization.
+  rpc SyncFirewallRules(SyncFirewallRulesRequest) returns (SyncFirewallRulesResponse);
+
   // ─── Node artifact store ─────────────────────────────────────────────
   //
   // The node's root-owned store of runtime releases and guest kernels. The
@@ -412,6 +418,63 @@ message ApplyExecutionPolicyResponse {
   // The policy now enforced, as GetExecutionInventory publishes it.
   space.execution.v1.ExecutionPolicyObservation enforced = 1;
   ClusterDefaultOutcome default_outcome = 2;
+}
+
+// The assignment node-ctl fetches from the control plane, as fetched.
+message FirewallRulesAssignment {
+  uint64 generation = 1;
+  // Canonical UUID.
+  string revision_id = 2;
+  // The revision's canonical JSON document (pplx-space-firewall-rules-protocol).
+  string revision = 3;
+}
+
+message SyncFirewallRulesRequest {
+  // Canonical node ID the assignment names, checked against this node's own.
+  string node_id = 1;
+  FirewallRulesAssignment assignment = 2;
+}
+
+enum FirewallAssignmentAcceptance {
+  FIREWALL_ASSIGNMENT_ACCEPTANCE_UNSPECIFIED = 0;
+  FIREWALL_ASSIGNMENT_ACCEPTANCE_COMMITTED = 1;
+  // Already the accepted assignment; this is no proof it was applied.
+  FIREWALL_ASSIGNMENT_ACCEPTANCE_REPLAYED = 2;
+}
+
+// What happened to the accepted generation in the bound slot, as of the reply.
+enum FirewallSlotDispatchOutcome {
+  FIREWALL_SLOT_DISPATCH_OUTCOME_UNSPECIFIED = 0;
+  // Queued or running when the bounded wait ended.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_PENDING = 1;
+  // A newer generation was accepted before this one's result.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_SUPERSEDED = 2;
+  // Nothing reached nft, as for a busy slot; redelivery may retry.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_NOT_RUN = 3;
+  // Submitted once, and the slot's readback listed exactly this revision.
+  // A point-in-time observation of one slot, not node-wide verification.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_MATCHED = 4;
+  // Submitted once; the readback listed something else.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_MISMATCHED = 5;
+  // Submitted once; the readback could not tell. Ends the binding.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_INCONCLUSIVE = 6;
+  // Submitted once, but what it was made for changed before the final check.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_STALE = 7;
+  // The apply failed and nft may have run. Ends the binding.
+  FIREWALL_SLOT_DISPATCH_OUTCOME_UNKNOWN = 8;
+}
+
+message FirewallSlotDispatch {
+  FirewallSlotDispatchOutcome outcome = 1;
+  // Diagnostic only.
+  string detail = 2;
+}
+
+message SyncFirewallRulesResponse {
+  // The request's generation, now durably accepted.
+  uint64 accepted_generation = 1;
+  FirewallAssignmentAcceptance acceptance = 2;
+  FirewallSlotDispatch dispatch = 3;
 }
 
 message ResolveExecutionEnvironmentRequest {
