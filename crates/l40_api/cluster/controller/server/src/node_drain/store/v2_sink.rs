@@ -4,14 +4,15 @@
 use std::str::FromStr;
 
 use pplx_space_api::controllers::substrate::connect_internal_node_api_client_for_target;
+use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
 use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeRequest, DrainNodeResponse};
 use uuid::Uuid;
 
 use pplx_space_node_registration_store::drain_v2::{
-    LockedV2Node, StoredV2Report, advance_v2_drained, evacuated_still_suspended, finish_v2_cancel,
-    let_go_v2_node, list_v2_node_rows, read_locked_v2_node, record_terminate_held,
-    record_v2_dispatched, record_v2_error, record_v2_report, record_v2_terminated_observed,
-    return_v2_drained, write_fence,
+    LockedV2Node, StoredV2Report, add_v2_evacuated, advance_v2_drained, evacuated_still_suspended,
+    finish_v2_cancel, let_go_v2_node, list_v2_node_rows, read_locked_v2_node,
+    record_terminate_held, record_v2_dispatched, record_v2_error, record_v2_report,
+    record_v2_terminated_observed, return_v2_drained, write_fence,
 };
 
 use super::*;
@@ -72,6 +73,40 @@ async fn lock_v2_node(
         return Ok(None);
     }
     read_locked_v2_node(tx, node_id).await
+}
+
+/// Add every durable row still homed on the `drained` v2 node under
+/// `generation` to the drain's `evacuated_total`, under the node's row lock:
+/// its suspended rows whose state a durable snapshot holds
+/// ([`pplx_space_sandbox_store::drain_terminate::durable_suspended_rows_naming`]).
+/// A v2 drain never moves a stopped sandbox, so none is counted. A
+/// `drain_status` write only, made only when a row isn't counted yet; no
+/// sandbox row is written. Returns the ids the set holds now of those rows;
+/// none for a row that is no longer that generation's `drained` node.
+pub(crate) async fn count_v2_drained_evacuations(
+    pool: &PgPool,
+    node_id: NodeId,
+    generation: i64,
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(node) = lock_v2_node(&mut tx, node_id).await? else {
+        return Ok(Vec::new());
+    };
+    if !node.is_v2("drained", generation) {
+        return Ok(Vec::new());
+    }
+    let durable =
+        pplx_space_sandbox_store::drain_terminate::durable_suspended_rows_naming(&mut *tx, node_id)
+            .await?;
+    // The node evicts a durable copy on its own, and one it evicted before a
+    // report named it evacuated leaves the report: these rows are the
+    // count's only witness of it.
+    if !durable.is_empty() {
+        let ids: Vec<String> = durable.iter().map(ToString::to_string).collect();
+        add_v2_evacuated(&mut *tx, node_id, generation, &ids).await?;
+    }
+    tx.commit().await?;
+    Ok(durable)
 }
 
 /// The terminate transaction of the v2 node under `generation`, under its
@@ -316,15 +351,19 @@ pub(crate) async fn record_v2_evacuated(
 /// snapshot. A node keeps a suspended sandbox's cache after the sandbox was
 /// restored elsewhere, so it can report an artifact the row no longer pins.
 /// A row that still pins the reported artifact waits for it, so a sandbox
-/// whose only copy is the node's is never recorded before its upload. A row
-/// still `started`, `paused` or `suspending` on the node isn't projected
-/// yet; one that runs on another node, with an active execution there, has
-/// moved on. A `stopped` row still homed on the node is never recorded
-/// ([`STOPPED_NOT_RECORDED`]): a v2 drain doesn't move it, so the drain stays
-/// unfinished with that reason rather than reaching `drained` and being held
-/// at the fence. Durable means a ready, stored backup of the artifact as a
-/// full snapshot (`artifact_backup_ready`, the verb a node's release of its
-/// local copy asks).
+/// whose only copy is the node's is never recorded before its upload. A
+/// node-initiated suspend can leave the row `suspended` on the node with no
+/// pin at all; it is recorded once the catalog holds the reported artifact
+/// ready and stored, and the restore selector's
+/// [`fresh_ready_snapshot_exists`] holds for the row, so its next restore
+/// has a source. A row still `started`, `paused` or `suspending` on the node
+/// isn't projected yet; one that runs on another node, with an active
+/// execution there, has moved on. A `stopped` row still homed on the node is
+/// never recorded ([`STOPPED_NOT_RECORDED`]): a v2 drain doesn't move it, so
+/// the drain stays unfinished with that reason rather than reaching
+/// `drained` and being held at the fence. Durable means a ready, stored
+/// backup of the artifact as a full snapshot (`artifact_backup_ready`, the
+/// verb a node's release of its local copy asks).
 ///
 /// A row that no longer needs anything is [`EvacuationRecord::Recorded`].
 pub(crate) async fn record_v2_evacuation(
@@ -400,6 +439,35 @@ pub(crate) async fn record_v2_evacuation(
     // pinning another artifact that is durable.
     if home.is_some_and(|home| home != node_id) {
         return Ok(EvacuationRecord::Recorded);
+    }
+    // A markerless row's restore takes a fresh ready full snapshot through
+    // the selector's legacy branch, so both halves must hold: the reported
+    // snapshot is durable, and that branch finds a source. A row the fence
+    // already unplaced, homed nowhere, is read the same way.
+    if pin.is_none() && home.is_none_or(|home| home == node_id) {
+        if !ready(artifact).await? {
+            return Ok(EvacuationRecord::NotYet(
+                "the row pins no artifact and the catalog doesn't hold the reported one as ready yet"
+                    .to_owned(),
+            ));
+        }
+        let fresh = format!(
+            "SELECT {} FROM sandboxes s WHERE s.id = $1",
+            fresh_ready_snapshot_exists("s")
+        );
+        let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(fresh.as_str())))
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await
+            .map_err(sql_error)?;
+        return Ok(if fresh {
+            EvacuationRecord::Recorded
+        } else {
+            EvacuationRecord::NotYet(
+                "the row pins no artifact and has no ready full snapshot since its placement changed"
+                    .to_owned(),
+            )
+        });
     }
     if let Some(pin) = pin
         && ready(pin).await?
@@ -579,6 +647,16 @@ impl DrainV2Sink for SubstrateSink {
             tracing::warn!(node_id = %node_id, %error, "node_drain v2: recording an error failed");
         }
         tracing::warn!(node_id = %node_id, error = message, "node_drain v2");
+    }
+
+    async fn count_drained_evacuations(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+    ) -> Result<Vec<SandboxId>, String> {
+        count_v2_drained_evacuations(&self.pool, node_id, generation_i64(generation)?)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn fence(&self, node_id: NodeId, generation: u64) -> Result<Fence, String> {

@@ -182,6 +182,15 @@ impl DrainV2Sink for FakeSink {
         self.log(format!("error {node_id} {message}"));
     }
 
+    async fn count_drained_evacuations(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+    ) -> Result<Vec<SandboxId>, String> {
+        self.log(format!("count_drained {node_id} {generation}"));
+        Ok(Vec::new())
+    }
+
     async fn fence(&self, node_id: NodeId, generation: u64) -> Result<Fence, String> {
         self.log(format!("fence {node_id} {generation}"));
         Ok(self
@@ -578,11 +587,12 @@ async fn draining_advances_only_on_a_finished_report_under_its_generation() {
     }
 }
 
-/// A drained node isn't called and its tick writes nothing: the one call of
-/// the sink that names it converges its cordon, since it is still sealed. A
-/// draining one's tick drains it.
+/// A drained node isn't called and its tick writes no sandbox row: its
+/// only sink calls converge its cordon, since it is still sealed, and count
+/// its durable homed rows evacuated. A draining one's tick drains it, and
+/// counts nothing.
 #[tokio::test]
-async fn a_drained_node_is_neither_called_nor_written() {
+async fn a_drained_node_is_not_called_and_only_counts_its_evacuations() {
     let drained = node(Some("drained"), Some(5));
     let draining = node(Some("draining"), Some(6));
     let sink = FakeSink {
@@ -596,8 +606,19 @@ async fn a_drained_node_is_neither_called_nor_written() {
         .into_iter()
         .filter(|call| call.contains(&drained.id.to_string()))
         .collect();
-    assert_eq!(drained_calls, [format!("cordon {}", drained.id)]);
+    assert_eq!(
+        drained_calls,
+        [
+            format!("cordon {}", drained.id),
+            format!("count_drained {} 5", drained.id),
+        ]
+    );
     assert!(called(&sink, "drain_node", &draining), "{:?}", sink.calls());
+    assert!(
+        !called(&sink, "count_drained", &draining),
+        "{:?}",
+        sink.calls()
+    );
 }
 
 /// EC2's listing of one instance id reads as one state only when it lists
