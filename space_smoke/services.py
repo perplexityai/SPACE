@@ -415,7 +415,7 @@ class SmokeServices:
         phase = "create sandbox" if sandbox_count == 1 else "create sandbox collection"
         with context.phase(phase):
             for _ in range(sandbox_count):
-                sandboxes.create()
+                sandboxes.create(sandbox_config.metadata)
         sandbox = sandboxes.items[0]
         fixture = fixture_type(
             context,

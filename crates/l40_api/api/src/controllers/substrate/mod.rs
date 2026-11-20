@@ -370,6 +370,23 @@ impl CreateBootMode {
             ))),
         }
     }
+
+    /// The mode a create's warm-pool attempt runs under, given the mode
+    /// [`Self::from_api`] chose for its cold boot. A create that leaves the
+    /// boot mode unset and names both vCPU and memory boots cold, but a ready
+    /// slot of exactly that shape for its release serves it first; the claim
+    /// matches the shape, and a miss still boots cold at the requested shape.
+    /// A disk size keeps it cold: a slot's rootfs is sized when it is
+    /// materialized.
+    pub fn for_pool_attempt(self, requested: Option<&str>, resources: &SandboxResources) -> Self {
+        let pool_matchable_shape = resources.vcpu.is_some()
+            && resources.memory_mib.is_some()
+            && resources.disk_mib.is_none();
+        match (self, requested) {
+            (Self::Cold, None) if pool_matchable_shape => Self::Fallthrough,
+            _ => self,
+        }
+    }
 }
 
 #[cfg(test)]

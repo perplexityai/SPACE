@@ -54,6 +54,7 @@ _DURATION_SECONDS = {
         "ecw.sandbox_list_pagination": 8,
         "ecw.timeout_update": 54,
         "ecw.warm_pool_environment": 14,
+        "ecw.warm_pool_shaped_claim": 14,
         "ecw.watcher_identity": 4,
         "local.btrfs_send_restore_fails_closed_without_parent_source": 55,
         "local.btrfs_send_restore_pulls_parent_template": 42,

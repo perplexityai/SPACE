@@ -1325,6 +1325,12 @@ impl SandboxController {
         )
         .await?
         .map(tokio::sync::Mutex::new);
+        // The warm-pool attempt can run under a different mode than the
+        // create: a shaped default create tries the pool (`Fallthrough`) but
+        // stays `Cold`, so a miss below boots cold at the requested shape
+        // rather than at the pool config's shape.
+        let pool_attempt_boot_mode =
+            boot_mode.for_pool_attempt(req.boot_mode.as_deref(), &requested_resources);
         let pooled_input = PooledCreateInput {
             federated_grant_audience: self.federated_grant_audience.clone(),
             pool,
@@ -1344,7 +1350,7 @@ impl SandboxController {
             template_network_policy: &template_network_policy,
             template_network_policy_generation,
             network_policy_override: network_policy_override.as_ref(),
-            boot_mode,
+            boot_mode: pool_attempt_boot_mode,
             federated_owner,
             federated_service_grant,
             volume_encryption,
