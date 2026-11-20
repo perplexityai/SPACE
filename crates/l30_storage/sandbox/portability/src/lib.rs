@@ -2132,8 +2132,8 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
     )
 }
 
-/// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
-/// still has a durable copy of the suspend artifact its marker pins, even
+/// SQL row condition: the snapshot `sn` is a durable copy of the suspend
+/// artifact the marker of the sandbox aliased as `sandbox_alias` pins, even
 /// though that copy predates the last recorded command or access.
 ///
 /// This is the evidence a lost started sandbox can be **rolled back** to once
@@ -2171,93 +2171,12 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
 /// that no runtime can still write to the sandbox: the source node is gone,
 /// the active execution is the terminal `recovery_failed` owner with no pod,
 /// and the row is locked.
-pub fn rollback_marker_suspend_backup_exists(sandbox_alias: &str) -> String {
-    let matches = rollback_marker_suspend_backup_matches(sandbox_alias);
-    format!(
-        "EXISTS (\n\
-             SELECT 1\n\
-               FROM snapshots sn\n\
-               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
-              WHERE {matches}\n\
-         )"
-    )
-}
-
-/// The row condition behind [`rollback_marker_suspend_backup_exists`], over
-/// `snapshots sn JOIN snapshot_storage_locations ssl ON ssl.snapshot_id =
-/// sn.id`. For a caller that has to select the marker snapshot itself (its
-/// id or timestamp) under exactly the same rules.
+///
+/// The row condition over `snapshots sn JOIN snapshot_storage_locations ssl
+/// ON ssl.snapshot_id = sn.id`, so a caller selects the marker snapshot
+/// itself (its id or timestamp) under exactly these rules.
 pub fn rollback_marker_suspend_backup_matches(sandbox_alias: &str) -> String {
-    rollback_marker_suspend_backup_matches_with(
-        sandbox_alias,
-        &no_newer_unfailed_full_snapshot(sandbox_alias, "sn"),
-    )
-}
-
-/// [`rollback_marker_suspend_backup_exists`] as the lost-started give-up
-/// sees it after it has failed the gone node's quiet uploads
-/// (`fail_quiet_full_uploads_from_node`): a `creating` full snapshot from
-/// `{sandbox_alias}.active_node_id` whose heartbeat
-/// (`COALESCE(last_attempt_at, timestamp)`) is older than `settle_param`
-/// seconds doesn't veto. For a caller that predicts the give-up's answer
-/// before the node is proven gone, such as the API classifying a started
-/// recovery that has no restore source.
-pub fn rollback_marker_suspend_backup_exists_after_quiet_upload_fail(
-    sandbox_alias: &str,
-    settle_param: &str,
-) -> String {
-    let quiet_same_node_upload = format!(
-        "newer.state = 'creating'\n\
-                    AND newer.source_node_id = {sandbox_alias}.active_node_id\n\
-                    AND COALESCE(newer.last_attempt_at, newer.timestamp)\n\
-                        < NOW() - make_interval(secs => {settle_param}::BIGINT)"
-    );
-    let no_newer =
-        no_newer_unfailed_full_snapshot_except(sandbox_alias, "sn", Some(&quiet_same_node_upload));
-    let matches = rollback_marker_suspend_backup_matches_with(sandbox_alias, &no_newer);
-    format!(
-        "EXISTS (\n\
-             SELECT 1\n\
-               FROM snapshots sn\n\
-               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
-              WHERE {matches}\n\
-         )"
-    )
-}
-
-/// SQL fragment: no full snapshot newer than `{snapshot_alias}` exists in any
-/// state but `failed`. A `failed` row holds no bytes, so it is never a better
-/// restore point than the snapshot it postdates. Shared by the lost-started
-/// rollback and started recovery's restore selector, so a row the rollback
-/// leaves behind (the marker, plus the dead upload it failed) is one started
-/// recovery accepts.
-pub fn no_newer_unfailed_full_snapshot(sandbox_alias: &str, snapshot_alias: &str) -> String {
-    no_newer_unfailed_full_snapshot_except(sandbox_alias, snapshot_alias, None)
-}
-
-fn no_newer_unfailed_full_snapshot_except(
-    sandbox_alias: &str,
-    snapshot_alias: &str,
-    except: Option<&str>,
-) -> String {
-    let except = except.map_or_else(String::new, |except| {
-        // COALESCE: a NULL in `except` (say, no source node) must keep the
-        // row vetoing, not drop it.
-        format!("\n                AND NOT COALESCE(({except}), FALSE)")
-    });
-    format!(
-        "NOT EXISTS (\n\
-             SELECT 1\n\
-               FROM snapshots newer\n\
-              WHERE newer.sandbox_id = {sandbox_alias}.id\n\
-                AND newer.type = 'full'\n\
-                AND newer.state <> 'failed'\n\
-                AND newer.timestamp > {snapshot_alias}.timestamp{except}\n\
-         )"
-    )
-}
-
-fn rollback_marker_suspend_backup_matches_with(sandbox_alias: &str, no_newer: &str) -> String {
+    let no_newer = no_newer_unfailed_full_snapshot(sandbox_alias, "sn");
     let suspend = ArtifactOrigin::Suspend.as_str();
     format!(
         "(sn.sandbox_id = {sandbox_alias}.id\n\
@@ -2269,6 +2188,25 @@ fn rollback_marker_suspend_backup_matches_with(sandbox_alias: &str, no_newer: &s
                 AND sn.state = 'ready'\n\
                 AND (sn.artifact_origin IS NULL OR sn.artifact_origin = '{suspend}')\n\
                 AND {no_newer})"
+    )
+}
+
+/// SQL fragment: no full snapshot newer than `{snapshot_alias}` exists in any
+/// state but `failed`. A `failed` row holds no bytes, so it is never a better
+/// restore point than the snapshot it postdates. Shared by the lost-started
+/// rollback and started recovery's restore selector, so a row the rollback
+/// leaves behind (the marker, plus the dead upload it failed) is one started
+/// recovery accepts.
+pub fn no_newer_unfailed_full_snapshot(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    format!(
+        "NOT EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots newer\n\
+              WHERE newer.sandbox_id = {sandbox_alias}.id\n\
+                AND newer.type = 'full'\n\
+                AND newer.state <> 'failed'\n\
+                AND newer.timestamp > {snapshot_alias}.timestamp\n\
+         )"
     )
 }
 

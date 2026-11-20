@@ -9,8 +9,8 @@ use super::*;
 use crate::controllers::substrate::kubernetes::store::{
     ActiveExecutionState, ActiveExecutionStatusRow, FailedRecoveryPodAbsenceOutcome,
     PlacementRetryDisposition, PodNodePlacement, PodTrackingCleanupCause, SandboxExecutionClaim,
-    StaleRecoverySourceNode, StartedRecoveryReplacement, StartedRecoveryRestoreContext,
-    StartedRecoveryRestoreSource, StartedRecoveryUnavailableCause, stopped_evacuation_pending,
+    StartedRecoveryReplacement, StartedRecoveryRestoreContext, StartedRecoveryRestoreSource,
+    stopped_evacuation_pending,
 };
 use crate::node_group_placement::{
     PlacementSubject, ResolvePath as NodeGroupResolvePath, ResolvedPlacement, RestoreSourceNode,

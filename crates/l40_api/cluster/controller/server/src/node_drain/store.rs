@@ -1986,7 +1986,6 @@ fn converging_restore_outcome(
     match error {
         SubstrateError::RestoreInFlight { message, .. }
         | SubstrateError::RestoreSourcePending { message }
-        | SubstrateError::RestoreUploadSettling { message }
         | SubstrateError::SuspendInFlight { message } => Some(RestoreOutcome::Converging {
             detail: message.clone(),
             wait_phase: None,
@@ -3357,8 +3356,6 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::FailedPrecondition { message }
                 | SubstrateError::Timeout { message, .. }
                 | SubstrateError::RestoreContextUnavailable { message }
-                | SubstrateError::RestoreAwaitingSourceNodeLoss { message }
-                | SubstrateError::RestoreUploadSettling { message }
                 | SubstrateError::RestoreSourcePending { message }
                 | SubstrateError::RestoreInFlight { message, .. }
                 | SubstrateError::SuspendInFlight { message }
@@ -5276,7 +5273,6 @@ mod pod_less_giveup;
 #[cfg(test)]
 pub(crate) use pod_less_giveup::PodLessHold;
 pub use pod_less_giveup::PodLessRecovery;
-pub(crate) use pod_less_giveup::retire_reverted_resident;
 
 #[cfg(test)]
 mod pod_less_giveup_tests;

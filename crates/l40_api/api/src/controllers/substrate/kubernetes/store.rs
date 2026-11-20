@@ -31,7 +31,6 @@ use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
     no_newer_unfailed_full_snapshot, restore_retry_source_snapshot_is_current,
     restore_retry_suspended_revert_snapshot_exists,
-    rollback_marker_suspend_backup_exists_after_quiet_upload_fail,
     snapshot_is_current_local_artifact,
 };
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
@@ -467,53 +466,6 @@ pub(super) enum StartedRecoveryRestoreContext {
     Ready(StartedRecoveryRestoreSource),
     Pending,
     Unavailable,
-}
-
-/// Why started recovery found no restore source, when the sandbox might
-/// still come back. Read only after
-/// [`K8sStore::started_recovery_restore_context`] answered
-/// [`StartedRecoveryRestoreContext::Unavailable`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum StartedRecoveryUnavailableCause {
-    /// A full snapshot is still uploading: the source is being published.
-    /// Retry; nothing is wrong.
-    SourcePublishing,
-    /// A full snapshot from the sandbox's own node is still `creating`, past
-    /// the settle window but inside
-    /// `pplx_space_sandbox_store::lost::ABANDONED_UPLOAD_AGE`. That upload is
-    /// only dead once its node is lost: a slow upload on a live node can
-    /// still finalize. Past the abandoned age it is ignored here. The caller answers
-    /// pending until `source_node` looks lost, then decides as if the upload
-    /// were absent, using `stale_rollback_source` (the
-    /// [`Self::StaleSourceAwaitingNodeLoss`] condition).
-    SameNodeUploadPastSettle {
-        source_node: StaleRecoverySourceNode,
-        stale_rollback_source: bool,
-    },
-    /// The only durable copy is the suspend the sandbox last woke from, and
-    /// it predates the last command or access. Restoring it now could roll
-    /// back writes that still exist on the source node, so recovery waits for
-    /// the cluster controller to prove that node gone; it then rolls the
-    /// sandbox back to that snapshot. Whether a retry can ever succeed
-    /// depends on `source_node`, which the caller checks.
-    StaleSourceAwaitingNodeLoss {
-        source_node: StaleRecoverySourceNode,
-    },
-    /// No durable copy of the sandbox exists.
-    NoDurableSource,
-}
-
-/// The node a stale-source started recovery is waiting on, as the database
-/// has it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum StaleRecoverySourceNode {
-    /// `active_node_id` names a node whose row is deleted.
-    RowDeleted,
-    /// A registered node with this Kubernetes Node name.
-    Named(String),
-    /// No `active_node_id`, or a node row with no Kubernetes name: nothing
-    /// the cluster controller can prove gone.
-    Unknown,
 }
 
 #[derive(Debug)]

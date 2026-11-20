@@ -107,11 +107,8 @@ pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(300);
 /// Default provably-dead age threshold. The on-node suspend-snapshot worker's
 /// full retry window is `5 × 7200s + (5 + 30 + 120 + 300)s ≈ 10.13h`; 24h
 /// leaves >2× margin so the reaper can never cut off a slow-but-alive (or
-/// recently node-restarted, and therefore resumed) upload. Shared with the
-/// API's started recovery, which stops waiting on such an upload at the
-/// same age.
-pub(crate) const DEFAULT_MIN_AGE_SECS: u64 =
-    pplx_space_sandbox_store::lost::ABANDONED_UPLOAD_AGE.as_secs();
+/// recently node-restarted, and therefore resumed) upload.
+pub(crate) const DEFAULT_MIN_AGE_SECS: u64 = 86_400;
 
 /// Stamped into `snapshots.failure_reason` when the reaper flips a row. Only
 /// applied when the column is still NULL (`COALESCE`), so a reason the worker

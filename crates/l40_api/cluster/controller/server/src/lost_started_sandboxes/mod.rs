@@ -52,7 +52,7 @@
 //! is usually still in object storage: only the writes since the wake lived
 //! on the dead node. When that copy is `ready`, stored, and no newer full
 //! snapshot other than a `failed` one exists
-//! ([`pplx_space_sandbox_portability::rollback_marker_suspend_backup_exists`]),
+//! ([`pplx_space_sandbox_portability::rollback_marker_suspend_backup_matches`]),
 //! the sandbox goes back to `suspended`, unplaced, with the marker kept, so
 //! the next wake restores that snapshot from object storage. The rollback
 //! retires the execution like the drain's pod-less revert does, emits

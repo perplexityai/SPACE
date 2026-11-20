@@ -445,11 +445,6 @@ impl KubernetesSubstrate {
                 | SubstrateError::SuspendInFlight { .. }
                 | SubstrateError::ActivationInFlight { .. },
             ) => None,
-            // `RestoreAwaitingSourceNodeLoss` and `RestoreUploadSettling` are
-            // retryable for the client but deliberately complete the attempt
-            // as failed: the cluster controller's lost-started pass only acts
-            // on a `recovery_failed` execution, nothing reaps an abandoned
-            // `recovering` one, and a fresh wake re-claims it.
             Err(_) => Some(StartedRecoveryCompletion::Failed),
         };
         if let Some(completion) = completion {
@@ -2651,7 +2646,6 @@ pub(super) fn wake_failure_should_revert_to_suspended(
                 SubstrateError::Timeout { .. }
                     | SubstrateError::RestoreInFlight { .. }
                     | SubstrateError::RestoreSourcePending { .. }
-                    | SubstrateError::RestoreUploadSettling { .. }
                     | SubstrateError::SuspendInFlight { .. }
                     | SubstrateError::ActivationInFlight { .. }
                 | SubstrateError::LockContention { .. }

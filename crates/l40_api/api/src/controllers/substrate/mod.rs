@@ -684,23 +684,6 @@ pub enum SubstrateError {
     /// restore evidence. Pending publication uses `RestoreSourcePending`.
     #[error("{message}")]
     RestoreContextUnavailable { message: String },
-    /// Started recovery found no restore source that covers the sandbox's
-    /// last activity, but a verified durable copy of the suspend it last woke
-    /// from exists. Restoring that copy would roll back any writes made since,
-    /// which is only safe once the source node, and its newer local state, is
-    /// proven gone. The cluster controller's lost-started-sandboxes pass makes
-    /// that call and rolls the sandbox back; until then callers should retry.
-    #[error("{message}")]
-    RestoreAwaitingSourceNodeLoss { message: String },
-    /// Started recovery found no restore source, but a newer full snapshot
-    /// upload may still land and become one. Retryable like
-    /// `RestoreSourcePending`, but the attempt completes as
-    /// `recovery_failed` instead of staying `recovering`: nothing reaps an
-    /// abandoned `recovering` execution, while the lost-started pass picks a
-    /// `recovery_failed` one up once the upload's settle window has passed,
-    /// and the next wake re-claims it.
-    #[error("{message}")]
-    RestoreUploadSettling { message: String },
     /// Started recovery found current local suspend state, but it cannot yet
     /// restore from the source node or durable storage.
     #[error("{message}")]
@@ -1023,9 +1006,7 @@ impl From<SubstrateError> for ControllerError {
                 // execution, without any work that can satisfy the request.
                 ControllerError::restore_context_unavailable(message)
             }
-            SubstrateError::RestoreSourcePending { message }
-            | SubstrateError::RestoreAwaitingSourceNodeLoss { message }
-            | SubstrateError::RestoreUploadSettling { message } => {
+            SubstrateError::RestoreSourcePending { message } => {
                 ControllerError::service_unavailable(message)
                     .with_retry_after(GATEWAY_RETRY_AFTER)
                     .with_retry_after_cause(ControllerRetryAfterCause::RestoreInFlight)
