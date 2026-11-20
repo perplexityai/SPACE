@@ -3,7 +3,11 @@
 //! job, and nothing here touches the baseline tables.
 
 #[cfg(target_os = "linux")]
-use std::{fs::File, process::Output, time::Duration};
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::process::Output;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use pplx_space_firewall_rules_model::{FirewallRuleRevision, RuleId};
 use serde_json::{Value, json};
