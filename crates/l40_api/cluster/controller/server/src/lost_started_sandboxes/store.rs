@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
 use pplx_space_sandbox_portability::{
-    snapshot_durable_for_source_release, started_restore_source_absent,
+    current_disk_artifact_backup_ready, started_restore_source_absent,
 };
 use pplx_space_sandbox_residency::{
     ResidencyEvidence, occupies_node_predicate, resident_lifecycle,
@@ -154,17 +154,19 @@ static NODE_RESIDENTS: LazyLock<String> = LazyLock::new(|| {
 ///
 /// - `running`: the drain gate's residents, [`resident_lifecycle`] and
 ///   [`occupies_node_predicate`], whose state lived only on the node;
-/// - `stopped_without_copy`: `stopped` residents without a durable copy
-///   ([`snapshot_durable_for_source_release`]). A stopped sandbox keeps its
+/// - `stopped_without_copy`: `stopped` residents whose pinned disk artifact
+///   has no ready backup ([`current_disk_artifact_backup_ready`], the proof
+///   a stopped evacuation releases its node on). A stopped sandbox keeps its
 ///   filesystem on the node, and neither the resident include-list nor the
-///   admin console's local snapshots count it.
+///   admin console's local snapshots count it. A full suspend snapshot is
+///   not a copy of it: the rootfs moved on after the wake.
 ///
 /// The at-rest half keyed on `target_node_id` is the admin console's
 /// `local_snapshots`, read through `admin_occupancy::fleet_occupancy`.
 fn active_node_counts(residency: ResidencyEvidence) -> String {
     let resident = resident_lifecycle("s");
     let occupies = occupies_node_predicate("s", "s.active_node_id", residency);
-    let durable = snapshot_durable_for_source_release("s");
+    let durable = current_disk_artifact_backup_ready("s");
     sql!(
         format!(
             "SELECT s.active_node_id,

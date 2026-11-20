@@ -377,6 +377,10 @@ pub struct Reconciler<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence
     /// out. The next census starts after it, so every absent node gets
     /// judged in turn.
     census_lookup_after: Option<NodeId>,
+    /// The last verdict a census settled for each absent registered node,
+    /// other than `lookup_budget`. A node the budget defers keeps it, so
+    /// rotating the lookups doesn't zero a node already judged gone.
+    census_verdicts: HashMap<NodeId, (StrandedVerdict, &'static str)>,
 }
 
 impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L, P> {
@@ -393,6 +397,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             census_registered: HashSet::new(),
             census_row_gone_since: HashMap::new(),
             census_lookup_after: None,
+            census_verdicts: HashMap::new(),
         }
     }
 
@@ -584,6 +589,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
         let mut lookups_left = self.config.max_census_lookups_per_tick;
         let mut last_lookup = None;
         let mut budget_spent = false;
+        let mut settled_verdicts = HashMap::new();
         let mut suspects = Vec::new();
         for node in nodes {
             let residents = match &node.source_node {
@@ -592,7 +598,11 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                         .census_row_gone_since
                         .get(&node.node_id)
                         .copied()
-                        .or_else(|| self.census_registered.contains(&node.node_id).then_some(now))
+                        .or_else(|| {
+                            self.census_registered
+                                .contains(&node.node_id)
+                                .then_some(now)
+                        })
                         .filter(|since| {
                             now.saturating_duration_since(*since) < DELETED_NODE_AT_REST_WINDOW
                         });
@@ -638,11 +648,17 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                     if lookups_left < budget_before {
                         last_lookup = Some(node.node_id);
                     }
-                    let Some(judged) = judged else {
+                    let Some(mut judged) = judged else {
                         continue;
                     };
                     if judged.1 == "lookup_budget" {
                         budget_spent = true;
+                        if let Some(last) = self.census_verdicts.get(&node.node_id) {
+                            judged = *last;
+                        }
+                    }
+                    if judged.1 != "lookup_budget" {
+                        settled_verdicts.insert(node.node_id, judged);
                     }
                     (judged.0, judged.1, k8s_node_name.clone())
                 }
@@ -652,6 +668,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
         self.census_registered = registered;
         self.census_row_gone_since = row_gone_since;
         self.census_lookup_after = if budget_spent { last_lookup } else { None };
+        self.census_verdicts = settled_verdicts;
 
         let suspect_ids: Vec<NodeId> = suspects.iter().map(|suspect| suspect.0).collect();
         let stranded_by_node = if suspect_ids.is_empty() {

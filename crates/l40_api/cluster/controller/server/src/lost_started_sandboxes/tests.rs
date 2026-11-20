@@ -1196,6 +1196,60 @@ mod postgres_backed {
             counts(1, 0)
         );
 
+        // A stopped sandbox keeps its rootfs on the node. Its pinned disk
+        // artifact is a copy only once a disk backup of it is ready; a full
+        // snapshot of the same sandbox doesn't count.
+        let stopped_id = SandboxId::new();
+        let disk_artifact = uuid::Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes
+                (id, user_id, org_id, managed_by, lifecycle, placement,
+                 active_node_id, network_policy_generation, placement_changed_at,
+                 current_local_artifact_id, current_local_artifact_kind,
+                 current_local_artifact_origin)
+             VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'stopped', 'placed',
+                     $4, 1, NOW() - INTERVAL '1 hour', $5, 'disk', 'stop')"
+        ))
+        .bind(stopped_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(registered_node.node_id)
+        .bind(disk_artifact)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 1),
+            "a local-only stopped sandbox counts at rest"
+        );
+        let disk_snapshot = SnapshotId::new();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                (id, sandbox_id, org_id, type, state, timestamp, source_node_id,
+                 local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, $3::uuid, 'disk', 'ready', NOW(), $4,
+                     $5, 'disk', 'stop')"
+        ))
+        .bind(disk_snapshot)
+        .bind(stopped_id)
+        .bind(SEED_ORG_ID)
+        .bind(registered_node.node_id)
+        .bind(disk_artifact)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://bucket/disk')"
+        ))
+        .bind(disk_snapshot)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 0),
+            "a stopped sandbox with a ready disk backup has a copy"
+        );
+
         // Terminal residents and drained nodes drop out of the first pass.
         sqlx::query(sql!(
             "UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"
@@ -1736,13 +1790,23 @@ async fn s8_census_lookups_resume_after_the_last_judged_node() {
     };
     let mut reconciler = Reconciler::new(config, sink, lookup.clone(), presence());
 
-    reconciler.tick().await;
+    let report = reconciler.tick().await;
     let first: HashSet<String> = lookup.calls().into_iter().collect();
     assert_eq!(first.len(), 2);
-    reconciler.tick().await;
+    assert_eq!(gone(&report), (2, 2));
+    let report = reconciler.tick().await;
+    // Every node has been judged gone once; the one the budget defers on
+    // the second tick keeps that verdict.
+    assert_eq!(gone(&report), (3, 3));
+    assert_eq!(
+        verdict_totals(&report, StrandedVerdict::Unverifiable),
+        (0, 0)
+    );
+    let report = reconciler.tick().await;
+    assert_eq!(gone(&report), (3, 3), "rotating again zeroes nothing");
 
     let calls = lookup.calls();
-    assert_eq!(calls.len(), 4, "the cap still holds per tick");
+    assert_eq!(calls.len(), 6, "the cap still holds per tick");
     let skipped = ["dead-a", "dead-b", "dead-c"]
         .into_iter()
         .find(|name| !first.contains(*name))
