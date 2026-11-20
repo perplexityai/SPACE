@@ -245,8 +245,9 @@ fn attempted(report: SlotFirewallReport) -> SlotFirewallAttempt {
     }
 }
 
-// Catches an unavailable or empty store, another node's assignment, or any
-// generation but the requested one treated as runnable.
+// Catches an unavailable store, another node's assignment, or a newer
+// generation than the accepted one treated as runnable. The apply tests cover
+// an empty store and an older generation.
 #[test]
 fn only_the_requested_accepted_assignment_is_runnable() {
     let accepted = Arc::new(DesiredAssignment {
@@ -255,27 +256,19 @@ fn only_the_requested_accepted_assignment_is_runnable() {
         revision_id: Uuid::from_u128(12),
         revision: decode_revision(&document(12)).unwrap(),
     });
-    let other = NodeId::from_uuid(Uuid::from_u128(2));
     let run = |node, generation| runnable(Ok(Some(accepted.clone())), node, generation);
     assert!(matches!(
         runnable(Err(Unavailable), NODE, 12),
         Err(NotRunnable::Unavailable(_))
     ));
     assert!(matches!(
-        runnable(Ok(None), NODE, 12),
-        Err(NotRunnable::NoAssignment)
-    ));
-    assert!(matches!(
-        run(other, 12),
+        run(NodeId::from_uuid(Uuid::from_u128(2)), 12),
         Err(NotRunnable::WrongNode { accepted }) if accepted == NODE
     ));
-    for requested in [11, 13] {
-        assert!(matches!(
-            run(NODE, requested),
-            Err(NotRunnable::NotCurrent { accepted: 12 })
-        ));
-    }
-    assert!(Arc::ptr_eq(&run(NODE, 12).unwrap(), &accepted));
+    assert!(matches!(
+        run(NODE, 13),
+        Err(NotRunnable::NotCurrent { accepted: 12 })
+    ));
 }
 
 // Catches an eligibility rule that admits any slot but a healthy ready one
@@ -481,22 +474,19 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
 
     let attempt = attempted(apply(&pool, &store, &host, 13, 0).await);
     assert!(attempt.verified(), "{attempt:?}");
-    assert_eq!(
-        (
-            (
-                attempt.node_id,
-                attempt.assignment_generation,
-                attempt.revision_id
-            ),
-            (attempt.slot_id, attempt.slot_generation, attempt.sandbox_id),
-            attempt.namespace,
-        ),
-        (
-            (NODE, 13, Uuid::from_u128(13)),
-            (0, 1, Some("sandbox-0".into())),
-            namespace
-        )
+    let assignment = (
+        attempt.node_id,
+        attempt.assignment_generation,
+        attempt.revision_id,
     );
+    assert_eq!(assignment, (NODE, 13, Uuid::from_u128(13)));
+    let slot = (
+        attempt.slot_id,
+        attempt.slot_generation,
+        attempt.sandbox_id.as_deref(),
+    );
+    assert_eq!(slot, (0, 1, Some("sandbox-0")));
+    assert_eq!(attempt.namespace, namespace);
     assert!(matches!(
         apply(&pool, &store, &host, 12, 0).await,
         SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NotCurrent { accepted: 13 }))
