@@ -13,12 +13,16 @@ use tokio::sync::oneshot;
 use tonic::{Code, Request, Response};
 
 use super::*;
+use crate::firewall::rules::install::InstallOutcome;
 use crate::proto::FirewallRulesAssignment;
 use crate::service::tests::service_tests::service_for_unit_tests;
 use crate::slot_pool::firewall_rules::tests::{
     BOUND, FakeHost, Fault, Hook, NODE, bounded, busy, document, hook, installed, set_slot,
 };
-use crate::slot_pool::{NamespaceIdentity, NetworkPoolConfig, SlotState};
+use crate::slot_pool::{
+    NamespaceIdentity, NetworkPoolConfig, NotRunnable, SlotFirewallAttempt, SlotHealth, SlotState,
+    SlotStoreError,
+};
 
 mod linux;
 
@@ -350,67 +354,114 @@ async fn a_busy_slot_runs_nothing_until_redelivery() {
     assert_eq!(bound.host.installs(), [bound.namespace]);
 }
 
-/// What happens to the bound slot during a test's first attempt.
-#[derive(Clone, Copy, Debug)]
-enum Drift {
-    None,
-    /// Reset while nft runs.
-    Reset,
-    /// Re-leased between lookup and ownership.
-    Released,
-    /// Dirty before the delivery.
-    Dirty,
-    /// Its namespace entry gone before the delivery.
-    Unlinked,
+fn attempted(readback: Verification, current: Result<(), Stale>) -> SlotFirewallReport {
+    SlotFirewallReport::Attempted(Box::new(SlotFirewallAttempt {
+        node_id: NODE,
+        assignment_generation: 12,
+        revision_id: Uuid::from_u128(12),
+        slot_id: SLOT,
+        slot_generation: 1,
+        sandbox_id: None,
+        namespace: NamespaceIdentity {
+            device: 1,
+            inode: 1,
+        },
+        submitted: InstallOutcome::Committed,
+        readback,
+        current,
+    }))
 }
 
-// Catches a generation submitted again, an outcome misreported, or work after
-// a changed target or an unknown result.
+// Catches an outcome misreported, or a binding that goes on after a changed
+// target or an unknown result, or ends after anything else.
 #[tokio::test]
-async fn a_generation_is_attempted_once_and_drift_ends_the_binding() {
-    for (fault, drift, outcome, ends) in [
-        (Some(Fault::Drops), Drift::None, Outcome::Mismatched, false),
-        (None, Drift::Reset, Outcome::Stale, true),
-        (None, Drift::Released, Outcome::NotRun, true),
-        (None, Drift::Dirty, Outcome::NotRun, true),
-        (None, Drift::Unlinked, Outcome::NotRun, true),
+async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
+    let cancelled = tokio::spawn(std::future::pending::<()>());
+    cancelled.abort();
+    let unknown = cancelled.await.unwrap_err();
+    let not_run = |not_run| Ok(SlotFirewallReport::NotRun(not_run));
+    let attempt = |readback, current| Ok(attempted(readback, current));
+    let current = |readback| attempt(readback, Ok(()));
+    let stale = |stale| attempt(Verification::Match, Err(stale));
+    let ineligible = NotRun::Ineligible {
+        state: SlotState::Dirty,
+        health: SlotHealth::Healthy,
+    };
+    let gone = || io::ErrorKind::NotFound.into();
+    let mismatch = || Verification::Mismatch(String::new());
+    let inconclusive = || Verification::Inconclusive(String::new());
+    let assignment = || Stale::Assignment(NotRunnable::NoAssignment);
+    let poisoned = || SlotStoreError::LockPoisoned;
+    let rows = [
+        (Outcome::Unknown, true, vec![Err(unknown)]),
         (
-            Some(Fault::Unlistable),
-            Drift::None,
+            Outcome::NotRun,
+            false,
+            vec![
+                not_run(NotRun::Busy),
+                not_run(NotRun::ShuttingDown),
+                not_run(NotRunnable::NoAssignment.into()),
+                not_run(poisoned().into()),
+            ],
+        ),
+        (
+            Outcome::NotRun,
+            true,
+            vec![
+                not_run(NotRun::NoSlot),
+                not_run(ineligible),
+                not_run(NotRun::Changed),
+                not_run(NotRun::Namespace(gone())),
+            ],
+        ),
+        (Outcome::Matched, false, vec![current(Verification::Match)]),
+        (Outcome::Mismatched, false, vec![current(mismatch())]),
+        (
             Outcome::Inconclusive,
             true,
+            vec![
+                current(inconclusive()),
+                attempt(inconclusive(), Err(assignment())),
+            ],
         ),
-        (Some(Fault::Panics), Drift::None, Outcome::Unknown, true),
-    ] {
-        let bound = bind(fault, None, WAIT).await;
-        let pool = bound.service.pool.clone();
-        match drift {
-            Drift::None => {}
-            Drift::Reset => hook(&bound.host.installed, move || {
-                set_slot(&pool, SLOT, SlotState::Dirty, 1);
-            }),
-            Drift::Released => hook(&bound.host.looked_up, move || {
-                set_slot(&pool, SLOT, SlotState::Leased, 2);
-            }),
-            Drift::Dirty => set_slot(&pool, SLOT, SlotState::Dirty, 1),
-            Drift::Unlinked => std::fs::remove_file(bound.host.link(SLOT)).unwrap(),
+        (Outcome::Stale, false, vec![stale(assignment())]),
+        (
+            Outcome::Stale,
+            true,
+            vec![
+                stale(Stale::Slot),
+                stale(Stale::SlotStore(poisoned())),
+                stale(Stale::Namespace(Err(gone()))),
+                attempt(mismatch(), Err(Stale::Slot)),
+            ],
+        ),
+    ];
+    for (outcome, ends, reports) in rows {
+        for report in reports {
+            let (done, ended) = dispatch(&report);
+            assert_eq!((done.outcome(), ended), (outcome, ends), "{report:?}");
         }
-        let committed = FirewallAssignmentAcceptance::Committed;
-        let first = reply(sync(&bound.service, delivery(12)).await);
-        assert_eq!(first, (12, committed, outcome), "{drift:?}");
-        let (record, installs) = (std::fs::read(&bound.path).unwrap(), bound.host.installs());
-        let again = sync(&bound.service, delivery(12)).await;
-        if ends {
-            assert_eq!(again.unwrap_err().code(), Code::FailedPrecondition);
-            let newer = sync(&bound.service, delivery(13)).await.unwrap_err();
-            assert_eq!(newer.code(), Code::FailedPrecondition, "{outcome:?}");
-        } else {
-            let replayed = FirewallAssignmentAcceptance::Replayed;
-            assert_eq!(reply(again), (12, replayed, outcome));
-        }
-        assert_eq!(std::fs::read(&bound.path).unwrap(), record, "{outcome:?}");
-        assert_eq!(bound.host.installs(), installs, "{outcome:?}");
     }
+}
+
+// Catches a binding-ending result not reaching the reply, or a later
+// delivery admitted, written or applied.
+#[tokio::test]
+async fn an_ended_binding_refuses_later_deliveries() {
+    let bound = bind(Some(Fault::Panics), None, WAIT).await;
+    let first = reply(sync(&bound.service, delivery(12)).await);
+    let committed = FirewallAssignmentAcceptance::Committed;
+    assert_eq!(first, (12, committed, Outcome::Unknown));
+    let (record, installs) = (std::fs::read(&bound.path).unwrap(), bound.host.installs());
+    for generation in [12, 13] {
+        let refused = sync(&bound.service, delivery(generation))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert_eq!(refused.message(), "the firewall rule sync binding ended");
+    }
+    assert_eq!(std::fs::read(&bound.path).unwrap(), record);
+    assert_eq!(bound.host.installs(), installs);
 }
 
 // Catches older work run or reported after a newer generation is accepted.
