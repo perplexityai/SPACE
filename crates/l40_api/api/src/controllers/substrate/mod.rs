@@ -2008,7 +2008,7 @@ impl Substrate {
                 .await
             {
                 Ok(Some(substrate)) => {
-                    environment_placement.check_kubernetes_support()?;
+                    substrate.k8s.check_environment_placement_support()?;
                     return Ok(Self::from_kubernetes(substrate));
                 }
                 Ok(None) => {}

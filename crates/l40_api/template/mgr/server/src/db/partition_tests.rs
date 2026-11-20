@@ -266,6 +266,47 @@ fn the_legacy_partition_s_latest_build_takes_an_adopted_build() {
     );
 }
 
+/// A lookup naming an environment takes a legacy-layout build bound to it,
+/// even an older one, over a newer build bound elsewhere; a lookup naming the
+/// legacy partition skips that adopted build.
+#[test]
+fn a_partition_s_bound_build_counts_an_adopted_legacy_layout_build() {
+    let conn = test_conn();
+    let adopted = "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+    upsert_build(
+        &conn,
+        &BuildUpsert {
+            name: NAME,
+            content_hash: adopted,
+            cache_partition: TemplateCachePartition::Legacy,
+            build_date: "2026-10-01T00:00:00Z",
+            manifest_json: &manifest_json(Some(other())),
+            runtime: "fc",
+            arch: "x86_64",
+            artifact_size_bytes: 1,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    upsert(
+        &conn,
+        Some(initial()),
+        TemplateCachePartition::Legacy,
+        "2026-10-20T00:00:00Z",
+    )
+    .unwrap();
+
+    let latest = |preferred| {
+        get_latest_build(&conn, NAME, preferred)
+            .unwrap()
+            .unwrap()
+            .content_hash
+    };
+    assert_eq!(latest(Some(twin())), adopted);
+    assert_eq!(latest(Some(TemplateCachePartition::Legacy)), HASH);
+    assert_eq!(latest(None), HASH);
+}
+
 /// A pool-capable Cloud Hypervisor environment from the node catalog.
 fn cloud_hypervisor_manifest() -> String {
     let catalog =
@@ -308,6 +349,47 @@ fn upsert_pool_candidate(
     )
     .unwrap();
     cache_partition
+}
+
+/// A Firecracker environment of the node catalog other than the initial one,
+/// as an upgrade's target is.
+fn firecracker_upgrade_manifest() -> String {
+    firecracker_manifest(|entry| entry.name() == "fc-1.17.0-linux-6.18.44")
+}
+
+fn firecracker_manifest(
+    select: impl Fn(&pplx_space_execution_catalog::catalog::CompiledEnvironment) -> bool,
+) -> String {
+    let catalog =
+        pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    let upgrade = catalog.iter().find(|entry| select(entry)).unwrap();
+    let mut manifest = TemplateManifest {
+        runtime: "fc".to_string(),
+        arch: "x86_64".to_string(),
+        ..Default::default()
+    };
+    manifest.set_execution_metadata(upgrade.definition().execution_requirements().unwrap());
+    serde_json::to_string(&manifest).unwrap()
+}
+
+/// A twin whose node holds only its upgrade build fills a pool: the
+/// environment-less lookup of the digest, which pool creates take, already
+/// resolves that build.
+#[test]
+fn a_twin_with_only_its_upgrade_build_fills_a_pool() {
+    let conn = test_conn();
+    let twin = upsert_pool_candidate(
+        &conn,
+        HASH,
+        "2026-10-01T00:00:00Z",
+        "fc",
+        &firecracker_upgrade_manifest(),
+    );
+    let build = crate::pool_manager::pool_base_build(&conn, NAME)
+        .unwrap()
+        .unwrap();
+    assert_eq!(build.cache_partition, twin);
 }
 
 const CH_HASH: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -529,14 +611,18 @@ fn lookups_prefer_the_selected_partition_then_legacy() {
     )
     .unwrap();
     let latest = |preferred| get_latest_build(&conn, NAME, preferred).unwrap().unwrap();
-    // Every lookup gets the newest build, which the caller checks as a
-    // compatible cold-boot source.
+    // A lookup naming no partition gets the newest build, which the caller
+    // checks as a compatible cold-boot source.
     assert_eq!(latest(None).content_hash, newer);
+    // One naming a partition gets the newest build bound to it, however old:
+    // the older initial-environment build beats the newer twin elsewhere.
     assert_eq!(
         latest(Some(TemplateCachePartition::Legacy)).content_hash,
-        newer
+        HASH
     );
     assert_eq!(latest(Some(twin())).content_hash, newer);
+    // With nothing bound to the partition on the node, the newest build
+    // stands, as before partitions.
     let unknown =
         TemplateCachePartition::Environment(EnvironmentReference::new(Digest::sha256([3; 32])));
     assert_eq!(latest(Some(unknown)).content_hash, newer);

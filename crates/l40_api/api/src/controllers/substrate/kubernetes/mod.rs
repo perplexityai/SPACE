@@ -6,7 +6,7 @@
 //!
 //! | Refused or missing | Effect today | Owner | Removed by |
 //! |---|---|---|---|
-//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) | `on` fails startup with `SubstrateError::Unsupported`. A runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. With `on`, a cold create requires the pod's environment (`space.pplx.net/environment-required`), so the worker boots that environment's build of the digest, pulling it when the node holds the digest only under another environment. A shim that predates the annotation ignores it, so `on` also needs every worker's shim from that release. `shadow` records, labels and counts, and places as `off`. Until `on` runs, creates keep the release a tag or digest names rather than a twin | the-gigi-pplx | activation pods recording an upgrade's target |
+//! | Environment placement gate `on` (`SPACE_ENVIRONMENT_PLACEMENT_GATE`) with resume-time runtime upgrades on (`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED`) | That pair fails startup with `SubstrateError::Unsupported`: a runtime-upgrade activation's pod requires the recorded environment rather than the upgrade's target. With upgrades off, `on` runs. A cold create requires the pod's environment (`space.pplx.net/environment-required`), so the worker boots that environment's build of the digest, pulling the release bound to it, a twin included, when the node holds the digest only under another environment; a warm pool asks its nodes for that environment's build. A shim that predates the annotation ignores it, so `on` also needs every worker's shim from that release. `shadow` records, labels and counts, and places as `off`. Until `on` runs, creates keep the release a tag or digest names rather than a twin | the-gigi-pplx | activation pods recording an upgrade's target |
 
 use std::{
     fmt,
@@ -478,6 +478,15 @@ pub enum KubernetesStateInitError {
 }
 
 impl KubernetesState {
+    /// Whether this substrate runs its environment placement gate's mode
+    /// alongside its resume-time runtime upgrades
+    /// ([`super::environment_placement::EnvironmentPlacementGate::check_kubernetes_support`]),
+    /// both as it read them; startup fails otherwise.
+    pub fn check_environment_placement_support(&self) -> Result<(), super::SubstrateError> {
+        self.environment_placement
+            .check_kubernetes_support(self.runtime_upgrade_at_activation)
+    }
+
     pub async fn try_from_env() -> Result<Option<Self>, KubernetesStateInitError> {
         if !pplx_space_env_vars::env_flag_var("SPACE_K8S_CONTROL_PLANE", false) {
             return Ok(None);

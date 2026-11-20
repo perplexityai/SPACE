@@ -650,16 +650,26 @@ pub fn template_local_state_exists(conn: &Connection, name: &str) -> Result<bool
 
 // ── Latest build (replaces tag-based resolution) ──────────────────────────
 
-/// Newest ready build of `name` in any partition, as before partitions
-/// existed; callers check it as a compatible cold-boot source. Same-date
-/// builds go to the larger content hash, as sandbox-manager's catalog and
-/// node-ctl pick, and a release and its twin go to `preferred`'s partition
-/// and then the legacy one.
+/// Newest ready build of `name` for a lookup that names no digest.
+///
+/// With `preferred`, the newest build bound to that partition wins, however
+/// old: a build in the partition, or a legacy-layout build whose binding maps
+/// to it (see [`get_latest_bound_build`]). Without one, or with none on the
+/// node, it's the newest ready build in any partition, as before partitions
+/// existed, which the caller checks as a compatible cold-boot source.
+/// Same-date builds go to the larger content hash, as sandbox-manager's
+/// catalog and node-ctl pick, and a release and its twin go to `preferred`'s
+/// partition and then the legacy one.
 pub fn get_latest_build(
     conn: &Connection,
     name: &str,
     preferred: Option<TemplateCachePartition>,
 ) -> Result<Option<BuildRow>> {
+    if let Some(partition) = preferred
+        && let Some(bound) = get_latest_bound_build(conn, name, partition)?
+    {
+        return Ok(Some(bound));
+    }
     let mut stmt = conn.prepare(
         "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
          FROM template_builds
@@ -674,6 +684,34 @@ pub fn get_latest_build(
         build_row,
     )?;
     rows.next().transpose()
+}
+
+/// Newest ready build of `name` bound to `cache_partition`: one cached in
+/// that partition, or one in the legacy partition whose binding maps to it,
+/// which startup recovery adopts in place from the pre-partition layout. The
+/// newest wins, a date tie goes to the larger digest, as in
+/// [`get_latest_build`], and only a tie on both goes to the partition's own
+/// row over an adopted one. A row whose
+/// binding maps elsewhere is skipped, so for the legacy partition only unbound
+/// and initial-environment builds count.
+fn get_latest_bound_build(
+    conn: &Connection,
+    name: &str,
+    cache_partition: TemplateCachePartition,
+) -> Result<Option<BuildRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
+         FROM template_builds
+         WHERE name = ?1 AND cache_partition IN (?2, '') AND state = 'ready'
+         ORDER BY build_date DESC, content_hash DESC, cache_partition = ?2 DESC",
+    )?;
+    for row in stmt.query_map(params![name, cache_partition.key()], build_row)? {
+        let row = row?;
+        if row.bound_partition() == cache_partition {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
 }
 
 /// Newest ready build of `name` in exactly one partition that belongs there:

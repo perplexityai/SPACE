@@ -940,6 +940,10 @@ fn get_template_pull_failures_return_corresponding_status_codes() {
             tonic::Code::DataLoss,
         ),
         (PullFailure::ExecutionMetadataInvalid, tonic::Code::DataLoss),
+        (
+            PullFailure::PartitionHeldByAnotherEnvironment,
+            tonic::Code::FailedPrecondition,
+        ),
     ] {
         assert_eq!(
             super::lookup::pull_failure_code(failure),
@@ -1612,6 +1616,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                         storage_uris: vec![],
                         visibility:
                             pplx_space_node_api_client::proto::TemplateVisibility::OrgSpecific,
+                        environment: None,
                     })
                 },
                 async |spec, _, release| {

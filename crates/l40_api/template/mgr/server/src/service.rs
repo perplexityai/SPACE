@@ -2778,6 +2778,7 @@ mod templates;
 mod tests;
 mod transfer;
 
+pub(crate) use import_helpers::template_arch;
 use import_helpers::*;
 use support::*;
 

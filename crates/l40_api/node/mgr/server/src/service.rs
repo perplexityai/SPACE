@@ -83,6 +83,16 @@ const ALLOW_NODE_STATUS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
+/// Node-status readers, plus template-manager, which reads the environments
+/// the node can run to warm and pool their template builds.
+const ALLOW_EXECUTION_INVENTORY: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Observer),
+    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
+    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
+];
 const ALLOW_NODE_ADMIN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
@@ -318,7 +328,7 @@ impl NodeManagerService {
         &self,
         request: Request<GetExecutionInventoryRequest>,
     ) -> Result<Response<pplx_space_execution_common::proto::NodeExecutionInventory>, Status> {
-        self.authorize_peer(&request, "GetExecutionInventory", ALLOW_NODE_STATUS)?;
+        self.authorize_peer(&request, "GetExecutionInventory", ALLOW_EXECUTION_INVENTORY)?;
         // Before discovery, so a node that can't report inventory still reports this.
         crate::metrics::node_manager::execution_policy_record_unreadable(
             self.execution_policy().cluster_policy_unreadable(),

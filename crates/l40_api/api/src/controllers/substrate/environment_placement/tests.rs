@@ -128,19 +128,34 @@ async fn shadow_reads_a_failed_binding_read_as_unbound_and_on_fails() {
     );
 }
 
-/// Kubernetes runs off and shadow, but refuses on at startup until the worker
-/// boots the environment a pod requires.
+/// Kubernetes runs off and shadow whatever resume-time upgrades say, and on
+/// while they're off. With them on it refuses on at startup, since a
+/// runtime-upgrade pod would require its recorded environment rather than the
+/// upgrade's target, and says which switch to turn off.
 #[test]
-fn kubernetes_refuses_on_until_its_worker_boots_the_pods_environment() {
+fn kubernetes_runs_on_unless_resume_time_upgrades_are_on() {
+    use crate::controllers::substrate::runtime_upgrade::RuntimeUpgradeAtActivation::{
+        Disabled, Enabled,
+    };
     use EnvironmentPlacementGate::{Off, On, Shadow};
-    Off.check_kubernetes_support()
-        .expect("off is supported everywhere");
-    Shadow
-        .check_kubernetes_support()
-        .expect("shadow places as off");
-    assert!(matches!(
-        On.check_kubernetes_support(),
-        Err(crate::controllers::substrate::SubstrateError::Unsupported { message })
-            if message.contains(EnvironmentPlacementGate::ENV)
-    ));
+    for upgrade in [Disabled, Enabled] {
+        Off.check_kubernetes_support(upgrade)
+            .expect("off is supported everywhere");
+        Shadow
+            .check_kubernetes_support(upgrade)
+            .expect("shadow places as off");
+    }
+    On.check_kubernetes_support(Disabled)
+        .expect("with no upgrade, every pod requires the environment it boots");
+    let Err(crate::controllers::substrate::SubstrateError::Unsupported { message }) =
+        On.check_kubernetes_support(Enabled)
+    else {
+        panic!("on with resume-time upgrades is refused at startup");
+    };
+    assert_eq!(
+        message,
+        "SPACE_ENVIRONMENT_PLACEMENT_GATE=on isn't supported on the Kubernetes substrate while \
+         SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED is on: runtime-upgrade pods don't yet \
+         require the upgrade's target environment; turn resume-time upgrades off or use shadow"
+    );
 }

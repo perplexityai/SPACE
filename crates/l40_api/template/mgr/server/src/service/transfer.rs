@@ -59,10 +59,12 @@ impl TemplateManagerService {
                 crate::volume::FindReleaseError::NotFound => {
                     Status::not_found("template release not found")
                 }
-                crate::volume::FindReleaseError::Unavailable => {
+                crate::volume::FindReleaseError::Unavailable
+                | crate::volume::FindReleaseError::SelectorIgnored { .. } => {
                     Status::unavailable("cluster metadata unavailable")
                 }
-                crate::volume::FindReleaseError::InvalidResponse => {
+                crate::volume::FindReleaseError::InvalidResponse
+                | crate::volume::FindReleaseError::InvalidBinding { .. } => {
                     Status::failed_precondition("cluster did not return an exact release")
                 }
                 crate::volume::FindReleaseError::Status(status) => status,
