@@ -120,8 +120,8 @@ async fn issue(
     node: NodeId,
     generation: i64,
     check_in_secs: Option<f64>,
-) -> TestResult<OffsetDateTime> {
-    Ok(sqlx::query_scalar::<_, OffsetDateTime>(sql!(
+) -> TestResult<jiff::Timestamp> {
+    let issued_at = sqlx::query_scalar::<_, OffsetDateTime>(sql!(
         "UPDATE firewall_rules_rollout_items
          SET issued_assignment_generation = $3,
              issued_at = date_trunc('second', now()) - interval '1 hour',
@@ -134,7 +134,10 @@ async fn issue(
     .bind(generation)
     .bind(check_in_secs)
     .fetch_one(pool)
-    .await?)
+    .await?;
+    Ok(jiff::Timestamp::from_nanosecond(
+        issued_at.unix_timestamp_nanos(),
+    )?)
 }
 
 async fn lease(

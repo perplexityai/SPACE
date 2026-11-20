@@ -6120,6 +6120,7 @@ dependencies = [
 name = "pplx-space-firewall-rules-store"
 version = "0.8.2"
 dependencies = [
+ "jiff",
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
  "pplx-space-firewall-rules-model",
