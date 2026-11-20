@@ -2703,6 +2703,12 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                         "worker node-api did not accept this API process's credential: {error}"
                                     )));
                                 }
+                                WakeRpcErrorDisposition::NodeSealed => {
+                                    self.store
+                                        .note_sealed_refusal(sandbox_id, error.message())
+                                        .await;
+                                    return Err(ControllerError::from(error));
+                                }
                                 WakeRpcErrorDisposition::Fail => {
                                     return Err(ControllerError::conflict(format!(
                                         "sandbox wake failed: {error}"

@@ -663,10 +663,12 @@ fn reconnect_error_outcome(
         ),
         // Only suspend returns `SandboxNoPod` and only a Delete teardown
         // returns `NodeDeleteNotAdmitted`, so a wake never sees either; they
-        // share `Unavailable`'s arm, as they share its 503.
+        // share `Unavailable`'s arm, as they share its 503. A node a drain
+        // sealed refuses the wake for now, with the same 503.
         SubstrateError::Unavailable { .. }
         | SubstrateError::SandboxNoPod { .. }
         | SubstrateError::Unschedulable { .. }
+        | SubstrateError::NodeSealed { .. }
         | SubstrateError::NodeDeleteNotAdmitted { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),

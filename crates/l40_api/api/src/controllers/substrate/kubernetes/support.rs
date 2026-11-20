@@ -872,6 +872,10 @@ pub(super) enum WakeRpcErrorDisposition {
     /// its Pod is deleted, while the process still runs out its termination.
     /// The wake is retried as an operation, by whichever executor claims it.
     CallerUnauthenticated,
+    /// A node drain sealed the node, which refused the wake before any VM
+    /// work: the caller retries once the drain has made the sandbox
+    /// durable, and the wake lands elsewhere.
+    NodeSealed,
     Fail,
 }
 
@@ -885,6 +889,9 @@ pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisp
             .contains(pplx_space_rpc_contracts::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER)
     {
         return WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context");
+    }
+    if crate::controllers::is_activation_sealed(error) {
+        return WakeRpcErrorDisposition::NodeSealed;
     }
     if error.code() == Code::FailedPrecondition
         && (error.message().contains("cannot wake") || error.message().contains("wait for"))

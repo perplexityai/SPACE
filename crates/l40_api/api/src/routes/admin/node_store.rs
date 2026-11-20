@@ -71,6 +71,7 @@ pub(super) struct AdminNodeRow {
     pub(super) drain_mode: Option<String>,
     pub(super) drain_started_at: Option<OffsetDateTime>,
     pub(super) drain_last_error: Option<String>,
+    pub(super) drain_engine: Option<String>,
     pub(super) terminate_decrement_capacity: bool,
     pub(super) node_group_id: Option<NodeGroupId>,
     pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
@@ -371,6 +372,7 @@ const ADMIN_NODE_SELECT: &str = "SELECT n.id,
        n.drain_mode,
        n.drain_started_at,
        n.drain_last_error,
+       n.drain_engine,
        n.terminate_decrement_capacity,
        n.node_group_id,
        nd.metadata,
@@ -1198,20 +1200,24 @@ pub(super) async fn list_pinned_local_only_sandboxes(
 /// serving user traffic by design. Reading the phase alone here would let an
 /// `:undrain` + gentle `:drain` landing mid-fan-out look like the safe regime it
 /// isn't, which is the whole failure this re-check exists to prevent. Resolved
-/// through the same [`NodeDrain::blocks_placement`] the gate itself uses.
+/// through the same [`NodeDrain::refuses_activations`] the gate itself uses,
+/// from the node's shared drain columns.
 pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(Option<NodeDrainPhase>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
+    type Row = (Option<String>, Option<String>, Option<String>);
+    let row: Option<Row> = sqlx::query_as(sql!(
+        "SELECT drain_engine, drain_phase, drain_mode FROM nodes WHERE id = $1"
     ))
     .bind(node_id)
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .and_then(|(phase, mode)| NodeDrain::from_v1_columns(phase, mode.as_deref()))
-        .is_some_and(NodeDrain::blocks_placement))
+        .and_then(|(engine, phase, mode)| {
+            NodeDrain::from_columns(engine.as_deref(), phase.as_deref(), mode.as_deref())
+        })
+        .is_some_and(NodeDrain::refuses_activations))
 }
 
 /// The in-place update for a node that is already `draining`: rewrite
