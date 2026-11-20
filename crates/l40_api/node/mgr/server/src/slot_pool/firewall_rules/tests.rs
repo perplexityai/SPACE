@@ -40,7 +40,7 @@ fn document(generation: u64) -> String {
     json!({"schema_version": 1, "rules": [rule]}).to_string()
 }
 
-/// A store with `generation` accepted, if any.
+/// A store with the `accepted` generation, if any.
 fn store(accepted: Option<u64>) -> (TempDir, Arc<FirewallAssignments>) {
     let dir = tempfile::tempdir().unwrap();
     let store = FirewallAssignments::open(&dir.path().join("assignment.json")).unwrap();
@@ -79,10 +79,11 @@ fn pool(slots: u32) -> (Arc<NetworkPool>, mpsc::Receiver<()>) {
     (pool, wakeups)
 }
 
-/// A healthy slot held by `sandbox-{slot_id}`.
+/// A healthy slot, held by `sandbox-{slot_id}` unless it is ready.
 fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, generation: i64) {
     let update = "UPDATE network_slots SET state = ?1, generation = ?2, health = 'healthy',
-                  sandbox_id = 'sandbox-' || ?3 WHERE slot_id = ?3";
+                  sandbox_id = CASE ?1 WHEN 'ready' THEN NULL ELSE 'sandbox-' || ?3 END
+                  WHERE slot_id = ?3";
     let params = params![state.as_str(), generation, slot_id];
     pool.db.lock().unwrap().execute(update, params).unwrap();
 }
@@ -106,7 +107,7 @@ fn hook(slot: &Hook, hook: impl FnOnce() + Send + 'static) {
     *slot.lock().unwrap() = Some(Box::new(hook));
 }
 
-fn run(slot: &Hook) {
+fn fire(slot: &Hook) {
     let hook = slot.lock().unwrap().take();
     if let Some(hook) = hook {
         hook();
@@ -119,8 +120,9 @@ struct FakeHost {
     tables: Mutex<HashMap<NamespaceIdentity, Vec<Value>>>,
     installs: Mutex<Vec<NamespaceIdentity>>,
     calls: Mutex<Vec<NamespaceIdentity>>,
-    /// Run once, after the lookup and once the next install commits.
+    /// Fired once, after the next lookup.
     looked_up: Hook,
+    /// Fired once, after the next install commits.
     installed: Hook,
 }
 
@@ -166,7 +168,7 @@ impl FakeHost {
             if self.fault != Some(Fault::Drops) {
                 self.tables.lock().unwrap().insert(namespace, added(stdin));
             }
-            run(&self.installed);
+            fire(&self.installed);
             return match self.fault {
                 Some(Fault::Rejects) => Some(output(1, Vec::new())),
                 Some(Fault::TimesOut) => None,
@@ -212,7 +214,7 @@ impl SlotHost for FakeHost {
     }
 
     fn looked_up(&self) {
-        run(&self.looked_up);
+        fire(&self.looked_up);
     }
 }
 
@@ -245,9 +247,7 @@ fn attempted(report: SlotFirewallReport) -> SlotFirewallAttempt {
     }
 }
 
-// Catches an unavailable store, another node's assignment, or a newer
-// generation than the accepted one treated as runnable. The apply tests cover
-// an empty store and an older generation.
+// Catches an unavailable store, another node, or a newer generation run.
 #[test]
 fn only_the_requested_accepted_assignment_is_runnable() {
     let accepted = Arc::new(DesiredAssignment {
@@ -271,9 +271,7 @@ fn only_the_requested_accepted_assignment_is_runnable() {
     ));
 }
 
-// Catches an eligibility rule that admits any slot but a healthy ready one
-// without a sandbox ID or a healthy leased one with one, including the inverse
-// ID shapes.
+// Catches any slot eligible but healthy Ready without an ID or Leased with one.
 #[test]
 fn only_healthy_ready_or_leased_slots_are_eligible() {
     use SlotHealth::*;
@@ -301,9 +299,7 @@ fn only_healthy_ready_or_leased_slots_are_eligible() {
     assert_eq!(passed, [(Ready, Healthy, ""), (Leased, Healthy, "sandbox")]);
 }
 
-// Catches nft run for a missing, ineligible, busy or changed slot, an
-// unpinnable namespace or no accepted assignment, the assignment read before
-// ownership, or a slot left owned after a refusal.
+// Catches nft run, ownership skipped or kept, or the assignment read early.
 #[tokio::test]
 async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
@@ -326,12 +322,13 @@ async fn refusals_never_run_nft() {
 
     accept(&store, 12);
     assert!(matches!(refused(1).await, NotRun::NoSlot));
-    set_slot(&pool, 0, SlotState::Dirty, 1);
+    let degrade = "UPDATE network_slots SET health = 'degraded' WHERE slot_id = 0";
+    pool.db.lock().unwrap().execute(degrade, []).unwrap();
     assert!(matches!(
         refused(0).await,
         NotRun::Ineligible {
-            state: SlotState::Dirty,
-            health: SlotHealth::Healthy
+            health: SlotHealth::Degraded,
+            ..
         }
     ));
     set_slot(&pool, 0, SlotState::Leased, 1);
@@ -356,8 +353,7 @@ async fn refusals_never_run_nft() {
     assert_eq!(host.calls(), []);
 }
 
-// Catches a readback skipped or trusted less than the submit outcome, a blind
-// retry, or a result reported as verified from nft's exit alone.
+// Catches a skipped readback, a retry, or verification from nft's exit.
 #[tokio::test]
 async fn submit_outcome_and_readback_are_reported_separately() {
     for (fault, submitted, readback) in [
@@ -399,9 +395,7 @@ enum Drift {
     NamespaceRemoved,
 }
 
-// Catches a result published as current after the assignment, the slot's
-// lifecycle or the namespace entry moved during nft, a result relabelled with
-// the newer assignment or entry, or in-flight work redirected to the new entry.
+// Catches a result current, relabelled or redirected after a change during nft.
 #[tokio::test]
 async fn changes_while_nft_runs_are_never_reported_current() {
     for drift in [
@@ -455,8 +449,7 @@ async fn changes_while_nft_runs_are_never_reported_current() {
     }
 }
 
-// Catches an older invocation that installs its generation once a newer one
-// was accepted before it took ownership, or over the newer one afterwards.
+// Catches an older generation installed after a newer one was accepted.
 #[tokio::test]
 async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
     let (pool, _jobs) = pool(1);
@@ -495,9 +488,7 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
     assert_eq!(host.tables.lock().unwrap()[&namespace], installed(13));
 }
 
-// Catches ownership released with the async caller while nft runs or kept once
-// the job finishes, one slot's apply blocking another's, or a neutral release
-// that nudges reset.
+// Catches ownership tied to the caller, kept, blocking other slots, or nudging reset.
 #[tokio::test]
 async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
     let (pool, mut jobs) = pool(2);
@@ -506,11 +497,11 @@ async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
     host.name(0, "net");
     let other = host.name(1, "uts");
     set_slot(&pool, 0, SlotState::Leased, 1);
-    set_slot(&pool, 1, SlotState::Leased, 1);
-    let (entered, entering) = oneshot::channel();
+    set_slot(&pool, 1, SlotState::Ready, 1);
+    let (enter, entered) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel::<()>();
     hook(&host.installed, move || {
-        let _ = entered.send(());
+        let _ = enter.send(());
         // Also ends once a failed test drops `release`.
         let _ = released.recv_timeout(BOUND);
     });
@@ -518,14 +509,14 @@ async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
         let (pool, store, host) = (pool.clone(), store.clone(), host.clone());
         async move { apply(&pool, &store, &host, 12, 0).await }
     });
-    bounded(entering).await.unwrap();
+    bounded(entered).await.unwrap();
     caller.abort();
     assert!(bounded(caller).await.unwrap_err().is_cancelled());
 
     assert!(SlotGuard::try_acquire(&pool, 0).is_none(), "released early");
     let progressed = attempted(apply(&pool, &store, &host, 12, 1).await);
     assert!(progressed.verified());
-    assert_eq!(progressed.namespace, other);
+    assert_eq!((progressed.namespace, progressed.sandbox_id), (other, None));
 
     release.send(()).unwrap();
     pool.task_tracker.close();

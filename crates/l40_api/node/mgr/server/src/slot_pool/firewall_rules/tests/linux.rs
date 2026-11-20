@@ -4,8 +4,6 @@
 use super::*;
 use crate::netns_tests::{TestNamespace, contained};
 
-const PRIVILEGE: &str = "create network namespaces and nftables tables";
-
 /// The slot's namespace entry, redirected to a test one.
 struct Redirected(String);
 
@@ -23,11 +21,10 @@ fn list(namespace: &TestNamespace, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-// Catches an apply that misses the slot's namespace, touches a sibling one, or
-// reports evidence for an object other than the one it pinned.
+// Catches an apply that misses the slot's namespace or touches a sibling one.
 #[test]
 fn applies_the_accepted_revision_only_to_the_slot_namespace() {
-    if !pplx_space_test_env::root_or_skip(PRIVILEGE) {
+    if !pplx_space_test_env::root_or_skip("create network namespaces and nftables tables") {
         return;
     }
     let target = TestNamespace::create();
