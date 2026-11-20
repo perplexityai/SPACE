@@ -595,7 +595,13 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                     reason,
                     residency,
                 };
-                metrics::stranded_sandboxes(&series.node, verdict.as_str(), reason, residency, count);
+                metrics::stranded_sandboxes(
+                    &series.node,
+                    verdict.as_str(),
+                    reason,
+                    residency,
+                    count,
+                );
                 published.insert(series);
             }
             if verdict == StrandedVerdict::Gone {
@@ -656,10 +662,11 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             None => {
                 // Whether `registered_node_verdict` would stop at the grace
                 // without an EC2 call; a first sighting starts the clock.
-                let settling = absent_since.get(k8s_node_name).map_or(
-                    !self.config.absence_grace.is_zero(),
-                    |first| first.elapsed() < self.config.absence_grace,
-                );
+                let settling = absent_since
+                    .get(k8s_node_name)
+                    .map_or(!self.config.absence_grace.is_zero(), |first| {
+                        first.elapsed() < self.config.absence_grace
+                    });
                 if !settling {
                     if *lookups_left == 0 {
                         return Some((StrandedVerdict::Unverifiable, "lookup_budget"));
@@ -674,10 +681,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             }
         };
         match verdict {
-            CachedVerdict::Gone => Some((
-                StrandedVerdict::Gone,
-                "source_node_instance_terminated",
-            )),
+            CachedVerdict::Gone => Some((StrandedVerdict::Gone, "source_node_instance_terminated")),
             CachedVerdict::Live => None,
             CachedVerdict::Unverifiable => {
                 Some((StrandedVerdict::Unverifiable, "source_node_unverifiable"))

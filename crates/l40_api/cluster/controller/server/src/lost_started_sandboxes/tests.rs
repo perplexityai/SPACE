@@ -1053,7 +1053,10 @@ mod postgres_backed {
             Some((SourceNode::RowDeleted, 1))
         );
         assert_eq!(
-            store.stranded_counts(registered_node.node_id).await?.running,
+            store
+                .stranded_counts(registered_node.node_id)
+                .await?
+                .running,
             1
         );
 
@@ -1065,15 +1068,20 @@ mod postgres_backed {
         .execute(&db.pool)
         .await?;
         assert_eq!(
-            store.stranded_counts(registered_node.node_id).await?.running,
+            store
+                .stranded_counts(registered_node.node_id)
+                .await?
+                .running,
             0
         );
 
         // Terminal residents and drained nodes drop out of the first pass.
-        sqlx::query(sql!("UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"))
-            .bind(deleted_row.sandbox_id)
-            .execute(&db.pool)
-            .await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"
+        ))
+        .bind(deleted_row.sandbox_id)
+        .execute(&db.pool)
+        .await?;
         sqlx::query(sql!(
             "UPDATE nodes SET drain_phase = 'draining' WHERE id = $1"
         ))
@@ -1081,12 +1089,9 @@ mod postgres_backed {
         .execute(&db.pool)
         .await?;
         let residents = store.node_residents().await?;
-        assert!(
-            residents
-                .iter()
-                .all(|row| row.node_id != registered_node.node_id
-                    && row.node_id != deleted_row.node_id)
-        );
+        assert!(residents.iter().all(
+            |row| row.node_id != registered_node.node_id && row.node_id != deleted_row.node_id
+        ));
         Ok(())
     }
 
@@ -1288,7 +1293,11 @@ fn gone(report: &TickReport) -> (u32, u64) {
 fn verdict_totals(report: &TickReport, verdict: StrandedVerdict) -> (u32, u64) {
     (
         report.stranded_nodes.get(&verdict).copied().unwrap_or(0),
-        report.stranded_sandboxes.get(&verdict).copied().unwrap_or(0),
+        report
+            .stranded_sandboxes
+            .get(&verdict)
+            .copied()
+            .unwrap_or(0),
     )
 }
 
@@ -1375,7 +1384,11 @@ async fn s3_not_ready_must_last_the_grace() {
         verdict_totals(&reconciler.tick().await, StrandedVerdict::NotReady),
         (0, 0)
     );
-    presence.not_ready.lock().unwrap().insert("sick".to_string());
+    presence
+        .not_ready
+        .lock()
+        .unwrap()
+        .insert("sick".to_string());
     assert_eq!(
         verdict_totals(&reconciler.tick().await, StrandedVerdict::NotReady),
         (0, 0)
@@ -1390,13 +1403,22 @@ async fn s4_disabled_give_up_still_runs_the_census_and_flips_nothing() {
         enabled: false,
         ..config()
     };
-    let mut reconciler = Reconciler::new(config, sink.clone(), Arc::new(FakeLookup::default()), presence());
+    let mut reconciler = Reconciler::new(
+        config,
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        presence(),
+    );
 
     let report = reconciler.tick().await;
 
     assert_eq!(gone(&report), (1, 1));
     assert_eq!(report.scanned, 0);
-    assert_eq!(sink.list_calls(), 0, "no candidate scan with the give-up off");
+    assert_eq!(
+        sink.list_calls(),
+        0,
+        "no candidate scan with the give-up off"
+    );
     assert!(sink.mark_calls().is_empty());
 }
 
@@ -1456,6 +1478,10 @@ async fn s7_census_reuses_the_give_up_verdict() {
 
     assert_eq!(report.marked_lost, 1);
     assert_eq!(gone(&report), (1, 1));
-    assert_eq!(lookup.calls(), vec!["dead".to_string()], "one EC2 call per node");
+    assert_eq!(
+        lookup.calls(),
+        vec!["dead".to_string()],
+        "one EC2 call per node"
+    );
     assert_eq!(presence.direct_calls(), vec!["dead".to_string()]);
 }

@@ -169,18 +169,20 @@ impl LostStartedSink for LostStartedDbStore {
             .await?;
         Ok(rows
             .into_iter()
-            .map(|(node_id, node_row_exists, name, residents)| NodeResidents {
-                node_id,
-                source_node: match (node_row_exists, name) {
-                    (false, _) => SourceNode::RowDeleted,
-                    (true, Some(k8s_node_name)) => SourceNode::Registered {
-                        k8s_node_name,
-                        k8s_node_uid: None,
+            .map(
+                |(node_id, node_row_exists, name, residents)| NodeResidents {
+                    node_id,
+                    source_node: match (node_row_exists, name) {
+                        (false, _) => SourceNode::RowDeleted,
+                        (true, Some(k8s_node_name)) => SourceNode::Registered {
+                            k8s_node_name,
+                            k8s_node_uid: None,
+                        },
+                        (true, None) => SourceNode::Unverifiable,
                     },
-                    (true, None) => SourceNode::Unverifiable,
+                    residents: residents.unsigned_abs(),
                 },
-                residents: residents.unsigned_abs(),
-            })
+            )
             .collect())
     }
 
