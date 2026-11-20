@@ -382,10 +382,10 @@ fn change_after_lookup(
     });
 }
 
-// Catches a slot mutated while transitional or unhealthy, while its sandbox or
-// slot is owned elsewhere, after it changed between lookup and ownership, in a
-// namespace that cannot be pinned, without the requested accepted assignment,
-// or with ownership kept or a reset nudged afterwards.
+// Catches a slot mutated while transitional or unhealthy, while it is owned
+// elsewhere, after it changed between lookup and ownership, in a namespace that
+// cannot be pinned, without the requested accepted assignment, or with
+// ownership kept or a reset nudged afterwards.
 #[tokio::test]
 async fn apply_touches_only_an_owned_stable_slot() {
     const STATES: [SlotState; 9] = [
@@ -423,21 +423,7 @@ async fn apply_touches_only_an_owned_stable_slot() {
             ));
         }
     }
-    let busy: [(&str, Setup); 4] = [
-        (
-            "sandbox mutation claim held",
-            Box::new(|pool, _| {
-                leased(pool, 0);
-                pool.try_claim_sandbox_mutation(SANDBOX).map(held)
-            }),
-        ),
-        (
-            "sandbox work claim held",
-            Box::new(|pool, _| {
-                leased(pool, 0);
-                pool.try_claim_sandbox_work(SANDBOX).map(held)
-            }),
-        ),
+    let busy: [(&str, Setup); 2] = [
         (
             "leased slot guard held",
             Box::new(|pool, _| {
@@ -550,10 +536,6 @@ async fn apply_touches_only_an_owned_stable_slot() {
             }
             drop(held);
             assert!(SlotGuard::try_acquire(&pool, 0).is_some(), "{context}");
-            assert!(
-                pool.try_claim_sandbox_mutation(SANDBOX).is_some(),
-                "{context}"
-            );
             assert_eq!(wakeups(&mut jobs), 0, "{context}: a reset was nudged");
         }
     }
@@ -789,7 +771,6 @@ async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
     assert!(caller.await.unwrap_err().is_cancelled());
 
     assert!(ResetClaim::acquire(&pool, 0).is_none());
-    assert!(pool.try_claim_sandbox_mutation(SANDBOX).is_none());
     let progressed = attempted(apply(&pool, &store, &host, 12, 1).await);
     assert!(progressed.verified());
     assert_eq!(progressed.namespace, other);
@@ -804,5 +785,4 @@ async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
     );
     let reset = ResetClaim::acquire(&pool, 0).expect("released once the job finished");
     reset.disarm();
-    assert!(pool.try_claim_sandbox_mutation(SANDBOX).is_some());
 }

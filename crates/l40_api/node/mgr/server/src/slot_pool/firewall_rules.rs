@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::db::query_record_by_slot;
 use super::reset::SlotGuard;
-use super::{NetworkPool, SandboxMutationClaim, SlotHealth, SlotRecord, SlotState, SlotStoreError};
+use super::{NetworkPool, SlotHealth, SlotRecord, SlotState, SlotStoreError};
 use crate::firewall::assignment::{DesiredAssignment, FirewallAssignments, Unavailable};
 use crate::firewall::rules::install::{InstallOutcome, install_with};
 use crate::firewall::rules::verify::{Verification, verify_with};
@@ -50,7 +50,7 @@ pub enum NotRun {
         state: SlotState,
         health: SlotHealth,
     },
-    #[error("the network slot or its sandbox is owned by other work")]
+    #[error("the network slot is owned by other work")]
     Busy,
     #[error("the network slot changed before it was owned")]
     Changed,
@@ -127,13 +127,10 @@ impl SlotHost for Live {
     }
 }
 
-/// Exclusive ownership of a slot at the lifecycle it was read at. Field order
-/// releases the guard before the claim, so a reset woken by the claim's release
-/// does not first collide with the guard and wait for rediscovery.
+/// Exclusive ownership of a slot at the lifecycle it was read at.
 struct OwnedSlot {
     record: SlotRecord,
     _guard: SlotGuard,
-    _claim: Option<Arc<SandboxMutationClaim>>,
 }
 
 impl NetworkPool {
@@ -186,22 +183,14 @@ impl NetworkPool {
         }
     }
 
-    /// Never waits: the DB lock is not held while claiming, and a held claim
-    /// or guard means the slot is busy.
+    /// Never waits: the DB lock is not held while taking the guard, and a
+    /// held guard means the slot is busy.
     fn own(self: &Arc<Self>, record: SlotRecord) -> Result<OwnedSlot, NotRun> {
-        let claim = match record.state {
-            SlotState::Leased => Some(
-                self.try_claim_sandbox_mutation(&record.info.sandbox_id)
-                    .ok_or(NotRun::Busy)?,
-            ),
-            _ => None,
-        };
         let guard = SlotGuard::try_acquire(self, record.info.slot).ok_or(NotRun::Busy)?;
         match self.record(record.info.slot)? {
             Some(now) if same_lifecycle(&now, &record) => Ok(OwnedSlot {
                 record,
                 _guard: guard,
-                _claim: claim,
             }),
             _ => Err(NotRun::Changed),
         }
