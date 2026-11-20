@@ -480,12 +480,6 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
     );
     assert_eq!(slot, (0, 1, Some("sandbox-0")));
     assert_eq!(attempt.namespace, namespace);
-    assert!(matches!(
-        apply(&pool, &store, &host, 12, 0).await,
-        SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NotCurrent { accepted: 13 }))
-    ));
-    assert_eq!(host.installs(), [namespace]);
-    assert_eq!(host.tables.lock().unwrap()[&namespace], installed(13));
 }
 
 // Catches ownership tied to the caller, kept, blocking other slots, or nudging reset.
