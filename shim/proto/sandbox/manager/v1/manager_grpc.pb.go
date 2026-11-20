@@ -200,7 +200,15 @@ type SandboxManagerClient interface {
 	// boot restores the old pair and releases the fence. Idempotent per
 	// `operation_id`: a retry resumes or settles the same upgrade. The node
 	// records outcomes per attempt, `(operation_id, attempt_id)`; see
-	// `UpgradeRuntimeRequest.attempt_id`. A rolled-back upgrade keeps only its
+	// `UpgradeRuntimeRequest.attempt_id`. An attempt acquires the finality
+	// below only while the node's attempt finality is on
+	// (`SPACE_SBXMGR_RUNTIME_UPGRADE_ATTEMPT_FINALITY_ENABLED`, off by
+	// default). Off, the node records nothing final for an attempt, its
+	// retries are decided again, and neither RPC names an attempt for what it
+	// decides then, as a node that predates attempt ids. What an attempt
+	// acquired while it was on stays final after it's turned off: its retries
+	// are still answered from it, and `GetRuntimeUpgrade` still names it. A
+	// rolled-back upgrade keeps only its
 	// outcome, recorded for its attempt, and so does a request refused before it
 	// fenced anything for a reason no retry changes;
 	// `RUNTIME_UPGRADE_STATUS_REFUSED` lists which refusals the node records and
@@ -211,11 +219,11 @@ type SandboxManagerClient interface {
 	// answered it, and never fences or boots again. A refusal left unrecorded
 	// leaves nothing to replay: `GetRuntimeUpgrade` answers as if it never
 	// happened, and a retry with the same attempt id tries again. A new attempt
-	// starts over. An error answering a STARTED attempt after the operation
-	// reached its target is a different case: it's recorded for that attempt as
-	// `GetRuntimeUpgradeResponse.refused_attempt_id` describes. A sandbox already
-	// on the target is activated in place for a STARTED target, and a suspended
-	// one absent from the node may be staged first; see
+	// starts over. A final refusal answering a STARTED attempt after the
+	// operation reached its target is a different case: it's recorded for that
+	// attempt as `GetRuntimeUpgradeResponse.refused_attempt_id` describes. A
+	// sandbox already on the target is activated in place for a STARTED target,
+	// and a suspended one absent from the node may be staged first; see
 	// `UpgradeRuntimeRequest.target_state` and `stage_from`, and
 	// `GetRuntimeUpgrade` for what the node records.
 	UpgradeRuntime(ctx context.Context, in *UpgradeRuntimeRequest, opts ...grpc.CallOption) (*UpgradeRuntimeResponse, error)
@@ -1441,7 +1449,15 @@ type SandboxManagerServer interface {
 	// boot restores the old pair and releases the fence. Idempotent per
 	// `operation_id`: a retry resumes or settles the same upgrade. The node
 	// records outcomes per attempt, `(operation_id, attempt_id)`; see
-	// `UpgradeRuntimeRequest.attempt_id`. A rolled-back upgrade keeps only its
+	// `UpgradeRuntimeRequest.attempt_id`. An attempt acquires the finality
+	// below only while the node's attempt finality is on
+	// (`SPACE_SBXMGR_RUNTIME_UPGRADE_ATTEMPT_FINALITY_ENABLED`, off by
+	// default). Off, the node records nothing final for an attempt, its
+	// retries are decided again, and neither RPC names an attempt for what it
+	// decides then, as a node that predates attempt ids. What an attempt
+	// acquired while it was on stays final after it's turned off: its retries
+	// are still answered from it, and `GetRuntimeUpgrade` still names it. A
+	// rolled-back upgrade keeps only its
 	// outcome, recorded for its attempt, and so does a request refused before it
 	// fenced anything for a reason no retry changes;
 	// `RUNTIME_UPGRADE_STATUS_REFUSED` lists which refusals the node records and
@@ -1452,11 +1468,11 @@ type SandboxManagerServer interface {
 	// answered it, and never fences or boots again. A refusal left unrecorded
 	// leaves nothing to replay: `GetRuntimeUpgrade` answers as if it never
 	// happened, and a retry with the same attempt id tries again. A new attempt
-	// starts over. An error answering a STARTED attempt after the operation
-	// reached its target is a different case: it's recorded for that attempt as
-	// `GetRuntimeUpgradeResponse.refused_attempt_id` describes. A sandbox already
-	// on the target is activated in place for a STARTED target, and a suspended
-	// one absent from the node may be staged first; see
+	// starts over. A final refusal answering a STARTED attempt after the
+	// operation reached its target is a different case: it's recorded for that
+	// attempt as `GetRuntimeUpgradeResponse.refused_attempt_id` describes. A
+	// sandbox already on the target is activated in place for a STARTED target,
+	// and a suspended one absent from the node may be staged first; see
 	// `UpgradeRuntimeRequest.target_state` and `stage_from`, and
 	// `GetRuntimeUpgrade` for what the node records.
 	UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error)

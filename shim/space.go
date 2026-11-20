@@ -2696,6 +2696,26 @@ func (s *ociSpec) sandboxPodUID() *string {
 	return nil
 }
 
+// kubeletPodUID is the UID kubelet gave the pod, or nil outside Kubernetes.
+// Unlike sandboxPodUID it never reads space.pplx.net/pod-uid: the control
+// plane writes that annotation, so a replacement pod could carry an earlier
+// pod's value, while kubelet's UID is the pod's own and new for every pod.
+// The pod UID and CRI sandbox UID annotations both carry it; a pod whose two
+// disagree names no pod for certain, and is refused.
+func (s *ociSpec) kubeletPodUID() (*string, error) {
+	pod := strings.TrimSpace(s.Annotations[kubernetesPodUIDAnnotation])
+	cri := strings.TrimSpace(s.Annotations[kubernetesCriSandboxUIDAnnotation])
+	switch {
+	case pod != "" && cri != "" && pod != cri:
+		return nil, fmt.Errorf("%s %q and %s %q name different pods", kubernetesPodUIDAnnotation, pod, kubernetesCriSandboxUIDAnnotation, cri)
+	case pod != "":
+		return ptr(pod), nil
+	case cri != "":
+		return ptr(cri), nil
+	}
+	return nil, nil
+}
+
 func (s *ociSpec) sandboxOwner() (string, error) {
 	value := strings.TrimSpace(s.Annotations[sandboxOwnerAnnotation])
 	if value == "" {
