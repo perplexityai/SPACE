@@ -50,6 +50,9 @@ use crate::env_config;
 pub(crate) const UNASSIGNED_TAINT_KEY: &str = "space.pplx.net/unassigned";
 /// Label EKS sets on every node of a managed node group.
 const EKS_NODEGROUP_LABEL: &str = "eks.amazonaws.com/nodegroup";
+/// Set on a Node just before its instance is terminated; the node then
+/// counts as leaving, so the terminate (and its decrement) is issued once.
+const TERMINATING_ANNOTATION: &str = "space.pplx.net/terminating";
 const DEFAULT_TICK: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
@@ -319,6 +322,7 @@ impl Backend {
                     group: label(node, NODE_GROUP_LABEL).map(str::to_string),
                     unassigned_taint: has_taint(node, UNASSIGNED_TAINT_KEY),
                     leaving: node.metadata.deletion_timestamp.is_some()
+                        || annotation(node, TERMINATING_ANNOTATION).is_some()
                         || row.is_some_and(|phase| phase.is_some()),
                     registered: row.is_some(),
                     instance_id: instance_id(node),
@@ -366,11 +370,16 @@ impl Backend {
                     }
                 },
                 Action::Drain { node } => self.drain(node).await,
-                Action::Terminate { instance_id, .. } => self
-                    .asg
-                    .terminate_instance_in_auto_scaling_group(instance_id, true)
-                    .await
-                    .map_err(|err| err.to_string()),
+                Action::Terminate { node, instance_id } => {
+                    match self.mark_terminating(node).await {
+                        Err(err) => Err(err),
+                        Ok(()) => self
+                            .asg
+                            .terminate_instance_in_auto_scaling_group(instance_id, true)
+                            .await
+                            .map_err(|err| err.to_string()),
+                    }
+                }
                 Action::Grow { pool, nodes } => self.grow(pool, *nodes).await,
             };
             if let Err(err) = result {
@@ -406,6 +415,20 @@ impl Backend {
         let patch = serde_json::json!({ "metadata": metadata, "spec": { "taints": taints } });
         Api::<Node>::all(self.kube.k8s.client.clone())
             .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    /// Record the terminate on the Node before issuing it, so later ticks
+    /// (and a restarted controller) count the node as leaving instead of
+    /// decrementing the pool again.
+    async fn mark_terminating(&self, node: &str) -> Result<(), String> {
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { TERMINATING_ANNOTATION: "true" } }
+        });
+        Api::<Node>::all(self.kube.k8s.client.clone())
+            .patch(node, &PatchParams::default(), &Patch::Merge(&patch))
             .await
             .map(|_| ())
             .map_err(|err| err.to_string())
@@ -461,6 +484,14 @@ fn label<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
         .get(key)
         .map(String::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn annotation<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
+    node.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(key))
+        .map(String::as_str)
 }
 
 fn has_taint(node: &Node, key: &str) -> bool {
