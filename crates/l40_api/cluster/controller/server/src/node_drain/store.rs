@@ -5273,6 +5273,7 @@ mod pod_less_giveup;
 #[cfg(test)]
 pub(crate) use pod_less_giveup::PodLessHold;
 pub use pod_less_giveup::PodLessRecovery;
+pub(crate) use pod_less_giveup::retire_reverted_resident;
 
 #[cfg(test)]
 mod pod_less_giveup_tests;
