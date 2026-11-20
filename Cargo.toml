@@ -427,6 +427,7 @@ pplx-space-node-status-store = { path = "crates/l30_storage/node/status/store" }
 pplx-space-feature-flags = { path = "crates/l10_foundation/feature/flags" }
 pplx-space-events = { path = "crates/l20_domain/events" }
 pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/store" }
+pplx-space-firewall-rules-store = { path = "crates/l30_storage/firewall/rules/store" }
 pplx-space-ingress-admission = { path = "crates/l40_api/ingress/admission" }
 pplx-space-credmgr = { path = "crates/l40_api/credmgr/server" }
 pplx-space-credmgr-client = { path = "crates/l40_api/credmgr/client" }

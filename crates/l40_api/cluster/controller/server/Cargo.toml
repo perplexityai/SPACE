@@ -80,6 +80,7 @@ pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-env-vars = { workspace = true }
 pplx-space-durations = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
+pplx-space-firewall-rules-store = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
