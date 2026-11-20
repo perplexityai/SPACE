@@ -351,12 +351,12 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
     Ok(())
 }
 
-/// A Fetch overlapping a commit that moves the worker from (revision, round)
-/// to the next pair returns one whole pair, never a mix. The writer holds one
-/// table's lock so Fetch reads it only after the commit; each table in turn,
-/// so a split read in either order would return a mixed pair. The last commit
-/// also deletes the registration, so a binding read in another snapshot would
-/// return the new pair.
+/// A Fetch overlapping a commit that moves the worker to the next (revision,
+/// round) pair returns exactly the old pair: its first read fixes the snapshot
+/// before the commit. The writer locks the observations, the assignments, then
+/// the registrations, so each read in turn waits for the commit. Reading
+/// either part, or the binding the last commit deletes, in a later snapshot
+/// returns something else.
 #[tokio::test(flavor = "current_thread")]
 async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
     let Some(fixture) = cluster_fixture_with_max_connections(4).await? else {
@@ -394,10 +394,10 @@ async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
         let new = response(a, generation, *revision, round, issued_at);
 
         let mut writer = pool.begin().await?;
-        sqlx::query(if step == 1 {
-            sql!("LOCK TABLE firewall_rules_node_assignments IN ACCESS EXCLUSIVE MODE")
-        } else {
-            sql!("LOCK TABLE firewall_rules_node_observations IN ACCESS EXCLUSIVE MODE")
+        sqlx::query(match step {
+            0 => sql!("LOCK TABLE firewall_rules_node_observations IN ACCESS EXCLUSIVE MODE"),
+            1 => sql!("LOCK TABLE firewall_rules_node_assignments IN ACCESS EXCLUSIVE MODE"),
+            _ => sql!("LOCK TABLE nodes IN ACCESS EXCLUSIVE MODE"),
         })
         .execute(&mut *writer)
         .await?;
@@ -447,16 +447,12 @@ async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
         }
         writer.commit().await?;
 
-        let overlapping = overlapping.await?;
+        assert_eq!(overlapping.await?, Ok(old.clone()), "step {step}");
         let after = if delete {
             Err(Code::PermissionDenied)
         } else {
             Ok(new.clone())
         };
-        assert!(
-            overlapping == Ok(old.clone()) || overlapping == after,
-            "step {step}: mixed snapshot {overlapping:?}"
-        );
         assert_eq!(fetch(&mut harness.client, Some(&token)).await?, after);
         old = new;
     }
