@@ -392,6 +392,156 @@ fn spawn_sandbox_manager_capability_bridge(
     })
 }
 
+#[cfg(not(test))]
+const BUILD_MANAGER_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const BUILD_MANAGER_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const BUILD_MANAGER_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What build-manager's health service reports for its BuildManager service.
+/// build-manager reports NOT_SERVING from the moment it starts draining, and
+/// rejects every StartBuild from then on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildManagerHealth {
+    Serving,
+    NotServing,
+    /// No answer: build-manager is starting, restarting or gone.
+    Unknown,
+}
+
+/// Whether a builder's node-api stays ready, and so an endpoint of the builder
+/// Service, given build-manager's latest health and the last decision.
+///
+/// A draining build-manager takes node-api out, so the API's StartBuild
+/// retries land on another builder instead of this one. No answer keeps the
+/// last decision: node-api still goes ready without build-manager at startup,
+/// as before, and a build-manager that stops answering after draining keeps
+/// node-api out until a build-manager on the node reports SERVING again.
+fn builder_node_api_ready(previous: bool, health: BuildManagerHealth) -> bool {
+    match health {
+        BuildManagerHealth::Serving => true,
+        BuildManagerHealth::NotServing => false,
+        BuildManagerHealth::Unknown => previous,
+    }
+}
+
+async fn build_manager_health(
+    client: &mut HealthClient<tonic::transport::Channel>,
+) -> BuildManagerHealth {
+    let request = HealthCheckRequest {
+        service: pplx_space_build_mgr_client::proto::build_manager_server::SERVICE_NAME.to_string(),
+    };
+    match tokio::time::timeout(BUILD_MANAGER_HEALTH_TIMEOUT, client.check(request)).await {
+        Ok(Ok(response)) if response.get_ref().status == HealthStatus::Serving as i32 => {
+            BuildManagerHealth::Serving
+        }
+        Ok(Ok(_)) => BuildManagerHealth::NotServing,
+        Ok(Err(status)) => {
+            tracing::debug!(%status, "build-manager health check failed");
+            BuildManagerHealth::Unknown
+        }
+        Err(_) => {
+            tracing::debug!("build-manager health check timed out");
+            BuildManagerHealth::Unknown
+        }
+    }
+}
+
+/// Mirror build-manager's drain onto a builder node-api's local readiness.
+///
+/// The API reaches builders through the builder Service and retries a
+/// StartBuild a draining build-manager rejects, each attempt on a fresh
+/// route. While the draining builder's node-api stays ready, a retry can land
+/// on it again. Turning readiness off once build-manager drains lets kubelet's
+/// readiness probe take the node-api out of the Service's endpoints, so later
+/// attempts go to another builder. The task stops at shutdown, where the
+/// shutdown hook already turns readiness off, and never turns it on after.
+fn spawn_build_manager_drain_bridge<P, Fut>(
+    mut probe: P,
+    health_reporter: HealthReporter,
+    shutdown_token: CancellationToken,
+) -> JoinHandle<()>
+where
+    P: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = BuildManagerHealth> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut ready = true;
+        loop {
+            let health = tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => break,
+                health = probe() => health,
+            };
+            let next = builder_node_api_ready(ready, health);
+            if next != ready {
+                if shutdown_token.is_cancelled() {
+                    break;
+                }
+                let status = if next {
+                    ReporterServingStatus::Serving
+                } else {
+                    ReporterServingStatus::NotServing
+                };
+                health_reporter.set_service_status("", status).await;
+                health_reporter
+                    .set_service_status(READINESS_SERVICE, status)
+                    .await;
+                // Shutdown may have turned readiness off between the check
+                // above and the update; it wins.
+                if shutdown_token.is_cancelled() {
+                    health_reporter
+                        .set_service_status("", ReporterServingStatus::NotServing)
+                        .await;
+                    health_reporter
+                        .set_service_status(READINESS_SERVICE, ReporterServingStatus::NotServing)
+                        .await;
+                    break;
+                }
+                tracing::info!(
+                    ready = next,
+                    ?health,
+                    "updated builder node-api readiness from build-manager"
+                );
+                ready = next;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => break,
+                _ = tokio::time::sleep(BUILD_MANAGER_DRAIN_POLL_INTERVAL) => {}
+            }
+        }
+    })
+}
+
+/// Start [`spawn_build_manager_drain_bridge`] against this node's
+/// build-manager, when node-api serves local readiness.
+fn spawn_local_build_manager_drain_bridge(
+    health_server: Option<&LocalHealthServer>,
+    shutdown_token: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    let (health_reporter, _) = health_server?;
+    let channel = match pplx_space_build_mgr_client::connect_lazy_health_channel() {
+        Ok(channel) => channel,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "cannot reach build-manager's health service; builder readiness won't follow its drain"
+            );
+            return None;
+        }
+    };
+    let client = HealthClient::new(channel);
+    Some(spawn_build_manager_drain_bridge(
+        move || {
+            let mut client = client.clone();
+            async move { build_manager_health(&mut client).await }
+        },
+        health_reporter.clone(),
+        shutdown_token,
+    ))
+}
+
 async fn wait_for_sandbox_manager_capabilities(socket_path: &Path) {
     let mut retry_index = 0;
     loop {
@@ -926,6 +1076,13 @@ pub async fn run(
                     .add_service(svc)
                     .add_service(NodeInfoServer::new(node_info));
                 set_local_readiness(health_server.as_ref(), ReporterServingStatus::Serving).await;
+                // A child token, so the bridge stops before readiness is turned
+                // off below, whatever ended the server.
+                let build_manager_drain_token = shutdown_token.child_token();
+                let build_manager_drain_task = spawn_local_build_manager_drain_bridge(
+                    health_server.as_ref(),
+                    build_manager_drain_token.clone(),
+                );
                 let serve_result = server.serve_with_incoming_shutdown(
                     pplx_space_common_grpc::internal_transport::Incoming::new(
                         TcpIncoming::from(listener).with_nodelay(Some(true)),
@@ -940,6 +1097,12 @@ pub async fn run(
                     serve_result,
                 )
                 .await;
+                build_manager_drain_token.cancel();
+                if let Some(task) = build_manager_drain_task
+                    && let Err(error) = task.await
+                {
+                    tracing::warn!(%error, "build-manager drain bridge failed");
+                }
                 set_local_readiness(health_server.as_ref(), ReporterServingStatus::NotServing)
                     .await;
                 shutdown_token.cancel();

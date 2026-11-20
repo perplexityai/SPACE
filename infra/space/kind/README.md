@@ -2072,8 +2072,11 @@ node-api's 150 s shutdown grace, and 7500 s for build-manager's 7200 s build
 drain. Each chart's values carry the comment and the citation. Builder node-api
 pods also sleep 5 s in preStop: on SIGTERM node-api closes its listener and
 answers new calls "draining" at once, while the API reaches builders through the
-`space-builder-node-api` Service and does not retry a draining build start, so
-the delay lets the pod leave the Service's endpoints first.
+`space-builder-node-api` Service, so the delay lets the pod leave the Service's
+endpoints first. While the node's build-manager drains, builder node-api also
+reports itself not ready, so the readiness probe takes it out of the Service and
+the API's retries of a build start that build-manager rejected as draining go to
+another builder.
 
 **The runtime-supervisor.** node-manager's init container runs the production
 `node-manager-init.sh` unchanged: it stages the host binaries under

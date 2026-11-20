@@ -184,6 +184,12 @@ pub fn connect_lazy() -> Result<BuildManagerGrpcClient, ConnectError> {
     client_from_env(lazy_channel(build_manager_endpoint())?)
 }
 
+/// A lazily connected channel to build-manager with no bearer interceptor, for
+/// the gRPC health service, which build-manager serves without authentication.
+pub fn connect_lazy_health_channel() -> Result<Channel, ConnectError> {
+    lazy_channel(build_manager_endpoint())
+}
+
 fn lazy_channel(endpoint: String) -> Result<Channel, ConnectError> {
     let endpoint =
         Endpoint::from_shared(internal_transport::qualify_endpoint(&endpoint))?.tcp_nodelay(true);

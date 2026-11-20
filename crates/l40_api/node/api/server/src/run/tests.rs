@@ -583,3 +583,141 @@ async fn open_streams_keep_the_whole_drain_without_a_grace() {
     .await;
     assert!(!drain.is_cancelled());
 }
+
+#[test]
+fn builder_readiness_follows_build_manager_drain() {
+    use BuildManagerHealth::{NotServing, Serving, Unknown};
+
+    assert!(builder_node_api_ready(true, Serving));
+    assert!(builder_node_api_ready(false, Serving));
+    assert!(!builder_node_api_ready(true, NotServing));
+    // No answer keeps the last decision: ready at startup, out after a drain.
+    assert!(builder_node_api_ready(true, Unknown));
+    assert!(!builder_node_api_ready(false, Unknown));
+}
+
+async fn spawn_build_manager_health(
+    socket_path: &Path,
+) -> (HealthReporter, CancellationToken, JoinHandle<()>) {
+    let listener = pplx_space_unix_socket_bind::bind_unix_socket(
+        socket_path,
+        pplx_space_unix_socket_bind::UnixSocketOptions::new(0o600),
+    )
+    .unwrap();
+    let (reporter, health) = pplx_space_grpc_server::grpc_health_service();
+    reporter
+        .set_service_status(
+            pplx_space_build_mgr_client::proto::build_manager_server::SERVICE_NAME,
+            ReporterServingStatus::Serving,
+        )
+        .await;
+    let shutdown_token = CancellationToken::new();
+    let server_shutdown = shutdown_token.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(health)
+            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
+                server_shutdown.cancelled().await
+            })
+            .await
+            .unwrap();
+    });
+    (reporter, shutdown_token, server)
+}
+
+async fn wait_for_readiness(
+    socket_path: &Path,
+    expected: tonic_health::pb::health_check_response::ServingStatus,
+    message: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while local_health_status(socket_path, READINESS_SERVICE).await != expected {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(message);
+}
+
+#[tokio::test]
+async fn builder_readiness_turns_off_while_build_manager_drains() {
+    use tonic_health::pb::health_check_response::ServingStatus;
+
+    let dir = tempfile::tempdir().unwrap();
+    let build_manager_socket = dir.path().join("build-manager-health.sock");
+    let (manager_reporter, manager_shutdown, manager_server) =
+        spawn_build_manager_health(&build_manager_socket).await;
+    let node_health_socket = dir.path().join("node-api-health.sock");
+    let node_shutdown = CancellationToken::new();
+    let node_health = spawn_local_health(Some(&node_health_socket), node_shutdown.clone())
+        .await
+        .unwrap();
+    set_local_readiness(node_health.as_ref(), ReporterServingStatus::Serving).await;
+
+    let channel = pplx_space_common_grpc::connect_uds_channel(SERVICE_NAME, &build_manager_socket)
+        .await
+        .unwrap();
+    let client = HealthClient::new(channel);
+    let bridge_token = node_shutdown.child_token();
+    let bridge = spawn_build_manager_drain_bridge(
+        move || {
+            let mut client = client.clone();
+            async move { build_manager_health(&mut client).await }
+        },
+        node_health.as_ref().unwrap().0.clone(),
+        bridge_token.clone(),
+    );
+
+    tokio::time::sleep(BUILD_MANAGER_DRAIN_POLL_INTERVAL * 4).await;
+    assert_eq!(
+        local_health_status(&node_health_socket, READINESS_SERVICE).await,
+        ServingStatus::Serving,
+        "a serving build-manager keeps node-api ready"
+    );
+
+    // build-manager starts draining (run.rs in build-manager).
+    manager_reporter
+        .set_service_status(
+            pplx_space_build_mgr_client::proto::build_manager_server::SERVICE_NAME,
+            ReporterServingStatus::NotServing,
+        )
+        .await;
+    wait_for_readiness(
+        &node_health_socket,
+        ServingStatus::NotServing,
+        "a draining build-manager must take node-api out of the builder Service",
+    )
+    .await;
+    assert_eq!(
+        local_health_status(&node_health_socket, "").await,
+        ServingStatus::NotServing
+    );
+
+    // build-manager exits after its drain: node-api stays out.
+    manager_shutdown.cancel();
+    manager_server.await.unwrap();
+    tokio::time::sleep(BUILD_MANAGER_DRAIN_POLL_INTERVAL * 4).await;
+    assert_eq!(
+        local_health_status(&node_health_socket, READINESS_SERVICE).await,
+        ServingStatus::NotServing,
+        "a build-manager that stops answering after draining keeps node-api out"
+    );
+
+    // A new build-manager comes up serving: node-api is ready again.
+    std::fs::remove_file(&build_manager_socket).ok();
+    let (_manager_reporter, manager_shutdown, manager_server) =
+        spawn_build_manager_health(&build_manager_socket).await;
+    wait_for_readiness(
+        &node_health_socket,
+        ServingStatus::Serving,
+        "a serving build-manager must bring node-api back",
+    )
+    .await;
+
+    bridge_token.cancel();
+    bridge.await.unwrap();
+    node_shutdown.cancel();
+    stop_local_health(node_health).await;
+    manager_shutdown.cancel();
+    manager_server.await.unwrap();
+}
