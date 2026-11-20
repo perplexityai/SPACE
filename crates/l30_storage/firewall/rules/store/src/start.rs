@@ -24,6 +24,7 @@ use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 
+use crate::read::{StoredStateError, read_revision};
 use crate::{ItemPhase, RevisionId, RolloutId, end_transaction, rollout_phase};
 
 #[cfg(test)]
@@ -114,12 +115,14 @@ pub enum StartError {
          qualification is approved"
     )]
     NotEnabled,
-    #[error("stored firewall revision {id} doesn't decode: {source}")]
-    StoredRevision { id: RevisionId, source: DecodeError },
-    #[error("the firewall_rules_control row is missing")]
-    MissingControlRow,
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Stored(#[from] StoredStateError),
+}
+
+impl From<sqlx::Error> for StartError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Stored(error.into())
+    }
 }
 
 impl StartError {
@@ -131,7 +134,7 @@ impl StartError {
         {
             return Self::SlotTaken;
         }
-        Self::Database(error)
+        error.into()
     }
 }
 
@@ -205,7 +208,7 @@ async fn start_in(
 ) -> Result<StartedRollout, StartError> {
     let adopted = lock_control(&mut *tx)
         .await?
-        .ok_or(StartError::MissingControlRow)?;
+        .ok_or(StoredStateError::MissingControlRow)?;
     let adopted = AdoptedRevision::from(adopted);
     if adopted != start.expected_adopted {
         return Err(StartError::Stale { adopted });
@@ -291,21 +294,4 @@ async fn lock_control(tx: &mut PgConnection) -> Result<Option<Option<RevisionId>
     ))
     .fetch_optional(tx)
     .await
-}
-
-/// Read revision `id` back through the protocol's strict decoder.
-async fn read_revision(
-    executor: impl sqlx::PgExecutor<'_>,
-    id: RevisionId,
-) -> Result<FirewallRuleRevision, StartError> {
-    let document = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT jsonb_build_object(
-                    'schema_version', ruleset_format_version, 'rules', ruleset)::text
-         FROM firewall_rules_revisions
-         WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_one(executor)
-    .await?;
-    decode_revision(&document).map_err(|source| StartError::StoredRevision { id, source })
 }

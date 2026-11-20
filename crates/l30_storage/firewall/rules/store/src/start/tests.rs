@@ -338,7 +338,10 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
         .await?;
     let refused = start(pool, a, &candidate).await;
     assert!(
-        matches!(refused, Err(StartError::MissingControlRow)),
+        matches!(
+            refused,
+            Err(StartError::Stored(StoredStateError::MissingControlRow))
+        ),
         "{refused:?}"
     );
     Ok(())
@@ -548,7 +551,7 @@ async fn the_whole_candidate_is_validated_and_stored_exactly() -> TestResult {
     .await?;
     let unreadable = start(pool, AdoptedRevision::Revision(newer), &reordered).await;
     assert!(
-        matches!(unreadable, Err(StartError::StoredRevision { id, .. }) if id == newer),
+        matches!(unreadable, Err(StartError::Stored(StoredStateError::StoredRevision { id, .. })) if id == newer),
         "{unreadable:?}"
     );
     Ok(())
@@ -585,7 +588,13 @@ async fn a_failed_write_leaves_nothing_behind() -> TestResult {
     ] {
         sqlx::raw_sql(table).execute(pool).await?;
         let failed = start(pool, AdoptedRevision::NoRevision, &candidate).await;
-        assert!(matches!(failed, Err(StartError::Database(_))), "{failed:?}");
+        assert!(
+            matches!(
+                failed,
+                Err(StartError::Stored(StoredStateError::Database(_)))
+            ),
+            "{failed:?}"
+        );
         assert_eq!(state(pool).await?, before);
         sqlx::raw_sql(sql!(
             "DROP TRIGGER IF EXISTS fail_insert ON firewall_rules_rollouts;

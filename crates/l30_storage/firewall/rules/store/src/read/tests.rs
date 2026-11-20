@@ -53,7 +53,7 @@ async fn only_the_adopted_document_is_read_and_faults_are_errors() -> TestResult
     let newer = adopt(pool, 2, "[]").await?;
     let unreadable = read_adopted(pool).await;
     assert!(
-        matches!(unreadable, Err(ReadAdoptedError::StoredRevision { id, .. }) if id == newer),
+        matches!(unreadable, Err(StoredStateError::StoredRevision { id, .. }) if id == newer),
         "{unreadable:?}"
     );
     sqlx::query(sql!("DELETE FROM firewall_rules_control"))
@@ -61,7 +61,7 @@ async fn only_the_adopted_document_is_read_and_faults_are_errors() -> TestResult
         .await?;
     let missing = read_adopted(pool).await;
     assert!(
-        matches!(missing, Err(ReadAdoptedError::MissingControlRow)),
+        matches!(missing, Err(StoredStateError::MissingControlRow)),
         "{missing:?}"
     );
     Ok(())

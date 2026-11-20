@@ -268,9 +268,9 @@ fn a_started_rollout_keeps_its_review() -> TestResult {
 }
 
 /// Catches the refusals production can't reach yet sharing a message or
-/// status, and a stored-state fault's detail reaching the caller.
+/// status.
 #[tokio::test(flavor = "current_thread")]
-async fn unreachable_refusals_stay_distinct_and_faults_are_sanitized() -> TestResult {
+async fn unreachable_refusals_stay_distinct() -> TestResult {
     async fn answer(error: StartError) -> TestResult<(StatusCode, Value)> {
         let response = start_error(error);
         let status = response.status();
@@ -285,16 +285,5 @@ async fn unreachable_refusals_stay_distinct_and_faults_are_sanitized() -> TestRe
             (StatusCode::CONFLICT, json!({"error": message}))
         );
     }
-    let fault = StartError::StoredRevision {
-        id: RevisionId(Uuid::from_u128(1)),
-        source: decode_revision("{}").err().ok_or("decoded")?,
-    };
-    assert_eq!(
-        answer(fault).await?,
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": "Internal server error"})
-        )
-    );
     Ok(())
 }

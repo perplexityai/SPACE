@@ -5,14 +5,16 @@
 use pplx_space_firewall_rules_model::FirewallRuleRevision;
 use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision};
 use pplx_space_sql_locator::sql;
+use sqlx::PgPool;
 
 use crate::RevisionId;
 
 #[cfg(test)]
 mod tests;
 
+/// Stored state that can't be read.
 #[derive(Debug, thiserror::Error)]
-pub enum ReadAdoptedError {
+pub enum StoredStateError {
     #[error("stored firewall revision {id} doesn't decode: {source}")]
     StoredRevision { id: RevisionId, source: DecodeError },
     #[error("the firewall_rules_control row is missing")]
@@ -21,26 +23,37 @@ pub enum ReadAdoptedError {
     Database(#[from] sqlx::Error),
 }
 
-/// The adopted default and its document, in one statement; `None` when no
-/// revision is adopted. An unfinished rollout's candidate is never returned.
+/// The adopted default and its document; `None` when no revision is adopted.
+/// An unfinished rollout's candidate is never returned. Two statements, which
+/// agree because revisions are immutable.
 pub async fn read_adopted(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Option<(RevisionId, FirewallRuleRevision)>, ReadAdoptedError> {
-    let (id, document) = sqlx::query_as::<_, (Option<RevisionId>, String)>(sql!(
-        "SELECT c.enrollment_default_revision_id,
-                jsonb_build_object(
-                    'schema_version', r.ruleset_format_version, 'rules', r.ruleset)::text
-         FROM firewall_rules_control c
-         LEFT JOIN firewall_rules_revisions r ON r.id = c.enrollment_default_revision_id
-         WHERE c.singleton"
+    pool: &PgPool,
+) -> Result<Option<(RevisionId, FirewallRuleRevision)>, StoredStateError> {
+    let id = sqlx::query_scalar::<_, Option<RevisionId>>(sql!(
+        "SELECT enrollment_default_revision_id FROM firewall_rules_control WHERE singleton"
     ))
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?
-    .ok_or(ReadAdoptedError::MissingControlRow)?;
+    .ok_or(StoredStateError::MissingControlRow)?;
     let Some(id) = id else {
         return Ok(None);
     };
-    decode_revision(&document)
-        .map(|revision| Some((id, revision)))
-        .map_err(|source| ReadAdoptedError::StoredRevision { id, source })
+    Ok(Some((id, read_revision(pool, id).await?)))
+}
+
+/// Read revision `id` back through the protocol's strict decoder.
+pub(crate) async fn read_revision(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: RevisionId,
+) -> Result<FirewallRuleRevision, StoredStateError> {
+    let document = sqlx::query_scalar::<_, String>(sql!(
+        "SELECT jsonb_build_object(
+                    'schema_version', ruleset_format_version, 'rules', ruleset)::text
+         FROM firewall_rules_revisions
+         WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(executor)
+    .await?;
+    decode_revision(&document).map_err(|source| StoredStateError::StoredRevision { id, source })
 }

@@ -14,8 +14,8 @@ use axum::{
 use pplx_space_firewall_rules_model::RuleChange;
 use pplx_space_firewall_rules_protocol::{decode_revision, encode_revision};
 use pplx_space_firewall_rules_store::{
-    self as store, AdoptedRevision, ReadAdoptedError, Review, RevisionId, StartError, StartRollout,
-    StartedRollout,
+    self as store, AdoptedRevision, Review, RevisionId, StartError, StartRollout, StartedRollout,
+    StoredStateError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue};
@@ -43,18 +43,18 @@ pub(super) async fn get_adopted(
     }
     let adopted = match store::read_adopted(&state.pool).await {
         Ok(adopted) => adopted,
-        Err(ReadAdoptedError::Database(err)) => return read_db_error(err),
-        Err(error) => return internal(&error),
+        Err(error) => return stored_state_error(error, read_db_error),
     };
-    let (adopted_revision_id, revision) = adopted
-        .map(|(RevisionId(id), revision)| {
-            let document =
-                RawValue::from_string(encode_revision(&revision)).unwrap_or_else(|error| {
-                    unreachable!("encode_revision wrote invalid JSON: {error}")
-                });
-            (id, document)
-        })
-        .unzip();
+    let (adopted_revision_id, revision) = match adopted {
+        None => (None, None),
+        Some((RevisionId(id), revision)) => {
+            let document = RawValue::from_string(encode_revision(&revision));
+            match document {
+                Ok(document) => (Some(id), Some(document)),
+                Err(error) => return internal(&error),
+            }
+        }
+    };
     Json(AdoptedResponse {
         adopted_revision_id,
         revision,
@@ -187,16 +187,24 @@ fn start_error(error: StartError) -> Response {
         error @ (StartError::SlotTaken | StartError::Unqualified(_) | StartError::NotEnabled) => {
             api_error(StatusCode::CONFLICT, error.to_string()).into_response()
         }
-        StartError::Database(err) => db_error(err).into_response(),
-        error @ (StartError::StoredRevision { .. } | StartError::MissingControlRow) => {
-            internal(&error)
-        }
+        StartError::Stored(error) => stored_state_error(error, |err| db_error(err).into_response()),
     }
 }
 
-/// A stored-state fault, logged and answered without detail.
+/// A database error through `db`; any other fault without detail.
+fn stored_state_error(
+    error: StoredStateError,
+    db: impl FnOnce(sqlx::Error) -> Response,
+) -> Response {
+    match error {
+        StoredStateError::Database(err) => db(err),
+        error => internal(&error),
+    }
+}
+
+/// A fault, logged and answered without detail.
 fn internal(error: &dyn std::error::Error) -> Response {
-    tracing::error!(error = %error, "firewall rules store fault");
+    tracing::error!(error = %error, "firewall rules admin route fault");
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
 }
 

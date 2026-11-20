@@ -46,7 +46,7 @@ pub(super) fn insert_firewall_rules_paths(paths: &mut Map<String, Value>) {
                     "201": { "description": "Object with revision_id, rollout_id, generation and review. review is {\"kind\":\"first_push\"} when nothing was adopted, or {\"kind\":\"against\"} with base_revision_id, changes (each {change: added, replaced or removed, rule_id}) and reordered, which is true when shared rules changed order even with no changes" },
                     "400": { "description": "Invalid body, precondition, reason or revision" },
                     "403": { "description": "Managing organization administrator required" },
-                    "409": { "description": "The adopted revision isn't the expected one (adopted_revision_id, possibly null, is the current one; review again), a rollout is unfinished (rollout_id when known), production starts aren't enabled yet, or a target can't enforce the candidate" }
+                    "409": { "description": "The adopted revision isn't the expected one (adopted_revision_id, possibly null, is the current one; review again), a rollout is unfinished (rollout_id when known), another rollout took the slot first, production starts aren't enabled yet, or a target can't enforce the candidate" }
                 }
             }
         }),

@@ -33,7 +33,7 @@ pub use lease::{
     LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
-pub use read::{ReadAdoptedError, read_adopted};
+pub use read::{StoredStateError, read_adopted};
 pub use start::{
     AdoptedRevision, REASON_MAX_CHARS, Review, StartError, StartRollout, StartedRollout,
     start_rollout,
