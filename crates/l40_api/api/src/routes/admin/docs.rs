@@ -7,6 +7,7 @@ use pplx_space_runtime_environment_policy_store::PolicyChangeReason;
 use serde_json::{Map, Value, json};
 
 mod cross_org;
+mod firewall_rules;
 mod runtime_upgrade_campaigns;
 
 const ADMIN_LLMS_TXT: &str = "SPACE Admin API\n\n\
@@ -361,6 +362,7 @@ fn admin_openapi_value() -> Value {
     insert_admin_sandbox_action_paths(paths);
     insert_identity_profile_paths(paths);
     insert_audit_event_paths(paths);
+    firewall_rules::insert_firewall_rules_paths(paths);
     insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
     runtime_upgrade_campaigns::insert_runtime_upgrade_campaign_paths(paths);
