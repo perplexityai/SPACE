@@ -20,7 +20,7 @@ use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
 use crate::lease::{HANDOFF_LOCK, item_timestamp, stamped_work};
-use crate::{ItemPhase, LeasedTarget, Path, Requeue, Work, requeue, roll_back, rollout_phase};
+use crate::{ItemPhase, LeasedTarget, Requeue, Scope, Work, requeue, roll_back, rollout_phase};
 
 /// The wakeup issuance queues for its node, on the issuing transaction.
 pub trait Wakeup {
@@ -89,7 +89,7 @@ pub async fn issue_first_assignment(
     first_check_in: Duration,
     wakeup: &mut impl Wakeup,
 ) -> Result<Issuance, sqlx::Error> {
-    issue_and_commit(conn, target, first_check_in, Path::Any, wakeup).await
+    issue_and_commit(conn, target, first_check_in, Scope::Any, wakeup).await
 }
 
 /// [`issue_first_assignment`], only while the rollout is in canary, ending
@@ -103,14 +103,14 @@ pub async fn issue_canary_and_release(
     first_check_in: Duration,
     wakeup: &mut impl Wakeup,
 ) -> Result<Issuance, sqlx::Error> {
-    issue_and_commit(conn, target, first_check_in, Path::FirstCanary, wakeup).await
+    issue_and_commit(conn, target, first_check_in, Scope::FirstCanary, wakeup).await
 }
 
 async fn issue_and_commit(
     conn: &mut PgConnection,
     target: &LeasedTarget,
     first_check_in: Duration,
-    path: Path,
+    scope: Scope,
     wakeup: &mut impl Wakeup,
 ) -> Result<Issuance, sqlx::Error> {
     // A hint only: a first assignment is rechecked below, a check never issues.
@@ -122,19 +122,7 @@ async fn issue_and_commit(
     let mut tx = conn
         .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
         .await?;
-    let mut issued = issue(&mut tx, target, first_check_in, path, wakeup).await;
-    if path == Path::FirstCanary && matches!(issued, Ok(Issuance::Issued(_))) {
-        let release = Requeue::Release { error: None };
-        issued = match requeue(&mut *tx, target, &release).await {
-            Ok(true) => issued,
-            Ok(false) => Err(sqlx::Error::Protocol(format!(
-                "firewall rules item {}/{} issued but didn't release",
-                target.rollout_id, target.node_id
-            ))),
-            Err(error) => Err(error),
-        };
-    }
-    match issued {
+    match issue(&mut tx, target, first_check_in, scope, wakeup).await {
         Ok(Issuance::Issued(stamp)) => {
             tx.commit().await?;
             Ok(Issuance::Issued(stamp))
@@ -150,7 +138,7 @@ async fn issue(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     target: &LeasedTarget,
     first_check_in: Duration,
-    path: Path,
+    scope: Scope,
     wakeup: &mut impl Wakeup,
 ) -> Result<Issuance, sqlx::Error> {
     let header = sqlx::query_as::<_, (bool, bool, uuid::Uuid)>(sql!(
@@ -167,7 +155,7 @@ async fn issue(
     let Some((issuing, canary, revision)) = header else {
         return Ok(Issuance::Refused(Refusal::NotATarget));
     };
-    let issuing = issuing && (canary || path == Path::Any);
+    let issuing = issuing && (canary || scope == Scope::Any);
     // Shared, as a renewal takes it. Without it, a claim on another rollout
     // could find this lease expired on its clock while this stamps it live on
     // an earlier one, and both commit. No test catches its removal.
@@ -320,7 +308,7 @@ async fn issue(
     let Some((issued_at, next_check_at)) = stamped else {
         return Ok(Issuance::Refused(Refusal::Lapsed));
     };
-    Ok(Issuance::Issued(Stamp {
+    let stamp = Stamp {
         assignment_generation: u64::try_from(generation).map_err(|_| {
             sqlx::Error::Decode(
                 format!(
@@ -332,5 +320,15 @@ async fn issue(
         })?,
         issued_at: timestamp("an out-of-range issuance time", issued_at)?,
         next_check_at: Some(timestamp("an out-of-range check time", next_check_at)?),
-    }))
+    };
+    // Under the item lock held since the read; the caller rolls back on error.
+    if scope == Scope::FirstCanary
+        && !requeue(&mut **tx, target, &Requeue::Release { error: None }).await?
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "firewall rules item {}/{} issued but didn't release",
+            target.rollout_id, target.node_id
+        )));
+    }
+    Ok(Issuance::Issued(stamp))
 }
