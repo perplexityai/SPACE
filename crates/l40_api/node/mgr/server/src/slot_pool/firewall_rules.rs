@@ -50,6 +50,8 @@ pub enum NotRun {
         state: SlotState,
         health: SlotHealth,
     },
+    /// The holder may be an older generation's apply, so retry until this
+    /// request applies or a newer generation supersedes it.
     #[error("the network slot is owned by other work")]
     Busy,
     #[error("the network slot changed before it was owned")]
@@ -139,7 +141,9 @@ impl NetworkPool {
     /// Installs `request`'s generation, if it is still the accepted one, in
     /// the slot's sandbox namespace and reads it back. A busy, transitional or
     /// changed slot is left alone. `Err` means the job panicked; nft may have
-    /// run.
+    /// run. Until it returns, a dynamic create skips a Ready slot this holds,
+    /// and fails if every free slot is held. A caller should apply to Ready
+    /// slots one at a time.
     pub async fn apply_firewall_rules(
         self: &Arc<Self>,
         assignments: &Arc<FirewallAssignments>,
@@ -176,8 +180,7 @@ impl NetworkPool {
         Ok(record)
     }
 
-    /// Never waits: the DB lock is not held while taking the guard, and a
-    /// held guard means the slot is busy.
+    /// Takes the guard without waiting, then waits for the DB lock.
     fn own(self: &Arc<Self>, record: SlotRecord) -> Result<OwnedSlot, NotRun> {
         let guard = SlotGuard::try_acquire(self, record.info.slot).ok_or(NotRun::Busy)?;
         match self.record(record.info.slot)? {
