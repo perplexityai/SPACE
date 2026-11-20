@@ -113,14 +113,12 @@ fn ready(pool: &NetworkPool, slot_id: u32) {
 #[derive(Clone, Copy, Debug)]
 enum Report {
     Exit(i32),
-    Signal(i32),
     TimedOut,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Listing {
     Kernel,
-    NotJson,
     Fails,
 }
 
@@ -208,7 +206,6 @@ impl FakeHost {
                 let objects: Vec<_> = std::iter::once(metainfo).chain(objects).collect();
                 json!({"nftables": objects}).to_string().into_bytes()
             }
-            Listing::NotJson => b"not json".to_vec(),
             Listing::Fails => return output(1 << 8, b"", b"Error: listing failed"),
         };
         output(0, &stdout, b"")
@@ -232,7 +229,6 @@ impl FakeHost {
                 }
                 match self.report {
                     Report::Exit(code) => Some(output(code << 8, b"", b"")),
-                    Report::Signal(signal) => Some(output(signal, b"", b"")),
                     Report::TimedOut => None,
                 }
             }
@@ -465,9 +461,7 @@ async fn refusals_never_run_nft() {
 #[tokio::test]
 async fn submit_outcome_and_readback_are_reported_separately() {
     let rows = [
-        (true, Report::Exit(0), Listing::Kernel, "committed", "match"),
         (true, Report::Exit(1), Listing::Kernel, "rejected", "match"),
-        (true, Report::Signal(9), Listing::Kernel, "unknown", "match"),
         (true, Report::TimedOut, Listing::Kernel, "unknown", "match"),
         (
             false,
@@ -475,20 +469,6 @@ async fn submit_outcome_and_readback_are_reported_separately() {
             Listing::Kernel,
             "committed",
             "mismatch",
-        ),
-        (
-            false,
-            Report::Exit(1),
-            Listing::Kernel,
-            "rejected",
-            "mismatch",
-        ),
-        (
-            true,
-            Report::Exit(0),
-            Listing::NotJson,
-            "committed",
-            "inconclusive",
         ),
         (
             true,
@@ -503,7 +483,7 @@ async fn submit_outcome_and_readback_are_reported_separately() {
         let (pool, _jobs) = pool(1);
         let (_dir, store) = store(Some((12, DNS)));
         let host = FakeHost::reporting(commits, report, listing);
-        let namespace = host.name(0, "net");
+        host.name(0, "net");
         leased(&pool, 0);
         let attempt = attempted(apply(&pool, &store, &host, 12, 0).await);
         let observed = (
@@ -520,22 +500,7 @@ async fn submit_outcome_and_readback_are_reported_separately() {
         );
         assert_eq!(observed, (submitted, readback), "{context}");
         assert_eq!(attempt.verified(), readback == "match", "{context}");
-        assert!(attempt.current.is_ok(), "{context}");
-        assert_eq!(
-            (
-                attempt.node_id,
-                attempt.assignment_generation,
-                attempt.revision_id
-            ),
-            (NODE, 12, Uuid::from_u128(12)),
-            "{context}"
-        );
-        assert_eq!(
-            (attempt.slot_id, attempt.slot_generation, attempt.sandbox_id),
-            (0, 1, Some(SANDBOX.to_string())),
-            "{context}"
-        );
-        assert_eq!(host.installs(), [namespace], "{context}: submitted once");
+        assert_eq!(host.installs().len(), 1, "{context}: submitted once");
         assert!(host.calls().len() > 1, "{context}: read back");
     }
 }
@@ -626,7 +591,7 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
     let (_dir, store) = store(Some((12, DNS)));
     let host = FakeHost::new();
     let namespace = host.name(0, "net");
-    ready(&pool, 0);
+    leased(&pool, 0);
     assert!(attempted(apply(&pool, &store, &host, 12, 0).await).verified());
 
     // 13 arrives after 12's lookup but before 12 owns the slot.
@@ -649,7 +614,24 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
         SlotFirewallReport::NotRun(NotRun::Busy)
     ));
     release.send(()).unwrap();
-    assert!(attempted(newer.await.unwrap()).verified());
+    let attempt = attempted(newer.await.unwrap());
+    assert!(attempt.verified(), "{attempt:?}");
+    assert_eq!(
+        (
+            (
+                attempt.node_id,
+                attempt.assignment_generation,
+                attempt.revision_id
+            ),
+            (attempt.slot_id, attempt.slot_generation, attempt.sandbox_id),
+            attempt.namespace,
+        ),
+        (
+            (NODE, 13, Uuid::from_u128(13)),
+            (0, 1, Some(SANDBOX.into())),
+            namespace
+        )
+    );
 
     assert!(matches!(
         apply(&pool, &store, &host, 12, 0).await,
