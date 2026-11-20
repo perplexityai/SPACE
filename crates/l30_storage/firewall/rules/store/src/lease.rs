@@ -1,9 +1,9 @@
 //! Leasing a rollout's saved targets: permission for one controller to work
 //! on one node for a while. A lease is not an assignment. Nothing here writes
 //! an assignment, an issuance stamp, an observation or a wakeup;
-//! [`issue_first_assignment`](crate::issue_first_assignment) does, under the
-//! lease. Only a retried check reschedules `next_check_at`
-//! ([`Requeue::Retry`]).
+//! [`issue_first_assignment`](crate::issue_first_assignment) writes the
+//! assignment, issuance stamp and wakeup under the lease, and no observation.
+//! Only a retried check reschedules `next_check_at` ([`Requeue::Retry`]).
 //!
 //! Claims and renewals run [`pplx_space_rollout_queue::claim`] and
 //! [`pplx_space_rollout_queue::renew`] on these tables, in their lock order:
