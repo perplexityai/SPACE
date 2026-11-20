@@ -1,5 +1,6 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_firewall_rules_protocol::decode_revision;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
@@ -116,7 +117,8 @@ async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
                 issued_at: issued_at(),
             }),
         };
-        assert_eq!(fetch_instructions(pool, node).await?, expected, "{case}");
+        let fetched = fetch_instructions(&mut *pool.acquire().await?, node).await?;
+        assert_eq!(fetched, expected, "{case}");
     }
     Ok(())
 }
@@ -138,9 +140,14 @@ async fn an_undecodable_revision_is_an_error() -> TestResult {
     .bind(revision)
     .execute(pool)
     .await?;
-    let error = fetch_instructions(pool, node).await.unwrap_err();
+    let error = fetch_instructions(&mut *pool.acquire().await?, node)
+        .await
+        .unwrap_err();
     assert!(
-        matches!(error, FetchError::StoredRevision { id, .. } if id == revision),
+        matches!(
+            error,
+            StoredStateError::StoredRevision { id, .. } if id == revision
+        ),
         "{error}"
     );
     Ok(())

@@ -31,7 +31,7 @@ mod lease;
 mod read;
 mod start;
 
-pub use fetch::{Assignment, FetchError, NodeInstructions, PendingRound, fetch_instructions};
+pub use fetch::{Assignment, NodeInstructions, PendingRound, fetch_instructions};
 pub use issue::{Issuance, Refusal, Stamp, Wakeup, issue_first_assignment};
 pub use lease::{
     LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,

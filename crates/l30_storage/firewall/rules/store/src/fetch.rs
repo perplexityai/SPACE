@@ -1,14 +1,16 @@
 //! Reading one node's instructions: its assignment, with the revision it
-//! names, and the round it's asked to verify, in one statement so they come
-//! from one snapshot. It writes nothing and decides no authorization.
+//! names, and the round it's asked to verify. Run it in one `REPEATABLE READ`
+//! transaction so they come from one snapshot. It writes nothing and decides
+//! no authorization.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_model::FirewallRuleRevision;
-use pplx_space_firewall_rules_protocol::{DecodeError, decode_revision};
 use pplx_space_sql_locator::sql;
+use sqlx::PgConnection;
 use time::OffsetDateTime;
 
 use crate::RevisionId;
+use crate::read::{StoredStateError, read_revision};
 
 #[cfg(test)]
 mod tests;
@@ -34,52 +36,37 @@ pub struct PendingRound {
     pub issued_at: OffsetDateTime,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum FetchError {
-    #[error("stored firewall revision {id} doesn't decode: {source}")]
-    StoredRevision { id: RevisionId, source: DecodeError },
-    #[error(transparent)]
-    Database(#[from] sqlx::Error),
-}
-
-/// Read `node`'s assignment and pending round together.
+/// Read `node`'s assignment and pending round.
 pub async fn fetch_instructions(
-    executor: impl sqlx::PgExecutor<'_>,
+    conn: &mut PgConnection,
     node: NodeId,
-) -> Result<NodeInstructions, FetchError> {
+) -> Result<NodeInstructions, StoredStateError> {
     // Anchored on the node, so a round without an assignment still returns.
-    // The document is rebuilt as `start::read_revision` rebuilds it.
-    let (generation, revision_id, document, round, issued_at) = sqlx::query_as::<
+    let (generation, revision_id, round, issued_at) = sqlx::query_as::<
         _,
         (
             Option<i64>,
             Option<RevisionId>,
-            Option<String>,
             Option<i64>,
             Option<OffsetDateTime>,
         ),
     >(sql!(
         "SELECT a.assignment_generation,
                 a.revision_id,
-                jsonb_build_object(
-                    'schema_version', r.ruleset_format_version, 'rules', r.ruleset)::text,
                 o.pending_round,
                 o.pending_round_issued_at
          FROM (SELECT $1::uuid AS node_id) n
-         LEFT JOIN (firewall_rules_node_assignments a
-                    JOIN firewall_rules_revisions r ON r.id = a.revision_id)
-             ON a.node_id = n.node_id
+         LEFT JOIN firewall_rules_node_assignments a ON a.node_id = n.node_id
          LEFT JOIN firewall_rules_node_observations o ON o.node_id = n.node_id"
     ))
     .bind(node)
-    .fetch_one(executor)
+    .fetch_one(&mut *conn)
     .await?;
-    let assignment = match (generation, revision_id, document) {
-        (Some(generation), Some(id), Some(document)) => Some(Assignment {
+    let assignment = match (generation, revision_id) {
+        (Some(generation), Some(id)) => Some(Assignment {
             generation: non_negative(generation)?,
             revision_id: id,
-            revision: decode_revision(&document)
-                .map_err(|source| FetchError::StoredRevision { id, source })?,
+            revision: read_revision(&mut *conn, id).await?,
         }),
         _ => None,
     };

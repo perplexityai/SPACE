@@ -82,7 +82,7 @@ impl ClusterApiService {
             _ => return Err(denied()),
         };
         self.firewall_enrollment.admit(node)?;
-        let instructions = pplx_space_firewall_rules_store::fetch_instructions(&mut *tx, node)
+        let instructions = pplx_space_firewall_rules_store::fetch_instructions(&mut tx, node)
             .await
             .map_err(|error| Status::internal(format!("fetch firewall instructions: {error}")))?;
         tx.commit()
