@@ -33,7 +33,7 @@ pub struct SlotFirewallRequest {
 }
 
 /// The occupant of a slot an attempt reached.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SlotTarget {
     pub slot_generation: u64,
     pub sandbox_id: Option<String>,

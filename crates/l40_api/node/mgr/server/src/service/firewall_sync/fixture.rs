@@ -5,12 +5,13 @@
 //! it is no receipt and does not survive a restart. A production binding is
 //! meant to promote this worker as is; only where the binding comes from changes.
 //!
-//! Each result is one of three cases. Retry: nothing was applied and the
+//! Three cases decide whether sync goes on. Retry: nothing was applied and the
 //! target isn't known to have changed, so redelivery runs it again. Target
 //! changed: the slot number no longer proves it's the same sandbox. Unknown:
 //! what the attempt did can't be told. The last two end the binding for this
 //! process, so waiting work never runs against a new occupant and a later
-//! success can't hide the uncertainty. A completed attempt is never resubmitted.
+//! success can't hide the uncertainty. Any other result neither retries nor
+//! ends; a completed attempt is never resubmitted.
 //! The first attempt to reach nft fixes the target, so a slot or namespace
 //! replaced between attempts is a changed target.
 

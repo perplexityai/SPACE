@@ -444,25 +444,21 @@ async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
     }
 }
 
-// Catches work run against a namespace replaced between attempts, a
-// binding-ending result not reaching the reply, or a later delivery admitted,
-// written or applied.
+// Catches a mismatched generation submitted again, work run against a
+// namespace replaced between attempts, a binding-ending result not reaching the
+// reply, or a later delivery admitted, written or applied.
 #[tokio::test]
 async fn a_target_replaced_between_attempts_ends_the_binding() {
-    let bound = bind(None, None, WAIT).await;
+    let bound = bind(Some(Fault::Drops), None, WAIT).await;
     let committed = FirewallAssignmentAcceptance::Committed;
     let first = reply(sync(&bound.service, delivery(12)).await);
-    assert_eq!(first, (12, committed, Outcome::Matched));
+    assert_eq!(first, (12, committed, Outcome::Mismatched));
+    let again = reply(sync(&bound.service, delivery(12)).await);
+    let replayed = FirewallAssignmentAcceptance::Replayed;
+    assert_eq!(again, (12, replayed, Outcome::Mismatched));
     bound.host.name(SLOT, "ipc");
-    let replaced = sync(&bound.service, delivery(13)).await.unwrap();
-    let dispatch = replaced.dispatch.unwrap();
-    assert_eq!(
-        (dispatch.outcome(), dispatch.detail.as_str()),
-        (
-            Outcome::NotRun,
-            "the network slot changed before it was owned"
-        )
-    );
+    let replaced = reply(sync(&bound.service, delivery(13)).await);
+    assert_eq!(replaced, (13, committed, Outcome::NotRun));
     let record = std::fs::read(&bound.path).unwrap();
     for generation in [13, 14] {
         let refused = sync(&bound.service, delivery(generation))

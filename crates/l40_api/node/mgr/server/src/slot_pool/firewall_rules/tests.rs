@@ -333,29 +333,28 @@ async fn refusals_never_run_nft() {
     let host = FakeHost::new(None);
     let net = host.name(0, "net");
     set_slot(&pool, 0, SlotState::Leased, 1);
-    let expecting =
-        async |expected| match apply_expecting(&pool, &store, &host, 12, 0, expected).await {
-            SlotFirewallReport::NotRun(not_run) => not_run,
-            SlotFirewallReport::Attempted(attempt) => panic!("attempted: {attempt:?}"),
-        };
-    let refused = async |slot_id| match apply(&pool, &store, &host, 12, slot_id).await {
+    let refused = async |slot_id, expected| match apply_expecting(
+        &pool, &store, &host, 12, slot_id, expected,
+    )
+    .await
+    {
         SlotFirewallReport::NotRun(not_run) => not_run,
         SlotFirewallReport::Attempted(attempt) => panic!("attempted: {attempt:?}"),
     };
 
     let guard = SlotGuard::try_acquire(&pool, 0).unwrap();
-    assert!(matches!(refused(0).await, NotRun::Busy));
+    assert!(matches!(refused(0, None).await, NotRun::Busy));
     drop(guard);
     assert!(matches!(
-        refused(0).await,
+        refused(0, None).await,
         NotRun::Assignment(NotRunnable::NoAssignment)
     ));
 
     accept(&store, 12);
-    assert!(matches!(refused(1).await, NotRun::NoSlot));
+    assert!(matches!(refused(1, None).await, NotRun::NoSlot));
     set_slot(&pool, 0, SlotState::Dirty, 1);
     assert!(matches!(
-        refused(0).await,
+        refused(0, None).await,
         NotRun::Ineligible {
             state: SlotState::Dirty,
             ..
@@ -367,8 +366,8 @@ async fn refusals_never_run_nft() {
     hook(&host.looked_up, move || {
         set_slot(&later, 0, SlotState::Leased, 2);
     });
-    assert!(matches!(refused(0).await, NotRun::Changed));
-    // Another occupant than an earlier attempt reached, as after a replacement
+    assert!(matches!(refused(0, None).await, NotRun::Changed));
+    // Not the occupant an earlier attempt reached, as after a replacement
     // between attempts.
     let current = SlotTarget {
         slot_generation: 2,
@@ -389,18 +388,18 @@ async fn refusals_never_run_nft() {
             ..current
         },
     ] {
-        assert!(matches!(expecting(Some(expected)).await, NotRun::Changed));
+        assert!(matches!(refused(0, Some(expected)).await, NotRun::Changed));
     }
 
     std::fs::remove_file(host.link(0)).unwrap();
     assert!(matches!(
-        refused(0).await,
+        refused(0, None).await,
         NotRun::Namespace(error) if error.kind() == io::ErrorKind::NotFound
     ));
     std::fs::write(host.link(0), b"").unwrap();
-    assert!(matches!(refused(0).await, NotRun::Namespace(_)));
+    assert!(matches!(refused(0, None).await, NotRun::Namespace(_)));
     pool.shutdown_token.cancel();
-    assert!(matches!(refused(0).await, NotRun::ShuttingDown));
+    assert!(matches!(refused(0, None).await, NotRun::ShuttingDown));
     assert!(
         SlotGuard::try_acquire(&pool, 0).is_some(),
         "a refusal kept the slot"
