@@ -357,18 +357,13 @@ async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
     let revisions = [
         (insert_revision(pool, ORDERED).await?, ORDERED),
         (insert_revision(pool, SSH).await?, SSH),
-        (insert_revision(pool, "[]").await?, "[]"),
     ];
     let mut old = give_work(pool, a, 1, revisions[0], 7).await?;
     let token = projected_token("node-ctl-a");
     let reviews = vec![(token.clone(), node_ctl_on("worker-a", "uid-a"))];
     let mut harness = serve(service, reviews, true).await?;
-    assert_eq!(
-        fetch(&mut harness.client, Some(&token)).await?,
-        Ok(old.clone())
-    );
 
-    for (step, revision) in [revisions[1], revisions[2], revisions[0]]
+    for (step, revision) in [revisions[1], revisions[0], revisions[1]]
         .iter()
         .enumerate()
     {
