@@ -299,3 +299,11 @@ output "credmgr_secrets_reader_role_arn" {
   description = "ARN of the role the credmgr authority assumes per organization to read that organization's tagged Secrets Manager secrets; the authority's SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN."
   value       = aws_iam_role.credmgr_secrets_reader.arn
 }
+
+output "credmgr_authority_role" {
+  description = "Name and ARN of the credmgr authority role. A root that creates an org vend role (org_vend_identity) trusts this ARN and grants this role sts:AssumeRole on it."
+  value = {
+    arn  = aws_iam_role.credmgr_authority.arn
+    name = aws_iam_role.credmgr_authority.name
+  }
+}
