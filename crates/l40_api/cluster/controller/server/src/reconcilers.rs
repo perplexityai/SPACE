@@ -365,6 +365,12 @@ pub async fn run_reconcilers(
                 shutdown_token.child_token(),
             )
         }),
+        // Firewall rules canary issuance. Off: nothing configures it yet.
+        tokio::spawn(crate::firewall_rules_issue::run(
+            None,
+            pool.clone(),
+            shutdown_token.child_token(),
+        )),
     ];
     if let Some(native_public_operation_executor) = native_public_operation_executor {
         // The cluster activation limiter exists in this process only while the

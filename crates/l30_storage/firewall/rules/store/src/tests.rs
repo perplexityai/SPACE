@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{
-    SEED_USER_ID, TestDb, insert_ready_worker_node, try_pg_test_db,
-    try_pg_test_db_with_max_connections,
+    TestDb, insert_ready_worker_node, try_pg_test_db, try_pg_test_db_with_max_connections,
 };
 use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
 use pplx_space_rollout_queue::LEASE_EXPIRED;
@@ -14,6 +13,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::*;
+pub(crate) use crate::test_support::{
+    hold_header, rollout, save_targets, set_phase, wait_for_lock_waiters,
+};
 
 mod issuance;
 
@@ -21,57 +23,6 @@ const LEASE: Duration = Duration::from_secs(600);
 const SCAN: u32 = 100;
 const MAX_ATTEMPTS: u64 = 5;
 const RELEASE: Requeue = Requeue::Release { error: None };
-
-/// A rollout header in `phase`, with the revision it references, created by
-/// the seeded user. The schema admits one unfinished header per database.
-pub(crate) async fn rollout(pool: &PgPool, phase: &str) -> TestResult<RolloutId> {
-    let revision = Uuid::now_v7();
-    sqlx::query(sql!(
-        "INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)
-         VALUES ($1, 1, '[]'::jsonb)"
-    ))
-    .bind(revision)
-    .execute(pool)
-    .await?;
-    let id = Uuid::now_v7();
-    sqlx::query(sql!(
-        "INSERT INTO firewall_rules_rollouts (
-             id, to_revision_id, created_by_user_id, phase, unfinished_slot, reason,
-             finished_at
-         )
-         VALUES ($1, $2, $3, $4,
-                 CASE WHEN $4 IN ('completed', 'aborted') THEN NULL ELSE 1 END,
-                 'test rollout',
-                 CASE WHEN $4 IN ('completed', 'aborted') THEN now() END)"
-    ))
-    .bind(id)
-    .bind(revision)
-    .bind(SEED_USER_ID)
-    .bind(phase)
-    .execute(pool)
-    .await?;
-    Ok(RolloutId(id))
-}
-
-/// Move `rollout` to `phase`, keeping the slot and finish time consistent.
-pub(crate) async fn set_phase(
-    executor: impl sqlx::PgExecutor<'_>,
-    rollout: RolloutId,
-    phase: &str,
-) -> TestResult {
-    sqlx::query(sql!(
-        "UPDATE firewall_rules_rollouts
-         SET phase = $2,
-             unfinished_slot = CASE WHEN $2 IN ('completed', 'aborted') THEN NULL ELSE 1 END,
-             finished_at = CASE WHEN $2 IN ('completed', 'aborted') THEN now() END
-         WHERE id = $1"
-    ))
-    .bind(rollout)
-    .bind(phase)
-    .execute(executor)
-    .await?;
-    Ok(())
-}
 
 /// `count` registered nodes with a reachable, fresh status snapshot, in the
 /// order a claim scans them.
@@ -101,20 +52,6 @@ async fn set_status(
         ..SnapshotSeed::default()
     };
     Ok(upsert_snapshot(pool, node, seed).await?)
-}
-
-async fn save_targets(pool: &PgPool, rollout: RolloutId, nodes: &[NodeId]) -> TestResult {
-    for node in nodes {
-        sqlx::query(sql!(
-            "INSERT INTO firewall_rules_rollout_items (rollout_id, node_id, phase)
-             VALUES ($1, $2, 'pending')"
-        ))
-        .bind(rollout)
-        .bind(*node)
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
 }
 
 /// Stand in for the later assignment transaction: stamp `node`'s item as
@@ -188,46 +125,6 @@ async fn lapse(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult {
     .execute(pool)
     .await?;
     Ok(())
-}
-
-/// Wait, for at most ten seconds, until `count` sessions on this test
-/// database wait for a lock: each racing statement is then known to be
-/// blocked rather than not started yet.
-pub(crate) async fn wait_for_lock_waiters(pool: &PgPool, count: i64) -> TestResult {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let waiting = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT count(*)
-             FROM pg_stat_activity
-             WHERE datname = current_database()
-               AND wait_event_type = 'Lock'"
-        ))
-        .fetch_one(pool)
-        .await?;
-        if waiting >= count {
-            return Ok(());
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{waiting} of {count} sessions started waiting for a lock"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Lock `rollout`'s header in an open transaction, so claims queue behind it.
-async fn hold_header(
-    pool: &PgPool,
-    rollout: RolloutId,
-) -> TestResult<sqlx::Transaction<'static, sqlx::Postgres>> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(sql!(
-        "SELECT 1 FROM firewall_rules_rollouts WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(rollout)
-    .execute(&mut *tx)
-    .await?;
-    Ok(tx)
 }
 
 /// Two claims of `rollout` that both reach the header lock before either
