@@ -2,7 +2,8 @@
 //! record. One tracked worker applies the latest accepted generation to that
 //! slot: deliveries of a generation share its one attempt, and a newer
 //! generation supersedes older work. The attempt state lives in memory only;
-//! it is no receipt and does not survive a restart.
+//! it is no receipt and does not survive a restart. A production binding is
+//! meant to promote this worker as is; only where the binding comes from changes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
