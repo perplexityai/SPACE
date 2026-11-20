@@ -1898,8 +1898,16 @@ async fn s10_deleted_node_found_clear_is_not_recounted() {
     );
     assert_eq!(gone(&report), (1, 1));
 
-    // Leaving the first pass forgets it.
-    sink.set_residents(clear, 0, counts(0, 0));
+    // A ready copy lost at the same resident count shows within the recheck.
+    sink.set_residents(clear, 2, counts(0, 1));
+    tokio::time::advance(DELETED_NODE_CLEAR_RECHECK).await;
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert!(sink.count_calls().contains(&clear));
+    assert_eq!(gone(&report), (2, 2));
+
+    // Found clear again, a changed resident count recounts it at once.
+    sink.set_residents(clear, 2, counts(0, 0));
     reconciler.tick().await;
     sink.set_residents(clear, 1, counts(0, 1));
     sink.clear_count_calls();

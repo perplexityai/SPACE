@@ -145,6 +145,9 @@ pub(crate) const DEFAULT_MAX_CENSUS_LOOKUPS_PER_TICK: u32 = 25;
 /// from within the window. `target_node_id` is never cleared, so without a
 /// bound every node that ever held a suspend would be checked every tick.
 pub(crate) const DELETED_NODE_AT_REST_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How long the census skips a deleted node it found holding nothing
+/// stranded, at an unchanged resident count, before counting it again.
+pub(crate) const DELETED_NODE_CLEAR_RECHECK: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
@@ -381,11 +384,12 @@ pub struct Reconciler<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence
     /// other than `lookup_budget`. A node the budget defers keeps it, so
     /// rotating the lookups doesn't zero a node already judged gone.
     census_verdicts: HashMap<NodeId, (StrandedVerdict, &'static str)>,
-    /// Deleted nodes a census found holding nothing stranded. A deleted node
-    /// gains no residents, so they are skipped until they leave the scan.
-    /// The one way back, a retention delete removing a ready copy, goes
-    /// unreported until the controller restarts.
-    census_deleted_clear: HashSet<NodeId>,
+    /// Deleted nodes a census found holding nothing stranded, with when and
+    /// at what resident count. A deleted node gains no residents, so each is
+    /// skipped until its count changes, it leaves the scan, or
+    /// [`DELETED_NODE_CLEAR_RECHECK`] passes. The recheck catches a retention
+    /// delete removing a ready copy, which changes no resident count.
+    census_deleted_clear: HashMap<NodeId, (tokio::time::Instant, u64)>,
 }
 
 impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L, P> {
@@ -403,7 +407,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             census_row_gone_since: HashMap::new(),
             census_lookup_after: None,
             census_verdicts: HashMap::new(),
-            census_deleted_clear: HashSet::new(),
+            census_deleted_clear: HashMap::new(),
         }
     }
 
@@ -597,8 +601,8 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
         let mut budget_spent = false;
         let mut settled_verdicts = HashMap::new();
         let mut suspects = Vec::new();
-        let mut deleted_clear = HashSet::new();
-        let mut deleted_suspects = HashSet::new();
+        let mut deleted_clear = HashMap::new();
+        let mut deleted_suspects = HashMap::new();
         for node in nodes {
             let residents = match &node.source_node {
                 SourceNode::RowDeleted => {
@@ -631,11 +635,14 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                 continue;
             }
             if matches!(node.source_node, SourceNode::RowDeleted) {
-                if self.census_deleted_clear.contains(&node.node_id) {
-                    deleted_clear.insert(node.node_id);
+                if let Some(&(since, count)) = self.census_deleted_clear.get(&node.node_id)
+                    && count == residents
+                    && now.saturating_duration_since(since) < DELETED_NODE_CLEAR_RECHECK
+                {
+                    deleted_clear.insert(node.node_id, (since, count));
                     continue;
                 }
-                deleted_suspects.insert(node.node_id);
+                deleted_suspects.insert(node.node_id, residents);
             }
             let (verdict, reason, tag_node) = match &node.source_node {
                 SourceNode::RowDeleted => (
@@ -710,8 +717,8 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             let counts = stranded_by_node.get(&node_id).copied().unwrap_or_default();
             let stranded = counts.running + counts.at_rest_without_copy;
             if stranded == 0 {
-                if deleted_suspects.contains(&node_id) {
-                    self.census_deleted_clear.insert(node_id);
+                if let Some(&residents) = deleted_suspects.get(&node_id) {
+                    self.census_deleted_clear.insert(node_id, (now, residents));
                 }
                 continue;
             }
