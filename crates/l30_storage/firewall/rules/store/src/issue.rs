@@ -128,6 +128,9 @@ async fn issue(
     let Some((issuing, canary, revision)) = header else {
         return Ok(Issuance::Refused(Refusal::NotATarget));
     };
+    // Shared, as a renewal takes it. Without it, a claim on another rollout
+    // could find this lease expired on its clock while this stamps it live on
+    // an earlier one, and both commit. No test catches its removal.
     sqlx::query(sql!(
         "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
     ))
