@@ -445,6 +445,10 @@ impl KubernetesSubstrate {
                 | SubstrateError::SuspendInFlight { .. }
                 | SubstrateError::ActivationInFlight { .. },
             ) => None,
+            // `RestoreAwaitingSourceNodeLoss` is retryable for the client but
+            // deliberately completes the attempt as failed: the cluster
+            // controller's lost-started pass only rolls back a
+            // `recovery_failed` execution, and a fresh wake re-claims it.
             Err(_) => Some(StartedRecoveryCompletion::Failed),
         };
         if let Some(completion) = completion {

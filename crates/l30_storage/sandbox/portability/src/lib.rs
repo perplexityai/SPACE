@@ -2133,6 +2133,67 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
 }
 
 /// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
+/// still has a durable copy of the suspend artifact its marker pins, even
+/// though that copy predates the last recorded command or access.
+///
+/// This is the evidence a lost started sandbox can be **rolled back** to once
+/// the node that ran it is gone. A `started` row keeps the marker of the
+/// suspend it last woke from (`current_local_artifact_*`, origin `suspend`).
+/// Every write after that wake lived only in the VM's memory and the node's
+/// local disk, so when the node dies those writes are gone for good, but the
+/// suspend bytes the sandbox woke from are still in object storage. Started
+/// recovery and [`started_restore_source_absent`] both refuse that copy,
+/// correctly, because restoring it silently would lose the post-wake writes.
+/// The lost-started give-up uses this fragment to tell "nothing survives"
+/// from "the last suspend survives": in the second case it reverts the
+/// sandbox to `suspended` on that snapshot and records the rollback, rather
+/// than failing it and discarding the bytes that are still there.
+///
+/// The copy must be the exact marker artifact (identity, kind, `suspend`
+/// origin), `ready`, with a storage location that isn't orphaned, and no
+/// newer full snapshot may exist in any state but `failed`. A `failed` row
+/// holds no bytes, so it can't be a better restore point. Anything else that
+/// is newer (a `ready` checkpoint, a `creating` upload, a `deleting` row)
+/// means the marker is not the most recent state the control plane knows
+/// about, and the rollback refuses. Callers fail the gone node's dead
+/// `creating` uploads first, so an upload that died with the node doesn't
+/// block its own sandbox's rollback.
+///
+/// The activity clocks are deliberately not compared. Callers own the proof
+/// that no runtime can still write to the sandbox: the source node is gone,
+/// the active execution is the terminal `recovery_failed` owner with no pod,
+/// and the row is locked.
+pub fn rollback_marker_suspend_backup_exists(sandbox_alias: &str) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    let no_newer = format!(
+        "NOT EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots newer\n\
+              WHERE newer.sandbox_id = {sandbox_alias}.id\n\
+                AND newer.type = 'full'\n\
+                AND newer.state <> 'failed'\n\
+                AND newer.timestamp > sn.timestamp\n\
+         )"
+    );
+    format!(
+        "EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots sn\n\
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
+              WHERE sn.sandbox_id = {sandbox_alias}.id\n\
+                AND ssl.orphaned_at IS NULL\n\
+                AND {sandbox_alias}.current_local_artifact_origin = '{suspend}'\n\
+                AND sn.local_artifact_id = {sandbox_alias}.current_local_artifact_id\n\
+                AND sn.artifact_kind = {sandbox_alias}.current_local_artifact_kind\n\
+                AND sn.type = 'full'\n\
+                AND sn.state = 'ready'\n\
+                AND (sn.artifact_origin IS NULL OR sn.artifact_origin = '{suspend}')\n\
+                AND {no_newer}\n\
+         )"
+    )
+}
+
+/// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
 /// is **portable for drain-completion**:
 ///
 /// `{alias}.lifecycle = 'suspended' AND <fresh ready snapshot exists>`.

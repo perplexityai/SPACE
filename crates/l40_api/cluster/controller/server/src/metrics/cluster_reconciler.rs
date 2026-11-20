@@ -48,7 +48,7 @@ use pplx_space_snapshot_model::SnapshotId;
 use std::fmt;
 use std::time::Instant;
 
-use pplx_space_metrics_emit::{counter, elapsed_ms, tag, timing_ms};
+use pplx_space_metrics_emit::{counter, distribution, elapsed_ms, tag, timing_ms};
 
 /// The reconciler loop emitting the metric; the `loop` tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +406,10 @@ pub enum LostStartedOutcome {
     /// The source node is confirmed gone and no snapshot can restore the
     /// sandbox without rolling it back: CAS'd to `failed`.
     GaveUpSourceNodeGone,
+    /// The source node is confirmed gone and the suspend the sandbox last
+    /// woke from is still durable: CAS'd back to `suspended` on it, losing
+    /// only the activity since that snapshot.
+    RolledBackSourceNodeGone,
     /// Left alone: the source node's instance is still live
     /// (`reason:source_node_live`).
     Skipped,
@@ -423,6 +427,7 @@ impl LostStartedOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::GaveUpSourceNodeGone => "gave_up_source_node_gone",
+            Self::RolledBackSourceNodeGone => "rolled_back_source_node_gone",
             Self::Skipped => OUTCOME_SKIPPED,
             Self::Deferred => OUTCOME_DEFERRED,
             Self::CasLost => OUTCOME_CAS_LOST,
@@ -433,6 +438,7 @@ impl LostStartedOutcome {
     fn to_lifecycle(self) -> Option<&'static str> {
         match self {
             Self::GaveUpSourceNodeGone => Some(LIFECYCLE_FAILED),
+            Self::RolledBackSourceNodeGone => Some(LIFECYCLE_SUSPENDED),
             Self::Skipped | Self::Deferred | Self::CasLost | Self::Error => None,
         }
     }
@@ -877,6 +883,34 @@ impl OutcomeEvent {
         event.from_lifecycle = Some("restoring".to_string());
         event.to_lifecycle = outcome.to_lifecycle();
         event
+    }
+
+    /// A lost `started` sandbox rolled back to the suspend it last woke from
+    /// (`restore_mode:stale_after_node_loss`). `lost_window_secs` is the
+    /// activity after that snapshot that died with the node (`None` when the
+    /// sandbox had no activity clocks), `snapshot_age_secs` how old the
+    /// snapshot was at rollback. Both are distributions so their tails are
+    /// visible, not only the count.
+    pub fn stale_restore_after_node_loss(
+        lost_window_secs: Option<u64>,
+        snapshot_age_secs: u64,
+    ) {
+        let tags = [
+            tag("loop", Loop::LostStartedSandboxes.as_str()),
+            tag("restore_mode", "stale_after_node_loss"),
+        ];
+        if let Some(lost_window_secs) = lost_window_secs {
+            distribution(
+                "cluster_reconciler.stale_restore.lost_window_secs",
+                lost_window_secs as f64,
+                &tags,
+            );
+        }
+        distribution(
+            "cluster_reconciler.stale_restore.snapshot_age_secs",
+            snapshot_age_secs as f64,
+            &tags,
+        );
     }
 
     pub fn lost_started_sandbox(outcome: LostStartedOutcome) -> Self {

@@ -47,13 +47,25 @@
 //!   wrong region or account, from failing the sandboxes of a live node.
 //!   A cold or empty reflector defers every registered candidate.
 //!
-//! A gone source node flips the sandbox to `failed`, retires its execution,
-//! and emits `sandbox_lost` and `sandbox_failed` events. The flip re-checks
-//! every scan condition under the sandbox row lock, so a wake that re-armed
-//! the execution in the meantime, a node re-registration, or a snapshot that
-//! became ready all refuse it. Once the sandbox is `failed`, wakes answer
-//! with the terminal-lifecycle rejection instead of re-running recovery, and
-//! the node row stops being pinned for `orphaned_nodes`.
+//! A gone source node first tries to roll the sandbox back. A `started`
+//! row keeps the marker of the suspend it last woke from, and that suspend
+//! is usually still in object storage: only the writes since the wake lived
+//! on the dead node. When that copy is `ready`, stored, and no newer full
+//! snapshot other than a `failed` one exists
+//! ([`pplx_space_sandbox_portability::rollback_marker_suspend_backup_exists`]),
+//! the sandbox goes back to `suspended`, unplaced, with the marker kept, so
+//! the next wake restores that snapshot from object storage. The rollback
+//! retires the execution like the drain's pod-less revert does, emits
+//! `sandbox_lost` with `to_state:suspended`, and logs the window of activity
+//! that was lost. Without such a copy the sandbox flips to `failed`, the
+//! execution is retired, and `sandbox_lost` and `sandbox_failed` are emitted.
+//! Either flip re-checks every scan condition under the sandbox row lock, so
+//! a wake that re-armed the execution in the meantime, a node
+//! re-registration, or a snapshot that became ready all refuse it. Once the
+//! sandbox is `suspended`, the next wake runs an ordinary remote restore;
+//! once it is `failed`, wakes answer with the terminal-lifecycle rejection
+//! instead of re-running recovery. Either way the node row stops being pinned
+//! for `orphaned_nodes`.
 //!
 //! ## Gating
 //!
@@ -168,6 +180,19 @@ impl SourceNode {
     }
 }
 
+/// What [`LostStartedSink::mark_lost`] did with a candidate whose source
+/// node is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostDisposition {
+    /// A guard refused; the row is unchanged.
+    Refused,
+    /// Reverted to `suspended` on the durable copy of the suspend it last
+    /// woke from. Activity after that snapshot died with the node.
+    RolledBack(pplx_space_sandbox_store::lost::LostStartedRollback),
+    /// Flipped to `failed`: no durable copy of the sandbox survives.
+    Failed,
+}
+
 pub trait LostStartedSink: Send + Sync + 'static {
     /// Up to `limit` candidates with `sandboxes.id > after`, ordered by id.
     fn list_candidates(
@@ -176,21 +201,30 @@ pub trait LostStartedSink: Send + Sync + 'static {
         after: Option<SandboxId>,
     ) -> impl std::future::Future<Output = Result<Vec<LostCandidate>, sqlx::Error>> + Send;
 
-    /// Flip the candidate to `failed`, once the tick established its source
-    /// node is gone, if every scan condition still holds and the node is still
-    /// gone the way `candidate.source_node` describes: no row for
-    /// [`SourceNode::RowDeleted`], or the scanned uid outside any drain for
-    /// [`SourceNode::Registered`]. `Ok(false)` means a guard refused.
+    /// Give up on the candidate's running state, once the tick established
+    /// its source node is gone, if every scan condition still holds and the
+    /// node is still gone the way `candidate.source_node` describes: no row
+    /// for [`SourceNode::RowDeleted`], or the scanned uid outside any drain
+    /// for [`SourceNode::Registered`].
+    ///
+    /// When the suspend the sandbox last woke from still has a durable copy,
+    /// the sandbox is rolled back to `suspended` on it
+    /// ([`LostDisposition::RolledBack`]); otherwise it is flipped to `failed`
+    /// ([`LostDisposition::Failed`]). [`LostDisposition::Refused`] means a
+    /// guard refused.
     fn mark_lost(
         &self,
         candidate: &LostCandidate,
-    ) -> impl std::future::Future<Output = Result<bool, sqlx::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<LostDisposition, sqlx::Error>> + Send;
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TickReport {
     pub scanned: u32,
+    /// Flipped to `failed`.
     pub marked_lost: u32,
+    /// Rolled back to `suspended` on their last durable suspend snapshot.
+    pub rolled_back: u32,
     pub source_live: u32,
     pub unverifiable: u32,
     pub lookup_errors: u32,
@@ -280,7 +314,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
         for candidate in candidates {
             // Checked before the lookup, so a capped tick spends no EC2 calls
             // on candidates it can't act on.
-            if report.marked_lost >= self.config.max_lost_per_tick {
+            if report.marked_lost + report.rolled_back >= self.config.max_lost_per_tick {
                 report.rate_limited += 1;
                 continue;
             }
@@ -294,7 +328,41 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                 .await;
             let (outcome, reason) = match verdict {
                 CachedVerdict::Gone => match self.sink.mark_lost(&candidate).await {
-                    Ok(true) => {
+                    Ok(LostDisposition::RolledBack(rollback)) => {
+                        report.rolled_back += 1;
+                        let lost_window_secs = rollback.last_activity_at.map(|last| {
+                            (last - rollback.snapshot_timestamp)
+                                .whole_seconds()
+                                .max(0)
+                                .unsigned_abs()
+                        });
+                        let snapshot_age_secs = (time::OffsetDateTime::now_utc()
+                            - rollback.snapshot_timestamp)
+                            .whole_seconds()
+                            .max(0)
+                            .unsigned_abs();
+                        OutcomeEvent::stale_restore_after_node_loss(
+                            lost_window_secs,
+                            snapshot_age_secs,
+                        );
+                        OutcomeEvent::lost_started_sandbox(
+                            LostStartedOutcome::RolledBackSourceNodeGone,
+                        )
+                        .age_secs(snapshot_age_secs)
+                        .detail(format!(
+                            "restore_mode=stale_after_node_loss snapshot_timestamp={} \
+                             lost_window_secs={}",
+                            rollback.snapshot_timestamp,
+                            lost_window_secs.map_or_else(|| "unknown".to_string(), |s| s.to_string()),
+                        ))
+                        .reason(candidate.source_node.gone_reason())
+                        .sandbox_id(candidate.sandbox_id)
+                        .generation(candidate.generation)
+                        .node(candidate.source_node_id.to_string())
+                        .warn();
+                        continue;
+                    }
+                    Ok(LostDisposition::Failed) => {
                         report.marked_lost += 1;
                         OutcomeEvent::lost_started_sandbox(
                             LostStartedOutcome::GaveUpSourceNodeGone,
@@ -306,7 +374,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                         .warn();
                         continue;
                     }
-                    Ok(false) => {
+                    Ok(LostDisposition::Refused) => {
                         report.cas_lost += 1;
                         (LostStartedOutcome::CasLost, None)
                     }

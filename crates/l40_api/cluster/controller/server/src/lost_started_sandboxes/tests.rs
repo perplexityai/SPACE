@@ -17,6 +17,7 @@
 //! - T10 `t10_failed_direct_node_lookup_defers`
 //! - T11 `t11_run_stops_mid_tick_when_cancelled`
 //! - T12 `t12_absence_must_last_the_grace_and_restarts_on_return`
+//! - T13 `t13_rollbacks_are_counted_and_share_the_cap`
 //!
 //! ## P - Postgres-backed sink
 //! - P1 `p1_stale_snapshot_and_terminated_source_ends_lost`
@@ -30,6 +31,10 @@
 //! - P9 `p9_only_recovery_failed_started_kubernetes_rows_are_listed`
 //! - P10 `p10_flip_rechecks_restore_sources_and_generation`
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
+//! - P12 `p12_durable_marker_suspend_rolls_back_to_suspended`
+//! - P13 `p13_newer_live_snapshot_refuses_the_rollback_but_a_dead_upload_does_not`
+//! - P14 `p14_marker_without_a_durable_copy_ends_lost`
+//! - P15 `p15_rollback_needs_proof_the_source_node_is_gone`
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -171,7 +176,7 @@ struct FakeSinkState {
     list_calls: Vec<Option<SandboxId>>,
     mark_calls: Vec<SandboxId>,
     /// `None` means the flip errors.
-    mark_result: Option<bool>,
+    mark_result: Option<LostDisposition>,
 }
 
 struct FakeSink(StdMutex<FakeSinkState>);
@@ -180,7 +185,7 @@ impl FakeSink {
     fn new(pages: Vec<Vec<LostCandidate>>) -> Arc<Self> {
         Arc::new(Self(StdMutex::new(FakeSinkState {
             pages,
-            mark_result: Some(true),
+            mark_result: Some(LostDisposition::Failed),
             ..FakeSinkState::default()
         })))
     }
@@ -204,7 +209,7 @@ impl LostStartedSink for Arc<FakeSink> {
         Ok(state.pages.remove(0))
     }
 
-    async fn mark_lost(&self, candidate: &LostCandidate) -> Result<bool, sqlx::Error> {
+    async fn mark_lost(&self, candidate: &LostCandidate) -> Result<LostDisposition, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
         state.mark_calls.push(candidate.sandbox_id);
         state.mark_result.ok_or(sqlx::Error::PoolTimedOut)
@@ -349,7 +354,7 @@ async fn t5_refused_and_failed_flips_are_counted() {
     let lookup = Arc::new(FakeLookup::default());
 
     let refused = FakeSink::new(vec![vec![candidate(SourceNode::RowDeleted)]]);
-    refused.0.lock().unwrap().mark_result = Some(false);
+    refused.0.lock().unwrap().mark_result = Some(LostDisposition::Refused);
     let report = Reconciler::new(config(), refused.clone(), lookup.clone(), presence())
         .tick()
         .await;
@@ -471,7 +476,7 @@ impl LostStartedSink for HangingSink {
         std::future::pending().await
     }
 
-    async fn mark_lost(&self, _candidate: &LostCandidate) -> Result<bool, sqlx::Error> {
+    async fn mark_lost(&self, _candidate: &LostCandidate) -> Result<LostDisposition, sqlx::Error> {
         unreachable!("the scan never returns")
     }
 }
@@ -537,6 +542,32 @@ async fn t12_absence_must_last_the_grace_and_restarts_on_return() {
     assert_eq!(report.marked_lost, 1);
     assert_eq!(lookup.calls(), vec!["dead".to_string()]);
     assert_eq!(sink.mark_calls(), vec![stuck.sandbox_id]);
+}
+
+#[tokio::test]
+async fn t13_rollbacks_are_counted_and_share_the_cap() {
+    let sink = FakeSink::new(vec![
+        (0..3).map(|_| candidate(SourceNode::RowDeleted)).collect(),
+    ]);
+    sink.0.lock().unwrap().mark_result = Some(LostDisposition::RolledBack(
+        pplx_space_sandbox_store::lost::LostStartedRollback {
+            snapshot_timestamp: time::OffsetDateTime::UNIX_EPOCH,
+            last_activity_at: None,
+        },
+    ));
+    let lookup = Arc::new(FakeLookup::default());
+    let config = ReconcilerConfig {
+        max_lost_per_tick: 2,
+        ..config()
+    };
+
+    let report = Reconciler::new(config, sink.clone(), lookup.clone(), presence())
+        .tick()
+        .await;
+
+    assert_eq!((report.rolled_back, report.marked_lost), (2, 0));
+    assert_eq!(report.rate_limited, 1);
+    assert_eq!(sink.mark_calls().len(), 2);
 }
 
 // -----------------------------------------------------------------
@@ -774,7 +805,7 @@ mod postgres_backed {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source_node, SourceNode::RowDeleted);
 
-        assert!(store.mark_lost(&candidates[0]).await?);
+        assert_eq!(store.mark_lost(&candidates[0]).await?, LostDisposition::Failed);
         assert_eq!(
             sandbox_state(&db.pool, seeded.sandbox_id).await?,
             ("failed".to_string(), None, 0)
@@ -860,7 +891,7 @@ mod postgres_backed {
         .await?;
         let candidates = listed(&store).await?;
         assert_eq!(candidates.len(), 1);
-        assert!(store.mark_lost(&candidates[0]).await?);
+        assert_eq!(store.mark_lost(&candidates[0]).await?, LostDisposition::Failed);
         let state: String = sqlx::query_scalar(sql!("SELECT state FROM snapshots WHERE id = $1"))
             .bind(dead)
             .fetch_one(&db.pool)
@@ -887,7 +918,7 @@ mod postgres_backed {
         .execute(&db.pool)
         .await?;
 
-        assert!(!store.mark_lost(&candidate).await?);
+        assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Refused);
         assert_eq!(
             sandbox_state(&db.pool, seeded.sandbox_id).await?.0,
             "started"
@@ -912,14 +943,14 @@ mod postgres_backed {
         .execute(&db.pool)
         .await?;
 
-        assert!(!store.mark_lost(&candidate).await?);
+        assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Refused);
 
         // And a node row that reappeared refuses a deleted-row candidate.
         let deleted_row = LostCandidate {
             source_node: SourceNode::RowDeleted,
             ..candidate.clone()
         };
-        assert!(!store.mark_lost(&deleted_row).await?);
+        assert_eq!(store.mark_lost(&deleted_row).await?, LostDisposition::Refused);
         assert_eq!(
             sandbox_state(&db.pool, seeded.sandbox_id).await?.0,
             "started"
@@ -961,8 +992,9 @@ mod postgres_backed {
             ("creating", "1 day", None),
         ] {
             let snapshot = insert_snapshot(&db.pool, seeded.sandbox_id, state, age, source).await?;
-            assert!(
-                !store.mark_lost(&candidate).await?,
+            assert_eq!(
+                store.mark_lost(&candidate).await?,
+                LostDisposition::Refused,
                 "{state} snapshot aged {age} from {source:?} must refuse the flip"
             );
             sqlx::query(sql!(
@@ -1001,7 +1033,7 @@ mod postgres_backed {
             .bind(seeded.sandbox_id)
             .execute(&db.pool)
             .await?;
-            assert!(!store.mark_lost(&candidate).await?, "{pod_column}");
+            assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Refused, "{pod_column}");
             assert!(listed(&store).await?.is_empty(), "{pod_column}");
             sqlx::query(sql!(
                 "UPDATE sandbox_k8s_executions
@@ -1021,12 +1053,12 @@ mod postgres_backed {
         .execute(&db.pool)
         .await?;
         insert_failed_recovery(&db.pool, seeded.sandbox_id, 8).await?;
-        assert!(!store.mark_lost(&candidate).await?);
+        assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Refused);
 
         // The rescanned candidate carries the new generation and flips.
         let rescanned = listed(&store).await?.remove(0);
         assert_eq!(rescanned.generation, 8);
-        assert!(store.mark_lost(&rescanned).await?);
+        assert_eq!(store.mark_lost(&rescanned).await?, LostDisposition::Failed);
         assert_eq!(
             sandbox_state(&db.pool, seeded.sandbox_id).await?,
             ("failed".to_string(), None, 0)
@@ -1075,14 +1107,14 @@ mod postgres_backed {
                 .bind(seeded.sandbox_id)
                 .execute(&db.pool)
                 .await?;
-            assert!(!store.mark_lost(&candidate).await?, "{change}");
+            assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Refused, "{change}");
             sqlx::query(sqlx::AssertSqlSafe(undo))
                 .bind(seeded.sandbox_id)
                 .execute(&db.pool)
                 .await?;
         }
 
-        assert!(store.mark_lost(&candidate).await?);
+        assert_eq!(store.mark_lost(&candidate).await?, LostDisposition::Failed);
         Ok(())
     }
 
@@ -1120,6 +1152,200 @@ mod postgres_backed {
                 .await?;
         }
         assert_eq!(listed(&store).await?.len(), 1);
+        Ok(())
+    }
+
+    /// Point the sandbox's marker at its newest snapshot, the shape a
+    /// `started` row has after it woke from that suspend.
+    async fn mark_newest_snapshot_current(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
+        sqlx::query(sql!(
+            "UPDATE sandboxes s
+                SET current_local_artifact_id = sn.local_artifact_id,
+                    current_local_artifact_kind = sn.artifact_kind,
+                    current_local_artifact_origin = 'suspend'
+               FROM (SELECT local_artifact_id, artifact_kind
+                       FROM snapshots
+                      WHERE sandbox_id = $1
+                      ORDER BY timestamp DESC
+                      LIMIT 1) sn
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn rollback_state(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+    ) -> TestResult<(String, String, Option<NodeId>, Option<NodeId>, bool)> {
+        Ok(sqlx::query_as(sql!(
+            "SELECT lifecycle, placement, active_node_id, target_node_id,
+                    current_local_artifact_id IS NOT NULL
+               FROM sandboxes
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p12_durable_marker_suspend_rolls_back_to_suspended() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        // The stuck shape, but the stale ready snapshot is the suspend the
+        // sandbox woke from: the node took an hour of activity with it, and
+        // everything before that is still in object storage.
+        let seeded = seed_stuck(&db.pool, true).await?;
+        mark_newest_snapshot_current(&db.pool, seeded.sandbox_id).await?;
+        let store = LostStartedDbStore::new(db.pool.clone());
+        let lookup = Arc::new(FakeLookup::default());
+
+        let report = Reconciler::new(config(), store, lookup.clone(), presence())
+            .tick()
+            .await;
+
+        assert_eq!((report.rolled_back, report.marked_lost), (1, 0));
+        assert_eq!(
+            rollback_state(&db.pool, seeded.sandbox_id).await?,
+            (
+                "suspended".to_string(),
+                "unplaced".to_string(),
+                None,
+                None,
+                true
+            ),
+            "suspended and unplaced, with the marker kept for the next restore"
+        );
+        let (state, active, terminated): (String, bool, bool) = sqlx::query_as(sql!(
+            "SELECT state, active, terminated_at IS NOT NULL
+               FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND generation = 7"
+        ))
+        .bind(seeded.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            (state.as_str(), active, terminated),
+            ("suspended", false, true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p15_rollback_needs_proof_the_source_node_is_gone() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        // A row the rollback would accept, on a node the lookup reports live,
+        // then on one whose lookup fails: neither is proof the node's newer
+        // local state is gone, so neither may roll back.
+        let seeded = seed_stuck(&db.pool, true).await?;
+        mark_newest_snapshot_current(&db.pool, seeded.sandbox_id).await?;
+        for lookup in [
+            FakeLookup::default().live(NODE_NAME),
+            FakeLookup::default().with(NODE_NAME, Err("throttled".to_string())),
+        ] {
+            let store = LostStartedDbStore::new(db.pool.clone());
+            let report = Reconciler::new(config(), store, Arc::new(lookup), presence())
+                .tick()
+                .await;
+
+            assert_eq!((report.rolled_back, report.marked_lost), (0, 0));
+            assert_eq!(
+                sandbox_state(&db.pool, seeded.sandbox_id).await?,
+                ("started".to_string(), Some(seeded.node_id), 1),
+                "an unproven node loss leaves the sandbox started and retryable"
+            );
+        }
+        // A draining (cordoned) node isn't gone either: the scan skips it.
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_phase = 'draining' WHERE id = $1"
+        ))
+        .bind(seeded.node_id)
+        .execute(&db.pool)
+        .await?;
+        let store = LostStartedDbStore::new(db.pool.clone());
+        assert!(listed(&store).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p13_newer_live_snapshot_refuses_the_rollback_but_a_dead_upload_does_not()
+    -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+
+        // A dead upload from the gone node, quiet past the settle window and
+        // newer than the marker, is failed first and doesn't block.
+        let dead_upload = seed_stuck(&db.pool, true).await?;
+        mark_newest_snapshot_current(&db.pool, dead_upload.sandbox_id).await?;
+        insert_snapshot(
+            &db.pool,
+            dead_upload.sandbox_id,
+            "creating",
+            "90 minutes",
+            Some(dead_upload.node_id),
+        )
+        .await?;
+        let store = LostStartedDbStore::new(db.pool.clone());
+        let candidate = listed(&store)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.sandbox_id == dead_upload.sandbox_id)
+            .expect("the dead upload doesn't hide the candidate");
+        assert!(matches!(
+            store.mark_lost(&candidate).await?,
+            LostDisposition::RolledBack(_)
+        ));
+
+        // A newer ready snapshot that still predates the activity names
+        // bytes newer than the marker; the rollback must not skip over them,
+        // so the give-up falls back to failing the sandbox.
+        let newer_ready = seed_stuck(&db.pool, false).await?;
+        mark_newest_snapshot_current(&db.pool, newer_ready.sandbox_id).await?;
+        insert_snapshot(&db.pool, newer_ready.sandbox_id, "ready", "90 minutes", None).await?;
+        let candidate = listed(&store)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.sandbox_id == newer_ready.sandbox_id)
+            .expect("listed");
+        assert_eq!(
+            store.mark_lost(&candidate).await?,
+            LostDisposition::Failed
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p14_marker_without_a_durable_copy_ends_lost() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let seeded = seed_stuck(&db.pool, false).await?;
+        mark_newest_snapshot_current(&db.pool, seeded.sandbox_id).await?;
+        sqlx::query(sql!(
+            "UPDATE snapshot_storage_locations SET orphaned_at = NOW()
+              WHERE snapshot_id IN (SELECT id FROM snapshots WHERE sandbox_id = $1)"
+        ))
+        .bind(seeded.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        let store = LostStartedDbStore::new(db.pool.clone());
+        let candidate = listed(&store).await?.remove(0);
+
+        assert_eq!(
+            store.mark_lost(&candidate).await?,
+            LostDisposition::Failed
+        );
+        assert_eq!(
+            sandbox_state(&db.pool, seeded.sandbox_id).await?,
+            ("failed".to_string(), None, 0)
+        );
         Ok(())
     }
 }

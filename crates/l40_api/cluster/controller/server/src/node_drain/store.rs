@@ -3356,6 +3356,7 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::FailedPrecondition { message }
                 | SubstrateError::Timeout { message, .. }
                 | SubstrateError::RestoreContextUnavailable { message }
+                | SubstrateError::RestoreAwaitingSourceNodeLoss { message }
                 | SubstrateError::RestoreSourcePending { message }
                 | SubstrateError::RestoreInFlight { message, .. }
                 | SubstrateError::SuspendInFlight { message }
@@ -5272,6 +5273,7 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
 mod pod_less_giveup;
 #[cfg(test)]
 pub(crate) use pod_less_giveup::PodLessHold;
+pub(crate) use pod_less_giveup::retire_reverted_resident;
 pub use pod_less_giveup::PodLessRecovery;
 
 #[cfg(test)]

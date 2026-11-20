@@ -337,6 +337,10 @@ pub enum ReconnectReason {
     /// Recovery has no verified state to materialize. Emitted with
     /// `outcome:wake_failed`; increasing the request budget cannot fix it.
     RestoreContextUnavailable,
+    /// Recovery's only durable copy predates the sandbox's last activity and
+    /// waits for the source node to be proven gone before rolling back to it.
+    /// Emitted with `outcome:wake_in_progress`.
+    RestoreAwaitingSourceNodeLoss,
     WaitBudget,
     PodNeverReady,
     ProxyUnreachable,
@@ -362,6 +366,7 @@ impl ReconnectReason {
             Self::NoWakeNeeded => "no_wake_needed",
             Self::RestoreInFlight => "restore_in_flight",
             Self::RestoreContextUnavailable => "restore_context_unavailable",
+            Self::RestoreAwaitingSourceNodeLoss => "restore_awaiting_source_node_loss",
             Self::WaitBudget => "wait_budget",
             Self::PodNeverReady => "pod_never_ready",
             Self::ProxyUnreachable => "proxy_unreachable",

@@ -78,12 +78,9 @@ impl KubernetesSubstrate {
                 ..
             }) => None,
             StartedRecoveryRestoreContext::Unavailable => {
-                return Err(SubstrateError::RestoreContextUnavailable {
-                    message: format!(
-                        "sandbox {sandbox_id} generation {generation} has no verified local or \
-                         remote restore source; leaving the execution unchanged"
-                    ),
-                });
+                return Err(self
+                    .started_recovery_unavailable_error(sandbox_id, generation)
+                    .await);
             }
         };
 
@@ -109,6 +106,47 @@ impl KubernetesSubstrate {
                 })
             }
             StartedRecoveryReplacement::OwnershipLost => Ok(None),
+        }
+    }
+
+    /// The error for a recovery with no verified restore source. Only a
+    /// sandbox with no durable copy at all gets the terminal-looking
+    /// `RestoreContextUnavailable`; one whose source is still publishing, or
+    /// whose only copy is a stale suspend that the cluster controller may roll
+    /// back to once the source node is proven gone, gets a retryable answer.
+    async fn started_recovery_unavailable_error(
+        &self,
+        sandbox_id: SandboxId,
+        generation: ExecutionGeneration,
+    ) -> SubstrateError {
+        match self
+            .store
+            .started_recovery_unavailable_cause(sandbox_id)
+            .await
+        {
+            Ok(StartedRecoveryUnavailableCause::SourcePublishing) => {
+                SubstrateError::restore_source_pending(sandbox_id)
+            }
+            Ok(StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss) => {
+                SubstrateError::RestoreAwaitingSourceNodeLoss {
+                    message: format!(
+                        "sandbox {sandbox_id} generation {generation}: the only durable restore \
+                         source predates the sandbox's last activity; waiting until the source \
+                         node is confirmed gone before rolling back to it"
+                    ),
+                }
+            }
+            Ok(StartedRecoveryUnavailableCause::NoDurableSource) => {
+                SubstrateError::RestoreContextUnavailable {
+                    message: format!(
+                        "sandbox {sandbox_id} generation {generation} has no verified local or \
+                         remote restore source; leaving the execution unchanged"
+                    ),
+                }
+            }
+            // The classification is advisory. Failing to read it must not turn
+            // a possibly recoverable sandbox into a terminal answer.
+            Err(error) => error,
         }
     }
 

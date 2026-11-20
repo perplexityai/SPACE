@@ -684,6 +684,14 @@ pub enum SubstrateError {
     /// restore evidence. Pending publication uses `RestoreSourcePending`.
     #[error("{message}")]
     RestoreContextUnavailable { message: String },
+    /// Started recovery found no restore source that covers the sandbox's
+    /// last activity, but a verified durable copy of the suspend it last woke
+    /// from exists. Restoring that copy would roll back any writes made since,
+    /// which is only safe once the source node, and its newer local state, is
+    /// proven gone. The cluster controller's lost-started-sandboxes pass makes
+    /// that call and rolls the sandbox back; until then callers should retry.
+    #[error("{message}")]
+    RestoreAwaitingSourceNodeLoss { message: String },
     /// Started recovery found current local suspend state, but it cannot yet
     /// restore from the source node or durable storage.
     #[error("{message}")]
@@ -1006,7 +1014,8 @@ impl From<SubstrateError> for ControllerError {
                 // execution, without any work that can satisfy the request.
                 ControllerError::restore_context_unavailable(message)
             }
-            SubstrateError::RestoreSourcePending { message } => {
+            SubstrateError::RestoreSourcePending { message }
+            | SubstrateError::RestoreAwaitingSourceNodeLoss { message } => {
                 ControllerError::service_unavailable(message)
                     .with_retry_after(GATEWAY_RETRY_AFTER)
                     .with_retry_after_cause(ControllerRetryAfterCause::RestoreInFlight)

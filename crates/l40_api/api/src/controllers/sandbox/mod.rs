@@ -625,6 +625,11 @@ fn reconnect_error_outcome(
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::RestoreContextUnavailable,
         ),
+        SubstrateError::RestoreAwaitingSourceNodeLoss { .. } => (
+            ReconnectOutcome::WakeInProgress,
+            ReconnectTerminalPhase::Restore,
+            ReconnectReason::RestoreAwaitingSourceNodeLoss,
+        ),
         SubstrateError::Timeout { .. } => {
             let (phase, reason) = reconnect_timeout_phase_and_reason(initial_lifecycle, err);
             (ReconnectOutcome::Exhausted, phase, reason)

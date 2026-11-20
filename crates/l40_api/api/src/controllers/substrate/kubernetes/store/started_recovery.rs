@@ -270,6 +270,68 @@ impl K8sStore {
         }
     }
 
+    /// Classify an [`StartedRecoveryRestoreContext::Unavailable`] answer, so
+    /// a sandbox that can still come back gets a retryable answer instead of
+    /// the terminal-looking `RestoreContextUnavailable`.
+    ///
+    /// Mirrors what the cluster controller's `lost_started_sandboxes` loop
+    /// decides on, so the API and the loop can't disagree about a row:
+    ///
+    /// - a `creating` full snapshot that may still finalize, the upload half
+    ///   of `started_restore_source_absent` (the auto-suspend race: the node
+    ///   suspended and is uploading, the API has not seen the marker yet).
+    ///   The loop leaves such a row alone, so the API answers pending.
+    ///   The other half, a ready snapshot that covers the activity clocks but
+    ///   doesn't match the marker, isn't treated as pending: nothing would
+    ///   make it match later, so it keeps today's answer.
+    /// - otherwise [`rollback_marker_suspend_backup_exists`] true: the loop
+    ///   rolls the row back to that snapshot once the source node is proven
+    ///   gone. Until then the API answers retryable, but still records the
+    ///   recovery as failed, because the loop only acts on a
+    ///   `recovery_failed` execution.
+    ///
+    /// The settle window for a `creating` upload from the sandbox's own node
+    /// is the loop's ([`pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE`]).
+    pub(in crate::controllers::substrate::kubernetes) async fn started_recovery_unavailable_cause(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<StartedRecoveryUnavailableCause, SubstrateError> {
+        let rollback_source = rollback_marker_suspend_backup_exists("s");
+        // Same clause as the upload half of `started_restore_source_absent`.
+        let query = format!(
+            "SELECT EXISTS (
+                        SELECT 1
+                          FROM snapshots sn
+                         WHERE sn.sandbox_id = s.id
+                           AND sn.type = 'full'
+                           AND sn.state = 'creating'
+                           AND (
+                               sn.source_node_id IS DISTINCT FROM s.active_node_id
+                               OR COALESCE(sn.last_attempt_at, sn.timestamp)
+                                  >= NOW() - make_interval(secs => $2::BIGINT)
+                           )
+                    ) AS publishing,
+                    {rollback_source} AS stale_rollback_source
+               FROM sandboxes s
+              WHERE s.id = $1"
+        );
+        let row = sqlx::query_as::<_, (bool, bool)>(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(sandbox_id.as_uuid())
+            .bind(
+                pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
+                    .as_secs()
+                    .cast_signed(),
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .db_context("failed to classify unavailable started recovery source")?;
+        Ok(match row {
+            Some((true, _)) => StartedRecoveryUnavailableCause::SourcePublishing,
+            Some((false, true)) => StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss,
+            Some((false, false)) | None => StartedRecoveryUnavailableCause::NoDurableSource,
+        })
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn replace_started_recovery_execution(
         &self,
         sandbox_id: SandboxId,

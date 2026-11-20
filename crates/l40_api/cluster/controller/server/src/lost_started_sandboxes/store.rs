@@ -7,17 +7,22 @@ use pplx_space_snapshot_model::SnapshotId;
 
 use std::sync::LazyLock;
 
-use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
+use pplx_space_events::{
+    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+    SandboxRestoreProvenance,
+};
 use pplx_space_sandbox_portability::started_restore_source_absent;
 use pplx_space_sandbox_store::lost::{
-    DEAD_UPLOAD_SETTLE, mark_started_lost, write_off_lost_sandboxes,
+    DEAD_UPLOAD_SETTLE, LostStartedRollback, mark_started_lost, roll_back_started_to_suspend,
+    write_off_lost_sandboxes,
 };
 use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use super::{LostCandidate, LostStartedSink, SourceNode};
+use super::{LostCandidate, LostDisposition, LostStartedSink, SourceNode};
 use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
+use crate::node_drain::store::retire_reverted_resident;
 
 type CandidateRow = (SandboxId, i64, NodeId, bool, Option<String>, Option<String>);
 
@@ -113,7 +118,7 @@ impl LostStartedSink for LostStartedDbStore {
             .collect())
     }
 
-    async fn mark_lost(&self, candidate: &LostCandidate) -> Result<bool, sqlx::Error> {
+    async fn mark_lost(&self, candidate: &LostCandidate) -> Result<LostDisposition, sqlx::Error> {
         let node_id = candidate.source_node_id;
         let mut tx = self.pool.begin().await?;
 
@@ -147,7 +152,7 @@ impl LostStartedSink for LostStartedDbStore {
         };
         if !gone {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(LostDisposition::Refused);
         }
 
         // Started recovery's claim takes the sandbox row lock before it re-arms
@@ -162,7 +167,7 @@ impl LostStartedSink for LostStartedDbStore {
         .await?;
         if locked.as_deref() != Some("started") {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(LostDisposition::Refused);
         }
 
         // Lock the sandbox's in-flight uploads before the flip evaluates its
@@ -186,6 +191,49 @@ impl LostStartedSink for LostStartedDbStore {
         .fetch_all(&mut *tx)
         .await?;
 
+        // Fail the gone node's dead uploads before either flip reads the
+        // snapshots. Their worker died with the instance, so a row quiet for
+        // the settle window can't finalize; failing it first keeps it from
+        // blocking the rollback below, which refuses any newer full snapshot
+        // that isn't `failed`. Rows still inside the window are untouched
+        // and keep vetoing both flips. A transaction that flips nothing rolls
+        // this back with everything else.
+        fail_quiet_full_uploads_from_node(
+            &mut tx,
+            node_id,
+            &[candidate.sandbox_id],
+            DEAD_UPLOAD_SETTLE,
+        )
+        .await?;
+
+        // Prefer the rollback. The writes since the sandbox last woke died
+        // with the node, but the suspend it woke from is usually still in
+        // object storage. Reverting to `suspended` on that copy keeps
+        // everything up to the suspend; failing the sandbox would throw it
+        // away too.
+        if let Some(rollback) = roll_back_started_to_suspend(
+            &mut tx,
+            candidate.sandbox_id,
+            node_id,
+            candidate.generation,
+            DEAD_UPLOAD_SETTLE,
+        )
+        .await?
+        {
+            sqlx::query(sql!(
+                "DELETE FROM node_local_backup_pending
+                  WHERE node_id = $1 AND sandbox_id = $2"
+            ))
+            .bind(node_id)
+            .bind(candidate.sandbox_id)
+            .execute(&mut *tx)
+            .await?;
+            retire_reverted_resident(&mut tx, candidate.sandbox_id).await?;
+            tx.commit().await?;
+            emit_rolled_back(candidate, rollback);
+            return Ok(LostDisposition::RolledBack(rollback));
+        }
+
         if !mark_started_lost(
             &mut tx,
             candidate.sandbox_id,
@@ -196,15 +244,8 @@ impl LostStartedSink for LostStartedDbStore {
         .await?
         {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(LostDisposition::Refused);
         }
-        fail_quiet_full_uploads_from_node(
-            &mut tx,
-            node_id,
-            &[candidate.sandbox_id],
-            DEAD_UPLOAD_SETTLE,
-        )
-        .await?;
         write_off_lost_sandboxes(&mut tx, node_id, &[candidate.sandbox_id]).await?;
         tx.commit().await?;
 
@@ -216,6 +257,43 @@ impl LostStartedSink for LostStartedDbStore {
             .reason(candidate.source_node.gone_reason())
             .trigger(SandboxEventTrigger::System);
         emit_lost_and_failed(candidate.sandbox_id, details, "lost_started_sandboxes");
-        Ok(true)
+        Ok(LostDisposition::Failed)
     }
+}
+
+/// Record a rollback: the sandbox event that says the sandbox is `suspended`
+/// again, and a warning with the window of activity that died with the node,
+/// so the loss is visible per sandbox rather than only as a count.
+fn emit_rolled_back(candidate: &LostCandidate, rollback: LostStartedRollback) {
+    let lost_window_secs = rollback
+        .last_activity_at
+        .map(|last| (last - rollback.snapshot_timestamp).whole_seconds().max(0));
+    tracing::warn!(
+        sandbox_id = %candidate.sandbox_id,
+        source_node_id = %candidate.source_node_id,
+        generation = candidate.generation,
+        reason = candidate.source_node.gone_reason(),
+        snapshot_timestamp = %rollback.snapshot_timestamp,
+        last_activity_at = ?rollback.last_activity_at,
+        lost_window_secs = ?lost_window_secs,
+        "lost_started_sandboxes: source node gone; rolled the sandbox back to its last \
+         durable suspend snapshot"
+    );
+    let details = SandboxEventDetails::default()
+        .with_from_state("started")
+        .with_to_state("suspended")
+        .source_node_id(candidate.source_node_id.to_string())
+        .execution_generation(candidate.generation.to_string())
+        .reason(candidate.source_node.gone_reason())
+        .operation("lost_started_sandboxes_rollback")
+        .restore_provenance(SandboxRestoreProvenance::StaleAfterNodeLoss)
+        .trigger(SandboxEventTrigger::System);
+    // `sandbox_lost`, not a suspend event: the running state was lost, and
+    // the sandbox lands in `suspended` only because its last suspend survives.
+    SandboxEvent::new(
+        candidate.sandbox_id,
+        SandboxEventType::SandboxLost,
+        SandboxEventSource::ClusterController,
+    )
+    .emit_with(details);
 }

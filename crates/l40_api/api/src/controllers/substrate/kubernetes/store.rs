@@ -30,7 +30,7 @@ use pplx_space_sandbox_model::{
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
-    snapshot_is_current_local_artifact,
+    rollback_marker_suspend_backup_exists, snapshot_is_current_local_artifact,
 };
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
 use pplx_space_sql_locator::sql;
@@ -465,6 +465,25 @@ pub(super) enum StartedRecoveryRestoreContext {
     Ready(StartedRecoveryRestoreSource),
     Pending,
     Unavailable,
+}
+
+/// Why started recovery found no restore source, when the sandbox might
+/// still come back. Read only after
+/// [`K8sStore::started_recovery_restore_context`] answered
+/// [`StartedRecoveryRestoreContext::Unavailable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartedRecoveryUnavailableCause {
+    /// A full snapshot is still uploading: the source is being published.
+    /// Retry; nothing is wrong.
+    SourcePublishing,
+    /// The only durable copy is the suspend the sandbox last woke from, and
+    /// it predates the last command or access. Restoring it now could roll
+    /// back writes that still exist on the source node, so recovery waits for
+    /// the cluster controller to prove that node gone; it then rolls the
+    /// sandbox back to that snapshot. Retry.
+    StaleSourceAwaitingNodeLoss,
+    /// No durable copy of the sandbox exists.
+    NoDurableSource,
 }
 
 #[derive(Debug)]

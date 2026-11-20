@@ -501,6 +501,107 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
         context,
         StartedRecoveryRestoreContext::Unavailable
     ));
+    // The stale suspend is never restored here; the API waits, retryably,
+    // for the cluster controller to prove the source node gone.
+    assert_eq!(
+        fixture
+            .store
+            .started_recovery_unavailable_cause(sandbox_id)
+            .await?,
+        StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss
+    );
+
+    // Act: a newer suspend upload is still in flight.
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, source_node_id, org_id,
+              local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'creating', NOW(), $3,
+                 '00000000-0000-0000-0000-000000000001',
+                 $4, 'full', 'suspend')"
+    ))
+    .bind(SnapshotId::new())
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(Uuid::now_v7())
+    .execute(&fixture.pool)
+    .await?;
+
+    // Assert: still no restore source, but the answer is pending, not a
+    // stale restore and not a terminal 412.
+    assert!(matches!(
+        fixture
+            .store
+            .started_recovery_restore_context(sandbox_id, ExecutionGeneration::new(2)?)
+            .await?,
+        StartedRecoveryRestoreContext::Unavailable
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .started_recovery_unavailable_cause(sandbox_id)
+            .await?,
+        StartedRecoveryUnavailableCause::SourcePublishing
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn started_recovery_without_durable_copy_stays_unavailable() -> TestResult {
+    // Arrange: the marker names a suspend that was never uploaded.
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    let source_node_id = NodeId::new();
+    let artifact_id = Uuid::now_v7();
+    insert_sandbox(
+        &fixture.pool,
+        sandbox_id,
+        SandboxLifecycle::Started.as_str(),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.12', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(source_node_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend',
+                last_command_at = NOW(),
+                last_access_at = NOW()
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, source_node_id, org_id,
+              local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'failed', NOW() - INTERVAL '1 minute', $3,
+                 '00000000-0000-0000-0000-000000000001',
+                 $4, 'full', 'suspend')"
+    ))
+    .bind(SnapshotId::new())
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(artifact_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    // Act.
+    let cause = fixture
+        .store
+        .started_recovery_unavailable_cause(sandbox_id)
+        .await?;
+
+    // Assert.
+    assert_eq!(cause, StartedRecoveryUnavailableCause::NoDurableSource);
     Ok(())
 }
 
