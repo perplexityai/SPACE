@@ -7936,8 +7936,8 @@ mod kubernetes_tests {
     /// so the builder Service stops sending it new builds. Status lookups for
     /// the builds still running there are pinned to its node and must keep
     /// resolving it until the drain ends.
-    #[test]
-    fn pinned_builder_status_lookup_resolves_while_builder_drains() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_builder_status_lookup_resolves_while_builder_drains() {
         let node_name = "space-builder-draining";
         let mut pod = unready_node_api_pod_on_node("space-builder-draining-pod", node_name);
         pod.metadata.labels = Some(BTreeMap::from([(
