@@ -216,6 +216,7 @@ async fn issue(
     }
     // Key share: the node can't be deleted before this commits, and other
     // writers of the row don't wait. Online as the lease verbs judge it.
+    // A node deleted later orphans its assignment and other firewall state.
     let online = sqlx::query_scalar::<_, Option<bool>>(sql!(
         "SELECT nss.reachable AND nss.stale_after > clock_timestamp()
          FROM nodes n
