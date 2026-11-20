@@ -4905,6 +4905,7 @@ dependencies = [
  "pplx-space-build-mgr-client",
  "pplx-space-byok-model",
  "pplx-space-byte-size",
+ "pplx-space-cluster-id",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-grpc",
