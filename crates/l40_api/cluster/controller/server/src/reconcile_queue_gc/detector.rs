@@ -140,6 +140,13 @@ pub trait KubeNodePresence: Send + Sync + 'static {
         &self,
         node_name: String,
     ) -> impl std::future::Future<Output = Result<bool, Self::LookupError>> + Send;
+
+    /// Names of registered Nodes whose `Ready` condition is not `True`, or
+    /// `None` when the reflector can't say. Read only by the stranded-sandbox
+    /// census, never by a destructive decision. Defaults to `None`.
+    fn not_ready_node_names(&self) -> Option<HashSet<String>> {
+        None
+    }
 }
 
 /// Reflector-backed detector: the node is gone when its name has been absent
@@ -298,5 +305,9 @@ impl KubeNodePresence for SubstrateKubeNodePresence {
 
     async fn node_exists(&self, node_name: String) -> Result<bool, Self::LookupError> {
         self.substrate.kube_node_exists(&node_name).await
+    }
+
+    fn not_ready_node_names(&self) -> Option<HashSet<String>> {
+        self.substrate.not_ready_node_names()
     }
 }

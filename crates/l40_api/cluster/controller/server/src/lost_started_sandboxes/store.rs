@@ -8,7 +8,9 @@ use pplx_space_snapshot_model::SnapshotId;
 use std::sync::LazyLock;
 
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
-use pplx_space_sandbox_portability::started_restore_source_absent;
+use pplx_space_sandbox_portability::{
+    snapshot_durable_for_source_release, started_restore_source_absent,
+};
 use pplx_space_sandbox_store::lost::{
     DEAD_UPLOAD_SETTLE, mark_started_lost, write_off_lost_sandboxes,
 };
@@ -16,7 +18,7 @@ use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use super::{LostCandidate, LostStartedSink, SourceNode};
+use super::{LostCandidate, LostStartedSink, NodeResidents, SourceNode, StrandedCounts};
 use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
 
 type CandidateRow = (SandboxId, i64, NodeId, bool, Option<String>, Option<String>);
@@ -67,6 +69,53 @@ static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// `$1` = [`SubstrateKind::Kubernetes`]. The stranded-sandbox census's cheap
+/// first pass: how many non-terminal Kubernetes sandboxes each node outside a
+/// drain still holds as `active_node_id`, including nodes whose row is gone.
+/// Drain phases are excluded because `node_drain` and
+/// `drained_node_terminator` own those residents and report them
+/// (`node_drain.kube_node_gone_parked`).
+const NODE_RESIDENTS: &str = sql!(
+    "SELECT s.active_node_id,
+            n.id IS NOT NULL AS node_row_exists,
+            nk.k8s_node_name,
+            COUNT(*) AS residents
+       FROM sandboxes s
+       LEFT JOIN nodes n ON n.id = s.active_node_id
+       LEFT JOIN node_k8s nk ON nk.node_id = n.id
+      WHERE s.managed_by = $1
+        AND s.active_node_id IS NOT NULL
+        AND s.lifecycle NOT IN ('failed', 'deleting')
+        AND (n.id IS NULL OR (n.managed_by = $1 AND n.drain_phase IS NULL))
+      GROUP BY s.active_node_id, n.id, nk.k8s_node_name"
+);
+
+/// `$1` = [`SubstrateKind::Kubernetes`], `$2` = node id. The census's second
+/// pass, run only for a node it already judged gone, not ready or
+/// unverifiable. A running resident (anything but `suspended`/`stopped`) has
+/// state that lived only on the node. An at-rest one counts only without a
+/// durable copy ([`snapshot_durable_for_source_release`]), since one with a
+/// copy restores from object storage.
+static STRANDED_COUNTS: LazyLock<String> = LazyLock::new(|| {
+    let durable = snapshot_durable_for_source_release("s");
+    sql!(
+        format!(
+            "SELECT COUNT(*) FILTER (
+                        WHERE s.lifecycle NOT IN ('suspended', 'stopped')
+                    ) AS running,
+                    COUNT(*) FILTER (
+                        WHERE s.lifecycle IN ('suspended', 'stopped')
+                          AND NOT {durable}
+                    ) AS at_rest_without_copy
+               FROM sandboxes s
+              WHERE s.managed_by = $1
+                AND s.active_node_id = $2
+                AND s.lifecycle NOT IN ('failed', 'deleting')"
+        )
+        .as_str()
+    )
+});
+
 pub struct LostStartedDbStore {
     pool: PgPool,
 }
@@ -111,6 +160,41 @@ impl LostStartedSink for LostStartedDbStore {
                 },
             )
             .collect())
+    }
+
+    async fn node_residents(&self) -> Result<Vec<NodeResidents>, sqlx::Error> {
+        let rows: Vec<(NodeId, bool, Option<String>, i64)> = sqlx::query_as(NODE_RESIDENTS)
+            .bind(SubstrateKind::Kubernetes)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(node_id, node_row_exists, name, residents)| NodeResidents {
+                node_id,
+                source_node: match (node_row_exists, name) {
+                    (false, _) => SourceNode::RowDeleted,
+                    (true, Some(k8s_node_name)) => SourceNode::Registered {
+                        k8s_node_name,
+                        k8s_node_uid: None,
+                    },
+                    (true, None) => SourceNode::Unverifiable,
+                },
+                residents: residents.unsigned_abs(),
+            })
+            .collect())
+    }
+
+    async fn stranded_counts(&self, node_id: NodeId) -> Result<StrandedCounts, sqlx::Error> {
+        let (running, at_rest_without_copy): (i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(STRANDED_COUNTS.as_str()))
+                .bind(SubstrateKind::Kubernetes)
+                .bind(node_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(StrandedCounts {
+            running: running.unsigned_abs(),
+            at_rest_without_copy: at_rest_without_copy.unsigned_abs(),
+        })
     }
 
     async fn mark_lost(&self, candidate: &LostCandidate) -> Result<bool, sqlx::Error> {

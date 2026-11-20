@@ -3,6 +3,7 @@
 //! ## C - `ReconcilerConfig`
 //! - C1 `c1_default_is_disabled`
 //! - C2 `c2_enabled_env_var_turns_it_on`
+//! - C3 `c3_census_is_on_by_default_and_has_a_kill_switch`
 //!
 //! ## T - Tick behavior (fake sink and lookup)
 //! - T1 `t1_terminated_and_deleted_sources_are_marked_lost`
@@ -18,6 +19,15 @@
 //! - T11 `t11_run_stops_mid_tick_when_cancelled`
 //! - T12 `t12_absence_must_last_the_grace_and_restarts_on_return`
 //!
+//! ## S - Stranded-sandbox census (fake sink and lookup)
+//! - S1 `s1_census_separates_gone_from_unverifiable`
+//! - S2 `s2_live_ready_nodes_and_empty_counts_are_not_reported`
+//! - S3 `s3_not_ready_must_last_the_grace`
+//! - S4 `s4_disabled_give_up_still_runs_the_census_and_flips_nothing`
+//! - S5 `s5_census_lookups_are_capped_per_tick`
+//! - S6 `s6_cold_reflector_skips_the_census`
+//! - S7 `s7_census_reuses_the_give_up_verdict`
+//!
 //! ## P - Postgres-backed sink
 //! - P1 `p1_stale_snapshot_and_terminated_source_ends_lost`
 //! - P2 `p2_live_source_node_stays_retryable`
@@ -30,6 +40,7 @@
 //! - P9 `p9_only_recovery_failed_started_kubernetes_rows_are_listed`
 //! - P10 `p10_flip_rechecks_restore_sources_and_generation`
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
+//! - P12 `p12_census_groups_residents_and_counts_running_ones`
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -99,6 +110,8 @@ impl InstanceLookup for Arc<FakeLookup> {
 /// `existing`.
 struct FakePresence {
     live: StdMutex<Option<HashSet<String>>>,
+    /// Listed names whose `Ready` condition isn't `True`.
+    not_ready: StdMutex<HashSet<String>>,
     existing: HashSet<String>,
     /// Names whose direct GET errors.
     failing: HashSet<String>,
@@ -109,10 +122,16 @@ impl FakePresence {
     fn listing(names: &[&str]) -> Self {
         Self {
             live: StdMutex::new(Some(names.iter().map(|name| (*name).to_string()).collect())),
+            not_ready: StdMutex::new(HashSet::new()),
             existing: HashSet::new(),
             failing: HashSet::new(),
             direct_calls: StdMutex::new(Vec::new()),
         }
+    }
+
+    fn not_ready(self, name: &str) -> Self {
+        self.not_ready.lock().unwrap().insert(name.to_string());
+        self
     }
 
     fn existing(mut self, name: &str) -> Self {
@@ -156,6 +175,14 @@ impl KubeNodePresence for Arc<FakePresence> {
         self.live.lock().unwrap().clone()
     }
 
+    fn not_ready_node_names(&self) -> Option<HashSet<String>> {
+        self.live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|_| self.not_ready.lock().unwrap().clone())
+    }
+
     async fn node_exists(&self, node_name: String) -> Result<bool, FakeNodeLookupError> {
         self.direct_calls.lock().unwrap().push(node_name.clone());
         if self.failing.contains(&node_name) {
@@ -172,6 +199,9 @@ struct FakeSinkState {
     mark_calls: Vec<SandboxId>,
     /// `None` means the flip errors.
     mark_result: Option<bool>,
+    residents: Vec<NodeResidents>,
+    stranded: HashMap<NodeId, StrandedCounts>,
+    count_calls: Vec<NodeId>,
 }
 
 struct FakeSink(StdMutex<FakeSinkState>);
@@ -183,6 +213,25 @@ impl FakeSink {
             mark_result: Some(true),
             ..FakeSinkState::default()
         })))
+    }
+
+    /// One resident row for `node_id`, with `counts` from the second pass.
+    fn with_node(&self, node_id: NodeId, source_node: SourceNode, counts: StrandedCounts) {
+        let mut state = self.0.lock().unwrap();
+        state.residents.push(NodeResidents {
+            node_id,
+            source_node,
+            residents: counts.running + counts.at_rest_without_copy,
+        });
+        state.stranded.insert(node_id, counts);
+    }
+
+    fn count_calls(&self) -> Vec<NodeId> {
+        self.0.lock().unwrap().count_calls.clone()
+    }
+
+    fn list_calls(&self) -> usize {
+        self.0.lock().unwrap().list_calls.len()
     }
 
     fn mark_calls(&self) -> Vec<SandboxId> {
@@ -208,6 +257,16 @@ impl LostStartedSink for Arc<FakeSink> {
         let mut state = self.0.lock().unwrap();
         state.mark_calls.push(candidate.sandbox_id);
         state.mark_result.ok_or(sqlx::Error::PoolTimedOut)
+    }
+
+    async fn node_residents(&self) -> Result<Vec<NodeResidents>, sqlx::Error> {
+        Ok(self.0.lock().unwrap().residents.clone())
+    }
+
+    async fn stranded_counts(&self, node_id: NodeId) -> Result<StrandedCounts, sqlx::Error> {
+        let mut state = self.0.lock().unwrap();
+        state.count_calls.push(node_id);
+        Ok(state.stranded.get(&node_id).copied().unwrap_or_default())
     }
 }
 
@@ -256,6 +315,21 @@ fn c2_enabled_env_var_turns_it_on() {
     let mut env = pplx_space_test_env::TestEnv::default();
     env.set("SPACE_LOST_STARTED_SANDBOXES_ENABLED", "true");
     assert!(ReconcilerConfig::from_environment(&env).enabled);
+}
+
+#[test]
+fn c3_census_is_on_by_default_and_has_a_kill_switch() {
+    let env = pplx_space_test_env::TestEnv::default();
+    let config = ReconcilerConfig::from_environment(&env);
+    assert!(config.census_enabled);
+    assert_eq!(
+        config.max_census_lookups_per_tick,
+        DEFAULT_MAX_CENSUS_LOOKUPS_PER_TICK
+    );
+
+    let mut env = pplx_space_test_env::TestEnv::default();
+    env.set("SPACE_STRANDED_SANDBOX_CENSUS_ENABLED", "false");
+    assert!(!ReconcilerConfig::from_environment(&env).census_enabled);
 }
 
 // -----------------------------------------------------------------
@@ -472,6 +546,14 @@ impl LostStartedSink for HangingSink {
     }
 
     async fn mark_lost(&self, _candidate: &LostCandidate) -> Result<bool, sqlx::Error> {
+        unreachable!("the scan never returns")
+    }
+
+    async fn node_residents(&self) -> Result<Vec<NodeResidents>, sqlx::Error> {
+        unreachable!("the scan never returns")
+    }
+
+    async fn stranded_counts(&self, _node_id: NodeId) -> Result<StrandedCounts, sqlx::Error> {
         unreachable!("the scan never returns")
     }
 }
@@ -945,6 +1027,70 @@ mod postgres_backed {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn p12_census_groups_residents_and_counts_running_ones() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let registered_node = seed_stuck(&db.pool, true).await?;
+        let deleted_row = seed_stuck(&db.pool, false).await?;
+        let store = LostStartedDbStore::new(db.pool.clone());
+
+        let residents = store.node_residents().await?;
+        let find = |node_id: NodeId| residents.iter().find(|row| row.node_id == node_id).cloned();
+        assert_eq!(
+            find(registered_node.node_id),
+            Some(NodeResidents {
+                node_id: registered_node.node_id,
+                source_node: SourceNode::Registered {
+                    k8s_node_name: NODE_NAME.to_string(),
+                    k8s_node_uid: None,
+                },
+                residents: 1,
+            })
+        );
+        assert_eq!(
+            find(deleted_row.node_id).map(|row| (row.source_node, row.residents)),
+            Some((SourceNode::RowDeleted, 1))
+        );
+        assert_eq!(
+            store.stranded_counts(registered_node.node_id).await?.running,
+            1
+        );
+
+        // At rest it no longer counts as running.
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+        ))
+        .bind(registered_node.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            store.stranded_counts(registered_node.node_id).await?.running,
+            0
+        );
+
+        // Terminal residents and drained nodes drop out of the first pass.
+        sqlx::query(sql!("UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"))
+            .bind(deleted_row.sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_phase = 'draining' WHERE id = $1"
+        ))
+        .bind(registered_node.node_id)
+        .execute(&db.pool)
+        .await?;
+        let residents = store.node_residents().await?;
+        assert!(
+            residents
+                .iter()
+                .all(|row| row.node_id != registered_node.node_id
+                    && row.node_id != deleted_row.node_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn p10_flip_rechecks_restore_sources_and_generation() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
             return Ok(());
@@ -1122,4 +1268,194 @@ mod postgres_backed {
         assert_eq!(listed(&store).await?.len(), 1);
         Ok(())
     }
+}
+
+// -----------------------------------------------------------------
+// S — stranded-sandbox census
+// -----------------------------------------------------------------
+
+fn counts(running: u64, at_rest_without_copy: u64) -> StrandedCounts {
+    StrandedCounts {
+        running,
+        at_rest_without_copy,
+    }
+}
+
+fn gone(report: &TickReport) -> (u32, u64) {
+    verdict_totals(report, StrandedVerdict::Gone)
+}
+
+fn verdict_totals(report: &TickReport, verdict: StrandedVerdict) -> (u32, u64) {
+    (
+        report.stranded_nodes.get(&verdict).copied().unwrap_or(0),
+        report.stranded_sandboxes.get(&verdict).copied().unwrap_or(0),
+    )
+}
+
+#[tokio::test]
+async fn s1_census_separates_gone_from_unverifiable() {
+    let sink = FakeSink::new(Vec::new());
+    // Gone: the row is deleted, or the registered node is absent with no EC2
+    // instance and no Node.
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(2, 1));
+    sink.with_node(NodeId::new(), registered("terminated", None), counts(3, 0));
+    // Unverifiable: no Kubernetes name, a failed EC2 lookup, a failed Node GET.
+    sink.with_node(NodeId::new(), SourceNode::Unverifiable, counts(1, 0));
+    sink.with_node(NodeId::new(), registered("ec2-flaky", None), counts(1, 0));
+    sink.with_node(NodeId::new(), registered("get-flaky", None), counts(0, 1));
+    let lookup = Arc::new(FakeLookup::default().with("ec2-flaky", Err("throttled".to_string())));
+    let presence = Arc::new(FakePresence::listing(&["some-other-node"]).failing("get-flaky"));
+    let mut reconciler = Reconciler::new(config(), sink.clone(), lookup, presence);
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(gone(&report), (2, 6));
+    assert_eq!(
+        verdict_totals(&report, StrandedVerdict::Unverifiable),
+        (3, 3)
+    );
+    assert_eq!(verdict_totals(&report, StrandedVerdict::NotReady), (0, 0));
+    assert!(sink.mark_calls().is_empty(), "the census never flips");
+}
+
+#[tokio::test]
+async fn s2_live_ready_nodes_and_empty_counts_are_not_reported() {
+    let sink = FakeSink::new(Vec::new());
+    let listed = NodeId::new();
+    let ec2_live = NodeId::new();
+    let api_live = NodeId::new();
+    sink.with_node(listed, registered("listed", None), counts(4, 0));
+    sink.with_node(ec2_live, registered("ec2-live", None), counts(4, 0));
+    sink.with_node(api_live, registered("api-live", None), counts(4, 0));
+    // Gone, but every resident is at rest with a durable copy.
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(0, 0));
+    let lookup = Arc::new(FakeLookup::default().live("ec2-live"));
+    let presence = Arc::new(FakePresence::listing(&["listed"]).existing("api-live"));
+    let mut reconciler = Reconciler::new(config(), sink.clone(), lookup.clone(), presence);
+
+    let report = reconciler.tick().await;
+
+    for verdict in StrandedVerdict::ALL {
+        assert_eq!(verdict_totals(&report, verdict), (0, 0), "{verdict:?}");
+    }
+    assert!(
+        !lookup.calls().contains(&"listed".to_string()),
+        "a listed node costs no EC2 call"
+    );
+    let counted = sink.count_calls();
+    for live in [listed, ec2_live, api_live] {
+        assert!(!counted.contains(&live), "live nodes get no second pass");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn s3_not_ready_must_last_the_grace() {
+    let sink = FakeSink::new(Vec::new());
+    sink.with_node(NodeId::new(), registered("sick", None), counts(2, 0));
+    let lookup = Arc::new(FakeLookup::default());
+    let presence = Arc::new(FakePresence::listing(&["sick"]).not_ready("sick"));
+    let config = ReconcilerConfig {
+        absence_grace: Duration::from_secs(600),
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(config, sink.clone(), lookup.clone(), presence.clone());
+
+    let report = reconciler.tick().await;
+    assert_eq!(verdict_totals(&report, StrandedVerdict::NotReady), (0, 0));
+
+    tokio::time::advance(Duration::from_secs(601)).await;
+    let report = reconciler.tick().await;
+    assert_eq!(verdict_totals(&report, StrandedVerdict::NotReady), (1, 2));
+    assert_eq!(gone(&report), (0, 0), "not ready is never gone");
+    assert!(lookup.calls().is_empty(), "a listed node costs no EC2 call");
+
+    // Ready again restarts the clock.
+    presence.not_ready.lock().unwrap().clear();
+    assert_eq!(
+        verdict_totals(&reconciler.tick().await, StrandedVerdict::NotReady),
+        (0, 0)
+    );
+    presence.not_ready.lock().unwrap().insert("sick".to_string());
+    assert_eq!(
+        verdict_totals(&reconciler.tick().await, StrandedVerdict::NotReady),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn s4_disabled_give_up_still_runs_the_census_and_flips_nothing() {
+    let sink = FakeSink::new(vec![vec![candidate(SourceNode::RowDeleted)]]);
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(1, 0));
+    let config = ReconcilerConfig {
+        enabled: false,
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(config, sink.clone(), Arc::new(FakeLookup::default()), presence());
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(gone(&report), (1, 1));
+    assert_eq!(report.scanned, 0);
+    assert_eq!(sink.list_calls(), 0, "no candidate scan with the give-up off");
+    assert!(sink.mark_calls().is_empty());
+}
+
+#[tokio::test]
+async fn s5_census_lookups_are_capped_per_tick() {
+    let sink = FakeSink::new(Vec::new());
+    for name in ["dead-a", "dead-b", "dead-c"] {
+        sink.with_node(NodeId::new(), registered(name, None), counts(1, 0));
+    }
+    let lookup = Arc::new(FakeLookup::default());
+    let config = ReconcilerConfig {
+        max_census_lookups_per_tick: 2,
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(config, sink, lookup.clone(), presence());
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(lookup.calls().len(), 2);
+    assert_eq!(gone(&report), (2, 2));
+    assert_eq!(
+        verdict_totals(&report, StrandedVerdict::Unverifiable),
+        (1, 1),
+        "the node past the cap reads as lookup_budget"
+    );
+}
+
+#[tokio::test]
+async fn s6_cold_reflector_skips_the_census() {
+    let sink = FakeSink::new(Vec::new());
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(1, 0));
+    let mut reconciler = Reconciler::new(
+        config(),
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        Arc::new(FakePresence::cold()),
+    );
+
+    let report = reconciler.tick().await;
+
+    assert!(report.stranded_nodes.is_empty());
+    assert!(sink.count_calls().is_empty());
+}
+
+#[tokio::test]
+async fn s7_census_reuses_the_give_up_verdict() {
+    let node_id = NodeId::new();
+    let mut stuck = candidate(registered("dead", None));
+    stuck.source_node_id = node_id;
+    let sink = FakeSink::new(vec![vec![stuck]]);
+    sink.with_node(node_id, registered("dead", None), counts(1, 0));
+    let lookup = Arc::new(FakeLookup::default());
+    let presence = presence();
+    let mut reconciler = Reconciler::new(config(), sink.clone(), lookup.clone(), presence.clone());
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.marked_lost, 1);
+    assert_eq!(gone(&report), (1, 1));
+    assert_eq!(lookup.calls(), vec!["dead".to_string()], "one EC2 call per node");
+    assert_eq!(presence.direct_calls(), vec!["dead".to_string()]);
 }
