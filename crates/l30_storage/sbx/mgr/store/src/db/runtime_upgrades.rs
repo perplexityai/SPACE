@@ -1218,9 +1218,10 @@ pub fn record_runtime_upgrade_refused_attempt(
 }
 
 /// The latest attempt the operation refused after reaching its target,
-/// `None` without one. A row is never rewritten, and `recorded_seq` is never
-/// reused or renumbered, so the highest is the latest recorded, however
-/// coarse or unsteady the clock that stamped `recorded_at`. A row kept from before its sandbox was deleted can
+/// `None` without one. A row is never rewritten, and while the table exists
+/// `recorded_seq` is never reused or renumbered, so the highest is the latest
+/// recorded, however coarse or unsteady the clock that stamped `recorded_at`.
+/// The order is all this reads: a down and up restarts the sequence. A row kept from before its sandbox was deleted can
 /// be the latest; a caller reads it only beside a report that reached the
 /// target.
 fn latest_refused_attempt(
