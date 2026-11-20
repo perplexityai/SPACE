@@ -510,9 +510,15 @@ pub async fn require_e2b_api_key(
                 }
             }
 
+            // Handlers that act through the key's user (create, for one) read
+            // the org from the actor, so a tenant request re-homes it too.
+            let mut actor = context.actor;
+            if let Some(actor) = actor.as_mut() {
+                actor.org_id = org.id;
+            }
             request.extensions_mut().insert(AuthApiKey(context.api_key));
             request.extensions_mut().insert(AuthOrg(org));
-            request.extensions_mut().insert(AuthEcwActor(context.actor));
+            request.extensions_mut().insert(AuthEcwActor(actor));
             if let Some(owner) = federated_owner {
                 request.extensions_mut().insert(AuthFederatedOwner(owner));
             }
