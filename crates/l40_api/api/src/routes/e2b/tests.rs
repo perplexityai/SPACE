@@ -1504,7 +1504,7 @@ async fn benchmark_fork_requires_explicit_mount_and_exact_authenticated_pair() -
 
     let grant = BenchmarkForkAccess {
         org_id: OrgId::new(),
-        api_key_id: Uuid::new_v4(),
+        api_key_id: Uuid::now_v7(),
     };
     state.benchmark_fork_access = Some(grant);
     assert_eq!(
@@ -1516,7 +1516,7 @@ async fn benchmark_fork_requires_explicit_mount_and_exact_authenticated_pair() -
     // points to a closed loopback DB: a replay attempt cannot return 403.
     let now = OffsetDateTime::now_utc();
     for (org_id, key_org_id, key_id, federated) in [
-        (grant.org_id, grant.org_id, Uuid::new_v4(), false),
+        (grant.org_id, grant.org_id, Uuid::now_v7(), false),
         (OrgId::new(), grant.org_id, grant.api_key_id, false),
         (grant.org_id, OrgId::new(), grant.api_key_id, false),
         (grant.org_id, grant.org_id, grant.api_key_id, true),
