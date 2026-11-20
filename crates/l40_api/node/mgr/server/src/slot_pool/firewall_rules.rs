@@ -56,6 +56,8 @@ pub enum NotRun {
     Changed,
     #[error("cannot pin the sandbox network namespace: {0}")]
     Namespace(#[source] io::Error),
+    #[error("node-manager is shutting down")]
+    ShuttingDown,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -242,6 +244,10 @@ fn apply_blocking(
     host: &dyn SlotHost,
     nft: &Nft<'_>,
 ) -> SlotFirewallReport {
+    // As reset does, refuse new slot work once drain starts.
+    if pool.shutdown_token.is_cancelled() {
+        return SlotFirewallReport::NotRun(NotRun::ShuttingDown);
+    }
     let owned = pool.lookup_eligible(request.slot_id).and_then(|record| {
         host.looked_up();
         pool.own(record)

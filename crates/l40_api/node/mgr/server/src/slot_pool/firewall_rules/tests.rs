@@ -307,7 +307,8 @@ fn only_healthy_ready_or_leased_slots_are_eligible() {
     assert_eq!(passed, expected);
 }
 
-// Catches nft run, ownership skipped or kept, or the assignment read early.
+// Catches nft run, ownership skipped or kept, the assignment read early, or
+// work started during drain.
 #[tokio::test]
 async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
@@ -353,6 +354,8 @@ async fn refusals_never_run_nft() {
     ));
     std::fs::write(host.link(0), b"").unwrap();
     assert!(matches!(refused(0).await, NotRun::Namespace(_)));
+    pool.shutdown_token.cancel();
+    assert!(matches!(refused(0).await, NotRun::ShuttingDown));
     assert!(
         SlotGuard::try_acquire(&pool, 0).is_some(),
         "a refusal kept the slot"
