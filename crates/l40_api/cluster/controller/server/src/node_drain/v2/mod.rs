@@ -52,7 +52,12 @@
 //!    `drain_last_error` and on the `node_drain.v2.stalled` gauge; the mark
 //!    changes nothing else. Once the report has nothing pending or blocked
 //!    and every evacuation is recorded, the node moves to `drained`.
-//! 4. **Drained**: nothing: no sandbox-row write, and the node isn't called.
+//! 4. **Drained**: no sandbox-row write, and the node isn't called. Every
+//!    durable row still homed on the node, a suspended row whose snapshot is
+//!    durable or a stopped row whose disk is durable since its stop, is added
+//!    to `evacuated_total`, a `drain_status` write only: the node evicts a
+//!    durable copy on its own, so one it evicted before a report named it
+//!    evacuated is counted too.
 //! 5. **Terminating** (`:terminate` moved it here, from `drained`): one fresh
 //!    `DrainNode` call, whose report is recorded as a draining one's. Only
 //!    an answer with nothing pending or blocked lets the loop fence: the
@@ -102,13 +107,16 @@ use std::time::Duration;
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_node_id::Ec2InstanceId;
 use pplx_space_node_registration_store::drain_v2::StoredV2Report;
+use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sbx_mgr_client::proto::{
     DrainEvacuated, DrainNodeRequest, DrainNodeResponse, drain_node_request,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use cleanup::{DispatchBackoff, REFUSED_TERMINATE, fence, let_go, terminated_or_dispatch};
+use cleanup::{
+    DispatchBackoff, REFUSED_TERMINATE, count_drained, fence, let_go, terminated_or_dispatch,
+};
 pub use cleanup::{Fence, TerminatedDelete};
 use step::step;
 #[cfg(test)]
@@ -599,6 +607,15 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         node_id: NodeId,
         message: &str,
     ) -> impl std::future::Future<Output = ()> + Send;
+    /// Add every durable row still homed on the `drained` node under
+    /// `generation` to its drain's `evacuated_total`, under the node's row
+    /// lock (`pplx_space_sandbox_store::drain_terminate::durable_rows_naming`):
+    /// a `drain_status` write only, no sandbox row. The ids it found.
+    fn count_drained_evacuations(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<SandboxId>, String>> + Send;
     /// The terminate transaction, under the node's row lock: re-check the
     /// generation's unfenced `terminating` node, hand off its durable
     /// stopped rows and release its durable suspended ones, require that

@@ -329,8 +329,12 @@ pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
             .await
             .then_some(NodeStep::Drained),
         // A drained node waits for `:terminate` or `:undrain`: its tick
-        // writes no sandbox row and makes no call.
-        Some("drained") => None,
+        // writes no sandbox row and makes no call, and counts the durable
+        // rows still homed on it evacuated.
+        Some("drained") => {
+            count_drained(sink, node.id, generation).await;
+            None
+        }
         Some("terminating") => terminate(sink, authority, node, generation).await,
         Some(other) => {
             tracing::warn!(node_id = %node.id, phase = other, "node_drain v2: unknown phase");
