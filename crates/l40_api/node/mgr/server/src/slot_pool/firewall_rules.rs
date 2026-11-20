@@ -6,9 +6,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 use std::sync::Arc;
-use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
 use uuid::Uuid;
@@ -18,8 +16,8 @@ use super::reset::SlotGuard;
 use super::{NetworkPool, SandboxMutationClaim, SlotHealth, SlotRecord, SlotState, SlotStoreError};
 use crate::firewall::assignment::{DesiredAssignment, FirewallAssignments, Unavailable};
 use crate::firewall::rules::install::{InstallOutcome, install_with};
-use crate::firewall::rules::render;
 use crate::firewall::rules::verify::{Verification, verify_with};
+use crate::firewall::rules::{Nft, nft, render};
 use crate::net::SlotInfo;
 
 #[cfg(test)]
@@ -114,18 +112,10 @@ impl SlotFirewallAttempt {
     }
 }
 
-/// What the operation reaches beyond the pool; tests substitute it.
+/// What the operation reaches beyond the pool and nft; tests substitute it.
 pub(super) trait SlotHost: Send + Sync + 'static {
     fn namespace_path(&self, slot: &SlotInfo) -> PathBuf;
-    fn nft(
-        &self,
-        netns: &File,
-        args: &[&str],
-        stdin: &[u8],
-        budget: Duration,
-    ) -> io::Result<Output>;
     /// Between the lookup and taking ownership.
-    #[cfg(test)]
     fn looked_up(&self) {}
 }
 
@@ -134,16 +124,6 @@ struct Live;
 impl SlotHost for Live {
     fn namespace_path(&self, slot: &SlotInfo) -> PathBuf {
         slot.ns_path().into()
-    }
-
-    fn nft(
-        &self,
-        netns: &File,
-        args: &[&str],
-        stdin: &[u8],
-        budget: Duration,
-    ) -> io::Result<Output> {
-        crate::firewall::rules::install::nft(netns, args, stdin, budget)
     }
 }
 
@@ -166,7 +146,7 @@ impl NetworkPool {
         assignments: &Arc<FirewallAssignments>,
         request: SlotFirewallRequest,
     ) -> Result<SlotFirewallReport, tokio::task::JoinError> {
-        self.apply_firewall_rules_with(assignments, request, Arc::new(Live))
+        self.apply_firewall_rules_with(assignments, request, Arc::new(Live), Arc::new(nft))
             .await
     }
 
@@ -175,9 +155,9 @@ impl NetworkPool {
         assignments: &Arc<FirewallAssignments>,
         request: SlotFirewallRequest,
         host: Arc<dyn SlotHost>,
+        nft: Arc<Nft<'static>>,
     ) -> Result<SlotFirewallReport, tokio::task::JoinError> {
         let owned = self.lookup_eligible(request.slot_id).and_then(|record| {
-            #[cfg(test)]
             host.looked_up();
             self.own(record)
         });
@@ -189,7 +169,7 @@ impl NetworkPool {
         // Ownership moves into the tracked job, so dropping this future
         // cannot release it while nft can still run.
         self.task_tracker
-            .spawn_blocking(move || apply_owned(&pool, &assignments, request, &*host, owned))
+            .spawn_blocking(move || apply_owned(&pool, &assignments, request, &*host, &*nft, owned))
             .await
     }
 
@@ -272,6 +252,7 @@ fn apply_owned(
     assignments: &FirewallAssignments,
     request: SlotFirewallRequest,
     host: &dyn SlotHost,
+    nft: &Nft<'_>,
     owned: OwnedSlot,
 ) -> SlotFirewallReport {
     let path = host.namespace_path(&owned.record.info);
@@ -285,10 +266,8 @@ fn apply_owned(
         Ok(desired) => desired,
         Err(not_runnable) => return SlotFirewallReport::NotRun(not_runnable.into()),
     };
-    let nft =
-        |netns: &File, args: &[&str], stdin: &[u8], budget| host.nft(netns, args, stdin, budget);
-    let submitted = install_with(&render(&desired.revision), &netns, &nft);
-    let readback = verify_with(&desired.revision, &netns, &nft);
+    let submitted = install_with(&render(&desired.revision), &netns, nft);
+    let readback = verify_with(&desired.revision, &netns, nft);
     let current = still_current(pool, assignments, &desired, &owned.record, &path, namespace);
     let info = &owned.record.info;
     SlotFirewallReport::Attempted(Box::new(SlotFirewallAttempt {

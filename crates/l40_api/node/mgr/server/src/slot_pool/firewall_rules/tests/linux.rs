@@ -13,22 +13,12 @@ impl SlotHost for Redirected {
     fn namespace_path(&self, _: &SlotInfo) -> PathBuf {
         format!("/run/netns/{}", self.0).into()
     }
-
-    fn nft(
-        &self,
-        netns: &File,
-        args: &[&str],
-        stdin: &[u8],
-        budget: Duration,
-    ) -> io::Result<Output> {
-        Live.nft(netns, args, stdin, budget)
-    }
 }
 
 fn nft(namespace: &TestNamespace, args: &[&str], stdin: &[u8]) -> Value {
     let netns = File::open(format!("/run/netns/{}", namespace.name())).unwrap();
     let output = contained(|| {
-        crate::firewall::rules::install::nft(&netns, args, stdin, crate::host_command::PROBE_BUDGET)
+        crate::firewall::rules::nft(&netns, args, stdin, crate::host_command::PROBE_BUDGET)
     })
     .unwrap();
     assert!(output.status.success(), "nft {args:?}: {output:?}");
@@ -100,7 +90,12 @@ fn applies_the_accepted_revision_only_to_the_slot_namespace() {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(pool.apply_firewall_rules_with(&store, request, host))
+            .block_on(pool.apply_firewall_rules_with(
+                &store,
+                request,
+                host,
+                Arc::new(crate::firewall::rules::nft),
+            ))
             .unwrap()
     });
     let attempt = attempted(report);

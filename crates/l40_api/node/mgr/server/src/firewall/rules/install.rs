@@ -7,20 +7,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use super::{FAMILY, TABLE, TableConstruction};
-
-/// Runs nft with these arguments and stdin, within the budget, in the
-/// namespace the descriptor pins.
-pub(crate) type Nft<'a> = dyn Fn(&File, &[&str], &[u8], Duration) -> std::io::Result<Output> + 'a;
-
-pub(crate) fn nft(
-    netns: &File,
-    args: &[&str],
-    stdin: &[u8],
-    budget: Duration,
-) -> std::io::Result<Output> {
-    crate::net::command_output_in_pinned_ns(netns, "nft", args, stdin, budget)
-}
+use super::{FAMILY, Nft, TABLE, TableConstruction, nft};
 
 /// What nft reported for one submission, which is not what Linux holds.
 #[derive(Debug)]

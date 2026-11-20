@@ -10,8 +10,7 @@ use pplx_space_firewall_rules_model::{FirewallRuleRevision, Match, Rule};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::install::{Nft, nft};
-use super::{CHAIN, FAMILY, PRIORITY, TABLE, rule_comment};
+use super::{CHAIN, FAMILY, Nft, PRIORITY, TABLE, nft, rule_comment};
 
 /// What fresh listings of the owned table showed, for this namespace only.
 #[derive(Debug, PartialEq, Eq)]

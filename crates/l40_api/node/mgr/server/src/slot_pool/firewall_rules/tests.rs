@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt as _;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Output};
 use std::sync::Mutex;
 
 use pplx_space_firewall_rules_protocol::decode_revision;
@@ -274,11 +274,6 @@ impl SlotHost for FakeHost {
         self.link(slot.slot)
     }
 
-    fn nft(&self, netns: &File, args: &[&str], stdin: &[u8], _: Duration) -> io::Result<Output> {
-        self.reply(netns, args, stdin)
-            .ok_or_else(|| io::ErrorKind::TimedOut.into())
-    }
-
     fn looked_up(&self) {
         let hook = self.looked_up.lock().unwrap().take();
         if let Some(hook) = hook {
@@ -299,7 +294,12 @@ async fn apply(
         generation,
         slot_id,
     };
-    pool.apply_firewall_rules_with(store, request, host.clone())
+    let fake = host.clone();
+    let nft = move |netns: &File, args: &[&str], stdin: &[u8], _| {
+        fake.reply(netns, args, stdin)
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    };
+    pool.apply_firewall_rules_with(store, request, host.clone(), Arc::new(nft))
         .await
         .unwrap()
 }
