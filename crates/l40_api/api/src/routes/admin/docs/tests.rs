@@ -101,3 +101,96 @@ fn the_drain_stub_states_what_forced_mode_destroys() {
         "the body description must cover the already-draining edge; got {body:?}"
     );
 }
+
+/// The `:drain` stub documents the v2 drain: its `engine` and
+/// `hold_seconds` fields, that a hold is required to start one and how a
+/// repeat moves the deadline, that a running sandbox is held until the
+/// deadline, that a v2 drain takes no mode, and the refusals' statuses and
+/// codes. Facts, not wording.
+#[test]
+fn the_drain_stub_states_the_v2_contract() {
+    let spec = admin_openapi_value();
+    let drain = &spec["paths"]["/nodes/{node_id}:drain"]["post"];
+    let properties = &drain["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    assert_eq!(
+        properties["engine"]["enum"],
+        serde_json::json!(["v1", "v2"])
+    );
+    assert!(properties.get("deadline").is_none());
+    let hold = &properties["hold_seconds"];
+    assert_eq!(hold["type"], "integer");
+    assert_eq!(hold["minimum"], 0);
+    assert_eq!(hold["maximum"], 31_536_000);
+    let hold = hold["description"]
+        .as_str()
+        .expect("hold_seconds description");
+    for fact in [
+        "Required",
+        "no default",
+        "drain_status.deadline",
+        "shorter",
+        "409",
+        "400",
+    ] {
+        assert!(hold.contains(fact), "{fact:?}: {hold:?}");
+    }
+    let engine = properties["engine"]["description"]
+        .as_str()
+        .expect("engine description");
+    for fact in [
+        "SPACE_DRAIN_V2_ENABLED",
+        "drain_v2_node_heartbeat_stale",
+        "drain_v2_evacuation_cap",
+        "Retry-After",
+        "hold_seconds 0",
+        "undrain",
+    ] {
+        assert!(engine.contains(fact), "{fact:?}: {engine:?}");
+    }
+    let mode = properties["mode"]["description"]
+        .as_str()
+        .expect("mode description");
+    assert!(mode.contains("takes no mode"), "{mode:?}");
+    let body = drain["requestBody"]["description"]
+        .as_str()
+        .expect("body description");
+    for fact in ["hold", "deadline", "503", "Retry-After", "409"] {
+        assert!(body.contains(fact), "{fact:?}: {body:?}");
+    }
+    for (status, facts) in [
+        (
+            "400",
+            &["SPACE_DRAIN_V2_ENABLED", "hold_seconds", "mode forced"][..],
+        ),
+        (
+            "409",
+            &[
+                "drain_v2_node_heartbeat_stale",
+                "drain_v2_evacuation_cap",
+                "Retry-After",
+                "hold_seconds",
+            ][..],
+        ),
+    ] {
+        let description = drain["responses"][status]["description"]
+            .as_str()
+            .expect("a response description");
+        for fact in facts {
+            assert!(
+                description.contains(fact),
+                "{status} {fact:?}: {description:?}"
+            );
+        }
+    }
+    for path in ["/nodes", "/nodes/{node_id}"] {
+        let description = spec["paths"][path]["get"]["description"]
+            .as_str()
+            .expect("a node read description");
+        for fact in ["drain_engine", "drain"] {
+            assert!(
+                description.contains(fact),
+                "{path} {fact:?}: {description:?}"
+            );
+        }
+    }
+}

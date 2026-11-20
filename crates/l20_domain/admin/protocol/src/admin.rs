@@ -25,6 +25,81 @@ use pplx_space_node_model::{
 };
 use pplx_space_template_model::{TemplateName, TemplateVisibility};
 
+/// A v2 drain of a node, as the cluster controller stored it in
+/// `drain_status`, for display: its generation and deadline, and the node's
+/// last report with what the controller recorded of it. Times are RFC 3339;
+/// `deadline` and the controller's stamps are by the database clock, a
+/// pending entry's `since` by the node's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminNodeDrain {
+    /// The drain's generation, which every `DrainNode` call of it names.
+    pub generation: u64,
+    /// Until when the drain holds running sandboxes: its start plus
+    /// `:drain`'s `hold_seconds`, moved earlier only. From it on, the node
+    /// evacuates them too.
+    pub deadline: Option<String>,
+    /// Undrained: the drain's engine with no phase, until the controller has
+    /// cancelled it on the node.
+    pub cancelling: bool,
+    /// The terminate transaction fenced the node's instance for termination.
+    pub fenced: bool,
+    /// When the controller stored the node's last report.
+    pub reported_at: Option<String>,
+    /// The last time the set of sandboxes the node reports evacuated grew,
+    /// or the deadline once passed if it hasn't since; past the deadline the
+    /// drain is stalled once this is 15 minutes old.
+    pub evacuated_grew_at: Option<String>,
+    /// Every sandbox the controller has recorded as evacuated in this drain,
+    /// a released one included, which the node's report no longer lists.
+    pub evacuated_total: Vec<String>,
+    /// Each sandbox the node's last report lists durable elsewhere.
+    pub evacuated: Vec<AdminNodeDrainEvacuated>,
+    /// Each sandbox the node's last report lists as not able to move yet.
+    pub pending: Vec<AdminNodeDrainPending>,
+    /// Node-wide problems that keep the drain from finishing.
+    pub blocked: Vec<AdminNodeDrainBlocked>,
+}
+
+/// A sandbox a v2 drain's node reports durable elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminNodeDrainEvacuated {
+    pub sandbox_id: String,
+    /// `full` for a suspended sandbox's snapshot, `disk` for a stopped
+    /// sandbox's disk, `unknown` for a kind this build doesn't know.
+    pub artifact_kind: String,
+    /// The drain saw the sandbox running.
+    pub was_running: bool,
+    /// The controller has recorded the evacuation; until then it is
+    /// recording it.
+    pub recorded: bool,
+}
+
+/// A sandbox a v2 drain's node reports as not able to move yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminNodeDrainPending {
+    pub sandbox_id: String,
+    /// What it waits on: `hold` (kept running until the drain evacuates),
+    /// `moving` (the drain is making it durable), `external` (work the drain
+    /// doesn't drive), or `unspecified`.
+    pub wait: String,
+    /// A started VM at the node's planning read.
+    pub running: bool,
+    /// A warm-pool member, not a user's sandbox.
+    #[serde(default)]
+    pub pool_member: bool,
+    /// The node's reason, for display only.
+    pub reason: Option<String>,
+    /// When the sandbox's row entered its current state, by the node's
+    /// clock.
+    pub since: Option<String>,
+}
+
+/// A node-wide problem a v2 drain's node reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminNodeDrainBlocked {
+    pub reason: String,
+}
+
 /// Response shape for `GET /admin/api/v1/nodes` (each element) and
 /// `GET /admin/api/v1/nodes/{node}`.
 ///
@@ -54,6 +129,15 @@ pub struct AdminNodeResponse {
     pub drain_mode: Option<NodeDrainMode>,
     pub drain_started_at: Option<String>,
     pub drain_last_error: Option<String>,
+    /// `v2` for a drain the node runs itself (`:drain {engine: v2}`), until
+    /// it ends; absent for a v1 drain or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_engine: Option<String>,
+    /// A v2 drain's generation, deadline and its node's last report, as the
+    /// cluster controller stored them ([`AdminNodeDrain`]); absent for a v1
+    /// drain or none, and when the stored state can't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<AdminNodeDrain>,
     /// Value the cluster controller passes to AWS Auto Scaling's
     /// `should_decrement_desired_capacity` when terminating this node. `false`
     /// is the single-node-drain default (the ASG auto-replaces the terminated
