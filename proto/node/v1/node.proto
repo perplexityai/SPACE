@@ -450,19 +450,19 @@ enum FirewallSlotDispatchOutcome {
   // A newer generation was accepted before this one's result.
   FIREWALL_SLOT_DISPATCH_OUTCOME_SUPERSEDED = 2;
   // Nothing reached nft. Redelivery retries a busy slot; a changed or missing
-  // slot or namespace ends sync until node-manager restarts.
+  // slot or namespace ends sync for this node-manager process.
   FIREWALL_SLOT_DISPATCH_OUTCOME_NOT_RUN = 3;
   // Submitted once, and the slot's readback listed exactly this revision.
   // A point-in-time observation of one slot, not node-wide verification.
   FIREWALL_SLOT_DISPATCH_OUTCOME_MATCHED = 4;
   // Submitted once; the readback listed something else.
   FIREWALL_SLOT_DISPATCH_OUTCOME_MISMATCHED = 5;
-  // Submitted once; the readback could not tell. Ends sync until restart.
+  // Submitted once; the readback could not tell. Ends sync for this process.
   FIREWALL_SLOT_DISPATCH_OUTCOME_INCONCLUSIVE = 6;
   // Submitted once, but what it was made for changed before the final check.
-  // Unless a newer generation was accepted, ends sync until restart.
+  // Unless a newer generation was accepted, ends sync for this process.
   FIREWALL_SLOT_DISPATCH_OUTCOME_STALE = 7;
-  // The apply failed and nft may have run. Ends sync until restart.
+  // The apply failed and nft may have run. Ends sync for this process.
   FIREWALL_SLOT_DISPATCH_OUTCOME_UNKNOWN = 8;
 }
 

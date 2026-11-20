@@ -146,7 +146,7 @@ impl FakeHost {
         })
     }
 
-    fn link(&self, slot_id: u32) -> PathBuf {
+    pub(crate) fn link(&self, slot_id: u32) -> PathBuf {
         self.links.path().join(format!("slot-{slot_id}"))
     }
 

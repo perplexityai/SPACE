@@ -188,17 +188,20 @@ impl FirewallSync {
                 detail = done.detail,
                 "fixture firewall slot dispatch finished"
             );
-            // Before the result shows, so no delivery that sees it is admitted.
-            if ends {
-                self.ended.cancel();
-            }
-            // A newer generation replaced this one, so its result is dropped.
-            self.wanted.send_if_modified(|wanted| match wanted {
-                Some(wanted) if wanted.generation == generation => {
-                    wanted.run = Run::Done(done);
-                    true
+            self.wanted.send_if_modified(|wanted| {
+                // Under the watch lock, so a waiter the end wakes reads this result,
+                // and no delivery that sees the result is admitted.
+                if ends {
+                    self.ended.cancel();
                 }
-                _ => false,
+                // A newer generation replaced this one, so its result is dropped.
+                match wanted {
+                    Some(wanted) if wanted.generation == generation => {
+                        wanted.run = Run::Done(done);
+                        true
+                    }
+                    _ => false,
+                }
             });
             if ends {
                 return;

@@ -358,6 +358,10 @@ enum Drift {
     Reset,
     /// Re-leased between lookup and ownership.
     Released,
+    /// Dirty before the delivery.
+    Dirty,
+    /// Its namespace entry gone before the delivery.
+    Unlinked,
 }
 
 // Catches a generation submitted again, an outcome misreported, or work after
@@ -368,6 +372,8 @@ async fn a_generation_is_attempted_once_and_drift_ends_the_binding() {
         (Some(Fault::Drops), Drift::None, Outcome::Mismatched, false),
         (None, Drift::Reset, Outcome::Stale, true),
         (None, Drift::Released, Outcome::NotRun, true),
+        (None, Drift::Dirty, Outcome::NotRun, true),
+        (None, Drift::Unlinked, Outcome::NotRun, true),
         (
             Some(Fault::Unlistable),
             Drift::None,
@@ -386,6 +392,8 @@ async fn a_generation_is_attempted_once_and_drift_ends_the_binding() {
             Drift::Released => hook(&bound.host.looked_up, move || {
                 set_slot(&pool, SLOT, SlotState::Leased, 2);
             }),
+            Drift::Dirty => set_slot(&pool, SLOT, SlotState::Dirty, 1),
+            Drift::Unlinked => std::fs::remove_file(bound.host.link(SLOT)).unwrap(),
         }
         let committed = FirewallAssignmentAcceptance::Committed;
         let first = reply(sync(&bound.service, delivery(12)).await);
@@ -436,4 +444,33 @@ async fn a_newer_generation_supersedes_older_work() {
     assert_eq!(bound.host.installs(), [bound.namespace; 2]);
     let tables = bound.host.tables.lock().unwrap();
     assert_eq!(tables[&bound.namespace], installed(13));
+}
+
+// Catches work queued behind an attempt that ends the binding run, or reported
+// as anything but not run.
+#[tokio::test]
+async fn work_queued_when_the_binding_ends_never_runs() {
+    let bound = bind(Some(Fault::Unlistable), None, WAIT).await;
+    let (entered, release) = gate(&bound.host.installed);
+    let deliver = |generation| {
+        let service = bound.service.clone();
+        tokio::spawn(async move { sync(&service, delivery(generation)).await.unwrap() })
+    };
+    let ending = deliver(11);
+    bounded(entered).await.unwrap();
+    let queued = deliver(12);
+    armed(&bound.service, 12).await;
+    release.send(()).unwrap();
+
+    let ending = bounded(ending).await.unwrap().dispatch.unwrap();
+    assert_eq!(ending.outcome(), Outcome::Superseded);
+    let queued = bounded(queued).await.unwrap().dispatch.unwrap();
+    assert_eq!(
+        (queued.outcome(), queued.detail.as_str()),
+        (Outcome::NotRun, "the binding ended")
+    );
+    // Only the worker is left on the tracker, so this waits for it to exit.
+    bound.service.device_op_tasks.close();
+    bounded(bound.service.device_op_tasks.wait()).await;
+    assert_eq!(bound.host.installs(), [bound.namespace]);
 }
