@@ -1,5 +1,5 @@
-//! The node's activation seal, and the VM activations in flight, which a
-//! drain reports as pending.
+//! The node's activation seal, and the VM activations and node-local artifact
+//! producers in flight, which a drain reports as pending.
 //!
 //! While sealed under a generation, [`ActivationSeal::admit`] refuses every VM
 //! activation: the cold boot of a sandbox, the restore of one from a snapshot
@@ -34,6 +34,20 @@
 //! one, unseals and leaves the cancel's generation as the tombstone: no seal at or
 //! below it is taken again. Each refusal is a `FailedPrecondition` naming
 //! both generations.
+//!
+//! A node-local artifact producer (a snapshot, an import, a publication)
+//! takes no activation, but it leaves an artifact a drain has to make
+//! durable. Holding the sandbox's artifact lock, it asks
+//! [`ActivationSeal::admit_producer`], which refuses it on a node known
+//! sealed when the sandbox has no VM: a drain may already have found
+//! everything there durable and reported nothing pending. A sandbox with a VM
+//! keeps the drain pending until its suspend, which waits for the same lock,
+//! so its producer is admitted sealed too. An unknown seal admits, as a node
+//! never sealed does. Each admitted producer holds an [`ArtifactProducerToken`]
+//! until it ends, which a drain reports as pending. A rollback that doesn't
+//! restart publishes no artifact, but rewrites the disk a drain may already
+//! have made durable: [`ActivationSeal::check_without_vm`] refuses it the
+//! same way, counting nothing in flight.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +60,7 @@ use tonic::Status;
 
 use crate::db::SharedConnection;
 use crate::db::activation_seal::{ActivationSealRecord, write_activation_seal};
+use crate::state::{SandboxState, SandboxStatus};
 
 /// The marker in the `FailedPrecondition` status a sealed node refuses a VM
 /// activation with. The node refuses the same activation until it is
@@ -58,6 +73,16 @@ pub(crate) const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed"
 /// seconds once the row reads, so a caller may retry.
 pub(crate) const ACTIVATION_SEAL_UNREADABLE_MARKER: &str = "activation seal unreadable; retrying";
 
+/// Whether a sandbox whose row is in `state` has a VM, as
+/// [`ActivationSeal::admit_producer`] asks: its lifecycle is `started` or
+/// `paused`, and no cleanup owns it.
+pub(crate) fn has_vm(state: SandboxStatus) -> bool {
+    matches!(
+        state.unowned(),
+        Some(SandboxState::Started | SandboxState::Paused)
+    )
+}
+
 /// The first and the longest wait between two reads of a seal row that
 /// couldn't be read.
 const RECOVERY_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
@@ -67,18 +92,23 @@ const RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// error being the first line.
 const UNREADABLE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The seal and the activations in flight, read together.
+/// The seal and the activations and artifact producers in flight, read
+/// together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ActivationSealStatus {
     /// The generation the node is sealed under.
     pub(crate) sealed_generation: Option<u64>,
     /// The sandbox of each activation in flight, oldest first.
     pub(crate) in_flight: Vec<String>,
+    /// The sandbox of each node-local artifact producer in flight, oldest
+    /// first.
+    pub(crate) producers_in_flight: Vec<String>,
 }
 
 pub(crate) struct ActivationSeal {
     state: Mutex<SealState>,
     in_flight: Arc<InFlightRegistry>,
+    producers: Arc<InFlightRegistry>,
 }
 
 struct SealState {
@@ -220,6 +250,7 @@ impl ActivationSeal {
                 record,
             }),
             in_flight: Arc::new(InFlightRegistry::default()),
+            producers: Arc::new(InFlightRegistry::default()),
         }
     }
 
@@ -232,6 +263,7 @@ impl ActivationSeal {
                 unreadable: None,
             }),
             in_flight: Arc::new(InFlightRegistry::default()),
+            producers: Arc::new(InFlightRegistry::default()),
         }
     }
 
@@ -323,6 +355,43 @@ impl ActivationSeal {
         Ok(self.in_flight.register(sandbox_id))
     }
 
+    /// Admit a node-local artifact producer, `producer` naming it in a
+    /// refusal, for `sandbox_id`, which the caller has read holding the
+    /// sandbox's artifact lock: `has_vm` when its lifecycle there is
+    /// `started` or `paused` ([`has_vm`]). A node known sealed refuses one
+    /// for a sandbox with no VM with the sealed refusal, so that the caller
+    /// writes nothing; an unknown seal admits, as a node never sealed does.
+    /// The token counts the producer in flight until it is dropped.
+    pub(crate) fn admit_producer(
+        &self,
+        producer: &str,
+        sandbox_id: &str,
+        has_vm: bool,
+    ) -> Result<ArtifactProducerToken, Status> {
+        let state = self.lock_state();
+        refuse_without_vm(&state, producer, sandbox_id, has_vm)?;
+        // Registered before the state lock is released, so a seal that
+        // lands next finds it in flight.
+        Ok(ArtifactProducerToken {
+            _in_flight: self.producers.register(sandbox_id),
+        })
+    }
+
+    /// The refusal [`Self::admit_producer`] gives, for work that publishes no
+    /// artifact but rewrites a sandbox without a VM, read holding the
+    /// sandbox's artifact lock, so a drain may already have made the old
+    /// state durable: a rollback that doesn't restart. `work` names it in the
+    /// refusal. A node known sealed refuses it; an unknown seal admits.
+    /// Nothing is counted in flight.
+    pub(crate) fn check_without_vm(
+        &self,
+        work: &str,
+        sandbox_id: &str,
+        has_vm: bool,
+    ) -> Result<(), Status> {
+        refuse_without_vm(&self.lock_state(), work, sandbox_id, has_vm)
+    }
+
     /// Seal under `generation`, persisted before the seal takes effect. The
     /// same generation again changes nothing. One drain seals the node at a
     /// time: sealed under another generation, the node refuses the seal,
@@ -403,11 +472,12 @@ impl ActivationSeal {
         ActivationSealStatus {
             sealed_generation,
             in_flight: self.in_flight.list(),
+            producers_in_flight: self.producers.list(),
         }
     }
 
-    /// The service tests' leak check: fails while any activation is still
-    /// counted in flight.
+    /// The service tests' leak check: fails while any activation or artifact
+    /// producer is still counted in flight.
     #[cfg(test)]
     #[track_caller]
     pub(crate) fn assert_quiesced(&self) {
@@ -415,6 +485,11 @@ impl ActivationSeal {
         assert!(
             in_flight.is_empty(),
             "activations still in flight: {in_flight:?}"
+        );
+        let producers = self.producers.list();
+        assert!(
+            producers.is_empty(),
+            "artifact producers still in flight: {producers:?}"
         );
     }
 
@@ -533,6 +608,32 @@ impl Drop for ActivationInFlightToken {
     fn drop(&mut self) {
         self.registry.release(self.id);
     }
+}
+
+/// The sealed refusal of `work` for `sandbox_id` when the node is known
+/// sealed and the sandbox has no VM.
+fn refuse_without_vm(
+    state: &SealState,
+    work: &str,
+    sandbox_id: &str,
+    has_vm: bool,
+) -> Result<(), Status> {
+    match state.sealed_generation() {
+        Some(generation) if !has_vm => Err(Status::failed_precondition(format!(
+            "{ACTIVATIONS_SEALED_MARKER} (generation {generation}); refusing the {work} of sandbox \
+             {sandbox_id}, which has no VM"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Counts one node-local artifact producer as in flight until dropped, on
+/// success, error, cancellation or unwinding alike
+/// ([`ActivationSeal::admit_producer`]).
+#[must_use = "dropping the token ends the producer's in-flight count"]
+#[derive(Debug)]
+pub(crate) struct ArtifactProducerToken {
+    _in_flight: ActivationInFlightToken,
 }
 
 #[cfg(test)]

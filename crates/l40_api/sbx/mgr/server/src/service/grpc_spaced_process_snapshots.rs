@@ -1306,6 +1306,20 @@ impl SandboxManagerService {
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock().await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
+        // A rollback that doesn't restart rewrites the disk of a sandbox
+        // without a VM, which a drain may already have reported durable: a
+        // node known sealed refuses it before it stops or rewrites anything.
+        // A running or paused sandbox keeps the drain pending, and the drain
+        // publishes its stopped disk once the rollback has stopped it. A
+        // restarting rollback is refused below by the seal's check of its
+        // restart.
+        if !auto_restart {
+            self.activation_seal.check_without_vm(
+                "rollback",
+                &sandbox.id,
+                crate::activation_seal::has_vm(sandbox.state),
+            )?;
+        }
         self.require_snapshot_mutation_ownership(&sandbox.id)?;
         // A full rollback restages the canonical checkpoint, which a verified
         // upgrade still owes the retirement of the old runtime's checkpoint at.
