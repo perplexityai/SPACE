@@ -407,6 +407,61 @@ fn report_pending(pending: &[&str]) -> StoredV2Report {
     }
 }
 
+/// A release adds the sandboxes it released to `evacuated_total`, keeping
+/// those a report recorded, sorted and without repeats, and keeps the rest
+/// of the status; under another generation it adds nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_release_adds_to_the_evacuated_set_once() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = node(pool, true).await?;
+    start(pool, node_id, 600).await?;
+    let generation = generation_of(pool, node_id).await?;
+    let report = report_pending(&[]);
+    let recorded = "00000000-0000-4000-8000-0000000000b2".to_owned();
+    let unreported = "00000000-0000-4000-8000-0000000000a1".to_owned();
+    assert!(
+        record_v2_report(
+            pool,
+            node_id,
+            generation,
+            &report,
+            &[],
+            std::slice::from_ref(&recorded)
+        )
+        .await?
+    );
+    assert!(
+        add_v2_evacuated(
+            pool,
+            node_id,
+            generation,
+            &[recorded.clone(), unreported.clone()]
+        )
+        .await?
+    );
+    let status = status_of(pool, node_id).await?;
+    assert_eq!(
+        status.evacuated_total,
+        [unreported.clone(), recorded.clone()]
+    );
+    assert_eq!(status.report, Some(report));
+    assert!(
+        !add_v2_evacuated(
+            pool,
+            node_id,
+            generation + 1,
+            &["00000000-0000-4000-8000-0000000000c3".to_owned()]
+        )
+        .await?
+    );
+    assert_eq!(
+        status_of(pool, node_id).await?.evacuated_total,
+        [unreported, recorded]
+    );
+    Ok(())
+}
+
 /// Each stored report adds the sandboxes it lists running to the drain's
 /// observed set and the evacuations recorded to `evacuated_total`, both of
 /// which only grow; the count takes, of the observed set, the ones

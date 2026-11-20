@@ -2,6 +2,7 @@
 //! report, the `drained` edge, the cancel and the listing.
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_node_registration_store::drain_v2::StoredV2Status;
 use pplx_space_test_env::TestResult;
 
 use super::*;
@@ -259,6 +260,63 @@ async fn a_row_that_moved_on_from_the_reported_artifact_is_recorded() -> TestRes
         "not yet",
         "a row still pinning A's artifact waits for it wherever it is homed"
     );
+    Ok(())
+}
+
+/// A node-initiated suspend projects the row `suspended` on the node without
+/// pinning its artifact. That evacuation is recorded once the catalog holds
+/// the reported artifact ready and stored and the row has a ready full
+/// snapshot since its placement changed, which a markerless restore takes;
+/// without either it waits, and says which is missing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_markerless_suspended_row_is_recorded_once_its_artifact_and_a_fresh_snapshot_are_ready()
+-> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = v2_node(
+        pool,
+        Some("draining"),
+        serde_json::json!({"generation": 5, "deadline_at": 0}),
+    )
+    .await?;
+    let artifact = Uuid::now_v7();
+    let record = |id| record_v2_evacuation(pool, node, id, EvacuatedArtifact::Full, artifact);
+
+    let durable = sandbox(pool, "suspended", Some(node)).await?;
+    catalog(pool, durable, artifact, "full", "ready").await?;
+    assert_eq!(pin(pool, durable).await?, (None, None));
+    assert_eq!(record(durable).await?, EvacuationRecord::Recorded);
+
+    // Another artifact's snapshot is fresh, so only the reported one's
+    // readiness is missing.
+    let uploading = sandbox(pool, "suspended", Some(node)).await?;
+    catalog(pool, uploading, artifact, "full", "creating").await?;
+    catalog(pool, uploading, Uuid::now_v7(), "full", "ready").await?;
+    let EvacuationRecord::NotYet(reason) = record(uploading).await? else {
+        panic!("the reported artifact isn't ready");
+    };
+    assert!(reason.contains("reported one as ready"), "{reason}");
+
+    let stale = sandbox(pool, "suspended", Some(node)).await?;
+    let snapshot = catalog(pool, stale, artifact, "full", "ready").await?;
+    sqlx::query(sql!(
+        "UPDATE snapshots SET timestamp = NOW() - INTERVAL '1 hour' WHERE id = $1"
+    ))
+    .bind(snapshot)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET placement_changed_at = NOW() WHERE id = $1"
+    ))
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    let EvacuationRecord::NotYet(reason) = record(stale).await? else {
+        panic!("the ready artifact predates the placement");
+    };
+    assert!(reason.contains("since its placement changed"), "{reason}");
     Ok(())
 }
 
@@ -660,6 +718,67 @@ async fn the_release_runs_only_on_its_generations_drained_node() -> TestResult {
         let released = release_v2_suspended(pool, node_id, generation).await?;
         assert_eq!(released == [id], releases, "{case}: {released:?}");
     }
+    Ok(())
+}
+
+/// The release adds each row it releases to the drain's `evacuated_total`,
+/// in its own transaction: one the node evicted before any report named it
+/// evacuated is counted, and one a report already recorded isn't counted
+/// twice. Ids already in the set stay, sorted; a release that releases
+/// nothing leaves the set as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn the_release_counts_each_released_row_evacuated_once() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let recorded = SandboxId::new();
+    let node_id = v2_node(
+        pool,
+        Some("drained"),
+        done(
+            7,
+            serde_json::json!({"evacuated_total": [recorded.to_string()]}),
+        ),
+    )
+    .await?;
+    identity(pool, node_id, Some(INSTANCE)).await?;
+    let unreported = sandbox(pool, "suspended", Some(node_id)).await?;
+    durable(pool, unreported).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, placement, managed_by,
+             active_node_id, target_node_id, network_policy_generation
+         ) VALUES ($1, '00000000-0000-0000-0000-000000000010', $2::UUID, 'suspended',
+                   'on_node', 'k8s', $3, $3, 1)"
+    ))
+    .bind(recorded)
+    .bind(ORG)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    durable(pool, recorded).await?;
+
+    let total = || async {
+        let (_, _, status, _) = columns(pool, node_id).await?;
+        let status = StoredV2Status::from_column(status.as_ref())?.ok_or("status")?;
+        TestResult::Ok(status.evacuated_total)
+    };
+    let mut released = release_v2_suspended(pool, node_id, 7).await?;
+    released.sort();
+    let mut both = vec![unreported, recorded];
+    both.sort();
+    assert_eq!(released, both);
+    let mut expected: Vec<String> = both.iter().map(ToString::to_string).collect();
+    expected.sort();
+    assert_eq!(total().await?, expected, "each released row counted once");
+
+    assert!(release_v2_suspended(pool, node_id, 7).await?.is_empty());
+    assert_eq!(
+        total().await?,
+        expected,
+        "a release of nothing adds nothing"
+    );
     Ok(())
 }
 

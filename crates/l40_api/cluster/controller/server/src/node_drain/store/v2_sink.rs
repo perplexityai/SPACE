@@ -4,15 +4,16 @@
 use std::str::FromStr;
 
 use pplx_space_api::controllers::substrate::connect_internal_node_api_client_for_target;
+use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
 use pplx_space_sandbox_store::drain_restore::V2StoppedEvacuation;
 use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeRequest, DrainNodeResponse};
 use uuid::Uuid;
 
 use pplx_space_node_registration_store::drain_v2::{
-    LockedV2Node, StoredV2Report, advance_v2_drained, evacuated_still_suspended, finish_v2_cancel,
-    let_go_v2_node, list_v2_node_rows, read_locked_v2_node, record_terminate_held,
-    record_v2_dispatched, record_v2_error, record_v2_report, record_v2_terminated_observed,
-    return_v2_drained, write_fence,
+    LockedV2Node, StoredV2Report, add_v2_evacuated, advance_v2_drained, evacuated_still_suspended,
+    finish_v2_cancel, let_go_v2_node, list_v2_node_rows, read_locked_v2_node,
+    record_terminate_held, record_v2_dispatched, record_v2_error, record_v2_report,
+    record_v2_terminated_observed, return_v2_drained, write_fence,
 };
 
 use super::*;
@@ -76,9 +77,9 @@ async fn lock_v2_node(
 }
 
 /// Release the durably suspended rows that name the `drained` v2 node under
-/// `generation`, in one transaction under the node's row lock. Returns the
-/// ids released; none for a row that is no longer that generation's
-/// `drained` node.
+/// `generation`, and add each to the drain's `evacuated_total`, in one
+/// transaction under the node's row lock. Returns the ids released; none for
+/// a row that is no longer that generation's `drained` node.
 pub(crate) async fn release_v2_suspended(
     pool: &PgPool,
     node_id: NodeId,
@@ -98,6 +99,13 @@ pub(crate) async fn release_v2_suspended(
         execution_ownership_ttl_secs(),
     )
     .await?;
+    // Counted with the release, under the same lock: the node evicts a
+    // durable copy on its own, and one it evicted before a report named it
+    // evacuated leaves the report, so its release is the count's only witness.
+    if !released.is_empty() {
+        let ids: Vec<String> = released.iter().map(ToString::to_string).collect();
+        add_v2_evacuated(&mut *tx, node_id, generation, &ids).await?;
+    }
     tx.commit().await?;
     Ok(released)
 }
@@ -304,7 +312,11 @@ pub(crate) enum EvacuatedArtifact {
 ///   after the sandbox was restored elsewhere, so it can report an artifact
 ///   the row no longer pins. A row that still pins the reported artifact
 ///   waits for it, so a sandbox whose only copy is the node's is never
-///   recorded before its upload. A row still `started`, `paused` or
+///   recorded before its upload. A node-initiated suspend can leave the row
+///   `suspended` on the node with no pin at all; it is recorded once the
+///   catalog holds the reported artifact ready and stored, and the restore
+///   selector's [`fresh_ready_snapshot_exists`] holds for the row, so its
+///   next restore has a source. A row still `started`, `paused` or
 ///   `suspending` on the node isn't projected yet; one that runs on another
 ///   node, with an active execution there, has moved on.
 /// * **disk**: pin the disk and release the node
@@ -412,6 +424,34 @@ pub(crate) async fn record_v2_evacuation(
     let home = target_node_id.or(active_node_id);
     if home.is_some_and(|home| home != node_id) {
         return Ok(EvacuationRecord::Recorded);
+    }
+    // A markerless row's restore takes a fresh ready full snapshot through
+    // the selector's legacy branch, so both halves must hold: the reported
+    // snapshot is durable, and that branch finds a source.
+    if pin.is_none() && home == Some(node_id) {
+        if !ready(artifact).await? {
+            return Ok(EvacuationRecord::NotYet(
+                "the row pins no artifact and the catalog doesn't hold the reported one as ready yet"
+                    .to_owned(),
+            ));
+        }
+        let fresh = format!(
+            "SELECT {} FROM sandboxes s WHERE s.id = $1",
+            fresh_ready_snapshot_exists("s")
+        );
+        let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(fresh.as_str())))
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await
+            .map_err(sql_error)?;
+        return Ok(if fresh {
+            EvacuationRecord::Recorded
+        } else {
+            EvacuationRecord::NotYet(
+                "the row pins no artifact and has no ready full snapshot since its placement changed"
+                    .to_owned(),
+            )
+        });
     }
     if let Some(pin) = pin
         && ready(pin).await?
