@@ -2057,6 +2057,60 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn postgres_shaped_default_create_miss_boots_cold_at_the_requested_shape() -> TestResult {
+    let db = pg_test_db().await?;
+    let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:shaped").await?;
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 2, 8192, 32768, 1, 1, 1, 'space', true)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    let template = TemplateName::parse("app-runtime").unwrap();
+    let requested = SandboxResources {
+        vcpu: Some(4),
+        memory_mib: Some(4096),
+        disk_mib: None,
+    };
+    let boot_mode = CreateBootMode::from_api(None, requested.has_custom_vm_shape())
+        .expect("a shaped default create is accepted");
+    assert_eq!(boot_mode, CreateBootMode::Cold);
+    assert_eq!(
+        boot_mode.for_pool_attempt(None, &requested),
+        CreateBootMode::Fallthrough,
+        "the shaped create tries the pool first"
+    );
+
+    // The miss path resolves with the create's own mode, not the pool
+    // attempt's, so the configured pool shape does not replace the request.
+    let (resources, _, source) = resolve_cold_create_resources(
+        &db.pool,
+        ColdCreateShapeInput {
+            capabilities: SubstrateCapabilities::KUBERNETES,
+            runtime: RuntimeKind::Firecracker,
+            boot_mode,
+            template: &template,
+            content_hash: "sha256:shaped",
+            template_release_id: release_id,
+            requested,
+            restoring: false,
+        },
+    )
+    .await?;
+    assert_eq!(
+        (resources.vcpu, resources.memory_mib, resources.disk_mib),
+        (Some(4), Some(4096), None)
+    );
+    assert_eq!(source, Some(CreateShapeSource::Request));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materialization() -> TestResult {
     let db = pg_test_db().await?;
     let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:new-release").await?;
