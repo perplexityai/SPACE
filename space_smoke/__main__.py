@@ -893,6 +893,20 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     inventory = subparsers.add_parser("list")
     inventory.add_argument("--tier", action="append", choices=sorted(TIERS))
+    inventory.add_argument("--prefix", help="only scenarios whose ID starts with this")
+    inventory.add_argument(
+        "--shard",
+        type=_parse_shard,
+        metavar="INDEX/COUNT",
+        help="only one duration-balanced partition of the listed scenarios, for runs by name "
+        "on several benches (1-based)",
+    )
+    inventory.add_argument(
+        "--api-surface",
+        choices=JOINT_SURFACES,
+        default="native",
+        help="the surface whose duration hints weigh the partition (default: native)",
+    )
     describe = subparsers.add_parser("describe")
     describe.add_argument("scenario")
     run = subparsers.add_parser("run")
@@ -912,9 +926,17 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "list":
-        for scenario in REGISTRY:
-            if args.tier is None or scenario.tier in args.tier:
-                print(f"{scenario.id}\t{scenario.invariant}")
+        listed = tuple(
+            scenario
+            for scenario in REGISTRY
+            if (args.tier is None or scenario.tier in args.tier)
+            and (args.prefix is None or scenario.id.startswith(args.prefix))
+        )
+        if args.shard is not None:
+            index, count = args.shard
+            listed = select_shard(listed, index=index, count=count, api_surface=args.api_surface)
+        for scenario in listed:
+            print(f"{scenario.id}\t{scenario.invariant}")
         return 0
     if args.command == "describe":
         return _describe(args.scenario)

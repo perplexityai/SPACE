@@ -216,6 +216,47 @@ class StoppableLifecycleSandbox(CommandSandbox, Protocol):
     def start(self) -> None: ...
 
 
+class OperationLifecycleSandbox(CommandSandbox, Protocol):
+    """Command sandbox whose lifecycle calls are recorded operations a caller can follow."""
+
+    def request_lifecycle(self, verb: str) -> str:
+        """Ask for `verb` (`wake`, `resume`, ...) without waiting; the operation's id."""
+        ...
+
+    def operation(self, operation_id: str) -> dict[str, object]:
+        """The operation as `GET /v1/operations/{id}` answers it."""
+        ...
+
+    def state(self) -> str:
+        """The sandbox's state as the public API reports it."""
+        ...
+
+
+@dataclass(frozen=True)
+class CallAnswer:
+    """One HTTP answer, as a caller that judges it itself reads it: the
+    status, its `Retry-After` header and its JSON body (`{}` when it had
+    none or wasn't JSON)."""
+
+    status: int
+    retry_after: str | None
+    body: dict[str, Any]
+
+
+class RawCallSandbox(OperationLifecycleSandbox, Protocol):
+    """Command sandbox whose calls a scenario can make without the client's
+    own handling, to judge a refusal's status and `Retry-After` itself."""
+
+    def lifecycle_answer(self, verb: str) -> CallAnswer:
+        """`POST /v1/sandboxes/{id}:<verb>`, answered as it came."""
+        ...
+
+    def command_answer(self, command: str) -> CallAnswer:
+        """`POST /v1/sandboxes/{id}/commands` for `sh -c command`, answered
+        as it came; the command's output is not attached."""
+        ...
+
+
 class ProcessHandle(Protocol):
     @property
     def process_id(self) -> str: ...
@@ -1654,6 +1695,7 @@ class AdminNodeView:
     drain_phase: str | None
     drain_mode: str | None
     sandboxes_active: int | None
+    drain_last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1700,6 +1742,298 @@ class NodeDrainControl(NodeFaultControl, Protocol):
     def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
 
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
+
+
+@dataclass(frozen=True)
+class SandboxRowState:
+    """The `sandboxes` columns a node cleanup would change, and `updated_at`.
+
+    `updated_at` is trigger-maintained: an update that changes any column
+    other than `last_used_at`, `last_access_at` and `last_command_at` moves it.
+    """
+
+    sandbox_id: str
+    lifecycle: str
+    placement: str
+    active_node_id: str | None
+    target_node_id: str | None
+    updated_at: str
+
+
+class KindWorkerControl(NodeDrainControl, Protocol):
+    """Kind-only operations on a worker's instance and on the controller's env.
+
+    A scenario overrides cluster-controller Deployment env (closed key list,
+    closed value vocabulary) under the controller-mutation Lease, and puts
+    the captured standing values back. A Kind worker gets a fake AWS
+    providerID by re-registering its Node with the kubelet's `--provider-id`
+    rewritten, so its EC2 instance is recorded and Kind's fake EC2 can answer
+    for it. The node fault is named: stop one Kind worker's container, delete
+    its Kubernetes Node or keep it, and mark its instance terminated in the
+    fake EC2; then start the container again, under a new providerID for a
+    same-name replacement.
+    """
+
+    def acquire_controller_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible controller-deployment Lease; returns its release."""
+        ...
+
+    def drain_v2_switches(self) -> dict[str, str | None]:
+        """`SPACE_DRAIN_V2_ENABLED` as the bench's values rendered it, by
+        Deployment role (`api`, the public API that answers `:drain`, and
+        `controller`); None where unset."""
+        ...
+
+    def drain_v2_test_hooks(self) -> dict[str, str | None]:
+        """The literal value of each `SPACE_DRAIN_V2_TEST_*` hook on the
+        controller Deployment, None if unset."""
+        ...
+
+    def drain_v2_env(self) -> dict[str, str | None]:
+        """The literal value of every drain v2 env key on the controller Deployment."""
+        ...
+
+    def set_drain_v2_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply smoke overrides and await the controller rollout; refuses keys or values off the lists."""
+        ...
+
+    def restore_drain_v2_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets), await the controller
+        rollout, and refuse unless the Deployment reads them back exactly."""
+        ...
+
+    def acquire_public_api_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible public-API-deployment Lease; returns its release."""
+        ...
+
+    def drain_v2_api_env(self) -> dict[str, str | None]:
+        """The literal value of every drain v2 env key on the public API Deployment."""
+        ...
+
+    def set_drain_v2_api_env(self, overrides: Mapping[str, str]) -> None:
+        """Apply the evacuation cap override and await the public API rollout,
+        under the caller's live public-API Lease; refuses keys or values off the list."""
+        ...
+
+    def restore_drain_v2_api_env(self, standing: Mapping[str, str | None]) -> None:
+        """Put the captured literals back (None unsets), await the rollout, and
+        refuse unless the Deployment reads them back exactly."""
+        ...
+
+    def kind_node_provider_id(self, node_name: str) -> str:
+        """The Kind worker's Node `spec.providerID`."""
+        ...
+
+    def set_kind_worker_provider_id(
+        self, node_name: str, provider_id: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the running Kind worker's Node under `provider_id`, a
+        fake AWS providerID: rewrite the kubelet's `--provider-id`, delete the
+        Node, restart the kubelet, put back `labels`, and wait for the Node
+        and its node services to be Ready."""
+        ...
+
+    def fake_ec2_terminate(self, instance_id: str) -> None:
+        """Mark the instance terminated in Kind's fake EC2, through its loopback test control."""
+        ...
+
+    def set_fake_ec2_terminate_delay(self, seconds: int) -> None:
+        """How long each instance Kind's fake EC2 marks terminated from now on
+        reads `shutting-down` first (0 to 3600), through its loopback test
+        control; 0 puts the default back."""
+        ...
+
+    def release_fake_ec2_instance(self, instance_id: str) -> None:
+        """End the `shutting-down` delay of an instance Kind's fake EC2 already
+        marked terminated, so it reads `terminated` from now on, through its
+        loopback test control."""
+        ...
+
+    def fake_ec2_instance_state(self, instance_id: str) -> str:
+        """What Kind's fake EC2 lists for the instance ID, as DescribeInstances
+        answers it: its states, comma-separated, or `no instance`."""
+        ...
+
+    def node_recorded_instance(self, node_id: str) -> str | None:
+        """`node_k8s.instance_id` of the node, None when it records none or has no row."""
+        ...
+
+    def set_node_recorded_instance(self, node_id: str, instance_id: str | None) -> None:
+        """Write the node's `node_k8s.instance_id` directly: the stale instance
+        an older registration writer leaves across a Node UID change, which no
+        public path sets up. A fake instance id, or None."""
+        ...
+
+    def restore_kind_worker_provider_id(
+        self, node_name: str, labels: Mapping[str, str], *, timeout: float
+    ) -> None:
+        """Re-register the worker under Kind's own providerID, which names no
+        EC2 instance; as `set_kind_worker_provider_id`, it deletes the pods on
+        the worker."""
+        ...
+
+    def node_row_exists(self, node_id: str) -> bool: ...
+
+    def creating_snapshots_from_node(self, node_id: str) -> list[str]:
+        """The ids of the snapshots still `creating` whose `source_node_id`
+        is the node, sorted."""
+        ...
+
+    def node_created_at(self, node_id: str) -> str | None:
+        """`nodes.created_at` of the node, as text; None without a row."""
+        ...
+
+    def kind_node_labels(self, node_name: str) -> dict[str, str]:
+        """The Kind worker's Node labels, which deleting the Node discards."""
+        ...
+
+    def stop_kind_worker(self, node_name: str, *, keep_node: bool = False) -> None:
+        """Stop the Kind worker's container, then delete its Kubernetes Node
+        unless `keep_node`, which leaves the Node behind its machine as a
+        cloud controller that lags would."""
+        ...
+
+    def kube_node_uid(self, node_name: str) -> str | None:
+        """The uid of the Kubernetes Node of that name, None when there is none."""
+        ...
+
+    def delete_kube_node(self, node_name: str, *, uid: str) -> None:
+        """Delete the Kubernetes Node of that name with a uid precondition, so
+        a replacement under the same name is never the one deleted."""
+        ...
+
+    def start_kind_worker(
+        self,
+        node_name: str,
+        labels: Mapping[str, str],
+        *,
+        timeout: float,
+        provider_id: str | None = None,
+    ) -> None:
+        """Start the Kind worker's container, under `provider_id` when given
+        (the kubelet's `--provider-id` rewritten while it is stopped), put
+        back the `labels` its re-registered Node lacks as soon as it exists,
+        then wait, each with the whole `timeout`, for the Node and the node
+        services on it to be Ready."""
+        ...
+
+    def sandbox_row_states(self, sandbox_ids: Sequence[str]) -> list[SandboxRowState]: ...
+
+
+@dataclass(frozen=True)
+class NodeCliOutcome:
+    """A `space-sbxmgr` call on a node, as it ended."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class DrainV2Status:
+    """`nodes.drain_engine` and `nodes.drain_status` of one node; `status` is the JSON object."""
+
+    engine: str | None
+    status: dict[str, Any] | None
+
+
+class DrainV2Control(KindWorkerControl, Protocol):
+    """Kind-only operations for the drain v2 scenarios, with the controller's
+    drain env and the Kind worker's instance, stop and replacement."""
+
+    def drain_node_v2(self, node_id: str, *, hold_seconds: int) -> None:
+        """`POST :drain` with `engine: v2` and the hold, in seconds (0: due
+        now); refused unless the API accepts it."""
+        ...
+
+    def drain_node_answer(self, node_id: str, body: Mapping[str, object]) -> CallAnswer:
+        """`POST :drain` with `body`, answered as it came."""
+        ...
+
+    def admin_node_drain(self, node_id: str) -> dict[str, Any] | None:
+        """The admin node response's `drain` view of a v2 drain; None when
+        the node has no v2 drain."""
+        ...
+
+    def drain_started_at(self, node_id: str) -> int | None:
+        """`nodes.drain_started_at` in whole Unix seconds; None when unset."""
+        ...
+
+    def drain_v2_status(self, node_id: str) -> DrainV2Status | None:
+        """The node's v2 drain columns; `None` once its row is gone."""
+        ...
+
+    def terminate_node(self, node_id: str) -> int:
+        """`POST :terminate`; the HTTP status it answered."""
+        ...
+
+    def drain_v2_preview(self, node_id: str) -> dict[str, Any]:
+        """`GET /nodes/{node_id}/drain-v2-preview`: what a v2 drain would find
+        on the node, which the node answers without changing anything."""
+        ...
+
+    def plant_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> str:
+        """Make an empty sandbox cache directory named `sandbox_id` on the
+        Kind worker, as a sandbox the node lost track of leaves; its path."""
+        ...
+
+    def remove_orphan_cache_dir(self, node_name: str, sandbox_id: str) -> None:
+        """Remove what `plant_orphan_cache_dir` left: the quarantined row
+        sandbox-manager's inventory made of the directory, if it made one,
+        and the directory, if it is still there and empty."""
+        ...
+
+    def disk_snapshot_ids(self, sandbox_id: str) -> list[str]:
+        """The sandbox's disk snapshot ids."""
+        ...
+
+    def stopped_residency(self, sandbox_id: str) -> StoppedResidency: ...
+
+    def node_tombstoned(self, node_id: str) -> bool:
+        """Whether `node_k8s_tombstones` holds a tombstone for the node id."""
+        ...
+
+    def node_sandbox_state(self, node_name: str, sandbox_id: str) -> str | None:
+        """The sandbox's row state in that node's sandbox-manager, or None without a row."""
+        ...
+
+    def restart_node_service(self, node_name: str, component: str, *, timeout: float) -> str:
+        """Delete that node service's pod and wait for its Ready replacement on the same node."""
+        ...
+
+    def block_node_traffic(self, node_name: str, path: str) -> None:
+        """Cut one node-local path on the Kind node (`object-store`: its pods'
+        and host processes' connections to the object store are reset;
+        `node-api`: connections to its node-api go unanswered)."""
+        ...
+
+    def unblock_node_traffic(self, node_name: str, path: str) -> None:
+        """Remove exactly the rules `block_node_traffic` added for `path`."""
+        ...
+
+    def restart_controller(self, *, timeout: float) -> list[str]:
+        """Kill every cluster-controller pod at once and await Ready
+        replacements; the killed pods' names."""
+        ...
+
+    def scale_controller(self, replicas: int, *, timeout: float) -> int:
+        """Scale the cluster-controller Deployment (0..2) under the caller's
+        controller-mutation Lease and await it; the replicas it had."""
+        ...
+
+    def sandbox_placements(self, sandbox_ids: Sequence[str]) -> dict[str, tuple[str, str | None]]:
+        """Each sandbox's lifecycle and active node id, by bare id, in one read."""
+        ...
+
+    def node_disk_snapshot(self, node_name: str, sandbox_id: str) -> str:
+        """`space-sbxmgr snapshot` (disk) of the sandbox on that node; the
+        snapshot's name."""
+        ...
+
+    def node_rollback(self, node_name: str, sandbox_id: str, snapshot: str) -> NodeCliOutcome:
+        """`space-sbxmgr rollback` of the sandbox to `snapshot` on that node,
+        as it ended."""
+        ...
 
 
 @dataclass(frozen=True)
