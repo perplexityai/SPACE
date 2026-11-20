@@ -178,7 +178,12 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
     ) -> Result<StartedRecoveryRestoreContext, SubstrateError> {
-        let no_newer = no_newer_full_snapshot("s", "sn");
+        // A newer `failed` full snapshot doesn't veto: it holds no bytes, the
+        // activity clocks below already decide staleness, and it's exactly
+        // what a lost-started rollback leaves behind (the dead upload it
+        // failed). Same rule as the rollback, so started recovery accepts a
+        // rolled-back row it re-woke instead of 412ing it forever.
+        let no_newer = no_newer_unfailed_full_snapshot("s", "sn");
         let query = format!(
             "SELECT sn.state,
                     nk.k8s_node_name,
@@ -284,9 +289,10 @@ impl K8sStore {
     ///   The other half, a ready snapshot that covers the activity clocks but
     ///   doesn't match the marker, isn't treated as pending: nothing would
     ///   make it match later, so it keeps today's answer.
-    /// - otherwise [`rollback_marker_suspend_backup_exists`] true: the loop
-    ///   rolls the row back to that snapshot once the source node is proven
-    ///   gone. The source node comes back with it, since the caller only
+    /// - otherwise [`rollback_marker_suspend_backup_exists_after_quiet_upload_fail`]
+    ///   true: the loop rolls the row back to that snapshot once the source
+    ///   node is proven gone, after failing that node's quiet uploads, which
+    ///   is why such an upload doesn't veto here. The source node comes back with it, since the caller only
     ///   answers retryable when that node already looks lost.
     ///
     /// The settle window for a `creating` upload from the sandbox's own node
@@ -303,7 +309,11 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<StartedRecoveryUnavailableCause, SubstrateError> {
-        let rollback_source = rollback_marker_suspend_backup_exists("s");
+        // As the give-up will see it once it has failed the node's quiet
+        // uploads, so a node that died mid-upload isn't told 412 just
+        // before it is rolled back.
+        let rollback_source =
+            rollback_marker_suspend_backup_exists_after_quiet_upload_fail("s", "$2");
         // The upload half of `started_restore_source_absent`, plus a bound
         // the loop doesn't need (it answers no client): an upload quiet past
         // the abandoned age never counts as landing, so a 503 can't last

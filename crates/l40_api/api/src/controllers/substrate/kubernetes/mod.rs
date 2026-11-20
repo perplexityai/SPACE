@@ -418,6 +418,15 @@ fn duration_to_proto(duration: Duration) -> prost_types::Duration {
     }
 }
 
+/// `SPACE_LOST_STARTED_SANDBOXES_ENABLED` in the cluster controller's
+/// vocabulary (`EnvConfig::truthy_default`: `1` or `true` in three cases),
+/// default off. The two processes must agree: the API only tells a client to
+/// wait for a node-loss rollback when the controller will perform it, so a
+/// value like `on`, which the controller ignores, keeps this off too.
+fn lost_started_give_up_enabled(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1" | "true" | "True" | "TRUE"))
+}
+
 #[derive(Clone)]
 pub struct KubernetesState {
     pub client: Client,
@@ -531,9 +540,10 @@ impl KubernetesState {
                 )?,
             activation_client_attribution: super::ActivationClientAttribution::from_env(),
             restore_dispatch_fence: RestoreDispatchFence::from_env(),
-            lost_started_give_up_enabled: pplx_space_env_vars::env_flag_var(
-                "SPACE_LOST_STARTED_SANDBOXES_ENABLED",
-                false,
+            lost_started_give_up_enabled: lost_started_give_up_enabled(
+                std::env::var("SPACE_LOST_STARTED_SANDBOXES_ENABLED")
+                    .ok()
+                    .as_deref(),
             ),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,

@@ -17941,3 +17941,14 @@ mod kubernetes_tests {
         assert_eq!(classify_fenced_pod_delete_error(&api_error(500)), None);
     }
 }
+
+#[test]
+fn lost_started_give_up_flag_reads_the_controllers_vocabulary() {
+    for on in ["1", "true", "True", "TRUE"] {
+        assert!(super::lost_started_give_up_enabled(Some(on)), "{on}");
+    }
+    for off in ["0", "false", "on", "yes", "enabled", "ON", ""] {
+        assert!(!super::lost_started_give_up_enabled(Some(off)), "{off}");
+    }
+    assert!(!super::lost_started_give_up_enabled(None));
+}

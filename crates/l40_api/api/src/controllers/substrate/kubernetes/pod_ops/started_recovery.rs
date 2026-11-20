@@ -151,30 +151,21 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
     ) -> SubstrateError {
-        match self
+        let cause = match self
             .store
             .started_recovery_unavailable_cause(sandbox_id)
             .await
         {
-            Ok(StartedRecoveryUnavailableCause::SourcePublishing) => {
-                upload_settling(sandbox_id, generation)
-            }
-            Ok(StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
-                source_node, ..
-            }) if !self.started_recovery_source_node_looks_lost(&source_node) => {
-                upload_settling(sandbox_id, generation)
-            }
-            Ok(
-                StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { source_node }
-                | StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
-                    source_node,
-                    stale_rollback_source: true,
-                },
-            ) if stale_source_retry_can_resolve(
-                self.k8s.lost_started_give_up_enabled,
-                self.started_recovery_source_node_looks_lost(&source_node),
-            ) =>
-            {
+            Ok(cause) => cause,
+            // The classification is advisory. Failing to read it must not turn
+            // a possibly recoverable sandbox into a terminal answer.
+            Err(error) => return error,
+        };
+        match unavailable_answer(&cause, self.k8s.lost_started_give_up_enabled, |node| {
+            self.started_recovery_source_node_looks_lost(node)
+        }) {
+            UnavailableAnswer::UploadSettling => upload_settling(sandbox_id, generation),
+            UnavailableAnswer::AwaitingSourceNodeLoss => {
                 SubstrateError::RestoreAwaitingSourceNodeLoss {
                     message: format!(
                         "sandbox {sandbox_id} generation {generation}: the only durable restore \
@@ -183,19 +174,12 @@ impl KubernetesSubstrate {
                     ),
                 }
             }
-            Ok(
-                StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { .. }
-                | StartedRecoveryUnavailableCause::SameNodeUploadPastSettle { .. }
-                | StartedRecoveryUnavailableCause::NoDurableSource,
-            ) => SubstrateError::RestoreContextUnavailable {
+            UnavailableAnswer::ContextUnavailable => SubstrateError::RestoreContextUnavailable {
                 message: format!(
                     "sandbox {sandbox_id} generation {generation} has no verified local or \
                      remote restore source; leaving the execution unchanged"
                 ),
             },
-            // The classification is advisory. Failing to read it must not turn
-            // a possibly recoverable sandbox into a terminal answer.
-            Err(error) => error,
         }
     }
 
@@ -259,6 +243,44 @@ impl KubernetesSubstrate {
     }
 }
 
+/// What started recovery answers for a classified unavailable restore source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnavailableAnswer {
+    /// `RestoreUploadSettling`: retryable 503, the attempt completes failed.
+    UploadSettling,
+    /// `RestoreAwaitingSourceNodeLoss`: retryable 503.
+    AwaitingSourceNodeLoss,
+    /// `RestoreContextUnavailable`: 412.
+    ContextUnavailable,
+}
+
+/// The decision behind `started_recovery_unavailable_error`, apart from the
+/// Node cache so it can be tested. `looks_lost` is
+/// `started_recovery_source_node_looks_lost`.
+fn unavailable_answer(
+    cause: &StartedRecoveryUnavailableCause,
+    give_up_enabled: bool,
+    looks_lost: impl Fn(&StaleRecoverySourceNode) -> bool,
+) -> UnavailableAnswer {
+    use StartedRecoveryUnavailableCause as Cause;
+    match cause {
+        Cause::SourcePublishing => UnavailableAnswer::UploadSettling,
+        Cause::SameNodeUploadPastSettle { source_node, .. } if !looks_lost(source_node) => {
+            UnavailableAnswer::UploadSettling
+        }
+        Cause::StaleSourceAwaitingNodeLoss { source_node }
+        | Cause::SameNodeUploadPastSettle {
+            source_node,
+            stale_rollback_source: true,
+        } if stale_source_retry_can_resolve(give_up_enabled, looks_lost(source_node)) => {
+            UnavailableAnswer::AwaitingSourceNodeLoss
+        }
+        Cause::StaleSourceAwaitingNodeLoss { .. }
+        | Cause::SameNodeUploadPastSettle { .. }
+        | Cause::NoDurableSource => UnavailableAnswer::ContextUnavailable,
+    }
+}
+
 fn upload_settling(sandbox_id: SandboxId, generation: ExecutionGeneration) -> SubstrateError {
     SubstrateError::RestoreUploadSettling {
         message: format!(
@@ -279,7 +301,80 @@ fn stale_source_retry_can_resolve(give_up_enabled: bool, source_node_looks_lost:
 
 #[cfg(test)]
 mod tests {
-    use super::stale_source_retry_can_resolve;
+    use super::{
+        StaleRecoverySourceNode, StartedRecoveryUnavailableCause, UnavailableAnswer,
+        stale_source_retry_can_resolve, unavailable_answer,
+    };
+
+    fn node() -> StaleRecoverySourceNode {
+        StaleRecoverySourceNode::Named("source-node".to_string())
+    }
+
+    #[test]
+    fn quiet_same_node_upload_on_a_lost_node_waits_for_the_rollback() {
+        // Arrange: the node died mid-upload; the loop will fail the quiet
+        // upload and roll the row back to the marker.
+        let cause = StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
+            source_node: node(),
+            stale_rollback_source: true,
+        };
+
+        // Act / Assert.
+        assert_eq!(
+            unavailable_answer(&cause, true, |_| true),
+            UnavailableAnswer::AwaitingSourceNodeLoss
+        );
+        assert_eq!(
+            unavailable_answer(&cause, true, |_| false),
+            UnavailableAnswer::UploadSettling,
+            "a live node can still finalize the upload"
+        );
+        assert_eq!(
+            unavailable_answer(&cause, false, |_| true),
+            UnavailableAnswer::ContextUnavailable,
+            "nothing rolls back with the give-up off"
+        );
+    }
+
+    #[test]
+    fn quiet_same_node_upload_without_a_rollback_source_is_unavailable_once_lost() {
+        let cause = StartedRecoveryUnavailableCause::SameNodeUploadPastSettle {
+            source_node: node(),
+            stale_rollback_source: false,
+        };
+
+        assert_eq!(
+            unavailable_answer(&cause, true, |_| true),
+            UnavailableAnswer::ContextUnavailable
+        );
+        assert_eq!(
+            unavailable_answer(&cause, true, |_| false),
+            UnavailableAnswer::UploadSettling
+        );
+    }
+
+    #[test]
+    fn stale_source_and_other_causes_map_as_before() {
+        let stale = StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss {
+            source_node: node(),
+        };
+        assert_eq!(
+            unavailable_answer(&stale, true, |_| true),
+            UnavailableAnswer::AwaitingSourceNodeLoss
+        );
+        assert_eq!(
+            unavailable_answer(&stale, true, |_| false),
+            UnavailableAnswer::ContextUnavailable
+        );
+        assert_eq!(
+            unavailable_answer(&StartedRecoveryUnavailableCause::SourcePublishing, false, |_| false),
+            UnavailableAnswer::UploadSettling
+        );
+        assert_eq!(
+            unavailable_answer(&StartedRecoveryUnavailableCause::NoDurableSource, true, |_| true),
+            UnavailableAnswer::ContextUnavailable
+        );
+    }
 
     #[test]
     fn stale_source_waits_only_for_a_lost_node_with_the_give_up_on() {
