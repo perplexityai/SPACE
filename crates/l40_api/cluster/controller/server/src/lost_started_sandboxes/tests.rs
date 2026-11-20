@@ -248,6 +248,18 @@ impl FakeSink {
         }
     }
 
+    /// Sets the first pass's resident count and the second pass's counts.
+    fn set_residents(&self, node_id: NodeId, residents: u64, counts: StrandedCounts) {
+        let mut state = self.0.lock().unwrap();
+        for row in &mut state.residents {
+            if row.node_id == node_id {
+                row.residents = residents;
+                row.recent_residents = residents;
+            }
+        }
+        state.stranded.insert(node_id, counts);
+    }
+
     fn clear_count_calls(&self) {
         self.0.lock().unwrap().count_calls.clear();
     }
@@ -1851,4 +1863,43 @@ async fn s9_deleted_node_at_rest_counts_only_within_the_window() {
     let report = reconciler.tick().await;
     assert!(sink.count_calls().is_empty(), "past the window it stops");
     assert_eq!(gone(&report), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn s10_deleted_node_found_clear_is_not_recounted() {
+    let sink = FakeSink::new(Vec::new());
+    // Deleted, holding suspends that all have a ready copy.
+    let clear = NodeId::new();
+    sink.with_node(clear, SourceNode::RowDeleted, counts(0, 0));
+    sink.set_residents(clear, 2, counts(0, 0));
+    let stranded = NodeId::new();
+    sink.with_node(stranded, SourceNode::RowDeleted, counts(0, 1));
+    let mut reconciler = Reconciler::new(
+        config(),
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        presence(),
+    );
+
+    let report = reconciler.tick().await;
+    let mut calls = sink.count_calls();
+    calls.sort();
+    let mut both = vec![clear, stranded];
+    both.sort();
+    assert_eq!(calls, both);
+    assert_eq!(gone(&report), (1, 1));
+
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert_eq!(sink.count_calls(), vec![stranded], "a clear deleted node is not recounted");
+    assert_eq!(gone(&report), (1, 1));
+
+    // Leaving the first pass forgets it.
+    sink.set_residents(clear, 0, counts(0, 0));
+    reconciler.tick().await;
+    sink.set_residents(clear, 1, counts(0, 1));
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert!(sink.count_calls().contains(&clear));
+    assert_eq!(gone(&report), (2, 2));
 }

@@ -381,6 +381,11 @@ pub struct Reconciler<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence
     /// other than `lookup_budget`. A node the budget defers keeps it, so
     /// rotating the lookups doesn't zero a node already judged gone.
     census_verdicts: HashMap<NodeId, (StrandedVerdict, &'static str)>,
+    /// Deleted nodes a census found holding nothing stranded. A deleted node
+    /// gains no residents, so they are skipped until they leave the scan.
+    /// The one way back, a retention delete removing a ready copy, goes
+    /// unreported until the controller restarts.
+    census_deleted_clear: HashSet<NodeId>,
 }
 
 impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L, P> {
@@ -398,6 +403,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             census_row_gone_since: HashMap::new(),
             census_lookup_after: None,
             census_verdicts: HashMap::new(),
+            census_deleted_clear: HashSet::new(),
         }
     }
 
@@ -591,6 +597,8 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
         let mut budget_spent = false;
         let mut settled_verdicts = HashMap::new();
         let mut suspects = Vec::new();
+        let mut deleted_clear = HashSet::new();
+        let mut deleted_suspects = HashSet::new();
         for node in nodes {
             let residents = match &node.source_node {
                 SourceNode::RowDeleted => {
@@ -621,6 +629,13 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             };
             if residents == 0 {
                 continue;
+            }
+            if matches!(node.source_node, SourceNode::RowDeleted) {
+                if self.census_deleted_clear.contains(&node.node_id) {
+                    deleted_clear.insert(node.node_id);
+                    continue;
+                }
+                deleted_suspects.insert(node.node_id);
             }
             let (verdict, reason, tag_node) = match &node.source_node {
                 SourceNode::RowDeleted => (
@@ -669,6 +684,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
         self.census_row_gone_since = row_gone_since;
         self.census_lookup_after = if budget_spent { last_lookup } else { None };
         self.census_verdicts = settled_verdicts;
+        self.census_deleted_clear = deleted_clear;
 
         let suspect_ids: Vec<NodeId> = suspects.iter().map(|suspect| suspect.0).collect();
         let stranded_by_node = if suspect_ids.is_empty() {
@@ -694,6 +710,9 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             let counts = stranded_by_node.get(&node_id).copied().unwrap_or_default();
             let stranded = counts.running + counts.at_rest_without_copy;
             if stranded == 0 {
+                if deleted_suspects.contains(&node_id) {
+                    self.census_deleted_clear.insert(node_id);
+                }
                 continue;
             }
             *report.stranded_nodes.entry(verdict).or_default() += 1;
