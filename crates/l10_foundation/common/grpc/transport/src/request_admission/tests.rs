@@ -264,28 +264,50 @@ fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
 }
 
 #[test]
-fn releasing_a_permit_frees_its_slots_for_every_clone_once() {
+fn exchanging_a_permit_frees_its_payload_slots_for_every_clone_once() {
     let slots = Arc::new(Semaphore::new(4));
+    let detached = Arc::new(Semaphore::new(2));
     let permit = RequestPermit::try_acquire(slots.clone(), 4, None).expect("admit");
     let transport_clone = permit.clone();
     let weak = permit.downgrade();
     assert!(weak.held_for().is_some());
     assert_eq!(slots.available_permits(), 0);
 
-    assert!(weak.release(), "the first release returns the slots");
+    let other = detached.clone().try_acquire_owned().expect("detached slot");
+    weak.exchange(other)
+        .expect("the first exchange returns the slots");
     assert_eq!(slots.available_permits(), 4, "every clone's slots are back");
+    assert_eq!(
+        detached.available_permits(),
+        1,
+        "the exchanged permit is held"
+    );
     assert_eq!(permit.slots(), 0);
     assert!(weak.held_for().is_none());
-    assert!(!weak.release(), "a second release has nothing to return");
+    let other = detached.clone().try_acquire_owned().expect("detached slot");
+    let other = weak
+        .exchange(other)
+        .expect_err("a second exchange has nothing to return");
+    drop(other);
+    assert_eq!(detached.available_permits(), 1);
 
-    // A released permit cannot stand in for admission; the handler takes
-    // fresh slots instead of reusing it.
+    // An exchanged permit cannot stand in for payload admission; the handler
+    // takes fresh slots instead of reusing it.
     let reacquired =
         RequestPermit::try_acquire(slots.clone(), 4, Some(transport_clone)).expect("reacquire");
     assert_eq!(reacquired.slots(), 4);
     assert_eq!(slots.available_permits(), 0);
     drop(permit);
+    assert_eq!(
+        detached.available_permits(),
+        2,
+        "the exchanged permit ends with its last owner"
+    );
     drop(reacquired);
     assert_eq!(slots.available_permits(), 4);
-    assert!(!weak.release(), "nothing is left once every owner dropped");
+    let other = detached.clone().try_acquire_owned().expect("detached slot");
+    assert!(
+        weak.exchange(other).is_err(),
+        "nothing is left once every owner dropped"
+    );
 }

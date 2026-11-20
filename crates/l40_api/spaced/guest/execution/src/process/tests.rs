@@ -1208,6 +1208,7 @@ async fn cancelled_account_lookup_retains_admission_until_nss_returns() {
     let lookup = tokio::spawn(resolve_process_account(
         service.inner.process_tasks.clone(),
         slots.clone(),
+        service.inner.start_admission.clone(),
         None,
         move || {
             let _ = started_tx.send(());
@@ -1221,6 +1222,7 @@ async fn cancelled_account_lookup_retains_admission_until_nss_returns() {
     let retry = resolve_process_account(
         service.inner.process_tasks.clone(),
         slots.clone(),
+        service.inner.start_admission.clone(),
         None,
         || Err(Status::unavailable("lookup ran")),
     )
@@ -1348,9 +1350,10 @@ fn stalled_placement_service() -> (ExecutionService, StalledPlacement) {
         let _ = io::copy(&mut reader, &mut io::sink());
     });
     let mut service = cancellation_service();
-    Arc::get_mut(&mut service.inner)
-        .expect("service is not shared yet")
-        .guest_cgroups = Some(Arc::new(crate::ExecutionCgroups::new(
+    let inner = Arc::get_mut(&mut service.inner).expect("service is not shared yet");
+    // Long enough that a start refused while two stall lands well inside it.
+    inner.start_admission.hold_limit = Duration::from_secs(1);
+    inner.guest_cgroups = Some(Arc::new(crate::ExecutionCgroups::new(
         std::fs::File::from(OwnedFd::from(
             writer.try_clone().expect("clone placement pipe"),
         )),
@@ -1565,8 +1568,9 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
 // Payload admission fits two starts at once. Two starts stalled in `spawn`,
 // as under guest memory pressure, used to keep both admissions until the
 // kernel let them go, and refused every later start (a reconnect included)
-// with RESOURCE_EXHAUSTED for as long as that took. Past the hold limit their
-// slots return to the budget while they carry on, so a later start is admitted.
+// with RESOURCE_EXHAUSTED for as long as that took. Past the hold limit they
+// trade their slots for detached-start slots and carry on, so a later start
+// is admitted.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn starts_stalled_in_spawn_release_admission_at_the_hold_limit() {
@@ -1619,7 +1623,7 @@ async fn starts_stalled_in_spawn_release_admission_at_the_hold_limit() {
         "{refused:?}"
     );
 
-    tokio::time::sleep(START_ADMISSION_HOLD_LIMIT + Duration::from_millis(100)).await;
+    tokio::time::sleep(service.inner.start_admission.hold_limit + Duration::from_millis(100)).await;
     assert!(
         stalled.iter().all(|start| !start.is_finished()),
         "both starts are still stalled in spawn"
@@ -1649,6 +1653,86 @@ async fn starts_stalled_in_spawn_release_admission_at_the_hold_limit() {
         .await
         .unwrap()
         .expect("the admitted start completes");
+    shut_down(&service).await;
+}
+
+// Starts that carry on past the hold limit are capped: with one detached
+// slot left, only one of two stalled starts gives up its payload slots, the
+// other keeps them, and admission refuses again once a third start stalls.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_detached_start_cap_keeps_admission_with_starts_past_it() {
+    use pplx_space_spaced_guest_protocol::process_limits;
+    let (service, placement) = stalled_placement_service();
+    let detached = service.inner.start_admission.detached_starts.clone();
+    let _taken = detached
+        .clone()
+        .try_acquire_many_owned(detached.available_permits() as u32 - 1)
+        .expect("leave one detached slot");
+    let start = |key: &'static str| {
+        let service = service.clone();
+        tokio::spawn(async move {
+            Process::start(
+                &service,
+                Request::new(StartRequest {
+                    command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                    idempotency_key: Some(key.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(drop)
+        })
+    };
+    let wait_for_owners = |owners: usize| {
+        let service = service.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while service.inner.processes.records.len() < owners {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("starts reach their owners");
+        }
+    };
+    let stalled = [start("stalled-1"), start("stalled-2")];
+    wait_for_owners(2).await;
+    tokio::time::sleep(service.inner.start_admission.hold_limit + Duration::from_millis(100)).await;
+    let slots = &service.inner.process_payload_slots;
+    assert_eq!(detached.available_permits(), 0, "one start detached");
+    assert_eq!(
+        slots.available_permits(),
+        process_limits::START_PAYLOAD_SLOTS as usize,
+        "the start past the detached cap keeps its payload slots"
+    );
+
+    let third = start("third");
+    wait_for_owners(3).await;
+    let refused = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            idempotency_key: Some("refused".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .map(drop)
+    .expect_err("admission refuses once the detached cap is reached");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::ResourceExhausted,
+        "{refused:?}"
+    );
+
+    placement.release();
+    for start in stalled.into_iter().chain([third]) {
+        start
+            .await
+            .unwrap()
+            .expect("a stalled start completes once its spawn resumes");
+    }
     shut_down(&service).await;
 }
 

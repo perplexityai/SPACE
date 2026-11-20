@@ -22,13 +22,21 @@ pub struct RequestPermit {
 
 #[derive(Debug)]
 struct PermitInner {
-    /// `None` once [`WeakRequestPermit::release`] returned the slots early.
-    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    permit: Mutex<Held>,
     semaphore: Arc<Semaphore>,
     slots: usize,
     acquired_at: Instant,
     observation: Option<Budget>,
     cancelled_at: OnceLock<Instant>,
+}
+
+/// What a permit holds: its payload slots, or, once
+/// [`WeakRequestPermit::exchange`] returned them, a permit from another budget
+/// held for the rest of the work.
+#[derive(Debug)]
+enum Held {
+    Payload(#[allow(dead_code)] OwnedSemaphorePermit),
+    Exchanged(#[allow(dead_code)] OwnedSemaphorePermit),
 }
 
 impl PermitInner {
@@ -42,26 +50,28 @@ impl PermitInner {
         }
     }
 
-    fn holds_slots(&self) -> bool {
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
         self.permit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
     }
 
-    /// Release the slots now, for every clone. Whether this call released them.
-    fn release(&self) -> bool {
-        let permit = self
-            .permit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let Some(permit) = permit else {
-            return false;
-        };
-        drop(permit);
+    fn holds_slots(&self) -> bool {
+        matches!(*self.held(), Held::Payload(_))
+    }
+
+    /// Swap the payload slots for `other`, for every clone, unless they are
+    /// already gone; then `other` comes back.
+    fn exchange(&self, other: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
+        let mut held = self.held();
+        if !matches!(*held, Held::Payload(_)) {
+            return Err(other);
+        }
+        // The payload slots drop here, returning to their budget.
+        *held = Held::Exchanged(other);
+        drop(held);
         self.record_cancelled_release();
-        true
+        Ok(())
     }
 
     fn record_cancelled_release(&self) {
@@ -116,13 +126,18 @@ impl WeakRequestPermit {
         permit.holds_slots().then(|| permit.acquired_at.elapsed())
     }
 
-    /// Return the slots to the budget now, for every clone, even though work
-    /// owning the permit continues. For work whose hold time must be bounded
-    /// where the budget cannot wait for it, such as a start stalled in the
-    /// kernel. Whether this call released them; `false` once every owner
-    /// dropped the permit or an earlier call released it.
-    pub fn release(&self) -> bool {
-        self.permit.upgrade().is_some_and(|permit| permit.release())
+    /// Return the payload slots to their budget now, for every clone, and
+    /// hold `other` (from a separate, smaller budget) in their place for as
+    /// long as the permit lives. For work whose hold time must be bounded
+    /// where the payload budget cannot wait for it, such as a start stalled in
+    /// the kernel, while `other` still caps how much such work is live.
+    /// `other` comes back if every owner dropped the permit or it was already
+    /// exchanged.
+    pub fn exchange(&self, other: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
+        match self.permit.upgrade() {
+            Some(permit) => permit.exchange(other),
+            None => Err(other),
+        }
     }
 }
 
@@ -132,7 +147,7 @@ impl RequestPermit {
             inner: Arc::new(PermitInner {
                 semaphore: Arc::clone(permit.semaphore()),
                 slots: permit.num_permits(),
-                permit: Mutex::new(Some(permit)),
+                permit: Mutex::new(Held::Payload(permit)),
                 acquired_at: Instant::now(),
                 observation,
                 cancelled_at: OnceLock::new(),
@@ -140,7 +155,7 @@ impl RequestPermit {
         }
     }
 
-    /// The slots in use, or 0 once released early.
+    /// The payload slots held, or 0 once exchanged.
     pub fn slots(&self) -> usize {
         if self.inner.holds_slots() {
             self.inner.slots

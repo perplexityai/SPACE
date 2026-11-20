@@ -96,6 +96,7 @@ pub(super) struct ExecutionServiceInner {
     // a spawn that could stall unrelated starts. Lifecycle guards own admission.
     pub(super) start_gate: std::sync::Mutex<()>,
     pub(super) process_payload_slots: Arc<Semaphore>,
+    pub(super) start_admission: process::StartAdmissionBound,
     pub(super) default_operation_user: GuestUserName,
     pub(super) default_working_dir: Option<std::path::PathBuf>,
     pub(super) identity_policy: IdentityPolicy,
@@ -208,6 +209,7 @@ impl ExecutionService {
                 process_payload_slots: Arc::new(Semaphore::new(
                     pplx_space_spaced_guest_protocol::process_limits::PAYLOAD_SLOTS,
                 )),
+                start_admission: process::StartAdmissionBound::default(),
                 default_operation_user: config.default_operation_user,
                 default_working_dir: config.default_working_dir,
                 identity_policy: config.identity_policy,
