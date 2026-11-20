@@ -141,7 +141,7 @@ impl NetworkPool {
     /// Installs `request`'s generation, if it is still the accepted one, in
     /// the slot's sandbox namespace and reads it back. A busy, transitional or
     /// changed slot is left alone. `Err` means the job panicked; nft may have
-    /// run. Until it returns, a dynamic create skips a Ready slot this holds,
+    /// run. While its job runs, a dynamic create skips a Ready slot it holds,
     /// and fails if every free slot is held. A caller should apply to Ready
     /// slots one at a time.
     pub async fn apply_firewall_rules(
@@ -247,7 +247,7 @@ fn apply_blocking(
     host: &dyn SlotHost,
     nft: &Nft<'_>,
 ) -> SlotFirewallReport {
-    // As reset does, refuse new slot work once drain starts.
+    // As reset does, refuse new slot work once node-manager shuts down.
     if pool.shutdown_token.is_cancelled() {
         return SlotFirewallReport::NotRun(NotRun::ShuttingDown);
     }

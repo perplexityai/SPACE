@@ -308,7 +308,7 @@ fn only_healthy_ready_or_leased_slots_are_eligible() {
 }
 
 // Catches nft run, ownership skipped or kept, the assignment read early, or
-// work started during drain.
+// work started during shutdown.
 #[tokio::test]
 async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
