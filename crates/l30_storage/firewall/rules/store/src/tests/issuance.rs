@@ -1,6 +1,7 @@
 //! Issuance against real Postgres and the real trigger queue, with the lease
 //! tests' fixtures.
 
+use jiff::Timestamp;
 use pplx_space_cluster_trigger_queue::{enqueue_triggers, enqueue_triggers_tx};
 use pplx_space_state_reconciliation::ReconcileReason;
 
@@ -72,7 +73,7 @@ async fn issued(pool: &PgPool, target: &LeasedTarget) -> TestResult<Stamp> {
 #[derive(Debug, PartialEq)]
 struct Effects {
     assignment: Option<(i64, Uuid)>,
-    stamp: Option<(Option<i64>, Option<OffsetDateTime>, Option<OffsetDateTime>)>,
+    stamp: Option<(Option<i64>, Option<Timestamp>, Option<Timestamp>)>,
     trigger: Option<(Vec<String>, i64, i32, OffsetDateTime, OffsetDateTime)>,
 }
 
@@ -93,14 +94,19 @@ async fn effects(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult<
         .bind(node)
         .fetch_optional(pool)
         .await?,
-        stamp: sqlx::query_as(sql!(
-            "SELECT issued_assignment_generation, issued_at, next_check_at
-             FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
-        ))
+        stamp: sqlx::query_as::<_, (Option<i64>, Option<OffsetDateTime>, Option<OffsetDateTime>)>(
+            sql!(
+                "SELECT issued_assignment_generation, issued_at, next_check_at
+                 FROM firewall_rules_rollout_items WHERE rollout_id = $1 AND node_id = $2"
+            ),
+        )
         .bind(rollout)
         .bind(node)
         .fetch_optional(pool)
-        .await?,
+        .await?
+        .map(|(generation, issued_at, next_check_at)| {
+            (generation, issued_at.map(jiff), next_check_at.map(jiff))
+        }),
         trigger: sqlx::query_as(sql!(
             "SELECT reasons::text[], generation, attempts, requested_at, next_attempt_at
              FROM node_reconcile_triggers WHERE node_id = $1"
@@ -166,10 +172,17 @@ fn spawn_issue(
     tokio::spawn(async move { issue_with(&pool, &target, Queue::Wake).await })
 }
 
-async fn clock(pool: &PgPool) -> TestResult<OffsetDateTime> {
-    Ok(sqlx::query_scalar(sql!("SELECT clock_timestamp()"))
-        .fetch_one(pool)
-        .await?)
+/// `value` as the store reports it.
+fn jiff(value: OffsetDateTime) -> Timestamp {
+    Timestamp::from_nanosecond(value.unix_timestamp_nanos()).expect("a time jiff can hold")
+}
+
+async fn clock(pool: &PgPool) -> TestResult<Timestamp> {
+    Ok(jiff(
+        sqlx::query_scalar(sql!("SELECT clock_timestamp()"))
+            .fetch_one(pool)
+            .await?,
+    ))
 }
 
 /// Catches a claim that writes delivery state; a generation shared between

@@ -375,11 +375,23 @@ impl ClaimStore for Claiming<'_> {
 }
 
 /// The schema keeps an item's counts non-negative and its stamp's pair
-/// together; a violation is a decode error rather than a guess.
+/// together; a violation, or a time jiff can't hold, is a decode error rather
+/// than a guess.
 fn invalid_item(rollout_id: RolloutId, node_id: NodeId, what: &str) -> sqlx::Error {
     sqlx::Error::Decode(
         format!("firewall rules rollout item {rollout_id}/{node_id} has {what}").into(),
     )
+}
+
+/// An item's time, from SQLx's `time` into jiff; `what` describes it in the error.
+pub(crate) fn item_timestamp(
+    rollout_id: RolloutId,
+    node_id: NodeId,
+    what: &str,
+    value: OffsetDateTime,
+) -> Result<Timestamp, sqlx::Error> {
+    Timestamp::from_nanosecond(value.unix_timestamp_nanos())
+        .map_err(|_| invalid_item(rollout_id, node_id, what))
 }
 
 /// The work an item's issuance stamp leaves.
@@ -394,7 +406,12 @@ pub(crate) fn stamped_work(
         (Some(generation), Some(issued_at)) => Ok(Work::Check {
             assignment_generation: u64::try_from(generation)
                 .map_err(|_| invalid_item(rollout_id, node_id, "a negative generation"))?,
-            issued_at,
+            issued_at: item_timestamp(
+                rollout_id,
+                node_id,
+                "an out-of-range issuance time",
+                issued_at,
+            )?,
         }),
         _ => Err(invalid_item(rollout_id, node_id, "half an issuance stamp")),
     }

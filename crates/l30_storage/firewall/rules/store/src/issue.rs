@@ -11,13 +11,14 @@
 
 use std::time::Duration;
 
+use jiff::Timestamp;
 use pplx_space_accounts::NodeId;
 use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
-use crate::lease::{HANDOFF_LOCK, stamped_work};
+use crate::lease::{HANDOFF_LOCK, item_timestamp, stamped_work};
 use crate::{ItemPhase, LeasedTarget, Work, roll_back, rollout_phase};
 
 /// The wakeup issuance queues for its node, on the issuing transaction.
@@ -34,9 +35,9 @@ pub trait Wakeup {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stamp {
     pub assignment_generation: u64,
-    pub issued_at: OffsetDateTime,
+    pub issued_at: Timestamp,
     /// `None` only if a later writer unscheduled it.
-    pub next_check_at: Option<OffsetDateTime>,
+    pub next_check_at: Option<Timestamp>,
 }
 
 /// What [`issue_first_assignment`] did.
@@ -172,6 +173,7 @@ async fn issue(
     let Some((leased, generation, issued_at, next_check_at)) = item else {
         return Ok(Issuance::Refused(Refusal::NotATarget));
     };
+    let timestamp = |what, at| item_timestamp(target.rollout_id, target.node_id, what, at);
     // A replay, or a commit whose response was lost: the stamp says what was
     // issued, whoever holds the lease now.
     if let Work::Check {
@@ -182,7 +184,9 @@ async fn issue(
         return Ok(Issuance::AlreadyIssued(Stamp {
             assignment_generation,
             issued_at,
-            next_check_at,
+            next_check_at: next_check_at
+                .map(|at| timestamp("an out-of-range check time", at))
+                .transpose()?,
         }));
     }
     if !issuing {
@@ -286,7 +290,7 @@ async fn issue(
                 .into(),
             )
         })?,
-        issued_at,
-        next_check_at: Some(next_check_at),
+        issued_at: timestamp("an out-of-range issuance time", issued_at)?,
+        next_check_at: Some(timestamp("an out-of-range check time", next_check_at)?),
     }))
 }
