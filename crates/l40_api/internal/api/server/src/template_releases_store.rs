@@ -8,6 +8,7 @@
 
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_node_model::{NodeRole, SubstrateKind};
+use pplx_space_node_registration_store::nodes_for_identity;
 
 use std::net::IpAddr;
 
@@ -176,12 +177,16 @@ impl TemplateReleasesStore {
         &self,
         node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
     ) -> Result<TemplateReadScope, sqlx::Error> {
-        let node_ids =
-            Self::nodes_for_identity(&self.pool, node, &[NodeRole::Worker, NodeRole::Builder])
-                .await?
-                .into_iter()
-                .filter_map(|(id, uid_matches)| (uid_matches == Some(true)).then_some(id))
-                .collect();
+        let node_ids = nodes_for_identity(
+            &self.pool,
+            node.name(),
+            node.uid(),
+            &[NodeRole::Worker, NodeRole::Builder],
+        )
+        .await?
+        .into_iter()
+        .filter_map(|(id, uid_matches)| (uid_matches == Some(true)).then_some(id))
+        .collect();
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
@@ -191,7 +196,8 @@ impl TemplateReleasesStore {
         &self,
         node: &pplx_space_rpc_auth::build::AuthenticatedBuildNode,
     ) -> Result<PublicationNode, sqlx::Error> {
-        let rows = Self::nodes_for_identity(&self.pool, node, &[NodeRole::Builder]).await?;
+        let rows =
+            nodes_for_identity(&self.pool, node.name(), node.uid(), &[NodeRole::Builder]).await?;
         if let Some((id, _)) = rows.iter().find(|(_, matches)| *matches == Some(true)) {
             Ok(PublicationNode::Registered(*id))
         } else if rows.iter().any(|(_, matches)| matches.is_none()) {
@@ -199,28 +205,6 @@ impl TemplateReleasesStore {
         } else {
             Ok(PublicationNode::Denied)
         }
-    }
-
-    /// Live registrations of the reviewed node name in `roles`, each with
-    /// whether its inventory UID matches (`None` when it has none).
-    pub(super) async fn nodes_for_identity(
-        executor: impl sqlx::PgExecutor<'_>,
-        node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
-        roles: &[NodeRole],
-    ) -> Result<Vec<(NodeId, Option<bool>)>, sqlx::Error> {
-        sqlx::query_as(sql!(
-            "SELECT n.id, k.k8s_node_uid = $2
-             FROM nodes n JOIN node_k8s k ON k.node_id = n.id
-             WHERE k.k8s_node_name = $1
-               AND n.managed_by = $3 AND n.role = ANY($4::TEXT[])
-               AND COALESCE(n.state, 'registered') != 'deleted'"
-        ))
-        .bind(node.name().as_str())
-        .bind(node.uid().as_str())
-        .bind(SubstrateKind::Kubernetes)
-        .bind(roles.iter().map(|role| role.as_str()).collect::<Vec<_>>())
-        .fetch_all(executor)
-        .await
     }
 
     /// Unscoped lookups with no caller organization or generic-only requirement

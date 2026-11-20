@@ -3,10 +3,13 @@
 //! Registering a Kubernetes node ([`register_k8s_node`]), which also records
 //! the EC2 instance it runs on, and the
 //! registration check on `node_k8s`: whether a Kubernetes node name and UID
-//! map to a SPACE node. Other `node_k8s` reads stay with their callers.
+//! map to a SPACE node ([`registered_node`]), or which live registrations in
+//! given roles carry that name ([`nodes_for_identity`]). Other `node_k8s`
+//! reads stay with their callers.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
+use pplx_space_node_model::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 
 mod register;
@@ -34,6 +37,29 @@ pub async fn registered_node(
     .bind(uid.as_str())
     .fetch_optional(executor)
     .await?)
+}
+
+/// Live registrations of the reviewed node name in `roles`, each with
+/// whether its inventory UID matches (`None` when it has none).
+pub async fn nodes_for_identity(
+    executor: impl sqlx::PgExecutor<'_>,
+    name: &K8sNodeName,
+    uid: &K8sNodeUid,
+    roles: &[NodeRole],
+) -> Result<Vec<(NodeId, Option<bool>)>, sqlx::Error> {
+    sqlx::query_as(sql!(
+        "SELECT n.id, k.k8s_node_uid = $2
+         FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+         WHERE k.k8s_node_name = $1
+           AND n.managed_by = $3 AND n.role = ANY($4::TEXT[])
+           AND COALESCE(n.state, 'registered') != 'deleted'"
+    ))
+    .bind(name.as_str())
+    .bind(uid.as_str())
+    .bind(SubstrateKind::Kubernetes)
+    .bind(roles.iter().map(|role| role.as_str()).collect::<Vec<_>>())
+    .fetch_all(executor)
+    .await
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_protocol::encode_revision;
+use pplx_space_node_registration_store::nodes_for_identity;
 use pplx_space_rpc_auth::{
     AuthenticatedNodeIdentity, FirewallRulesFetchAuthority, NodeApiAuthenticatedCaller, NodeRole,
 };
@@ -19,7 +20,6 @@ use crate::proto::{
     FetchFirewallRulesRequest, FetchFirewallRulesResponse, FirewallRulesAssignment,
     FirewallRulesPendingRound,
 };
-use crate::template_releases_store::TemplateReleasesStore;
 
 const DENIED: &str = "the caller may not fetch firewall rules";
 
@@ -69,9 +69,10 @@ impl ClusterApiService {
             .begin_with(sql!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"))
             .await
             .map_err(|error| Status::internal(format!("begin firewall rules fetch: {error}")))?;
-        let node = match TemplateReleasesStore::nodes_for_identity(
+        let node = match nodes_for_identity(
             &mut *tx,
-            identity,
+            identity.name(),
+            identity.uid(),
             &[NodeRole::Worker],
         )
         .await

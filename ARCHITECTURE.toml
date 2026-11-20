@@ -378,7 +378,11 @@ pplx-space-firewall-rules-store = [
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
-pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-node-registration-store = [
+  "pplx-space-api",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
 pplx-space-node-status-store = [
   "pplx-space-api",
   "pplx-space-runtime-upgrade-campaign-store",
