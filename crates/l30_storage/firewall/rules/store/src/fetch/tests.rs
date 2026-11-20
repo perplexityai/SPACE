@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 use super::*;
 
-/// Two rules out of name order, the second with two comparisons.
+/// Two rules out of name order, the first with two comparisons.
 const ORDERED: &str = concat!(
     r#"[{"id":"web","all_of":["#,
     r#"{"left":{"payload":{"protocol":"tcp","field":"sport"}},"op":"==","right":1024},"#,
@@ -20,26 +20,21 @@ fn issued_at() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp_nanos(1_790_000_000_123_456_000).unwrap()
 }
 
-async fn insert_revision(pool: &PgPool, rules: &str) -> TestResult<RevisionId> {
-    let id = RevisionId(uuid::Uuid::now_v7());
-    sqlx::query(sql!(
-        "INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)
-         VALUES ($1, 1, $2::jsonb)"
-    ))
-    .bind(id)
-    .bind(rules)
-    .execute(pool)
-    .await?;
-    Ok(id)
-}
-
 async fn assign(
     pool: &PgPool,
     node: NodeId,
     generation: i64,
     rules: &str,
-) -> TestResult<Assignment> {
-    let revision_id = insert_revision(pool, rules).await?;
+) -> TestResult<RevisionId> {
+    let revision_id = RevisionId(uuid::Uuid::now_v7());
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)
+         VALUES ($1, 1, $2::jsonb)"
+    ))
+    .bind(revision_id)
+    .bind(rules)
+    .execute(pool)
+    .await?;
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
          VALUES ($1, $2, $3)"
@@ -49,11 +44,7 @@ async fn assign(
     .bind(revision_id)
     .execute(pool)
     .await?;
-    Ok(Assignment {
-        generation: generation.try_into()?,
-        revision_id,
-        revision: decode_revision(&format!(r#"{{"schema_version":1,"rules":{rules}}}"#))?,
-    })
+    Ok(revision_id)
 }
 
 /// An observation row with the given pending and accepted rounds.
@@ -104,7 +95,11 @@ async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
     ] {
         let node = NodeId::new();
         let assignment = match assignment {
-            Some((generation, rules)) => Some(assign(pool, node, generation, rules).await?),
+            Some((generation, rules)) => Some(Assignment {
+                generation: generation.try_into()?,
+                revision_id: assign(pool, node, generation, rules).await?,
+                revision: decode_revision(&format!(r#"{{"schema_version":1,"rules":{rules}}}"#))?,
+            }),
             None => None,
         };
         if pending.is_some() || accepted.is_some() {
@@ -131,15 +126,7 @@ async fn an_undecodable_revision_is_an_error() -> TestResult {
     };
     let pool = &db.pool;
     let node = NodeId::new();
-    let revision = insert_revision(pool, r#"[{"id":"r","all_of":[],"extra":1}]"#).await?;
-    sqlx::query(sql!(
-        "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
-         VALUES ($1, 1, $2)"
-    ))
-    .bind(node)
-    .bind(revision)
-    .execute(pool)
-    .await?;
+    let revision = assign(pool, node, 1, r#"[{"id":"r","all_of":[],"extra":1}]"#).await?;
     let error = fetch_instructions(&mut *pool.acquire().await?, node)
         .await
         .unwrap_err();

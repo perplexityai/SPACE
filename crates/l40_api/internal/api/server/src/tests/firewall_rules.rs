@@ -194,28 +194,14 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
 
     let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
     let b = register(pool, "worker", "ready", "127.0.0.1", "worker-b", "uid-b").await?;
-    let unenrolled = register(pool, "worker", "ready", "192.0.2.11", "worker-u", "uid-u").await?;
+    register(pool, "worker", "ready", "192.0.2.11", "worker-u", "uid-u").await?;
     let builder = register(pool, "builder", "ready", "192.0.2.12", "builder-x", "uid-x").await?;
     let deleted = register(pool, "worker", "deleted", "192.0.2.13", "worker-d", "uid-d").await?;
     let twin = register(pool, "worker", "ready", "192.0.2.14", "worker-t", "uid-t").await?;
     let twin_peer = register(pool, "worker", "ready", "192.0.2.15", "worker-t", "uid-t2").await?;
-    let corrupt = register(pool, "worker", "ready", "192.0.2.16", "worker-c", "uid-c").await?;
-    let undecodable = r#"[{"id":"r","all_of":[],"extra":1}]"#;
-    give_work(
-        pool,
-        corrupt,
-        1,
-        (insert_revision(pool, undecodable).await?, undecodable),
-        1,
-    )
-    .await?;
-    let a_work = give_work(pool, a, 4, (ordered, ORDERED), 7).await?;
     give_work(pool, b, 9, (ssh, SSH), 70).await?;
-    for node in [unenrolled, builder, deleted, twin, twin_peer] {
-        give_work(pool, node, 1, (ssh, SSH), 1).await?;
-    }
     service.firewall_enrollment =
-        Enrollment::Fixture(vec![a, b, builder, deleted, twin, twin_peer, corrupt]);
+        Enrollment::Fixture(vec![a, b, builder, deleted, twin, twin_peer]);
 
     let mut malformed = node_ctl_on("worker-a", "uid-a");
     malformed
@@ -249,11 +235,6 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
         ("builder", node_ctl_on("builder-x", "uid-x"), denied),
         ("deleted", node_ctl_on("worker-d", "uid-d"), denied),
         ("ambiguous", node_ctl_on("worker-t", "uid-t"), denied),
-        (
-            "corrupt",
-            node_ctl_on("worker-c", "uid-c"),
-            Err(Code::Internal),
-        ),
     ]
     .map(|(label, status, expected)| (projected_token(label), status, expected));
     let node_ctl_a = reviewed[0].0.clone();
@@ -263,6 +244,17 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
         .collect();
     let mut harness = serve(service, reviews, true).await?;
     let client = &mut harness.client;
+
+    // A has no instructions yet; B, at the peer address, already has work.
+    assert_eq!(
+        fetch(client, Some(&node_ctl_a)).await?,
+        Ok(FetchFirewallRulesResponse {
+            node_id: a.to_string(),
+            assignment: None,
+            pending_round: None,
+        })
+    );
+    let a_work = give_work(pool, a, 4, (ordered, ORDERED), 7).await?;
 
     let unreviewed = [
         (Some(REVIEWED_STATIC_TOKEN.to_owned()), denied),
@@ -303,21 +295,16 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
         .await?;
     assert_eq!(state, "deleted");
 
-    // Without work, A learns that it has none, never B's.
-    for statement in [
-        sql!("DELETE FROM firewall_rules_node_assignments WHERE node_id = $1"),
-        sql!("DELETE FROM firewall_rules_node_observations WHERE node_id = $1"),
-    ] {
-        sqlx::query(statement).bind(a).execute(pool).await?;
-    }
-    assert_eq!(
-        fetch(client, Some(&node_ctl_a)).await?,
-        Ok(FetchFirewallRulesResponse {
-            node_id: a.to_string(),
-            assignment: None,
-            pending_round: None,
-        })
-    );
+    // Same authorized caller; an unreadable revision is an RPC error, not no work.
+    let bad = insert_revision(pool, r#"[{"id":"r","all_of":[],"extra":1}]"#).await?;
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_node_assignments SET revision_id = $2 WHERE node_id = $1"
+    ))
+    .bind(a)
+    .bind(bad)
+    .execute(pool)
+    .await?;
+    assert_eq!(fetch(client, Some(&node_ctl_a)).await?, Err(Code::Internal));
     Ok(())
 }
 
@@ -329,16 +316,16 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
         return Ok(());
     };
     let pool = fixture.service.pool.clone();
-    let revision = insert_revision(&pool, SSH).await?;
     let a = register(&pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
-    give_work(&pool, a, 1, (revision, SSH), 1).await?;
 
-    for (grant, enrollment, expected) in [
-        (false, Enrollment::Fixture(vec![a]), Code::PermissionDenied),
-        (true, Enrollment::Unapproved, Code::FailedPrecondition),
+    for (grant, expected) in [
+        (false, Code::PermissionDenied),
+        (true, Code::FailedPrecondition),
     ] {
         let mut service = fixture.service.clone();
-        service.firewall_enrollment = enrollment;
+        if !grant {
+            service.firewall_enrollment = Enrollment::Fixture(vec![a]);
+        }
         let token = projected_token("node-ctl-a");
         let reviews = vec![(token.clone(), node_ctl_on("worker-a", "uid-a"))];
         let mut harness = serve(service, reviews, grant).await?;
