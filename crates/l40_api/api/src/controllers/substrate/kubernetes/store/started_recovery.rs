@@ -286,9 +286,8 @@ impl K8sStore {
     ///   make it match later, so it keeps today's answer.
     /// - otherwise [`rollback_marker_suspend_backup_exists`] true: the loop
     ///   rolls the row back to that snapshot once the source node is proven
-    ///   gone. Until then the API answers retryable, but still records the
-    ///   recovery as failed, because the loop only acts on a
-    ///   `recovery_failed` execution.
+    ///   gone. The source node comes back with it, since the caller only
+    ///   answers retryable when that node already looks lost.
     ///
     /// The settle window for a `creating` upload from the sandbox's own node
     /// is the loop's ([`pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE`]).
@@ -311,24 +310,38 @@ impl K8sStore {
                                   >= NOW() - make_interval(secs => $2::BIGINT)
                            )
                     ) AS publishing,
-                    {rollback_source} AS stale_rollback_source
+                    {rollback_source} AS stale_rollback_source,
+                    s.active_node_id IS NOT NULL AND n.id IS NULL AS node_row_deleted,
+                    nk.k8s_node_name
                FROM sandboxes s
+               LEFT JOIN nodes n ON n.id = s.active_node_id
+               LEFT JOIN node_k8s nk ON nk.node_id = n.id
               WHERE s.id = $1"
         );
-        let row = sqlx::query_as::<_, (bool, bool)>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id.as_uuid())
-            .bind(
-                pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
-                    .as_secs()
-                    .cast_signed(),
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .db_context("failed to classify unavailable started recovery source")?;
+        let row = sqlx::query_as::<_, (bool, bool, bool, Option<String>)>(sqlx::AssertSqlSafe(
+            sql!(query.as_str()),
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(
+            pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
+                .as_secs()
+                .cast_signed(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to classify unavailable started recovery source")?;
         Ok(match row {
-            Some((true, _)) => StartedRecoveryUnavailableCause::SourcePublishing,
-            Some((false, true)) => StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss,
-            Some((false, false)) | None => StartedRecoveryUnavailableCause::NoDurableSource,
+            Some((true, ..)) => StartedRecoveryUnavailableCause::SourcePublishing,
+            Some((false, true, node_row_deleted, k8s_node_name)) => {
+                StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss {
+                    source_node: match (node_row_deleted, k8s_node_name) {
+                        (true, _) => StaleRecoverySourceNode::RowDeleted,
+                        (false, Some(name)) => StaleRecoverySourceNode::Named(name),
+                        (false, None) => StaleRecoverySourceNode::Unknown,
+                    },
+                }
+            }
+            Some((false, false, ..)) | None => StartedRecoveryUnavailableCause::NoDurableSource,
         })
     }
 

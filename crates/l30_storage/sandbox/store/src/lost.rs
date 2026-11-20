@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_sandbox_portability::{
-    inflight_suspend_upload_from_other_node_exists, rollback_marker_suspend_backup_exists,
+    inflight_suspend_upload_from_other_node_exists, rollback_marker_suspend_backup_matches,
     snapshot_durable_for_source_release, started_restore_source_absent,
 };
 use pplx_space_sql_locator::sql;
@@ -112,13 +112,26 @@ pub struct LostStartedRollback {
 /// restore it without a rollback ([`started_restore_source_absent`]; if one
 /// could, ordinary recovery owns the row). On top of those, the marker's
 /// suspend artifact must still have a durable copy that is the newest full
-/// snapshot ([`rollback_marker_suspend_backup_exists`]).
+/// snapshot ([`pplx_space_sandbox_portability::rollback_marker_suspend_backup_exists`]).
 ///
 /// The write mirrors the drain's pod-less revert: `suspended`, unplaced, no
 /// target node, `placement_changed_at` cleared, and the marker kept, so the
 /// next wake restores exactly that artifact from object storage. Activity
 /// recorded after the snapshot is lost with the node; the caller records the
 /// window from the returned [`LostStartedRollback`].
+///
+/// The same UPDATE moves `last_command_at` and `last_access_at` back to the
+/// marker snapshot's timestamp when they are past it (a NULL clock stays
+/// NULL), so the row no longer claims activity its restore point lacks. The
+/// anti-rollback guards that compare those clocks with a snapshot (started
+/// recovery's stale guard, the failed-restorable repair) then accept the
+/// marker again, including when the re-woken pod is lost before any new
+/// activity. `last_used_at` is left alone: idle timers read it.
+///
+/// The marker snapshot is chosen once, in `pre`, under
+/// [`rollback_marker_suspend_backup_matches`]: no match means no row to
+/// update, and the WHERE, the clock reset and the returned timestamp all use
+/// that one snapshot.
 ///
 /// The caller owns everything around it, as for [`mark_started_lost`]: the
 /// sandbox row lock, the re-check that the node is still gone, and, in the
@@ -134,7 +147,7 @@ pub async fn roll_back_started_to_suspend(
     /// Built once: every input is a literal or a bind placeholder.
     static ROLL_BACK_STARTED: LazyLock<String> = LazyLock::new(|| {
         let no_restore_source = started_restore_source_absent("s", "$4");
-        let rollback_source = rollback_marker_suspend_backup_exists("s");
+        let marker = rollback_marker_suspend_backup_matches("s");
         sql!(
             format!(
                 "WITH pre AS (
@@ -145,8 +158,17 @@ pub async fn roll_back_started_to_suspend(
                                     COALESCE(s.last_access_at, '-infinity'::timestamptz)
                                 ),
                                 '-infinity'::timestamptz
-                            ) AS last_activity_at
+                            ) AS last_activity_at,
+                            marker.timestamp AS marker_timestamp
                        FROM sandboxes s
+                       CROSS JOIN LATERAL (
+                           SELECT sn.timestamp
+                             FROM snapshots sn
+                             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+                            WHERE {marker}
+                            ORDER BY sn.timestamp DESC, sn.id DESC
+                            LIMIT 1
+                       ) marker
                       WHERE s.id = $1
                  )
                  UPDATE sandboxes s
@@ -155,7 +177,17 @@ pub async fn roll_back_started_to_suspend(
                         active_node_id = NULL,
                         command_ready_pending = FALSE,
                         target_node_id = NULL,
-                        placement_changed_at = NULL
+                        placement_changed_at = NULL,
+                        last_command_at = CASE
+                            WHEN s.last_command_at > pre.marker_timestamp
+                                THEN pre.marker_timestamp
+                            ELSE s.last_command_at
+                        END,
+                        last_access_at = CASE
+                            WHEN s.last_access_at > pre.marker_timestamp
+                                THEN pre.marker_timestamp
+                            ELSE s.last_access_at
+                        END
                    FROM pre
                   WHERE s.id = pre.id
                     AND s.managed_by = $5
@@ -173,24 +205,13 @@ pub async fn roll_back_started_to_suspend(
                            AND e.k8s_node_name IS NULL
                     )
                     AND {no_restore_source}
-                    AND {rollback_source}
-                  RETURNING (
-                        SELECT sn.timestamp
-                          FROM snapshots sn
-                         WHERE sn.sandbox_id = s.id
-                           AND sn.local_artifact_id = s.current_local_artifact_id
-                           AND sn.artifact_kind = s.current_local_artifact_kind
-                           AND sn.type = 'full'
-                           AND sn.state = 'ready'
-                         ORDER BY sn.timestamp DESC
-                         LIMIT 1
-                    ) AS snapshot_timestamp,
+                  RETURNING pre.marker_timestamp,
                     pre.last_activity_at"
             )
             .as_str()
         )
     });
-    let row: Option<(Option<OffsetDateTime>, Option<OffsetDateTime>)> =
+    let row: Option<(OffsetDateTime, Option<OffsetDateTime>)> =
         sqlx::query_as(sqlx::AssertSqlSafe(ROLL_BACK_STARTED.as_str()))
             .bind(sandbox_id)
             .bind(source_node_id)
@@ -201,9 +222,7 @@ pub async fn roll_back_started_to_suspend(
             .await?;
     Ok(row.map(
         |(snapshot_timestamp, last_activity_at)| LostStartedRollback {
-            // The UPDATE only matches when `rollback_source` found this row, so
-            // the subselect can't come back empty under the same snapshot.
-            snapshot_timestamp: snapshot_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            snapshot_timestamp,
             last_activity_at,
         },
     ))

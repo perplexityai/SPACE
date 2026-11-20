@@ -461,6 +461,11 @@ pub struct KubernetesState {
     /// Whether user restores fence their unsent Wake and re-drives take over
     /// an expired fence (`SPACE_RESTORE_DISPATCH_FENCE_ENABLED`, default off).
     pub restore_dispatch_fence: RestoreDispatchFence,
+    /// Whether the cluster controller's lost-started give-up runs
+    /// (`SPACE_LOST_STARTED_SANDBOXES_ENABLED`, default off; the same switch
+    /// the controller reads). Started recovery only tells a client to wait
+    /// for a node-loss rollback when something will perform it.
+    pub lost_started_give_up_enabled: bool,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -526,6 +531,10 @@ impl KubernetesState {
                 )?,
             activation_client_attribution: super::ActivationClientAttribution::from_env(),
             restore_dispatch_fence: RestoreDispatchFence::from_env(),
+            lost_started_give_up_enabled: pplx_space_env_vars::env_flag_var(
+                "SPACE_LOST_STARTED_SANDBOXES_ENABLED",
+                false,
+            ),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,

@@ -2159,11 +2159,35 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
 /// `creating` uploads first, so an upload that died with the node doesn't
 /// block its own sandbox's rollback.
 ///
+/// Only the marker artifact qualifies, never a newer checkpoint or other
+/// full snapshot, because that is the only one a `suspended` row restores:
+/// with a marker set, the suspended restore selectors match the snapshot by
+/// the marker's exact artifact identity ([`matching_ready_backup_exists`]
+/// via [`artifact_identity_or_legacy`]), so a rollback onto any other
+/// snapshot would also have to repoint the marker. A newer `ready` full
+/// snapshot therefore vetoes the rollback instead of being skipped.
+///
 /// The activity clocks are deliberately not compared. Callers own the proof
 /// that no runtime can still write to the sandbox: the source node is gone,
 /// the active execution is the terminal `recovery_failed` owner with no pod,
 /// and the row is locked.
 pub fn rollback_marker_suspend_backup_exists(sandbox_alias: &str) -> String {
+    let matches = rollback_marker_suspend_backup_matches(sandbox_alias);
+    format!(
+        "EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots sn\n\
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
+              WHERE {matches}\n\
+         )"
+    )
+}
+
+/// The row condition behind [`rollback_marker_suspend_backup_exists`], over
+/// `snapshots sn JOIN snapshot_storage_locations ssl ON ssl.snapshot_id =
+/// sn.id`. For a caller that has to select the marker snapshot itself (its
+/// id or timestamp) under exactly the same rules.
+pub fn rollback_marker_suspend_backup_matches(sandbox_alias: &str) -> String {
     let suspend = ArtifactOrigin::Suspend.as_str();
     let no_newer = format!(
         "NOT EXISTS (\n\
@@ -2176,11 +2200,7 @@ pub fn rollback_marker_suspend_backup_exists(sandbox_alias: &str) -> String {
          )"
     );
     format!(
-        "EXISTS (\n\
-             SELECT 1\n\
-               FROM snapshots sn\n\
-               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id\n\
-              WHERE sn.sandbox_id = {sandbox_alias}.id\n\
+        "(sn.sandbox_id = {sandbox_alias}.id\n\
                 AND ssl.orphaned_at IS NULL\n\
                 AND {sandbox_alias}.current_local_artifact_origin = '{suspend}'\n\
                 AND sn.local_artifact_id = {sandbox_alias}.current_local_artifact_id\n\
@@ -2188,8 +2208,7 @@ pub fn rollback_marker_suspend_backup_exists(sandbox_alias: &str) -> String {
                 AND sn.type = 'full'\n\
                 AND sn.state = 'ready'\n\
                 AND (sn.artifact_origin IS NULL OR sn.artifact_origin = '{suspend}')\n\
-                AND {no_newer}\n\
-         )"
+                AND {no_newer})"
     )
 }
 

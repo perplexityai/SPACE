@@ -1986,6 +1986,7 @@ fn converging_restore_outcome(
     match error {
         SubstrateError::RestoreInFlight { message, .. }
         | SubstrateError::RestoreSourcePending { message }
+        | SubstrateError::RestoreUploadSettling { message }
         | SubstrateError::SuspendInFlight { message } => Some(RestoreOutcome::Converging {
             detail: message.clone(),
             wait_phase: None,
@@ -3357,6 +3358,7 @@ impl NodeDrainSink for SubstrateSink {
                 | SubstrateError::Timeout { message, .. }
                 | SubstrateError::RestoreContextUnavailable { message }
                 | SubstrateError::RestoreAwaitingSourceNodeLoss { message }
+                | SubstrateError::RestoreUploadSettling { message }
                 | SubstrateError::RestoreSourcePending { message }
                 | SubstrateError::RestoreInFlight { message, .. }
                 | SubstrateError::SuspendInFlight { message }

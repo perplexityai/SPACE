@@ -109,11 +109,39 @@ impl KubernetesSubstrate {
         }
     }
 
-    /// The error for a recovery with no verified restore source. Only a
-    /// sandbox with no durable copy at all gets the terminal-looking
-    /// `RestoreContextUnavailable`; one whose source is still publishing, or
-    /// whose only copy is a stale suspend that the cluster controller may roll
-    /// back to once the source node is proven gone, gets a retryable answer.
+    /// Whether the API already sees `source_node` as lost: its row is deleted,
+    /// or the warm Node cache doesn't list it, or lists it not Ready or
+    /// cordoned. A cold cache answers `false`.
+    fn started_recovery_source_node_looks_lost(&self, source_node: &StaleRecoverySourceNode) -> bool {
+        match source_node {
+            StaleRecoverySourceNode::RowDeleted => true,
+            StaleRecoverySourceNode::Unknown => false,
+            StaleRecoverySourceNode::Named(name) => {
+                if !self.k8s.caches.nodes_ready() {
+                    return false;
+                }
+                self.k8s
+                    .caches
+                    .nodes
+                    .state()
+                    .iter()
+                    .find(|node| node.metadata.name.as_deref() == Some(name.as_str()))
+                    .is_none_or(|node| !adapter::node_schedulable(node))
+            }
+        }
+    }
+
+    /// The error for a recovery with no verified restore source.
+    ///
+    /// - A newer upload that may still land: `RestoreUploadSettling`, a
+    ///   retryable 503 that still completes the attempt as failed.
+    /// - Only a stale durable suspend: `RestoreAwaitingSourceNodeLoss`, also
+    ///   retryable, but only when the retry can resolve, that is
+    ///   [`stale_source_retry_can_resolve`] holds. Otherwise the node is live
+    ///   (the pod-loss-on-a-live-node case the stale guard exists for) or
+    ///   nothing will roll the sandbox back, and it keeps the
+    ///   `RestoreContextUnavailable` answer.
+    /// - No durable copy: `RestoreContextUnavailable`.
     async fn started_recovery_unavailable_error(
         &self,
         sandbox_id: SandboxId,
@@ -125,9 +153,19 @@ impl KubernetesSubstrate {
             .await
         {
             Ok(StartedRecoveryUnavailableCause::SourcePublishing) => {
-                SubstrateError::restore_source_pending(sandbox_id)
+                SubstrateError::RestoreUploadSettling {
+                    message: format!(
+                        "sandbox {sandbox_id} generation {generation}: a newer snapshot upload \
+                         may still land; retry"
+                    ),
+                }
             }
-            Ok(StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss) => {
+            Ok(StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { source_node })
+                if stale_source_retry_can_resolve(
+                    self.k8s.lost_started_give_up_enabled,
+                    self.started_recovery_source_node_looks_lost(&source_node),
+                ) =>
+            {
                 SubstrateError::RestoreAwaitingSourceNodeLoss {
                     message: format!(
                         "sandbox {sandbox_id} generation {generation}: the only durable restore \
@@ -136,7 +174,10 @@ impl KubernetesSubstrate {
                     ),
                 }
             }
-            Ok(StartedRecoveryUnavailableCause::NoDurableSource) => {
+            Ok(
+                StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss { .. }
+                | StartedRecoveryUnavailableCause::NoDurableSource,
+            ) => {
                 SubstrateError::RestoreContextUnavailable {
                     message: format!(
                         "sandbox {sandbox_id} generation {generation} has no verified local or \
@@ -207,5 +248,27 @@ impl KubernetesSubstrate {
         *pod_name = claim.row.pod_name.clone();
         *restore_source = Some(source);
         Ok(true)
+    }
+}
+
+/// Whether telling the client to wait for a node-loss rollback is honest: the
+/// lost-started give-up must run, and the API must already see the source
+/// node as lost. A live source node is never rolled back, and with the
+/// give-up off nothing rolls anything back, so either way the retry could
+/// never resolve.
+fn stale_source_retry_can_resolve(give_up_enabled: bool, source_node_looks_lost: bool) -> bool {
+    give_up_enabled && source_node_looks_lost
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stale_source_retry_can_resolve;
+
+    #[test]
+    fn stale_source_waits_only_for_a_lost_node_with_the_give_up_on() {
+        assert!(stale_source_retry_can_resolve(true, true));
+        assert!(!stale_source_retry_can_resolve(true, false), "live node");
+        assert!(!stale_source_retry_can_resolve(false, true), "give-up off");
+        assert!(!stale_source_retry_can_resolve(false, false));
     }
 }

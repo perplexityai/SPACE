@@ -471,7 +471,7 @@ pub(super) enum StartedRecoveryRestoreContext {
 /// still come back. Read only after
 /// [`K8sStore::started_recovery_restore_context`] answered
 /// [`StartedRecoveryRestoreContext::Unavailable`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum StartedRecoveryUnavailableCause {
     /// A full snapshot is still uploading: the source is being published.
     /// Retry; nothing is wrong.
@@ -480,10 +480,24 @@ pub(super) enum StartedRecoveryUnavailableCause {
     /// it predates the last command or access. Restoring it now could roll
     /// back writes that still exist on the source node, so recovery waits for
     /// the cluster controller to prove that node gone; it then rolls the
-    /// sandbox back to that snapshot. Retry.
-    StaleSourceAwaitingNodeLoss,
+    /// sandbox back to that snapshot. Whether a retry can ever succeed
+    /// depends on `source_node`, which the caller checks.
+    StaleSourceAwaitingNodeLoss { source_node: StaleRecoverySourceNode },
     /// No durable copy of the sandbox exists.
     NoDurableSource,
+}
+
+/// The node a stale-source started recovery is waiting on, as the database
+/// has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StaleRecoverySourceNode {
+    /// `active_node_id` names a node whose row is deleted.
+    RowDeleted,
+    /// A registered node with this Kubernetes Node name.
+    Named(String),
+    /// No `active_node_id`, or a node row with no Kubernetes name: nothing
+    /// the cluster controller can prove gone.
+    Unknown,
 }
 
 #[derive(Debug)]

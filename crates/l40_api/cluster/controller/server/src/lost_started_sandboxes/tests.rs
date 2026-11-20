@@ -35,6 +35,7 @@
 //! - P13 `p13_newer_live_snapshot_refuses_the_rollback_but_a_dead_upload_does_not`
 //! - P14 `p14_marker_without_a_durable_copy_ends_lost`
 //! - P15 `p15_rollback_needs_proof_the_source_node_is_gone`
+//! - P16 `p16_rollback_resets_activity_clocks_so_a_rewake_can_recover_again`
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -1248,6 +1249,87 @@ mod postgres_backed {
         assert_eq!(
             (state.as_str(), active, terminated),
             ("suspended", false, true)
+        );
+        Ok(())
+    }
+
+    type Clocks = (
+        Option<time::OffsetDateTime>,
+        Option<time::OffsetDateTime>,
+        Option<time::OffsetDateTime>,
+    );
+
+    /// `last_command_at`, `last_access_at` and `last_used_at`.
+    async fn activity_clocks(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Clocks> {
+        Ok(sqlx::query_as(sql!(
+            "SELECT last_command_at, last_access_at, last_used_at
+               FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p16_rollback_resets_activity_clocks_so_a_rewake_can_recover_again() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let seeded = seed_stuck(&db.pool, true).await?;
+        mark_newest_snapshot_current(&db.pool, seeded.sandbox_id).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET last_used_at = NOW() - INTERVAL '30 minutes' WHERE id = $1"
+        ))
+        .bind(seeded.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        let (_, _, used_before) = activity_clocks(&db.pool, seeded.sandbox_id).await?;
+        let store = LostStartedDbStore::new(db.pool.clone());
+
+        let report = Reconciler::new(config(), store, Arc::new(FakeLookup::default()), presence())
+            .tick()
+            .await;
+        assert_eq!(report.rolled_back, 1);
+
+        // Both activity clocks now sit at the marker snapshot; last_used_at,
+        // which idle timers read, is untouched.
+        let (marker_timestamp,): (time::OffsetDateTime,) = sqlx::query_as(sql!(
+            "SELECT sn.timestamp
+               FROM snapshots sn
+               JOIN sandboxes s ON s.id = sn.sandbox_id
+              WHERE s.id = $1
+                AND sn.local_artifact_id = s.current_local_artifact_id"
+        ))
+        .bind(seeded.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        let (command, access, used_after) = activity_clocks(&db.pool, seeded.sandbox_id).await?;
+        assert_eq!(command, Some(marker_timestamp));
+        assert_eq!(access, Some(marker_timestamp));
+        assert_eq!(used_after, used_before);
+
+        // Re-woken from the marker, then its pod is lost before any new
+        // activity lands: started recovery must find the marker as a restore
+        // source instead of refusing it as stale again.
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle = 'started', placement = 'on_node', active_node_id = $2
+              WHERE id = $1"
+        ))
+        .bind(seeded.sandbox_id)
+        .bind(seeded.node_id)
+        .execute(&db.pool)
+        .await?;
+        let absent = pplx_space_sandbox_portability::started_restore_source_absent("s", "$2");
+        let query = format!("SELECT {absent} FROM sandboxes s WHERE s.id = $1");
+        let (source_absent,): (bool,) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(seeded.sandbox_id)
+            .bind(pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
+            .fetch_one(&db.pool)
+            .await?;
+        assert!(
+            !source_absent,
+            "the marker covers the reset clocks, so started recovery restores it"
         );
         Ok(())
     }

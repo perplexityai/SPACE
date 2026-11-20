@@ -451,11 +451,13 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
                 current_local_artifact_kind = 'full',
                 current_local_artifact_origin = 'suspend',
                 last_command_at = NOW(),
-                last_access_at = NOW()
+                last_access_at = NOW(),
+                active_node_id = $3
           WHERE id = $1"
     ))
     .bind(sandbox_id)
     .bind(artifact_id)
+    .bind(source_node_id)
     .execute(&fixture.pool)
     .await?;
     sqlx::query(sql!(
@@ -508,7 +510,9 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
             .store
             .started_recovery_unavailable_cause(sandbox_id)
             .await?,
-        StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss
+        StartedRecoveryUnavailableCause::StaleSourceAwaitingNodeLoss {
+            source_node: StaleRecoverySourceNode::Named("source-node".to_string()),
+        }
     );
 
     // Act: a newer suspend upload is still in flight.

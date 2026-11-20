@@ -614,6 +614,7 @@ fn reconnect_error_outcome(
     match err {
         SubstrateError::RestoreInFlight { .. }
         | SubstrateError::RestoreSourcePending { .. }
+        | SubstrateError::RestoreUploadSettling { .. }
         | SubstrateError::SuspendInFlight { .. }
         | SubstrateError::ActivationInFlight { .. } => (
             ReconnectOutcome::WakeInProgress,
@@ -625,9 +626,11 @@ fn reconnect_error_outcome(
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::RestoreContextUnavailable,
         ),
+        // Retryable for the client, but no progress until the cluster
+        // controller acts, so it is reported with the failures.
         SubstrateError::RestoreAwaitingSourceNodeLoss { .. } => (
-            ReconnectOutcome::WakeInProgress,
-            ReconnectTerminalPhase::Restore,
+            ReconnectOutcome::WakeFailed,
+            initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::RestoreAwaitingSourceNodeLoss,
         ),
         SubstrateError::Timeout { .. } => {
