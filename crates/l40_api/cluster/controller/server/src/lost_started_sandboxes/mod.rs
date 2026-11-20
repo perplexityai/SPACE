@@ -283,8 +283,7 @@ pub trait LostStartedSink: Send + Sync + 'static {
     fn stranded_counts(
         &self,
         node_ids: &[NodeId],
-    ) -> impl std::future::Future<Output = Result<HashMap<NodeId, StrandedCounts>, sqlx::Error>>
-           + Send;
+    ) -> impl std::future::Future<Output = Result<HashMap<NodeId, StrandedCounts>, sqlx::Error>> + Send;
 
     /// Up to `limit` candidates with `sandboxes.id > after`, ordered by id.
     fn list_candidates(
