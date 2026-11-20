@@ -11,6 +11,8 @@
 //! what the attempt did can't be told. The last two end the binding for this
 //! process, so waiting work never runs against a new occupant and a later
 //! success can't hide the uncertainty. A completed attempt is never resubmitted.
+//! The first attempt to reach nft fixes the target, so a slot or namespace
+//! replaced between attempts is a changed target.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -170,6 +172,7 @@ impl FirewallSync {
     async fn work(self: Arc<Self>, pool: Arc<NetworkPool>) {
         let _ended = self.ended.clone().drop_guard();
         let mut changed = self.wanted.subscribe();
+        let mut target = None;
         loop {
             let Some(generation) = self.claim() else {
                 tokio::select! {
@@ -183,11 +186,15 @@ impl FirewallSync {
                 node_id: self.fixture.node_id,
                 generation,
                 slot_id: self.fixture.slot_id,
+                expected: target.clone(),
             };
             let (host, nft) = (self.fixture.host.clone(), self.fixture.nft.clone());
             let report = pool
                 .apply_firewall_rules_with(&self.assignments, request, host, nft)
                 .await;
+            if let Ok(SlotFirewallReport::Attempted(attempt)) = &report {
+                target.get_or_insert_with(|| attempt.target());
+            }
             let (done, ends) = dispatch(&report);
             tracing::info!(
                 generation,

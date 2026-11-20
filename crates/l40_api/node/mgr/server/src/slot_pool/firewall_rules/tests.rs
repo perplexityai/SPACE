@@ -104,8 +104,6 @@ pub(crate) enum Fault {
     Drops,
     /// Commits, then fails every listing.
     Unlistable,
-    /// Commits, then panics, failing the apply's job.
-    Panics,
 }
 
 pub(crate) type Hook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
@@ -177,7 +175,6 @@ impl FakeHost {
             }
             fire(&self.installed);
             return match self.fault {
-                Some(Fault::Panics) => panic!("the fake nft panics after committing"),
                 Some(Fault::Rejects) => Some(output(1, Vec::new())),
                 Some(Fault::TimesOut) => None,
                 _ => Some(output(0, Vec::new())),
@@ -233,10 +230,22 @@ async fn apply(
     generation: u64,
     slot_id: u32,
 ) -> SlotFirewallReport {
+    apply_expecting(pool, store, host, generation, slot_id, None).await
+}
+
+async fn apply_expecting(
+    pool: &Arc<NetworkPool>,
+    store: &Arc<FirewallAssignments>,
+    host: &Arc<FakeHost>,
+    generation: u64,
+    slot_id: u32,
+    expected: Option<SlotTarget>,
+) -> SlotFirewallReport {
     let request = SlotFirewallRequest {
         node_id: NODE,
         generation,
         slot_id,
+        expected,
     };
     let fake = host.clone();
     let nft = move |netns: &File, args: &[&str], stdin: &[u8], _| {
@@ -322,8 +331,13 @@ async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
     let (_dir, store) = store(None);
     let host = FakeHost::new(None);
-    host.name(0, "net");
+    let net = host.name(0, "net");
     set_slot(&pool, 0, SlotState::Leased, 1);
+    let expecting =
+        async |expected| match apply_expecting(&pool, &store, &host, 12, 0, expected).await {
+            SlotFirewallReport::NotRun(not_run) => not_run,
+            SlotFirewallReport::Attempted(attempt) => panic!("attempted: {attempt:?}"),
+        };
     let refused = async |slot_id| match apply(&pool, &store, &host, 12, slot_id).await {
         SlotFirewallReport::NotRun(not_run) => not_run,
         SlotFirewallReport::Attempted(attempt) => panic!("attempted: {attempt:?}"),
@@ -354,6 +368,29 @@ async fn refusals_never_run_nft() {
         set_slot(&later, 0, SlotState::Leased, 2);
     });
     assert!(matches!(refused(0).await, NotRun::Changed));
+    // Another occupant than an earlier attempt reached, as after a replacement
+    // between attempts.
+    let current = SlotTarget {
+        slot_generation: 2,
+        sandbox_id: Some("sandbox-0".into()),
+        namespace: host.name(0, "uts"),
+    };
+    for expected in [
+        SlotTarget {
+            slot_generation: 1,
+            ..current.clone()
+        },
+        SlotTarget {
+            sandbox_id: Some("sandbox-1".into()),
+            ..current.clone()
+        },
+        SlotTarget {
+            namespace: net,
+            ..current
+        },
+    ] {
+        assert!(matches!(expecting(Some(expected)).await, NotRun::Changed));
+    }
 
     std::fs::remove_file(host.link(0)).unwrap();
     assert!(matches!(

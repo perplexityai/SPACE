@@ -444,16 +444,27 @@ async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
     }
 }
 
-// Catches a binding-ending result not reaching the reply, or a later
-// delivery admitted, written or applied.
+// Catches work run against a namespace replaced between attempts, a
+// binding-ending result not reaching the reply, or a later delivery admitted,
+// written or applied.
 #[tokio::test]
-async fn an_ended_binding_refuses_later_deliveries() {
-    let bound = bind(Some(Fault::Panics), None, WAIT).await;
-    let first = reply(sync(&bound.service, delivery(12)).await);
+async fn a_target_replaced_between_attempts_ends_the_binding() {
+    let bound = bind(None, None, WAIT).await;
     let committed = FirewallAssignmentAcceptance::Committed;
-    assert_eq!(first, (12, committed, Outcome::Unknown));
-    let (record, installs) = (std::fs::read(&bound.path).unwrap(), bound.host.installs());
-    for generation in [12, 13] {
+    let first = reply(sync(&bound.service, delivery(12)).await);
+    assert_eq!(first, (12, committed, Outcome::Matched));
+    bound.host.name(SLOT, "ipc");
+    let replaced = sync(&bound.service, delivery(13)).await.unwrap();
+    let dispatch = replaced.dispatch.unwrap();
+    assert_eq!(
+        (dispatch.outcome(), dispatch.detail.as_str()),
+        (
+            Outcome::NotRun,
+            "the network slot changed before it was owned"
+        )
+    );
+    let record = std::fs::read(&bound.path).unwrap();
+    for generation in [13, 14] {
         let refused = sync(&bound.service, delivery(generation))
             .await
             .unwrap_err();
@@ -461,7 +472,7 @@ async fn an_ended_binding_refuses_later_deliveries() {
         assert_eq!(refused.message(), "the firewall rule sync binding ended");
     }
     assert_eq!(std::fs::read(&bound.path).unwrap(), record);
-    assert_eq!(bound.host.installs(), installs);
+    assert_eq!(bound.host.installs(), [bound.namespace]);
 }
 
 // Catches older work run or reported after a newer generation is accepted.

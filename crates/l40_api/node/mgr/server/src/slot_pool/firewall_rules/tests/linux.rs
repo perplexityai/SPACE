@@ -50,6 +50,7 @@ fn applies_the_accepted_revision_only_to_the_slot_namespace() {
         node_id: NODE,
         generation: 12,
         slot_id: 0,
+        expected: None,
     };
     // A blocking thread the runtime starts inherits this contained namespace.
     let report = contained(|| {

@@ -19,7 +19,7 @@ pub use crate::node_state_sync::{NodeCtlNodeStatusDirtySink, NodeStatusDirtySink
 #[cfg(target_os = "linux")]
 pub use firewall_rules::{
     NamespaceIdentity, NotRun, NotRunnable, SlotFirewallAttempt, SlotFirewallReport,
-    SlotFirewallRequest, Stale,
+    SlotFirewallRequest, SlotTarget, Stale,
 };
 
 pub const NETWORK_POOL_SCHEMA_VERSION: u32 = 4;
