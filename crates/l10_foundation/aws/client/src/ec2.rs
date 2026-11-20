@@ -6,6 +6,8 @@ use crate::query::{
 };
 
 const DESCRIBE_INSTANCES_ACTION: &str = "DescribeInstances";
+const CREATE_TAGS_ACTION: &str = "CreateTags";
+const REBOOT_INSTANCES_ACTION: &str = "RebootInstances";
 const EC2_API_VERSION: &str = "2016-11-15";
 const DESCRIBE_PAGE_SIZE: &str = "1000";
 
@@ -43,6 +45,39 @@ impl<T: QueryTransport> Client<T> {
                 transport,
             ),
         }
+    }
+
+    /// `CreateTags` with one tag on one instance. Overwrites an existing value.
+    pub async fn create_instance_tag(
+        &self,
+        instance_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), AwsClientError> {
+        self.query
+            .send_action(
+                CREATE_TAGS_ACTION,
+                EC2_API_VERSION,
+                vec![
+                    ("ResourceId.1", instance_id.to_string()),
+                    ("Tag.1.Key", key.to_string()),
+                    ("Tag.1.Value", value.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `RebootInstances` for one instance. Instance store survives a reboot.
+    pub async fn reboot_instance(&self, instance_id: &str) -> Result<(), AwsClientError> {
+        self.query
+            .send_action(
+                REBOOT_INSTANCES_ACTION,
+                EC2_API_VERSION,
+                vec![("InstanceId.1", instance_id.to_string())],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn describe_instances_by_private_dns(

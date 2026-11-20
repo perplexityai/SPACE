@@ -515,6 +515,9 @@ impl NodeObjectReconciles for kubernetes_controller::Controller {
         if let Err(error) = self.reconcile_environment_labels().await {
             tracing::warn!(%error, "local Kubernetes environment-label reconcile failed");
         }
+        if let Err(error) = self.reconcile_cache_encryption().await {
+            tracing::warn!(%error, "local Kubernetes cache-encryption reconcile failed");
+        }
     }
 }
 
