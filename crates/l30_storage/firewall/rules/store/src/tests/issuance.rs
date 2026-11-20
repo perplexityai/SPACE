@@ -344,7 +344,7 @@ async fn a_node_or_lease_that_lapses_while_issuance_waits_issues_nothing() -> Te
 
     sqlx::query(sql!(
         "UPDATE firewall_rules_rollout_items
-         SET lease_expires_at = clock_timestamp() + interval '3 seconds'
+         SET lease_expires_at = clock_timestamp() + interval '1 second'
          WHERE rollout_id = $1"
     ))
     .bind(rollout)
