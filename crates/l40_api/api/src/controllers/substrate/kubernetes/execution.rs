@@ -445,6 +445,10 @@ impl KubernetesSubstrate {
                 | SubstrateError::SuspendInFlight { .. }
                 | SubstrateError::ActivationInFlight { .. },
             ) => None,
+            // `RestoreUploadSettling` is retryable for the client but still
+            // completes the attempt as failed, like the 412 it replaces:
+            // nothing reaps an abandoned `recovering` execution, and the
+            // next wake re-claims a failed one.
             Err(_) => Some(StartedRecoveryCompletion::Failed),
         };
         if let Some(completion) = completion {
@@ -2646,6 +2650,7 @@ pub(super) fn wake_failure_should_revert_to_suspended(
                 SubstrateError::Timeout { .. }
                     | SubstrateError::RestoreInFlight { .. }
                     | SubstrateError::RestoreSourcePending { .. }
+                    | SubstrateError::RestoreUploadSettling { .. }
                     | SubstrateError::SuspendInFlight { .. }
                     | SubstrateError::ActivationInFlight { .. }
                 | SubstrateError::LockContention { .. }

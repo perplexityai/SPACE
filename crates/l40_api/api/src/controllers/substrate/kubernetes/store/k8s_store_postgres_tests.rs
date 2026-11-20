@@ -505,6 +505,79 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
 }
 
 #[tokio::test]
+async fn started_recovery_source_publishing_is_bounded_by_the_settle_window() -> TestResult {
+    // Arrange: a started sandbox with no restore source, as in the
+    // auto-suspend race before the node's upload lands.
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    let source_node_id = NodeId::new();
+    insert_sandbox(
+        &fixture.pool,
+        sandbox_id,
+        SandboxLifecycle::Started.as_str(),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.14', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(source_node_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    // Act / Assert: nothing uploading.
+    assert!(
+        !fixture
+            .store
+            .started_recovery_source_publishing(sandbox_id)
+            .await?
+    );
+
+    // Act: an upload whose heartbeat is past the settle window.
+    let upload_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, last_attempt_at, source_node_id,
+              org_id, local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'creating', NOW() - INTERVAL '2 hours',
+                 NOW() - INTERVAL '1 hour', $3,
+                 '00000000-0000-0000-0000-000000000001',
+                 $4, 'full', 'suspend')"
+    ))
+    .bind(upload_id)
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(Uuid::now_v7())
+    .execute(&fixture.pool)
+    .await?;
+
+    // Assert: a quiet upload no longer counts.
+    assert!(
+        !fixture
+            .store
+            .started_recovery_source_publishing(sandbox_id)
+            .await?
+    );
+
+    // Act: the worker heartbeats again.
+    sqlx::query(sql!(
+        "UPDATE snapshots SET last_attempt_at = NOW() WHERE id = $1"
+    ))
+    .bind(upload_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    // Assert.
+    assert!(
+        fixture
+            .store
+            .started_recovery_source_publishing(sandbox_id)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn started_recovery_treats_deleting_snapshot_as_unavailable() -> TestResult {
     // Arrange: a started sandbox whose marker-matched suspend snapshot is a
     // valid remote restore source.

@@ -614,6 +614,7 @@ fn reconnect_error_outcome(
     match err {
         SubstrateError::RestoreInFlight { .. }
         | SubstrateError::RestoreSourcePending { .. }
+        | SubstrateError::RestoreUploadSettling { .. }
         | SubstrateError::SuspendInFlight { .. }
         | SubstrateError::ActivationInFlight { .. } => (
             ReconnectOutcome::WakeInProgress,

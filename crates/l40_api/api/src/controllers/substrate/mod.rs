@@ -684,6 +684,14 @@ pub enum SubstrateError {
     /// restore evidence. Pending publication uses `RestoreSourcePending`.
     #[error("{message}")]
     RestoreContextUnavailable { message: String },
+    /// Started recovery found no restore source, but a full snapshot upload
+    /// of the sandbox is still within its settle window and may become one
+    /// (a wake racing the node's own suspend). Retryable like
+    /// `RestoreSourcePending`, but the attempt completes as
+    /// `recovery_failed` rather than staying `recovering`, as the 412 it
+    /// replaces does, so the next wake re-claims it.
+    #[error("{message}")]
+    RestoreUploadSettling { message: String },
     /// Started recovery found current local suspend state, but it cannot yet
     /// restore from the source node or durable storage.
     #[error("{message}")]
@@ -1006,7 +1014,8 @@ impl From<SubstrateError> for ControllerError {
                 // execution, without any work that can satisfy the request.
                 ControllerError::restore_context_unavailable(message)
             }
-            SubstrateError::RestoreSourcePending { message } => {
+            SubstrateError::RestoreSourcePending { message }
+            | SubstrateError::RestoreUploadSettling { message } => {
                 ControllerError::service_unavailable(message)
                     .with_retry_after(GATEWAY_RETRY_AFTER)
                     .with_retry_after_cause(ControllerRetryAfterCause::RestoreInFlight)

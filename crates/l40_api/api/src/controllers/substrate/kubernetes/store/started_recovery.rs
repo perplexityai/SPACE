@@ -270,6 +270,43 @@ impl K8sStore {
         }
     }
 
+    /// Whether a started recovery with no restore source may only be racing
+    /// a snapshot upload: a `creating` full snapshot of the sandbox whose
+    /// heartbeat (`COALESCE(last_attempt_at, timestamp)`) is within
+    /// [`pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE`].
+    ///
+    /// This is the auto-suspend race. The node suspended the sandbox and is
+    /// uploading, and the wake reached the API before the new marker did. The
+    /// bound is the settle window the cluster controller already uses to call
+    /// such an upload dead. It is well inside the stuck-snapshot reaper's
+    /// age, so a quiet or abandoned upload stops counting long before the
+    /// reaper would act, and the answer goes back to the usual 412.
+    pub(in crate::controllers::substrate::kubernetes) async fn started_recovery_source_publishing(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM snapshots sn
+                  WHERE sn.sandbox_id = $1
+                    AND sn.type = 'full'
+                    AND sn.state = 'creating'
+                    AND COALESCE(sn.last_attempt_at, sn.timestamp)
+                        >= NOW() - make_interval(secs => $2::BIGINT)
+             )"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(
+            pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
+                .as_secs()
+                .cast_signed(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .db_context("failed to check for an in-flight started recovery upload")
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn replace_started_recovery_execution(
         &self,
         sandbox_id: SandboxId,

@@ -78,12 +78,17 @@ impl KubernetesSubstrate {
                 ..
             }) => None,
             StartedRecoveryRestoreContext::Unavailable => {
-                return Err(SubstrateError::RestoreContextUnavailable {
-                    message: format!(
-                        "sandbox {sandbox_id} generation {generation} has no verified local or \
-                         remote restore source; leaving the execution unchanged"
-                    ),
-                });
+                return Err(self
+                    .started_recovery_unavailable_error(
+                        sandbox_id,
+                        SubstrateError::RestoreContextUnavailable {
+                            message: format!(
+                                "sandbox {sandbox_id} generation {generation} has no verified \
+                                 local or remote restore source; leaving the execution unchanged"
+                            ),
+                        },
+                    )
+                    .await);
             }
         };
 
@@ -100,15 +105,50 @@ impl KubernetesSubstrate {
             StartedRecoveryReplacement::Pending => {
                 Err(SubstrateError::restore_source_pending(sandbox_id))
             }
-            StartedRecoveryReplacement::Unavailable => {
-                Err(SubstrateError::RestoreContextUnavailable {
-                    message: format!(
-                        "sandbox {sandbox_id} generation {generation} lost its verified restore \
-                         source before execution handoff; leaving the execution unchanged"
-                    ),
-                })
-            }
+            // An upload can start between the pre-check and the handoff
+            // transaction; answer the same state the same way.
+            StartedRecoveryReplacement::Unavailable => Err(self
+                .started_recovery_unavailable_error(
+                    sandbox_id,
+                    SubstrateError::RestoreContextUnavailable {
+                        message: format!(
+                            "sandbox {sandbox_id} generation {generation} lost its verified \
+                             restore source before execution handoff; leaving the execution \
+                             unchanged"
+                        ),
+                    },
+                )
+                .await),
             StartedRecoveryReplacement::OwnershipLost => Ok(None),
+        }
+    }
+
+    /// The error for a started recovery with no restore source: the
+    /// retryable `RestoreUploadSettling` while a snapshot upload may still
+    /// land ([`K8sStore::started_recovery_source_publishing`]), otherwise
+    /// `unavailable` unchanged. A failed read keeps `unavailable`, the answer
+    /// before this check existed.
+    async fn started_recovery_unavailable_error(
+        &self,
+        sandbox_id: SandboxId,
+        unavailable: SubstrateError,
+    ) -> SubstrateError {
+        match self.store.started_recovery_source_publishing(sandbox_id).await {
+            Ok(true) => SubstrateError::RestoreUploadSettling {
+                message: format!(
+                    "sandbox {sandbox_id}: a snapshot upload is in flight and may become the \
+                     restore source; retry"
+                ),
+            },
+            Ok(false) => unavailable,
+            Err(error) => {
+                tracing::warn!(
+                    %sandbox_id,
+                    error = %error,
+                    "started recovery: in-flight upload check failed; answering unavailable"
+                );
+                unavailable
+            }
         }
     }
 
