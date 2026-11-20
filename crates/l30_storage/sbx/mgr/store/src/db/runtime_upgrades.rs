@@ -1169,8 +1169,8 @@ db_private_outside_tests! {
 /// False, recording nothing, when the operation hasn't reached its target for
 /// that sandbox: its rollback or refusal is what the attempt's report says
 /// then. False too, keeping the recorded one, when the attempt already has a
-/// final outcome: a row is never rewritten, so recording order is insertion
-/// order (see [`latest_refused_attempt`]). The check and the write are one
+/// final outcome: a row is never rewritten, so `recorded_seq` order is
+/// recording order (see [`latest_refused_attempt`]). The check and the write are one
 /// statement.
 pub fn record_runtime_upgrade_refused_attempt(
     conn: &Connection,
@@ -1218,9 +1218,9 @@ pub fn record_runtime_upgrade_refused_attempt(
 }
 
 /// The latest attempt the operation refused after reaching its target,
-/// `None` without one. A row is never rewritten or deleted, so the newest
-/// rowid is the latest recorded, however coarse or unsteady the clock that
-/// stamped `recorded_at`. A row kept from before its sandbox was deleted can
+/// `None` without one. A row is never rewritten, and `recorded_seq` is never
+/// reused or renumbered, so the highest is the latest recorded, however
+/// coarse or unsteady the clock that stamped `recorded_at`. A row kept from before its sandbox was deleted can
 /// be the latest; a caller reads it only beside a report that reached the
 /// target.
 fn latest_refused_attempt(
@@ -1232,7 +1232,7 @@ fn latest_refused_attempt(
            FROM sandbox_runtime_upgrade_attempt_outcomes
           WHERE operation_id = ?1
             AND outcome = ?2
-          ORDER BY rowid DESC
+          ORDER BY recorded_seq DESC
           LIMIT 1",
         params![
             operation_id.to_string(),
