@@ -120,13 +120,13 @@ between the two values:
   fully used, that surge falls back to on-demand capacity and can fail, and
   EKS rolls the update back.
 
-The module defaults builders to one node (`builders_min_size` and
-`builders_desired_size` of 1). Set both to 2 or more to keep a builder up
-under `MINIMAL`. Apply a
-strategy change on its own, before any LT or AMI change to the group: in a
-combined apply the node group version update runs first, under the old
-strategy. `builders_launch_template_version` can hold the builders on a
-version, like the capacity group pin below.
+Run at least two builders in every cluster. The module defaults
+`builders_min_size` and `builders_desired_size` to 1, so set both to 2 or
+more; with one builder, `MINIMAL` leaves the cluster without a builder for
+each replacement. Apply a strategy change on its own, before any LT or AMI
+change to the group: in a combined apply the node group version update
+runs first, under the old strategy. `builders_launch_template_version`
+can hold the builders on a version, like the capacity group pin below.
 
 Keep builder LT changes in their own apply, separate from worker changes, so
 a builder capacity failure does not hold up unrelated work.
@@ -221,8 +221,10 @@ warns while any pin lags the latest version. During a plan that changes the
 LT, the latest version is not known until apply, so the check reports as
 unknown. A pin above the template's latest version fails a precondition
 at apply, before any node group update starts. The module does not require
-a populated group to be pinned; pin every populated group to the version
-it runs.
+a populated group to be pinned, so make it a rule: pin a group to the
+version it runs before scaling it out from zero and before any change that
+publishes a new LT version. An unpinned group that is populated when the LT
+changes rolls on that apply.
 
 The builders pool has the same control, `builders_launch_template_version`,
 with the `custom_node_groups_on_latest_launch_template` check and the same
@@ -235,6 +237,27 @@ latest version and serves it when it scales out. A group can be drained to
 zero, its pin moved or cleared, and then refilled on the new version
 without a blue/green pair, provided the rest of the fleet can hold its
 sandboxes meanwhile.
+
+Bump pins deliberately: one group per change, reviewed, applied while
+someone watches node availability, and only after the previous group has
+finished and its nodes are back to Ready and schedulable. Never batch pin
+bumps for several populated groups into one apply.
+
+## Operating guardrails
+
+The mechanisms above assume a few standing practices:
+
+- Reserved capacity covers every running worker and builder. Size
+  reservations per instance type and AZ to the live node counts, plus the
+  `H` headroom of any planned blue/green rollout. A `DEFAULT` surge or a
+  replacement that falls back to on-demand capacity can fail with
+  `InsufficientInstanceCapacity`.
+- Node availability is monitored. Alert on each node group's Ready and
+  schedulable node counts, on nodes stuck NotReady or cordoned, and on node
+  group updates that run long or fail, so an unintended or stalled roll is
+  caught while it is still one group.
+- Every populated worker group is pinned, and every cluster runs at least
+  two builders on `MINIMAL`.
 
 ## Parallel pairs (future)
 
@@ -254,8 +277,9 @@ wall time roughly by the number of pairs. It is not implemented. It needs:
 | --- | --- |
 | Empty capacity group | Native update; it adopts the latest LT on apply. |
 | Boot-only or cosmetic LT change on nonempty groups | Keep the groups pinned, let empty groups adopt it and roll the rest at the next planned rollout. |
-| Planned worker AMI, kernel or bootstrap change | Pin, or drain to zero, every nonempty capacity group before the apply that publishes the LT. Then roll sandbox-aware blue/green, one pair at a time, with room for `N + H` in the target. |
-| Builders | Native update with `builders_update_strategy` (`MINIMAL` by default) and two or more builders where a gap is not acceptable, one cluster at a time. |
+| Scale-out of a capacity group | Pin the group to the version it will run before scaling it out. |
+| Planned worker AMI, kernel or bootstrap change | Pin, or drain to zero, every nonempty capacity group before the apply that publishes the LT. Then roll sandbox-aware blue/green, one pair at a time, with room for `N + H` in the target, or bump one group's pin at a time. |
+| Builders | Native update with `builders_update_strategy` (`MINIMAL` by default) and at least two builders, one cluster at a time. |
 | Emergency on nonempty workers | Blue/green with larger `K` and `H` if headroom exists; otherwise native update one group at a time, with approval. |
 
 Avoid native updates of several nonempty worker groups in parallel: each
