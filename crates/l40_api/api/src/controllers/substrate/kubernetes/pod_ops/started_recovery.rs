@@ -133,7 +133,11 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         unavailable: SubstrateError,
     ) -> SubstrateError {
-        match self.store.started_recovery_source_publishing(sandbox_id).await {
+        match self
+            .store
+            .started_recovery_source_publishing(sandbox_id)
+            .await
+        {
             Ok(true) => SubstrateError::RestoreUploadSettling {
                 message: format!(
                     "sandbox {sandbox_id}: a snapshot upload is in flight and may become the \
