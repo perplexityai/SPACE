@@ -7,8 +7,10 @@
 //!
 //! Claims and renewals run [`pplx_space_rollout_queue::claim`] and
 //! [`pplx_space_rollout_queue::renew`] on these tables, in their lock order:
-//! the rollout row, then the lease handoff lock, then item rows. Requeues and
-//! redrives are single fenced updates under the shared outcome contract
+//! the rollout row, then the lease handoff lock, then item rows. A canary's
+//! first claim takes back its lapsed unissued claims in the same transaction,
+//! right after the rollout row. Requeues and redrives are single fenced
+//! updates under the shared outcome contract
 //! ([`pplx_space_rollout_queue::LEASE_EXPIRED`]).
 //!
 //! A lease isn't permission to assign: the assignment step must still recheck
@@ -114,10 +116,10 @@ pub async fn lease_targets(
 /// eligible targets, while it's in canary and none of its saved targets is
 /// issued. No check is leased. Commits before it returns.
 ///
-/// First, while it's still in canary under its header lock, its unissued
-/// targets whose leases lapsed go back to pending, keeping their attempts:
-/// their claimants died before issuing. An issued one may be a check's, so
-/// it's left alone.
+/// First, in the same transaction once the header lock finds it in canary,
+/// its unissued targets whose leases lapsed go back to pending, keeping their
+/// attempts: their claimants died before issuing. An issued one may be a
+/// check's, so it's left alone.
 pub async fn lease_first_canary(
     conn: &mut PgConnection,
     lease: Duration,
@@ -135,32 +137,6 @@ pub async fn lease_first_canary(
     else {
         return Ok(None);
     };
-    // Discovery is a hint: recover only if still canary under the header lock.
-    let mut tx = conn
-        .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
-        .await?;
-    let recovered = async {
-        let canary = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT phase = $2
-             FROM firewall_rules_rollouts
-             WHERE id = $1
-             FOR UPDATE"
-        ))
-        .bind(rollout_id)
-        .bind(rollout_phase(HeaderPhase::Canary))
-        .fetch_optional(&mut *tx)
-        .await?;
-        if canary != Some(true) {
-            return Ok(false);
-        }
-        // Never failed, which is the later driver's call; the attempts stay.
-        redrive(&mut *tx, rollout_id, u64::MAX, Scope::FirstCanary).await?;
-        Ok::<_, sqlx::Error>(true)
-    }
-    .await;
-    if !end_transaction(tx, recovered).await? {
-        return Ok(None);
-    }
     let mut tx = conn
         .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
         .await?;
@@ -220,9 +196,13 @@ impl ClaimStore for Claiming<'_> {
         .bind(rollout_phase(HeaderPhase::Rolling))
         .fetch_optional(&mut *self.tx)
         .await?;
-        // The rollout may leave canary after recovery commits. No test
-        // catches its removal.
+        // A canary's first claim found its rollout without a lock: this is
+        // its only canary check.
         let canary = canary.filter(|&canary| canary || self.scope == Scope::Any);
+        if canary == Some(true) && self.scope == Scope::FirstCanary {
+            // Never failed, which is the later driver's call; the attempts stay.
+            redrive(&mut *self.tx, self.rollout_id, u64::MAX, Scope::FirstCanary).await?;
+        }
         Ok(canary.map(|canary| {
             (
                 canary,
