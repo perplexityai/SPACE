@@ -161,9 +161,11 @@ async fn the_fragments_match_the_documented_rule() -> TestResult {
         return Ok(());
     };
     let pool = &db.pool;
-    sqlx::query(sqlx::AssertSqlSafe(sql!(format!("DROP INDEX {OLD_INDEX}"))))
-        .execute(pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
+        "DROP INDEX IF EXISTS {OLD_INDEX}"
+    ))))
+    .execute(pool)
+    .await?;
 
     let mut rng = Lcg(0x5eed);
     let mut fixtures = Vec::new();
@@ -570,9 +572,11 @@ async fn the_spelling_pair_fixture_names_the_digest_original() -> TestResult {
     let pool = &db.pool;
     insert_template(pool, "pairs").await?;
     let pairs = seed_spelling_pairs(pool, "pairs", None).await?;
-    sqlx::query(sqlx::AssertSqlSafe(sql!(format!("DROP INDEX {INDEX}"))))
-        .execute(pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
+        "DROP INDEX IF EXISTS {INDEX}"
+    ))))
+    .execute(pool)
+    .await?;
     insert_template(pool, "pairs-with-twins").await?;
     let with_twins = seed_spelling_pairs(
         pool,
