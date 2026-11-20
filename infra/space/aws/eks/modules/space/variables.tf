@@ -831,6 +831,46 @@ variable "builders_capacity_reservation_resource_group_arn" {
   nullable    = true
 }
 
+variable "builders_update_strategy" {
+  description = <<-EOT
+    EKS update strategy for the builders node group when a launch template or
+    AMI change rolls it. `MINIMAL` (the default) drains and terminates a
+    builder before launching its replacement, so a roll never needs capacity
+    beyond the group's size: a small bare-metal group whose instances come
+    from a fully used capacity reservation can roll. `MINIMAL` avoids a
+    builder gap only with more than one builder: the group replaces one node
+    at a time (max_unavailable = 1) while the others keep serving builds, so
+    set `builders_min_size` and `builders_desired_size` to at least 2 to roll
+    without a gap. A single-node group has no builder until its replacement
+    joins. `DEFAULT` launches the replacement first, which keeps a builder up
+    throughout but needs a spare instance of the same type in the old node's
+    Availability Zone; without one the roll fails and EKS rolls it back. Never
+    null: EKS cannot clear a strategy once set, so null would plan a diff on
+    every run.
+
+    Upgrade: an existing builders group keeps its nodes when the strategy
+    changes and rolls under `MINIMAL` at its next roll. On a single-node
+    group, template build submissions then fail as unavailable until the
+    replacement joins, so callers must retry them; run at least two builders
+    to avoid that. Set `DEFAULT` to keep the previous behavior, but only where
+    a spare instance of the same type is available in the group's Availability
+    Zones.
+
+    Apply a strategy change on its own, before any launch template or AMI
+    change to the group. In a combined apply the provider updates the node
+    group version first, so the roll runs under the old strategy, and if it
+    fails the strategy change is never sent.
+  EOT
+  type        = string
+  default     = "MINIMAL"
+  nullable    = false
+
+  validation {
+    condition     = contains(["DEFAULT", "MINIMAL"], var.builders_update_strategy)
+    error_message = "builders_update_strategy must be DEFAULT or MINIMAL."
+  }
+}
+
 variable "builders_disk_size_gib" {
   description = "Root disk size for the builders node group"
   type        = number

@@ -310,9 +310,10 @@ locals {
       capacity_reservation_resource_group_arn = pool.capacity_reservation_resource_group_arn
       # EKS keeps reporting a node group's update strategy once one has been
       # set and has no way to clear it, so leaving it null plans a diff on
-      # every run for such a group. Builders pin EKS's default (surge-first)
-      # explicitly; changing only the strategy does not roll nodes.
-      update_strategy = name == "builders" ? "DEFAULT" : null
+      # every run for such a group. Builders always carry an explicit
+      # strategy (`var.builders_update_strategy`); changing only the strategy
+      # does not roll nodes.
+      update_strategy = name == "builders" ? var.builders_update_strategy : null
       # Only builders runs a custom AMI here, and only a custom-AMI pool tracks
       # its template's latest version; the EKS-managed pools already stay on
       # theirs.
