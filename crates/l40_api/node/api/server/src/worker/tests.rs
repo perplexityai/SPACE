@@ -158,6 +158,43 @@ fn policy_mutation_requires_control_plane_authority() {
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 }
 
+#[tokio::test]
+async fn worker_refuses_classed_snapshot_from_weak_or_missing_authority() {
+    use proto::create_snapshot_source::Source;
+    let request = |source| proto::CreateSnapshotRequest {
+        sandbox_id: SandboxId::new().to_string(),
+        source: Some(proto::CreateSnapshotSource {
+            source: Some(source),
+        }),
+        ..Default::default()
+    };
+    let classed = request(Source::ClassedDurableArtifact(Default::default()));
+    assert_eq!(
+        check_snapshot_source_authority(&classed, Some(NetworkPolicyMutationAuthority::Denied))
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    check_snapshot_source_authority(&classed, Some(NetworkPolicyMutationAuthority::Granted))
+        .unwrap();
+    let (channel, backend_calls) = answering_sandbox_manager(tonic::Code::Unimplemented, "").await;
+    let worker = WorkerApiService::new(crate::clients::BackendClients::with_channel(channel));
+    let rejected = worker
+        .create_sandbox_snapshot(Request::new(classed))
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), tonic::Code::PermissionDenied);
+    assert_eq!(backend_calls.load(Ordering::SeqCst), 0);
+
+    let ordinary = request(Source::DurableArtifact(Default::default()));
+    let forwarded = worker
+        .create_sandbox_snapshot(Request::new(ordinary))
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented);
+    assert_eq!(backend_calls.load(Ordering::SeqCst), 1);
+}
+
 /// A backend that answers every call with `Unimplemented`, so a call node-api
 /// forwarded is told apart from one it refused at admission.
 fn unimplemented_backend() -> axum::Router {

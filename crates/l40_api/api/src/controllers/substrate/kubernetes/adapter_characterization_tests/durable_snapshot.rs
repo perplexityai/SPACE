@@ -3,7 +3,9 @@ use super::super::scripted_test_doubles::{
 };
 use super::super::tests::{node_api_pod_on_node, substrate_with_inventory_caches_and_pool};
 use super::*;
-use crate::controllers::substrate::{DurableSnapshotError, NodeApiTarget, Substrate};
+use crate::controllers::substrate::{
+    CopyDurableArtifact, DurableSnapshotError, NodeApiTarget, Substrate,
+};
 use pplx_space_node_model::{NodeManagedBy, NodeRole};
 use pplx_space_public_api::OperationId;
 use pplx_space_sbx_mgr_client::proto as sbx;
@@ -28,6 +30,7 @@ async fn durable_copy_refusal_can_be_replayed_with_the_same_identity() -> TestRe
                 published_durable_artifact: Some(sbx::PublishedDurableArtifact {
                     storage_uri: destination.to_string(),
                     bytes_published: 42,
+                    verified_disk_storage_class: None,
                 }),
                 ..Default::default()
             }),
@@ -54,11 +57,14 @@ async fn durable_copy_refusal_can_be_replayed_with_the_same_identity() -> TestRe
     let copy = || {
         substrate.create_snapshot_from_durable_artifact(
             &target,
-            operation_id,
-            source,
-            child,
-            "s3://snapshots/source".to_string(),
-            destination.to_string(),
+            CopyDurableArtifact {
+                operation_id,
+                source_sandbox_id: source,
+                target_sandbox_id: child,
+                source_storage_uri: "s3://snapshots/source".to_string(),
+                destination_storage_uri: destination.to_string(),
+                disk_storage_class: None,
+            },
         )
     };
 

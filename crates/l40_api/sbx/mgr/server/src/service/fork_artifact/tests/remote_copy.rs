@@ -50,11 +50,15 @@ impl Transfers {
         })
     }
 
-    fn copy(&self, request: CopyObjectRequest) -> Result<SubmitTransferResponse, Status> {
+    fn copy(
+        &self,
+        request: CopyObjectRequest,
+        method: &str,
+    ) -> Result<SubmitTransferResponse, Status> {
         self.calls
             .lock()
             .map_err(|error| Status::internal(error.to_string()))?
-            .push("copy".into());
+            .push(method.into());
         assert_eq!(
             request.subject_id,
             format!("sandbox:{}", self.metadata.sandbox_id)
@@ -202,7 +206,27 @@ async fn peer(metadata: crate::snapshot_upload::SnapshotMeta, reply: CopyReply) 
                 }
                 "SubmitCopyObject" => {
                     tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
-                        .unary(Unary(move |r| handler.copy(r)), request)
+                        .unary(
+                            Unary(move |r: CopyObjectRequest| {
+                                assert_eq!(r.destination_storage_class, None);
+                                handler.copy(r, "copy")
+                            }),
+                            request,
+                        )
+                        .await
+                }
+                "SubmitClassedCopyObject" => {
+                    tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                        .unary(
+                            Unary(move |r: CopyObjectRequest| {
+                                assert_eq!(
+                                    r.destination_storage_class,
+                                    Some(CopyStorageClass::GlacierInstantRetrieval as i32)
+                                );
+                                handler.copy(r, "copy:classed")
+                            }),
+                            request,
+                        )
                         .await
                 }
                 "WaitTransferJob" => {
@@ -239,6 +263,15 @@ async fn run(
     source: SandboxId,
     destination: SandboxId,
 ) -> Result<crate::proto::CreateSnapshotResponse, Status> {
+    run_with_class(peer, source, destination, None).await
+}
+
+async fn run_with_class(
+    peer: &mut Peer,
+    source: SandboxId,
+    destination: SandboxId,
+    class: Option<ForkDiskStorageClass>,
+) -> Result<crate::proto::CreateSnapshotResponse, Status> {
     let source_config = crate::snapshot_upload::SnapshotUploadConfig::from_uri(
         "s3://example-artifacts/snapshot?region=us-east-1",
     )
@@ -264,11 +297,12 @@ async fn run(
             destination_storage_uri:
                 "s3://example-artifacts/snapshot/fork/operation?region=us-east-1".into(),
             destination_origin: ArtifactOrigin::Fork,
+            disk_storage_class: class,
         },
         staging.path(),
         move || {
             assert!(
-                requires_disk,
+                class.is_none() && requires_disk,
                 "server-side copy must not require bulk disk staging admission"
             );
             Ok(CacheDiskMeasurement {
@@ -324,6 +358,53 @@ async fn server_copy_publishes_only_disk_metadata_after_durable_copy() {
             response.published_durable_artifact.unwrap().bytes_published,
             4 + serde_json::to_vec_pretty(metadata).unwrap().len() as u64
         );
+    }
+}
+
+#[tokio::test]
+async fn classed_disk_copy_never_falls_back_and_publishes_only_after_success() {
+    let class = ForkDiskStorageClass::GlacierInstantRetrieval;
+    for (size, reply, expected) in [
+        (None, CopyReply::Complete, tonic::Code::FailedPrecondition),
+        (Some(4), CopyReply::Unsupported, tonic::Code::Unimplemented),
+        (Some(4), CopyReply::Failed, tonic::Code::Aborted),
+        (Some(4), CopyReply::Complete, tonic::Code::Ok),
+    ] {
+        let source = SandboxId::new();
+        let mut metadata = suspended_metadata(source);
+        metadata.rootfs_size_bytes = size;
+        metadata.rootfs_diff_format =
+            Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into());
+        let mut peer = peer(metadata, reply).await;
+        let result = run_with_class(&mut peer, source, SandboxId::new(), Some(class)).await;
+        let calls = peer.transfers.calls.lock().unwrap();
+        if expected == tonic::Code::Ok {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .published_durable_artifact
+                    .unwrap()
+                    .verified_disk_storage_class,
+                Some(class as i32)
+            );
+            assert_eq!(
+                *calls,
+                [
+                    "pull:metadata.json",
+                    "copy:classed",
+                    "wait",
+                    "push:metadata.json"
+                ]
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code(), expected);
+            assert_eq!(
+                calls.iter().any(|call| call == "copy:classed"),
+                size.is_some()
+            );
+            assert!(!calls.iter().any(|call| call.starts_with("push:")));
+            assert!(peer.transfers.published.lock().unwrap().is_none());
+        }
     }
 }
 

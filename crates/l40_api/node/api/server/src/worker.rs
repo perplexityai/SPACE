@@ -65,6 +65,26 @@ fn check_policy_mutation_authority(
     }
 }
 
+fn check_snapshot_source_authority(
+    request: &pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest,
+    authority: Option<NetworkPolicyMutationAuthority>,
+) -> Result<(), Status> {
+    use pplx_space_sbx_mgr_client::proto::create_snapshot_source::Source;
+    if matches!(
+        request
+            .source
+            .as_ref()
+            .and_then(|source| source.source.as_ref()),
+        Some(Source::ClassedDurableArtifact(_))
+    ) && authority != Some(NetworkPolicyMutationAuthority::Granted)
+    {
+        return Err(Status::permission_denied(
+            "classed fork copy requires control-plane authority",
+        ));
+    }
+    Ok(())
+}
+
 fn classify_wait_ready_caller<T>(request: &Request<T>) -> SpaceApiBridgeCallerPolicy {
     classify_wait_ready_policy(
         request
@@ -880,6 +900,12 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::CreateSnapshotResponse>, Status> {
+        check_snapshot_source_authority(
+            r.get_ref(),
+            r.extensions()
+                .get::<NodeApiAuthenticatedCaller>()
+                .map(NodeApiAuthenticatedCaller::network_policy_authority),
+        )?;
         fwd_sbx!(self, "CreateSandboxSnapshot", create_snapshot, r)
     }
 

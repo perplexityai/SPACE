@@ -1191,6 +1191,9 @@ message CreateSnapshotSource {
   oneof source {
     CurrentSandboxSnapshotSource current_sandbox = 1;
     DurableArtifactSnapshotSource durable_artifact = 2;
+    // An older receiver sees an unset source and rejects the operation instead
+    // of silently copying the artifact without its class.
+    ClassedDurableArtifactSnapshotSource classed_durable_artifact = 3;
   }
 }
 
@@ -1201,9 +1204,21 @@ message DurableArtifactSnapshotSource {
   ArtifactOrigin destination_origin = 4;
 }
 
+message ClassedDurableArtifactSnapshotSource {
+  DurableArtifactSnapshotSource artifact = 1;
+  ForkDiskStorageClass storage_class = 2;
+}
+
+enum ForkDiskStorageClass {
+  FORK_DISK_STORAGE_CLASS_UNSPECIFIED = 0;
+  FORK_DISK_STORAGE_CLASS_STANDARD = 1;
+  FORK_DISK_STORAGE_CLASS_GLACIER_INSTANT_RETRIEVAL = 2;
+}
+
 message PublishedDurableArtifact {
   string storage_uri = 1;
   uint64 bytes_published = 2;
+  optional ForkDiskStorageClass verified_disk_storage_class = 3;
 }
 
 message CreateTemplateBaseSnapshotRequest {

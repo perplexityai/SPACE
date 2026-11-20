@@ -6,4 +6,8 @@ fn fork_log_path_does_not_retain_caller_controlled_sandbox_segment() {
         ecw_logged_path("/sandboxes/caller-secret/fork"),
         "/sandboxes/{sandboxID}/fork"
     );
+    assert_eq!(
+        ecw_logged_path("/sandboxes/caller-secret/benchmark-fork"),
+        "/sandboxes/{sandboxID}/benchmark-fork"
+    );
 }

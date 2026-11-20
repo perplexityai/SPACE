@@ -89,7 +89,7 @@ impl ForkOperationStore {
         operation: &ClaimedPublicOperation,
         payload: &ForkSandboxPayloadV1,
     ) -> Result<(), ForkOperationStoreError> {
-        let payload_json = serde_json::to_value(ForkSandboxPayload::v1(payload.clone()))?;
+        let payload_json = serde_json::to_value(ForkSandboxPayload::from_payload(payload.clone()))?;
         let updated = self
             .public_operations
             .update_claimed_payload(UpdateClaimedPublicOperationPayload {
@@ -232,7 +232,7 @@ impl ForkOperationStore {
         {
             leader_payload.set_capture_operation_id(leader);
             let leader_payload_json =
-                serde_json::to_value(ForkSandboxPayload::v1(leader_payload.clone()))?;
+                serde_json::to_value(ForkSandboxPayload::from_payload(leader_payload.clone()))?;
             let updated = sqlx::query(sql!(
                 "UPDATE public_operations
                  SET payload_json = $3, updated_at = NOW()
@@ -252,7 +252,7 @@ impl ForkOperationStore {
             }
         }
         payload.set_capture_operation_id(leader);
-        let payload_json = serde_json::to_value(ForkSandboxPayload::v1(payload.clone()))?;
+        let payload_json = serde_json::to_value(ForkSandboxPayload::from_payload(payload.clone()))?;
         let updated = self
             .public_operations
             .update_claimed_payload_in_transaction(

@@ -19,10 +19,10 @@ use super::template_build::{
     put_uploaded_file, start_build,
 };
 use super::{
-    AppState, ECW_SANDBOX_API_LOG_EVENT, EcwHostConfig, EcwRequestLogContext, connect_sandbox,
-    connect_sandbox_v2, create_sandbox, delete_sandbox, fork_sandbox, get_sandbox, list_sandboxes,
-    pause_sandbox_e2b, record_ecw_sandbox_span_tag, refresh_sandbox, request_client_id,
-    require_ecw_api_host, resume_sandbox_e2b, timeout_sandbox,
+    AppState, BENCHMARK_FORK_PATH, ECW_SANDBOX_API_LOG_EVENT, EcwHostConfig, EcwRequestLogContext,
+    benchmark_fork, connect_sandbox, connect_sandbox_v2, create_sandbox, delete_sandbox,
+    fork_sandbox, get_sandbox, list_sandboxes, pause_sandbox_e2b, record_ecw_sandbox_span_tag,
+    refresh_sandbox, request_client_id, require_ecw_api_host, resume_sandbox_e2b, timeout_sandbox,
 };
 
 pub(crate) fn dedicated_host_router(state: AppState) -> Router<AppState> {
@@ -61,7 +61,7 @@ fn e2b_api_router(state: AppState, ecw_hosts: EcwHostConfig) -> Router<AppState>
 }
 
 fn protected_e2b_api_routes(state: AppState) -> Router<AppState> {
-    authenticated_e2b_api_routes()
+    authenticated_e2b_api_routes(state.benchmark_fork_access.is_some())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::auth::require_e2b_api_key,
@@ -176,24 +176,25 @@ pub(super) async fn log_ecw_request(request: Request, next: Next) -> Response {
 }
 
 fn is_sandbox_fork_path(path: &str) -> bool {
+    fork_path_template(path).is_some()
+}
+
+fn fork_path_template(path: &str) -> Option<&'static str> {
     let mut segments = path.trim_matches('/').split('/');
-    matches!(
-        (
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next()
-        ),
-        (Some("sandboxes"), Some(_), Some("fork"), None)
-    )
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("sandboxes"), Some(_), Some("fork"), None) => Some("/sandboxes/{sandboxID}/fork"),
+        (Some("sandboxes"), Some(_), Some("benchmark-fork"), None) => Some(BENCHMARK_FORK_PATH),
+        _ => None,
+    }
 }
 
 fn ecw_logged_path(path: &str) -> String {
-    if is_sandbox_fork_path(path) {
-        "/sandboxes/{sandboxID}/fork".to_string()
-    } else {
-        path.to_string()
-    }
+    fork_path_template(path).unwrap_or(path).to_string()
 }
 
 #[cfg(test)]
@@ -238,11 +239,11 @@ fn ecw_api_sandbox_id_from_path(path: &str) -> Option<SandboxId> {
 
 #[cfg(test)]
 pub(super) fn e2b_api_routes() -> Router<AppState> {
-    authenticated_e2b_api_routes().merge(file_upload_routes())
+    authenticated_e2b_api_routes(false).merge(file_upload_routes())
 }
 
-fn authenticated_e2b_api_routes() -> Router<AppState> {
-    Router::new()
+fn authenticated_e2b_api_routes(benchmark_fork_enabled: bool) -> Router<AppState> {
+    let router = Router::new()
         .route(
             "/sandboxes",
             axum::routing::get(list_sandboxes).post(create_sandbox),
@@ -313,7 +314,12 @@ fn authenticated_e2b_api_routes() -> Router<AppState> {
             axum::routing::get(get_build_status),
         )
         .method_not_allowed_fallback(unsupported_e2b_method)
-        .fallback(unsupported_e2b_endpoint)
+        .fallback(unsupported_e2b_endpoint);
+    if benchmark_fork_enabled {
+        router.route(BENCHMARK_FORK_PATH, axum::routing::post(benchmark_fork))
+    } else {
+        router
+    }
 }
 
 async fn unsupported_e2b_method() -> Response {

@@ -66,6 +66,7 @@ pub struct AppState {
     /// External console identity; `None` keeps password sessions. See
     /// [`crate::external_console`] and [`Self::session_user`].
     pub external_console: Option<crate::external_console::ExternalConsole>,
+    pub(crate) benchmark_fork_access: Option<crate::fork_operations::BenchmarkForkAccess>,
     pub data_plane_base_url: String,
     /// Relays a new command's event stream from `POST .../commands` when the
     /// caller accepts `text/event-stream`; `None` keeps the JSON-only answer.
@@ -277,6 +278,7 @@ impl AppState {
             template_build_state,
             federated_identity,
             external_console: None,
+            benchmark_fork_access: None,
             data_plane_base_url,
             command_stream,
             feature_flags,

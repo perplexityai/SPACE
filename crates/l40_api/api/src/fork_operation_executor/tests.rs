@@ -5,8 +5,13 @@ use pplx_space_snapshot_model::SnapshotId;
 use super::*;
 
 #[cfg(feature = "kubernetes")]
+#[rstest::rstest]
+#[case::ordinary_capture(false)]
+#[case::classed_source_restored_before_freeze(true)]
 #[tokio::test]
-async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_env::TestResult {
+async fn unfrozen_source_selects_capture_only_for_ordinary_forks(
+    #[case] classed_fork: bool,
+) -> pplx_space_test_env::TestResult {
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db};
     use pplx_space_node_model::SubstrateKind;
     use pplx_space_public_api::{OperationKind, OperationTargetType};
@@ -23,13 +28,14 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
         "INSERT INTO sandboxes (
              id, user_id, org_id, template_id, content_hash, lifecycle, placement,
              network_policy_generation, managed_by
-         ) VALUES ($1, $2, $3, 'seed', $4, 'started', 'unplaced', 1, $5)"
+         ) VALUES ($1, $2, $3, 'seed', $4, $6, 'unplaced', 1, $5)"
     ))
     .bind(source)
     .bind(SEED_USER_ID)
     .bind(SEED_ORG_ID)
     .bind("sha256:0000000000000000000000000000000000000000000000000000000000000001")
     .bind(SubstrateKind::Kubernetes)
+    .bind(if classed_fork { "suspended" } else { "started" })
     .execute(&db.pool)
     .await?;
     sqlx::query(sql!(
@@ -41,11 +47,13 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
     .bind(format!("space-sbx-{}-g7", source.as_uuid().simple()))
     .execute(&db.pool)
     .await?;
-    let payload = ForkSandboxPayloadV1::new(
-        source,
-        crate::fork_operations::ForkRequest::from_wire(Some(60), Some(1))?,
-        "e2b.example.test".to_string(),
-    );
+    let mut request = crate::fork_operations::ForkRequest::from_wire(Some(60), Some(1))?;
+    if classed_fork {
+        request = request.with_disk_storage_class(
+            pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass::GlacierInstantRetrieval,
+        );
+    }
+    let payload = ForkSandboxPayloadV1::new(source, request, "e2b.example.test".into());
     let source_id = source.to_string();
     let store = PublicOperationStore::new(db.pool.clone());
     let CreateClaimedPublicOperationResult::Claimed {
@@ -59,7 +67,7 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
             kind: OperationKind::ForkSandbox,
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&source_id),
-            payload_json: serde_json::to_value(ForkSandboxPayload::v1(payload))?,
+            payload_json: serde_json::to_value(ForkSandboxPayload::from_payload(payload))?,
             idempotency: None,
             traceparent: None,
         })
@@ -76,7 +84,28 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
         SandboxController::new(substrate),
     );
 
+    if classed_fork {
+        // Restore wins between enqueueing the job and the executor's freeze.
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
+        ))
+        .bind(source)
+        .execute(&db.pool)
+        .await?;
+    }
     let result = executor.execute(&claim_token, &operation).await;
+    if classed_fork {
+        assert_eq!(result.state, OperationState::Failed);
+        assert_eq!(
+            result.terminal_error_code,
+            Some(PublicErrorCode::FailedPrecondition)
+        );
+        assert_eq!(
+            result.terminal_error_json.unwrap()["message"],
+            "classed forks require a suspended source"
+        );
+        return Ok(());
+    }
 
     assert_eq!(result.state, OperationState::Queued);
     // Reclaim through the dispatcher's store API to inspect what the next
@@ -505,7 +534,7 @@ fn copy_admission_refusal_preserves_the_failure_retry_budget() {
         rate_limited_status("copy admission is busy", Some(hint)),
         hint,
     );
-    let error = copy_artifact_error(durable_snapshot_rpc_error(busy));
+    let error = copy_artifact_error(durable_snapshot_rpc_error(busy), false);
     assert!(
         matches!(error, ForkExecutionError::Wait(_)),
         "admission backpressure must wait without consuming failure retries: {error:?}"
@@ -516,7 +545,7 @@ fn copy_admission_refusal_preserves_the_failure_retry_budget() {
         tonic::Status::unavailable("worker unavailable"),
     ] {
         assert!(matches!(
-            copy_artifact_error(durable_snapshot_rpc_error(status)),
+            copy_artifact_error(durable_snapshot_rpc_error(status), false),
             ForkExecutionError::Retry(_)
         ));
     }
