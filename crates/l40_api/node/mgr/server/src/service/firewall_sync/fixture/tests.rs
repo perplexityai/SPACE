@@ -365,7 +365,7 @@ enum Drift {
 }
 
 // Catches a generation submitted again, an outcome misreported, or work after
-// an unknown kernel state or a slot that is no longer the bound one.
+// a changed target or an unknown result.
 #[tokio::test]
 async fn a_generation_is_attempted_once_and_drift_ends_the_binding() {
     for (fault, drift, outcome, ends) in [

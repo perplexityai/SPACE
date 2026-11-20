@@ -246,8 +246,8 @@ fn arm(wanted: &mut Option<Wanted>, generation: u64) -> bool {
     }
 }
 
-/// The reply for `report`, and whether it ends the binding: nothing runs again
-/// once the slot's kernel state is unknown or the slot is no longer the bound one.
+/// The reply for `report`, and whether it ends the binding: only a changed
+/// target or an unknown result does.
 fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDispatch, bool) {
     let (outcome, detail, ends) = match report {
         Err(error) => (Outcome::Unknown, error.to_string(), true),
@@ -260,7 +260,7 @@ fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDisp
         }
         Ok(SlotFirewallReport::Attempted(attempt)) => match (&attempt.readback, &attempt.current) {
             (Verification::Inconclusive(why), _) => (Outcome::Inconclusive, why.clone(), true),
-            // A newer generation is ordinary supersession; anything else is drift.
+            // Only an assignment change leaves the target trusted.
             (_, Err(stale)) => (
                 Outcome::Stale,
                 format!("{stale:?}"),

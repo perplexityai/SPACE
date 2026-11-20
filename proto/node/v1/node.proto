@@ -443,26 +443,34 @@ enum FirewallAssignmentAcceptance {
 }
 
 // What happened to the accepted generation in the bound slot, as of the reply.
+//
+// Three cases decide whether sync goes on. Retry: nothing was applied and the
+// target isn't known to have changed. Target changed: the slot number doesn't
+// prove it's the same sandbox. Unknown: what the attempt did can't be told.
+// Only the last two end this fixture binding, for this node-manager process
+// only, so waiting work never runs against a new occupant and a later success
+// can't hide the uncertainty. Pending, superseded, matched and mismatched
+// never do.
 enum FirewallSlotDispatchOutcome {
   FIREWALL_SLOT_DISPATCH_OUTCOME_UNSPECIFIED = 0;
   // Queued or running when the bounded wait ended.
   FIREWALL_SLOT_DISPATCH_OUTCOME_PENDING = 1;
   // A newer generation was accepted before this one's result.
   FIREWALL_SLOT_DISPATCH_OUTCOME_SUPERSEDED = 2;
-  // Nothing reached nft. Redelivery retries a busy slot; a changed or missing
-  // slot or namespace ends sync for this node-manager process.
+  // Nothing reached nft. Target changed if the slot or namespace is gone,
+  // changed or ineligible; otherwise redelivery may retry.
   FIREWALL_SLOT_DISPATCH_OUTCOME_NOT_RUN = 3;
   // Submitted once, and the slot's readback listed exactly this revision.
   // A point-in-time observation of one slot, not node-wide verification.
   FIREWALL_SLOT_DISPATCH_OUTCOME_MATCHED = 4;
   // Submitted once; the readback listed something else.
   FIREWALL_SLOT_DISPATCH_OUTCOME_MISMATCHED = 5;
-  // Submitted once; the readback could not tell. Ends sync for this process.
+  // Submitted once; the readback could not tell. Unknown.
   FIREWALL_SLOT_DISPATCH_OUTCOME_INCONCLUSIVE = 6;
-  // Submitted once, but what it was made for changed before the final check.
-  // Unless a newer generation was accepted, ends sync for this process.
+  // Submitted once, but the assignment, slot or namespace changed before the
+  // final check. Target changed or unknown, unless only the assignment changed.
   FIREWALL_SLOT_DISPATCH_OUTCOME_STALE = 7;
-  // The apply failed and nft may have run. Ends sync for this process.
+  // The apply failed and nft may have run. Unknown.
   FIREWALL_SLOT_DISPATCH_OUTCOME_UNKNOWN = 8;
 }
 
