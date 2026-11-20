@@ -247,20 +247,18 @@ async fn issue(
         )));
     }
     // After the waits above, on one clock reading: the lease may have lapsed
-    // or the node gone offline while they waited.
+    // or the node gone offline while they waited. The item lock, held since
+    // the item was read, keeps its phase, token and stamp as checked.
     let stamped = sqlx::query_as::<_, (OffsetDateTime, OffsetDateTime)>(sql!(
         "WITH clock AS (SELECT clock_timestamp() AS reading)
          UPDATE firewall_rules_rollout_items i
-         SET issued_assignment_generation = $4,
+         SET issued_assignment_generation = $3,
              issued_at = clock.reading,
-             next_check_at = clock.reading + make_interval(secs => $5)
+             next_check_at = clock.reading + make_interval(secs => $4)
          FROM clock
          WHERE i.rollout_id = $1
            AND i.node_id = $2
-           AND i.phase = $6
-           AND i.lease_token = $3
            AND i.lease_expires_at > clock.reading
-           AND i.issued_at IS NULL
            AND EXISTS (
                SELECT 1
                FROM node_status_snapshots nss
@@ -271,10 +269,8 @@ async fn issue(
     ))
     .bind(target.rollout_id)
     .bind(target.node_id)
-    .bind(target.lease_token)
     .bind(generation)
     .bind(first_check_in.as_secs_f64())
-    .bind(ItemPhase::InFlight.as_str())
     .fetch_optional(&mut **tx)
     .await?;
     let Some((issued_at, next_check_at)) = stamped else {

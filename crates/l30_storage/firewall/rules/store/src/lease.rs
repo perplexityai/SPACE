@@ -12,9 +12,9 @@
 //! ([`pplx_space_rollout_queue::LEASE_EXPIRED`]).
 //!
 //! A lease isn't permission to assign: the assignment step must still recheck
-//! the live token and the node's eligibility before it issues, stamping in the
-//! same `UPDATE` that checks `phase = 'in_flight' AND lease_token = $t`; the
-//! claim's canary pin relies on that.
+//! the live token and the node's eligibility before it issues, holding the
+//! item's lock from that check through its stamp; the claim's canary pin
+//! relies on that.
 //!
 //! In rolling, `active_limit` bounds the nodes leased or holding an
 //! unverified assignment: an issued target keeps its slot until it's done
