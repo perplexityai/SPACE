@@ -99,6 +99,7 @@ pub async fn claim_evacuation_suspend(
                  WHERE n.id = $3
                    AND n.drain_phase = $4
                    AND n.drain_mode = $5
+                   AND n.drain_engine IS NULL
             )"
     ))
     .bind(sandbox_id)
@@ -375,6 +376,7 @@ pub async fn claim_stopped_evacuation(
                  WHERE n.id = $2
                    AND n.drain_phase = $3
                    AND n.drain_mode = $4
+                   AND n.drain_engine IS NULL
             )
       RETURNING prior.evacuation_restore_target IS NULL"
     );
@@ -498,6 +500,7 @@ pub async fn record_stopped_evacuation_artifact(
                  WHERE n.id = $2
                    AND n.drain_phase = $8
                    AND n.drain_mode = $9
+                   AND n.drain_engine IS NULL
             )"
     ))
     .bind(sandbox_id)

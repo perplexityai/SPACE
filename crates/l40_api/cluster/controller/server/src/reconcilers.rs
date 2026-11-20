@@ -151,6 +151,11 @@ pub enum ReconcilerRuntimeError {
     InvalidTerminatorKind(String),
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
     RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
+    /// The drain's v2 runs in the node drain's loop.
+    #[error(
+        "SPACE_DRAIN_V2_ENABLED needs SPACE_NODE_DRAIN_ENABLED: the node drain runs the v2 loop"
+    )]
+    DrainV2NeedsNodeDrain,
 }
 
 /// How [`run_reconcilers`] wound down on a requested shutdown — whether every
@@ -212,6 +217,72 @@ impl TerminatorKind {
             Self::Aws => "aws",
             Self::KubeDelete => "kube-delete",
             Self::Noop => "noop",
+        }
+    }
+}
+
+/// Whether new v2 drains are admitted: `SPACE_DRAIN_V2_ENABLED`, refused
+/// unless the node drain runs, since its v2 loop drives them. The loop
+/// itself runs wherever the node drain does, flag or not, so a v2 drain
+/// already persisted still has an owner.
+fn drain_v2_enabled(
+    env: &dyn pplx_space_env_vars::Environment,
+    node_drain_enabled: bool,
+) -> Result<bool, ReconcilerRuntimeError> {
+    let enabled = pplx_space_env_vars::env_flag(
+        env.var(pplx_space_api::routes::admin::nodes::DRAIN_V2_ENABLED_ENV)
+            .ok()
+            .as_deref(),
+        false,
+    );
+    if enabled && !node_drain_enabled {
+        return Err(ReconcilerRuntimeError::DrainV2NeedsNodeDrain);
+    }
+    Ok(enabled)
+}
+
+/// The terminator backend a [`TerminatorKind`] selects, with the AWS
+/// config only the `aws` backend loads.
+enum TerminatorBackend {
+    Aws(Box<aws_config::SdkConfig>),
+    KubeDelete,
+    Noop,
+}
+
+impl TerminatorBackend {
+    async fn load(kind: TerminatorKind) -> Self {
+        Self::load_with(kind, || {
+            aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+        })
+        .await
+    }
+
+    /// [`Self::load`], with the AWS config from `aws_config`, which only
+    /// the `aws` backend calls.
+    async fn load_with<F, Fut>(kind: TerminatorKind, aws_config: F) -> Self
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = aws_config::SdkConfig>,
+    {
+        match kind {
+            TerminatorKind::Aws => Self::Aws(Box::new(aws_config().await)),
+            TerminatorKind::KubeDelete => Self::KubeDelete,
+            TerminatorKind::Noop => Self::Noop,
+        }
+    }
+
+    /// The v2 loop's authority: EC2 and Auto Scaling under the `aws`
+    /// backend, which terminate a node `:terminate` moved to `terminating`
+    /// and say when a v2 node's instance is gone. Under any other it never
+    /// fences, and the node waits for an operator, who may still undrain
+    /// it.
+    fn v2_terminator(&self) -> node_drain::v2::V2Terminator {
+        match self {
+            Self::Aws(aws_config) => node_drain::v2::V2Terminator::Ec2 {
+                ec2: pplx_space_aws_client::ec2::Client::from_config(aws_config),
+                autoscaling: pplx_space_aws_client::autoscaling::Client::from_config(aws_config),
+            },
+            Self::KubeDelete | Self::Noop => node_drain::v2::V2Terminator::Refuse,
         }
     }
 }
@@ -492,6 +563,12 @@ pub async fn run_reconcilers(
             tracing::info!("skipping Kubernetes-only reconcilers on direct substrate");
         }
         Some(kube) => {
+            // Admission is the API's; here the flag is only checked against
+            // what a v2 drain needs.
+            drain_v2_enabled(
+                &pplx_space_env_vars::ProcessEnvironment,
+                node_drain::ReconcilerConfig::from_env().enabled,
+            )?;
             let kube = Arc::new(kube.clone());
             let environment_placement = substrate.environment_placement();
             let warm_pool_token = shutdown_token.child_token();
@@ -753,10 +830,26 @@ pub async fn run_reconcilers(
                     evacuates_stopped_residents,
                     node_drain_config.replace_stopped_evacuations,
                 );
-                match kind {
-                    TerminatorKind::Aws => {
-                        let aws_config =
-                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let backend = TerminatorBackend::load(kind).await;
+                // The v2 drain's loop, beside v1's: it acts only on the rows
+                // `:drain {engine: v2}` marked, which v1's writers skip. It
+                // runs whether or not new v2 drains are admitted, so a
+                // persisted one is still drained or cancelled; it terminates
+                // a node only through EC2
+                // ([`TerminatorBackend::v2_terminator`]).
+                handles.push(tokio::spawn(node_drain::v2::run(
+                    node_drain::SubstrateSink::v2(pool.clone(), kube.clone()),
+                    backend.v2_terminator(),
+                    node_drain_config.tick,
+                    // Each bound's test hook shrinks it in a test-hooks build;
+                    // a release build reads the defaults.
+                    node_drain::v2::V2LoopConfig::from_environment(
+                        &pplx_space_env_vars::ProcessEnvironment,
+                    ),
+                    shutdown_token.child_token(),
+                )));
+                match backend {
+                    TerminatorBackend::Aws(aws_config) => {
                         let autoscaling_client =
                             pplx_space_aws_client::autoscaling::Client::from_config(&aws_config);
                         let terminator = node_drain::Ec2InstanceTerminator::new(
@@ -786,7 +879,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorKind::KubeDelete => {
+                    TerminatorBackend::KubeDelete => {
                         let terminator = node_drain::KubeNodeDeleteTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
@@ -799,7 +892,7 @@ pub async fn run_reconcilers(
                             node_drain_token,
                         )));
                     }
-                    TerminatorKind::Noop => {
+                    TerminatorBackend::Noop => {
                         let terminator = node_drain::NoopInstanceTerminator::new();
                         handles.push(tokio::spawn(node_drain::run(
                             node_drain_config,
