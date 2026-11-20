@@ -230,6 +230,13 @@ impl From<ForkSandboxLifetimeSeconds> for u32 {
 pub struct ForkRequest {
     timeout: ForkSandboxLifetimeSeconds,
     count: ForkCount,
+    disk_storage_class: Option<pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BenchmarkForkAccess {
+    pub(crate) org_id: OrgId,
+    pub(crate) api_key_id: Uuid,
 }
 
 impl ForkRequest {
@@ -237,7 +244,22 @@ impl ForkRequest {
         Ok(Self {
             timeout: timeout.unwrap_or(DEFAULT_FORK_TIMEOUT_SECONDS).try_into()?,
             count: count.unwrap_or(DEFAULT_FORK_COUNT).try_into()?,
+            disk_storage_class: None,
         })
+    }
+
+    pub(crate) fn with_disk_storage_class(
+        mut self,
+        class: pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass,
+    ) -> Self {
+        self.disk_storage_class = Some(class);
+        self
+    }
+
+    pub(crate) const fn disk_storage_class(
+        &self,
+    ) -> Option<pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass> {
+        self.disk_storage_class
     }
 
     pub const fn timeout(self) -> ForkSandboxLifetimeSeconds {
@@ -275,6 +297,9 @@ pub struct ForkSandboxPayloadV1 {
     /// activation to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_id: Option<ClientId>,
+    // An explicit class may only be encoded by the V2 envelope.
+    #[serde(skip)]
+    disk_storage_class: Option<pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,16 +575,41 @@ pub struct ForkTargetConfig {
 pub(crate) enum ForkSandboxPayload {
     #[serde(rename = "1")]
     V1(ForkSandboxPayloadV1),
+    #[serde(rename = "2")]
+    V2 {
+        disk_storage_class: pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass,
+        #[serde(flatten)]
+        fork: ForkSandboxPayloadV1,
+    },
 }
 
 impl ForkSandboxPayload {
     pub fn into_v1(self) -> ForkSandboxPayloadV1 {
-        let Self::V1(payload) = self;
-        payload
+        match self {
+            Self::V1(payload) => payload,
+            Self::V2 {
+                disk_storage_class,
+                mut fork,
+            } => {
+                fork.disk_storage_class = Some(disk_storage_class);
+                fork
+            }
+        }
     }
 
+    pub fn from_payload(payload: ForkSandboxPayloadV1) -> Self {
+        match payload.disk_storage_class {
+            None => Self::V1(payload),
+            Some(disk_storage_class) => Self::V2 {
+                disk_storage_class,
+                fork: payload,
+            },
+        }
+    }
+
+    #[cfg(test)]
     pub fn v1(payload: ForkSandboxPayloadV1) -> Self {
-        Self::V1(payload)
+        Self::from_payload(payload)
     }
 }
 
@@ -604,7 +654,14 @@ impl ForkSandboxPayloadV1 {
             target_sandbox_id: SandboxId::new(),
             workflow: ForkWorkflowState::AwaitingSource,
             client_id: None,
+            disk_storage_class: request.disk_storage_class(),
         }
+    }
+
+    pub(crate) const fn disk_storage_class(
+        &self,
+    ) -> Option<pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass> {
+        self.disk_storage_class
     }
 
     pub const fn source_sandbox_id(&self) -> SandboxId {
@@ -1015,7 +1072,7 @@ fn prepare_fork_operation(
         input.source_sandbox_id,
         pplx_space_env_vars::env_flag_var(FORK_PUBLIC_TARGET_ID_ENV, false),
     );
-    let payload_json = serde_json::to_value(ForkSandboxPayload::v1(payload))?;
+    let payload_json = serde_json::to_value(ForkSandboxPayload::from_payload(payload))?;
     Ok(PreparedForkOperation {
         source_id,
         payload_json,
@@ -1100,6 +1157,8 @@ struct ForkRequestFingerprint {
     requested_count: ForkCount,
     #[serde(skip_serializing_if = "Option::is_none")]
     federated_subject_id: Option<UpstreamSubjectId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_storage_class: Option<pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass>,
 }
 
 fn fork_request_fingerprint(
@@ -1112,6 +1171,7 @@ fn fork_request_fingerprint(
         requested_timeout_seconds: request.timeout(),
         requested_count: request.count(),
         federated_subject_id: federated_subject_id.cloned(),
+        disk_storage_class: request.disk_storage_class(),
     })?;
     RequestFingerprint::parse(hex::encode(Sha256::digest(bytes))).map_err(Into::into)
 }

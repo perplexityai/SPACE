@@ -21,8 +21,8 @@ use pplx_space_snapshot_model::{ArtifactKind, BackupAttemptId, BackupSource, Sna
 use sqlx::PgPool;
 
 use crate::controllers::substrate::{
-    DurableSnapshotError, NodeAddressing, OwnedNodeApiTarget, SnapshotRef, Substrate,
-    SubstrateAdapter,
+    CopyDurableArtifact, DurableSnapshotError, NodeAddressing, OwnedNodeApiTarget, SnapshotRef,
+    Substrate, SubstrateAdapter,
 };
 use crate::controllers::{
     ControllerError,
@@ -413,7 +413,7 @@ impl ForkSandboxOperationExecutor {
         if payload.target_config().is_none() {
             self.freeze_source(claim_token, operation, &mut payload)
                 .await?;
-            return serde_json::to_value(ForkSandboxPayload::v1(payload))
+            return serde_json::to_value(ForkSandboxPayload::from_payload(payload))
                 .map(ControlFlow::Continue)
                 .map_err(ForkExecutionError::retry_error);
         }
@@ -426,7 +426,7 @@ impl ForkSandboxOperationExecutor {
                     "fork artifact materialization is in progress".to_string(),
                 ));
             }
-            return serde_json::to_value(ForkSandboxPayload::v1(payload))
+            return serde_json::to_value(ForkSandboxPayload::from_payload(payload))
                 .map(ControlFlow::Continue)
                 .map_err(ForkExecutionError::retry_error);
         }
@@ -460,6 +460,7 @@ impl ForkSandboxOperationExecutor {
             .lifecycle
             .parse::<ForkSourceLifecycle>()
             .map_err(classify_fork_source_lifecycle_error)?;
+        require_suspended_for_classed_fork(payload, Some(lifecycle))?;
         let source_template_id = source
             .template_id
             .as_deref()
@@ -517,6 +518,7 @@ impl ForkSandboxOperationExecutor {
         payload: &mut ForkSandboxPayloadV1,
         remaining: Duration,
     ) -> Result<(), ForkExecutionError> {
+        require_suspended_for_classed_fork(payload, payload.source_lifecycle())?;
         if payload.source_lifecycle() == Some(ForkSourceLifecycle::Suspended) {
             return self
                 .copy_suspended_artifact(claim_token, operation, payload, remaining)
@@ -867,6 +869,19 @@ impl ForkSandboxOperationExecutor {
                 direct_endpoint,
                 substrate_node_id,
             };
+            // This detects a restore or a changed artifact before dispatch;
+            // it does not serialize the remote copy with lifecycle changes.
+            if payload.disk_storage_class().is_some()
+                && self
+                    .store
+                    .suspended_source_artifact(payload.source_sandbox_id())
+                    .await?
+                    != Some((source_snapshot_id, source_location_id))
+            {
+                return Err(ForkExecutionError::failed_precondition(
+                    "classed fork source changed before copy dispatch",
+                ));
+            }
             tokio::time::timeout(
                 remaining,
                 self.with_claim_heartbeat(
@@ -874,11 +889,14 @@ impl ForkSandboxOperationExecutor {
                     operation,
                     self.substrate.create_snapshot_from_durable_artifact(
                         &target.as_target(),
-                        operation.id,
-                        payload.source_sandbox_id(),
-                        target_sandbox_id,
-                        source_storage_uri,
-                        destination_storage_uri.clone(),
+                        CopyDurableArtifact {
+                            operation_id: operation.id,
+                            source_sandbox_id: payload.source_sandbox_id(),
+                            target_sandbox_id,
+                            source_storage_uri,
+                            destination_storage_uri: destination_storage_uri.clone(),
+                            disk_storage_class: payload.disk_storage_class(),
+                        },
                     ),
                 ),
             )
@@ -886,7 +904,7 @@ impl ForkSandboxOperationExecutor {
             .map_err(|_| {
                 ForkExecutionError::Retry("fork artifact copy reached its deadline".into())
             })??
-            .map_err(copy_artifact_error)
+            .map_err(|error| copy_artifact_error(error, payload.disk_storage_class().is_some()))
         }
         .await;
         let published = match copy_result {
@@ -1394,6 +1412,18 @@ impl ForkSandboxOperationExecutor {
     }
 }
 
+fn require_suspended_for_classed_fork(
+    payload: &ForkSandboxPayloadV1,
+    lifecycle: Option<ForkSourceLifecycle>,
+) -> Result<(), ForkExecutionError> {
+    if payload.disk_storage_class().is_some() && lifecycle != Some(ForkSourceLifecycle::Suspended) {
+        return Err(ForkExecutionError::failed_precondition(
+            "classed forks require a suspended source",
+        ));
+    }
+    Ok(())
+}
+
 fn terminal_cleanup_target_ids(payload: &ForkSandboxPayloadV1) -> Vec<SandboxId> {
     vec![payload.target_sandbox_id()]
 }
@@ -1766,9 +1796,24 @@ fn successful_fork_result_after_retirement(
     successful_fork_result(results)
 }
 
-fn copy_artifact_error(error: DurableSnapshotError) -> ForkExecutionError {
+fn copy_artifact_error(error: DurableSnapshotError, explicit_class: bool) -> ForkExecutionError {
     match error {
         DurableSnapshotError::Backpressure => ForkExecutionError::Wait(error.to_string()),
+        DurableSnapshotError::NodeRpc(status)
+            if explicit_class
+                && matches!(
+                    status.code(),
+                    tonic::Code::Unimplemented
+                        | tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::PermissionDenied
+                        | tonic::Code::Unauthenticated
+                ) =>
+        {
+            ForkExecutionError::failed_precondition(
+                "the worker could not verify the requested fork storage class",
+            )
+        }
         error => ForkExecutionError::retry_error(error),
     }
 }

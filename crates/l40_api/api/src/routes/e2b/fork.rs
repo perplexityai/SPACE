@@ -12,7 +12,8 @@ use pplx_space_events::{
 };
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::PublicErrorCode;
-use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass;
 
 use super::{AppState, E2bApiError, MatchedEcwHost, acquire_client_slot, request_client_id};
 use crate::controllers::sandbox::lifecycle::user_admission::{
@@ -24,7 +25,7 @@ use crate::fork_operations::{
     ForkTargetOutcome, admit_locked_fork_operation, begin_fork_operation_admission,
     observe_fork_operation_idempotency,
 };
-use crate::middleware::auth::{AuthEcwActor, AuthOrg};
+use crate::middleware::auth::{AuthApiKey, AuthEcwActor, AuthFederatedOwner, AuthOrg};
 use crate::public_operations::{
     CreatePublicOperationResult, ForkOperationOutcome, ObservePublicOperationIdempotency,
     PublicOperationStore, PublicOperationStoreError,
@@ -44,22 +45,79 @@ const fn fork_admission_needs_client_slot(created: bool) -> bool {
     created
 }
 
+type ForkCaller = (
+    Extension<AuthOrg>,
+    Extension<AuthEcwActor>,
+    Option<Extension<AuthFederatedOwner>>,
+);
+
+type ForkHttpResponse = Result<(StatusCode, Json<serde_json::Value>), E2bApiError>;
+
 pub(super) async fn fork_sandbox(
-    State(state): State<AppState>,
-    MatchedEcwHost(ecw_host_pair): MatchedEcwHost,
-    (Extension(AuthOrg(org)), Extension(AuthEcwActor(actor)), federated): (
-        Extension<AuthOrg>,
-        Extension<AuthEcwActor>,
-        Option<Extension<crate::middleware::auth::AuthFederatedOwner>>,
-    ),
-    Path(source_sandbox_id): Path<String>,
+    state: State<AppState>,
+    host: MatchedEcwHost,
+    caller: ForkCaller,
+    source: Path<String>,
     headers: HeaderMap,
     crate::e2b::E2bJson(request): crate::e2b::E2bJson<SandboxForkRequestE2b>,
-) -> Result<(StatusCode, Json<serde_json::Value>), E2bApiError> {
+) -> ForkHttpResponse {
+    execute_fork(state, host, caller, source, headers, request, None).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct BenchmarkForkRequest {
+    disk_storage_class: ForkDiskStorageClass,
+}
+
+pub(super) const BENCHMARK_FORK_PATH: &str = "/sandboxes/{sandboxID}/benchmark-fork";
+
+pub(super) async fn benchmark_fork(
+    State(state): State<AppState>,
+    host: MatchedEcwHost,
+    (caller, Extension(AuthApiKey(key))): (ForkCaller, Extension<AuthApiKey>),
+    source: Path<String>,
+    headers: HeaderMap,
+    crate::e2b::E2bJson(request): crate::e2b::E2bJson<BenchmarkForkRequest>,
+) -> ForkHttpResponse {
+    let Extension(AuthOrg(org)) = &caller.0;
+    if !state.benchmark_fork_access.is_some_and(|access| {
+        access.org_id == org.id && access.org_id == key.org_id && access.api_key_id == key.id
+    }) || caller.2.is_some()
+    {
+        return Err(E2bApiError::new(
+            StatusCode::FORBIDDEN,
+            "Benchmark fork is not authorized",
+        ));
+    }
+    execute_fork(
+        State(state),
+        host,
+        caller,
+        source,
+        headers,
+        SandboxForkRequestE2b::default(),
+        Some(request.disk_storage_class),
+    )
+    .await
+}
+
+async fn execute_fork(
+    State(state): State<AppState>,
+    MatchedEcwHost(ecw_host_pair): MatchedEcwHost,
+    (Extension(AuthOrg(org)), Extension(AuthEcwActor(actor)), federated): ForkCaller,
+    Path(source_sandbox_id): Path<String>,
+    headers: HeaderMap,
+    request: SandboxForkRequestE2b,
+    disk_storage_class: Option<ForkDiskStorageClass>,
+) -> ForkHttpResponse {
     let actor = actor.ok_or_else(E2bApiError::unauthorized)?;
     let source_sandbox_id = parse_fork_source_sandbox_id(&source_sandbox_id)?;
-    let request = ForkRequest::from_wire(request.timeout, request.count)
+    let mut request = ForkRequest::from_wire(request.timeout, request.count)
         .map_err(|error| E2bApiError::bad_request(error.to_string()))?;
+    if let Some(class) = disk_storage_class {
+        request = request.with_disk_storage_class(class);
+    }
     let idempotency_key = parse_idempotency_key(&headers)?;
     let store = PublicOperationStore::new(state.pool.clone());
     let federated_owner = super::lifecycle::federated_owner_ref(&federated);
@@ -120,6 +178,14 @@ pub(super) async fn fork_sandbox(
     let scope = super::ecw_access_scope(&org, &federated);
     let source =
         super::fetch_scoped_sandbox(&state, &scope, &source_sandbox_id.to_string()).await?;
+    if request.disk_storage_class().is_some()
+        && source.lifecycle != SandboxLifecycle::Suspended.as_str()
+    {
+        return Err(E2bApiError::new(
+            StatusCode::CONFLICT,
+            "Benchmark fork requires a suspended source",
+        ));
+    }
     let operation_actor_user_id =
         fork_execution_actor_id(actor.id, actor.org_id, source.user_id, source.org_id);
     // A legacy local source keeps local semantics through the bridge: the fork

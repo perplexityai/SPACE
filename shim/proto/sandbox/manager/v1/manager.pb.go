@@ -1163,6 +1163,55 @@ func (SnapshotSourceLifecycle) EnumDescriptor() ([]byte, []int) {
 	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{19}
 }
 
+type ForkDiskStorageClass int32
+
+const (
+	ForkDiskStorageClass_FORK_DISK_STORAGE_CLASS_UNSPECIFIED               ForkDiskStorageClass = 0
+	ForkDiskStorageClass_FORK_DISK_STORAGE_CLASS_STANDARD                  ForkDiskStorageClass = 1
+	ForkDiskStorageClass_FORK_DISK_STORAGE_CLASS_GLACIER_INSTANT_RETRIEVAL ForkDiskStorageClass = 2
+)
+
+// Enum value maps for ForkDiskStorageClass.
+var (
+	ForkDiskStorageClass_name = map[int32]string{
+		0: "FORK_DISK_STORAGE_CLASS_UNSPECIFIED",
+		1: "FORK_DISK_STORAGE_CLASS_STANDARD",
+		2: "FORK_DISK_STORAGE_CLASS_GLACIER_INSTANT_RETRIEVAL",
+	}
+	ForkDiskStorageClass_value = map[string]int32{
+		"FORK_DISK_STORAGE_CLASS_UNSPECIFIED":               0,
+		"FORK_DISK_STORAGE_CLASS_STANDARD":                  1,
+		"FORK_DISK_STORAGE_CLASS_GLACIER_INSTANT_RETRIEVAL": 2,
+	}
+)
+
+func (x ForkDiskStorageClass) Enum() *ForkDiskStorageClass {
+	p := new(ForkDiskStorageClass)
+	*p = x
+	return p
+}
+
+func (x ForkDiskStorageClass) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ForkDiskStorageClass) Descriptor() protoreflect.EnumDescriptor {
+	return file_sandbox_manager_v1_manager_proto_enumTypes[20].Descriptor()
+}
+
+func (ForkDiskStorageClass) Type() protoreflect.EnumType {
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[20]
+}
+
+func (x ForkDiskStorageClass) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ForkDiskStorageClass.Descriptor instead.
+func (ForkDiskStorageClass) EnumDescriptor() ([]byte, []int) {
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{20}
+}
+
 // Codec for the rootfs artifact a suspend snapshot writes to object
 // storage. Per-request opt-in: callers stay on `UNSPECIFIED` (which
 // the handler maps to `FULL`) unless they specifically want a
@@ -1213,11 +1262,11 @@ func (x SuspendSnapshotFormat) String() string {
 }
 
 func (SuspendSnapshotFormat) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[20].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[21].Descriptor()
 }
 
 func (SuspendSnapshotFormat) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[20]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[21]
 }
 
 func (x SuspendSnapshotFormat) Number() protoreflect.EnumNumber {
@@ -1226,7 +1275,7 @@ func (x SuspendSnapshotFormat) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SuspendSnapshotFormat.Descriptor instead.
 func (SuspendSnapshotFormat) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{20}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{21}
 }
 
 type ArtifactKind int32
@@ -1262,11 +1311,11 @@ func (x ArtifactKind) String() string {
 }
 
 func (ArtifactKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[21].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[22].Descriptor()
 }
 
 func (ArtifactKind) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[21]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[22]
 }
 
 func (x ArtifactKind) Number() protoreflect.EnumNumber {
@@ -1275,7 +1324,7 @@ func (x ArtifactKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ArtifactKind.Descriptor instead.
 func (ArtifactKind) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{21}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{22}
 }
 
 type ArtifactOrigin int32
@@ -1317,11 +1366,11 @@ func (x ArtifactOrigin) String() string {
 }
 
 func (ArtifactOrigin) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[22].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[23].Descriptor()
 }
 
 func (ArtifactOrigin) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[22]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[23]
 }
 
 func (x ArtifactOrigin) Number() protoreflect.EnumNumber {
@@ -1330,7 +1379,7 @@ func (x ArtifactOrigin) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ArtifactOrigin.Descriptor instead.
 func (ArtifactOrigin) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{22}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{23}
 }
 
 type RuntimeUpgradeOutcome int32
@@ -1372,11 +1421,11 @@ func (x RuntimeUpgradeOutcome) String() string {
 }
 
 func (RuntimeUpgradeOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[23].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[24].Descriptor()
 }
 
 func (RuntimeUpgradeOutcome) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[23]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[24]
 }
 
 func (x RuntimeUpgradeOutcome) Number() protoreflect.EnumNumber {
@@ -1385,7 +1434,7 @@ func (x RuntimeUpgradeOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RuntimeUpgradeOutcome.Descriptor instead.
 func (RuntimeUpgradeOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{23}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{24}
 }
 
 type RuntimeUpgradeStatus int32
@@ -1472,11 +1521,11 @@ func (x RuntimeUpgradeStatus) String() string {
 }
 
 func (RuntimeUpgradeStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[24].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[25].Descriptor()
 }
 
 func (RuntimeUpgradeStatus) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[24]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[25]
 }
 
 func (x RuntimeUpgradeStatus) Number() protoreflect.EnumNumber {
@@ -1485,7 +1534,7 @@ func (x RuntimeUpgradeStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RuntimeUpgradeStatus.Descriptor instead.
 func (RuntimeUpgradeStatus) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{24}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{25}
 }
 
 // The phase of an upgrade that's IN_PROGRESS.
@@ -1528,11 +1577,11 @@ func (x RuntimeUpgradePhase) String() string {
 }
 
 func (RuntimeUpgradePhase) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[25].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[26].Descriptor()
 }
 
 func (RuntimeUpgradePhase) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[25]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[26]
 }
 
 func (x RuntimeUpgradePhase) Number() protoreflect.EnumNumber {
@@ -1541,7 +1590,7 @@ func (x RuntimeUpgradePhase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RuntimeUpgradePhase.Descriptor instead.
 func (RuntimeUpgradePhase) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{25}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{26}
 }
 
 type TeardownSuspendAction int32
@@ -1582,11 +1631,11 @@ func (x TeardownSuspendAction) String() string {
 }
 
 func (TeardownSuspendAction) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[26].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[27].Descriptor()
 }
 
 func (TeardownSuspendAction) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[26]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[27]
 }
 
 func (x TeardownSuspendAction) Number() protoreflect.EnumNumber {
@@ -1595,7 +1644,7 @@ func (x TeardownSuspendAction) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TeardownSuspendAction.Descriptor instead.
 func (TeardownSuspendAction) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{26}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{27}
 }
 
 type TeardownSuspendOutcome int32
@@ -1644,11 +1693,11 @@ func (x TeardownSuspendOutcome) String() string {
 }
 
 func (TeardownSuspendOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[27].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[28].Descriptor()
 }
 
 func (TeardownSuspendOutcome) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[27]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[28]
 }
 
 func (x TeardownSuspendOutcome) Number() protoreflect.EnumNumber {
@@ -1657,7 +1706,7 @@ func (x TeardownSuspendOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TeardownSuspendOutcome.Descriptor instead.
 func (TeardownSuspendOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{27}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{28}
 }
 
 // Node-local facts about the current legacy quarantine-recovery episode.
@@ -1692,11 +1741,11 @@ func (x QuarantineRecoveryObservedOwner) String() string {
 }
 
 func (QuarantineRecoveryObservedOwner) Descriptor() protoreflect.EnumDescriptor {
-	return file_sandbox_manager_v1_manager_proto_enumTypes[28].Descriptor()
+	return file_sandbox_manager_v1_manager_proto_enumTypes[29].Descriptor()
 }
 
 func (QuarantineRecoveryObservedOwner) Type() protoreflect.EnumType {
-	return &file_sandbox_manager_v1_manager_proto_enumTypes[28]
+	return &file_sandbox_manager_v1_manager_proto_enumTypes[29]
 }
 
 func (x QuarantineRecoveryObservedOwner) Number() protoreflect.EnumNumber {
@@ -1705,7 +1754,7 @@ func (x QuarantineRecoveryObservedOwner) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use QuarantineRecoveryObservedOwner.Descriptor instead.
 func (QuarantineRecoveryObservedOwner) EnumDescriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{28}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{29}
 }
 
 type GuestUpdateStatusRequest struct {
@@ -6204,6 +6253,7 @@ type CreateSnapshotSource struct {
 	//
 	//	*CreateSnapshotSource_CurrentSandbox
 	//	*CreateSnapshotSource_DurableArtifact
+	//	*CreateSnapshotSource_ClassedDurableArtifact
 	Source        isCreateSnapshotSource_Source `protobuf_oneof:"source"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -6264,6 +6314,15 @@ func (x *CreateSnapshotSource) GetDurableArtifact() *DurableArtifactSnapshotSour
 	return nil
 }
 
+func (x *CreateSnapshotSource) GetClassedDurableArtifact() *ClassedDurableArtifactSnapshotSource {
+	if x != nil {
+		if x, ok := x.Source.(*CreateSnapshotSource_ClassedDurableArtifact); ok {
+			return x.ClassedDurableArtifact
+		}
+	}
+	return nil
+}
+
 type isCreateSnapshotSource_Source interface {
 	isCreateSnapshotSource_Source()
 }
@@ -6276,9 +6335,17 @@ type CreateSnapshotSource_DurableArtifact struct {
 	DurableArtifact *DurableArtifactSnapshotSource `protobuf:"bytes,2,opt,name=durable_artifact,json=durableArtifact,proto3,oneof"`
 }
 
+type CreateSnapshotSource_ClassedDurableArtifact struct {
+	// An older receiver sees an unset source and rejects the operation instead
+	// of silently copying the artifact without its class.
+	ClassedDurableArtifact *ClassedDurableArtifactSnapshotSource `protobuf:"bytes,3,opt,name=classed_durable_artifact,json=classedDurableArtifact,proto3,oneof"`
+}
+
 func (*CreateSnapshotSource_CurrentSandbox) isCreateSnapshotSource_Source() {}
 
 func (*CreateSnapshotSource_DurableArtifact) isCreateSnapshotSource_Source() {}
+
+func (*CreateSnapshotSource_ClassedDurableArtifact) isCreateSnapshotSource_Source() {}
 
 type DurableArtifactSnapshotSource struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
@@ -6348,17 +6415,70 @@ func (x *DurableArtifactSnapshotSource) GetDestinationOrigin() ArtifactOrigin {
 	return ArtifactOrigin_ARTIFACT_ORIGIN_UNSPECIFIED
 }
 
+type ClassedDurableArtifactSnapshotSource struct {
+	state         protoimpl.MessageState         `protogen:"open.v1"`
+	Artifact      *DurableArtifactSnapshotSource `protobuf:"bytes,1,opt,name=artifact,proto3" json:"artifact,omitempty"`
+	StorageClass  ForkDiskStorageClass           `protobuf:"varint,2,opt,name=storage_class,json=storageClass,proto3,enum=space.sandbox.manager.v1.ForkDiskStorageClass" json:"storage_class,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClassedDurableArtifactSnapshotSource) Reset() {
+	*x = ClassedDurableArtifactSnapshotSource{}
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[61]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClassedDurableArtifactSnapshotSource) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClassedDurableArtifactSnapshotSource) ProtoMessage() {}
+
+func (x *ClassedDurableArtifactSnapshotSource) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[61]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClassedDurableArtifactSnapshotSource.ProtoReflect.Descriptor instead.
+func (*ClassedDurableArtifactSnapshotSource) Descriptor() ([]byte, []int) {
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{61}
+}
+
+func (x *ClassedDurableArtifactSnapshotSource) GetArtifact() *DurableArtifactSnapshotSource {
+	if x != nil {
+		return x.Artifact
+	}
+	return nil
+}
+
+func (x *ClassedDurableArtifactSnapshotSource) GetStorageClass() ForkDiskStorageClass {
+	if x != nil {
+		return x.StorageClass
+	}
+	return ForkDiskStorageClass_FORK_DISK_STORAGE_CLASS_UNSPECIFIED
+}
+
 type PublishedDurableArtifact struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	StorageUri     string                 `protobuf:"bytes,1,opt,name=storage_uri,json=storageUri,proto3" json:"storage_uri,omitempty"`
-	BytesPublished uint64                 `protobuf:"varint,2,opt,name=bytes_published,json=bytesPublished,proto3" json:"bytes_published,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state                    protoimpl.MessageState `protogen:"open.v1"`
+	StorageUri               string                 `protobuf:"bytes,1,opt,name=storage_uri,json=storageUri,proto3" json:"storage_uri,omitempty"`
+	BytesPublished           uint64                 `protobuf:"varint,2,opt,name=bytes_published,json=bytesPublished,proto3" json:"bytes_published,omitempty"`
+	VerifiedDiskStorageClass *ForkDiskStorageClass  `protobuf:"varint,3,opt,name=verified_disk_storage_class,json=verifiedDiskStorageClass,proto3,enum=space.sandbox.manager.v1.ForkDiskStorageClass,oneof" json:"verified_disk_storage_class,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *PublishedDurableArtifact) Reset() {
 	*x = PublishedDurableArtifact{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[61]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6370,7 +6490,7 @@ func (x *PublishedDurableArtifact) String() string {
 func (*PublishedDurableArtifact) ProtoMessage() {}
 
 func (x *PublishedDurableArtifact) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[61]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6383,7 +6503,7 @@ func (x *PublishedDurableArtifact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishedDurableArtifact.ProtoReflect.Descriptor instead.
 func (*PublishedDurableArtifact) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{61}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *PublishedDurableArtifact) GetStorageUri() string {
@@ -6398,6 +6518,13 @@ func (x *PublishedDurableArtifact) GetBytesPublished() uint64 {
 		return x.BytesPublished
 	}
 	return 0
+}
+
+func (x *PublishedDurableArtifact) GetVerifiedDiskStorageClass() ForkDiskStorageClass {
+	if x != nil && x.VerifiedDiskStorageClass != nil {
+		return *x.VerifiedDiskStorageClass
+	}
+	return ForkDiskStorageClass_FORK_DISK_STORAGE_CLASS_UNSPECIFIED
 }
 
 type CreateTemplateBaseSnapshotRequest struct {
@@ -6419,7 +6546,7 @@ type CreateTemplateBaseSnapshotRequest struct {
 
 func (x *CreateTemplateBaseSnapshotRequest) Reset() {
 	*x = CreateTemplateBaseSnapshotRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[62]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6431,7 +6558,7 @@ func (x *CreateTemplateBaseSnapshotRequest) String() string {
 func (*CreateTemplateBaseSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateTemplateBaseSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[62]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6444,7 +6571,7 @@ func (x *CreateTemplateBaseSnapshotRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use CreateTemplateBaseSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateTemplateBaseSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{62}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *CreateTemplateBaseSnapshotRequest) GetSandboxId() string {
@@ -6485,7 +6612,7 @@ type CreateTemplateBaseSnapshotResponse struct {
 
 func (x *CreateTemplateBaseSnapshotResponse) Reset() {
 	*x = CreateTemplateBaseSnapshotResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[63]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6497,7 +6624,7 @@ func (x *CreateTemplateBaseSnapshotResponse) String() string {
 func (*CreateTemplateBaseSnapshotResponse) ProtoMessage() {}
 
 func (x *CreateTemplateBaseSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[63]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6510,7 +6637,7 @@ func (x *CreateTemplateBaseSnapshotResponse) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use CreateTemplateBaseSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*CreateTemplateBaseSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{63}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *CreateTemplateBaseSnapshotResponse) GetSnapshotHash() string {
@@ -6542,7 +6669,7 @@ type SuspendRequest struct {
 
 func (x *SuspendRequest) Reset() {
 	*x = SuspendRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[64]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6554,7 +6681,7 @@ func (x *SuspendRequest) String() string {
 func (*SuspendRequest) ProtoMessage() {}
 
 func (x *SuspendRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[64]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6567,7 +6694,7 @@ func (x *SuspendRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspendRequest.ProtoReflect.Descriptor instead.
 func (*SuspendRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{64}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *SuspendRequest) GetSandboxId() string {
@@ -6603,7 +6730,7 @@ type PublishedArtifact struct {
 
 func (x *PublishedArtifact) Reset() {
 	*x = PublishedArtifact{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[65]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6615,7 +6742,7 @@ func (x *PublishedArtifact) String() string {
 func (*PublishedArtifact) ProtoMessage() {}
 
 func (x *PublishedArtifact) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[65]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6628,7 +6755,7 @@ func (x *PublishedArtifact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishedArtifact.ProtoReflect.Descriptor instead.
 func (*PublishedArtifact) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{65}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *PublishedArtifact) GetLocalArtifactId() string {
@@ -6671,7 +6798,7 @@ type SuspendResponse struct {
 
 func (x *SuspendResponse) Reset() {
 	*x = SuspendResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[66]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6683,7 +6810,7 @@ func (x *SuspendResponse) String() string {
 func (*SuspendResponse) ProtoMessage() {}
 
 func (x *SuspendResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[66]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6696,7 +6823,7 @@ func (x *SuspendResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspendResponse.ProtoReflect.Descriptor instead.
 func (*SuspendResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{66}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *SuspendResponse) GetPublishedArtifact() *PublishedArtifact {
@@ -6714,7 +6841,7 @@ type CurrentInstanceSource struct {
 
 func (x *CurrentInstanceSource) Reset() {
 	*x = CurrentInstanceSource{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[67]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6726,7 +6853,7 @@ func (x *CurrentInstanceSource) String() string {
 func (*CurrentInstanceSource) ProtoMessage() {}
 
 func (x *CurrentInstanceSource) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[67]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6739,7 +6866,7 @@ func (x *CurrentInstanceSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CurrentInstanceSource.ProtoReflect.Descriptor instead.
 func (*CurrentInstanceSource) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{67}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{68}
 }
 
 type EnqueueArtifactBackupRequest struct {
@@ -6760,7 +6887,7 @@ type EnqueueArtifactBackupRequest struct {
 
 func (x *EnqueueArtifactBackupRequest) Reset() {
 	*x = EnqueueArtifactBackupRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[68]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6772,7 +6899,7 @@ func (x *EnqueueArtifactBackupRequest) String() string {
 func (*EnqueueArtifactBackupRequest) ProtoMessage() {}
 
 func (x *EnqueueArtifactBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[68]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6785,7 +6912,7 @@ func (x *EnqueueArtifactBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnqueueArtifactBackupRequest.ProtoReflect.Descriptor instead.
 func (*EnqueueArtifactBackupRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{68}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *EnqueueArtifactBackupRequest) GetSandboxId() string {
@@ -6869,7 +6996,7 @@ type EnqueueArtifactBackupResponse struct {
 
 func (x *EnqueueArtifactBackupResponse) Reset() {
 	*x = EnqueueArtifactBackupResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[69]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6881,7 +7008,7 @@ func (x *EnqueueArtifactBackupResponse) String() string {
 func (*EnqueueArtifactBackupResponse) ProtoMessage() {}
 
 func (x *EnqueueArtifactBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[69]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6894,7 +7021,7 @@ func (x *EnqueueArtifactBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnqueueArtifactBackupResponse.ProtoReflect.Descriptor instead.
 func (*EnqueueArtifactBackupResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{69}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *EnqueueArtifactBackupResponse) GetLocalArtifactId() string {
@@ -6927,7 +7054,7 @@ type EvictClusterDeletedSandboxRequest struct {
 
 func (x *EvictClusterDeletedSandboxRequest) Reset() {
 	*x = EvictClusterDeletedSandboxRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[70]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6939,7 +7066,7 @@ func (x *EvictClusterDeletedSandboxRequest) String() string {
 func (*EvictClusterDeletedSandboxRequest) ProtoMessage() {}
 
 func (x *EvictClusterDeletedSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[70]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6952,7 +7079,7 @@ func (x *EvictClusterDeletedSandboxRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use EvictClusterDeletedSandboxRequest.ProtoReflect.Descriptor instead.
 func (*EvictClusterDeletedSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{70}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *EvictClusterDeletedSandboxRequest) GetSandboxId() string {
@@ -6970,7 +7097,7 @@ type EvictClusterDeletedSandboxResponse struct {
 
 func (x *EvictClusterDeletedSandboxResponse) Reset() {
 	*x = EvictClusterDeletedSandboxResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[71]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6982,7 +7109,7 @@ func (x *EvictClusterDeletedSandboxResponse) String() string {
 func (*EvictClusterDeletedSandboxResponse) ProtoMessage() {}
 
 func (x *EvictClusterDeletedSandboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[71]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6995,7 +7122,7 @@ func (x *EvictClusterDeletedSandboxResponse) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use EvictClusterDeletedSandboxResponse.ProtoReflect.Descriptor instead.
 func (*EvictClusterDeletedSandboxResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{71}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{72}
 }
 
 // The audited operator action an upgrade runs under: an environment block or
@@ -7013,7 +7140,7 @@ type RuntimeUpgradeAuthorization struct {
 
 func (x *RuntimeUpgradeAuthorization) Reset() {
 	*x = RuntimeUpgradeAuthorization{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[72]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7025,7 +7152,7 @@ func (x *RuntimeUpgradeAuthorization) String() string {
 func (*RuntimeUpgradeAuthorization) ProtoMessage() {}
 
 func (x *RuntimeUpgradeAuthorization) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[72]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7038,7 +7165,7 @@ func (x *RuntimeUpgradeAuthorization) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeUpgradeAuthorization.ProtoReflect.Descriptor instead.
 func (*RuntimeUpgradeAuthorization) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{72}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *RuntimeUpgradeAuthorization) GetAuthorizationId() string {
@@ -7160,7 +7287,7 @@ type UpgradeRuntimeRequest struct {
 
 func (x *UpgradeRuntimeRequest) Reset() {
 	*x = UpgradeRuntimeRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[73]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7172,7 +7299,7 @@ func (x *UpgradeRuntimeRequest) String() string {
 func (*UpgradeRuntimeRequest) ProtoMessage() {}
 
 func (x *UpgradeRuntimeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[73]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7185,7 +7312,7 @@ func (x *UpgradeRuntimeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeRuntimeRequest.ProtoReflect.Descriptor instead.
 func (*UpgradeRuntimeRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{73}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *UpgradeRuntimeRequest) GetSandboxId() string {
@@ -7263,7 +7390,7 @@ type RuntimeUpgradeStageFrom struct {
 
 func (x *RuntimeUpgradeStageFrom) Reset() {
 	*x = RuntimeUpgradeStageFrom{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[74]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7275,7 +7402,7 @@ func (x *RuntimeUpgradeStageFrom) String() string {
 func (*RuntimeUpgradeStageFrom) ProtoMessage() {}
 
 func (x *RuntimeUpgradeStageFrom) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[74]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7288,7 +7415,7 @@ func (x *RuntimeUpgradeStageFrom) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeUpgradeStageFrom.ProtoReflect.Descriptor instead.
 func (*RuntimeUpgradeStageFrom) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{74}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *RuntimeUpgradeStageFrom) GetSuspendRestoreStorageUri() string {
@@ -7321,7 +7448,7 @@ type UpgradeRuntimeResponse struct {
 
 func (x *UpgradeRuntimeResponse) Reset() {
 	*x = UpgradeRuntimeResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[75]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7333,7 +7460,7 @@ func (x *UpgradeRuntimeResponse) String() string {
 func (*UpgradeRuntimeResponse) ProtoMessage() {}
 
 func (x *UpgradeRuntimeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[75]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7346,7 +7473,7 @@ func (x *UpgradeRuntimeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeRuntimeResponse.ProtoReflect.Descriptor instead.
 func (*UpgradeRuntimeResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{75}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *UpgradeRuntimeResponse) GetOutcome() RuntimeUpgradeOutcome {
@@ -7402,7 +7529,7 @@ type GetRuntimeUpgradeRequest struct {
 
 func (x *GetRuntimeUpgradeRequest) Reset() {
 	*x = GetRuntimeUpgradeRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[76]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7414,7 +7541,7 @@ func (x *GetRuntimeUpgradeRequest) String() string {
 func (*GetRuntimeUpgradeRequest) ProtoMessage() {}
 
 func (x *GetRuntimeUpgradeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[76]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7427,7 +7554,7 @@ func (x *GetRuntimeUpgradeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRuntimeUpgradeRequest.ProtoReflect.Descriptor instead.
 func (*GetRuntimeUpgradeRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{76}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *GetRuntimeUpgradeRequest) GetSandboxId() string {
@@ -7461,7 +7588,7 @@ type AbandonRuntimeUpgradeRequest struct {
 
 func (x *AbandonRuntimeUpgradeRequest) Reset() {
 	*x = AbandonRuntimeUpgradeRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[77]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7473,7 +7600,7 @@ func (x *AbandonRuntimeUpgradeRequest) String() string {
 func (*AbandonRuntimeUpgradeRequest) ProtoMessage() {}
 
 func (x *AbandonRuntimeUpgradeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[77]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7486,7 +7613,7 @@ func (x *AbandonRuntimeUpgradeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonRuntimeUpgradeRequest.ProtoReflect.Descriptor instead.
 func (*AbandonRuntimeUpgradeRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{77}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *AbandonRuntimeUpgradeRequest) GetSandboxId() string {
@@ -7511,7 +7638,7 @@ type AbandonRuntimeUpgradeResponse struct {
 
 func (x *AbandonRuntimeUpgradeResponse) Reset() {
 	*x = AbandonRuntimeUpgradeResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[78]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7523,7 +7650,7 @@ func (x *AbandonRuntimeUpgradeResponse) String() string {
 func (*AbandonRuntimeUpgradeResponse) ProtoMessage() {}
 
 func (x *AbandonRuntimeUpgradeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[78]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7536,7 +7663,7 @@ func (x *AbandonRuntimeUpgradeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonRuntimeUpgradeResponse.ProtoReflect.Descriptor instead.
 func (*AbandonRuntimeUpgradeResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{78}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{79}
 }
 
 // The upgrade's outcome on the node, not the outcome of the attempt that asked
@@ -7608,7 +7735,7 @@ type GetRuntimeUpgradeResponse struct {
 
 func (x *GetRuntimeUpgradeResponse) Reset() {
 	*x = GetRuntimeUpgradeResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[79]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7620,7 +7747,7 @@ func (x *GetRuntimeUpgradeResponse) String() string {
 func (*GetRuntimeUpgradeResponse) ProtoMessage() {}
 
 func (x *GetRuntimeUpgradeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[79]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7633,7 +7760,7 @@ func (x *GetRuntimeUpgradeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRuntimeUpgradeResponse.ProtoReflect.Descriptor instead.
 func (*GetRuntimeUpgradeResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{79}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *GetRuntimeUpgradeResponse) GetStatus() RuntimeUpgradeStatus {
@@ -7701,7 +7828,7 @@ type EnableSnapshotsRequest struct {
 
 func (x *EnableSnapshotsRequest) Reset() {
 	*x = EnableSnapshotsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[80]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7713,7 +7840,7 @@ func (x *EnableSnapshotsRequest) String() string {
 func (*EnableSnapshotsRequest) ProtoMessage() {}
 
 func (x *EnableSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[80]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7726,7 +7853,7 @@ func (x *EnableSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnableSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*EnableSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{80}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *EnableSnapshotsRequest) GetSandboxId() string {
@@ -7744,7 +7871,7 @@ type EnableSnapshotsResponse struct {
 
 func (x *EnableSnapshotsResponse) Reset() {
 	*x = EnableSnapshotsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[81]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7756,7 +7883,7 @@ func (x *EnableSnapshotsResponse) String() string {
 func (*EnableSnapshotsResponse) ProtoMessage() {}
 
 func (x *EnableSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[81]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7769,7 +7896,7 @@ func (x *EnableSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnableSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*EnableSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{81}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{82}
 }
 
 type DisableSnapshotsRequest struct {
@@ -7781,7 +7908,7 @@ type DisableSnapshotsRequest struct {
 
 func (x *DisableSnapshotsRequest) Reset() {
 	*x = DisableSnapshotsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[82]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7793,7 +7920,7 @@ func (x *DisableSnapshotsRequest) String() string {
 func (*DisableSnapshotsRequest) ProtoMessage() {}
 
 func (x *DisableSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[82]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7806,7 +7933,7 @@ func (x *DisableSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DisableSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*DisableSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{82}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *DisableSnapshotsRequest) GetSandboxId() string {
@@ -7824,7 +7951,7 @@ type DisableSnapshotsResponse struct {
 
 func (x *DisableSnapshotsResponse) Reset() {
 	*x = DisableSnapshotsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[83]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7836,7 +7963,7 @@ func (x *DisableSnapshotsResponse) String() string {
 func (*DisableSnapshotsResponse) ProtoMessage() {}
 
 func (x *DisableSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[83]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7849,7 +7976,7 @@ func (x *DisableSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DisableSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*DisableSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{83}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{84}
 }
 
 type ListSnapshotsRequest struct {
@@ -7861,7 +7988,7 @@ type ListSnapshotsRequest struct {
 
 func (x *ListSnapshotsRequest) Reset() {
 	*x = ListSnapshotsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[84]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7873,7 +8000,7 @@ func (x *ListSnapshotsRequest) String() string {
 func (*ListSnapshotsRequest) ProtoMessage() {}
 
 func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[84]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7886,7 +8013,7 @@ func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{84}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *ListSnapshotsRequest) GetSandboxIds() []string {
@@ -7905,7 +8032,7 @@ type ListSnapshotsResponse struct {
 
 func (x *ListSnapshotsResponse) Reset() {
 	*x = ListSnapshotsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[85]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7917,7 +8044,7 @@ func (x *ListSnapshotsResponse) String() string {
 func (*ListSnapshotsResponse) ProtoMessage() {}
 
 func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[85]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7930,7 +8057,7 @@ func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*ListSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{85}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *ListSnapshotsResponse) GetSnapshots() []*SnapshotDetail {
@@ -7966,7 +8093,7 @@ type SnapshotDetail struct {
 
 func (x *SnapshotDetail) Reset() {
 	*x = SnapshotDetail{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[86]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7978,7 +8105,7 @@ func (x *SnapshotDetail) String() string {
 func (*SnapshotDetail) ProtoMessage() {}
 
 func (x *SnapshotDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[86]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7991,7 +8118,7 @@ func (x *SnapshotDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotDetail.ProtoReflect.Descriptor instead.
 func (*SnapshotDetail) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{86}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *SnapshotDetail) GetId() string {
@@ -8106,7 +8233,7 @@ type SnapshotLocation struct {
 
 func (x *SnapshotLocation) Reset() {
 	*x = SnapshotLocation{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[87]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8118,7 +8245,7 @@ func (x *SnapshotLocation) String() string {
 func (*SnapshotLocation) ProtoMessage() {}
 
 func (x *SnapshotLocation) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[87]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8131,7 +8258,7 @@ func (x *SnapshotLocation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotLocation.ProtoReflect.Descriptor instead.
 func (*SnapshotLocation) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{87}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *SnapshotLocation) GetLocationType() string {
@@ -8187,7 +8314,7 @@ type DeleteSnapshotsRequest struct {
 
 func (x *DeleteSnapshotsRequest) Reset() {
 	*x = DeleteSnapshotsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[88]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8199,7 +8326,7 @@ func (x *DeleteSnapshotsRequest) String() string {
 func (*DeleteSnapshotsRequest) ProtoMessage() {}
 
 func (x *DeleteSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[88]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8212,7 +8339,7 @@ func (x *DeleteSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*DeleteSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{88}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *DeleteSnapshotsRequest) GetSandboxId() string {
@@ -8245,7 +8372,7 @@ type DeleteSnapshotsResponse struct {
 
 func (x *DeleteSnapshotsResponse) Reset() {
 	*x = DeleteSnapshotsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[89]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8257,7 +8384,7 @@ func (x *DeleteSnapshotsResponse) String() string {
 func (*DeleteSnapshotsResponse) ProtoMessage() {}
 
 func (x *DeleteSnapshotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[89]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8270,7 +8397,7 @@ func (x *DeleteSnapshotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSnapshotsResponse.ProtoReflect.Descriptor instead.
 func (*DeleteSnapshotsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{89}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *DeleteSnapshotsResponse) GetDeleted() []string {
@@ -8296,7 +8423,7 @@ type RollbackRequest struct {
 
 func (x *RollbackRequest) Reset() {
 	*x = RollbackRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[90]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8308,7 +8435,7 @@ func (x *RollbackRequest) String() string {
 func (*RollbackRequest) ProtoMessage() {}
 
 func (x *RollbackRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[90]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8321,7 +8448,7 @@ func (x *RollbackRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackRequest.ProtoReflect.Descriptor instead.
 func (*RollbackRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{90}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *RollbackRequest) GetSandboxId() string {
@@ -8370,7 +8497,7 @@ type RollbackResponse struct {
 
 func (x *RollbackResponse) Reset() {
 	*x = RollbackResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[91]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8382,7 +8509,7 @@ func (x *RollbackResponse) String() string {
 func (*RollbackResponse) ProtoMessage() {}
 
 func (x *RollbackResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[91]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8395,7 +8522,7 @@ func (x *RollbackResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackResponse.ProtoReflect.Descriptor instead.
 func (*RollbackResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{91}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *RollbackResponse) GetSandboxId() string {
@@ -8428,7 +8555,7 @@ type StatsRequest struct {
 
 func (x *StatsRequest) Reset() {
 	*x = StatsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[92]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8440,7 +8567,7 @@ func (x *StatsRequest) String() string {
 func (*StatsRequest) ProtoMessage() {}
 
 func (x *StatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[92]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8453,7 +8580,7 @@ func (x *StatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsRequest.ProtoReflect.Descriptor instead.
 func (*StatsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{92}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *StatsRequest) GetSandboxId() string {
@@ -8493,7 +8620,7 @@ type StatsResponse struct {
 
 func (x *StatsResponse) Reset() {
 	*x = StatsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[93]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8505,7 +8632,7 @@ func (x *StatsResponse) String() string {
 func (*StatsResponse) ProtoMessage() {}
 
 func (x *StatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[93]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8518,7 +8645,7 @@ func (x *StatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsResponse.ProtoReflect.Descriptor instead.
 func (*StatsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{93}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *StatsResponse) GetSandboxId() string {
@@ -8643,7 +8770,7 @@ type UpdateRequest struct {
 
 func (x *UpdateRequest) Reset() {
 	*x = UpdateRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[94]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8655,7 +8782,7 @@ func (x *UpdateRequest) String() string {
 func (*UpdateRequest) ProtoMessage() {}
 
 func (x *UpdateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[94]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8668,7 +8795,7 @@ func (x *UpdateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateRequest.ProtoReflect.Descriptor instead.
 func (*UpdateRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{94}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *UpdateRequest) GetSandboxId() string {
@@ -8735,7 +8862,7 @@ type UpdateResponse struct {
 
 func (x *UpdateResponse) Reset() {
 	*x = UpdateResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[95]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8747,7 +8874,7 @@ func (x *UpdateResponse) String() string {
 func (*UpdateResponse) ProtoMessage() {}
 
 func (x *UpdateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[95]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8760,7 +8887,7 @@ func (x *UpdateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateResponse.ProtoReflect.Descriptor instead.
 func (*UpdateResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{95}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{96}
 }
 
 type SpacedPingGuestRequest struct {
@@ -8772,7 +8899,7 @@ type SpacedPingGuestRequest struct {
 
 func (x *SpacedPingGuestRequest) Reset() {
 	*x = SpacedPingGuestRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[96]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8784,7 +8911,7 @@ func (x *SpacedPingGuestRequest) String() string {
 func (*SpacedPingGuestRequest) ProtoMessage() {}
 
 func (x *SpacedPingGuestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[96]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8797,7 +8924,7 @@ func (x *SpacedPingGuestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedPingGuestRequest.ProtoReflect.Descriptor instead.
 func (*SpacedPingGuestRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{96}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *SpacedPingGuestRequest) GetSandboxId() string {
@@ -8815,7 +8942,7 @@ type SpacedPingGuestResponse struct {
 
 func (x *SpacedPingGuestResponse) Reset() {
 	*x = SpacedPingGuestResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[97]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8827,7 +8954,7 @@ func (x *SpacedPingGuestResponse) String() string {
 func (*SpacedPingGuestResponse) ProtoMessage() {}
 
 func (x *SpacedPingGuestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[97]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8840,7 +8967,7 @@ func (x *SpacedPingGuestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedPingGuestResponse.ProtoReflect.Descriptor instead.
 func (*SpacedPingGuestResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{97}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{98}
 }
 
 type SpacedGetStatusRequest struct {
@@ -8852,7 +8979,7 @@ type SpacedGetStatusRequest struct {
 
 func (x *SpacedGetStatusRequest) Reset() {
 	*x = SpacedGetStatusRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[98]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8864,7 +8991,7 @@ func (x *SpacedGetStatusRequest) String() string {
 func (*SpacedGetStatusRequest) ProtoMessage() {}
 
 func (x *SpacedGetStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[98]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8877,7 +9004,7 @@ func (x *SpacedGetStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedGetStatusRequest.ProtoReflect.Descriptor instead.
 func (*SpacedGetStatusRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{98}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *SpacedGetStatusRequest) GetSandboxId() string {
@@ -8899,7 +9026,7 @@ type SpacedGetStatusResponse struct {
 
 func (x *SpacedGetStatusResponse) Reset() {
 	*x = SpacedGetStatusResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[99]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8911,7 +9038,7 @@ func (x *SpacedGetStatusResponse) String() string {
 func (*SpacedGetStatusResponse) ProtoMessage() {}
 
 func (x *SpacedGetStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[99]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8924,7 +9051,7 @@ func (x *SpacedGetStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedGetStatusResponse.ProtoReflect.Descriptor instead.
 func (*SpacedGetStatusResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{99}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *SpacedGetStatusResponse) GetReady() bool {
@@ -8965,7 +9092,7 @@ type SpacedVersionInfo struct {
 
 func (x *SpacedVersionInfo) Reset() {
 	*x = SpacedVersionInfo{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[100]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8977,7 +9104,7 @@ func (x *SpacedVersionInfo) String() string {
 func (*SpacedVersionInfo) ProtoMessage() {}
 
 func (x *SpacedVersionInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[100]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8990,7 +9117,7 @@ func (x *SpacedVersionInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedVersionInfo.ProtoReflect.Descriptor instead.
 func (*SpacedVersionInfo) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{100}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *SpacedVersionInfo) GetVersion() string {
@@ -9017,7 +9144,7 @@ type SpacedWaitReadyRequest struct {
 
 func (x *SpacedWaitReadyRequest) Reset() {
 	*x = SpacedWaitReadyRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[101]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9029,7 +9156,7 @@ func (x *SpacedWaitReadyRequest) String() string {
 func (*SpacedWaitReadyRequest) ProtoMessage() {}
 
 func (x *SpacedWaitReadyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[101]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9042,7 +9169,7 @@ func (x *SpacedWaitReadyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedWaitReadyRequest.ProtoReflect.Descriptor instead.
 func (*SpacedWaitReadyRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{101}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{102}
 }
 
 func (x *SpacedWaitReadyRequest) GetSandboxId() string {
@@ -9068,7 +9195,7 @@ type SpacedWaitReadyResponse struct {
 
 func (x *SpacedWaitReadyResponse) Reset() {
 	*x = SpacedWaitReadyResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[102]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9080,7 +9207,7 @@ func (x *SpacedWaitReadyResponse) String() string {
 func (*SpacedWaitReadyResponse) ProtoMessage() {}
 
 func (x *SpacedWaitReadyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[102]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9093,7 +9220,7 @@ func (x *SpacedWaitReadyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedWaitReadyResponse.ProtoReflect.Descriptor instead.
 func (*SpacedWaitReadyResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{102}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *SpacedWaitReadyResponse) GetGuestUptime() *durationpb.Duration {
@@ -9113,7 +9240,7 @@ type SpacedStatRequest struct {
 
 func (x *SpacedStatRequest) Reset() {
 	*x = SpacedStatRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[103]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9125,7 +9252,7 @@ func (x *SpacedStatRequest) String() string {
 func (*SpacedStatRequest) ProtoMessage() {}
 
 func (x *SpacedStatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[103]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9138,7 +9265,7 @@ func (x *SpacedStatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedStatRequest.ProtoReflect.Descriptor instead.
 func (*SpacedStatRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{103}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{104}
 }
 
 func (x *SpacedStatRequest) GetSandboxId() string {
@@ -9165,7 +9292,7 @@ type SpacedListRequest struct {
 
 func (x *SpacedListRequest) Reset() {
 	*x = SpacedListRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[104]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9177,7 +9304,7 @@ func (x *SpacedListRequest) String() string {
 func (*SpacedListRequest) ProtoMessage() {}
 
 func (x *SpacedListRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[104]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9190,7 +9317,7 @@ func (x *SpacedListRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedListRequest.ProtoReflect.Descriptor instead.
 func (*SpacedListRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{104}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *SpacedListRequest) GetSandboxId() string {
@@ -9217,7 +9344,7 @@ type SpacedReadRequest struct {
 
 func (x *SpacedReadRequest) Reset() {
 	*x = SpacedReadRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[105]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9229,7 +9356,7 @@ func (x *SpacedReadRequest) String() string {
 func (*SpacedReadRequest) ProtoMessage() {}
 
 func (x *SpacedReadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[105]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9242,7 +9369,7 @@ func (x *SpacedReadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedReadRequest.ProtoReflect.Descriptor instead.
 func (*SpacedReadRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{105}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *SpacedReadRequest) GetSandboxId() string {
@@ -9269,7 +9396,7 @@ type SpacedWriteRequest struct {
 
 func (x *SpacedWriteRequest) Reset() {
 	*x = SpacedWriteRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[106]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9281,7 +9408,7 @@ func (x *SpacedWriteRequest) String() string {
 func (*SpacedWriteRequest) ProtoMessage() {}
 
 func (x *SpacedWriteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[106]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9294,7 +9421,7 @@ func (x *SpacedWriteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedWriteRequest.ProtoReflect.Descriptor instead.
 func (*SpacedWriteRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{106}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *SpacedWriteRequest) GetSandboxId() string {
@@ -9321,7 +9448,7 @@ type SpacedWriteBatchRequest struct {
 
 func (x *SpacedWriteBatchRequest) Reset() {
 	*x = SpacedWriteBatchRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[107]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9333,7 +9460,7 @@ func (x *SpacedWriteBatchRequest) String() string {
 func (*SpacedWriteBatchRequest) ProtoMessage() {}
 
 func (x *SpacedWriteBatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[107]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9346,7 +9473,7 @@ func (x *SpacedWriteBatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedWriteBatchRequest.ProtoReflect.Descriptor instead.
 func (*SpacedWriteBatchRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{107}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *SpacedWriteBatchRequest) GetSandboxId() string {
@@ -9373,7 +9500,7 @@ type SpacedMkdirRequest struct {
 
 func (x *SpacedMkdirRequest) Reset() {
 	*x = SpacedMkdirRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[108]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9385,7 +9512,7 @@ func (x *SpacedMkdirRequest) String() string {
 func (*SpacedMkdirRequest) ProtoMessage() {}
 
 func (x *SpacedMkdirRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[108]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9398,7 +9525,7 @@ func (x *SpacedMkdirRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedMkdirRequest.ProtoReflect.Descriptor instead.
 func (*SpacedMkdirRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{108}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *SpacedMkdirRequest) GetSandboxId() string {
@@ -9425,7 +9552,7 @@ type SpacedRemoveRequest struct {
 
 func (x *SpacedRemoveRequest) Reset() {
 	*x = SpacedRemoveRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[109]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9437,7 +9564,7 @@ func (x *SpacedRemoveRequest) String() string {
 func (*SpacedRemoveRequest) ProtoMessage() {}
 
 func (x *SpacedRemoveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[109]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9450,7 +9577,7 @@ func (x *SpacedRemoveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedRemoveRequest.ProtoReflect.Descriptor instead.
 func (*SpacedRemoveRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{109}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *SpacedRemoveRequest) GetSandboxId() string {
@@ -9477,7 +9604,7 @@ type SpacedRenameRequest struct {
 
 func (x *SpacedRenameRequest) Reset() {
 	*x = SpacedRenameRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[110]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9489,7 +9616,7 @@ func (x *SpacedRenameRequest) String() string {
 func (*SpacedRenameRequest) ProtoMessage() {}
 
 func (x *SpacedRenameRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[110]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9502,7 +9629,7 @@ func (x *SpacedRenameRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedRenameRequest.ProtoReflect.Descriptor instead.
 func (*SpacedRenameRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{110}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *SpacedRenameRequest) GetSandboxId() string {
@@ -9529,7 +9656,7 @@ type SpacedNormalizeWatchRootRequest struct {
 
 func (x *SpacedNormalizeWatchRootRequest) Reset() {
 	*x = SpacedNormalizeWatchRootRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[111]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9541,7 +9668,7 @@ func (x *SpacedNormalizeWatchRootRequest) String() string {
 func (*SpacedNormalizeWatchRootRequest) ProtoMessage() {}
 
 func (x *SpacedNormalizeWatchRootRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[111]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9554,7 +9681,7 @@ func (x *SpacedNormalizeWatchRootRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedNormalizeWatchRootRequest.ProtoReflect.Descriptor instead.
 func (*SpacedNormalizeWatchRootRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{111}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *SpacedNormalizeWatchRootRequest) GetSandboxId() string {
@@ -9581,7 +9708,7 @@ type SpacedWatchRequest struct {
 
 func (x *SpacedWatchRequest) Reset() {
 	*x = SpacedWatchRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[112]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9593,7 +9720,7 @@ func (x *SpacedWatchRequest) String() string {
 func (*SpacedWatchRequest) ProtoMessage() {}
 
 func (x *SpacedWatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[112]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9606,7 +9733,7 @@ func (x *SpacedWatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedWatchRequest.ProtoReflect.Descriptor instead.
 func (*SpacedWatchRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{112}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *SpacedWatchRequest) GetSandboxId() string {
@@ -9633,7 +9760,7 @@ type SpacedCreateWatcherRequest struct {
 
 func (x *SpacedCreateWatcherRequest) Reset() {
 	*x = SpacedCreateWatcherRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[113]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9645,7 +9772,7 @@ func (x *SpacedCreateWatcherRequest) String() string {
 func (*SpacedCreateWatcherRequest) ProtoMessage() {}
 
 func (x *SpacedCreateWatcherRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[113]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9658,7 +9785,7 @@ func (x *SpacedCreateWatcherRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedCreateWatcherRequest.ProtoReflect.Descriptor instead.
 func (*SpacedCreateWatcherRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{113}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *SpacedCreateWatcherRequest) GetSandboxId() string {
@@ -9685,7 +9812,7 @@ type SpacedGetWatcherEventsRequest struct {
 
 func (x *SpacedGetWatcherEventsRequest) Reset() {
 	*x = SpacedGetWatcherEventsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[114]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9697,7 +9824,7 @@ func (x *SpacedGetWatcherEventsRequest) String() string {
 func (*SpacedGetWatcherEventsRequest) ProtoMessage() {}
 
 func (x *SpacedGetWatcherEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[114]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9710,7 +9837,7 @@ func (x *SpacedGetWatcherEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedGetWatcherEventsRequest.ProtoReflect.Descriptor instead.
 func (*SpacedGetWatcherEventsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{114}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *SpacedGetWatcherEventsRequest) GetSandboxId() string {
@@ -9737,7 +9864,7 @@ type SpacedRemoveWatcherRequest struct {
 
 func (x *SpacedRemoveWatcherRequest) Reset() {
 	*x = SpacedRemoveWatcherRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[115]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[116]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9749,7 +9876,7 @@ func (x *SpacedRemoveWatcherRequest) String() string {
 func (*SpacedRemoveWatcherRequest) ProtoMessage() {}
 
 func (x *SpacedRemoveWatcherRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[115]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[116]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9762,7 +9889,7 @@ func (x *SpacedRemoveWatcherRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedRemoveWatcherRequest.ProtoReflect.Descriptor instead.
 func (*SpacedRemoveWatcherRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{115}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{116}
 }
 
 func (x *SpacedRemoveWatcherRequest) GetSandboxId() string {
@@ -9789,7 +9916,7 @@ type SpacedEnableFileChangesRequest struct {
 
 func (x *SpacedEnableFileChangesRequest) Reset() {
 	*x = SpacedEnableFileChangesRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[116]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9801,7 +9928,7 @@ func (x *SpacedEnableFileChangesRequest) String() string {
 func (*SpacedEnableFileChangesRequest) ProtoMessage() {}
 
 func (x *SpacedEnableFileChangesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[116]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9814,7 +9941,7 @@ func (x *SpacedEnableFileChangesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedEnableFileChangesRequest.ProtoReflect.Descriptor instead.
 func (*SpacedEnableFileChangesRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{116}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{117}
 }
 
 func (x *SpacedEnableFileChangesRequest) GetSandboxId() string {
@@ -9841,7 +9968,7 @@ type SpacedDisableFileChangesRequest struct {
 
 func (x *SpacedDisableFileChangesRequest) Reset() {
 	*x = SpacedDisableFileChangesRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[117]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9853,7 +9980,7 @@ func (x *SpacedDisableFileChangesRequest) String() string {
 func (*SpacedDisableFileChangesRequest) ProtoMessage() {}
 
 func (x *SpacedDisableFileChangesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[117]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9866,7 +9993,7 @@ func (x *SpacedDisableFileChangesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedDisableFileChangesRequest.ProtoReflect.Descriptor instead.
 func (*SpacedDisableFileChangesRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{117}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{118}
 }
 
 func (x *SpacedDisableFileChangesRequest) GetSandboxId() string {
@@ -9893,7 +10020,7 @@ type SpacedGetModifiedFilesRequest struct {
 
 func (x *SpacedGetModifiedFilesRequest) Reset() {
 	*x = SpacedGetModifiedFilesRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[118]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9905,7 +10032,7 @@ func (x *SpacedGetModifiedFilesRequest) String() string {
 func (*SpacedGetModifiedFilesRequest) ProtoMessage() {}
 
 func (x *SpacedGetModifiedFilesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[118]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9918,7 +10045,7 @@ func (x *SpacedGetModifiedFilesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedGetModifiedFilesRequest.ProtoReflect.Descriptor instead.
 func (*SpacedGetModifiedFilesRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{118}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *SpacedGetModifiedFilesRequest) GetSandboxId() string {
@@ -9945,7 +10072,7 @@ type SpacedStartProcessRequest struct {
 
 func (x *SpacedStartProcessRequest) Reset() {
 	*x = SpacedStartProcessRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[119]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9957,7 +10084,7 @@ func (x *SpacedStartProcessRequest) String() string {
 func (*SpacedStartProcessRequest) ProtoMessage() {}
 
 func (x *SpacedStartProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[119]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9970,7 +10097,7 @@ func (x *SpacedStartProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedStartProcessRequest.ProtoReflect.Descriptor instead.
 func (*SpacedStartProcessRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{119}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *SpacedStartProcessRequest) GetSandboxId() string {
@@ -9997,7 +10124,7 @@ type SpacedConnectProcessRequest struct {
 
 func (x *SpacedConnectProcessRequest) Reset() {
 	*x = SpacedConnectProcessRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[120]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10009,7 +10136,7 @@ func (x *SpacedConnectProcessRequest) String() string {
 func (*SpacedConnectProcessRequest) ProtoMessage() {}
 
 func (x *SpacedConnectProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[120]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10022,7 +10149,7 @@ func (x *SpacedConnectProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedConnectProcessRequest.ProtoReflect.Descriptor instead.
 func (*SpacedConnectProcessRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{120}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{121}
 }
 
 func (x *SpacedConnectProcessRequest) GetSandboxId() string {
@@ -10049,7 +10176,7 @@ type SpacedListProcessesRequest struct {
 
 func (x *SpacedListProcessesRequest) Reset() {
 	*x = SpacedListProcessesRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[121]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10061,7 +10188,7 @@ func (x *SpacedListProcessesRequest) String() string {
 func (*SpacedListProcessesRequest) ProtoMessage() {}
 
 func (x *SpacedListProcessesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[121]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10074,7 +10201,7 @@ func (x *SpacedListProcessesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedListProcessesRequest.ProtoReflect.Descriptor instead.
 func (*SpacedListProcessesRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{121}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *SpacedListProcessesRequest) GetSandboxId() string {
@@ -10100,7 +10227,7 @@ type SpacedListProcessesResponse struct {
 
 func (x *SpacedListProcessesResponse) Reset() {
 	*x = SpacedListProcessesResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[122]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10112,7 +10239,7 @@ func (x *SpacedListProcessesResponse) String() string {
 func (*SpacedListProcessesResponse) ProtoMessage() {}
 
 func (x *SpacedListProcessesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[122]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10125,7 +10252,7 @@ func (x *SpacedListProcessesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedListProcessesResponse.ProtoReflect.Descriptor instead.
 func (*SpacedListProcessesResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{122}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *SpacedListProcessesResponse) GetProcesses() []*v14.ProcessInfo {
@@ -10145,7 +10272,7 @@ type SpacedSendSignalRequest struct {
 
 func (x *SpacedSendSignalRequest) Reset() {
 	*x = SpacedSendSignalRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[123]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10157,7 +10284,7 @@ func (x *SpacedSendSignalRequest) String() string {
 func (*SpacedSendSignalRequest) ProtoMessage() {}
 
 func (x *SpacedSendSignalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[123]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10170,7 +10297,7 @@ func (x *SpacedSendSignalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedSendSignalRequest.ProtoReflect.Descriptor instead.
 func (*SpacedSendSignalRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{123}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *SpacedSendSignalRequest) GetSandboxId() string {
@@ -10197,7 +10324,7 @@ type SpacedSendInputRequest struct {
 
 func (x *SpacedSendInputRequest) Reset() {
 	*x = SpacedSendInputRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[124]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10209,7 +10336,7 @@ func (x *SpacedSendInputRequest) String() string {
 func (*SpacedSendInputRequest) ProtoMessage() {}
 
 func (x *SpacedSendInputRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[124]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10222,7 +10349,7 @@ func (x *SpacedSendInputRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedSendInputRequest.ProtoReflect.Descriptor instead.
 func (*SpacedSendInputRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{124}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *SpacedSendInputRequest) GetSandboxId() string {
@@ -10249,7 +10376,7 @@ type SpacedCloseStdinRequest struct {
 
 func (x *SpacedCloseStdinRequest) Reset() {
 	*x = SpacedCloseStdinRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[125]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10261,7 +10388,7 @@ func (x *SpacedCloseStdinRequest) String() string {
 func (*SpacedCloseStdinRequest) ProtoMessage() {}
 
 func (x *SpacedCloseStdinRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[125]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10274,7 +10401,7 @@ func (x *SpacedCloseStdinRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedCloseStdinRequest.ProtoReflect.Descriptor instead.
 func (*SpacedCloseStdinRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{125}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *SpacedCloseStdinRequest) GetSandboxId() string {
@@ -10301,7 +10428,7 @@ type SpacedResizePtyRequest struct {
 
 func (x *SpacedResizePtyRequest) Reset() {
 	*x = SpacedResizePtyRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[126]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10313,7 +10440,7 @@ func (x *SpacedResizePtyRequest) String() string {
 func (*SpacedResizePtyRequest) ProtoMessage() {}
 
 func (x *SpacedResizePtyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[126]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10326,7 +10453,7 @@ func (x *SpacedResizePtyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedResizePtyRequest.ProtoReflect.Descriptor instead.
 func (*SpacedResizePtyRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{126}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *SpacedResizePtyRequest) GetSandboxId() string {
@@ -10353,7 +10480,7 @@ type SpacedKillProcessRequest struct {
 
 func (x *SpacedKillProcessRequest) Reset() {
 	*x = SpacedKillProcessRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[127]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10365,7 +10492,7 @@ func (x *SpacedKillProcessRequest) String() string {
 func (*SpacedKillProcessRequest) ProtoMessage() {}
 
 func (x *SpacedKillProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[127]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10378,7 +10505,7 @@ func (x *SpacedKillProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedKillProcessRequest.ProtoReflect.Descriptor instead.
 func (*SpacedKillProcessRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{127}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{128}
 }
 
 func (x *SpacedKillProcessRequest) GetSandboxId() string {
@@ -10406,7 +10533,7 @@ type SetAutoLifecyclePolicyRequest struct {
 
 func (x *SetAutoLifecyclePolicyRequest) Reset() {
 	*x = SetAutoLifecyclePolicyRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[128]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[129]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10418,7 +10545,7 @@ func (x *SetAutoLifecyclePolicyRequest) String() string {
 func (*SetAutoLifecyclePolicyRequest) ProtoMessage() {}
 
 func (x *SetAutoLifecyclePolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[128]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[129]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10431,7 +10558,7 @@ func (x *SetAutoLifecyclePolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetAutoLifecyclePolicyRequest.ProtoReflect.Descriptor instead.
 func (*SetAutoLifecyclePolicyRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{128}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{129}
 }
 
 func (x *SetAutoLifecyclePolicyRequest) GetSandboxId() string {
@@ -10465,7 +10592,7 @@ type SetAutoLifecyclePolicyResponse struct {
 
 func (x *SetAutoLifecyclePolicyResponse) Reset() {
 	*x = SetAutoLifecyclePolicyResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[129]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[130]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10477,7 +10604,7 @@ func (x *SetAutoLifecyclePolicyResponse) String() string {
 func (*SetAutoLifecyclePolicyResponse) ProtoMessage() {}
 
 func (x *SetAutoLifecyclePolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[129]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[130]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10490,7 +10617,7 @@ func (x *SetAutoLifecyclePolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetAutoLifecyclePolicyResponse.ProtoReflect.Descriptor instead.
 func (*SetAutoLifecyclePolicyResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{129}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{130}
 }
 
 func (x *SetAutoLifecyclePolicyResponse) GetEffectivePolicy() *AutoLifecyclePolicy {
@@ -10520,7 +10647,7 @@ type TouchAutoLifecycleRequest struct {
 
 func (x *TouchAutoLifecycleRequest) Reset() {
 	*x = TouchAutoLifecycleRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[130]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10532,7 +10659,7 @@ func (x *TouchAutoLifecycleRequest) String() string {
 func (*TouchAutoLifecycleRequest) ProtoMessage() {}
 
 func (x *TouchAutoLifecycleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[130]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10545,7 +10672,7 @@ func (x *TouchAutoLifecycleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TouchAutoLifecycleRequest.ProtoReflect.Descriptor instead.
 func (*TouchAutoLifecycleRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{130}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *TouchAutoLifecycleRequest) GetSandboxId() string {
@@ -10591,7 +10718,7 @@ type AccessIdleUpdate struct {
 
 func (x *AccessIdleUpdate) Reset() {
 	*x = AccessIdleUpdate{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[131]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10603,7 +10730,7 @@ func (x *AccessIdleUpdate) String() string {
 func (*AccessIdleUpdate) ProtoMessage() {}
 
 func (x *AccessIdleUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[131]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10616,7 +10743,7 @@ func (x *AccessIdleUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AccessIdleUpdate.ProtoReflect.Descriptor instead.
 func (*AccessIdleUpdate) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{131}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{132}
 }
 
 func (x *AccessIdleUpdate) GetExecutionGeneration() int64 {
@@ -10683,7 +10810,7 @@ type TouchAutoLifecycleResponse struct {
 
 func (x *TouchAutoLifecycleResponse) Reset() {
 	*x = TouchAutoLifecycleResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[132]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10695,7 +10822,7 @@ func (x *TouchAutoLifecycleResponse) String() string {
 func (*TouchAutoLifecycleResponse) ProtoMessage() {}
 
 func (x *TouchAutoLifecycleResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[132]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10708,7 +10835,7 @@ func (x *TouchAutoLifecycleResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TouchAutoLifecycleResponse.ProtoReflect.Descriptor instead.
 func (*TouchAutoLifecycleResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{132}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{133}
 }
 
 func (x *TouchAutoLifecycleResponse) GetResult() AutoLifecycleTouchResult {
@@ -10727,7 +10854,7 @@ type GetNetworkPolicyRequest struct {
 
 func (x *GetNetworkPolicyRequest) Reset() {
 	*x = GetNetworkPolicyRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[133]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10739,7 +10866,7 @@ func (x *GetNetworkPolicyRequest) String() string {
 func (*GetNetworkPolicyRequest) ProtoMessage() {}
 
 func (x *GetNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[133]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10752,7 +10879,7 @@ func (x *GetNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNetworkPolicyRequest.ProtoReflect.Descriptor instead.
 func (*GetNetworkPolicyRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{133}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{134}
 }
 
 func (x *GetNetworkPolicyRequest) GetSandboxIds() []string {
@@ -10771,7 +10898,7 @@ type GetNetworkPolicyResponse struct {
 
 func (x *GetNetworkPolicyResponse) Reset() {
 	*x = GetNetworkPolicyResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[134]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10783,7 +10910,7 @@ func (x *GetNetworkPolicyResponse) String() string {
 func (*GetNetworkPolicyResponse) ProtoMessage() {}
 
 func (x *GetNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[134]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10796,7 +10923,7 @@ func (x *GetNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNetworkPolicyResponse.ProtoReflect.Descriptor instead.
 func (*GetNetworkPolicyResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{134}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{135}
 }
 
 func (x *GetNetworkPolicyResponse) GetPolicies() []*NetworkPolicyDetail {
@@ -10823,7 +10950,7 @@ type SetNetworkPolicyRequest struct {
 
 func (x *SetNetworkPolicyRequest) Reset() {
 	*x = SetNetworkPolicyRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[135]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10835,7 +10962,7 @@ func (x *SetNetworkPolicyRequest) String() string {
 func (*SetNetworkPolicyRequest) ProtoMessage() {}
 
 func (x *SetNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[135]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10848,7 +10975,7 @@ func (x *SetNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNetworkPolicyRequest.ProtoReflect.Descriptor instead.
 func (*SetNetworkPolicyRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{135}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *SetNetworkPolicyRequest) GetSandboxId() string {
@@ -10916,7 +11043,7 @@ type SetNetworkPolicyResponse struct {
 
 func (x *SetNetworkPolicyResponse) Reset() {
 	*x = SetNetworkPolicyResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[136]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10928,7 +11055,7 @@ func (x *SetNetworkPolicyResponse) String() string {
 func (*SetNetworkPolicyResponse) ProtoMessage() {}
 
 func (x *SetNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[136]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10941,7 +11068,7 @@ func (x *SetNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNetworkPolicyResponse.ProtoReflect.Descriptor instead.
 func (*SetNetworkPolicyResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{136}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{137}
 }
 
 func (x *SetNetworkPolicyResponse) GetEffectivePolicy() *v11.NetworkPolicyV1 {
@@ -11020,7 +11147,7 @@ type TemplateNetworkPolicyUpdatedRequest struct {
 
 func (x *TemplateNetworkPolicyUpdatedRequest) Reset() {
 	*x = TemplateNetworkPolicyUpdatedRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[137]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[138]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11032,7 +11159,7 @@ func (x *TemplateNetworkPolicyUpdatedRequest) String() string {
 func (*TemplateNetworkPolicyUpdatedRequest) ProtoMessage() {}
 
 func (x *TemplateNetworkPolicyUpdatedRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[137]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[138]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11045,7 +11172,7 @@ func (x *TemplateNetworkPolicyUpdatedRequest) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use TemplateNetworkPolicyUpdatedRequest.ProtoReflect.Descriptor instead.
 func (*TemplateNetworkPolicyUpdatedRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{137}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{138}
 }
 
 func (x *TemplateNetworkPolicyUpdatedRequest) GetTemplate() string {
@@ -11087,7 +11214,7 @@ type TemplateNetworkPolicyUpdatedResponse struct {
 
 func (x *TemplateNetworkPolicyUpdatedResponse) Reset() {
 	*x = TemplateNetworkPolicyUpdatedResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[138]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[139]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11099,7 +11226,7 @@ func (x *TemplateNetworkPolicyUpdatedResponse) String() string {
 func (*TemplateNetworkPolicyUpdatedResponse) ProtoMessage() {}
 
 func (x *TemplateNetworkPolicyUpdatedResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[138]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[139]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11112,7 +11239,7 @@ func (x *TemplateNetworkPolicyUpdatedResponse) ProtoReflect() protoreflect.Messa
 
 // Deprecated: Use TemplateNetworkPolicyUpdatedResponse.ProtoReflect.Descriptor instead.
 func (*TemplateNetworkPolicyUpdatedResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{138}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{139}
 }
 
 func (x *TemplateNetworkPolicyUpdatedResponse) GetMatchedSandboxes() uint32 {
@@ -11151,7 +11278,7 @@ type CycleNetGatewayRequest struct {
 
 func (x *CycleNetGatewayRequest) Reset() {
 	*x = CycleNetGatewayRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[139]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[140]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11163,7 +11290,7 @@ func (x *CycleNetGatewayRequest) String() string {
 func (*CycleNetGatewayRequest) ProtoMessage() {}
 
 func (x *CycleNetGatewayRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[139]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[140]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11176,7 +11303,7 @@ func (x *CycleNetGatewayRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CycleNetGatewayRequest.ProtoReflect.Descriptor instead.
 func (*CycleNetGatewayRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{139}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{140}
 }
 
 func (x *CycleNetGatewayRequest) GetSandboxId() string {
@@ -11211,7 +11338,7 @@ type CycleNetGatewayResponse struct {
 
 func (x *CycleNetGatewayResponse) Reset() {
 	*x = CycleNetGatewayResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[140]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[141]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11223,7 +11350,7 @@ func (x *CycleNetGatewayResponse) String() string {
 func (*CycleNetGatewayResponse) ProtoMessage() {}
 
 func (x *CycleNetGatewayResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[140]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[141]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11236,7 +11363,7 @@ func (x *CycleNetGatewayResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CycleNetGatewayResponse.ProtoReflect.Descriptor instead.
 func (*CycleNetGatewayResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{140}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{141}
 }
 
 func (x *CycleNetGatewayResponse) GetOldPid() uint32 {
@@ -11289,7 +11416,7 @@ type AdoptPoolSandboxRequest struct {
 
 func (x *AdoptPoolSandboxRequest) Reset() {
 	*x = AdoptPoolSandboxRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[141]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11301,7 +11428,7 @@ func (x *AdoptPoolSandboxRequest) String() string {
 func (*AdoptPoolSandboxRequest) ProtoMessage() {}
 
 func (x *AdoptPoolSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[141]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11314,7 +11441,7 @@ func (x *AdoptPoolSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdoptPoolSandboxRequest.ProtoReflect.Descriptor instead.
 func (*AdoptPoolSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{141}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *AdoptPoolSandboxRequest) GetTemplate() string {
@@ -11419,7 +11546,7 @@ type AdoptPoolSandboxResponse struct {
 
 func (x *AdoptPoolSandboxResponse) Reset() {
 	*x = AdoptPoolSandboxResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[142]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11431,7 +11558,7 @@ func (x *AdoptPoolSandboxResponse) String() string {
 func (*AdoptPoolSandboxResponse) ProtoMessage() {}
 
 func (x *AdoptPoolSandboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[142]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11444,7 +11571,7 @@ func (x *AdoptPoolSandboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdoptPoolSandboxResponse.ProtoReflect.Descriptor instead.
 func (*AdoptPoolSandboxResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{142}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *AdoptPoolSandboxResponse) GetSandboxId() string {
@@ -11471,7 +11598,7 @@ type WaitRequest struct {
 
 func (x *WaitRequest) Reset() {
 	*x = WaitRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[143]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11483,7 +11610,7 @@ func (x *WaitRequest) String() string {
 func (*WaitRequest) ProtoMessage() {}
 
 func (x *WaitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[143]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11496,7 +11623,7 @@ func (x *WaitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitRequest.ProtoReflect.Descriptor instead.
 func (*WaitRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{143}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *WaitRequest) GetSandboxId() string {
@@ -11528,7 +11655,7 @@ type WaitResponse struct {
 
 func (x *WaitResponse) Reset() {
 	*x = WaitResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[144]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[145]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11540,7 +11667,7 @@ func (x *WaitResponse) String() string {
 func (*WaitResponse) ProtoMessage() {}
 
 func (x *WaitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[144]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[145]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11553,7 +11680,7 @@ func (x *WaitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitResponse.ProtoReflect.Descriptor instead.
 func (*WaitResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{144}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{145}
 }
 
 func (x *WaitResponse) GetSandboxId() string {
@@ -11589,7 +11716,7 @@ type CloneFromDonorRequest struct {
 
 func (x *CloneFromDonorRequest) Reset() {
 	*x = CloneFromDonorRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[145]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[146]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11601,7 +11728,7 @@ func (x *CloneFromDonorRequest) String() string {
 func (*CloneFromDonorRequest) ProtoMessage() {}
 
 func (x *CloneFromDonorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[145]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[146]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11614,7 +11741,7 @@ func (x *CloneFromDonorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloneFromDonorRequest.ProtoReflect.Descriptor instead.
 func (*CloneFromDonorRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{145}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{146}
 }
 
 func (x *CloneFromDonorRequest) GetDonorSandboxId() string {
@@ -11654,7 +11781,7 @@ type CloneFromDonorResponse struct {
 
 func (x *CloneFromDonorResponse) Reset() {
 	*x = CloneFromDonorResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[146]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[147]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11666,7 +11793,7 @@ func (x *CloneFromDonorResponse) String() string {
 func (*CloneFromDonorResponse) ProtoMessage() {}
 
 func (x *CloneFromDonorResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[146]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[147]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11679,7 +11806,7 @@ func (x *CloneFromDonorResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloneFromDonorResponse.ProtoReflect.Descriptor instead.
 func (*CloneFromDonorResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{146}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{147}
 }
 
 func (x *CloneFromDonorResponse) GetSandboxId() string {
@@ -11701,7 +11828,7 @@ type ExportSnapshotRequest struct {
 
 func (x *ExportSnapshotRequest) Reset() {
 	*x = ExportSnapshotRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[147]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[148]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11713,7 +11840,7 @@ func (x *ExportSnapshotRequest) String() string {
 func (*ExportSnapshotRequest) ProtoMessage() {}
 
 func (x *ExportSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[147]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[148]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11726,7 +11853,7 @@ func (x *ExportSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*ExportSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{147}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{148}
 }
 
 func (x *ExportSnapshotRequest) GetSandboxId() string {
@@ -11770,7 +11897,7 @@ type ExportSnapshotChunk struct {
 
 func (x *ExportSnapshotChunk) Reset() {
 	*x = ExportSnapshotChunk{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[148]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[149]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11782,7 +11909,7 @@ func (x *ExportSnapshotChunk) String() string {
 func (*ExportSnapshotChunk) ProtoMessage() {}
 
 func (x *ExportSnapshotChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[148]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[149]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11795,7 +11922,7 @@ func (x *ExportSnapshotChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSnapshotChunk.ProtoReflect.Descriptor instead.
 func (*ExportSnapshotChunk) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{148}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{149}
 }
 
 func (x *ExportSnapshotChunk) GetPayload() isExportSnapshotChunk_Payload {
@@ -11852,7 +11979,7 @@ type ExportSnapshotHeader struct {
 
 func (x *ExportSnapshotHeader) Reset() {
 	*x = ExportSnapshotHeader{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[149]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[150]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11864,7 +11991,7 @@ func (x *ExportSnapshotHeader) String() string {
 func (*ExportSnapshotHeader) ProtoMessage() {}
 
 func (x *ExportSnapshotHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[149]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[150]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11877,7 +12004,7 @@ func (x *ExportSnapshotHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSnapshotHeader.ProtoReflect.Descriptor instead.
 func (*ExportSnapshotHeader) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{149}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{150}
 }
 
 func (x *ExportSnapshotHeader) GetSandboxId() string {
@@ -11928,7 +12055,7 @@ type ExportSnapshotFileChunk struct {
 
 func (x *ExportSnapshotFileChunk) Reset() {
 	*x = ExportSnapshotFileChunk{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[150]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[151]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11940,7 +12067,7 @@ func (x *ExportSnapshotFileChunk) String() string {
 func (*ExportSnapshotFileChunk) ProtoMessage() {}
 
 func (x *ExportSnapshotFileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[150]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[151]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11953,7 +12080,7 @@ func (x *ExportSnapshotFileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSnapshotFileChunk.ProtoReflect.Descriptor instead.
 func (*ExportSnapshotFileChunk) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{150}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{151}
 }
 
 func (x *ExportSnapshotFileChunk) GetFileName() string {
@@ -11997,7 +12124,7 @@ type ImportSnapshotRequest struct {
 
 func (x *ImportSnapshotRequest) Reset() {
 	*x = ImportSnapshotRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[151]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[152]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12009,7 +12136,7 @@ func (x *ImportSnapshotRequest) String() string {
 func (*ImportSnapshotRequest) ProtoMessage() {}
 
 func (x *ImportSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[151]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[152]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12022,7 +12149,7 @@ func (x *ImportSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*ImportSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{151}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{152}
 }
 
 func (x *ImportSnapshotRequest) GetPayload() isImportSnapshotRequest_Payload {
@@ -12080,7 +12207,7 @@ type ImportSnapshotHeader struct {
 
 func (x *ImportSnapshotHeader) Reset() {
 	*x = ImportSnapshotHeader{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[152]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[153]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12092,7 +12219,7 @@ func (x *ImportSnapshotHeader) String() string {
 func (*ImportSnapshotHeader) ProtoMessage() {}
 
 func (x *ImportSnapshotHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[152]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[153]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12105,7 +12232,7 @@ func (x *ImportSnapshotHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSnapshotHeader.ProtoReflect.Descriptor instead.
 func (*ImportSnapshotHeader) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{152}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{153}
 }
 
 func (x *ImportSnapshotHeader) GetSandboxId() string {
@@ -12162,7 +12289,7 @@ type ImportSnapshotFileChunk struct {
 
 func (x *ImportSnapshotFileChunk) Reset() {
 	*x = ImportSnapshotFileChunk{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[153]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[154]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12174,7 +12301,7 @@ func (x *ImportSnapshotFileChunk) String() string {
 func (*ImportSnapshotFileChunk) ProtoMessage() {}
 
 func (x *ImportSnapshotFileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[153]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[154]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12187,7 +12314,7 @@ func (x *ImportSnapshotFileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSnapshotFileChunk.ProtoReflect.Descriptor instead.
 func (*ImportSnapshotFileChunk) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{153}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{154}
 }
 
 func (x *ImportSnapshotFileChunk) GetFileName() string {
@@ -12230,7 +12357,7 @@ type ImportSnapshotResponse struct {
 
 func (x *ImportSnapshotResponse) Reset() {
 	*x = ImportSnapshotResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[154]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[155]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12242,7 +12369,7 @@ func (x *ImportSnapshotResponse) String() string {
 func (*ImportSnapshotResponse) ProtoMessage() {}
 
 func (x *ImportSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[154]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[155]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12255,7 +12382,7 @@ func (x *ImportSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*ImportSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{154}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{155}
 }
 
 func (x *ImportSnapshotResponse) GetSandboxId() string {
@@ -12296,7 +12423,7 @@ type ExportSandboxRequest struct {
 
 func (x *ExportSandboxRequest) Reset() {
 	*x = ExportSandboxRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[155]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[156]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12308,7 +12435,7 @@ func (x *ExportSandboxRequest) String() string {
 func (*ExportSandboxRequest) ProtoMessage() {}
 
 func (x *ExportSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[155]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[156]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12321,7 +12448,7 @@ func (x *ExportSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSandboxRequest.ProtoReflect.Descriptor instead.
 func (*ExportSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{155}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{156}
 }
 
 func (x *ExportSandboxRequest) GetSandboxId() string {
@@ -12351,7 +12478,7 @@ type ExportSandboxChunk struct {
 
 func (x *ExportSandboxChunk) Reset() {
 	*x = ExportSandboxChunk{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[156]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[157]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12363,7 +12490,7 @@ func (x *ExportSandboxChunk) String() string {
 func (*ExportSandboxChunk) ProtoMessage() {}
 
 func (x *ExportSandboxChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[156]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[157]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12376,7 +12503,7 @@ func (x *ExportSandboxChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSandboxChunk.ProtoReflect.Descriptor instead.
 func (*ExportSandboxChunk) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{156}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{157}
 }
 
 func (x *ExportSandboxChunk) GetPayload() isExportSandboxChunk_Payload {
@@ -12453,7 +12580,7 @@ type ExportSandboxHeader struct {
 
 func (x *ExportSandboxHeader) Reset() {
 	*x = ExportSandboxHeader{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[157]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[158]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12465,7 +12592,7 @@ func (x *ExportSandboxHeader) String() string {
 func (*ExportSandboxHeader) ProtoMessage() {}
 
 func (x *ExportSandboxHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[157]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[158]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12478,7 +12605,7 @@ func (x *ExportSandboxHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSandboxHeader.ProtoReflect.Descriptor instead.
 func (*ExportSandboxHeader) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{157}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{158}
 }
 
 func (x *ExportSandboxHeader) GetSandboxId() string {
@@ -12640,7 +12767,7 @@ type ExportSandboxFileChunk struct {
 
 func (x *ExportSandboxFileChunk) Reset() {
 	*x = ExportSandboxFileChunk{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[158]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[159]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12652,7 +12779,7 @@ func (x *ExportSandboxFileChunk) String() string {
 func (*ExportSandboxFileChunk) ProtoMessage() {}
 
 func (x *ExportSandboxFileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[158]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[159]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12665,7 +12792,7 @@ func (x *ExportSandboxFileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSandboxFileChunk.ProtoReflect.Descriptor instead.
 func (*ExportSandboxFileChunk) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{158}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{159}
 }
 
 func (x *ExportSandboxFileChunk) GetFileName() string {
@@ -12709,7 +12836,7 @@ type ImportSandboxRequest struct {
 
 func (x *ImportSandboxRequest) Reset() {
 	*x = ImportSandboxRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[159]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[160]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12721,7 +12848,7 @@ func (x *ImportSandboxRequest) String() string {
 func (*ImportSandboxRequest) ProtoMessage() {}
 
 func (x *ImportSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[159]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[160]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12734,7 +12861,7 @@ func (x *ImportSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSandboxRequest.ProtoReflect.Descriptor instead.
 func (*ImportSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{159}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{160}
 }
 
 func (x *ImportSandboxRequest) GetPayload() isImportSandboxRequest_Payload {
@@ -12808,7 +12935,7 @@ type ImportSandboxHeader struct {
 
 func (x *ImportSandboxHeader) Reset() {
 	*x = ImportSandboxHeader{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[160]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[161]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12820,7 +12947,7 @@ func (x *ImportSandboxHeader) String() string {
 func (*ImportSandboxHeader) ProtoMessage() {}
 
 func (x *ImportSandboxHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[160]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[161]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12833,7 +12960,7 @@ func (x *ImportSandboxHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSandboxHeader.ProtoReflect.Descriptor instead.
 func (*ImportSandboxHeader) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{160}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{161}
 }
 
 func (x *ImportSandboxHeader) GetSandboxId() string {
@@ -12988,7 +13115,7 @@ type ImportSandboxFileChunk struct {
 
 func (x *ImportSandboxFileChunk) Reset() {
 	*x = ImportSandboxFileChunk{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[161]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[162]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13000,7 +13127,7 @@ func (x *ImportSandboxFileChunk) String() string {
 func (*ImportSandboxFileChunk) ProtoMessage() {}
 
 func (x *ImportSandboxFileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[161]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[162]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13013,7 +13140,7 @@ func (x *ImportSandboxFileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSandboxFileChunk.ProtoReflect.Descriptor instead.
 func (*ImportSandboxFileChunk) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{161}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{162}
 }
 
 func (x *ImportSandboxFileChunk) GetFileName() string {
@@ -13055,7 +13182,7 @@ type ImportSandboxResponse struct {
 
 func (x *ImportSandboxResponse) Reset() {
 	*x = ImportSandboxResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[162]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[163]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13067,7 +13194,7 @@ func (x *ImportSandboxResponse) String() string {
 func (*ImportSandboxResponse) ProtoMessage() {}
 
 func (x *ImportSandboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[162]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[163]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13080,7 +13207,7 @@ func (x *ImportSandboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSandboxResponse.ProtoReflect.Descriptor instead.
 func (*ImportSandboxResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{162}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{163}
 }
 
 func (x *ImportSandboxResponse) GetSandboxId() string {
@@ -13114,7 +13241,7 @@ type SpacedOpenLoopbackBridgeRequest struct {
 
 func (x *SpacedOpenLoopbackBridgeRequest) Reset() {
 	*x = SpacedOpenLoopbackBridgeRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[163]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[164]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13126,7 +13253,7 @@ func (x *SpacedOpenLoopbackBridgeRequest) String() string {
 func (*SpacedOpenLoopbackBridgeRequest) ProtoMessage() {}
 
 func (x *SpacedOpenLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[163]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[164]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13139,7 +13266,7 @@ func (x *SpacedOpenLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedOpenLoopbackBridgeRequest.ProtoReflect.Descriptor instead.
 func (*SpacedOpenLoopbackBridgeRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{163}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{164}
 }
 
 func (x *SpacedOpenLoopbackBridgeRequest) GetSandboxId() string {
@@ -13166,7 +13293,7 @@ type SpacedCloseLoopbackBridgeRequest struct {
 
 func (x *SpacedCloseLoopbackBridgeRequest) Reset() {
 	*x = SpacedCloseLoopbackBridgeRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[164]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[165]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13178,7 +13305,7 @@ func (x *SpacedCloseLoopbackBridgeRequest) String() string {
 func (*SpacedCloseLoopbackBridgeRequest) ProtoMessage() {}
 
 func (x *SpacedCloseLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[164]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[165]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13191,7 +13318,7 @@ func (x *SpacedCloseLoopbackBridgeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpacedCloseLoopbackBridgeRequest.ProtoReflect.Descriptor instead.
 func (*SpacedCloseLoopbackBridgeRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{164}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{165}
 }
 
 func (x *SpacedCloseLoopbackBridgeRequest) GetSandboxId() string {
@@ -13217,7 +13344,7 @@ type ResolveSandboxMemoryRequest struct {
 
 func (x *ResolveSandboxMemoryRequest) Reset() {
 	*x = ResolveSandboxMemoryRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[165]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[166]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13229,7 +13356,7 @@ func (x *ResolveSandboxMemoryRequest) String() string {
 func (*ResolveSandboxMemoryRequest) ProtoMessage() {}
 
 func (x *ResolveSandboxMemoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[165]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[166]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13242,7 +13369,7 @@ func (x *ResolveSandboxMemoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveSandboxMemoryRequest.ProtoReflect.Descriptor instead.
 func (*ResolveSandboxMemoryRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{165}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{166}
 }
 
 func (x *ResolveSandboxMemoryRequest) GetRequestedMemoryMib() uint32 {
@@ -13266,7 +13393,7 @@ type ResolveSandboxMemoryResponse struct {
 
 func (x *ResolveSandboxMemoryResponse) Reset() {
 	*x = ResolveSandboxMemoryResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[166]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[167]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13278,7 +13405,7 @@ func (x *ResolveSandboxMemoryResponse) String() string {
 func (*ResolveSandboxMemoryResponse) ProtoMessage() {}
 
 func (x *ResolveSandboxMemoryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[166]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[167]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13291,7 +13418,7 @@ func (x *ResolveSandboxMemoryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveSandboxMemoryResponse.ProtoReflect.Descriptor instead.
 func (*ResolveSandboxMemoryResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{166}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{167}
 }
 
 func (x *ResolveSandboxMemoryResponse) GetRequestedMemoryMib() uint32 {
@@ -13353,7 +13480,7 @@ type NetworkPolicyDetail struct {
 
 func (x *NetworkPolicyDetail) Reset() {
 	*x = NetworkPolicyDetail{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[167]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[168]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13365,7 +13492,7 @@ func (x *NetworkPolicyDetail) String() string {
 func (*NetworkPolicyDetail) ProtoMessage() {}
 
 func (x *NetworkPolicyDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[167]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[168]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13378,7 +13505,7 @@ func (x *NetworkPolicyDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkPolicyDetail.ProtoReflect.Descriptor instead.
 func (*NetworkPolicyDetail) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{167}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{168}
 }
 
 func (x *NetworkPolicyDetail) GetSandboxId() string {
@@ -13450,7 +13577,7 @@ type PrepareTeardownSuspendRequest struct {
 
 func (x *PrepareTeardownSuspendRequest) Reset() {
 	*x = PrepareTeardownSuspendRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[168]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[169]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13462,7 +13589,7 @@ func (x *PrepareTeardownSuspendRequest) String() string {
 func (*PrepareTeardownSuspendRequest) ProtoMessage() {}
 
 func (x *PrepareTeardownSuspendRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[168]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[169]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13475,7 +13602,7 @@ func (x *PrepareTeardownSuspendRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareTeardownSuspendRequest.ProtoReflect.Descriptor instead.
 func (*PrepareTeardownSuspendRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{168}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{169}
 }
 
 func (x *PrepareTeardownSuspendRequest) GetSandboxId() string {
@@ -13512,7 +13639,7 @@ type PrepareTeardownSuspendResponse struct {
 
 func (x *PrepareTeardownSuspendResponse) Reset() {
 	*x = PrepareTeardownSuspendResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[169]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[170]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13524,7 +13651,7 @@ func (x *PrepareTeardownSuspendResponse) String() string {
 func (*PrepareTeardownSuspendResponse) ProtoMessage() {}
 
 func (x *PrepareTeardownSuspendResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[169]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[170]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13537,7 +13664,7 @@ func (x *PrepareTeardownSuspendResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareTeardownSuspendResponse.ProtoReflect.Descriptor instead.
 func (*PrepareTeardownSuspendResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{169}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{170}
 }
 
 func (x *PrepareTeardownSuspendResponse) GetOutcome() TeardownSuspendOutcome {
@@ -13582,7 +13709,7 @@ type RestoreArtifactAsNewContext struct {
 
 func (x *RestoreArtifactAsNewContext) Reset() {
 	*x = RestoreArtifactAsNewContext{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[170]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[171]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13594,7 +13721,7 @@ func (x *RestoreArtifactAsNewContext) String() string {
 func (*RestoreArtifactAsNewContext) ProtoMessage() {}
 
 func (x *RestoreArtifactAsNewContext) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[170]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[171]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13607,7 +13734,7 @@ func (x *RestoreArtifactAsNewContext) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreArtifactAsNewContext.ProtoReflect.Descriptor instead.
 func (*RestoreArtifactAsNewContext) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{170}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{171}
 }
 
 func (x *RestoreArtifactAsNewContext) GetSourceSandboxId() string {
@@ -13672,7 +13799,7 @@ type AutoLifecycleDeleteReceipt struct {
 
 func (x *AutoLifecycleDeleteReceipt) Reset() {
 	*x = AutoLifecycleDeleteReceipt{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[171]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[172]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13684,7 +13811,7 @@ func (x *AutoLifecycleDeleteReceipt) String() string {
 func (*AutoLifecycleDeleteReceipt) ProtoMessage() {}
 
 func (x *AutoLifecycleDeleteReceipt) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[171]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[172]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13697,7 +13824,7 @@ func (x *AutoLifecycleDeleteReceipt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AutoLifecycleDeleteReceipt.ProtoReflect.Descriptor instead.
 func (*AutoLifecycleDeleteReceipt) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{171}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{172}
 }
 
 func (x *AutoLifecycleDeleteReceipt) GetReceiptId() string {
@@ -13743,7 +13870,7 @@ type ListAutoLifecycleDeleteReceiptsRequest struct {
 
 func (x *ListAutoLifecycleDeleteReceiptsRequest) Reset() {
 	*x = ListAutoLifecycleDeleteReceiptsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[172]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[173]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13755,7 +13882,7 @@ func (x *ListAutoLifecycleDeleteReceiptsRequest) String() string {
 func (*ListAutoLifecycleDeleteReceiptsRequest) ProtoMessage() {}
 
 func (x *ListAutoLifecycleDeleteReceiptsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[172]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[173]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13768,7 +13895,7 @@ func (x *ListAutoLifecycleDeleteReceiptsRequest) ProtoReflect() protoreflect.Mes
 
 // Deprecated: Use ListAutoLifecycleDeleteReceiptsRequest.ProtoReflect.Descriptor instead.
 func (*ListAutoLifecycleDeleteReceiptsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{172}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{173}
 }
 
 type ListAutoLifecycleDeleteReceiptsResponse struct {
@@ -13780,7 +13907,7 @@ type ListAutoLifecycleDeleteReceiptsResponse struct {
 
 func (x *ListAutoLifecycleDeleteReceiptsResponse) Reset() {
 	*x = ListAutoLifecycleDeleteReceiptsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[173]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[174]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13792,7 +13919,7 @@ func (x *ListAutoLifecycleDeleteReceiptsResponse) String() string {
 func (*ListAutoLifecycleDeleteReceiptsResponse) ProtoMessage() {}
 
 func (x *ListAutoLifecycleDeleteReceiptsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[173]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[174]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13805,7 +13932,7 @@ func (x *ListAutoLifecycleDeleteReceiptsResponse) ProtoReflect() protoreflect.Me
 
 // Deprecated: Use ListAutoLifecycleDeleteReceiptsResponse.ProtoReflect.Descriptor instead.
 func (*ListAutoLifecycleDeleteReceiptsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{173}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{174}
 }
 
 func (x *ListAutoLifecycleDeleteReceiptsResponse) GetReceipts() []*AutoLifecycleDeleteReceipt {
@@ -13824,7 +13951,7 @@ type AcknowledgeAutoLifecycleDeleteReceiptsRequest struct {
 
 func (x *AcknowledgeAutoLifecycleDeleteReceiptsRequest) Reset() {
 	*x = AcknowledgeAutoLifecycleDeleteReceiptsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[174]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[175]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13836,7 +13963,7 @@ func (x *AcknowledgeAutoLifecycleDeleteReceiptsRequest) String() string {
 func (*AcknowledgeAutoLifecycleDeleteReceiptsRequest) ProtoMessage() {}
 
 func (x *AcknowledgeAutoLifecycleDeleteReceiptsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[174]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[175]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13849,7 +13976,7 @@ func (x *AcknowledgeAutoLifecycleDeleteReceiptsRequest) ProtoReflect() protorefl
 
 // Deprecated: Use AcknowledgeAutoLifecycleDeleteReceiptsRequest.ProtoReflect.Descriptor instead.
 func (*AcknowledgeAutoLifecycleDeleteReceiptsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{174}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{175}
 }
 
 func (x *AcknowledgeAutoLifecycleDeleteReceiptsRequest) GetReceiptIds() []string {
@@ -13868,7 +13995,7 @@ type AcknowledgeAutoLifecycleDeleteReceiptsResponse struct {
 
 func (x *AcknowledgeAutoLifecycleDeleteReceiptsResponse) Reset() {
 	*x = AcknowledgeAutoLifecycleDeleteReceiptsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[175]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[176]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13880,7 +14007,7 @@ func (x *AcknowledgeAutoLifecycleDeleteReceiptsResponse) String() string {
 func (*AcknowledgeAutoLifecycleDeleteReceiptsResponse) ProtoMessage() {}
 
 func (x *AcknowledgeAutoLifecycleDeleteReceiptsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[175]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[176]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13893,7 +14020,7 @@ func (x *AcknowledgeAutoLifecycleDeleteReceiptsResponse) ProtoReflect() protoref
 
 // Deprecated: Use AcknowledgeAutoLifecycleDeleteReceiptsResponse.ProtoReflect.Descriptor instead.
 func (*AcknowledgeAutoLifecycleDeleteReceiptsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{175}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{176}
 }
 
 func (x *AcknowledgeAutoLifecycleDeleteReceiptsResponse) GetAcknowledgedReceiptIds() []string {
@@ -13924,7 +14051,7 @@ type PendingLocalBackup struct {
 
 func (x *PendingLocalBackup) Reset() {
 	*x = PendingLocalBackup{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[176]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[177]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13936,7 +14063,7 @@ func (x *PendingLocalBackup) String() string {
 func (*PendingLocalBackup) ProtoMessage() {}
 
 func (x *PendingLocalBackup) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[176]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[177]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13949,7 +14076,7 @@ func (x *PendingLocalBackup) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PendingLocalBackup.ProtoReflect.Descriptor instead.
 func (*PendingLocalBackup) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{176}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{177}
 }
 
 func (x *PendingLocalBackup) GetSandboxId() string {
@@ -13981,7 +14108,7 @@ type ListPendingLocalBackupsRequest struct {
 
 func (x *ListPendingLocalBackupsRequest) Reset() {
 	*x = ListPendingLocalBackupsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[177]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[178]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13993,7 +14120,7 @@ func (x *ListPendingLocalBackupsRequest) String() string {
 func (*ListPendingLocalBackupsRequest) ProtoMessage() {}
 
 func (x *ListPendingLocalBackupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[177]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[178]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14006,7 +14133,7 @@ func (x *ListPendingLocalBackupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListPendingLocalBackupsRequest.ProtoReflect.Descriptor instead.
 func (*ListPendingLocalBackupsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{177}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{178}
 }
 
 type ListPendingLocalBackupsResponse struct {
@@ -14018,7 +14145,7 @@ type ListPendingLocalBackupsResponse struct {
 
 func (x *ListPendingLocalBackupsResponse) Reset() {
 	*x = ListPendingLocalBackupsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[178]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[179]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14030,7 +14157,7 @@ func (x *ListPendingLocalBackupsResponse) String() string {
 func (*ListPendingLocalBackupsResponse) ProtoMessage() {}
 
 func (x *ListPendingLocalBackupsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[178]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[179]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14043,7 +14170,7 @@ func (x *ListPendingLocalBackupsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListPendingLocalBackupsResponse.ProtoReflect.Descriptor instead.
 func (*ListPendingLocalBackupsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{178}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{179}
 }
 
 func (x *ListPendingLocalBackupsResponse) GetPending() []*PendingLocalBackup {
@@ -14071,7 +14198,7 @@ type QuarantineRecoveryObservation struct {
 
 func (x *QuarantineRecoveryObservation) Reset() {
 	*x = QuarantineRecoveryObservation{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[179]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[180]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14083,7 +14210,7 @@ func (x *QuarantineRecoveryObservation) String() string {
 func (*QuarantineRecoveryObservation) ProtoMessage() {}
 
 func (x *QuarantineRecoveryObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[179]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[180]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14096,7 +14223,7 @@ func (x *QuarantineRecoveryObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QuarantineRecoveryObservation.ProtoReflect.Descriptor instead.
 func (*QuarantineRecoveryObservation) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{179}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{180}
 }
 
 func (x *QuarantineRecoveryObservation) GetSchemaVersion() uint32 {
@@ -14152,7 +14279,7 @@ type WaitTemplateAppsRequest struct {
 
 func (x *WaitTemplateAppsRequest) Reset() {
 	*x = WaitTemplateAppsRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[180]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[181]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14164,7 +14291,7 @@ func (x *WaitTemplateAppsRequest) String() string {
 func (*WaitTemplateAppsRequest) ProtoMessage() {}
 
 func (x *WaitTemplateAppsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[180]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[181]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14177,7 +14304,7 @@ func (x *WaitTemplateAppsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitTemplateAppsRequest.ProtoReflect.Descriptor instead.
 func (*WaitTemplateAppsRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{180}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{181}
 }
 
 func (x *WaitTemplateAppsRequest) GetSandboxId() string {
@@ -14197,7 +14324,7 @@ type WaitTemplateAppsResponse struct {
 
 func (x *WaitTemplateAppsResponse) Reset() {
 	*x = WaitTemplateAppsResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[181]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[182]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14209,7 +14336,7 @@ func (x *WaitTemplateAppsResponse) String() string {
 func (*WaitTemplateAppsResponse) ProtoMessage() {}
 
 func (x *WaitTemplateAppsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[181]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[182]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14222,7 +14349,7 @@ func (x *WaitTemplateAppsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitTemplateAppsResponse.ProtoReflect.Descriptor instead.
 func (*WaitTemplateAppsResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{181}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{182}
 }
 
 func (x *WaitTemplateAppsResponse) GetWarnings() []string {
@@ -14240,7 +14367,7 @@ type GetExecutionCapabilitiesRequest struct {
 
 func (x *GetExecutionCapabilitiesRequest) Reset() {
 	*x = GetExecutionCapabilitiesRequest{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[182]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[183]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14252,7 +14379,7 @@ func (x *GetExecutionCapabilitiesRequest) String() string {
 func (*GetExecutionCapabilitiesRequest) ProtoMessage() {}
 
 func (x *GetExecutionCapabilitiesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[182]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[183]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14265,7 +14392,7 @@ func (x *GetExecutionCapabilitiesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetExecutionCapabilitiesRequest.ProtoReflect.Descriptor instead.
 func (*GetExecutionCapabilitiesRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{182}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{183}
 }
 
 type GetExecutionCapabilitiesResponse struct {
@@ -14278,7 +14405,7 @@ type GetExecutionCapabilitiesResponse struct {
 
 func (x *GetExecutionCapabilitiesResponse) Reset() {
 	*x = GetExecutionCapabilitiesResponse{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[183]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[184]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14290,7 +14417,7 @@ func (x *GetExecutionCapabilitiesResponse) String() string {
 func (*GetExecutionCapabilitiesResponse) ProtoMessage() {}
 
 func (x *GetExecutionCapabilitiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[183]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[184]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14303,7 +14430,7 @@ func (x *GetExecutionCapabilitiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetExecutionCapabilitiesResponse.ProtoReflect.Descriptor instead.
 func (*GetExecutionCapabilitiesResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{183}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{184}
 }
 
 func (x *GetExecutionCapabilitiesResponse) GetEnvironmentSelection() bool {
@@ -14323,7 +14450,7 @@ type EnvironmentCreateInput struct {
 
 func (x *EnvironmentCreateInput) Reset() {
 	*x = EnvironmentCreateInput{}
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[184]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[185]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -14335,7 +14462,7 @@ func (x *EnvironmentCreateInput) String() string {
 func (*EnvironmentCreateInput) ProtoMessage() {}
 
 func (x *EnvironmentCreateInput) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[184]
+	mi := &file_sandbox_manager_v1_manager_proto_msgTypes[185]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -14348,7 +14475,7 @@ func (x *EnvironmentCreateInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnvironmentCreateInput.ProtoReflect.Descriptor instead.
 func (*EnvironmentCreateInput) Descriptor() ([]byte, []int) {
-	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{184}
+	return file_sandbox_manager_v1_manager_proto_rawDescGZIP(), []int{185}
 }
 
 func (x *EnvironmentCreateInput) GetReference() string {
@@ -14901,20 +15028,26 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"request_id\x18\x01 \x01(\tR\trequestId\"\xa2\x01\n" +
 	"\x1cCurrentSandboxSnapshotSource\x121\n" +
 	"\x14execution_generation\x18\x01 \x01(\x03R\x13executionGeneration\x12O\n" +
-	"\tlifecycle\x18\x02 \x01(\x0e21.space.sandbox.manager.v1.SnapshotSourceLifecycleR\tlifecycle\"\xe9\x01\n" +
+	"\tlifecycle\x18\x02 \x01(\x0e21.space.sandbox.manager.v1.SnapshotSourceLifecycleR\tlifecycle\"\xe5\x02\n" +
 	"\x14CreateSnapshotSource\x12a\n" +
 	"\x0fcurrent_sandbox\x18\x01 \x01(\v26.space.sandbox.manager.v1.CurrentSandboxSnapshotSourceH\x00R\x0ecurrentSandbox\x12d\n" +
-	"\x10durable_artifact\x18\x02 \x01(\v27.space.sandbox.manager.v1.DurableArtifactSnapshotSourceH\x00R\x0fdurableArtifactB\b\n" +
+	"\x10durable_artifact\x18\x02 \x01(\v27.space.sandbox.manager.v1.DurableArtifactSnapshotSourceH\x00R\x0fdurableArtifact\x12z\n" +
+	"\x18classed_durable_artifact\x18\x03 \x01(\v2>.space.sandbox.manager.v1.ClassedDurableArtifactSnapshotSourceH\x00R\x16classedDurableArtifactB\b\n" +
 	"\x06source\"\x94\x02\n" +
 	"\x1dDurableArtifactSnapshotSource\x12,\n" +
 	"\x12source_storage_uri\x18\x01 \x01(\tR\x10sourceStorageUri\x126\n" +
 	"\x17destination_storage_uri\x18\x02 \x01(\tR\x15destinationStorageUri\x124\n" +
 	"\x16destination_sandbox_id\x18\x03 \x01(\tR\x14destinationSandboxId\x12W\n" +
-	"\x12destination_origin\x18\x04 \x01(\x0e2(.space.sandbox.manager.v1.ArtifactOriginR\x11destinationOrigin\"d\n" +
+	"\x12destination_origin\x18\x04 \x01(\x0e2(.space.sandbox.manager.v1.ArtifactOriginR\x11destinationOrigin\"\xd0\x01\n" +
+	"$ClassedDurableArtifactSnapshotSource\x12S\n" +
+	"\bartifact\x18\x01 \x01(\v27.space.sandbox.manager.v1.DurableArtifactSnapshotSourceR\bartifact\x12S\n" +
+	"\rstorage_class\x18\x02 \x01(\x0e2..space.sandbox.manager.v1.ForkDiskStorageClassR\fstorageClass\"\xf8\x01\n" +
 	"\x18PublishedDurableArtifact\x12\x1f\n" +
 	"\vstorage_uri\x18\x01 \x01(\tR\n" +
 	"storageUri\x12'\n" +
-	"\x0fbytes_published\x18\x02 \x01(\x04R\x0ebytesPublished\"\xb7\x01\n" +
+	"\x0fbytes_published\x18\x02 \x01(\x04R\x0ebytesPublished\x12r\n" +
+	"\x1bverified_disk_storage_class\x18\x03 \x01(\x0e2..space.sandbox.manager.v1.ForkDiskStorageClassH\x00R\x18verifiedDiskStorageClass\x88\x01\x01B\x1e\n" +
+	"\x1c_verified_disk_storage_class\"\xb7\x01\n" +
 	"!CreateTemplateBaseSnapshotRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x12\n" +
@@ -15749,7 +15882,11 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x17SnapshotSourceLifecycle\x12)\n" +
 	"%SNAPSHOT_SOURCE_LIFECYCLE_UNSPECIFIED\x10\x00\x12%\n" +
 	"!SNAPSHOT_SOURCE_LIFECYCLE_STARTED\x10\x01\x12$\n" +
-	" SNAPSHOT_SOURCE_LIFECYCLE_PAUSED\x10\x02*\x8a\x01\n" +
+	" SNAPSHOT_SOURCE_LIFECYCLE_PAUSED\x10\x02*\x9c\x01\n" +
+	"\x14ForkDiskStorageClass\x12'\n" +
+	"#FORK_DISK_STORAGE_CLASS_UNSPECIFIED\x10\x00\x12$\n" +
+	" FORK_DISK_STORAGE_CLASS_STANDARD\x10\x01\x125\n" +
+	"1FORK_DISK_STORAGE_CLASS_GLACIER_INSTANT_RETRIEVAL\x10\x02*\x8a\x01\n" +
 	"\x15SuspendSnapshotFormat\x12'\n" +
 	"#SUSPEND_SNAPSHOT_FORMAT_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cSUSPEND_SNAPSHOT_FORMAT_FULL\x10\x01\x12&\n" +
@@ -15897,8 +16034,8 @@ func file_sandbox_manager_v1_manager_proto_rawDescGZIP() []byte {
 	return file_sandbox_manager_v1_manager_proto_rawDescData
 }
 
-var file_sandbox_manager_v1_manager_proto_enumTypes = make([]protoimpl.EnumInfo, 29)
-var file_sandbox_manager_v1_manager_proto_msgTypes = make([]protoimpl.MessageInfo, 192)
+var file_sandbox_manager_v1_manager_proto_enumTypes = make([]protoimpl.EnumInfo, 30)
+var file_sandbox_manager_v1_manager_proto_msgTypes = make([]protoimpl.MessageInfo, 193)
 var file_sandbox_manager_v1_manager_proto_goTypes = []any{
 	(GuestUpdateOperationPhase)(0),                         // 0: space.sandbox.manager.v1.GuestUpdateOperationPhase
 	(BootMode)(0),                                          // 1: space.sandbox.manager.v1.BootMode
@@ -15920,669 +16057,675 @@ var file_sandbox_manager_v1_manager_proto_goTypes = []any{
 	(WakeTargetState)(0),                                   // 17: space.sandbox.manager.v1.WakeTargetState
 	(SnapshotType)(0),                                      // 18: space.sandbox.manager.v1.SnapshotType
 	(SnapshotSourceLifecycle)(0),                           // 19: space.sandbox.manager.v1.SnapshotSourceLifecycle
-	(SuspendSnapshotFormat)(0),                             // 20: space.sandbox.manager.v1.SuspendSnapshotFormat
-	(ArtifactKind)(0),                                      // 21: space.sandbox.manager.v1.ArtifactKind
-	(ArtifactOrigin)(0),                                    // 22: space.sandbox.manager.v1.ArtifactOrigin
-	(RuntimeUpgradeOutcome)(0),                             // 23: space.sandbox.manager.v1.RuntimeUpgradeOutcome
-	(RuntimeUpgradeStatus)(0),                              // 24: space.sandbox.manager.v1.RuntimeUpgradeStatus
-	(RuntimeUpgradePhase)(0),                               // 25: space.sandbox.manager.v1.RuntimeUpgradePhase
-	(TeardownSuspendAction)(0),                             // 26: space.sandbox.manager.v1.TeardownSuspendAction
-	(TeardownSuspendOutcome)(0),                            // 27: space.sandbox.manager.v1.TeardownSuspendOutcome
-	(QuarantineRecoveryObservedOwner)(0),                   // 28: space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
-	(*GuestUpdateStatusRequest)(nil),                       // 29: space.sandbox.manager.v1.GuestUpdateStatusRequest
-	(*ApplyGuestUpdateRequest)(nil),                        // 30: space.sandbox.manager.v1.ApplyGuestUpdateRequest
-	(*RestartGuestRequest)(nil),                            // 31: space.sandbox.manager.v1.RestartGuestRequest
-	(*GuestUpdateOperation)(nil),                           // 32: space.sandbox.manager.v1.GuestUpdateOperation
-	(*AutoLifecycleWakePolicy)(nil),                        // 33: space.sandbox.manager.v1.AutoLifecycleWakePolicy
-	(*AutoLifecycleConditionSet)(nil),                      // 34: space.sandbox.manager.v1.AutoLifecycleConditionSet
-	(*AutoLifecycleStage)(nil),                             // 35: space.sandbox.manager.v1.AutoLifecycleStage
-	(*AutoLifecyclePolicy)(nil),                            // 36: space.sandbox.manager.v1.AutoLifecyclePolicy
-	(*AutoLifecycleConditionStatus)(nil),                   // 37: space.sandbox.manager.v1.AutoLifecycleConditionStatus
-	(*AutoLifecycleStatus)(nil),                            // 38: space.sandbox.manager.v1.AutoLifecycleStatus
-	(*CreateRequest)(nil),                                  // 39: space.sandbox.manager.v1.CreateRequest
-	(*CreateResponse)(nil),                                 // 40: space.sandbox.manager.v1.CreateResponse
-	(*StartRequest)(nil),                                   // 41: space.sandbox.manager.v1.StartRequest
-	(*StartResponse)(nil),                                  // 42: space.sandbox.manager.v1.StartResponse
-	(*StopRequest)(nil),                                    // 43: space.sandbox.manager.v1.StopRequest
-	(*StopResponse)(nil),                                   // 44: space.sandbox.manager.v1.StopResponse
-	(*KillRequest)(nil),                                    // 45: space.sandbox.manager.v1.KillRequest
-	(*KillResponse)(nil),                                   // 46: space.sandbox.manager.v1.KillResponse
-	(*DeleteRequest)(nil),                                  // 47: space.sandbox.manager.v1.DeleteRequest
-	(*DeleteResponse)(nil),                                 // 48: space.sandbox.manager.v1.DeleteResponse
-	(*StateRequest)(nil),                                   // 49: space.sandbox.manager.v1.StateRequest
-	(*StateResponse)(nil),                                  // 50: space.sandbox.manager.v1.StateResponse
-	(*GetEnvRequest)(nil),                                  // 51: space.sandbox.manager.v1.GetEnvRequest
-	(*GetEnvResponse)(nil),                                 // 52: space.sandbox.manager.v1.GetEnvResponse
-	(*ListRequest)(nil),                                    // 53: space.sandbox.manager.v1.ListRequest
-	(*ScanCleanupTargetsRequest)(nil),                      // 54: space.sandbox.manager.v1.ScanCleanupTargetsRequest
-	(*CleanupTargetObservation)(nil),                       // 55: space.sandbox.manager.v1.CleanupTargetObservation
-	(*CleanupTargetBatch)(nil),                             // 56: space.sandbox.manager.v1.CleanupTargetBatch
-	(*SandboxInfo)(nil),                                    // 57: space.sandbox.manager.v1.SandboxInfo
-	(*SandboxCleanup)(nil),                                 // 58: space.sandbox.manager.v1.SandboxCleanup
-	(*SandboxHealthObservation)(nil),                       // 59: space.sandbox.manager.v1.SandboxHealthObservation
-	(*SandboxComponentHealth)(nil),                         // 60: space.sandbox.manager.v1.SandboxComponentHealth
-	(*GetSandboxHealthRequest)(nil),                        // 61: space.sandbox.manager.v1.GetSandboxHealthRequest
-	(*GetSandboxHealthResponse)(nil),                       // 62: space.sandbox.manager.v1.GetSandboxHealthResponse
-	(*TransitionReceipt)(nil),                              // 63: space.sandbox.manager.v1.TransitionReceipt
-	(*SandboxListElement)(nil),                             // 64: space.sandbox.manager.v1.SandboxListElement
-	(*ListResponse)(nil),                                   // 65: space.sandbox.manager.v1.ListResponse
-	(*ListBuildReferencingSandboxesRequest)(nil),           // 66: space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
-	(*ListBuildReferencingSandboxesResponse)(nil),          // 67: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
-	(*GetDiskUsageRequest)(nil),                            // 68: space.sandbox.manager.v1.GetDiskUsageRequest
-	(*MissingDiskUsageId)(nil),                             // 69: space.sandbox.manager.v1.MissingDiskUsageId
-	(*GetDiskUsageResponse)(nil),                           // 70: space.sandbox.manager.v1.GetDiskUsageResponse
-	(*CleanupRequest)(nil),                                 // 71: space.sandbox.manager.v1.CleanupRequest
-	(*CleanupResponse)(nil),                                // 72: space.sandbox.manager.v1.CleanupResponse
-	(*ListTemplatesRequest)(nil),                           // 73: space.sandbox.manager.v1.ListTemplatesRequest
-	(*TemplateInfo)(nil),                                   // 74: space.sandbox.manager.v1.TemplateInfo
-	(*ListTemplatesResponse)(nil),                          // 75: space.sandbox.manager.v1.ListTemplatesResponse
-	(*PauseRequest)(nil),                                   // 76: space.sandbox.manager.v1.PauseRequest
-	(*PauseResponse)(nil),                                  // 77: space.sandbox.manager.v1.PauseResponse
-	(*ResumeRequest)(nil),                                  // 78: space.sandbox.manager.v1.ResumeRequest
-	(*ResumeResponse)(nil),                                 // 79: space.sandbox.manager.v1.ResumeResponse
-	(*WakeRequest)(nil),                                    // 80: space.sandbox.manager.v1.WakeRequest
-	(*WakeRuntimeUpgrade)(nil),                             // 81: space.sandbox.manager.v1.WakeRuntimeUpgrade
-	(*WakeStartContext)(nil),                               // 82: space.sandbox.manager.v1.WakeStartContext
-	(*WakeResponse)(nil),                                   // 83: space.sandbox.manager.v1.WakeResponse
-	(*CreateSnapshotRequest)(nil),                          // 84: space.sandbox.manager.v1.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil),                         // 85: space.sandbox.manager.v1.CreateSnapshotResponse
-	(*SnapshotCreationIdentity)(nil),                       // 86: space.sandbox.manager.v1.SnapshotCreationIdentity
-	(*CurrentSandboxSnapshotSource)(nil),                   // 87: space.sandbox.manager.v1.CurrentSandboxSnapshotSource
-	(*CreateSnapshotSource)(nil),                           // 88: space.sandbox.manager.v1.CreateSnapshotSource
-	(*DurableArtifactSnapshotSource)(nil),                  // 89: space.sandbox.manager.v1.DurableArtifactSnapshotSource
-	(*PublishedDurableArtifact)(nil),                       // 90: space.sandbox.manager.v1.PublishedDurableArtifact
-	(*CreateTemplateBaseSnapshotRequest)(nil),              // 91: space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
-	(*CreateTemplateBaseSnapshotResponse)(nil),             // 92: space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
-	(*SuspendRequest)(nil),                                 // 93: space.sandbox.manager.v1.SuspendRequest
-	(*PublishedArtifact)(nil),                              // 94: space.sandbox.manager.v1.PublishedArtifact
-	(*SuspendResponse)(nil),                                // 95: space.sandbox.manager.v1.SuspendResponse
-	(*CurrentInstanceSource)(nil),                          // 96: space.sandbox.manager.v1.CurrentInstanceSource
-	(*EnqueueArtifactBackupRequest)(nil),                   // 97: space.sandbox.manager.v1.EnqueueArtifactBackupRequest
-	(*EnqueueArtifactBackupResponse)(nil),                  // 98: space.sandbox.manager.v1.EnqueueArtifactBackupResponse
-	(*EvictClusterDeletedSandboxRequest)(nil),              // 99: space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
-	(*EvictClusterDeletedSandboxResponse)(nil),             // 100: space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
-	(*RuntimeUpgradeAuthorization)(nil),                    // 101: space.sandbox.manager.v1.RuntimeUpgradeAuthorization
-	(*UpgradeRuntimeRequest)(nil),                          // 102: space.sandbox.manager.v1.UpgradeRuntimeRequest
-	(*RuntimeUpgradeStageFrom)(nil),                        // 103: space.sandbox.manager.v1.RuntimeUpgradeStageFrom
-	(*UpgradeRuntimeResponse)(nil),                         // 104: space.sandbox.manager.v1.UpgradeRuntimeResponse
-	(*GetRuntimeUpgradeRequest)(nil),                       // 105: space.sandbox.manager.v1.GetRuntimeUpgradeRequest
-	(*AbandonRuntimeUpgradeRequest)(nil),                   // 106: space.sandbox.manager.v1.AbandonRuntimeUpgradeRequest
-	(*AbandonRuntimeUpgradeResponse)(nil),                  // 107: space.sandbox.manager.v1.AbandonRuntimeUpgradeResponse
-	(*GetRuntimeUpgradeResponse)(nil),                      // 108: space.sandbox.manager.v1.GetRuntimeUpgradeResponse
-	(*EnableSnapshotsRequest)(nil),                         // 109: space.sandbox.manager.v1.EnableSnapshotsRequest
-	(*EnableSnapshotsResponse)(nil),                        // 110: space.sandbox.manager.v1.EnableSnapshotsResponse
-	(*DisableSnapshotsRequest)(nil),                        // 111: space.sandbox.manager.v1.DisableSnapshotsRequest
-	(*DisableSnapshotsResponse)(nil),                       // 112: space.sandbox.manager.v1.DisableSnapshotsResponse
-	(*ListSnapshotsRequest)(nil),                           // 113: space.sandbox.manager.v1.ListSnapshotsRequest
-	(*ListSnapshotsResponse)(nil),                          // 114: space.sandbox.manager.v1.ListSnapshotsResponse
-	(*SnapshotDetail)(nil),                                 // 115: space.sandbox.manager.v1.SnapshotDetail
-	(*SnapshotLocation)(nil),                               // 116: space.sandbox.manager.v1.SnapshotLocation
-	(*DeleteSnapshotsRequest)(nil),                         // 117: space.sandbox.manager.v1.DeleteSnapshotsRequest
-	(*DeleteSnapshotsResponse)(nil),                        // 118: space.sandbox.manager.v1.DeleteSnapshotsResponse
-	(*RollbackRequest)(nil),                                // 119: space.sandbox.manager.v1.RollbackRequest
-	(*RollbackResponse)(nil),                               // 120: space.sandbox.manager.v1.RollbackResponse
-	(*StatsRequest)(nil),                                   // 121: space.sandbox.manager.v1.StatsRequest
-	(*StatsResponse)(nil),                                  // 122: space.sandbox.manager.v1.StatsResponse
-	(*UpdateRequest)(nil),                                  // 123: space.sandbox.manager.v1.UpdateRequest
-	(*UpdateResponse)(nil),                                 // 124: space.sandbox.manager.v1.UpdateResponse
-	(*SpacedPingGuestRequest)(nil),                         // 125: space.sandbox.manager.v1.SpacedPingGuestRequest
-	(*SpacedPingGuestResponse)(nil),                        // 126: space.sandbox.manager.v1.SpacedPingGuestResponse
-	(*SpacedGetStatusRequest)(nil),                         // 127: space.sandbox.manager.v1.SpacedGetStatusRequest
-	(*SpacedGetStatusResponse)(nil),                        // 128: space.sandbox.manager.v1.SpacedGetStatusResponse
-	(*SpacedVersionInfo)(nil),                              // 129: space.sandbox.manager.v1.SpacedVersionInfo
-	(*SpacedWaitReadyRequest)(nil),                         // 130: space.sandbox.manager.v1.SpacedWaitReadyRequest
-	(*SpacedWaitReadyResponse)(nil),                        // 131: space.sandbox.manager.v1.SpacedWaitReadyResponse
-	(*SpacedStatRequest)(nil),                              // 132: space.sandbox.manager.v1.SpacedStatRequest
-	(*SpacedListRequest)(nil),                              // 133: space.sandbox.manager.v1.SpacedListRequest
-	(*SpacedReadRequest)(nil),                              // 134: space.sandbox.manager.v1.SpacedReadRequest
-	(*SpacedWriteRequest)(nil),                             // 135: space.sandbox.manager.v1.SpacedWriteRequest
-	(*SpacedWriteBatchRequest)(nil),                        // 136: space.sandbox.manager.v1.SpacedWriteBatchRequest
-	(*SpacedMkdirRequest)(nil),                             // 137: space.sandbox.manager.v1.SpacedMkdirRequest
-	(*SpacedRemoveRequest)(nil),                            // 138: space.sandbox.manager.v1.SpacedRemoveRequest
-	(*SpacedRenameRequest)(nil),                            // 139: space.sandbox.manager.v1.SpacedRenameRequest
-	(*SpacedNormalizeWatchRootRequest)(nil),                // 140: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
-	(*SpacedWatchRequest)(nil),                             // 141: space.sandbox.manager.v1.SpacedWatchRequest
-	(*SpacedCreateWatcherRequest)(nil),                     // 142: space.sandbox.manager.v1.SpacedCreateWatcherRequest
-	(*SpacedGetWatcherEventsRequest)(nil),                  // 143: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
-	(*SpacedRemoveWatcherRequest)(nil),                     // 144: space.sandbox.manager.v1.SpacedRemoveWatcherRequest
-	(*SpacedEnableFileChangesRequest)(nil),                 // 145: space.sandbox.manager.v1.SpacedEnableFileChangesRequest
-	(*SpacedDisableFileChangesRequest)(nil),                // 146: space.sandbox.manager.v1.SpacedDisableFileChangesRequest
-	(*SpacedGetModifiedFilesRequest)(nil),                  // 147: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
-	(*SpacedStartProcessRequest)(nil),                      // 148: space.sandbox.manager.v1.SpacedStartProcessRequest
-	(*SpacedConnectProcessRequest)(nil),                    // 149: space.sandbox.manager.v1.SpacedConnectProcessRequest
-	(*SpacedListProcessesRequest)(nil),                     // 150: space.sandbox.manager.v1.SpacedListProcessesRequest
-	(*SpacedListProcessesResponse)(nil),                    // 151: space.sandbox.manager.v1.SpacedListProcessesResponse
-	(*SpacedSendSignalRequest)(nil),                        // 152: space.sandbox.manager.v1.SpacedSendSignalRequest
-	(*SpacedSendInputRequest)(nil),                         // 153: space.sandbox.manager.v1.SpacedSendInputRequest
-	(*SpacedCloseStdinRequest)(nil),                        // 154: space.sandbox.manager.v1.SpacedCloseStdinRequest
-	(*SpacedResizePtyRequest)(nil),                         // 155: space.sandbox.manager.v1.SpacedResizePtyRequest
-	(*SpacedKillProcessRequest)(nil),                       // 156: space.sandbox.manager.v1.SpacedKillProcessRequest
-	(*SetAutoLifecyclePolicyRequest)(nil),                  // 157: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
-	(*SetAutoLifecyclePolicyResponse)(nil),                 // 158: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
-	(*TouchAutoLifecycleRequest)(nil),                      // 159: space.sandbox.manager.v1.TouchAutoLifecycleRequest
-	(*AccessIdleUpdate)(nil),                               // 160: space.sandbox.manager.v1.AccessIdleUpdate
-	(*TouchAutoLifecycleResponse)(nil),                     // 161: space.sandbox.manager.v1.TouchAutoLifecycleResponse
-	(*GetNetworkPolicyRequest)(nil),                        // 162: space.sandbox.manager.v1.GetNetworkPolicyRequest
-	(*GetNetworkPolicyResponse)(nil),                       // 163: space.sandbox.manager.v1.GetNetworkPolicyResponse
-	(*SetNetworkPolicyRequest)(nil),                        // 164: space.sandbox.manager.v1.SetNetworkPolicyRequest
-	(*SetNetworkPolicyResponse)(nil),                       // 165: space.sandbox.manager.v1.SetNetworkPolicyResponse
-	(*TemplateNetworkPolicyUpdatedRequest)(nil),            // 166: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
-	(*TemplateNetworkPolicyUpdatedResponse)(nil),           // 167: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
-	(*CycleNetGatewayRequest)(nil),                         // 168: space.sandbox.manager.v1.CycleNetGatewayRequest
-	(*CycleNetGatewayResponse)(nil),                        // 169: space.sandbox.manager.v1.CycleNetGatewayResponse
-	(*AdoptPoolSandboxRequest)(nil),                        // 170: space.sandbox.manager.v1.AdoptPoolSandboxRequest
-	(*AdoptPoolSandboxResponse)(nil),                       // 171: space.sandbox.manager.v1.AdoptPoolSandboxResponse
-	(*WaitRequest)(nil),                                    // 172: space.sandbox.manager.v1.WaitRequest
-	(*WaitResponse)(nil),                                   // 173: space.sandbox.manager.v1.WaitResponse
-	(*CloneFromDonorRequest)(nil),                          // 174: space.sandbox.manager.v1.CloneFromDonorRequest
-	(*CloneFromDonorResponse)(nil),                         // 175: space.sandbox.manager.v1.CloneFromDonorResponse
-	(*ExportSnapshotRequest)(nil),                          // 176: space.sandbox.manager.v1.ExportSnapshotRequest
-	(*ExportSnapshotChunk)(nil),                            // 177: space.sandbox.manager.v1.ExportSnapshotChunk
-	(*ExportSnapshotHeader)(nil),                           // 178: space.sandbox.manager.v1.ExportSnapshotHeader
-	(*ExportSnapshotFileChunk)(nil),                        // 179: space.sandbox.manager.v1.ExportSnapshotFileChunk
-	(*ImportSnapshotRequest)(nil),                          // 180: space.sandbox.manager.v1.ImportSnapshotRequest
-	(*ImportSnapshotHeader)(nil),                           // 181: space.sandbox.manager.v1.ImportSnapshotHeader
-	(*ImportSnapshotFileChunk)(nil),                        // 182: space.sandbox.manager.v1.ImportSnapshotFileChunk
-	(*ImportSnapshotResponse)(nil),                         // 183: space.sandbox.manager.v1.ImportSnapshotResponse
-	(*ExportSandboxRequest)(nil),                           // 184: space.sandbox.manager.v1.ExportSandboxRequest
-	(*ExportSandboxChunk)(nil),                             // 185: space.sandbox.manager.v1.ExportSandboxChunk
-	(*ExportSandboxHeader)(nil),                            // 186: space.sandbox.manager.v1.ExportSandboxHeader
-	(*ExportSandboxFileChunk)(nil),                         // 187: space.sandbox.manager.v1.ExportSandboxFileChunk
-	(*ImportSandboxRequest)(nil),                           // 188: space.sandbox.manager.v1.ImportSandboxRequest
-	(*ImportSandboxHeader)(nil),                            // 189: space.sandbox.manager.v1.ImportSandboxHeader
-	(*ImportSandboxFileChunk)(nil),                         // 190: space.sandbox.manager.v1.ImportSandboxFileChunk
-	(*ImportSandboxResponse)(nil),                          // 191: space.sandbox.manager.v1.ImportSandboxResponse
-	(*SpacedOpenLoopbackBridgeRequest)(nil),                // 192: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
-	(*SpacedCloseLoopbackBridgeRequest)(nil),               // 193: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
-	(*ResolveSandboxMemoryRequest)(nil),                    // 194: space.sandbox.manager.v1.ResolveSandboxMemoryRequest
-	(*ResolveSandboxMemoryResponse)(nil),                   // 195: space.sandbox.manager.v1.ResolveSandboxMemoryResponse
-	(*NetworkPolicyDetail)(nil),                            // 196: space.sandbox.manager.v1.NetworkPolicyDetail
-	(*PrepareTeardownSuspendRequest)(nil),                  // 197: space.sandbox.manager.v1.PrepareTeardownSuspendRequest
-	(*PrepareTeardownSuspendResponse)(nil),                 // 198: space.sandbox.manager.v1.PrepareTeardownSuspendResponse
-	(*RestoreArtifactAsNewContext)(nil),                    // 199: space.sandbox.manager.v1.RestoreArtifactAsNewContext
-	(*AutoLifecycleDeleteReceipt)(nil),                     // 200: space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
-	(*ListAutoLifecycleDeleteReceiptsRequest)(nil),         // 201: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
-	(*ListAutoLifecycleDeleteReceiptsResponse)(nil),        // 202: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
-	(*AcknowledgeAutoLifecycleDeleteReceiptsRequest)(nil),  // 203: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
-	(*AcknowledgeAutoLifecycleDeleteReceiptsResponse)(nil), // 204: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
-	(*PendingLocalBackup)(nil),                             // 205: space.sandbox.manager.v1.PendingLocalBackup
-	(*ListPendingLocalBackupsRequest)(nil),                 // 206: space.sandbox.manager.v1.ListPendingLocalBackupsRequest
-	(*ListPendingLocalBackupsResponse)(nil),                // 207: space.sandbox.manager.v1.ListPendingLocalBackupsResponse
-	(*QuarantineRecoveryObservation)(nil),                  // 208: space.sandbox.manager.v1.QuarantineRecoveryObservation
-	(*WaitTemplateAppsRequest)(nil),                        // 209: space.sandbox.manager.v1.WaitTemplateAppsRequest
-	(*WaitTemplateAppsResponse)(nil),                       // 210: space.sandbox.manager.v1.WaitTemplateAppsResponse
-	(*GetExecutionCapabilitiesRequest)(nil),                // 211: space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
-	(*GetExecutionCapabilitiesResponse)(nil),               // 212: space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
-	(*EnvironmentCreateInput)(nil),                         // 213: space.sandbox.manager.v1.EnvironmentCreateInput
-	nil,                                                    // 214: space.sandbox.manager.v1.CreateRequest.EnvEntry
-	nil,                                                    // 215: space.sandbox.manager.v1.GetEnvResponse.EnvEntry
-	nil,                                                    // 216: space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
-	nil,                                                    // 217: space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
-	nil,                                                    // 218: space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
-	nil,                                                    // 219: space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
-	nil,                                                    // 220: space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
-	(*v1.Promotion)(nil),                                   // 221: space.spaced.update.v1.Promotion
-	(*v1.Status)(nil),                                      // 222: space.spaced.update.v1.Status
-	(*durationpb.Duration)(nil),                            // 223: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),                          // 224: google.protobuf.Timestamp
-	(*v11.NetworkPolicyV1)(nil),                            // 225: space.net.policy.v1.NetworkPolicyV1
-	(v11.PolicyAuthority)(0),                               // 226: space.net.policy.v1.PolicyAuthority
-	(*v12.SpaceApiRouteIdentity)(nil),                      // 227: space.net.gateway.v1.SpaceApiRouteIdentity
-	(v11.NetworkPolicySource)(0),                           // 228: space.net.policy.v1.NetworkPolicySource
-	(*v13.ExecutionMetadata)(nil),                          // 229: space.execution.v1.ExecutionMetadata
-	(v12.SandboxSubstrateKind)(0),                          // 230: space.net.gateway.v1.SandboxSubstrateKind
-	(*v14.StatRequest)(nil),                                // 231: space.spaced.operations.v1.StatRequest
-	(*v14.ListRequest)(nil),                                // 232: space.spaced.operations.v1.ListRequest
-	(*v14.ReadRequest)(nil),                                // 233: space.spaced.operations.v1.ReadRequest
-	(*v14.WriteRequest)(nil),                               // 234: space.spaced.operations.v1.WriteRequest
-	(*v14.WriteBatchRequest)(nil),                          // 235: space.spaced.operations.v1.WriteBatchRequest
-	(*v14.MkdirRequest)(nil),                               // 236: space.spaced.operations.v1.MkdirRequest
-	(*v14.RemoveRequest)(nil),                              // 237: space.spaced.operations.v1.RemoveRequest
-	(*v14.RenameRequest)(nil),                              // 238: space.spaced.operations.v1.RenameRequest
-	(*v14.NormalizeWatchRootRequest)(nil),                  // 239: space.spaced.operations.v1.NormalizeWatchRootRequest
-	(*v14.WatchRequest)(nil),                               // 240: space.spaced.operations.v1.WatchRequest
-	(*v14.CreateWatcherRequest)(nil),                       // 241: space.spaced.operations.v1.CreateWatcherRequest
-	(*v14.GetWatcherEventsRequest)(nil),                    // 242: space.spaced.operations.v1.GetWatcherEventsRequest
-	(*v14.RemoveWatcherRequest)(nil),                       // 243: space.spaced.operations.v1.RemoveWatcherRequest
-	(*v14.EnableFileChangesRequest)(nil),                   // 244: space.spaced.operations.v1.EnableFileChangesRequest
-	(*v14.DisableFileChangesRequest)(nil),                  // 245: space.spaced.operations.v1.DisableFileChangesRequest
-	(*v14.GetModifiedFilesRequest)(nil),                    // 246: space.spaced.operations.v1.GetModifiedFilesRequest
-	(*v14.StartRequest)(nil),                               // 247: space.spaced.operations.v1.StartRequest
-	(*v14.ConnectProcessRequest)(nil),                      // 248: space.spaced.operations.v1.ConnectProcessRequest
-	(*v14.ListProcessesRequest)(nil),                       // 249: space.spaced.operations.v1.ListProcessesRequest
-	(*v14.ProcessInfo)(nil),                                // 250: space.spaced.operations.v1.ProcessInfo
-	(*v14.SendSignalRequest)(nil),                          // 251: space.spaced.operations.v1.SendSignalRequest
-	(*v14.SendInputRequest)(nil),                           // 252: space.spaced.operations.v1.SendInputRequest
-	(*v14.CloseStdinRequest)(nil),                          // 253: space.spaced.operations.v1.CloseStdinRequest
-	(*v14.ResizePtyRequest)(nil),                           // 254: space.spaced.operations.v1.ResizePtyRequest
-	(*v14.KillRequest)(nil),                                // 255: space.spaced.operations.v1.KillRequest
-	(v11.NetworkPolicyApplyDecision)(0),                    // 256: space.net.policy.v1.NetworkPolicyApplyDecision
-	(*v14.OpenLoopbackBridgeRequest)(nil),                  // 257: space.spaced.operations.v1.OpenLoopbackBridgeRequest
-	(*v14.CloseLoopbackBridgeRequest)(nil),                 // 258: space.spaced.operations.v1.CloseLoopbackBridgeRequest
-	(*v12.ServicePortIngressFrame)(nil),                    // 259: space.net.gateway.v1.ServicePortIngressFrame
-	(*v14.StatResponse)(nil),                               // 260: space.spaced.operations.v1.StatResponse
-	(*v14.FileInfo)(nil),                                   // 261: space.spaced.operations.v1.FileInfo
-	(*v14.FileChunk)(nil),                                  // 262: space.spaced.operations.v1.FileChunk
-	(*v14.WriteResponse)(nil),                              // 263: space.spaced.operations.v1.WriteResponse
-	(*v14.WriteBatchResponse)(nil),                         // 264: space.spaced.operations.v1.WriteBatchResponse
-	(*v14.MkdirResponse)(nil),                              // 265: space.spaced.operations.v1.MkdirResponse
-	(*v14.RemoveResponse)(nil),                             // 266: space.spaced.operations.v1.RemoveResponse
-	(*v14.RenameResponse)(nil),                             // 267: space.spaced.operations.v1.RenameResponse
-	(*v14.NormalizeWatchRootResponse)(nil),                 // 268: space.spaced.operations.v1.NormalizeWatchRootResponse
-	(*v14.FileEvent)(nil),                                  // 269: space.spaced.operations.v1.FileEvent
-	(*v14.CreateWatcherResponse)(nil),                      // 270: space.spaced.operations.v1.CreateWatcherResponse
-	(*v14.GetWatcherEventsResponse)(nil),                   // 271: space.spaced.operations.v1.GetWatcherEventsResponse
-	(*v14.RemoveWatcherResponse)(nil),                      // 272: space.spaced.operations.v1.RemoveWatcherResponse
-	(*v14.EnableFileChangesResponse)(nil),                  // 273: space.spaced.operations.v1.EnableFileChangesResponse
-	(*v14.DisableFileChangesResponse)(nil),                 // 274: space.spaced.operations.v1.DisableFileChangesResponse
-	(*v14.GetModifiedFilesResponse)(nil),                   // 275: space.spaced.operations.v1.GetModifiedFilesResponse
-	(*v14.ProcessEvent)(nil),                               // 276: space.spaced.operations.v1.ProcessEvent
-	(*v14.SendSignalResponse)(nil),                         // 277: space.spaced.operations.v1.SendSignalResponse
-	(*v14.SendInputResponse)(nil),                          // 278: space.spaced.operations.v1.SendInputResponse
-	(*v14.CloseStdinResponse)(nil),                         // 279: space.spaced.operations.v1.CloseStdinResponse
-	(*v14.ResizePtyResponse)(nil),                          // 280: space.spaced.operations.v1.ResizePtyResponse
-	(*v14.KillResponse)(nil),                               // 281: space.spaced.operations.v1.KillResponse
-	(*v14.OpenLoopbackBridgeResponse)(nil),                 // 282: space.spaced.operations.v1.OpenLoopbackBridgeResponse
-	(*v14.CloseLoopbackBridgeResponse)(nil),                // 283: space.spaced.operations.v1.CloseLoopbackBridgeResponse
+	(ForkDiskStorageClass)(0),                              // 20: space.sandbox.manager.v1.ForkDiskStorageClass
+	(SuspendSnapshotFormat)(0),                             // 21: space.sandbox.manager.v1.SuspendSnapshotFormat
+	(ArtifactKind)(0),                                      // 22: space.sandbox.manager.v1.ArtifactKind
+	(ArtifactOrigin)(0),                                    // 23: space.sandbox.manager.v1.ArtifactOrigin
+	(RuntimeUpgradeOutcome)(0),                             // 24: space.sandbox.manager.v1.RuntimeUpgradeOutcome
+	(RuntimeUpgradeStatus)(0),                              // 25: space.sandbox.manager.v1.RuntimeUpgradeStatus
+	(RuntimeUpgradePhase)(0),                               // 26: space.sandbox.manager.v1.RuntimeUpgradePhase
+	(TeardownSuspendAction)(0),                             // 27: space.sandbox.manager.v1.TeardownSuspendAction
+	(TeardownSuspendOutcome)(0),                            // 28: space.sandbox.manager.v1.TeardownSuspendOutcome
+	(QuarantineRecoveryObservedOwner)(0),                   // 29: space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
+	(*GuestUpdateStatusRequest)(nil),                       // 30: space.sandbox.manager.v1.GuestUpdateStatusRequest
+	(*ApplyGuestUpdateRequest)(nil),                        // 31: space.sandbox.manager.v1.ApplyGuestUpdateRequest
+	(*RestartGuestRequest)(nil),                            // 32: space.sandbox.manager.v1.RestartGuestRequest
+	(*GuestUpdateOperation)(nil),                           // 33: space.sandbox.manager.v1.GuestUpdateOperation
+	(*AutoLifecycleWakePolicy)(nil),                        // 34: space.sandbox.manager.v1.AutoLifecycleWakePolicy
+	(*AutoLifecycleConditionSet)(nil),                      // 35: space.sandbox.manager.v1.AutoLifecycleConditionSet
+	(*AutoLifecycleStage)(nil),                             // 36: space.sandbox.manager.v1.AutoLifecycleStage
+	(*AutoLifecyclePolicy)(nil),                            // 37: space.sandbox.manager.v1.AutoLifecyclePolicy
+	(*AutoLifecycleConditionStatus)(nil),                   // 38: space.sandbox.manager.v1.AutoLifecycleConditionStatus
+	(*AutoLifecycleStatus)(nil),                            // 39: space.sandbox.manager.v1.AutoLifecycleStatus
+	(*CreateRequest)(nil),                                  // 40: space.sandbox.manager.v1.CreateRequest
+	(*CreateResponse)(nil),                                 // 41: space.sandbox.manager.v1.CreateResponse
+	(*StartRequest)(nil),                                   // 42: space.sandbox.manager.v1.StartRequest
+	(*StartResponse)(nil),                                  // 43: space.sandbox.manager.v1.StartResponse
+	(*StopRequest)(nil),                                    // 44: space.sandbox.manager.v1.StopRequest
+	(*StopResponse)(nil),                                   // 45: space.sandbox.manager.v1.StopResponse
+	(*KillRequest)(nil),                                    // 46: space.sandbox.manager.v1.KillRequest
+	(*KillResponse)(nil),                                   // 47: space.sandbox.manager.v1.KillResponse
+	(*DeleteRequest)(nil),                                  // 48: space.sandbox.manager.v1.DeleteRequest
+	(*DeleteResponse)(nil),                                 // 49: space.sandbox.manager.v1.DeleteResponse
+	(*StateRequest)(nil),                                   // 50: space.sandbox.manager.v1.StateRequest
+	(*StateResponse)(nil),                                  // 51: space.sandbox.manager.v1.StateResponse
+	(*GetEnvRequest)(nil),                                  // 52: space.sandbox.manager.v1.GetEnvRequest
+	(*GetEnvResponse)(nil),                                 // 53: space.sandbox.manager.v1.GetEnvResponse
+	(*ListRequest)(nil),                                    // 54: space.sandbox.manager.v1.ListRequest
+	(*ScanCleanupTargetsRequest)(nil),                      // 55: space.sandbox.manager.v1.ScanCleanupTargetsRequest
+	(*CleanupTargetObservation)(nil),                       // 56: space.sandbox.manager.v1.CleanupTargetObservation
+	(*CleanupTargetBatch)(nil),                             // 57: space.sandbox.manager.v1.CleanupTargetBatch
+	(*SandboxInfo)(nil),                                    // 58: space.sandbox.manager.v1.SandboxInfo
+	(*SandboxCleanup)(nil),                                 // 59: space.sandbox.manager.v1.SandboxCleanup
+	(*SandboxHealthObservation)(nil),                       // 60: space.sandbox.manager.v1.SandboxHealthObservation
+	(*SandboxComponentHealth)(nil),                         // 61: space.sandbox.manager.v1.SandboxComponentHealth
+	(*GetSandboxHealthRequest)(nil),                        // 62: space.sandbox.manager.v1.GetSandboxHealthRequest
+	(*GetSandboxHealthResponse)(nil),                       // 63: space.sandbox.manager.v1.GetSandboxHealthResponse
+	(*TransitionReceipt)(nil),                              // 64: space.sandbox.manager.v1.TransitionReceipt
+	(*SandboxListElement)(nil),                             // 65: space.sandbox.manager.v1.SandboxListElement
+	(*ListResponse)(nil),                                   // 66: space.sandbox.manager.v1.ListResponse
+	(*ListBuildReferencingSandboxesRequest)(nil),           // 67: space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
+	(*ListBuildReferencingSandboxesResponse)(nil),          // 68: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
+	(*GetDiskUsageRequest)(nil),                            // 69: space.sandbox.manager.v1.GetDiskUsageRequest
+	(*MissingDiskUsageId)(nil),                             // 70: space.sandbox.manager.v1.MissingDiskUsageId
+	(*GetDiskUsageResponse)(nil),                           // 71: space.sandbox.manager.v1.GetDiskUsageResponse
+	(*CleanupRequest)(nil),                                 // 72: space.sandbox.manager.v1.CleanupRequest
+	(*CleanupResponse)(nil),                                // 73: space.sandbox.manager.v1.CleanupResponse
+	(*ListTemplatesRequest)(nil),                           // 74: space.sandbox.manager.v1.ListTemplatesRequest
+	(*TemplateInfo)(nil),                                   // 75: space.sandbox.manager.v1.TemplateInfo
+	(*ListTemplatesResponse)(nil),                          // 76: space.sandbox.manager.v1.ListTemplatesResponse
+	(*PauseRequest)(nil),                                   // 77: space.sandbox.manager.v1.PauseRequest
+	(*PauseResponse)(nil),                                  // 78: space.sandbox.manager.v1.PauseResponse
+	(*ResumeRequest)(nil),                                  // 79: space.sandbox.manager.v1.ResumeRequest
+	(*ResumeResponse)(nil),                                 // 80: space.sandbox.manager.v1.ResumeResponse
+	(*WakeRequest)(nil),                                    // 81: space.sandbox.manager.v1.WakeRequest
+	(*WakeRuntimeUpgrade)(nil),                             // 82: space.sandbox.manager.v1.WakeRuntimeUpgrade
+	(*WakeStartContext)(nil),                               // 83: space.sandbox.manager.v1.WakeStartContext
+	(*WakeResponse)(nil),                                   // 84: space.sandbox.manager.v1.WakeResponse
+	(*CreateSnapshotRequest)(nil),                          // 85: space.sandbox.manager.v1.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil),                         // 86: space.sandbox.manager.v1.CreateSnapshotResponse
+	(*SnapshotCreationIdentity)(nil),                       // 87: space.sandbox.manager.v1.SnapshotCreationIdentity
+	(*CurrentSandboxSnapshotSource)(nil),                   // 88: space.sandbox.manager.v1.CurrentSandboxSnapshotSource
+	(*CreateSnapshotSource)(nil),                           // 89: space.sandbox.manager.v1.CreateSnapshotSource
+	(*DurableArtifactSnapshotSource)(nil),                  // 90: space.sandbox.manager.v1.DurableArtifactSnapshotSource
+	(*ClassedDurableArtifactSnapshotSource)(nil),           // 91: space.sandbox.manager.v1.ClassedDurableArtifactSnapshotSource
+	(*PublishedDurableArtifact)(nil),                       // 92: space.sandbox.manager.v1.PublishedDurableArtifact
+	(*CreateTemplateBaseSnapshotRequest)(nil),              // 93: space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
+	(*CreateTemplateBaseSnapshotResponse)(nil),             // 94: space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
+	(*SuspendRequest)(nil),                                 // 95: space.sandbox.manager.v1.SuspendRequest
+	(*PublishedArtifact)(nil),                              // 96: space.sandbox.manager.v1.PublishedArtifact
+	(*SuspendResponse)(nil),                                // 97: space.sandbox.manager.v1.SuspendResponse
+	(*CurrentInstanceSource)(nil),                          // 98: space.sandbox.manager.v1.CurrentInstanceSource
+	(*EnqueueArtifactBackupRequest)(nil),                   // 99: space.sandbox.manager.v1.EnqueueArtifactBackupRequest
+	(*EnqueueArtifactBackupResponse)(nil),                  // 100: space.sandbox.manager.v1.EnqueueArtifactBackupResponse
+	(*EvictClusterDeletedSandboxRequest)(nil),              // 101: space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
+	(*EvictClusterDeletedSandboxResponse)(nil),             // 102: space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
+	(*RuntimeUpgradeAuthorization)(nil),                    // 103: space.sandbox.manager.v1.RuntimeUpgradeAuthorization
+	(*UpgradeRuntimeRequest)(nil),                          // 104: space.sandbox.manager.v1.UpgradeRuntimeRequest
+	(*RuntimeUpgradeStageFrom)(nil),                        // 105: space.sandbox.manager.v1.RuntimeUpgradeStageFrom
+	(*UpgradeRuntimeResponse)(nil),                         // 106: space.sandbox.manager.v1.UpgradeRuntimeResponse
+	(*GetRuntimeUpgradeRequest)(nil),                       // 107: space.sandbox.manager.v1.GetRuntimeUpgradeRequest
+	(*AbandonRuntimeUpgradeRequest)(nil),                   // 108: space.sandbox.manager.v1.AbandonRuntimeUpgradeRequest
+	(*AbandonRuntimeUpgradeResponse)(nil),                  // 109: space.sandbox.manager.v1.AbandonRuntimeUpgradeResponse
+	(*GetRuntimeUpgradeResponse)(nil),                      // 110: space.sandbox.manager.v1.GetRuntimeUpgradeResponse
+	(*EnableSnapshotsRequest)(nil),                         // 111: space.sandbox.manager.v1.EnableSnapshotsRequest
+	(*EnableSnapshotsResponse)(nil),                        // 112: space.sandbox.manager.v1.EnableSnapshotsResponse
+	(*DisableSnapshotsRequest)(nil),                        // 113: space.sandbox.manager.v1.DisableSnapshotsRequest
+	(*DisableSnapshotsResponse)(nil),                       // 114: space.sandbox.manager.v1.DisableSnapshotsResponse
+	(*ListSnapshotsRequest)(nil),                           // 115: space.sandbox.manager.v1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),                          // 116: space.sandbox.manager.v1.ListSnapshotsResponse
+	(*SnapshotDetail)(nil),                                 // 117: space.sandbox.manager.v1.SnapshotDetail
+	(*SnapshotLocation)(nil),                               // 118: space.sandbox.manager.v1.SnapshotLocation
+	(*DeleteSnapshotsRequest)(nil),                         // 119: space.sandbox.manager.v1.DeleteSnapshotsRequest
+	(*DeleteSnapshotsResponse)(nil),                        // 120: space.sandbox.manager.v1.DeleteSnapshotsResponse
+	(*RollbackRequest)(nil),                                // 121: space.sandbox.manager.v1.RollbackRequest
+	(*RollbackResponse)(nil),                               // 122: space.sandbox.manager.v1.RollbackResponse
+	(*StatsRequest)(nil),                                   // 123: space.sandbox.manager.v1.StatsRequest
+	(*StatsResponse)(nil),                                  // 124: space.sandbox.manager.v1.StatsResponse
+	(*UpdateRequest)(nil),                                  // 125: space.sandbox.manager.v1.UpdateRequest
+	(*UpdateResponse)(nil),                                 // 126: space.sandbox.manager.v1.UpdateResponse
+	(*SpacedPingGuestRequest)(nil),                         // 127: space.sandbox.manager.v1.SpacedPingGuestRequest
+	(*SpacedPingGuestResponse)(nil),                        // 128: space.sandbox.manager.v1.SpacedPingGuestResponse
+	(*SpacedGetStatusRequest)(nil),                         // 129: space.sandbox.manager.v1.SpacedGetStatusRequest
+	(*SpacedGetStatusResponse)(nil),                        // 130: space.sandbox.manager.v1.SpacedGetStatusResponse
+	(*SpacedVersionInfo)(nil),                              // 131: space.sandbox.manager.v1.SpacedVersionInfo
+	(*SpacedWaitReadyRequest)(nil),                         // 132: space.sandbox.manager.v1.SpacedWaitReadyRequest
+	(*SpacedWaitReadyResponse)(nil),                        // 133: space.sandbox.manager.v1.SpacedWaitReadyResponse
+	(*SpacedStatRequest)(nil),                              // 134: space.sandbox.manager.v1.SpacedStatRequest
+	(*SpacedListRequest)(nil),                              // 135: space.sandbox.manager.v1.SpacedListRequest
+	(*SpacedReadRequest)(nil),                              // 136: space.sandbox.manager.v1.SpacedReadRequest
+	(*SpacedWriteRequest)(nil),                             // 137: space.sandbox.manager.v1.SpacedWriteRequest
+	(*SpacedWriteBatchRequest)(nil),                        // 138: space.sandbox.manager.v1.SpacedWriteBatchRequest
+	(*SpacedMkdirRequest)(nil),                             // 139: space.sandbox.manager.v1.SpacedMkdirRequest
+	(*SpacedRemoveRequest)(nil),                            // 140: space.sandbox.manager.v1.SpacedRemoveRequest
+	(*SpacedRenameRequest)(nil),                            // 141: space.sandbox.manager.v1.SpacedRenameRequest
+	(*SpacedNormalizeWatchRootRequest)(nil),                // 142: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
+	(*SpacedWatchRequest)(nil),                             // 143: space.sandbox.manager.v1.SpacedWatchRequest
+	(*SpacedCreateWatcherRequest)(nil),                     // 144: space.sandbox.manager.v1.SpacedCreateWatcherRequest
+	(*SpacedGetWatcherEventsRequest)(nil),                  // 145: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
+	(*SpacedRemoveWatcherRequest)(nil),                     // 146: space.sandbox.manager.v1.SpacedRemoveWatcherRequest
+	(*SpacedEnableFileChangesRequest)(nil),                 // 147: space.sandbox.manager.v1.SpacedEnableFileChangesRequest
+	(*SpacedDisableFileChangesRequest)(nil),                // 148: space.sandbox.manager.v1.SpacedDisableFileChangesRequest
+	(*SpacedGetModifiedFilesRequest)(nil),                  // 149: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
+	(*SpacedStartProcessRequest)(nil),                      // 150: space.sandbox.manager.v1.SpacedStartProcessRequest
+	(*SpacedConnectProcessRequest)(nil),                    // 151: space.sandbox.manager.v1.SpacedConnectProcessRequest
+	(*SpacedListProcessesRequest)(nil),                     // 152: space.sandbox.manager.v1.SpacedListProcessesRequest
+	(*SpacedListProcessesResponse)(nil),                    // 153: space.sandbox.manager.v1.SpacedListProcessesResponse
+	(*SpacedSendSignalRequest)(nil),                        // 154: space.sandbox.manager.v1.SpacedSendSignalRequest
+	(*SpacedSendInputRequest)(nil),                         // 155: space.sandbox.manager.v1.SpacedSendInputRequest
+	(*SpacedCloseStdinRequest)(nil),                        // 156: space.sandbox.manager.v1.SpacedCloseStdinRequest
+	(*SpacedResizePtyRequest)(nil),                         // 157: space.sandbox.manager.v1.SpacedResizePtyRequest
+	(*SpacedKillProcessRequest)(nil),                       // 158: space.sandbox.manager.v1.SpacedKillProcessRequest
+	(*SetAutoLifecyclePolicyRequest)(nil),                  // 159: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
+	(*SetAutoLifecyclePolicyResponse)(nil),                 // 160: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
+	(*TouchAutoLifecycleRequest)(nil),                      // 161: space.sandbox.manager.v1.TouchAutoLifecycleRequest
+	(*AccessIdleUpdate)(nil),                               // 162: space.sandbox.manager.v1.AccessIdleUpdate
+	(*TouchAutoLifecycleResponse)(nil),                     // 163: space.sandbox.manager.v1.TouchAutoLifecycleResponse
+	(*GetNetworkPolicyRequest)(nil),                        // 164: space.sandbox.manager.v1.GetNetworkPolicyRequest
+	(*GetNetworkPolicyResponse)(nil),                       // 165: space.sandbox.manager.v1.GetNetworkPolicyResponse
+	(*SetNetworkPolicyRequest)(nil),                        // 166: space.sandbox.manager.v1.SetNetworkPolicyRequest
+	(*SetNetworkPolicyResponse)(nil),                       // 167: space.sandbox.manager.v1.SetNetworkPolicyResponse
+	(*TemplateNetworkPolicyUpdatedRequest)(nil),            // 168: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
+	(*TemplateNetworkPolicyUpdatedResponse)(nil),           // 169: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
+	(*CycleNetGatewayRequest)(nil),                         // 170: space.sandbox.manager.v1.CycleNetGatewayRequest
+	(*CycleNetGatewayResponse)(nil),                        // 171: space.sandbox.manager.v1.CycleNetGatewayResponse
+	(*AdoptPoolSandboxRequest)(nil),                        // 172: space.sandbox.manager.v1.AdoptPoolSandboxRequest
+	(*AdoptPoolSandboxResponse)(nil),                       // 173: space.sandbox.manager.v1.AdoptPoolSandboxResponse
+	(*WaitRequest)(nil),                                    // 174: space.sandbox.manager.v1.WaitRequest
+	(*WaitResponse)(nil),                                   // 175: space.sandbox.manager.v1.WaitResponse
+	(*CloneFromDonorRequest)(nil),                          // 176: space.sandbox.manager.v1.CloneFromDonorRequest
+	(*CloneFromDonorResponse)(nil),                         // 177: space.sandbox.manager.v1.CloneFromDonorResponse
+	(*ExportSnapshotRequest)(nil),                          // 178: space.sandbox.manager.v1.ExportSnapshotRequest
+	(*ExportSnapshotChunk)(nil),                            // 179: space.sandbox.manager.v1.ExportSnapshotChunk
+	(*ExportSnapshotHeader)(nil),                           // 180: space.sandbox.manager.v1.ExportSnapshotHeader
+	(*ExportSnapshotFileChunk)(nil),                        // 181: space.sandbox.manager.v1.ExportSnapshotFileChunk
+	(*ImportSnapshotRequest)(nil),                          // 182: space.sandbox.manager.v1.ImportSnapshotRequest
+	(*ImportSnapshotHeader)(nil),                           // 183: space.sandbox.manager.v1.ImportSnapshotHeader
+	(*ImportSnapshotFileChunk)(nil),                        // 184: space.sandbox.manager.v1.ImportSnapshotFileChunk
+	(*ImportSnapshotResponse)(nil),                         // 185: space.sandbox.manager.v1.ImportSnapshotResponse
+	(*ExportSandboxRequest)(nil),                           // 186: space.sandbox.manager.v1.ExportSandboxRequest
+	(*ExportSandboxChunk)(nil),                             // 187: space.sandbox.manager.v1.ExportSandboxChunk
+	(*ExportSandboxHeader)(nil),                            // 188: space.sandbox.manager.v1.ExportSandboxHeader
+	(*ExportSandboxFileChunk)(nil),                         // 189: space.sandbox.manager.v1.ExportSandboxFileChunk
+	(*ImportSandboxRequest)(nil),                           // 190: space.sandbox.manager.v1.ImportSandboxRequest
+	(*ImportSandboxHeader)(nil),                            // 191: space.sandbox.manager.v1.ImportSandboxHeader
+	(*ImportSandboxFileChunk)(nil),                         // 192: space.sandbox.manager.v1.ImportSandboxFileChunk
+	(*ImportSandboxResponse)(nil),                          // 193: space.sandbox.manager.v1.ImportSandboxResponse
+	(*SpacedOpenLoopbackBridgeRequest)(nil),                // 194: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
+	(*SpacedCloseLoopbackBridgeRequest)(nil),               // 195: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
+	(*ResolveSandboxMemoryRequest)(nil),                    // 196: space.sandbox.manager.v1.ResolveSandboxMemoryRequest
+	(*ResolveSandboxMemoryResponse)(nil),                   // 197: space.sandbox.manager.v1.ResolveSandboxMemoryResponse
+	(*NetworkPolicyDetail)(nil),                            // 198: space.sandbox.manager.v1.NetworkPolicyDetail
+	(*PrepareTeardownSuspendRequest)(nil),                  // 199: space.sandbox.manager.v1.PrepareTeardownSuspendRequest
+	(*PrepareTeardownSuspendResponse)(nil),                 // 200: space.sandbox.manager.v1.PrepareTeardownSuspendResponse
+	(*RestoreArtifactAsNewContext)(nil),                    // 201: space.sandbox.manager.v1.RestoreArtifactAsNewContext
+	(*AutoLifecycleDeleteReceipt)(nil),                     // 202: space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
+	(*ListAutoLifecycleDeleteReceiptsRequest)(nil),         // 203: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
+	(*ListAutoLifecycleDeleteReceiptsResponse)(nil),        // 204: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
+	(*AcknowledgeAutoLifecycleDeleteReceiptsRequest)(nil),  // 205: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
+	(*AcknowledgeAutoLifecycleDeleteReceiptsResponse)(nil), // 206: space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
+	(*PendingLocalBackup)(nil),                             // 207: space.sandbox.manager.v1.PendingLocalBackup
+	(*ListPendingLocalBackupsRequest)(nil),                 // 208: space.sandbox.manager.v1.ListPendingLocalBackupsRequest
+	(*ListPendingLocalBackupsResponse)(nil),                // 209: space.sandbox.manager.v1.ListPendingLocalBackupsResponse
+	(*QuarantineRecoveryObservation)(nil),                  // 210: space.sandbox.manager.v1.QuarantineRecoveryObservation
+	(*WaitTemplateAppsRequest)(nil),                        // 211: space.sandbox.manager.v1.WaitTemplateAppsRequest
+	(*WaitTemplateAppsResponse)(nil),                       // 212: space.sandbox.manager.v1.WaitTemplateAppsResponse
+	(*GetExecutionCapabilitiesRequest)(nil),                // 213: space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
+	(*GetExecutionCapabilitiesResponse)(nil),               // 214: space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
+	(*EnvironmentCreateInput)(nil),                         // 215: space.sandbox.manager.v1.EnvironmentCreateInput
+	nil,                                                    // 216: space.sandbox.manager.v1.CreateRequest.EnvEntry
+	nil,                                                    // 217: space.sandbox.manager.v1.GetEnvResponse.EnvEntry
+	nil,                                                    // 218: space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
+	nil,                                                    // 219: space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
+	nil,                                                    // 220: space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
+	nil,                                                    // 221: space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
+	nil,                                                    // 222: space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
+	(*v1.Promotion)(nil),                                   // 223: space.spaced.update.v1.Promotion
+	(*v1.Status)(nil),                                      // 224: space.spaced.update.v1.Status
+	(*durationpb.Duration)(nil),                            // 225: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),                          // 226: google.protobuf.Timestamp
+	(*v11.NetworkPolicyV1)(nil),                            // 227: space.net.policy.v1.NetworkPolicyV1
+	(v11.PolicyAuthority)(0),                               // 228: space.net.policy.v1.PolicyAuthority
+	(*v12.SpaceApiRouteIdentity)(nil),                      // 229: space.net.gateway.v1.SpaceApiRouteIdentity
+	(v11.NetworkPolicySource)(0),                           // 230: space.net.policy.v1.NetworkPolicySource
+	(*v13.ExecutionMetadata)(nil),                          // 231: space.execution.v1.ExecutionMetadata
+	(v12.SandboxSubstrateKind)(0),                          // 232: space.net.gateway.v1.SandboxSubstrateKind
+	(*v14.StatRequest)(nil),                                // 233: space.spaced.operations.v1.StatRequest
+	(*v14.ListRequest)(nil),                                // 234: space.spaced.operations.v1.ListRequest
+	(*v14.ReadRequest)(nil),                                // 235: space.spaced.operations.v1.ReadRequest
+	(*v14.WriteRequest)(nil),                               // 236: space.spaced.operations.v1.WriteRequest
+	(*v14.WriteBatchRequest)(nil),                          // 237: space.spaced.operations.v1.WriteBatchRequest
+	(*v14.MkdirRequest)(nil),                               // 238: space.spaced.operations.v1.MkdirRequest
+	(*v14.RemoveRequest)(nil),                              // 239: space.spaced.operations.v1.RemoveRequest
+	(*v14.RenameRequest)(nil),                              // 240: space.spaced.operations.v1.RenameRequest
+	(*v14.NormalizeWatchRootRequest)(nil),                  // 241: space.spaced.operations.v1.NormalizeWatchRootRequest
+	(*v14.WatchRequest)(nil),                               // 242: space.spaced.operations.v1.WatchRequest
+	(*v14.CreateWatcherRequest)(nil),                       // 243: space.spaced.operations.v1.CreateWatcherRequest
+	(*v14.GetWatcherEventsRequest)(nil),                    // 244: space.spaced.operations.v1.GetWatcherEventsRequest
+	(*v14.RemoveWatcherRequest)(nil),                       // 245: space.spaced.operations.v1.RemoveWatcherRequest
+	(*v14.EnableFileChangesRequest)(nil),                   // 246: space.spaced.operations.v1.EnableFileChangesRequest
+	(*v14.DisableFileChangesRequest)(nil),                  // 247: space.spaced.operations.v1.DisableFileChangesRequest
+	(*v14.GetModifiedFilesRequest)(nil),                    // 248: space.spaced.operations.v1.GetModifiedFilesRequest
+	(*v14.StartRequest)(nil),                               // 249: space.spaced.operations.v1.StartRequest
+	(*v14.ConnectProcessRequest)(nil),                      // 250: space.spaced.operations.v1.ConnectProcessRequest
+	(*v14.ListProcessesRequest)(nil),                       // 251: space.spaced.operations.v1.ListProcessesRequest
+	(*v14.ProcessInfo)(nil),                                // 252: space.spaced.operations.v1.ProcessInfo
+	(*v14.SendSignalRequest)(nil),                          // 253: space.spaced.operations.v1.SendSignalRequest
+	(*v14.SendInputRequest)(nil),                           // 254: space.spaced.operations.v1.SendInputRequest
+	(*v14.CloseStdinRequest)(nil),                          // 255: space.spaced.operations.v1.CloseStdinRequest
+	(*v14.ResizePtyRequest)(nil),                           // 256: space.spaced.operations.v1.ResizePtyRequest
+	(*v14.KillRequest)(nil),                                // 257: space.spaced.operations.v1.KillRequest
+	(v11.NetworkPolicyApplyDecision)(0),                    // 258: space.net.policy.v1.NetworkPolicyApplyDecision
+	(*v14.OpenLoopbackBridgeRequest)(nil),                  // 259: space.spaced.operations.v1.OpenLoopbackBridgeRequest
+	(*v14.CloseLoopbackBridgeRequest)(nil),                 // 260: space.spaced.operations.v1.CloseLoopbackBridgeRequest
+	(*v12.ServicePortIngressFrame)(nil),                    // 261: space.net.gateway.v1.ServicePortIngressFrame
+	(*v14.StatResponse)(nil),                               // 262: space.spaced.operations.v1.StatResponse
+	(*v14.FileInfo)(nil),                                   // 263: space.spaced.operations.v1.FileInfo
+	(*v14.FileChunk)(nil),                                  // 264: space.spaced.operations.v1.FileChunk
+	(*v14.WriteResponse)(nil),                              // 265: space.spaced.operations.v1.WriteResponse
+	(*v14.WriteBatchResponse)(nil),                         // 266: space.spaced.operations.v1.WriteBatchResponse
+	(*v14.MkdirResponse)(nil),                              // 267: space.spaced.operations.v1.MkdirResponse
+	(*v14.RemoveResponse)(nil),                             // 268: space.spaced.operations.v1.RemoveResponse
+	(*v14.RenameResponse)(nil),                             // 269: space.spaced.operations.v1.RenameResponse
+	(*v14.NormalizeWatchRootResponse)(nil),                 // 270: space.spaced.operations.v1.NormalizeWatchRootResponse
+	(*v14.FileEvent)(nil),                                  // 271: space.spaced.operations.v1.FileEvent
+	(*v14.CreateWatcherResponse)(nil),                      // 272: space.spaced.operations.v1.CreateWatcherResponse
+	(*v14.GetWatcherEventsResponse)(nil),                   // 273: space.spaced.operations.v1.GetWatcherEventsResponse
+	(*v14.RemoveWatcherResponse)(nil),                      // 274: space.spaced.operations.v1.RemoveWatcherResponse
+	(*v14.EnableFileChangesResponse)(nil),                  // 275: space.spaced.operations.v1.EnableFileChangesResponse
+	(*v14.DisableFileChangesResponse)(nil),                 // 276: space.spaced.operations.v1.DisableFileChangesResponse
+	(*v14.GetModifiedFilesResponse)(nil),                   // 277: space.spaced.operations.v1.GetModifiedFilesResponse
+	(*v14.ProcessEvent)(nil),                               // 278: space.spaced.operations.v1.ProcessEvent
+	(*v14.SendSignalResponse)(nil),                         // 279: space.spaced.operations.v1.SendSignalResponse
+	(*v14.SendInputResponse)(nil),                          // 280: space.spaced.operations.v1.SendInputResponse
+	(*v14.CloseStdinResponse)(nil),                         // 281: space.spaced.operations.v1.CloseStdinResponse
+	(*v14.ResizePtyResponse)(nil),                          // 282: space.spaced.operations.v1.ResizePtyResponse
+	(*v14.KillResponse)(nil),                               // 283: space.spaced.operations.v1.KillResponse
+	(*v14.OpenLoopbackBridgeResponse)(nil),                 // 284: space.spaced.operations.v1.OpenLoopbackBridgeResponse
+	(*v14.CloseLoopbackBridgeResponse)(nil),                // 285: space.spaced.operations.v1.CloseLoopbackBridgeResponse
 }
 var file_sandbox_manager_v1_manager_proto_depIdxs = []int32{
-	221, // 0: space.sandbox.manager.v1.ApplyGuestUpdateRequest.promotion:type_name -> space.spaced.update.v1.Promotion
+	223, // 0: space.sandbox.manager.v1.ApplyGuestUpdateRequest.promotion:type_name -> space.spaced.update.v1.Promotion
 	0,   // 1: space.sandbox.manager.v1.GuestUpdateOperation.phase:type_name -> space.sandbox.manager.v1.GuestUpdateOperationPhase
-	222, // 2: space.sandbox.manager.v1.GuestUpdateOperation.guest:type_name -> space.spaced.update.v1.Status
+	224, // 2: space.sandbox.manager.v1.GuestUpdateOperation.guest:type_name -> space.spaced.update.v1.Status
 	3,   // 3: space.sandbox.manager.v1.AutoLifecycleWakePolicy.on:type_name -> space.sandbox.manager.v1.AutoLifecycleWakeSource
 	7,   // 4: space.sandbox.manager.v1.AutoLifecycleConditionSet.id:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSetId
 	4,   // 5: space.sandbox.manager.v1.AutoLifecycleConditionSet.kind:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionKind
 	5,   // 6: space.sandbox.manager.v1.AutoLifecycleConditionSet.activity_source:type_name -> space.sandbox.manager.v1.AutoLifecycleActivitySource
-	223, // 7: space.sandbox.manager.v1.AutoLifecycleConditionSet.max_guest_idle_extension:type_name -> google.protobuf.Duration
+	225, // 7: space.sandbox.manager.v1.AutoLifecycleConditionSet.max_guest_idle_extension:type_name -> google.protobuf.Duration
 	7,   // 8: space.sandbox.manager.v1.AutoLifecycleStage.condition_set:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSetId
-	223, // 9: space.sandbox.manager.v1.AutoLifecycleStage.at:type_name -> google.protobuf.Duration
+	225, // 9: space.sandbox.manager.v1.AutoLifecycleStage.at:type_name -> google.protobuf.Duration
 	2,   // 10: space.sandbox.manager.v1.AutoLifecycleStage.action:type_name -> space.sandbox.manager.v1.AutoLifecycleIdleAction
-	33,  // 11: space.sandbox.manager.v1.AutoLifecyclePolicy.wake:type_name -> space.sandbox.manager.v1.AutoLifecycleWakePolicy
-	34,  // 12: space.sandbox.manager.v1.AutoLifecyclePolicy.condition_sets:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSet
-	35,  // 13: space.sandbox.manager.v1.AutoLifecyclePolicy.stages:type_name -> space.sandbox.manager.v1.AutoLifecycleStage
+	34,  // 11: space.sandbox.manager.v1.AutoLifecyclePolicy.wake:type_name -> space.sandbox.manager.v1.AutoLifecycleWakePolicy
+	35,  // 12: space.sandbox.manager.v1.AutoLifecyclePolicy.condition_sets:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSet
+	36,  // 13: space.sandbox.manager.v1.AutoLifecyclePolicy.stages:type_name -> space.sandbox.manager.v1.AutoLifecycleStage
 	7,   // 14: space.sandbox.manager.v1.AutoLifecycleConditionStatus.condition_set:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionSetId
-	224, // 15: space.sandbox.manager.v1.AutoLifecycleConditionStatus.epoch_at:type_name -> google.protobuf.Timestamp
-	224, // 16: space.sandbox.manager.v1.AutoLifecycleConditionStatus.last_touched_at:type_name -> google.protobuf.Timestamp
-	37,  // 17: space.sandbox.manager.v1.AutoLifecycleStatus.conditions:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionStatus
-	224, // 18: space.sandbox.manager.v1.AutoLifecycleStatus.next_auto_event_at:type_name -> google.protobuf.Timestamp
+	226, // 15: space.sandbox.manager.v1.AutoLifecycleConditionStatus.epoch_at:type_name -> google.protobuf.Timestamp
+	226, // 16: space.sandbox.manager.v1.AutoLifecycleConditionStatus.last_touched_at:type_name -> google.protobuf.Timestamp
+	38,  // 17: space.sandbox.manager.v1.AutoLifecycleStatus.conditions:type_name -> space.sandbox.manager.v1.AutoLifecycleConditionStatus
+	226, // 18: space.sandbox.manager.v1.AutoLifecycleStatus.next_auto_event_at:type_name -> google.protobuf.Timestamp
 	8,   // 19: space.sandbox.manager.v1.AutoLifecycleStatus.last_auto_transition:type_name -> space.sandbox.manager.v1.AutoLifecycleTransition
-	224, // 20: space.sandbox.manager.v1.AutoLifecycleStatus.last_auto_transition_at:type_name -> google.protobuf.Timestamp
-	224, // 21: space.sandbox.manager.v1.AutoLifecycleStatus.last_access_at:type_name -> google.protobuf.Timestamp
-	224, // 22: space.sandbox.manager.v1.AutoLifecycleStatus.last_command_at:type_name -> google.protobuf.Timestamp
-	213, // 23: space.sandbox.manager.v1.CreateRequest.environment:type_name -> space.sandbox.manager.v1.EnvironmentCreateInput
+	226, // 20: space.sandbox.manager.v1.AutoLifecycleStatus.last_auto_transition_at:type_name -> google.protobuf.Timestamp
+	226, // 21: space.sandbox.manager.v1.AutoLifecycleStatus.last_access_at:type_name -> google.protobuf.Timestamp
+	226, // 22: space.sandbox.manager.v1.AutoLifecycleStatus.last_command_at:type_name -> google.protobuf.Timestamp
+	215, // 23: space.sandbox.manager.v1.CreateRequest.environment:type_name -> space.sandbox.manager.v1.EnvironmentCreateInput
 	1,   // 24: space.sandbox.manager.v1.CreateRequest.boot_mode:type_name -> space.sandbox.manager.v1.BootMode
-	214, // 25: space.sandbox.manager.v1.CreateRequest.env:type_name -> space.sandbox.manager.v1.CreateRequest.EnvEntry
-	36,  // 26: space.sandbox.manager.v1.CreateRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	225, // 27: space.sandbox.manager.v1.CreateRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 28: space.sandbox.manager.v1.CreateRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	226, // 29: space.sandbox.manager.v1.CreateRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	225, // 30: space.sandbox.manager.v1.CreateRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 31: space.sandbox.manager.v1.CreateRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	227, // 32: space.sandbox.manager.v1.CreateRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	216, // 25: space.sandbox.manager.v1.CreateRequest.env:type_name -> space.sandbox.manager.v1.CreateRequest.EnvEntry
+	37,  // 26: space.sandbox.manager.v1.CreateRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	227, // 27: space.sandbox.manager.v1.CreateRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 28: space.sandbox.manager.v1.CreateRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	228, // 29: space.sandbox.manager.v1.CreateRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	227, // 30: space.sandbox.manager.v1.CreateRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 31: space.sandbox.manager.v1.CreateRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	229, // 32: space.sandbox.manager.v1.CreateRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
 	1,   // 33: space.sandbox.manager.v1.CreateResponse.boot_mode_used:type_name -> space.sandbox.manager.v1.BootMode
-	227, // 34: space.sandbox.manager.v1.CreateResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	229, // 34: space.sandbox.manager.v1.CreateResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
 	17,  // 35: space.sandbox.manager.v1.StartRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
-	227, // 36: space.sandbox.manager.v1.StartRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	199, // 37: space.sandbox.manager.v1.StartRequest.restore_artifact_as_new:type_name -> space.sandbox.manager.v1.RestoreArtifactAsNewContext
-	36,  // 38: space.sandbox.manager.v1.StartRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	227, // 39: space.sandbox.manager.v1.StartResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	57,  // 40: space.sandbox.manager.v1.StateResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxInfo
-	215, // 41: space.sandbox.manager.v1.GetEnvResponse.env:type_name -> space.sandbox.manager.v1.GetEnvResponse.EnvEntry
-	55,  // 42: space.sandbox.manager.v1.CleanupTargetBatch.targets:type_name -> space.sandbox.manager.v1.CleanupTargetObservation
-	36,  // 43: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	38,  // 44: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
-	224, // 45: space.sandbox.manager.v1.SandboxInfo.last_guest_ready_at:type_name -> google.protobuf.Timestamp
-	224, // 46: space.sandbox.manager.v1.SandboxInfo.last_guest_heartbeat_at:type_name -> google.protobuf.Timestamp
-	228, // 47: space.sandbox.manager.v1.SandboxInfo.applied_network_policy_source:type_name -> space.net.policy.v1.NetworkPolicySource
-	226, // 48: space.sandbox.manager.v1.SandboxInfo.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	226, // 49: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	21,  // 50: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	22,  // 51: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
-	229, // 52: space.sandbox.manager.v1.SandboxInfo.execution:type_name -> space.execution.v1.ExecutionMetadata
-	63,  // 53: space.sandbox.manager.v1.SandboxInfo.transition_receipt:type_name -> space.sandbox.manager.v1.TransitionReceipt
+	229, // 36: space.sandbox.manager.v1.StartRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	201, // 37: space.sandbox.manager.v1.StartRequest.restore_artifact_as_new:type_name -> space.sandbox.manager.v1.RestoreArtifactAsNewContext
+	37,  // 38: space.sandbox.manager.v1.StartRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	229, // 39: space.sandbox.manager.v1.StartResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	58,  // 40: space.sandbox.manager.v1.StateResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxInfo
+	217, // 41: space.sandbox.manager.v1.GetEnvResponse.env:type_name -> space.sandbox.manager.v1.GetEnvResponse.EnvEntry
+	56,  // 42: space.sandbox.manager.v1.CleanupTargetBatch.targets:type_name -> space.sandbox.manager.v1.CleanupTargetObservation
+	37,  // 43: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	39,  // 44: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
+	226, // 45: space.sandbox.manager.v1.SandboxInfo.last_guest_ready_at:type_name -> google.protobuf.Timestamp
+	226, // 46: space.sandbox.manager.v1.SandboxInfo.last_guest_heartbeat_at:type_name -> google.protobuf.Timestamp
+	230, // 47: space.sandbox.manager.v1.SandboxInfo.applied_network_policy_source:type_name -> space.net.policy.v1.NetworkPolicySource
+	228, // 48: space.sandbox.manager.v1.SandboxInfo.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	228, // 49: space.sandbox.manager.v1.SandboxInfo.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	22,  // 50: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	23,  // 51: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
+	231, // 52: space.sandbox.manager.v1.SandboxInfo.execution:type_name -> space.execution.v1.ExecutionMetadata
+	64,  // 53: space.sandbox.manager.v1.SandboxInfo.transition_receipt:type_name -> space.sandbox.manager.v1.TransitionReceipt
 	13,  // 54: space.sandbox.manager.v1.SandboxInfo.health_status:type_name -> space.sandbox.manager.v1.SandboxHealthStatus
-	224, // 55: space.sandbox.manager.v1.SandboxInfo.health_observed_at:type_name -> google.protobuf.Timestamp
-	230, // 56: space.sandbox.manager.v1.SandboxInfo.route_provenance_substrate_kind:type_name -> space.net.gateway.v1.SandboxSubstrateKind
-	224, // 57: space.sandbox.manager.v1.SandboxInfo.state_changed_at:type_name -> google.protobuf.Timestamp
-	208, // 58: space.sandbox.manager.v1.SandboxInfo.quarantine_recovery:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservation
+	226, // 55: space.sandbox.manager.v1.SandboxInfo.health_observed_at:type_name -> google.protobuf.Timestamp
+	232, // 56: space.sandbox.manager.v1.SandboxInfo.route_provenance_substrate_kind:type_name -> space.net.gateway.v1.SandboxSubstrateKind
+	226, // 57: space.sandbox.manager.v1.SandboxInfo.state_changed_at:type_name -> google.protobuf.Timestamp
+	210, // 58: space.sandbox.manager.v1.SandboxInfo.quarantine_recovery:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservation
 	10,  // 59: space.sandbox.manager.v1.SandboxInfo.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
-	224, // 60: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_created_at:type_name -> google.protobuf.Timestamp
-	58,  // 61: space.sandbox.manager.v1.SandboxInfo.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
+	226, // 60: space.sandbox.manager.v1.SandboxInfo.current_local_artifact_created_at:type_name -> google.protobuf.Timestamp
+	59,  // 61: space.sandbox.manager.v1.SandboxInfo.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
 	11,  // 62: space.sandbox.manager.v1.SandboxCleanup.completion:type_name -> space.sandbox.manager.v1.SandboxCleanupCompletion
 	12,  // 63: space.sandbox.manager.v1.SandboxCleanup.state:type_name -> space.sandbox.manager.v1.SandboxCleanupState
-	224, // 64: space.sandbox.manager.v1.SandboxHealthObservation.observed_at:type_name -> google.protobuf.Timestamp
+	226, // 64: space.sandbox.manager.v1.SandboxHealthObservation.observed_at:type_name -> google.protobuf.Timestamp
 	15,  // 65: space.sandbox.manager.v1.SandboxHealthObservation.outcome:type_name -> space.sandbox.manager.v1.SandboxHealthProbeOutcome
 	14,  // 66: space.sandbox.manager.v1.SandboxComponentHealth.component:type_name -> space.sandbox.manager.v1.SandboxHealthComponent
-	59,  // 67: space.sandbox.manager.v1.SandboxComponentHealth.observations:type_name -> space.sandbox.manager.v1.SandboxHealthObservation
+	60,  // 67: space.sandbox.manager.v1.SandboxComponentHealth.observations:type_name -> space.sandbox.manager.v1.SandboxHealthObservation
 	13,  // 68: space.sandbox.manager.v1.GetSandboxHealthResponse.status:type_name -> space.sandbox.manager.v1.SandboxHealthStatus
-	224, // 69: space.sandbox.manager.v1.GetSandboxHealthResponse.evaluated_at:type_name -> google.protobuf.Timestamp
+	226, // 69: space.sandbox.manager.v1.GetSandboxHealthResponse.evaluated_at:type_name -> google.protobuf.Timestamp
 	14,  // 70: space.sandbox.manager.v1.GetSandboxHealthResponse.degraded_components:type_name -> space.sandbox.manager.v1.SandboxHealthComponent
-	60,  // 71: space.sandbox.manager.v1.GetSandboxHealthResponse.components:type_name -> space.sandbox.manager.v1.SandboxComponentHealth
+	61,  // 71: space.sandbox.manager.v1.GetSandboxHealthResponse.components:type_name -> space.sandbox.manager.v1.SandboxComponentHealth
 	10,  // 72: space.sandbox.manager.v1.SandboxListElement.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
-	58,  // 73: space.sandbox.manager.v1.SandboxListElement.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
-	64,  // 74: space.sandbox.manager.v1.ListResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
-	64,  // 75: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
+	59,  // 73: space.sandbox.manager.v1.SandboxListElement.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
+	65,  // 74: space.sandbox.manager.v1.ListResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
+	65,  // 75: space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse.sandboxes:type_name -> space.sandbox.manager.v1.SandboxListElement
 	16,  // 76: space.sandbox.manager.v1.MissingDiskUsageId.reason:type_name -> space.sandbox.manager.v1.MissingDiskUsageReason
-	216, // 77: space.sandbox.manager.v1.GetDiskUsageResponse.usage_bytes:type_name -> space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
-	69,  // 78: space.sandbox.manager.v1.GetDiskUsageResponse.missing_ids:type_name -> space.sandbox.manager.v1.MissingDiskUsageId
-	74,  // 79: space.sandbox.manager.v1.ListTemplatesResponse.templates:type_name -> space.sandbox.manager.v1.TemplateInfo
-	36,  // 80: space.sandbox.manager.v1.ResumeRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	227, // 81: space.sandbox.manager.v1.ResumeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	82,  // 82: space.sandbox.manager.v1.WakeRequest.start_context:type_name -> space.sandbox.manager.v1.WakeStartContext
+	218, // 77: space.sandbox.manager.v1.GetDiskUsageResponse.usage_bytes:type_name -> space.sandbox.manager.v1.GetDiskUsageResponse.UsageBytesEntry
+	70,  // 78: space.sandbox.manager.v1.GetDiskUsageResponse.missing_ids:type_name -> space.sandbox.manager.v1.MissingDiskUsageId
+	75,  // 79: space.sandbox.manager.v1.ListTemplatesResponse.templates:type_name -> space.sandbox.manager.v1.TemplateInfo
+	37,  // 80: space.sandbox.manager.v1.ResumeRequest.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	229, // 81: space.sandbox.manager.v1.ResumeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	83,  // 82: space.sandbox.manager.v1.WakeRequest.start_context:type_name -> space.sandbox.manager.v1.WakeStartContext
 	17,  // 83: space.sandbox.manager.v1.WakeRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
 	3,   // 84: space.sandbox.manager.v1.WakeRequest.implicit_wake_source:type_name -> space.sandbox.manager.v1.AutoLifecycleWakeSource
-	81,  // 85: space.sandbox.manager.v1.WakeRequest.runtime_upgrade:type_name -> space.sandbox.manager.v1.WakeRuntimeUpgrade
-	101, // 86: space.sandbox.manager.v1.WakeRuntimeUpgrade.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
-	227, // 87: space.sandbox.manager.v1.WakeStartContext.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	36,  // 88: space.sandbox.manager.v1.WakeStartContext.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	82,  // 85: space.sandbox.manager.v1.WakeRequest.runtime_upgrade:type_name -> space.sandbox.manager.v1.WakeRuntimeUpgrade
+	103, // 86: space.sandbox.manager.v1.WakeRuntimeUpgrade.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
+	229, // 87: space.sandbox.manager.v1.WakeStartContext.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	37,  // 88: space.sandbox.manager.v1.WakeStartContext.activation_auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
 	9,   // 89: space.sandbox.manager.v1.WakeResponse.transition:type_name -> space.sandbox.manager.v1.WakeTransition
-	227, // 90: space.sandbox.manager.v1.WakeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	229, // 90: space.sandbox.manager.v1.WakeResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
 	18,  // 91: space.sandbox.manager.v1.CreateSnapshotRequest.type:type_name -> space.sandbox.manager.v1.SnapshotType
-	86,  // 92: space.sandbox.manager.v1.CreateSnapshotRequest.creation_identity:type_name -> space.sandbox.manager.v1.SnapshotCreationIdentity
-	88,  // 93: space.sandbox.manager.v1.CreateSnapshotRequest.source:type_name -> space.sandbox.manager.v1.CreateSnapshotSource
+	87,  // 92: space.sandbox.manager.v1.CreateSnapshotRequest.creation_identity:type_name -> space.sandbox.manager.v1.SnapshotCreationIdentity
+	89,  // 93: space.sandbox.manager.v1.CreateSnapshotRequest.source:type_name -> space.sandbox.manager.v1.CreateSnapshotSource
 	18,  // 94: space.sandbox.manager.v1.CreateSnapshotResponse.type:type_name -> space.sandbox.manager.v1.SnapshotType
-	94,  // 95: space.sandbox.manager.v1.CreateSnapshotResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
-	90,  // 96: space.sandbox.manager.v1.CreateSnapshotResponse.published_durable_artifact:type_name -> space.sandbox.manager.v1.PublishedDurableArtifact
+	96,  // 95: space.sandbox.manager.v1.CreateSnapshotResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
+	92,  // 96: space.sandbox.manager.v1.CreateSnapshotResponse.published_durable_artifact:type_name -> space.sandbox.manager.v1.PublishedDurableArtifact
 	19,  // 97: space.sandbox.manager.v1.CurrentSandboxSnapshotSource.lifecycle:type_name -> space.sandbox.manager.v1.SnapshotSourceLifecycle
-	87,  // 98: space.sandbox.manager.v1.CreateSnapshotSource.current_sandbox:type_name -> space.sandbox.manager.v1.CurrentSandboxSnapshotSource
-	89,  // 99: space.sandbox.manager.v1.CreateSnapshotSource.durable_artifact:type_name -> space.sandbox.manager.v1.DurableArtifactSnapshotSource
-	22,  // 100: space.sandbox.manager.v1.DurableArtifactSnapshotSource.destination_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
-	20,  // 101: space.sandbox.manager.v1.SuspendRequest.format:type_name -> space.sandbox.manager.v1.SuspendSnapshotFormat
-	21,  // 102: space.sandbox.manager.v1.PublishedArtifact.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	22,  // 103: space.sandbox.manager.v1.PublishedArtifact.origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
-	94,  // 104: space.sandbox.manager.v1.SuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
-	21,  // 105: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.expected_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	96,  // 106: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.current_instance:type_name -> space.sandbox.manager.v1.CurrentInstanceSource
-	21,  // 107: space.sandbox.manager.v1.EnqueueArtifactBackupResponse.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	101, // 108: space.sandbox.manager.v1.UpgradeRuntimeRequest.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
-	41,  // 109: space.sandbox.manager.v1.UpgradeRuntimeRequest.start:type_name -> space.sandbox.manager.v1.StartRequest
-	17,  // 110: space.sandbox.manager.v1.UpgradeRuntimeRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
-	103, // 111: space.sandbox.manager.v1.UpgradeRuntimeRequest.stage_from:type_name -> space.sandbox.manager.v1.RuntimeUpgradeStageFrom
-	23,  // 112: space.sandbox.manager.v1.UpgradeRuntimeResponse.outcome:type_name -> space.sandbox.manager.v1.RuntimeUpgradeOutcome
-	42,  // 113: space.sandbox.manager.v1.UpgradeRuntimeResponse.start:type_name -> space.sandbox.manager.v1.StartResponse
-	24,  // 114: space.sandbox.manager.v1.GetRuntimeUpgradeResponse.status:type_name -> space.sandbox.manager.v1.RuntimeUpgradeStatus
-	25,  // 115: space.sandbox.manager.v1.GetRuntimeUpgradeResponse.phase:type_name -> space.sandbox.manager.v1.RuntimeUpgradePhase
-	115, // 116: space.sandbox.manager.v1.ListSnapshotsResponse.snapshots:type_name -> space.sandbox.manager.v1.SnapshotDetail
-	18,  // 117: space.sandbox.manager.v1.SnapshotDetail.type:type_name -> space.sandbox.manager.v1.SnapshotType
-	116, // 118: space.sandbox.manager.v1.SnapshotDetail.locations:type_name -> space.sandbox.manager.v1.SnapshotLocation
-	227, // 119: space.sandbox.manager.v1.RollbackRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	227, // 120: space.sandbox.manager.v1.RollbackResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	217, // 121: space.sandbox.manager.v1.UpdateRequest.process_env:type_name -> space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
-	223, // 122: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_uptime:type_name -> google.protobuf.Duration
-	129, // 123: space.sandbox.manager.v1.SpacedGetStatusResponse.host_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
-	129, // 124: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
-	223, // 125: space.sandbox.manager.v1.SpacedWaitReadyRequest.timeout:type_name -> google.protobuf.Duration
-	223, // 126: space.sandbox.manager.v1.SpacedWaitReadyResponse.guest_uptime:type_name -> google.protobuf.Duration
-	231, // 127: space.sandbox.manager.v1.SpacedStatRequest.operation:type_name -> space.spaced.operations.v1.StatRequest
-	232, // 128: space.sandbox.manager.v1.SpacedListRequest.operation:type_name -> space.spaced.operations.v1.ListRequest
-	233, // 129: space.sandbox.manager.v1.SpacedReadRequest.operation:type_name -> space.spaced.operations.v1.ReadRequest
-	234, // 130: space.sandbox.manager.v1.SpacedWriteRequest.operation:type_name -> space.spaced.operations.v1.WriteRequest
-	235, // 131: space.sandbox.manager.v1.SpacedWriteBatchRequest.operation:type_name -> space.spaced.operations.v1.WriteBatchRequest
-	236, // 132: space.sandbox.manager.v1.SpacedMkdirRequest.operation:type_name -> space.spaced.operations.v1.MkdirRequest
-	237, // 133: space.sandbox.manager.v1.SpacedRemoveRequest.operation:type_name -> space.spaced.operations.v1.RemoveRequest
-	238, // 134: space.sandbox.manager.v1.SpacedRenameRequest.operation:type_name -> space.spaced.operations.v1.RenameRequest
-	239, // 135: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest.operation:type_name -> space.spaced.operations.v1.NormalizeWatchRootRequest
-	240, // 136: space.sandbox.manager.v1.SpacedWatchRequest.operation:type_name -> space.spaced.operations.v1.WatchRequest
-	241, // 137: space.sandbox.manager.v1.SpacedCreateWatcherRequest.operation:type_name -> space.spaced.operations.v1.CreateWatcherRequest
-	242, // 138: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest.operation:type_name -> space.spaced.operations.v1.GetWatcherEventsRequest
-	243, // 139: space.sandbox.manager.v1.SpacedRemoveWatcherRequest.operation:type_name -> space.spaced.operations.v1.RemoveWatcherRequest
-	244, // 140: space.sandbox.manager.v1.SpacedEnableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.EnableFileChangesRequest
-	245, // 141: space.sandbox.manager.v1.SpacedDisableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.DisableFileChangesRequest
-	246, // 142: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest.operation:type_name -> space.spaced.operations.v1.GetModifiedFilesRequest
-	247, // 143: space.sandbox.manager.v1.SpacedStartProcessRequest.operation:type_name -> space.spaced.operations.v1.StartRequest
-	248, // 144: space.sandbox.manager.v1.SpacedConnectProcessRequest.operation:type_name -> space.spaced.operations.v1.ConnectProcessRequest
-	249, // 145: space.sandbox.manager.v1.SpacedListProcessesRequest.operation:type_name -> space.spaced.operations.v1.ListProcessesRequest
-	250, // 146: space.sandbox.manager.v1.SpacedListProcessesResponse.processes:type_name -> space.spaced.operations.v1.ProcessInfo
-	251, // 147: space.sandbox.manager.v1.SpacedSendSignalRequest.operation:type_name -> space.spaced.operations.v1.SendSignalRequest
-	252, // 148: space.sandbox.manager.v1.SpacedSendInputRequest.operation:type_name -> space.spaced.operations.v1.SendInputRequest
-	253, // 149: space.sandbox.manager.v1.SpacedCloseStdinRequest.operation:type_name -> space.spaced.operations.v1.CloseStdinRequest
-	254, // 150: space.sandbox.manager.v1.SpacedResizePtyRequest.operation:type_name -> space.spaced.operations.v1.ResizePtyRequest
-	255, // 151: space.sandbox.manager.v1.SpacedKillProcessRequest.operation:type_name -> space.spaced.operations.v1.KillRequest
-	36,  // 152: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	226, // 153: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	36,  // 154: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.effective_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	226, // 155: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	5,   // 156: space.sandbox.manager.v1.TouchAutoLifecycleRequest.source:type_name -> space.sandbox.manager.v1.AutoLifecycleActivitySource
-	224, // 157: space.sandbox.manager.v1.TouchAutoLifecycleRequest.observed_at:type_name -> google.protobuf.Timestamp
-	160, // 158: space.sandbox.manager.v1.TouchAutoLifecycleRequest.access_idle_update:type_name -> space.sandbox.manager.v1.AccessIdleUpdate
-	224, // 159: space.sandbox.manager.v1.AccessIdleUpdate.expires_at:type_name -> google.protobuf.Timestamp
-	224, // 160: space.sandbox.manager.v1.AccessIdleUpdate.extend_until:type_name -> google.protobuf.Timestamp
-	36,  // 161: space.sandbox.manager.v1.AccessIdleUpdate.reset_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	6,   // 162: space.sandbox.manager.v1.TouchAutoLifecycleResponse.result:type_name -> space.sandbox.manager.v1.AutoLifecycleTouchResult
-	196, // 163: space.sandbox.manager.v1.GetNetworkPolicyResponse.policies:type_name -> space.sandbox.manager.v1.NetworkPolicyDetail
-	225, // 164: space.sandbox.manager.v1.SetNetworkPolicyRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 165: space.sandbox.manager.v1.SetNetworkPolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	225, // 166: space.sandbox.manager.v1.SetNetworkPolicyResponse.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	228, // 167: space.sandbox.manager.v1.SetNetworkPolicyResponse.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
-	256, // 168: space.sandbox.manager.v1.SetNetworkPolicyResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
-	226, // 169: space.sandbox.manager.v1.SetNetworkPolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	225, // 170: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 171: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	256, // 172: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
-	218, // 173: space.sandbox.manager.v1.AdoptPoolSandboxRequest.env:type_name -> space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
-	36,  // 174: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	225, // 175: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 176: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	225, // 177: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 178: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	226, // 179: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	227, // 180: space.sandbox.manager.v1.AdoptPoolSandboxRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	227, // 181: space.sandbox.manager.v1.AdoptPoolSandboxResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	10,  // 182: space.sandbox.manager.v1.WaitResponse.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
-	58,  // 183: space.sandbox.manager.v1.WaitResponse.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
-	178, // 184: space.sandbox.manager.v1.ExportSnapshotChunk.header:type_name -> space.sandbox.manager.v1.ExportSnapshotHeader
-	179, // 185: space.sandbox.manager.v1.ExportSnapshotChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSnapshotFileChunk
-	18,  // 186: space.sandbox.manager.v1.ExportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
-	181, // 187: space.sandbox.manager.v1.ImportSnapshotRequest.header:type_name -> space.sandbox.manager.v1.ImportSnapshotHeader
-	182, // 188: space.sandbox.manager.v1.ImportSnapshotRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSnapshotFileChunk
-	18,  // 189: space.sandbox.manager.v1.ImportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
-	186, // 190: space.sandbox.manager.v1.ExportSandboxChunk.header:type_name -> space.sandbox.manager.v1.ExportSandboxHeader
-	187, // 191: space.sandbox.manager.v1.ExportSandboxChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSandboxFileChunk
-	219, // 192: space.sandbox.manager.v1.ExportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
-	36,  // 193: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	225, // 194: space.sandbox.manager.v1.ExportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 195: space.sandbox.manager.v1.ExportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	226, // 196: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	229, // 197: space.sandbox.manager.v1.ExportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
-	189, // 198: space.sandbox.manager.v1.ImportSandboxRequest.header:type_name -> space.sandbox.manager.v1.ImportSandboxHeader
-	190, // 199: space.sandbox.manager.v1.ImportSandboxRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSandboxFileChunk
-	220, // 200: space.sandbox.manager.v1.ImportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
-	36,  // 201: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	225, // 202: space.sandbox.manager.v1.ImportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	226, // 203: space.sandbox.manager.v1.ImportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	226, // 204: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
-	229, // 205: space.sandbox.manager.v1.ImportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
-	36,  // 206: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
-	38,  // 207: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
-	257, // 208: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.OpenLoopbackBridgeRequest
-	258, // 209: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.CloseLoopbackBridgeRequest
-	225, // 210: space.sandbox.manager.v1.NetworkPolicyDetail.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	228, // 211: space.sandbox.manager.v1.NetworkPolicyDetail.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
-	226, // 212: space.sandbox.manager.v1.NetworkPolicyDetail.authority:type_name -> space.net.policy.v1.PolicyAuthority
-	26,  // 213: space.sandbox.manager.v1.PrepareTeardownSuspendRequest.action:type_name -> space.sandbox.manager.v1.TeardownSuspendAction
-	27,  // 214: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.outcome:type_name -> space.sandbox.manager.v1.TeardownSuspendOutcome
-	94,  // 215: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
-	21,  // 216: space.sandbox.manager.v1.RestoreArtifactAsNewContext.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	200, // 217: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse.receipts:type_name -> space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
-	21,  // 218: space.sandbox.manager.v1.PendingLocalBackup.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
-	205, // 219: space.sandbox.manager.v1.ListPendingLocalBackupsResponse.pending:type_name -> space.sandbox.manager.v1.PendingLocalBackup
-	28,  // 220: space.sandbox.manager.v1.QuarantineRecoveryObservation.observed_owner:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
-	224, // 221: space.sandbox.manager.v1.QuarantineRecoveryObservation.next_attempt_at:type_name -> google.protobuf.Timestamp
-	29,  // 222: space.sandbox.manager.v1.SandboxManager.GuestUpdateStatus:input_type -> space.sandbox.manager.v1.GuestUpdateStatusRequest
-	30,  // 223: space.sandbox.manager.v1.SandboxManager.ApplyGuestUpdate:input_type -> space.sandbox.manager.v1.ApplyGuestUpdateRequest
-	31,  // 224: space.sandbox.manager.v1.SandboxManager.RestartGuest:input_type -> space.sandbox.manager.v1.RestartGuestRequest
-	211, // 225: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:input_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
-	39,  // 226: space.sandbox.manager.v1.SandboxManager.Create:input_type -> space.sandbox.manager.v1.CreateRequest
-	41,  // 227: space.sandbox.manager.v1.SandboxManager.Start:input_type -> space.sandbox.manager.v1.StartRequest
-	43,  // 228: space.sandbox.manager.v1.SandboxManager.Stop:input_type -> space.sandbox.manager.v1.StopRequest
-	45,  // 229: space.sandbox.manager.v1.SandboxManager.Kill:input_type -> space.sandbox.manager.v1.KillRequest
-	47,  // 230: space.sandbox.manager.v1.SandboxManager.Delete:input_type -> space.sandbox.manager.v1.DeleteRequest
-	49,  // 231: space.sandbox.manager.v1.SandboxManager.State:input_type -> space.sandbox.manager.v1.StateRequest
-	61,  // 232: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:input_type -> space.sandbox.manager.v1.GetSandboxHealthRequest
-	51,  // 233: space.sandbox.manager.v1.SandboxManager.GetEnv:input_type -> space.sandbox.manager.v1.GetEnvRequest
-	53,  // 234: space.sandbox.manager.v1.SandboxManager.List:input_type -> space.sandbox.manager.v1.ListRequest
-	54,  // 235: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:input_type -> space.sandbox.manager.v1.ScanCleanupTargetsRequest
-	66,  // 236: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:input_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
-	68,  // 237: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:input_type -> space.sandbox.manager.v1.GetDiskUsageRequest
-	71,  // 238: space.sandbox.manager.v1.SandboxManager.Cleanup:input_type -> space.sandbox.manager.v1.CleanupRequest
-	73,  // 239: space.sandbox.manager.v1.SandboxManager.ListTemplates:input_type -> space.sandbox.manager.v1.ListTemplatesRequest
-	76,  // 240: space.sandbox.manager.v1.SandboxManager.Pause:input_type -> space.sandbox.manager.v1.PauseRequest
-	78,  // 241: space.sandbox.manager.v1.SandboxManager.Resume:input_type -> space.sandbox.manager.v1.ResumeRequest
-	80,  // 242: space.sandbox.manager.v1.SandboxManager.Wake:input_type -> space.sandbox.manager.v1.WakeRequest
-	84,  // 243: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:input_type -> space.sandbox.manager.v1.CreateSnapshotRequest
-	209, // 244: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:input_type -> space.sandbox.manager.v1.WaitTemplateAppsRequest
-	91,  // 245: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:input_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
-	93,  // 246: space.sandbox.manager.v1.SandboxManager.Suspend:input_type -> space.sandbox.manager.v1.SuspendRequest
-	197, // 247: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:input_type -> space.sandbox.manager.v1.PrepareTeardownSuspendRequest
-	97,  // 248: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:input_type -> space.sandbox.manager.v1.EnqueueArtifactBackupRequest
-	99,  // 249: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:input_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
-	102, // 250: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:input_type -> space.sandbox.manager.v1.UpgradeRuntimeRequest
-	105, // 251: space.sandbox.manager.v1.SandboxManager.GetRuntimeUpgrade:input_type -> space.sandbox.manager.v1.GetRuntimeUpgradeRequest
-	106, // 252: space.sandbox.manager.v1.SandboxManager.AbandonRuntimeUpgrade:input_type -> space.sandbox.manager.v1.AbandonRuntimeUpgradeRequest
-	109, // 253: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:input_type -> space.sandbox.manager.v1.EnableSnapshotsRequest
-	111, // 254: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:input_type -> space.sandbox.manager.v1.DisableSnapshotsRequest
-	113, // 255: space.sandbox.manager.v1.SandboxManager.ListSnapshots:input_type -> space.sandbox.manager.v1.ListSnapshotsRequest
-	117, // 256: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:input_type -> space.sandbox.manager.v1.DeleteSnapshotsRequest
-	119, // 257: space.sandbox.manager.v1.SandboxManager.Rollback:input_type -> space.sandbox.manager.v1.RollbackRequest
-	121, // 258: space.sandbox.manager.v1.SandboxManager.Stats:input_type -> space.sandbox.manager.v1.StatsRequest
-	123, // 259: space.sandbox.manager.v1.SandboxManager.Update:input_type -> space.sandbox.manager.v1.UpdateRequest
-	157, // 260: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:input_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
-	159, // 261: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:input_type -> space.sandbox.manager.v1.TouchAutoLifecycleRequest
-	201, // 262: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
-	203, // 263: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
-	206, // 264: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:input_type -> space.sandbox.manager.v1.ListPendingLocalBackupsRequest
-	162, // 265: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:input_type -> space.sandbox.manager.v1.GetNetworkPolicyRequest
-	164, // 266: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:input_type -> space.sandbox.manager.v1.SetNetworkPolicyRequest
-	166, // 267: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:input_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
-	168, // 268: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:input_type -> space.sandbox.manager.v1.CycleNetGatewayRequest
-	125, // 269: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:input_type -> space.sandbox.manager.v1.SpacedPingGuestRequest
-	127, // 270: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:input_type -> space.sandbox.manager.v1.SpacedGetStatusRequest
-	130, // 271: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:input_type -> space.sandbox.manager.v1.SpacedWaitReadyRequest
-	132, // 272: space.sandbox.manager.v1.SandboxManager.SpacedStat:input_type -> space.sandbox.manager.v1.SpacedStatRequest
-	133, // 273: space.sandbox.manager.v1.SandboxManager.SpacedList:input_type -> space.sandbox.manager.v1.SpacedListRequest
-	134, // 274: space.sandbox.manager.v1.SandboxManager.SpacedRead:input_type -> space.sandbox.manager.v1.SpacedReadRequest
-	135, // 275: space.sandbox.manager.v1.SandboxManager.SpacedWrite:input_type -> space.sandbox.manager.v1.SpacedWriteRequest
-	136, // 276: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:input_type -> space.sandbox.manager.v1.SpacedWriteBatchRequest
-	137, // 277: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:input_type -> space.sandbox.manager.v1.SpacedMkdirRequest
-	138, // 278: space.sandbox.manager.v1.SandboxManager.SpacedRemove:input_type -> space.sandbox.manager.v1.SpacedRemoveRequest
-	139, // 279: space.sandbox.manager.v1.SandboxManager.SpacedRename:input_type -> space.sandbox.manager.v1.SpacedRenameRequest
-	140, // 280: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:input_type -> space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
-	141, // 281: space.sandbox.manager.v1.SandboxManager.SpacedWatch:input_type -> space.sandbox.manager.v1.SpacedWatchRequest
-	142, // 282: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:input_type -> space.sandbox.manager.v1.SpacedCreateWatcherRequest
-	143, // 283: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:input_type -> space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
-	144, // 284: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:input_type -> space.sandbox.manager.v1.SpacedRemoveWatcherRequest
-	145, // 285: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:input_type -> space.sandbox.manager.v1.SpacedEnableFileChangesRequest
-	146, // 286: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:input_type -> space.sandbox.manager.v1.SpacedDisableFileChangesRequest
-	147, // 287: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:input_type -> space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
-	148, // 288: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:input_type -> space.sandbox.manager.v1.SpacedStartProcessRequest
-	149, // 289: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:input_type -> space.sandbox.manager.v1.SpacedConnectProcessRequest
-	150, // 290: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:input_type -> space.sandbox.manager.v1.SpacedListProcessesRequest
-	152, // 291: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:input_type -> space.sandbox.manager.v1.SpacedSendSignalRequest
-	153, // 292: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:input_type -> space.sandbox.manager.v1.SpacedSendInputRequest
-	154, // 293: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:input_type -> space.sandbox.manager.v1.SpacedCloseStdinRequest
-	155, // 294: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:input_type -> space.sandbox.manager.v1.SpacedResizePtyRequest
-	156, // 295: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:input_type -> space.sandbox.manager.v1.SpacedKillProcessRequest
-	192, // 296: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
-	193, // 297: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
-	259, // 298: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:input_type -> space.net.gateway.v1.ServicePortIngressFrame
-	170, // 299: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:input_type -> space.sandbox.manager.v1.AdoptPoolSandboxRequest
-	172, // 300: space.sandbox.manager.v1.SandboxManager.Wait:input_type -> space.sandbox.manager.v1.WaitRequest
-	174, // 301: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:input_type -> space.sandbox.manager.v1.CloneFromDonorRequest
-	176, // 302: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:input_type -> space.sandbox.manager.v1.ExportSnapshotRequest
-	180, // 303: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:input_type -> space.sandbox.manager.v1.ImportSnapshotRequest
-	184, // 304: space.sandbox.manager.v1.SandboxManager.ExportSandbox:input_type -> space.sandbox.manager.v1.ExportSandboxRequest
-	188, // 305: space.sandbox.manager.v1.SandboxManager.ImportSandbox:input_type -> space.sandbox.manager.v1.ImportSandboxRequest
-	194, // 306: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:input_type -> space.sandbox.manager.v1.ResolveSandboxMemoryRequest
-	32,  // 307: space.sandbox.manager.v1.SandboxManager.GuestUpdateStatus:output_type -> space.sandbox.manager.v1.GuestUpdateOperation
-	32,  // 308: space.sandbox.manager.v1.SandboxManager.ApplyGuestUpdate:output_type -> space.sandbox.manager.v1.GuestUpdateOperation
-	32,  // 309: space.sandbox.manager.v1.SandboxManager.RestartGuest:output_type -> space.sandbox.manager.v1.GuestUpdateOperation
-	212, // 310: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:output_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
-	40,  // 311: space.sandbox.manager.v1.SandboxManager.Create:output_type -> space.sandbox.manager.v1.CreateResponse
-	42,  // 312: space.sandbox.manager.v1.SandboxManager.Start:output_type -> space.sandbox.manager.v1.StartResponse
-	44,  // 313: space.sandbox.manager.v1.SandboxManager.Stop:output_type -> space.sandbox.manager.v1.StopResponse
-	46,  // 314: space.sandbox.manager.v1.SandboxManager.Kill:output_type -> space.sandbox.manager.v1.KillResponse
-	48,  // 315: space.sandbox.manager.v1.SandboxManager.Delete:output_type -> space.sandbox.manager.v1.DeleteResponse
-	50,  // 316: space.sandbox.manager.v1.SandboxManager.State:output_type -> space.sandbox.manager.v1.StateResponse
-	62,  // 317: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:output_type -> space.sandbox.manager.v1.GetSandboxHealthResponse
-	52,  // 318: space.sandbox.manager.v1.SandboxManager.GetEnv:output_type -> space.sandbox.manager.v1.GetEnvResponse
-	65,  // 319: space.sandbox.manager.v1.SandboxManager.List:output_type -> space.sandbox.manager.v1.ListResponse
-	56,  // 320: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:output_type -> space.sandbox.manager.v1.CleanupTargetBatch
-	67,  // 321: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:output_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
-	70,  // 322: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:output_type -> space.sandbox.manager.v1.GetDiskUsageResponse
-	72,  // 323: space.sandbox.manager.v1.SandboxManager.Cleanup:output_type -> space.sandbox.manager.v1.CleanupResponse
-	75,  // 324: space.sandbox.manager.v1.SandboxManager.ListTemplates:output_type -> space.sandbox.manager.v1.ListTemplatesResponse
-	77,  // 325: space.sandbox.manager.v1.SandboxManager.Pause:output_type -> space.sandbox.manager.v1.PauseResponse
-	79,  // 326: space.sandbox.manager.v1.SandboxManager.Resume:output_type -> space.sandbox.manager.v1.ResumeResponse
-	83,  // 327: space.sandbox.manager.v1.SandboxManager.Wake:output_type -> space.sandbox.manager.v1.WakeResponse
-	85,  // 328: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:output_type -> space.sandbox.manager.v1.CreateSnapshotResponse
-	210, // 329: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:output_type -> space.sandbox.manager.v1.WaitTemplateAppsResponse
-	92,  // 330: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:output_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
-	95,  // 331: space.sandbox.manager.v1.SandboxManager.Suspend:output_type -> space.sandbox.manager.v1.SuspendResponse
-	198, // 332: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:output_type -> space.sandbox.manager.v1.PrepareTeardownSuspendResponse
-	98,  // 333: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:output_type -> space.sandbox.manager.v1.EnqueueArtifactBackupResponse
-	100, // 334: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:output_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
-	104, // 335: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:output_type -> space.sandbox.manager.v1.UpgradeRuntimeResponse
-	108, // 336: space.sandbox.manager.v1.SandboxManager.GetRuntimeUpgrade:output_type -> space.sandbox.manager.v1.GetRuntimeUpgradeResponse
-	107, // 337: space.sandbox.manager.v1.SandboxManager.AbandonRuntimeUpgrade:output_type -> space.sandbox.manager.v1.AbandonRuntimeUpgradeResponse
-	110, // 338: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:output_type -> space.sandbox.manager.v1.EnableSnapshotsResponse
-	112, // 339: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:output_type -> space.sandbox.manager.v1.DisableSnapshotsResponse
-	114, // 340: space.sandbox.manager.v1.SandboxManager.ListSnapshots:output_type -> space.sandbox.manager.v1.ListSnapshotsResponse
-	118, // 341: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:output_type -> space.sandbox.manager.v1.DeleteSnapshotsResponse
-	120, // 342: space.sandbox.manager.v1.SandboxManager.Rollback:output_type -> space.sandbox.manager.v1.RollbackResponse
-	122, // 343: space.sandbox.manager.v1.SandboxManager.Stats:output_type -> space.sandbox.manager.v1.StatsResponse
-	124, // 344: space.sandbox.manager.v1.SandboxManager.Update:output_type -> space.sandbox.manager.v1.UpdateResponse
-	158, // 345: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:output_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
-	161, // 346: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:output_type -> space.sandbox.manager.v1.TouchAutoLifecycleResponse
-	202, // 347: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
-	204, // 348: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
-	207, // 349: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:output_type -> space.sandbox.manager.v1.ListPendingLocalBackupsResponse
-	163, // 350: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:output_type -> space.sandbox.manager.v1.GetNetworkPolicyResponse
-	165, // 351: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:output_type -> space.sandbox.manager.v1.SetNetworkPolicyResponse
-	167, // 352: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:output_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
-	169, // 353: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:output_type -> space.sandbox.manager.v1.CycleNetGatewayResponse
-	126, // 354: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:output_type -> space.sandbox.manager.v1.SpacedPingGuestResponse
-	128, // 355: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:output_type -> space.sandbox.manager.v1.SpacedGetStatusResponse
-	131, // 356: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:output_type -> space.sandbox.manager.v1.SpacedWaitReadyResponse
-	260, // 357: space.sandbox.manager.v1.SandboxManager.SpacedStat:output_type -> space.spaced.operations.v1.StatResponse
-	261, // 358: space.sandbox.manager.v1.SandboxManager.SpacedList:output_type -> space.spaced.operations.v1.FileInfo
-	262, // 359: space.sandbox.manager.v1.SandboxManager.SpacedRead:output_type -> space.spaced.operations.v1.FileChunk
-	263, // 360: space.sandbox.manager.v1.SandboxManager.SpacedWrite:output_type -> space.spaced.operations.v1.WriteResponse
-	264, // 361: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:output_type -> space.spaced.operations.v1.WriteBatchResponse
-	265, // 362: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:output_type -> space.spaced.operations.v1.MkdirResponse
-	266, // 363: space.sandbox.manager.v1.SandboxManager.SpacedRemove:output_type -> space.spaced.operations.v1.RemoveResponse
-	267, // 364: space.sandbox.manager.v1.SandboxManager.SpacedRename:output_type -> space.spaced.operations.v1.RenameResponse
-	268, // 365: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:output_type -> space.spaced.operations.v1.NormalizeWatchRootResponse
-	269, // 366: space.sandbox.manager.v1.SandboxManager.SpacedWatch:output_type -> space.spaced.operations.v1.FileEvent
-	270, // 367: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:output_type -> space.spaced.operations.v1.CreateWatcherResponse
-	271, // 368: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:output_type -> space.spaced.operations.v1.GetWatcherEventsResponse
-	272, // 369: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:output_type -> space.spaced.operations.v1.RemoveWatcherResponse
-	273, // 370: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:output_type -> space.spaced.operations.v1.EnableFileChangesResponse
-	274, // 371: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:output_type -> space.spaced.operations.v1.DisableFileChangesResponse
-	275, // 372: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:output_type -> space.spaced.operations.v1.GetModifiedFilesResponse
-	276, // 373: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:output_type -> space.spaced.operations.v1.ProcessEvent
-	276, // 374: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:output_type -> space.spaced.operations.v1.ProcessEvent
-	151, // 375: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:output_type -> space.sandbox.manager.v1.SpacedListProcessesResponse
-	277, // 376: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:output_type -> space.spaced.operations.v1.SendSignalResponse
-	278, // 377: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:output_type -> space.spaced.operations.v1.SendInputResponse
-	279, // 378: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:output_type -> space.spaced.operations.v1.CloseStdinResponse
-	280, // 379: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:output_type -> space.spaced.operations.v1.ResizePtyResponse
-	281, // 380: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:output_type -> space.spaced.operations.v1.KillResponse
-	282, // 381: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:output_type -> space.spaced.operations.v1.OpenLoopbackBridgeResponse
-	283, // 382: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:output_type -> space.spaced.operations.v1.CloseLoopbackBridgeResponse
-	259, // 383: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:output_type -> space.net.gateway.v1.ServicePortIngressFrame
-	171, // 384: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:output_type -> space.sandbox.manager.v1.AdoptPoolSandboxResponse
-	173, // 385: space.sandbox.manager.v1.SandboxManager.Wait:output_type -> space.sandbox.manager.v1.WaitResponse
-	175, // 386: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:output_type -> space.sandbox.manager.v1.CloneFromDonorResponse
-	177, // 387: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:output_type -> space.sandbox.manager.v1.ExportSnapshotChunk
-	183, // 388: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:output_type -> space.sandbox.manager.v1.ImportSnapshotResponse
-	185, // 389: space.sandbox.manager.v1.SandboxManager.ExportSandbox:output_type -> space.sandbox.manager.v1.ExportSandboxChunk
-	191, // 390: space.sandbox.manager.v1.SandboxManager.ImportSandbox:output_type -> space.sandbox.manager.v1.ImportSandboxResponse
-	195, // 391: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:output_type -> space.sandbox.manager.v1.ResolveSandboxMemoryResponse
-	307, // [307:392] is the sub-list for method output_type
-	222, // [222:307] is the sub-list for method input_type
-	222, // [222:222] is the sub-list for extension type_name
-	222, // [222:222] is the sub-list for extension extendee
-	0,   // [0:222] is the sub-list for field type_name
+	88,  // 98: space.sandbox.manager.v1.CreateSnapshotSource.current_sandbox:type_name -> space.sandbox.manager.v1.CurrentSandboxSnapshotSource
+	90,  // 99: space.sandbox.manager.v1.CreateSnapshotSource.durable_artifact:type_name -> space.sandbox.manager.v1.DurableArtifactSnapshotSource
+	91,  // 100: space.sandbox.manager.v1.CreateSnapshotSource.classed_durable_artifact:type_name -> space.sandbox.manager.v1.ClassedDurableArtifactSnapshotSource
+	23,  // 101: space.sandbox.manager.v1.DurableArtifactSnapshotSource.destination_origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
+	90,  // 102: space.sandbox.manager.v1.ClassedDurableArtifactSnapshotSource.artifact:type_name -> space.sandbox.manager.v1.DurableArtifactSnapshotSource
+	20,  // 103: space.sandbox.manager.v1.ClassedDurableArtifactSnapshotSource.storage_class:type_name -> space.sandbox.manager.v1.ForkDiskStorageClass
+	20,  // 104: space.sandbox.manager.v1.PublishedDurableArtifact.verified_disk_storage_class:type_name -> space.sandbox.manager.v1.ForkDiskStorageClass
+	21,  // 105: space.sandbox.manager.v1.SuspendRequest.format:type_name -> space.sandbox.manager.v1.SuspendSnapshotFormat
+	22,  // 106: space.sandbox.manager.v1.PublishedArtifact.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	23,  // 107: space.sandbox.manager.v1.PublishedArtifact.origin:type_name -> space.sandbox.manager.v1.ArtifactOrigin
+	96,  // 108: space.sandbox.manager.v1.SuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
+	22,  // 109: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.expected_artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	98,  // 110: space.sandbox.manager.v1.EnqueueArtifactBackupRequest.current_instance:type_name -> space.sandbox.manager.v1.CurrentInstanceSource
+	22,  // 111: space.sandbox.manager.v1.EnqueueArtifactBackupResponse.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	103, // 112: space.sandbox.manager.v1.UpgradeRuntimeRequest.authorization:type_name -> space.sandbox.manager.v1.RuntimeUpgradeAuthorization
+	42,  // 113: space.sandbox.manager.v1.UpgradeRuntimeRequest.start:type_name -> space.sandbox.manager.v1.StartRequest
+	17,  // 114: space.sandbox.manager.v1.UpgradeRuntimeRequest.target_state:type_name -> space.sandbox.manager.v1.WakeTargetState
+	105, // 115: space.sandbox.manager.v1.UpgradeRuntimeRequest.stage_from:type_name -> space.sandbox.manager.v1.RuntimeUpgradeStageFrom
+	24,  // 116: space.sandbox.manager.v1.UpgradeRuntimeResponse.outcome:type_name -> space.sandbox.manager.v1.RuntimeUpgradeOutcome
+	43,  // 117: space.sandbox.manager.v1.UpgradeRuntimeResponse.start:type_name -> space.sandbox.manager.v1.StartResponse
+	25,  // 118: space.sandbox.manager.v1.GetRuntimeUpgradeResponse.status:type_name -> space.sandbox.manager.v1.RuntimeUpgradeStatus
+	26,  // 119: space.sandbox.manager.v1.GetRuntimeUpgradeResponse.phase:type_name -> space.sandbox.manager.v1.RuntimeUpgradePhase
+	117, // 120: space.sandbox.manager.v1.ListSnapshotsResponse.snapshots:type_name -> space.sandbox.manager.v1.SnapshotDetail
+	18,  // 121: space.sandbox.manager.v1.SnapshotDetail.type:type_name -> space.sandbox.manager.v1.SnapshotType
+	118, // 122: space.sandbox.manager.v1.SnapshotDetail.locations:type_name -> space.sandbox.manager.v1.SnapshotLocation
+	229, // 123: space.sandbox.manager.v1.RollbackRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	229, // 124: space.sandbox.manager.v1.RollbackResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	219, // 125: space.sandbox.manager.v1.UpdateRequest.process_env:type_name -> space.sandbox.manager.v1.UpdateRequest.ProcessEnvEntry
+	225, // 126: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_uptime:type_name -> google.protobuf.Duration
+	131, // 127: space.sandbox.manager.v1.SpacedGetStatusResponse.host_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
+	131, // 128: space.sandbox.manager.v1.SpacedGetStatusResponse.guest_version:type_name -> space.sandbox.manager.v1.SpacedVersionInfo
+	225, // 129: space.sandbox.manager.v1.SpacedWaitReadyRequest.timeout:type_name -> google.protobuf.Duration
+	225, // 130: space.sandbox.manager.v1.SpacedWaitReadyResponse.guest_uptime:type_name -> google.protobuf.Duration
+	233, // 131: space.sandbox.manager.v1.SpacedStatRequest.operation:type_name -> space.spaced.operations.v1.StatRequest
+	234, // 132: space.sandbox.manager.v1.SpacedListRequest.operation:type_name -> space.spaced.operations.v1.ListRequest
+	235, // 133: space.sandbox.manager.v1.SpacedReadRequest.operation:type_name -> space.spaced.operations.v1.ReadRequest
+	236, // 134: space.sandbox.manager.v1.SpacedWriteRequest.operation:type_name -> space.spaced.operations.v1.WriteRequest
+	237, // 135: space.sandbox.manager.v1.SpacedWriteBatchRequest.operation:type_name -> space.spaced.operations.v1.WriteBatchRequest
+	238, // 136: space.sandbox.manager.v1.SpacedMkdirRequest.operation:type_name -> space.spaced.operations.v1.MkdirRequest
+	239, // 137: space.sandbox.manager.v1.SpacedRemoveRequest.operation:type_name -> space.spaced.operations.v1.RemoveRequest
+	240, // 138: space.sandbox.manager.v1.SpacedRenameRequest.operation:type_name -> space.spaced.operations.v1.RenameRequest
+	241, // 139: space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest.operation:type_name -> space.spaced.operations.v1.NormalizeWatchRootRequest
+	242, // 140: space.sandbox.manager.v1.SpacedWatchRequest.operation:type_name -> space.spaced.operations.v1.WatchRequest
+	243, // 141: space.sandbox.manager.v1.SpacedCreateWatcherRequest.operation:type_name -> space.spaced.operations.v1.CreateWatcherRequest
+	244, // 142: space.sandbox.manager.v1.SpacedGetWatcherEventsRequest.operation:type_name -> space.spaced.operations.v1.GetWatcherEventsRequest
+	245, // 143: space.sandbox.manager.v1.SpacedRemoveWatcherRequest.operation:type_name -> space.spaced.operations.v1.RemoveWatcherRequest
+	246, // 144: space.sandbox.manager.v1.SpacedEnableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.EnableFileChangesRequest
+	247, // 145: space.sandbox.manager.v1.SpacedDisableFileChangesRequest.operation:type_name -> space.spaced.operations.v1.DisableFileChangesRequest
+	248, // 146: space.sandbox.manager.v1.SpacedGetModifiedFilesRequest.operation:type_name -> space.spaced.operations.v1.GetModifiedFilesRequest
+	249, // 147: space.sandbox.manager.v1.SpacedStartProcessRequest.operation:type_name -> space.spaced.operations.v1.StartRequest
+	250, // 148: space.sandbox.manager.v1.SpacedConnectProcessRequest.operation:type_name -> space.spaced.operations.v1.ConnectProcessRequest
+	251, // 149: space.sandbox.manager.v1.SpacedListProcessesRequest.operation:type_name -> space.spaced.operations.v1.ListProcessesRequest
+	252, // 150: space.sandbox.manager.v1.SpacedListProcessesResponse.processes:type_name -> space.spaced.operations.v1.ProcessInfo
+	253, // 151: space.sandbox.manager.v1.SpacedSendSignalRequest.operation:type_name -> space.spaced.operations.v1.SendSignalRequest
+	254, // 152: space.sandbox.manager.v1.SpacedSendInputRequest.operation:type_name -> space.spaced.operations.v1.SendInputRequest
+	255, // 153: space.sandbox.manager.v1.SpacedCloseStdinRequest.operation:type_name -> space.spaced.operations.v1.CloseStdinRequest
+	256, // 154: space.sandbox.manager.v1.SpacedResizePtyRequest.operation:type_name -> space.spaced.operations.v1.ResizePtyRequest
+	257, // 155: space.sandbox.manager.v1.SpacedKillProcessRequest.operation:type_name -> space.spaced.operations.v1.KillRequest
+	37,  // 156: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	228, // 157: space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	37,  // 158: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.effective_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	228, // 159: space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	5,   // 160: space.sandbox.manager.v1.TouchAutoLifecycleRequest.source:type_name -> space.sandbox.manager.v1.AutoLifecycleActivitySource
+	226, // 161: space.sandbox.manager.v1.TouchAutoLifecycleRequest.observed_at:type_name -> google.protobuf.Timestamp
+	162, // 162: space.sandbox.manager.v1.TouchAutoLifecycleRequest.access_idle_update:type_name -> space.sandbox.manager.v1.AccessIdleUpdate
+	226, // 163: space.sandbox.manager.v1.AccessIdleUpdate.expires_at:type_name -> google.protobuf.Timestamp
+	226, // 164: space.sandbox.manager.v1.AccessIdleUpdate.extend_until:type_name -> google.protobuf.Timestamp
+	37,  // 165: space.sandbox.manager.v1.AccessIdleUpdate.reset_policy:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	6,   // 166: space.sandbox.manager.v1.TouchAutoLifecycleResponse.result:type_name -> space.sandbox.manager.v1.AutoLifecycleTouchResult
+	198, // 167: space.sandbox.manager.v1.GetNetworkPolicyResponse.policies:type_name -> space.sandbox.manager.v1.NetworkPolicyDetail
+	227, // 168: space.sandbox.manager.v1.SetNetworkPolicyRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 169: space.sandbox.manager.v1.SetNetworkPolicyRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	227, // 170: space.sandbox.manager.v1.SetNetworkPolicyResponse.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	230, // 171: space.sandbox.manager.v1.SetNetworkPolicyResponse.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
+	258, // 172: space.sandbox.manager.v1.SetNetworkPolicyResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
+	228, // 173: space.sandbox.manager.v1.SetNetworkPolicyResponse.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	227, // 174: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 175: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	258, // 176: space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse.apply_decision:type_name -> space.net.policy.v1.NetworkPolicyApplyDecision
+	220, // 177: space.sandbox.manager.v1.AdoptPoolSandboxRequest.env:type_name -> space.sandbox.manager.v1.AdoptPoolSandboxRequest.EnvEntry
+	37,  // 178: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	227, // 179: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 180: space.sandbox.manager.v1.AdoptPoolSandboxRequest.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	227, // 181: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 182: space.sandbox.manager.v1.AdoptPoolSandboxRequest.template_network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	228, // 183: space.sandbox.manager.v1.AdoptPoolSandboxRequest.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	229, // 184: space.sandbox.manager.v1.AdoptPoolSandboxRequest.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	229, // 185: space.sandbox.manager.v1.AdoptPoolSandboxResponse.route_identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	10,  // 186: space.sandbox.manager.v1.WaitResponse.lifecycle:type_name -> space.sandbox.manager.v1.SandboxLifecycleState
+	59,  // 187: space.sandbox.manager.v1.WaitResponse.cleanup:type_name -> space.sandbox.manager.v1.SandboxCleanup
+	180, // 188: space.sandbox.manager.v1.ExportSnapshotChunk.header:type_name -> space.sandbox.manager.v1.ExportSnapshotHeader
+	181, // 189: space.sandbox.manager.v1.ExportSnapshotChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSnapshotFileChunk
+	18,  // 190: space.sandbox.manager.v1.ExportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
+	183, // 191: space.sandbox.manager.v1.ImportSnapshotRequest.header:type_name -> space.sandbox.manager.v1.ImportSnapshotHeader
+	184, // 192: space.sandbox.manager.v1.ImportSnapshotRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSnapshotFileChunk
+	18,  // 193: space.sandbox.manager.v1.ImportSnapshotHeader.snapshot_type:type_name -> space.sandbox.manager.v1.SnapshotType
+	188, // 194: space.sandbox.manager.v1.ExportSandboxChunk.header:type_name -> space.sandbox.manager.v1.ExportSandboxHeader
+	189, // 195: space.sandbox.manager.v1.ExportSandboxChunk.chunk:type_name -> space.sandbox.manager.v1.ExportSandboxFileChunk
+	221, // 196: space.sandbox.manager.v1.ExportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ExportSandboxHeader.EnvEntry
+	37,  // 197: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	227, // 198: space.sandbox.manager.v1.ExportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 199: space.sandbox.manager.v1.ExportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	228, // 200: space.sandbox.manager.v1.ExportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	231, // 201: space.sandbox.manager.v1.ExportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
+	191, // 202: space.sandbox.manager.v1.ImportSandboxRequest.header:type_name -> space.sandbox.manager.v1.ImportSandboxHeader
+	192, // 203: space.sandbox.manager.v1.ImportSandboxRequest.chunk:type_name -> space.sandbox.manager.v1.ImportSandboxFileChunk
+	222, // 204: space.sandbox.manager.v1.ImportSandboxHeader.env:type_name -> space.sandbox.manager.v1.ImportSandboxHeader.EnvEntry
+	37,  // 205: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	227, // 206: space.sandbox.manager.v1.ImportSandboxHeader.network_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	228, // 207: space.sandbox.manager.v1.ImportSandboxHeader.network_policy_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	228, // 208: space.sandbox.manager.v1.ImportSandboxHeader.auto_lifecycle_authority:type_name -> space.net.policy.v1.PolicyAuthority
+	231, // 209: space.sandbox.manager.v1.ImportSandboxHeader.execution:type_name -> space.execution.v1.ExecutionMetadata
+	37,  // 210: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle:type_name -> space.sandbox.manager.v1.AutoLifecyclePolicy
+	39,  // 211: space.sandbox.manager.v1.ImportSandboxResponse.auto_lifecycle_status:type_name -> space.sandbox.manager.v1.AutoLifecycleStatus
+	259, // 212: space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.OpenLoopbackBridgeRequest
+	260, // 213: space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest.operation:type_name -> space.spaced.operations.v1.CloseLoopbackBridgeRequest
+	227, // 214: space.sandbox.manager.v1.NetworkPolicyDetail.effective_policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	230, // 215: space.sandbox.manager.v1.NetworkPolicyDetail.applied_source:type_name -> space.net.policy.v1.NetworkPolicySource
+	228, // 216: space.sandbox.manager.v1.NetworkPolicyDetail.authority:type_name -> space.net.policy.v1.PolicyAuthority
+	27,  // 217: space.sandbox.manager.v1.PrepareTeardownSuspendRequest.action:type_name -> space.sandbox.manager.v1.TeardownSuspendAction
+	28,  // 218: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.outcome:type_name -> space.sandbox.manager.v1.TeardownSuspendOutcome
+	96,  // 219: space.sandbox.manager.v1.PrepareTeardownSuspendResponse.published_artifact:type_name -> space.sandbox.manager.v1.PublishedArtifact
+	22,  // 220: space.sandbox.manager.v1.RestoreArtifactAsNewContext.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	202, // 221: space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse.receipts:type_name -> space.sandbox.manager.v1.AutoLifecycleDeleteReceipt
+	22,  // 222: space.sandbox.manager.v1.PendingLocalBackup.artifact_kind:type_name -> space.sandbox.manager.v1.ArtifactKind
+	207, // 223: space.sandbox.manager.v1.ListPendingLocalBackupsResponse.pending:type_name -> space.sandbox.manager.v1.PendingLocalBackup
+	29,  // 224: space.sandbox.manager.v1.QuarantineRecoveryObservation.observed_owner:type_name -> space.sandbox.manager.v1.QuarantineRecoveryObservedOwner
+	226, // 225: space.sandbox.manager.v1.QuarantineRecoveryObservation.next_attempt_at:type_name -> google.protobuf.Timestamp
+	30,  // 226: space.sandbox.manager.v1.SandboxManager.GuestUpdateStatus:input_type -> space.sandbox.manager.v1.GuestUpdateStatusRequest
+	31,  // 227: space.sandbox.manager.v1.SandboxManager.ApplyGuestUpdate:input_type -> space.sandbox.manager.v1.ApplyGuestUpdateRequest
+	32,  // 228: space.sandbox.manager.v1.SandboxManager.RestartGuest:input_type -> space.sandbox.manager.v1.RestartGuestRequest
+	213, // 229: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:input_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesRequest
+	40,  // 230: space.sandbox.manager.v1.SandboxManager.Create:input_type -> space.sandbox.manager.v1.CreateRequest
+	42,  // 231: space.sandbox.manager.v1.SandboxManager.Start:input_type -> space.sandbox.manager.v1.StartRequest
+	44,  // 232: space.sandbox.manager.v1.SandboxManager.Stop:input_type -> space.sandbox.manager.v1.StopRequest
+	46,  // 233: space.sandbox.manager.v1.SandboxManager.Kill:input_type -> space.sandbox.manager.v1.KillRequest
+	48,  // 234: space.sandbox.manager.v1.SandboxManager.Delete:input_type -> space.sandbox.manager.v1.DeleteRequest
+	50,  // 235: space.sandbox.manager.v1.SandboxManager.State:input_type -> space.sandbox.manager.v1.StateRequest
+	62,  // 236: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:input_type -> space.sandbox.manager.v1.GetSandboxHealthRequest
+	52,  // 237: space.sandbox.manager.v1.SandboxManager.GetEnv:input_type -> space.sandbox.manager.v1.GetEnvRequest
+	54,  // 238: space.sandbox.manager.v1.SandboxManager.List:input_type -> space.sandbox.manager.v1.ListRequest
+	55,  // 239: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:input_type -> space.sandbox.manager.v1.ScanCleanupTargetsRequest
+	67,  // 240: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:input_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesRequest
+	69,  // 241: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:input_type -> space.sandbox.manager.v1.GetDiskUsageRequest
+	72,  // 242: space.sandbox.manager.v1.SandboxManager.Cleanup:input_type -> space.sandbox.manager.v1.CleanupRequest
+	74,  // 243: space.sandbox.manager.v1.SandboxManager.ListTemplates:input_type -> space.sandbox.manager.v1.ListTemplatesRequest
+	77,  // 244: space.sandbox.manager.v1.SandboxManager.Pause:input_type -> space.sandbox.manager.v1.PauseRequest
+	79,  // 245: space.sandbox.manager.v1.SandboxManager.Resume:input_type -> space.sandbox.manager.v1.ResumeRequest
+	81,  // 246: space.sandbox.manager.v1.SandboxManager.Wake:input_type -> space.sandbox.manager.v1.WakeRequest
+	85,  // 247: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:input_type -> space.sandbox.manager.v1.CreateSnapshotRequest
+	211, // 248: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:input_type -> space.sandbox.manager.v1.WaitTemplateAppsRequest
+	93,  // 249: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:input_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotRequest
+	95,  // 250: space.sandbox.manager.v1.SandboxManager.Suspend:input_type -> space.sandbox.manager.v1.SuspendRequest
+	199, // 251: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:input_type -> space.sandbox.manager.v1.PrepareTeardownSuspendRequest
+	99,  // 252: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:input_type -> space.sandbox.manager.v1.EnqueueArtifactBackupRequest
+	101, // 253: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:input_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxRequest
+	104, // 254: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:input_type -> space.sandbox.manager.v1.UpgradeRuntimeRequest
+	107, // 255: space.sandbox.manager.v1.SandboxManager.GetRuntimeUpgrade:input_type -> space.sandbox.manager.v1.GetRuntimeUpgradeRequest
+	108, // 256: space.sandbox.manager.v1.SandboxManager.AbandonRuntimeUpgrade:input_type -> space.sandbox.manager.v1.AbandonRuntimeUpgradeRequest
+	111, // 257: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:input_type -> space.sandbox.manager.v1.EnableSnapshotsRequest
+	113, // 258: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:input_type -> space.sandbox.manager.v1.DisableSnapshotsRequest
+	115, // 259: space.sandbox.manager.v1.SandboxManager.ListSnapshots:input_type -> space.sandbox.manager.v1.ListSnapshotsRequest
+	119, // 260: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:input_type -> space.sandbox.manager.v1.DeleteSnapshotsRequest
+	121, // 261: space.sandbox.manager.v1.SandboxManager.Rollback:input_type -> space.sandbox.manager.v1.RollbackRequest
+	123, // 262: space.sandbox.manager.v1.SandboxManager.Stats:input_type -> space.sandbox.manager.v1.StatsRequest
+	125, // 263: space.sandbox.manager.v1.SandboxManager.Update:input_type -> space.sandbox.manager.v1.UpdateRequest
+	159, // 264: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:input_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest
+	161, // 265: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:input_type -> space.sandbox.manager.v1.TouchAutoLifecycleRequest
+	203, // 266: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsRequest
+	205, // 267: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:input_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsRequest
+	208, // 268: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:input_type -> space.sandbox.manager.v1.ListPendingLocalBackupsRequest
+	164, // 269: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:input_type -> space.sandbox.manager.v1.GetNetworkPolicyRequest
+	166, // 270: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:input_type -> space.sandbox.manager.v1.SetNetworkPolicyRequest
+	168, // 271: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:input_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedRequest
+	170, // 272: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:input_type -> space.sandbox.manager.v1.CycleNetGatewayRequest
+	127, // 273: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:input_type -> space.sandbox.manager.v1.SpacedPingGuestRequest
+	129, // 274: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:input_type -> space.sandbox.manager.v1.SpacedGetStatusRequest
+	132, // 275: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:input_type -> space.sandbox.manager.v1.SpacedWaitReadyRequest
+	134, // 276: space.sandbox.manager.v1.SandboxManager.SpacedStat:input_type -> space.sandbox.manager.v1.SpacedStatRequest
+	135, // 277: space.sandbox.manager.v1.SandboxManager.SpacedList:input_type -> space.sandbox.manager.v1.SpacedListRequest
+	136, // 278: space.sandbox.manager.v1.SandboxManager.SpacedRead:input_type -> space.sandbox.manager.v1.SpacedReadRequest
+	137, // 279: space.sandbox.manager.v1.SandboxManager.SpacedWrite:input_type -> space.sandbox.manager.v1.SpacedWriteRequest
+	138, // 280: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:input_type -> space.sandbox.manager.v1.SpacedWriteBatchRequest
+	139, // 281: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:input_type -> space.sandbox.manager.v1.SpacedMkdirRequest
+	140, // 282: space.sandbox.manager.v1.SandboxManager.SpacedRemove:input_type -> space.sandbox.manager.v1.SpacedRemoveRequest
+	141, // 283: space.sandbox.manager.v1.SandboxManager.SpacedRename:input_type -> space.sandbox.manager.v1.SpacedRenameRequest
+	142, // 284: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:input_type -> space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest
+	143, // 285: space.sandbox.manager.v1.SandboxManager.SpacedWatch:input_type -> space.sandbox.manager.v1.SpacedWatchRequest
+	144, // 286: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:input_type -> space.sandbox.manager.v1.SpacedCreateWatcherRequest
+	145, // 287: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:input_type -> space.sandbox.manager.v1.SpacedGetWatcherEventsRequest
+	146, // 288: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:input_type -> space.sandbox.manager.v1.SpacedRemoveWatcherRequest
+	147, // 289: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:input_type -> space.sandbox.manager.v1.SpacedEnableFileChangesRequest
+	148, // 290: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:input_type -> space.sandbox.manager.v1.SpacedDisableFileChangesRequest
+	149, // 291: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:input_type -> space.sandbox.manager.v1.SpacedGetModifiedFilesRequest
+	150, // 292: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:input_type -> space.sandbox.manager.v1.SpacedStartProcessRequest
+	151, // 293: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:input_type -> space.sandbox.manager.v1.SpacedConnectProcessRequest
+	152, // 294: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:input_type -> space.sandbox.manager.v1.SpacedListProcessesRequest
+	154, // 295: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:input_type -> space.sandbox.manager.v1.SpacedSendSignalRequest
+	155, // 296: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:input_type -> space.sandbox.manager.v1.SpacedSendInputRequest
+	156, // 297: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:input_type -> space.sandbox.manager.v1.SpacedCloseStdinRequest
+	157, // 298: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:input_type -> space.sandbox.manager.v1.SpacedResizePtyRequest
+	158, // 299: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:input_type -> space.sandbox.manager.v1.SpacedKillProcessRequest
+	194, // 300: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest
+	195, // 301: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:input_type -> space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest
+	261, // 302: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:input_type -> space.net.gateway.v1.ServicePortIngressFrame
+	172, // 303: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:input_type -> space.sandbox.manager.v1.AdoptPoolSandboxRequest
+	174, // 304: space.sandbox.manager.v1.SandboxManager.Wait:input_type -> space.sandbox.manager.v1.WaitRequest
+	176, // 305: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:input_type -> space.sandbox.manager.v1.CloneFromDonorRequest
+	178, // 306: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:input_type -> space.sandbox.manager.v1.ExportSnapshotRequest
+	182, // 307: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:input_type -> space.sandbox.manager.v1.ImportSnapshotRequest
+	186, // 308: space.sandbox.manager.v1.SandboxManager.ExportSandbox:input_type -> space.sandbox.manager.v1.ExportSandboxRequest
+	190, // 309: space.sandbox.manager.v1.SandboxManager.ImportSandbox:input_type -> space.sandbox.manager.v1.ImportSandboxRequest
+	196, // 310: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:input_type -> space.sandbox.manager.v1.ResolveSandboxMemoryRequest
+	33,  // 311: space.sandbox.manager.v1.SandboxManager.GuestUpdateStatus:output_type -> space.sandbox.manager.v1.GuestUpdateOperation
+	33,  // 312: space.sandbox.manager.v1.SandboxManager.ApplyGuestUpdate:output_type -> space.sandbox.manager.v1.GuestUpdateOperation
+	33,  // 313: space.sandbox.manager.v1.SandboxManager.RestartGuest:output_type -> space.sandbox.manager.v1.GuestUpdateOperation
+	214, // 314: space.sandbox.manager.v1.SandboxManager.GetExecutionCapabilities:output_type -> space.sandbox.manager.v1.GetExecutionCapabilitiesResponse
+	41,  // 315: space.sandbox.manager.v1.SandboxManager.Create:output_type -> space.sandbox.manager.v1.CreateResponse
+	43,  // 316: space.sandbox.manager.v1.SandboxManager.Start:output_type -> space.sandbox.manager.v1.StartResponse
+	45,  // 317: space.sandbox.manager.v1.SandboxManager.Stop:output_type -> space.sandbox.manager.v1.StopResponse
+	47,  // 318: space.sandbox.manager.v1.SandboxManager.Kill:output_type -> space.sandbox.manager.v1.KillResponse
+	49,  // 319: space.sandbox.manager.v1.SandboxManager.Delete:output_type -> space.sandbox.manager.v1.DeleteResponse
+	51,  // 320: space.sandbox.manager.v1.SandboxManager.State:output_type -> space.sandbox.manager.v1.StateResponse
+	63,  // 321: space.sandbox.manager.v1.SandboxManager.GetSandboxHealth:output_type -> space.sandbox.manager.v1.GetSandboxHealthResponse
+	53,  // 322: space.sandbox.manager.v1.SandboxManager.GetEnv:output_type -> space.sandbox.manager.v1.GetEnvResponse
+	66,  // 323: space.sandbox.manager.v1.SandboxManager.List:output_type -> space.sandbox.manager.v1.ListResponse
+	57,  // 324: space.sandbox.manager.v1.SandboxManager.ScanCleanupTargets:output_type -> space.sandbox.manager.v1.CleanupTargetBatch
+	68,  // 325: space.sandbox.manager.v1.SandboxManager.ListBuildReferencingSandboxes:output_type -> space.sandbox.manager.v1.ListBuildReferencingSandboxesResponse
+	71,  // 326: space.sandbox.manager.v1.SandboxManager.GetDiskUsage:output_type -> space.sandbox.manager.v1.GetDiskUsageResponse
+	73,  // 327: space.sandbox.manager.v1.SandboxManager.Cleanup:output_type -> space.sandbox.manager.v1.CleanupResponse
+	76,  // 328: space.sandbox.manager.v1.SandboxManager.ListTemplates:output_type -> space.sandbox.manager.v1.ListTemplatesResponse
+	78,  // 329: space.sandbox.manager.v1.SandboxManager.Pause:output_type -> space.sandbox.manager.v1.PauseResponse
+	80,  // 330: space.sandbox.manager.v1.SandboxManager.Resume:output_type -> space.sandbox.manager.v1.ResumeResponse
+	84,  // 331: space.sandbox.manager.v1.SandboxManager.Wake:output_type -> space.sandbox.manager.v1.WakeResponse
+	86,  // 332: space.sandbox.manager.v1.SandboxManager.CreateSnapshot:output_type -> space.sandbox.manager.v1.CreateSnapshotResponse
+	212, // 333: space.sandbox.manager.v1.SandboxManager.WaitTemplateApps:output_type -> space.sandbox.manager.v1.WaitTemplateAppsResponse
+	94,  // 334: space.sandbox.manager.v1.SandboxManager.CreateTemplateBaseSnapshot:output_type -> space.sandbox.manager.v1.CreateTemplateBaseSnapshotResponse
+	97,  // 335: space.sandbox.manager.v1.SandboxManager.Suspend:output_type -> space.sandbox.manager.v1.SuspendResponse
+	200, // 336: space.sandbox.manager.v1.SandboxManager.PrepareTeardownSuspend:output_type -> space.sandbox.manager.v1.PrepareTeardownSuspendResponse
+	100, // 337: space.sandbox.manager.v1.SandboxManager.EnqueueArtifactBackup:output_type -> space.sandbox.manager.v1.EnqueueArtifactBackupResponse
+	102, // 338: space.sandbox.manager.v1.SandboxManager.EvictClusterDeletedSandbox:output_type -> space.sandbox.manager.v1.EvictClusterDeletedSandboxResponse
+	106, // 339: space.sandbox.manager.v1.SandboxManager.UpgradeRuntime:output_type -> space.sandbox.manager.v1.UpgradeRuntimeResponse
+	110, // 340: space.sandbox.manager.v1.SandboxManager.GetRuntimeUpgrade:output_type -> space.sandbox.manager.v1.GetRuntimeUpgradeResponse
+	109, // 341: space.sandbox.manager.v1.SandboxManager.AbandonRuntimeUpgrade:output_type -> space.sandbox.manager.v1.AbandonRuntimeUpgradeResponse
+	112, // 342: space.sandbox.manager.v1.SandboxManager.EnableSnapshots:output_type -> space.sandbox.manager.v1.EnableSnapshotsResponse
+	114, // 343: space.sandbox.manager.v1.SandboxManager.DisableSnapshots:output_type -> space.sandbox.manager.v1.DisableSnapshotsResponse
+	116, // 344: space.sandbox.manager.v1.SandboxManager.ListSnapshots:output_type -> space.sandbox.manager.v1.ListSnapshotsResponse
+	120, // 345: space.sandbox.manager.v1.SandboxManager.DeleteSnapshots:output_type -> space.sandbox.manager.v1.DeleteSnapshotsResponse
+	122, // 346: space.sandbox.manager.v1.SandboxManager.Rollback:output_type -> space.sandbox.manager.v1.RollbackResponse
+	124, // 347: space.sandbox.manager.v1.SandboxManager.Stats:output_type -> space.sandbox.manager.v1.StatsResponse
+	126, // 348: space.sandbox.manager.v1.SandboxManager.Update:output_type -> space.sandbox.manager.v1.UpdateResponse
+	160, // 349: space.sandbox.manager.v1.SandboxManager.SetAutoLifecyclePolicy:output_type -> space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse
+	163, // 350: space.sandbox.manager.v1.SandboxManager.TouchAutoLifecycle:output_type -> space.sandbox.manager.v1.TouchAutoLifecycleResponse
+	204, // 351: space.sandbox.manager.v1.SandboxManager.ListAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.ListAutoLifecycleDeleteReceiptsResponse
+	206, // 352: space.sandbox.manager.v1.SandboxManager.AcknowledgeAutoLifecycleDeleteReceipts:output_type -> space.sandbox.manager.v1.AcknowledgeAutoLifecycleDeleteReceiptsResponse
+	209, // 353: space.sandbox.manager.v1.SandboxManager.ListPendingLocalBackups:output_type -> space.sandbox.manager.v1.ListPendingLocalBackupsResponse
+	165, // 354: space.sandbox.manager.v1.SandboxManager.GetNetworkPolicy:output_type -> space.sandbox.manager.v1.GetNetworkPolicyResponse
+	167, // 355: space.sandbox.manager.v1.SandboxManager.SetNetworkPolicy:output_type -> space.sandbox.manager.v1.SetNetworkPolicyResponse
+	169, // 356: space.sandbox.manager.v1.SandboxManager.TemplateNetworkPolicyUpdated:output_type -> space.sandbox.manager.v1.TemplateNetworkPolicyUpdatedResponse
+	171, // 357: space.sandbox.manager.v1.SandboxManager.CycleNetGateway:output_type -> space.sandbox.manager.v1.CycleNetGatewayResponse
+	128, // 358: space.sandbox.manager.v1.SandboxManager.SpacedPingGuest:output_type -> space.sandbox.manager.v1.SpacedPingGuestResponse
+	130, // 359: space.sandbox.manager.v1.SandboxManager.SpacedGetStatus:output_type -> space.sandbox.manager.v1.SpacedGetStatusResponse
+	133, // 360: space.sandbox.manager.v1.SandboxManager.SpacedWaitReady:output_type -> space.sandbox.manager.v1.SpacedWaitReadyResponse
+	262, // 361: space.sandbox.manager.v1.SandboxManager.SpacedStat:output_type -> space.spaced.operations.v1.StatResponse
+	263, // 362: space.sandbox.manager.v1.SandboxManager.SpacedList:output_type -> space.spaced.operations.v1.FileInfo
+	264, // 363: space.sandbox.manager.v1.SandboxManager.SpacedRead:output_type -> space.spaced.operations.v1.FileChunk
+	265, // 364: space.sandbox.manager.v1.SandboxManager.SpacedWrite:output_type -> space.spaced.operations.v1.WriteResponse
+	266, // 365: space.sandbox.manager.v1.SandboxManager.SpacedWriteBatch:output_type -> space.spaced.operations.v1.WriteBatchResponse
+	267, // 366: space.sandbox.manager.v1.SandboxManager.SpacedMkdir:output_type -> space.spaced.operations.v1.MkdirResponse
+	268, // 367: space.sandbox.manager.v1.SandboxManager.SpacedRemove:output_type -> space.spaced.operations.v1.RemoveResponse
+	269, // 368: space.sandbox.manager.v1.SandboxManager.SpacedRename:output_type -> space.spaced.operations.v1.RenameResponse
+	270, // 369: space.sandbox.manager.v1.SandboxManager.SpacedNormalizeWatchRoot:output_type -> space.spaced.operations.v1.NormalizeWatchRootResponse
+	271, // 370: space.sandbox.manager.v1.SandboxManager.SpacedWatch:output_type -> space.spaced.operations.v1.FileEvent
+	272, // 371: space.sandbox.manager.v1.SandboxManager.SpacedCreateWatcher:output_type -> space.spaced.operations.v1.CreateWatcherResponse
+	273, // 372: space.sandbox.manager.v1.SandboxManager.SpacedGetWatcherEvents:output_type -> space.spaced.operations.v1.GetWatcherEventsResponse
+	274, // 373: space.sandbox.manager.v1.SandboxManager.SpacedRemoveWatcher:output_type -> space.spaced.operations.v1.RemoveWatcherResponse
+	275, // 374: space.sandbox.manager.v1.SandboxManager.SpacedEnableFileChanges:output_type -> space.spaced.operations.v1.EnableFileChangesResponse
+	276, // 375: space.sandbox.manager.v1.SandboxManager.SpacedDisableFileChanges:output_type -> space.spaced.operations.v1.DisableFileChangesResponse
+	277, // 376: space.sandbox.manager.v1.SandboxManager.SpacedGetModifiedFiles:output_type -> space.spaced.operations.v1.GetModifiedFilesResponse
+	278, // 377: space.sandbox.manager.v1.SandboxManager.SpacedStartProcess:output_type -> space.spaced.operations.v1.ProcessEvent
+	278, // 378: space.sandbox.manager.v1.SandboxManager.SpacedConnectProcess:output_type -> space.spaced.operations.v1.ProcessEvent
+	153, // 379: space.sandbox.manager.v1.SandboxManager.SpacedListProcesses:output_type -> space.sandbox.manager.v1.SpacedListProcessesResponse
+	279, // 380: space.sandbox.manager.v1.SandboxManager.SpacedSendSignal:output_type -> space.spaced.operations.v1.SendSignalResponse
+	280, // 381: space.sandbox.manager.v1.SandboxManager.SpacedSendInput:output_type -> space.spaced.operations.v1.SendInputResponse
+	281, // 382: space.sandbox.manager.v1.SandboxManager.SpacedCloseStdin:output_type -> space.spaced.operations.v1.CloseStdinResponse
+	282, // 383: space.sandbox.manager.v1.SandboxManager.SpacedResizePty:output_type -> space.spaced.operations.v1.ResizePtyResponse
+	283, // 384: space.sandbox.manager.v1.SandboxManager.SpacedKillProcess:output_type -> space.spaced.operations.v1.KillResponse
+	284, // 385: space.sandbox.manager.v1.SandboxManager.SpacedOpenLoopbackBridge:output_type -> space.spaced.operations.v1.OpenLoopbackBridgeResponse
+	285, // 386: space.sandbox.manager.v1.SandboxManager.SpacedCloseLoopbackBridge:output_type -> space.spaced.operations.v1.CloseLoopbackBridgeResponse
+	261, // 387: space.sandbox.manager.v1.SandboxManager.ServicePortIngress:output_type -> space.net.gateway.v1.ServicePortIngressFrame
+	173, // 388: space.sandbox.manager.v1.SandboxManager.AdoptPoolSandbox:output_type -> space.sandbox.manager.v1.AdoptPoolSandboxResponse
+	175, // 389: space.sandbox.manager.v1.SandboxManager.Wait:output_type -> space.sandbox.manager.v1.WaitResponse
+	177, // 390: space.sandbox.manager.v1.SandboxManager.CloneFromDonor:output_type -> space.sandbox.manager.v1.CloneFromDonorResponse
+	179, // 391: space.sandbox.manager.v1.SandboxManager.ExportSnapshot:output_type -> space.sandbox.manager.v1.ExportSnapshotChunk
+	185, // 392: space.sandbox.manager.v1.SandboxManager.ImportSnapshot:output_type -> space.sandbox.manager.v1.ImportSnapshotResponse
+	187, // 393: space.sandbox.manager.v1.SandboxManager.ExportSandbox:output_type -> space.sandbox.manager.v1.ExportSandboxChunk
+	193, // 394: space.sandbox.manager.v1.SandboxManager.ImportSandbox:output_type -> space.sandbox.manager.v1.ImportSandboxResponse
+	197, // 395: space.sandbox.manager.v1.SandboxManager.ResolveSandboxMemory:output_type -> space.sandbox.manager.v1.ResolveSandboxMemoryResponse
+	311, // [311:396] is the sub-list for method output_type
+	226, // [226:311] is the sub-list for method input_type
+	226, // [226:226] is the sub-list for extension type_name
+	226, // [226:226] is the sub-list for extension extendee
+	0,   // [0:226] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_manager_v1_manager_proto_init() }
@@ -16617,69 +16760,71 @@ func file_sandbox_manager_v1_manager_proto_init() {
 	file_sandbox_manager_v1_manager_proto_msgTypes[59].OneofWrappers = []any{
 		(*CreateSnapshotSource_CurrentSandbox)(nil),
 		(*CreateSnapshotSource_DurableArtifact)(nil),
+		(*CreateSnapshotSource_ClassedDurableArtifact)(nil),
 	}
 	file_sandbox_manager_v1_manager_proto_msgTypes[62].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[65].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[63].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[66].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[68].OneofWrappers = []any{
+	file_sandbox_manager_v1_manager_proto_msgTypes[67].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[69].OneofWrappers = []any{
 		(*EnqueueArtifactBackupRequest_CurrentInstance)(nil),
 		(*EnqueueArtifactBackupRequest_SnapshotName)(nil),
 		(*EnqueueArtifactBackupRequest_LocalArtifactId)(nil),
 	}
-	file_sandbox_manager_v1_manager_proto_msgTypes[73].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[74].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[75].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[76].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[79].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[86].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[77].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[80].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[87].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[88].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[90].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[89].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[91].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[94].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[99].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[101].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[92].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[95].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[100].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[102].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[131].OneofWrappers = []any{
+	file_sandbox_manager_v1_manager_proto_msgTypes[103].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[132].OneofWrappers = []any{
 		(*AccessIdleUpdate_ExtendUntil)(nil),
 		(*AccessIdleUpdate_ResetPolicy)(nil),
 	}
-	file_sandbox_manager_v1_manager_proto_msgTypes[135].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[141].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[136].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[142].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[143].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[144].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[145].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[148].OneofWrappers = []any{
+	file_sandbox_manager_v1_manager_proto_msgTypes[146].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[149].OneofWrappers = []any{
 		(*ExportSnapshotChunk_Header)(nil),
 		(*ExportSnapshotChunk_Chunk)(nil),
 	}
-	file_sandbox_manager_v1_manager_proto_msgTypes[151].OneofWrappers = []any{
+	file_sandbox_manager_v1_manager_proto_msgTypes[152].OneofWrappers = []any{
 		(*ImportSnapshotRequest_Header)(nil),
 		(*ImportSnapshotRequest_Chunk)(nil),
 	}
-	file_sandbox_manager_v1_manager_proto_msgTypes[152].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[156].OneofWrappers = []any{
+	file_sandbox_manager_v1_manager_proto_msgTypes[153].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[157].OneofWrappers = []any{
 		(*ExportSandboxChunk_Header)(nil),
 		(*ExportSandboxChunk_Chunk)(nil),
 	}
-	file_sandbox_manager_v1_manager_proto_msgTypes[157].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[159].OneofWrappers = []any{
+	file_sandbox_manager_v1_manager_proto_msgTypes[158].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[160].OneofWrappers = []any{
 		(*ImportSandboxRequest_Header)(nil),
 		(*ImportSandboxRequest_Chunk)(nil),
 	}
-	file_sandbox_manager_v1_manager_proto_msgTypes[160].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[162].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[169].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[161].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[163].OneofWrappers = []any{}
 	file_sandbox_manager_v1_manager_proto_msgTypes[170].OneofWrappers = []any{}
-	file_sandbox_manager_v1_manager_proto_msgTypes[179].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[171].OneofWrappers = []any{}
+	file_sandbox_manager_v1_manager_proto_msgTypes[180].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sandbox_manager_v1_manager_proto_rawDesc), len(file_sandbox_manager_v1_manager_proto_rawDesc)),
-			NumEnums:      29,
-			NumMessages:   192,
+			NumEnums:      30,
+			NumMessages:   193,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

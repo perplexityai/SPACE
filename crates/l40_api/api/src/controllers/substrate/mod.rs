@@ -582,6 +582,15 @@ pub struct PublishedDurableSnapshot {
     pub bytes_published: u64,
 }
 
+pub(crate) struct CopyDurableArtifact {
+    pub operation_id: OperationId,
+    pub source_sandbox_id: SandboxId,
+    pub target_sandbox_id: SandboxId,
+    pub source_storage_uri: String,
+    pub destination_storage_uri: String,
+    pub disk_storage_class: Option<pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass>,
+}
+
 /// Substrate-synthesized inventory row. The direct substrate never produces
 /// this (the database is the source of truth); substrates that own their own
 /// node view synthesize entries so builder-only nodes and idle workers stay
@@ -1910,40 +1919,44 @@ impl Substrate {
     /// Copy a durable artifact into a new sandbox's snapshot on the node
     /// behind `target`. Shared over any substrate: the adapter only says how
     /// to reach the node.
-    pub async fn create_snapshot_from_durable_artifact(
+    pub(crate) async fn create_snapshot_from_durable_artifact(
         &self,
         target: &NodeApiTarget<'_>,
-        operation_id: OperationId,
-        source_sandbox_id: SandboxId,
-        target_sandbox_id: SandboxId,
-        source_storage_uri: String,
-        destination_storage_uri: String,
+        copy: CopyDurableArtifact,
     ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
+        use pplx_space_sbx_mgr_client::proto::{
+            ArtifactOrigin, ClassedDurableArtifactSnapshotSource, DurableArtifactSnapshotSource,
+            create_snapshot_source::Source,
+        };
+        let artifact = DurableArtifactSnapshotSource {
+            source_storage_uri: copy.source_storage_uri,
+            destination_storage_uri: copy.destination_storage_uri,
+            destination_sandbox_id: copy.target_sandbox_id.to_string(),
+            destination_origin: ArtifactOrigin::Fork as i32,
+        };
+        let source = match copy.disk_storage_class {
+            Some(class) => Source::ClassedDurableArtifact(ClassedDurableArtifactSnapshotSource {
+                artifact: Some(artifact),
+                storage_class: class as i32,
+            }),
+            None => Source::DurableArtifact(artifact),
+        };
         let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
         let mut node_api = retrying_worker_node_api(&endpoint_addr, Duration::from_secs(30))?;
         let mut client = RetryingWorkerApiClient::new(&mut node_api);
         let response = client
             .create_sandbox_snapshot(
                 pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest {
-                    sandbox_id: source_sandbox_id.to_string(),
+                    sandbox_id: copy.source_sandbox_id.to_string(),
                     r#type: pplx_space_sbx_mgr_client::proto::SnapshotType::Disk as i32,
                     label: None,
                     creation_identity: Some(
                         pplx_space_sbx_mgr_client::proto::SnapshotCreationIdentity {
-                            request_id: operation_id.as_uuid().to_string(),
+                            request_id: copy.operation_id.as_uuid().to_string(),
                         },
                     ),
                     source: Some(pplx_space_sbx_mgr_client::proto::CreateSnapshotSource {
-                        source: Some(
-                            pplx_space_sbx_mgr_client::proto::create_snapshot_source::Source::DurableArtifact(
-                                pplx_space_sbx_mgr_client::proto::DurableArtifactSnapshotSource {
-                                    source_storage_uri,
-                                    destination_storage_uri,
-                                    destination_sandbox_id: target_sandbox_id.to_string(),
-                                    destination_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Fork as i32,
-                                },
-                            ),
-                        ),
+                        source: Some(source),
                     }),
                 },
                 Duration::from_secs(600),
@@ -1957,6 +1970,16 @@ impl Substrate {
                 .ok_or_else(|| SubstrateError::Failed {
                     message: "durable snapshot response omitted its storage identity".to_string(),
                 })?;
+        if copy
+            .disk_storage_class
+            .is_some_and(|class| published.verified_disk_storage_class != Some(class as i32))
+        {
+            return Err(durable_snapshot_rpc_error(
+                tonic::Status::failed_precondition(
+                    "durable snapshot response did not verify the requested storage class",
+                ),
+            ));
+        }
         Ok(PublishedDurableSnapshot {
             storage_uri: published.storage_uri,
             bytes_published: published.bytes_published,

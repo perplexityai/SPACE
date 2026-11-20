@@ -99,9 +99,22 @@ impl std::fmt::Debug for ApiRunConfig {
 pub struct ApiExtensions {
     external_console_authenticator:
         Option<std::sync::Arc<dyn crate::external_console::ExternalConsoleAuthenticator>>,
+    benchmark_fork_access: Option<crate::fork_operations::BenchmarkForkAccess>,
 }
 
 impl ApiExtensions {
+    /// Mount the suspended-fork benchmark route for one authenticated
+    /// API key in one organization. Not configured by the stock binary.
+    pub fn with_benchmark_fork_access(
+        mut self,
+        org_id: pplx_space_accounts::OrgId,
+        api_key_id: uuid::Uuid,
+    ) -> Self {
+        self.benchmark_fork_access =
+            Some(crate::fork_operations::BenchmarkForkAccess { org_id, api_key_id });
+        self
+    }
+
     /// Authenticate console browser requests with `authenticator` instead of
     /// SPACE password sessions. [`run_with`] reads the console settings from
     /// the environment ([`crate::external_console::ExternalConsoleSettings::from_env`])
@@ -253,6 +266,7 @@ pub async fn run_with(
         route_ed25519_authority.map(std::sync::Arc::new),
     )
     .await?;
+    state.benchmark_fork_access = extensions.benchmark_fork_access;
     if let Some(external_console) = external_console {
         let password_session_emails = external_console.settings().password_session_emails();
         // Reported on the limiter heartbeat cadence rather than once: a gauge

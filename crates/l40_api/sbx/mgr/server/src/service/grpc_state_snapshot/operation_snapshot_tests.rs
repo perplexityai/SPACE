@@ -25,13 +25,47 @@ fn operation_snapshot_accepts_the_current_sandbox_source() {
 }
 
 #[test]
-fn operation_snapshot_rejects_an_empty_source_union() {
-    let request = crate::proto::CreateSnapshotRequest {
-        source: Some(crate::proto::CreateSnapshotSource { source: None }),
+fn operation_snapshot_rejects_a_classed_source_dropped_by_an_old_forwarder() {
+    use crate::proto::{
+        ClassedDurableArtifactSnapshotSource, CreateSnapshotRequest, CreateSnapshotSource,
+        ForkDiskStorageClass, SnapshotCreationIdentity, create_snapshot_source::Source,
+    };
+    use prost::Message;
+
+    // The old decoder knows the outer request and source messages, but not
+    // the third source variant. Simulate decoding and forwarding that wire.
+    #[derive(Clone, PartialEq, Message)]
+    struct OldCreateSnapshotSource {}
+    #[derive(Clone, PartialEq, Message)]
+    struct OldCreateSnapshotRequest {
+        #[prost(message, optional, tag = "6")]
+        creation_identity: Option<SnapshotCreationIdentity>,
+        #[prost(message, optional, tag = "8")]
+        source: Option<OldCreateSnapshotSource>,
+    }
+    let request = CreateSnapshotRequest {
+        creation_identity: Some(SnapshotCreationIdentity {
+            request_id: Uuid::now_v7().to_string(),
+        }),
+        source: Some(CreateSnapshotSource {
+            source: Some(Source::ClassedDurableArtifact(
+                ClassedDurableArtifactSnapshotSource {
+                    artifact: Some(Default::default()),
+                    storage_class: ForkDiskStorageClass::GlacierInstantRetrieval as i32,
+                },
+            )),
+        }),
         ..Default::default()
     };
 
-    let error = current_snapshot_precondition(&request).unwrap_err();
+    let old = OldCreateSnapshotRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    let forwarded = CreateSnapshotRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(forwarded.creation_identity, request.creation_identity);
+    assert_eq!(
+        forwarded.source,
+        Some(CreateSnapshotSource { source: None })
+    );
+    let error = current_snapshot_precondition(&forwarded).unwrap_err();
 
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }

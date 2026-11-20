@@ -1,3 +1,4 @@
+use crate::proto::ForkDiskStorageClass;
 use pplx_space_accounts::JobId;
 use pplx_space_artifact_model::SnapshotArtifact;
 use pplx_space_node_disk_admission::{
@@ -9,8 +10,8 @@ use pplx_space_subject_model::SubjectId;
 use pplx_space_volmgr_client::{
     VOLMGR_SOCKET,
     proto::{
-        CopyObjectRequest, ExistingFilePolicy, GetTransferJobRequest, PullFileRequest,
-        PushFileRequest, TransferJobStatus,
+        CopyObjectRequest, CopyStorageClass, ExistingFilePolicy, GetTransferJobRequest,
+        PullFileRequest, PushFileRequest, TransferJobStatus,
     },
     snapshot_artifact_to_proto,
 };
@@ -203,6 +204,7 @@ pub(super) struct CopyObjectsRequest<'a> {
     pub(super) destination: &'a crate::snapshot_upload::SnapshotUploadConfig,
     pub(super) destination_storage_uri: String,
     pub(super) destination_origin: ArtifactOrigin,
+    pub(super) disk_storage_class: Option<ForkDiskStorageClass>,
 }
 
 pub(super) async fn copy_objects(
@@ -288,6 +290,7 @@ where
         destination,
         destination_storage_uri,
         destination_origin,
+        disk_storage_class,
     } = request;
     let metadata_path = copy_dir.join(SnapshotArtifact::Metadata.file_name());
     pull_object(
@@ -317,24 +320,30 @@ where
             source,
             destination,
             rootfs_artifact,
+            disk_storage_class,
         )
         .await
         {
             Ok(()) => Some(size),
             Err(error)
-                if matches!(
-                    error.code(),
-                    tonic::Code::Unimplemented
-                        | tonic::Code::InvalidArgument
-                        | tonic::Code::FailedPrecondition
-                        | tonic::Code::Aborted
-                ) =>
+                if disk_storage_class.is_none()
+                    && matches!(
+                        error.code(),
+                        tonic::Code::Unimplemented
+                            | tonic::Code::InvalidArgument
+                            | tonic::Code::FailedPrecondition
+                            | tonic::Code::Aborted
+                    ) =>
             {
                 tracing::warn!(%operation_id, %error, "server-side disk copy unavailable; using disk transfer");
                 None
             }
             Err(error) => return Err(error),
         }
+    } else if disk_storage_class.is_some() {
+        return Err(Status::failed_precondition(
+            "a classed fork requires source rootfs size metadata",
+        ));
     } else {
         None
     };
@@ -408,6 +417,7 @@ where
         published_durable_artifact: Some(crate::proto::PublishedDurableArtifact {
             storage_uri: destination_storage_uri,
             bytes_published: rootfs_bytes.saturating_add(metadata_uploaded),
+            verified_disk_storage_class: disk_storage_class.map(|class| class as i32),
         }),
     })
 }
@@ -418,26 +428,40 @@ async fn copy_remote_disk(
     source: &crate::snapshot_upload::SnapshotUploadConfig,
     destination: &crate::snapshot_upload::SnapshotUploadConfig,
     artifact: SnapshotArtifact,
+    disk_storage_class: Option<ForkDiskStorageClass>,
 ) -> Result<(), Status> {
     bounded_transfer(
         async {
-            let submitted = volmgr
-                .submit_copy_object(CopyObjectRequest {
-                    subject_id: SubjectId::Sandbox(sandbox_id).to_string(),
-                    source_s3_uri: artifact_uri(source, artifact),
-                    destination_s3_uri: artifact_uri(destination, artifact),
-                    destination_storage_class: None,
-                })
-                .await
-                .map_err(|error| match error.code() {
-                    tonic::Code::Unimplemented
-                    | tonic::Code::InvalidArgument
-                    | tonic::Code::FailedPrecondition
-                    | tonic::Code::PermissionDenied
-                    | tonic::Code::Unauthenticated => error,
-                    _ => Status::unavailable(format!("submit fork disk copy: {error}")),
-                })?
-                .into_inner();
+            let destination_storage_class = match disk_storage_class {
+                None => None,
+                Some(ForkDiskStorageClass::Standard) => Some(CopyStorageClass::Standard as i32),
+                Some(ForkDiskStorageClass::GlacierInstantRetrieval) => {
+                    Some(CopyStorageClass::GlacierInstantRetrieval as i32)
+                }
+                Some(ForkDiskStorageClass::Unspecified) => {
+                    return Err(Status::invalid_argument("invalid fork disk storage class"));
+                }
+            };
+            let request = CopyObjectRequest {
+                subject_id: SubjectId::Sandbox(sandbox_id).to_string(),
+                source_s3_uri: artifact_uri(source, artifact),
+                destination_s3_uri: artifact_uri(destination, artifact),
+                destination_storage_class,
+            };
+            let submitted = if destination_storage_class.is_some() {
+                volmgr.submit_classed_copy_object(request).await
+            } else {
+                volmgr.submit_copy_object(request).await
+            }
+            .map_err(|error| match error.code() {
+                tonic::Code::Unimplemented
+                | tonic::Code::InvalidArgument
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::PermissionDenied
+                | tonic::Code::Unauthenticated => error,
+                _ => Status::unavailable(format!("submit fork disk copy: {error}")),
+            })?
+            .into_inner();
             let job_id: JobId = submitted
                 .job_id
                 .parse()

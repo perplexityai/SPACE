@@ -7978,6 +7978,7 @@ dependencies = [
  "pplx-space-spaced-guest-protocol",
  "prost",
  "prost-types",
+ "serde",
  "thiserror 2.0.20",
  "tonic",
  "tonic-prost",

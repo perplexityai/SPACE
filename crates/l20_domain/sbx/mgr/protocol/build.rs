@@ -12,6 +12,22 @@ fn main() -> anyhow::Result<()> {
         pplx_space_spaced_build::protobuf_include_dir()?,
     ];
     let builder = tonic_prost_build::configure()
+        .enum_attribute(
+            ".space.sandbox.manager.v1.ForkDiskStorageClass",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .field_attribute(
+            ".space.sandbox.manager.v1.ForkDiskStorageClass.FORK_DISK_STORAGE_CLASS_UNSPECIFIED",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".space.sandbox.manager.v1.ForkDiskStorageClass.FORK_DISK_STORAGE_CLASS_STANDARD",
+            "#[serde(rename = \"STANDARD\")]",
+        )
+        .field_attribute(
+            ".space.sandbox.manager.v1.ForkDiskStorageClass.FORK_DISK_STORAGE_CLASS_GLACIER_INSTANT_RETRIEVAL",
+            "#[serde(rename = \"GLACIER_IR\")]",
+        )
         .extern_path(
             ".space.spaced.update.v1",
             "::pplx_space_spaced_guest_protocol::proto::update",

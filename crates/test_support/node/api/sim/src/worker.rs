@@ -724,7 +724,8 @@ impl WorkerApi for SimWorkerApiService {
             .and_then(|source| source.source)
             .and_then(|source| match source {
                 sbx::create_snapshot_source::Source::DurableArtifact(source) => Some(source),
-                sbx::create_snapshot_source::Source::CurrentSandbox(_) => None,
+                sbx::create_snapshot_source::Source::CurrentSandbox(_)
+                | sbx::create_snapshot_source::Source::ClassedDurableArtifact(_) => None,
             })
             .ok_or_else(|| Status::unimplemented("sim only supports durable snapshot sources"))?;
         self.state
@@ -738,6 +739,7 @@ impl WorkerApi for SimWorkerApiService {
             published_durable_artifact: Some(sbx::PublishedDurableArtifact {
                 storage_uri: durable_artifact.destination_storage_uri,
                 bytes_published: 0,
+                verified_disk_storage_class: None,
             }),
         }))
     }

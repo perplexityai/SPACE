@@ -1469,6 +1469,116 @@ async fn dedicated_host_root_allows_e2b_api_host() {
 }
 
 #[tokio::test]
+async fn benchmark_fork_requires_explicit_mount_and_exact_authenticated_pair() -> TestResult {
+    use super::fork::{BENCHMARK_FORK_PATH, benchmark_fork};
+    use crate::{
+        federated_identity::FederatedOwner,
+        fork_operations::BenchmarkForkAccess,
+        middleware::auth::{AuthApiKey, AuthFederatedOwner},
+        models::{ApiKey, User},
+        user_role::UserRole,
+    };
+
+    let mut state = test_state().await;
+    let source = SandboxId::new();
+    let request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/sandboxes/{source}/benchmark-fork"))
+            .header(header::HOST, TEST_ECW_API_HOST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "classed-replay")
+            .body(Body::from(r#"{"diskStorageClass":"GLACIER_IR"}"#))
+    };
+    let router = |state: AppState| {
+        path_root_router_with_ecw_hosts(state.clone(), test_ecw_host_config()).with_state(state)
+    };
+    assert_eq!(
+        e2b_api_routes()
+            .with_state(state.clone())
+            .oneshot(request()?)
+            .await?
+            .status(),
+        StatusCode::NOT_IMPLEMENTED
+    );
+
+    let grant = BenchmarkForkAccess {
+        org_id: OrgId::new(),
+        api_key_id: Uuid::now_v7(),
+    };
+    state.benchmark_fork_access = Some(grant);
+    assert_eq!(
+        router(state.clone()).oneshot(request()?).await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Emulate the already-authenticated middleware extensions. The state
+    // points to a closed loopback DB: a replay attempt cannot return 403.
+    let now = OffsetDateTime::now_utc();
+    for (org_id, key_org_id, key_id, federated) in [
+        (grant.org_id, grant.org_id, Uuid::now_v7(), false),
+        (OrgId::new(), grant.org_id, grant.api_key_id, false),
+        (grant.org_id, OrgId::new(), grant.api_key_id, false),
+        (grant.org_id, grant.org_id, grant.api_key_id, true),
+    ] {
+        let app = Router::new()
+            .route(BENCHMARK_FORK_PATH, axum::routing::post(benchmark_fork))
+            .layer(Extension(test_ecw_host_config()))
+            .layer(Extension(AuthEcwActor(Some(User {
+                id: UserId::new(),
+                email: "fixture@example.test".into(),
+                password_hash: String::new(),
+                display_name: "fixture".into(),
+                org_id,
+                role: UserRole::OrganizationAdmin,
+                owner_source: SandboxOwnerSource::Local,
+                created_at: now,
+                updated_at: now,
+            }))))
+            .layer(Extension(AuthOrg(Organization {
+                id: org_id,
+                name: "benchmark fixture".into(),
+                slug: "benchmark-fixture".into(),
+                parent_id: None,
+                theme_primary: None,
+                theme_secondary: None,
+                logo_url: None,
+                byok_enabled: false,
+                snapshot_base_object_storage_uri: None,
+                created_at: now,
+                updated_at: now,
+            })))
+            .layer(Extension(AuthApiKey(ApiKey {
+                id: key_id,
+                org_id: key_org_id,
+                name: "fixture".into(),
+                key_hash: String::new(),
+                created_by: None,
+                last_used_at: None,
+                federated_owner_assertions_enabled: false,
+                allowed_surfaces: vec![],
+                created_at: now,
+                updated_at: now,
+            })))
+            .with_state(state.clone());
+        let app = if federated {
+            app.layer(Extension(AuthFederatedOwner(FederatedOwner {
+                issuer: pplx_space_accounts::UpstreamIssuer::parse("fixture-issuer")?,
+                org_id: pplx_space_accounts::UpstreamOrgId::parse("fixture-org")?,
+                subject_id: pplx_space_accounts::UpstreamSubjectId::parse("fixture-subject")?,
+            })))
+        } else {
+            app
+        };
+        assert_eq!(
+            app.oneshot(request()?).await?.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn unsupported_e2b_endpoint_returns_e2b_error() {
     let state = test_state().await;
     let app = e2b_api_routes().with_state(state);

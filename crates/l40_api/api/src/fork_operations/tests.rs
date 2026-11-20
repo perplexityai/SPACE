@@ -72,6 +72,60 @@ fn payload_wire_version_and_validated_newtypes_round_trip() -> TestResult {
 }
 
 #[test]
+fn classed_fork_payload_fences_old_readers_and_keeps_legacy_fingerprint() -> TestResult {
+    use pplx_space_sbx_mgr_client::proto::ForkDiskStorageClass;
+
+    #[derive(Deserialize)]
+    #[serde(tag = "version")]
+    enum LegacyPayloadVersion {
+        #[serde(rename = "1")]
+        V1,
+    }
+    let source = SandboxId::new();
+    let plain = ForkRequest::from_wire(Some(60), Some(1))?;
+    let legacy_bytes = format!(
+        r#"{{"source_sandbox_id":{},"requested_timeout_seconds":60,"requested_count":1}}"#,
+        serde_json::to_string(&source)?
+    );
+    let legacy_fingerprint = fork_request_fingerprint(source, plain, None)?;
+    assert_eq!(
+        legacy_fingerprint.to_string(),
+        hex::encode(Sha256::digest(legacy_bytes))
+    );
+    assert_ne!(
+        fork_request_fingerprint(
+            source,
+            plain.with_disk_storage_class(ForkDiskStorageClass::Standard),
+            None
+        )?,
+        fork_request_fingerprint(
+            source,
+            plain.with_disk_storage_class(ForkDiskStorageClass::GlacierInstantRetrieval),
+            None
+        )?,
+    );
+    for (class, wire) in [
+        (ForkDiskStorageClass::Standard, "STANDARD"),
+        (ForkDiskStorageClass::GlacierInstantRetrieval, "GLACIER_IR"),
+    ] {
+        let classed = plain.with_disk_storage_class(class);
+        let payload = ForkSandboxPayloadV1::new(source, classed, "e2b.example.test".into());
+        let stored = serde_json::to_value(ForkSandboxPayload::from_payload(payload.clone()))?;
+        assert_eq!(stored["version"], "2");
+        assert_eq!(stored["payload"]["disk_storage_class"], wire);
+        assert!(serde_json::from_value::<LegacyPayloadVersion>(stored.clone()).is_err());
+        let decoded = decode_fork_payload(stored)?;
+        assert_eq!(decoded.disk_storage_class(), Some(class));
+        assert_eq!(decoded.target_sandbox_id(), payload.target_sandbox_id());
+        assert_ne!(
+            fork_request_fingerprint(source, classed, None)?,
+            legacy_fingerprint
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn new_admission_persists_the_explicit_v1_workflow() -> TestResult {
     let idempotency_key = IdempotencyKey::parse("explicit-v1-admission")?;
     let input = AdmitForkOperation {

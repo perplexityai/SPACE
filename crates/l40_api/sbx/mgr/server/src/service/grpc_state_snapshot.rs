@@ -313,11 +313,12 @@ fn current_snapshot_precondition(
                     lifecycle: source.lifecycle,
                 })
             }
-            Some(crate::proto::create_snapshot_source::Source::DurableArtifact(_)) => {
-                Err(Status::invalid_argument(
-                    "durable artifact source must use durable snapshot publication",
-                ))
-            }
+            Some(
+                crate::proto::create_snapshot_source::Source::DurableArtifact(_)
+                | crate::proto::create_snapshot_source::Source::ClassedDurableArtifact(_),
+            ) => Err(Status::invalid_argument(
+                "durable artifact source must use durable snapshot publication",
+            )),
             None => Err(Status::invalid_argument(
                 "create snapshot source must be specified",
             )),
@@ -1194,14 +1195,40 @@ impl SandboxManagerService {
             crate::proto::SnapshotType::Disk => pplx_space_snapshot_model::ArtifactKind::Disk,
             _ => pplx_space_snapshot_model::ArtifactKind::Full,
         };
-        if let Some(crate::proto::create_snapshot_source::Source::DurableArtifact(source)) = req
-            .source
-            .as_ref()
-            .and_then(|source| source.source.as_ref())
-        {
-            return self
-                .create_snapshot_from_durable_artifact(&req, source, artifact_kind)
-                .await;
+        if let Some(source) = &req.source {
+            use crate::proto::{ForkDiskStorageClass, create_snapshot_source::Source};
+            match source.source.as_ref() {
+                Some(Source::DurableArtifact(source)) => {
+                    return self
+                        .create_snapshot_from_durable_artifact(&req, source, artifact_kind, None)
+                        .await;
+                }
+                Some(Source::ClassedDurableArtifact(source)) => {
+                    let artifact = source.artifact.as_ref().ok_or_else(|| {
+                        Status::invalid_argument("classed snapshot source requires an artifact")
+                    })?;
+                    let class = ForkDiskStorageClass::try_from(source.storage_class)
+                        .ok()
+                        .filter(|class| *class != ForkDiskStorageClass::Unspecified)
+                        .ok_or_else(|| {
+                            Status::invalid_argument("invalid fork disk storage class")
+                        })?;
+                    return self
+                        .create_snapshot_from_durable_artifact(
+                            &req,
+                            artifact,
+                            artifact_kind,
+                            Some(class),
+                        )
+                        .await;
+                }
+                Some(Source::CurrentSandbox(_)) => {}
+                None => {
+                    return Err(Status::invalid_argument(
+                        "create snapshot source must be specified",
+                    ));
+                }
+            }
         }
 
         let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
@@ -1814,6 +1841,7 @@ impl SandboxManagerService {
         req: &crate::proto::CreateSnapshotRequest,
         source: &crate::proto::DurableArtifactSnapshotSource,
         artifact_kind: ArtifactKind,
+        disk_storage_class: Option<crate::proto::ForkDiskStorageClass>,
     ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
         if artifact_kind != ArtifactKind::Disk {
             return Err(Status::unimplemented(
@@ -1845,6 +1873,11 @@ impl SandboxManagerService {
             crate::snapshot_upload::SnapshotUploadConfig::from_uri(&source.destination_storage_uri)
                 .map_err(|_| Status::invalid_argument("invalid destination_storage_uri"))?;
         let destination_origin = durable_copy_destination_origin(source.destination_origin)?;
+        if disk_storage_class.is_some() && destination_origin != ArtifactOrigin::Fork {
+            return Err(Status::invalid_argument(
+                "classed durable copies require a fork destination",
+            ));
+        }
         if !source_storage.same_store(&destination_storage) {
             return Err(Status::invalid_argument(
                 "snapshot source and destination must use the same object store",
@@ -1868,6 +1901,7 @@ impl SandboxManagerService {
                 destination: &destination_storage,
                 destination_storage_uri: source.destination_storage_uri.clone(),
                 destination_origin,
+                disk_storage_class,
             },
         )
         .await
