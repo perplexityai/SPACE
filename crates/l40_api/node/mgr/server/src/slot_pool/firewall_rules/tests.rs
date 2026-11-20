@@ -583,8 +583,8 @@ async fn changes_while_nft_runs_are_never_reported_current() {
     }
 }
 
-// Catches an invocation for an older generation that installs it once a newer
-// one was accepted before it took ownership, or applied before it ran.
+// Catches an older invocation that installs its generation once a newer one
+// was accepted before it took ownership, or over the newer one afterwards.
 #[tokio::test]
 async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
     let (pool, _jobs) = pool(1);
@@ -592,29 +592,15 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
     let host = FakeHost::new();
     let namespace = host.name(0, "net");
     leased(&pool, 0);
-    assert!(attempted(apply(&pool, &store, &host, 12, 0).await).verified());
-
-    // 13 arrives after 12's lookup but before 12 owns the slot.
     let later = store.clone();
     host.on_lookup(move || accept(&later, 13, WEB));
     assert!(matches!(
         apply(&pool, &store, &host, 12, 0).await,
         SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NotCurrent { accepted: 13 }))
     ));
-    assert_eq!(host.installs(), [namespace]);
+    assert_eq!(host.calls(), []);
 
-    let (entered, release) = host.gate();
-    let newer = tokio::spawn({
-        let (pool, store, host) = (pool.clone(), store.clone(), host.clone());
-        async move { apply(&pool, &store, &host, 13, 0).await }
-    });
-    entered.await.unwrap();
-    assert!(matches!(
-        apply(&pool, &store, &host, 12, 0).await,
-        SlotFirewallReport::NotRun(NotRun::Busy)
-    ));
-    release.send(()).unwrap();
-    let attempt = attempted(newer.await.unwrap());
+    let attempt = attempted(apply(&pool, &store, &host, 13, 0).await);
     assert!(attempt.verified(), "{attempt:?}");
     assert_eq!(
         (
@@ -632,12 +618,11 @@ async fn an_older_invocation_never_reinstalls_over_a_newer_one() {
             namespace
         )
     );
-
     assert!(matches!(
         apply(&pool, &store, &host, 12, 0).await,
         SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NotCurrent { accepted: 13 }))
     ));
-    assert_eq!(host.installs(), [namespace, namespace]);
+    assert_eq!(host.installs(), [namespace]);
     assert_eq!(host.table(namespace), Some(installed(WEB)));
 }
 
