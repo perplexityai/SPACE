@@ -885,7 +885,10 @@ pub async fn run_reconcilers(
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
-                let sink = lost_started_sandboxes::LostStartedDbStore::new(pool.clone());
+                let sink = lost_started_sandboxes::LostStartedDbStore::new(
+                    pool.clone(),
+                    residency_evidence,
+                );
                 let presence = reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone());
                 handles.push(tokio::spawn(lost_started_sandboxes::run(
                     lost_started_config,

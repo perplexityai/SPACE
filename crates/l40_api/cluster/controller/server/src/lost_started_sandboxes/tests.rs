@@ -40,7 +40,7 @@
 //! - P9 `p9_only_recovery_failed_started_kubernetes_rows_are_listed`
 //! - P10 `p10_flip_rechecks_restore_sources_and_generation`
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
-//! - P12 `p12_census_groups_residents_and_counts_running_ones`
+//! - P12 `p12_census_counts_running_and_at_rest_residents`
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -263,10 +263,21 @@ impl LostStartedSink for Arc<FakeSink> {
         Ok(self.0.lock().unwrap().residents.clone())
     }
 
-    async fn stranded_counts(&self, node_id: NodeId) -> Result<StrandedCounts, sqlx::Error> {
+    async fn stranded_counts(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, StrandedCounts>, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
-        state.count_calls.push(node_id);
-        Ok(state.stranded.get(&node_id).copied().unwrap_or_default())
+        state.count_calls.extend_from_slice(node_ids);
+        Ok(node_ids
+            .iter()
+            .filter_map(|node_id| {
+                state
+                    .stranded
+                    .get(node_id)
+                    .map(|counts| (*node_id, *counts))
+            })
+            .collect())
     }
 }
 
@@ -553,7 +564,10 @@ impl LostStartedSink for HangingSink {
         unreachable!("the scan never returns")
     }
 
-    async fn stranded_counts(&self, _node_id: NodeId) -> Result<StrandedCounts, sqlx::Error> {
+    async fn stranded_counts(
+        &self,
+        _node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, StrandedCounts>, sqlx::Error> {
         unreachable!("the scan never returns")
     }
 }
@@ -627,6 +641,7 @@ async fn t12_absence_must_last_the_grace_and_restarts_on_return() {
 
 mod postgres_backed {
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_sandbox_residency::ResidencyEvidence;
     use pplx_space_snapshot_model::SnapshotId;
     use pplx_space_sql_locator::sql;
     use pplx_space_test_env::TestResult;
@@ -786,7 +801,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let lookup = Arc::new(FakeLookup::default());
 
         let report = Reconciler::new(config(), store, lookup.clone(), presence())
@@ -820,7 +835,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let lookup = Arc::new(FakeLookup::default().live(NODE_NAME));
 
         let report = Reconciler::new(config(), store, lookup.clone(), presence())
@@ -851,7 +866,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, false).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidates = listed(&store).await?;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source_node, SourceNode::RowDeleted);
@@ -870,7 +885,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         assert_eq!(listed(&store).await?.len(), 1);
 
         // Newer than the last command and access: restoring it rolls nothing
@@ -897,7 +912,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
 
         // From another node: it may still finalize.
         let other_node = insert_snapshot(
@@ -957,7 +972,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // A wake re-armed the execution after the scan.
@@ -983,7 +998,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // A same-name replacement registered after the EC2 lookup.
@@ -1021,24 +1036,68 @@ mod postgres_backed {
         .bind(seeded.node_id)
         .execute(&db.pool)
         .await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         assert!(listed(&store).await?.is_empty());
         Ok(())
     }
 
+    async fn census_counts(
+        store: &LostStartedDbStore,
+        node_id: NodeId,
+    ) -> TestResult<StrandedCounts> {
+        Ok(store
+            .stranded_counts(&[node_id])
+            .await?
+            .get(&node_id)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    /// A completed suspend on `node_id`: `active_node_id` cleared, the source
+    /// kept in `target_node_id`, and the only copy the local artifact the
+    /// returned id names, with no snapshot uploaded.
+    async fn seed_suspended_local_only(
+        pool: &PgPool,
+        node_id: NodeId,
+    ) -> TestResult<(SandboxId, uuid::Uuid)> {
+        let sandbox_id = SandboxId::new();
+        let artifact_id = uuid::Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes
+                (id, user_id, org_id, managed_by, lifecycle, placement,
+                 active_node_id, target_node_id, network_policy_generation,
+                 placement_changed_at, current_local_artifact_id,
+                 current_local_artifact_kind, current_local_artifact_origin,
+                 last_command_at, last_access_at)
+             VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'suspended', 'unplaced',
+                     NULL, $4, 1, NOW() - INTERVAL '1 hour', $5, 'full', 'suspend',
+                     NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')"
+        ))
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(node_id)
+        .bind(artifact_id)
+        .execute(pool)
+        .await?;
+        Ok((sandbox_id, artifact_id))
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn p12_census_groups_residents_and_counts_running_ones() -> TestResult {
+    async fn p12_census_counts_running_and_at_rest_residents() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
             return Ok(());
         };
         let registered_node = seed_stuck(&db.pool, true).await?;
         let deleted_row = seed_stuck(&db.pool, false).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
 
         let residents = store.node_residents().await?;
-        let find = |node_id: NodeId| residents.iter().find(|row| row.node_id == node_id).cloned();
+        let find = |residents: &[NodeResidents], node_id: NodeId| {
+            residents.iter().find(|row| row.node_id == node_id).cloned()
+        };
         assert_eq!(
-            find(registered_node.node_id),
+            find(&residents, registered_node.node_id),
             Some(NodeResidents {
                 node_id: registered_node.node_id,
                 source_node: SourceNode::Registered {
@@ -1049,30 +1108,65 @@ mod postgres_backed {
             })
         );
         assert_eq!(
-            find(deleted_row.node_id).map(|row| (row.source_node, row.residents)),
+            find(&residents, deleted_row.node_id).map(|row| (row.source_node, row.residents)),
             Some((SourceNode::RowDeleted, 1))
         );
         assert_eq!(
-            store
-                .stranded_counts(registered_node.node_id)
-                .await?
-                .running,
-            1
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 0)
         );
 
-        // At rest it no longer counts as running.
+        // A suspended sandbox whose only copy is on the node: the suspend
+        // cleared active_node_id, so the census must find it through
+        // target_node_id.
+        let (suspended_id, artifact_id) =
+            seed_suspended_local_only(&db.pool, registered_node.node_id).await?;
+        let residents = store.node_residents().await?;
+        assert_eq!(
+            find(&residents, registered_node.node_id).map(|row| row.residents),
+            Some(2)
+        );
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 1)
+        );
+        // Batched: each node gets its own counts.
+        let both = store
+            .stranded_counts(&[registered_node.node_id, deleted_row.node_id])
+            .await?;
+        assert_eq!(
+            both.get(&registered_node.node_id).copied(),
+            Some(counts(1, 1))
+        );
+        assert_eq!(both.get(&deleted_row.node_id).copied(), Some(counts(1, 0)));
+
+        // Once the artifact has a durable copy it restores from object
+        // storage and no longer counts.
+        let snapshot_id = SnapshotId::new();
         sqlx::query(sql!(
-            "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
+            "INSERT INTO snapshots
+                (id, sandbox_id, org_id, type, state, timestamp, source_node_id,
+                 local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, $3::uuid, 'full', 'ready', NOW(), $4,
+                     $5, 'full', 'suspend')"
         ))
-        .bind(registered_node.sandbox_id)
+        .bind(snapshot_id)
+        .bind(suspended_id)
+        .bind(SEED_ORG_ID)
+        .bind(registered_node.node_id)
+        .bind(artifact_id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://bucket/snapshot')"
+        ))
+        .bind(snapshot_id)
         .execute(&db.pool)
         .await?;
         assert_eq!(
-            store
-                .stranded_counts(registered_node.node_id)
-                .await?
-                .running,
-            0
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 0)
         );
 
         // Terminal residents and drained nodes drop out of the first pass.
@@ -1101,7 +1195,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // Each source appears after the scan; the flip must still refuse.
@@ -1191,7 +1285,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // Each change lands after the scan and must refuse the flip; undoing
@@ -1243,7 +1337,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, false).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         assert_eq!(listed(&store).await?.len(), 1);
 
         for (column_update, restore) in [

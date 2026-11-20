@@ -59,10 +59,13 @@
 //!
 //! Every tick also counts the sandboxes still pinned to a node that is gone,
 //! not ready, or can't be checked, whether or not any wake has run recovery
-//! for them. It groups non-terminal Kubernetes sandboxes by `active_node_id`
-//! (nodes in a drain phase excluded; the drain reports those), judges each
-//! node that the reflector doesn't list as live and ready with the same
-//! verdict the give-up uses, and publishes, per node:
+//! for them. It groups Kubernetes sandboxes by the node holding them: live
+//! residents and `stopped` rows by `active_node_id`, `suspended` rows by
+//! `target_node_id` (a suspend clears `active_node_id`), and in-flight full
+//! uploads by their source node. Nodes in a drain phase are excluded; the
+//! drain reports those. It judges each node that the reflector doesn't list
+//! as live and ready with the same verdict the give-up uses, and publishes,
+//! per node:
 //!
 //! - `sandbox.stranded{node,verdict,reason,residency}`, a gauge.
 //!   `verdict:gone` is the give-up's proof (row deleted, or absent from
@@ -71,9 +74,14 @@
 //!   `True` for the grace. `verdict:unverifiable` is everything the checks
 //!   couldn't settle (still inside the grace, a failed lookup, no Kubernetes
 //!   name, the lookup budget spent). A monitor should page on `gone` only.
-//!   `residency:running` counts sandboxes whose state lived only on the node;
-//!   `residency:at_rest` counts suspended or stopped ones with no durable
-//!   copy. A series that stops applying is published once more as 0.
+//!   `residency:running` counts the node's residents as the drain gate
+//!   defines them (`pplx_space_sandbox_residency::resident_lifecycle` and
+//!   `occupies_node_predicate`), whose state lived only on the node.
+//!   `residency:at_rest` counts the admin console's local snapshots for the
+//!   node (`pplx_space_sandbox_store::admin_occupancy`: suspended sandboxes
+//!   targeting it and uploads from it, without a durable copy), plus
+//!   `stopped` residents without one, whose copy stays on the node. A series
+//!   that stops applying is published once more as 0.
 //! - `sandbox.stranded.nodes{verdict}`, the number of such nodes, published
 //!   every census for every verdict, 0 included, so a monitor always has
 //!   data. A census is skipped, publishing nothing, while the Node reflector
@@ -224,10 +232,12 @@ pub struct NodeResidents {
 /// A suspect node's residents that lose state with it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StrandedCounts {
-    /// Any lifecycle but `suspended` or `stopped`: the state lived on the
-    /// node.
+    /// Residents by `active_node_id` in a resident lifecycle that the node
+    /// has not proven absent: the state lived on the node.
     pub running: u64,
-    /// `suspended` or `stopped` with no durable copy in object storage.
+    /// Local snapshots with no durable copy in object storage: `suspended`
+    /// rows targeting the node and uploads from it, as the admin console
+    /// counts them, plus `stopped` residents.
     pub at_rest_without_copy: u64,
 }
 
@@ -268,11 +278,13 @@ pub trait LostStartedSink: Send + Sync + 'static {
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<NodeResidents>, sqlx::Error>> + Send;
 
-    /// The census's second pass, for one suspect node.
+    /// The census's second pass, batched over the suspect nodes. A node
+    /// holding nothing stranded may be missing from the map.
     fn stranded_counts(
         &self,
-        node_id: NodeId,
-    ) -> impl std::future::Future<Output = Result<StrandedCounts, sqlx::Error>> + Send;
+        node_ids: &[NodeId],
+    ) -> impl std::future::Future<Output = Result<HashMap<NodeId, StrandedCounts>, sqlx::Error>>
+           + Send;
 
     /// Up to `limit` candidates with `sandboxes.id > after`, ordered by id.
     fn list_candidates(
@@ -532,7 +544,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
         };
 
         let mut lookups_left = self.config.max_census_lookups_per_tick;
-        let mut published = HashSet::new();
+        let mut suspects = Vec::new();
         for node in nodes {
             if node.residents == 0 {
                 continue;
@@ -565,17 +577,31 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
                     (judged.0, judged.1, k8s_node_name.clone())
                 }
             };
-            let counts = match self.sink.stranded_counts(node.node_id).await {
+            suspects.push((node.node_id, verdict, reason, tag_node));
+        }
+
+        let suspect_ids: Vec<NodeId> = suspects.iter().map(|suspect| suspect.0).collect();
+        let stranded_by_node = if suspect_ids.is_empty() {
+            HashMap::new()
+        } else {
+            match self.sink.stranded_counts(&suspect_ids).await {
                 Ok(counts) => counts,
                 Err(err) => {
+                    // Keep the last published series rather than zero them on
+                    // a read error; the missing node gauges show the gap.
                     tracing::warn!(
-                        node_id = %node.node_id,
                         error = %err,
+                        nodes = suspect_ids.len(),
                         "lost_started_sandboxes: census count failed"
                     );
-                    continue;
+                    return;
                 }
-            };
+            }
+        };
+
+        let mut published = HashSet::new();
+        for (node_id, verdict, reason, tag_node) in suspects {
+            let counts = stranded_by_node.get(&node_id).copied().unwrap_or_default();
             let stranded = counts.running + counts.at_rest_without_copy;
             if stranded == 0 {
                 continue;
@@ -606,7 +632,7 @@ impl<S: LostStartedSink, L: InstanceLookup, P: KubeNodePresence> Reconciler<S, L
             }
             if verdict == StrandedVerdict::Gone {
                 tracing::warn!(
-                    node_id = %node.node_id,
+                    node_id = %node_id,
                     node = %tag_node,
                     reason,
                     running = counts.running,
