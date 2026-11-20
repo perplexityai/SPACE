@@ -1565,6 +1565,23 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
     });
 }
 
+/// Wait, well past the fixture's hold limit, until `semaphore` has exactly
+/// `permits` free, rather than sleep for the limit and race the timer.
+#[cfg(target_os = "linux")]
+async fn wait_for_permits(semaphore: &Semaphore, permits: usize, what: &str) {
+    let waited = tokio::time::timeout(Duration::from_secs(3), async {
+        while semaphore.available_permits() != permits {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "{what}: {} free",
+        semaphore.available_permits()
+    );
+}
+
 // Payload admission fits two starts at once. Two starts stalled in `spawn`,
 // as under guest memory pressure, used to keep both admissions until the
 // kernel let them go, and refused every later start (a reconnect included)
@@ -1623,15 +1640,15 @@ async fn starts_stalled_in_spawn_release_admission_at_the_hold_limit() {
         "{refused:?}"
     );
 
-    tokio::time::sleep(service.inner.start_admission.hold_limit + Duration::from_millis(100)).await;
+    wait_for_permits(
+        slots,
+        process_limits::PAYLOAD_SLOTS,
+        "stalled starts return their slots at the hold limit",
+    )
+    .await;
     assert!(
         stalled.iter().all(|start| !start.is_finished()),
         "both starts are still stalled in spawn"
-    );
-    assert_eq!(
-        slots.available_permits(),
-        process_limits::PAYLOAD_SLOTS,
-        "stalled starts return their slots at the hold limit"
     );
     let admitted = start("admitted");
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1698,9 +1715,8 @@ async fn the_detached_start_cap_keeps_admission_with_starts_past_it() {
     };
     let stalled = [start("stalled-1"), start("stalled-2")];
     wait_for_owners(2).await;
-    tokio::time::sleep(service.inner.start_admission.hold_limit + Duration::from_millis(100)).await;
     let slots = &service.inner.process_payload_slots;
-    assert_eq!(detached.available_permits(), 0, "one start detached");
+    wait_for_permits(&detached, 0, "one start detaches at the hold limit").await;
     assert_eq!(
         slots.available_permits(),
         process_limits::START_PAYLOAD_SLOTS as usize,
