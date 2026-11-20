@@ -1309,3 +1309,10 @@ variable "eppo_secret_id" {
     error_message = "eppo_secret_id must be either empty — the provider-free deployment, which renders no space-eppo ExternalSecret — or a trimmed Secrets Manager secret name. A whitespace-only or space-padded value is neither: it is non-empty, so the entry renders, and the external-secrets read grant is interpolated from the same string."
   }
 }
+
+variable "builders_az_rebalance_suspended" {
+  description = "Suspend the AZRebalance process on the builders node group's Auto Scaling group, so EC2 Auto Scaling never terminates a builder to even out its zones (EKS drains that termination without honoring PodDisruptionBudgets). Needs builders_update_strategy = MINIMAL, an existing builders group, and the `aws` CLI with autoscaling:SuspendProcesses and autoscaling:ResumeProcesses on the machine running the apply. Changes no node group: the apply only calls SuspendProcesses, and turning it off calls ResumeProcesses. See builders_az_rebalance.tf."
+  type        = bool
+  default     = false
+  nullable    = false
+}

@@ -128,6 +128,17 @@ change to the group: in a combined apply the node group version update
 runs first, under the old strategy. `builders_launch_template_version`
 can hold the builders on a version, like the capacity group pin below.
 
+The builders group spans every private subnet, so two builders in one AZ
+(for example when the other AZ had no capacity) give `AZRebalance` a reason
+to terminate one of them, and EKS drains that termination without honoring
+PodDisruptionBudgets. With `MINIMAL`, set `builders_az_rebalance_suspended`
+to suspend the process on the builders ASG. It changes no node group, and
+needs the `aws` CLI with `autoscaling:SuspendProcesses` and
+`autoscaling:ResumeProcesses` where the apply runs. `DEFAULT` places each
+surge node through `AZRebalance`, so the module refuses the two together.
+With the process suspended nothing evens the zones out, so check builder
+placement after a launch.
+
 Keep builder LT changes in their own apply, separate from worker changes, so
 a builder capacity failure does not hold up unrelated work.
 
