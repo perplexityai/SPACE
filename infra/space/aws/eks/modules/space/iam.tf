@@ -242,3 +242,76 @@ resource "aws_iam_policy" "snapshots_rw" {
 
   tags = var.common_tags
 }
+
+# Node role per tenant-encrypted launch template. Separate from the shared
+# workers role so only that tenant's nodes can use its KMS key: the key policy
+# names this role, and the shared role never appears in it. Otherwise the same
+# node permissions as `workers_pool`.
+resource "aws_iam_role" "workers_encrypted" {
+  for_each = var.encrypted_worker_launch_templates
+
+  assume_role_policy = data.aws_iam_policy_document.node_assume_role.json
+  name               = "${local.name}-workers-enc-${each.key}-nodes"
+
+  tags = merge(var.common_tags, {
+    Name = "${local.name}-workers-enc-${each.key}-nodes"
+  })
+}
+
+resource "aws_eks_access_entry" "workers_encrypted" {
+  for_each = var.encrypted_worker_launch_templates
+
+  cluster_name  = module.eks.cluster_name
+  principal_arn = aws_iam_role.workers_encrypted[each.key].arn
+  type          = "EC2_LINUX"
+
+  tags = var.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "workers_encrypted_managed" {
+  for_each = {
+    for attachment in flatten([
+      for name in keys(var.encrypted_worker_launch_templates) : [
+        for policy_arn in module.eks.node_managed_policy_arns : {
+          name       = name
+          policy_arn = policy_arn
+        }
+      ]
+    ]) : "${attachment.name}-${replace(basename(attachment.policy_arn), ":", "-")}" => attachment
+  }
+
+  policy_arn = each.value.policy_arn
+  role       = aws_iam_role.workers_encrypted[each.value.name].name
+}
+
+resource "aws_iam_role_policy_attachment" "workers_encrypted_s3_read" {
+  for_each = length(var.s3_read_bucket_names) > 0 ? var.encrypted_worker_launch_templates : {}
+
+  policy_arn = aws_iam_policy.s3_read[0].arn
+  role       = aws_iam_role.workers_encrypted[each.key].name
+}
+
+# The cache unit wraps one data key per boot and the watchdog unwraps it every
+# minute, both under the node-cache encryption context. Nothing else.
+data "aws_iam_policy_document" "workers_encrypted_cache_key" {
+  for_each = var.encrypted_worker_launch_templates
+
+  statement {
+    actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
+    resources = [each.value.kms_key_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:space:purpose"
+      values   = ["node-cache"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "workers_encrypted_cache_key" {
+  for_each = var.encrypted_worker_launch_templates
+
+  name   = "cache-encryption-key"
+  role   = aws_iam_role.workers_encrypted[each.key].id
+  policy = data.aws_iam_policy_document.workers_encrypted_cache_key[each.key].json
+}

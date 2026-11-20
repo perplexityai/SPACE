@@ -1908,7 +1908,10 @@ impl SandboxManagerService {
             gateway_caller_client: options.node_manager.lazy(),
             gateway_authority,
             snapshot_upload_config: {
-                let cfg = crate::snapshot_upload::SnapshotUploadConfig::from_env();
+                let cfg = crate::snapshot_upload::shared_upload_config_for_node(
+                    crate::snapshot_upload::SnapshotUploadConfig::from_env(),
+                    std::path::Path::new(crate::snapshot_upload::ENCRYPTED_CACHE_MARKER),
+                );
                 if cfg.is_none() {
                     tracing::info!(
                         "snapshot S3 upload disabled \

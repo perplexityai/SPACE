@@ -317,6 +317,38 @@ impl AuthorizedExchange {
                 }),
             ]);
         }
+        // An org that vends through its own role keeps its snapshots in its own
+        // bucket, which may encrypt with SSE-KMS under a key the org controls.
+        // S3 then calls KMS as the requester, so the session must be allowed to
+        // use that key through S3 for these buckets and nothing else. The
+        // session policy only caps the role: the org's role policy and its key
+        // policy still decide whether the call succeeds, and the shared vend
+        // role never receives this statement.
+        if self.role_override.is_some() {
+            // S3 Bucket Keys bind the bucket ARN as the encryption context;
+            // without them it is the object ARN. Admit both shapes.
+            let mut buckets = Vec::with_capacity(4);
+            for bucket in std::iter::once(&self.resource.bucket)
+                .chain(self.copy_source.as_ref().map(|source| &source.bucket))
+            {
+                let bucket_arn = format!("arn:aws:s3:::{bucket}");
+                if !buckets.contains(&bucket_arn) {
+                    buckets.push(format!("{bucket_arn}/*"));
+                    buckets.push(bucket_arn);
+                }
+            }
+            statements.push(serde_json::json!({
+                "Effect": "Allow",
+                "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+                "Resource": "*",
+                "Condition": {
+                    "StringLike": {
+                        "kms:ViaService": "s3.*.amazonaws.com",
+                        "kms:EncryptionContext:aws:s3:arn": buckets,
+                    },
+                },
+            }));
+        }
         let policy = serde_json::json!({
             "Version": "2012-10-17",
             "Statement": statements,

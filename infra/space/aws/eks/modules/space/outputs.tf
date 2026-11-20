@@ -251,6 +251,24 @@ output "workers_launch_template_latest_version" {
   value       = aws_launch_template.workers.latest_version
 }
 
+output "encrypted_worker_launch_templates" {
+  description = "Tenant-encrypted worker launch templates by name: id, latest_version and the node role that may use the key, for the MNG that runs that tenant's dedicated node group."
+  value = {
+    for name, template in aws_launch_template.workers_encrypted : name => {
+      id             = template.id
+      latest_version = template.latest_version
+      node_role_arn  = aws_iam_role.workers_encrypted[name].arn
+    }
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.workers_encrypted_managed,
+    aws_iam_role_policy_attachment.workers_encrypted_s3_read,
+    aws_iam_role_policy.workers_encrypted_cache_key,
+    aws_eks_access_entry.workers_encrypted,
+  ]
+}
+
 output "workers_pool_node_role_arn" {
   description = "Shared workers-pool node role ARN, or null while the pool is disabled. Its policies and EKS access entry are attached before this value resolves, so an MNG created from it can register nodes."
   value       = one(aws_iam_role.workers_pool[*].arn)

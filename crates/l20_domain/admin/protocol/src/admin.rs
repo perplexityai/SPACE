@@ -696,6 +696,11 @@ pub struct AdminNodeGroupResponse {
     pub org_id: Option<pplx_space_accounts::OrgId>,
     pub template_policy: NodeGroupTemplatePolicy,
     pub is_default: bool,
+    /// Dedicated groups only. When set, the owning org is confined to its
+    /// dedicated groups: placement never offers it shared capacity, for any
+    /// template, on create, restore, evacuation or materialize.
+    #[serde(default)]
+    pub exclusive: bool,
     pub created_at: String,
     /// Number of worker `nodes` rows whose mirrored `node_group_id` points
     /// at this group (node groups are worker pools; builder/cluster rows
@@ -734,6 +739,11 @@ pub struct CreateNodeGroupRequest {
     /// `:set-default` to move the flag.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_default: bool,
+    /// Confine the owning org to its dedicated groups (org-owned groups only).
+    /// See [`AdminNodeGroupResponse::exclusive`]. Cleared by any later
+    /// `:assign-org`, so an exclusive grant never carries over to a new owner.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclusive: bool,
 }
 
 /// JSON body for `POST /admin/api/v1/node-groups/{id}:assign-org`.

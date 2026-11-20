@@ -348,12 +348,32 @@ impl NodeGroupPlacementResolver {
                 template: template_name.to_string(),
             });
         };
-        let NodeGroupCatalog { template, groups } = catalog;
-        let candidates: Vec<NodeGroup> = groups
-            .into_iter()
-            .filter(|group| group.compatible(caller_org, &template))
-            .collect();
+        let NodeGroupCatalog {
+            template,
+            groups,
+            exclusive_orgs,
+        } = catalog;
+        let confined = caller_org.is_some_and(|org| exclusive_orgs.contains(&org));
+        let candidates = candidate_set(caller_org, &template, groups, confined);
         if candidates.is_empty() {
+            if confined {
+                // An org confined to exclusive capacity has no shared fallback
+                // for any template, generic ones included: the set being
+                // empty means its dedicated groups do not admit this template.
+                if path != ResolvePath::PoolClaim {
+                    tracing::warn!(
+                        %path,
+                        template = template_name,
+                        ?caller_org,
+                        "org is confined to exclusive node groups and none admits this \
+                         template; failing closed with no shared fallback"
+                    );
+                }
+                return Err(NodeGroupPlacementResolveError::NoCompatibleNodeGroup {
+                    template: template_name.to_string(),
+                    caller_org,
+                });
+            }
             return Self::empty_candidate_set(path, caller_org, template.visibility, template_name);
         }
         Ok(Some(NodeGroupPlacement::for_caller(
@@ -415,6 +435,23 @@ impl NodeGroupPlacementResolver {
             }
         }
     }
+}
+
+/// The candidate set: every group [`NodeGroup::compatible`] admits, narrowed to
+/// the caller's own dedicated groups when the caller is `confined` (it owns an
+/// exclusive group). Narrowing only removes groups, so the result still
+/// satisfies `compatible` and `NodeGroupPlacement::for_caller` accepts it.
+fn candidate_set(
+    caller_org: Option<OrgId>,
+    template: &pplx_space_node_model::TemplateCompatSpec,
+    groups: Vec<NodeGroup>,
+    confined: bool,
+) -> Vec<NodeGroup> {
+    groups
+        .into_iter()
+        .filter(|group| group.compatible(caller_org, template))
+        .filter(|group| !confined || (caller_org.is_some() && group.org_id() == caller_org))
+        .collect()
 }
 
 /// What the node reflector could say about a restore's source node.

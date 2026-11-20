@@ -176,6 +176,7 @@ locals {
       bootstrap_bucket           = var.bootstrap_bucket
       shim_dogstatsd_socket_path = var.worker_shim_dogstatsd_socket_path
       shim_environment           = var.environment
+      cache_encryption_required  = false
     }
   }
 
