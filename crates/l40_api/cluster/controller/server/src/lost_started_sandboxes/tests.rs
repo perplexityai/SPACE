@@ -1891,7 +1891,11 @@ async fn s10_deleted_node_found_clear_is_not_recounted() {
 
     sink.clear_count_calls();
     let report = reconciler.tick().await;
-    assert_eq!(sink.count_calls(), vec![stranded], "a clear deleted node is not recounted");
+    assert_eq!(
+        sink.count_calls(),
+        vec![stranded],
+        "a clear deleted node is not recounted"
+    );
     assert_eq!(gone(&report), (1, 1));
 
     // Leaving the first pass forgets it.
