@@ -73,6 +73,13 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   warm-pool autoscaler and the environment block guard have to agree on which
   release serves. Build the statement once, bind every value, and keep the
   rest of the statement whole at its query site.
+- Another is a whole predicate from `pplx_space_template_release_original`
+  (`spelling_original`, `digest_original`), the single definition of which
+  release of a template digest is its original. Interpolate it rather than
+  re-spelling the ordering: callers that disagree register, tag, create and
+  warm against different releases of one digest. Build the statement once,
+  bind every value, and keep the rest of the statement whole at its query
+  site.
 - The last is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it

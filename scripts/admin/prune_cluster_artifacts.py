@@ -2113,10 +2113,17 @@ SELECT r.id::text AS template_release_id,
 FROM ranked r
 WHERE r.created_at < TIMESTAMPTZ {sql_literal(cutoff)}
   AND r.newest_rank > {args.keep_latest_per_template}
+  -- A tag on any release of the digest, under either spelling: lookups
+  -- resolve a tag to the digest's original release, which may not be the
+  -- release a tag written before that rule names.
   AND NOT EXISTS (
       SELECT 1
       FROM template_release_tags tags
-      WHERE tags.template_release_id = r.id
+      JOIN template_releases tagged
+        ON tagged.id = tags.template_release_id
+      WHERE tagged.template_name = r.template_name
+        AND replace(tagged.hash, 'sha256:', '')
+          = replace(r.content_hash, 'sha256:', '')
   )
   AND NOT EXISTS (
       SELECT 1
@@ -2273,6 +2280,30 @@ CREATE TEMP TABLE requested_template_releases (id uuid PRIMARY KEY) ON COMMIT DR
 INSERT INTO requested_template_releases (id)
 VALUES
 {values};
+-- Registration and the admin tag and delete lock the parent template first,
+-- so taking it first too orders this delete behind them and behind another
+-- prune of the same template instead of deadlocking on the release rows.
+CREATE TEMP TABLE locked_templates (name text NOT NULL) ON COMMIT DROP;
+INSERT INTO locked_templates (name)
+SELECT t.name
+FROM templates t
+JOIN template_releases r ON r.template_name = t.name
+JOIN requested_template_releases requested ON requested.id = r.id
+FOR NO KEY UPDATE OF t;
+-- The tag guard below reads tags on every release of the candidate's digest,
+-- but a tag writer's foreign-key check locks only the release it tags, and
+-- not every tag writer locks the template. Lock them all first, so a tag
+-- written on either spelling either commits before the guard reads it or
+-- waits for this delete.
+CREATE TEMP TABLE locked_digest_releases (id uuid NOT NULL) ON COMMIT DROP;
+INSERT INTO locked_digest_releases (id)
+SELECT digest.id
+FROM template_releases r
+JOIN requested_template_releases requested ON requested.id = r.id
+JOIN template_releases digest
+  ON digest.template_name = r.template_name
+ AND replace(digest.hash, 'sha256:', '') = replace(r.hash, 'sha256:', '')
+FOR UPDATE OF digest;
 CREATE TEMP TABLE locked_template_releases (
     id uuid PRIMARY KEY,
     template_name text NOT NULL,
@@ -2293,10 +2324,17 @@ JOIN requested_template_releases requested ON requested.id = r.id
 JOIN ranked ON ranked.id = r.id
 WHERE r.created_at < TIMESTAMPTZ {sql_literal(cutoff)}
   AND ranked.newest_rank > {args.keep_latest_per_template}
+  -- A tag on any release of the digest, under either spelling: lookups
+  -- resolve a tag to the digest's original release, which may not be the
+  -- release a tag written before that rule names.
   AND NOT EXISTS (
       SELECT 1
       FROM template_release_tags tags
-      WHERE tags.template_release_id = r.id
+      JOIN template_releases tagged
+        ON tagged.id = tags.template_release_id
+      WHERE tagged.template_name = r.template_name
+        AND replace(tagged.hash, 'sha256:', '')
+          = replace(r.hash, 'sha256:', '')
   )
   AND NOT EXISTS (
       SELECT 1

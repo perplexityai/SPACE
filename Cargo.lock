@@ -4973,6 +4973,7 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
  "pplx-space-template-release-store",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
@@ -5456,7 +5457,9 @@ dependencies = [
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
  "pplx-space-template-release-store",
+ "rstest",
  "serde",
  "sqlx",
  "thiserror 2.0.20",
@@ -6336,6 +6339,8 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
+ "pplx-space-template-release-store",
  "pplx-space-test-env",
  "prost",
  "prost-types",
@@ -8846,6 +8851,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-release-original"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-template-release-store",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-template-release-store"
 version = "0.8.2"
 dependencies = [
@@ -8860,6 +8878,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-object-store",
  "pplx-space-sql-locator",
+ "pplx-space-template-release-original",
  "pplx-space-test-env",
  "serde_json",
  "sqlx",

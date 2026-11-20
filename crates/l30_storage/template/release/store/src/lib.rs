@@ -61,6 +61,9 @@ mod tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod spelling_pairs;
+
 /// Which releases a lookup selects by execution environment: those bound to
 /// `environment`, and, when the environment caches in the legacy partition
 /// (the initial environment), those recorded without one.

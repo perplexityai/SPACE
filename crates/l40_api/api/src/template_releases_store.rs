@@ -6,9 +6,19 @@ use pplx_space_template_model::{
     TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateDesiredState, TemplateName,
     TemplateReference, TemplateSelector, TemplateTag, TemplateVisibility,
 };
+use pplx_space_template_release_original::digest_original;
 use sqlx::PgExecutor;
+use std::sync::LazyLock;
 use uuid::Uuid;
 
+/// The release a create names by tag: the digest original
+/// (`pplx_space_template_release_original::digest_original`) of the tagged
+/// release's digest. Tag writers attach tags to the digest original, but a tag
+/// written before the shared rule can sit on the other spelling's original,
+/// and the warm pool only warms the digest original. The hash comes back as
+/// the tagged release stores it, as before the shared rule: the create's
+/// node inventory and lifecycle-default reads match it exactly, and a pool
+/// claim matches either spelling.
 pub(crate) async fn resolve_template_release_by_tag(
     executor: impl PgExecutor<'_>,
     template_name: &TemplateName,
@@ -16,33 +26,45 @@ pub(crate) async fn resolve_template_release_by_tag(
     runtime: RuntimeKind,
     caller_org: OrgId,
 ) -> Result<Option<(Uuid, String)>, sqlx::Error> {
-    sqlx::query_as::<_, (Uuid, String)>(sql!(
-        "SELECT r.id, r.hash
-         FROM template_release_tags t
-         JOIN template_releases r
-           ON r.id = t.template_release_id
-          AND r.template_name = t.template_name
-         JOIN templates tpl
-           ON tpl.name = t.template_name
-         WHERE t.template_name = $1
-           AND t.tag = $2
-           AND r.type = $3
-           AND tpl.desired_state = $6
-           AND (tpl.visibility = $4 OR tpl.org_id = $5)"
-    ))
-    .bind(template_name.as_str())
-    .bind(tag.as_str())
-    .bind(runtime.alias())
-    .bind(TemplateVisibility::Generic.as_str())
-    .bind(caller_org.as_uuid())
-    .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(executor)
-    .await
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id, tagged.hash
+             FROM template_release_tags t
+             JOIN template_releases tagged
+               ON tagged.id = t.template_release_id
+              AND tagged.template_name = t.template_name
+             JOIN template_releases r
+               ON r.template_name = tagged.template_name
+              AND r.hash IN (replace(tagged.hash, 'sha256:', ''),
+                             'sha256:' || replace(tagged.hash, 'sha256:', ''))
+             JOIN templates tpl
+               ON tpl.name = t.template_name
+             WHERE t.template_name = $1
+               AND t.tag = $2
+               AND r.type = $3
+               AND tpl.desired_state = $6
+               AND (tpl.visibility = $4 OR tpl.org_id = $5)
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_as::<_, (Uuid, String)>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name.as_str())
+        .bind(tag.as_str())
+        .bind(runtime.alias())
+        .bind(TemplateVisibility::Generic.as_str())
+        .bind(caller_org.as_uuid())
+        .bind(TemplateDesiredState::Present.as_str())
+        .fetch_optional(executor)
+        .await
 }
 
-/// The release a create or base resolution names by digest: the original
-/// release of the digest (the first registered), never a twin bound to
-/// another environment, and the canonical spelling over a legacy bare one.
+/// The release a create or base resolution names by digest: the digest's
+/// original release under either spelling
+/// (`pplx_space_template_release_original::digest_original`, the rule the
+/// internal API and the warm pool resolve it with), never a twin bound to
+/// another environment.
 pub(crate) async fn resolve_template_release_by_digest(
     executor: impl PgExecutor<'_>,
     template_name: &TemplateName,
@@ -50,36 +72,40 @@ pub(crate) async fn resolve_template_release_by_digest(
     runtime: RuntimeKind,
     caller_org: OrgId,
 ) -> Result<Option<(Uuid, String)>, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id
+             FROM template_releases r
+             JOIN templates tpl ON tpl.name = r.template_name
+             WHERE r.template_name = $1
+               AND r.hash IN ($2, replace($2, 'sha256:', ''))
+               AND r.type = $3
+               AND (tpl.visibility = $4 OR tpl.org_id = $5)
+               AND tpl.desired_state = $6
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
     let hash = digest.to_string();
-    let release_id = sqlx::query_scalar::<_, Uuid>(sql!(
-        "SELECT r.id
-         FROM template_releases r
-         JOIN templates tpl ON tpl.name = r.template_name
-         WHERE r.template_name = $1
-           AND r.hash IN ($2, replace($2, 'sha256:', ''))
-           AND r.type = $3
-           AND (tpl.visibility = $4 OR tpl.org_id = $5)
-           AND tpl.desired_state = $6
-         ORDER BY (r.hash = $2) DESC, r.created_at ASC, r.id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name.as_str())
-    .bind(&hash)
-    .bind(runtime.alias())
-    .bind(TemplateVisibility::Generic.as_str())
-    .bind(caller_org.as_uuid())
-    .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(executor)
-    .await?;
+    let release_id = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name.as_str())
+        .bind(&hash)
+        .bind(runtime.alias())
+        .bind(TemplateVisibility::Generic.as_str())
+        .bind(caller_org.as_uuid())
+        .bind(TemplateDesiredState::Present.as_str())
+        .fetch_optional(executor)
+        .await?;
     // Legacy unprefixed rows matched the same digest; return its canonical form.
     Ok(release_id.map(|id| (id, hash)))
 }
 
 /// The execution environment the original release of `template_name` at
 /// `content_hash` is bound to (its `execution_metadata.environment`), unparsed;
-/// `None` for an unbound release or no release. A legacy unprefixed hash
-/// matches the way [`resolve_template_release_by_digest`] matches it. The
-/// original release is the first registered for the hash: its twins, bound to
+/// `None` for an unbound release or no release. `content_hash` may be either
+/// spelling, and the release is the digest's original under either one, the
+/// one [`resolve_template_release_by_digest`] resolves: its twins, bound to
 /// other environments, are registered after it, and a create that names no
 /// environment resolves the original.
 ///
@@ -92,19 +118,26 @@ pub(crate) async fn release_environment(
     template_name: &str,
     content_hash: &str,
 ) -> Result<Option<String>, sqlx::Error> {
-    Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
-        "SELECT r.execution_metadata->>'environment'
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash IN ($2, replace($2, 'sha256:', ''))
-         ORDER BY (r.hash = $2) DESC, r.created_at ASC, r.id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(content_hash)
-    .fetch_optional(executor)
-    .await?
-    .flatten())
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.execution_metadata->>'environment'
+             FROM template_releases r
+             WHERE r.template_name = $1
+               AND r.hash IN (replace($2, 'sha256:', ''),
+                              'sha256:' || replace($2, 'sha256:', ''))
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(QUERY.as_str()))
+            .bind(template_name)
+            .bind(content_hash)
+            .fetch_optional(executor)
+            .await?
+            .flatten(),
+    )
 }
 
 /// The execution environment the release `release_id` is bound to, unparsed;
@@ -274,3 +307,6 @@ pub(crate) async fn resolve_base(
     let hash = hash.ok_or(ResolveBaseError::NotFound)?;
     Ok(hash.parse()?)
 }
+
+#[cfg(test)]
+mod tests;

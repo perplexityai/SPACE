@@ -446,6 +446,12 @@ pplx-space-snapshot-store = [
   "pplx-space-snapshot-retention",
 ]
 pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
+pplx-space-template-release-original = [
+  "pplx-space-api",
+  "pplx-space-cluster-pool",
+  "pplx-space-internal-api-server",
+  "pplx-space-template-release-store",
+]
 # The API resolves creates, placement and pool claims to a release's twin
 # through the store, and the cluster pool's autoscaler embeds its resolution
 # SQL so demand follows the release creates run.
