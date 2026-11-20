@@ -454,8 +454,12 @@ async fn build_manager_health(
 /// route. While the draining builder's node-api stays ready, a retry can land
 /// on it again. Turning readiness off once build-manager drains lets kubelet's
 /// readiness probe take the node-api out of the Service's endpoints, so later
-/// attempts go to another builder. The task stops at shutdown, where the
-/// shutdown hook already turns readiness off, and never turns it on after.
+/// attempts go to another builder. Calls pinned to this builder's node, such
+/// as build status for the builds the drain is waiting on, still reach it: the
+/// API resolves a pinned builder to a Running node-api pod whether or not it
+/// is Ready (`node_api_pod_for_pinned_call_on`); an API without that loses
+/// pinned build status for the whole drain. The task stops at shutdown, where
+/// the shutdown hook already turns readiness off, and never turns it on after.
 fn spawn_build_manager_drain_bridge<P, Fut>(
     mut probe: P,
     health_reporter: HealthReporter,

@@ -2076,7 +2076,9 @@ answers new calls "draining" at once, while the API reaches builders through the
 endpoints first. While the node's build-manager drains, builder node-api also
 reports itself not ready, so the readiness probe takes it out of the Service and
 the API's retries of a build start that build-manager rejected as draining go to
-another builder.
+another builder. Calls pinned to the draining builder's node, such as build
+status, still reach its node-api: the API accepts a Running builder node-api pod
+there whether or not it is Ready.
 
 **The runtime-supervisor.** node-manager's init container runs the production
 `node-manager-init.sh` unchanged: it stages the host binaries under

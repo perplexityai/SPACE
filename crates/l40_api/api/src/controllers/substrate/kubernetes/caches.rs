@@ -165,6 +165,33 @@ impl K8sCaches {
         })
     }
 
+    /// Find the node-api Pod a node-pinned call for `role` on `k8s_node_name`
+    /// dials: a Ready one if there is one, as [`Self::ready_node_api_pod_on`]
+    /// finds. A builder also falls back to a Running, started pod that is
+    /// not Ready ([`pod_is_running_and_started`]). Builder node-api goes
+    /// unready while its build-manager drains, so the builder Service stops
+    /// sending it new builds. Calls pinned to the builds still running there,
+    /// such as build status, must keep reaching it until the drain ends.
+    /// A worker has no fallback: an unready worker node-api is not serving.
+    pub fn node_api_pod_for_pinned_call_on(
+        &self,
+        k8s_node_name: &str,
+        role: &str,
+    ) -> Option<std::sync::Arc<Pod>> {
+        if let Some(pod) = self.ready_node_api_pod_on(k8s_node_name, role) {
+            return Some(pod);
+        }
+        if SpaceNodeRole::parse(role).ok()? != SpaceNodeRole::Builder {
+            return None;
+        }
+        self.node_api_pods.find(|pod| {
+            pod.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(k8s_node_name)
+                && pod_app_name(pod).and_then(role_from_app_name)
+                    == Some(SpaceNodeRole::Builder.as_str())
+                && pod_is_running_and_started(pod)
+        })
+    }
+
     /// Look up a cluster Node by name from the watcher-backed store.
     pub fn node_by_name(&self, name: &str) -> Option<std::sync::Arc<Node>> {
         self.nodes
@@ -242,6 +269,26 @@ pub fn pod_is_ready(pod: &Pod) -> bool {
                 .any(|c| c.type_ == "Ready" && c.status == "True")
         })
         .unwrap_or(false)
+}
+
+/// True when the Pod is Running, is not being deleted, has a pod IP, and
+/// every container has started, whatever its Ready condition.
+pub fn pod_is_running_and_started(pod: &Pod) -> bool {
+    if pod.metadata.deletion_timestamp.is_some() || pod_ip(pod).is_none() {
+        return false;
+    }
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    if status.phase.as_deref() != Some("Running") {
+        return false;
+    }
+    status.container_statuses.as_ref().is_some_and(|statuses| {
+        !statuses.is_empty()
+            && statuses.iter().all(|c| {
+                c.started == Some(true) && c.state.as_ref().is_some_and(|s| s.running.is_some())
+            })
+    })
 }
 
 #[cfg(test)]

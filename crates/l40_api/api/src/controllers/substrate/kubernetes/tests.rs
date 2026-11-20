@@ -7932,6 +7932,61 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// A builder whose build-manager is draining reports its node-api unready,
+    /// so the builder Service stops sending it new builds. Status lookups for
+    /// the builds still running there are pinned to its node and must keep
+    /// resolving it until the drain ends.
+    #[test]
+    fn pinned_builder_status_lookup_resolves_while_builder_drains() {
+        let node_name = "space-builder-draining";
+        let mut pod = unready_node_api_pod_on_node("space-builder-draining-pod", node_name);
+        pod.metadata.labels = Some(BTreeMap::from([(
+            "app.kubernetes.io/name".to_string(),
+            "space-builder".to_string(),
+        )]));
+        let status = pod.status.as_mut().expect("pod has a status");
+        status.phase = Some("Running".to_string());
+        status.pod_ip = Some("10.0.0.70".to_string());
+        status.container_statuses = Some(vec![k8s_openapi::api::core::v1::ContainerStatus {
+            name: "node-api".to_string(),
+            started: Some(true),
+            state: Some(k8s_openapi::api::core::v1::ContainerState {
+                running: Some(k8s_openapi::api::core::v1::ContainerStateRunning::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        let substrate = substrate_with_inventory_caches(vec![pod.clone()], Vec::new());
+        let builder = NodeApiTarget {
+            managed_by: SpaceNodeManagedBy::Kubernetes,
+            role: SpaceNodeRole::Builder,
+            direct_endpoint: None,
+            substrate_node_id: Some(node_name),
+        };
+        assert_eq!(
+            substrate
+                .try_resolve_node_api_endpoint(&builder)
+                .expect("a draining builder still serves pinned calls"),
+            format!("10.0.0.70:{DEFAULT_SANDBOX_PROXY_PORT}")
+        );
+
+        // The same pod as a worker is not serving: pinned worker calls still
+        // need a Ready node-api.
+        pod.metadata.labels = Some(BTreeMap::from([(
+            "app.kubernetes.io/name".to_string(),
+            "space-worker".to_string(),
+        )]));
+        let substrate = substrate_with_inventory_caches(vec![pod], Vec::new());
+        let worker = NodeApiTarget {
+            role: SpaceNodeRole::Worker,
+            ..builder
+        };
+        assert!(matches!(
+            substrate.try_resolve_node_api_endpoint(&worker),
+            Err(SubstrateError::Unavailable { .. })
+        ));
+    }
+
     pub(crate) fn test_sandbox_with_lifecycle(lifecycle: &str) -> Sandbox {
         Sandbox {
             id: SandboxId::from_uuid(Uuid::nil()),

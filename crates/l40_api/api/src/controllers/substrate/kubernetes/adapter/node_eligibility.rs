@@ -247,7 +247,7 @@ impl KubernetesSubstrate {
         let pod = self
             .k8s
             .caches
-            .ready_node_api_pod_on(k8s_node_name, target.role.as_str())
+            .node_api_pod_for_pinned_call_on(k8s_node_name, target.role.as_str())
             .ok_or_else(|| SubstrateError::Unavailable {
                 message: format!(
                     "no ready node-api pod for role {} on k8s node {k8s_node_name}",

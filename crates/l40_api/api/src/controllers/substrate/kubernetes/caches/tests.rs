@@ -1,8 +1,8 @@
 use super::*;
 use futures_util::poll;
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, Node, Pod, PodCondition, PodSpec as K8sPodSpec,
-    PodStatus as K8sPodStatus,
+    Container, ContainerPort, ContainerState, ContainerStateRunning, ContainerStatus, Node, Pod,
+    PodCondition, PodSpec as K8sPodSpec, PodStatus as K8sPodStatus,
 };
 use kube::{api::ObjectMeta, runtime::watcher::Event};
 use std::task::Poll;
@@ -249,4 +249,92 @@ fn pod_node_api_port_ignores_invalid_values() {
         None
     );
     assert_eq!(pod_node_api_port(&make_port_pod(Some("70000"), None)), None);
+}
+
+/// A node-api pod whose container is running and has started, Ready or not.
+fn make_live_pod(node: &str, ip: &str, ready: bool, app: &str) -> Pod {
+    let mut pod = make_pod(node, ip, ready, app);
+    let status = pod.status.as_mut().unwrap();
+    status.phase = Some("Running".to_string());
+    status.container_statuses = Some(vec![ContainerStatus {
+        name: "node-api".to_string(),
+        ready,
+        started: Some(true),
+        state: Some(ContainerState {
+            running: Some(ContainerStateRunning::default()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }]);
+    pod
+}
+
+#[test]
+fn pinned_builder_lookup_reaches_a_draining_builder() {
+    // A draining builder's node-api reports itself unready to leave the
+    // builder Service; calls pinned to its node must still find it.
+    let caches = caches_with_pods(vec![make_live_pod(
+        "node-a",
+        "10.0.0.5",
+        false,
+        "space-builder",
+    )]);
+    assert!(
+        caches
+            .ready_node_api_pod_on("node-a", SpaceNodeRole::Builder.as_str())
+            .is_none()
+    );
+    let found = caches
+        .node_api_pod_for_pinned_call_on("node-a", SpaceNodeRole::Builder.as_str())
+        .expect("a live, unready builder node-api still serves pinned calls");
+    assert_eq!(pod_ip(&found), Some("10.0.0.5"));
+}
+
+#[test]
+fn pinned_builder_lookup_prefers_a_ready_pod() {
+    let caches = caches_with_pods(vec![
+        make_live_pod("node-a", "10.0.0.5", false, "space-builder"),
+        make_live_pod("node-a", "10.0.0.6", true, "space-builder"),
+    ]);
+    let found = caches
+        .node_api_pod_for_pinned_call_on("node-a", SpaceNodeRole::Builder.as_str())
+        .unwrap();
+    assert_eq!(pod_ip(&found), Some("10.0.0.6"));
+}
+
+#[test]
+fn pinned_lookup_skips_unready_workers_and_dead_builders() {
+    let mut deleting = make_live_pod("node-b", "10.0.0.7", false, "space-builder");
+    deleting.metadata.deletion_timestamp =
+        Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            "2026-10-01T00:00:00Z".parse().expect("valid timestamp"),
+        ));
+    let mut not_started = make_live_pod("node-c", "10.0.0.8", false, "space-builder");
+    not_started
+        .status
+        .as_mut()
+        .unwrap()
+        .container_statuses
+        .as_mut()
+        .unwrap()[0]
+        .started = Some(false);
+    let caches = caches_with_pods(vec![
+        make_live_pod("node-a", "10.0.0.6", false, "space-worker"),
+        deleting,
+        not_started,
+        make_pod("node-d", "10.0.0.9", false, "space-builder"),
+    ]);
+    for (node, role) in [
+        ("node-a", SpaceNodeRole::Worker),
+        ("node-b", SpaceNodeRole::Builder),
+        ("node-c", SpaceNodeRole::Builder),
+        ("node-d", SpaceNodeRole::Builder),
+    ] {
+        assert!(
+            caches
+                .node_api_pod_for_pinned_call_on(node, role.as_str())
+                .is_none(),
+            "{node} must not resolve for a pinned {role:?} call"
+        );
+    }
 }
