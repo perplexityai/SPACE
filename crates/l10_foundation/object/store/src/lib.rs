@@ -14,7 +14,7 @@ use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::{Region, RequestChecksumCalculation, StalledStreamProtectionConfig};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
-use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::{ByteStream, ByteStreamError, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::{Client, Config};
@@ -34,6 +34,7 @@ use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
 mod attempts;
 mod content_md5;
 mod copy;
+pub use copy::CopyStorageClass;
 mod download;
 pub mod metrics;
 #[cfg(test)]
@@ -146,6 +147,13 @@ pub enum ObjectStoreError {
     Multipart(String),
     #[error("S3 server-side copy failed: {0}")]
     Copy(String),
+    #[error("this object store cannot verify server-side copy storage class")]
+    CopyStorageClassUnsupported,
+    #[error("copied object has storage class {actual}, expected {expected}")]
+    CopyStorageClassMismatch {
+        expected: CopyStorageClass,
+        actual: String,
+    },
     #[error("S3 get_object failed: {0}")]
     Get(String),
     /// Object does not exist at `key`. Surfaces from `get_bytes` and
@@ -338,6 +346,19 @@ pub trait ObjectStore: Send + Sync {
             "this object store cannot copy {}/{} server-side",
             source.bucket, source.key,
         )))
+    }
+
+    /// Copies server-side and reads the destination metadata, succeeding
+    /// only if the backend confirms the requested storage class.
+    async fn copy_object_with_storage_class(
+        &self,
+        _creds: &ObjectCredentials,
+        _source: ObjectTarget<'_>,
+        _dest: ObjectTarget<'_>,
+        _source_size: u64,
+        _storage_class: CopyStorageClass,
+    ) -> Result<ObjectMeta, ObjectStoreError> {
+        Err(ObjectStoreError::CopyStorageClassUnsupported)
     }
 
     /// Reads the entire object body into memory. Use only for small
@@ -937,17 +958,12 @@ impl S3ObjectStore {
     }
 }
 
-#[async_trait]
-impl ObjectStore for S3ObjectStore {
-    fn streaming_upload(&self) -> Option<&dyn StreamingUpload> {
-        Some(self)
-    }
-
-    async fn head(
+impl S3ObjectStore {
+    async fn head_object(
         &self,
         creds: &ObjectCredentials,
         target: ObjectTarget<'_>,
-    ) -> Result<Option<ObjectMeta>, ObjectStoreError> {
+    ) -> Result<Option<HeadObjectOutput>, ObjectStoreError> {
         match self
             .base
             .head_object()
@@ -958,10 +974,7 @@ impl ObjectStore for S3ObjectStore {
             .send()
             .await
         {
-            Ok(resp) => Ok(Some(ObjectMeta {
-                size: resp.content_length().unwrap_or(0).max(0).cast_unsigned(),
-                etag: resp.e_tag().map(str::to_string),
-            })),
+            Ok(resp) => Ok(Some(resp)),
             Err(SdkError::ServiceError(svc))
                 if matches!(svc.err(), HeadObjectError::NotFound(_)) =>
             {
@@ -978,6 +991,30 @@ impl ObjectStore for S3ObjectStore {
             }
         }
     }
+}
+
+impl From<HeadObjectOutput> for ObjectMeta {
+    fn from(resp: HeadObjectOutput) -> Self {
+        Self {
+            size: resp.content_length().unwrap_or(0).max(0).cast_unsigned(),
+            etag: resp.e_tag().map(str::to_string),
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectStore for S3ObjectStore {
+    fn streaming_upload(&self) -> Option<&dyn StreamingUpload> {
+        Some(self)
+    }
+
+    async fn head(
+        &self,
+        creds: &ObjectCredentials,
+        target: ObjectTarget<'_>,
+    ) -> Result<Option<ObjectMeta>, ObjectStoreError> {
+        Ok(self.head_object(creds, target).await?.map(ObjectMeta::from))
+    }
 
     async fn copy_object(
         &self,
@@ -986,8 +1023,36 @@ impl ObjectStore for S3ObjectStore {
         dest: ObjectTarget<'_>,
         source_size: u64,
     ) -> Result<(), ObjectStoreError> {
-        self.copy_object_server_side(creds, source, dest, source_size)
+        self.copy_object_server_side(creds, source, dest, source_size, None)
             .await
+    }
+
+    async fn copy_object_with_storage_class(
+        &self,
+        creds: &ObjectCredentials,
+        source: ObjectTarget<'_>,
+        dest: ObjectTarget<'_>,
+        source_size: u64,
+        storage_class: CopyStorageClass,
+    ) -> Result<ObjectMeta, ObjectStoreError> {
+        self.copy_object_server_side(creds, source, dest, source_size, Some(storage_class))
+            .await?;
+        let head = self
+            .head_object(creds, dest)
+            .await?
+            .ok_or_else(|| ObjectStoreError::Copy("copied object is not visible".into()))?;
+        // S3 omits the header for STANDARD. A present, unfamiliar class
+        // must not be mistaken for the default.
+        let actual = head
+            .storage_class()
+            .map_or("STANDARD", |class| class.as_str());
+        if actual != storage_class.as_str() {
+            return Err(ObjectStoreError::CopyStorageClassMismatch {
+                expected: storage_class,
+                actual: actual.into(),
+            });
+        }
+        Ok(ObjectMeta::from(head))
     }
 
     async fn put_bytes(

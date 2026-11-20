@@ -20,9 +20,10 @@
 //! magnitude above any template artifact — and the tuning floor of 8 MiB still
 //! covers 78 GiB.
 
-use aws_sdk_s3::types::CompletedMultipartUpload;
+use aws_sdk_s3::types::{CompletedMultipartUpload, StorageClass};
 use aws_smithy_types::error::display::DisplayErrorContext;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use std::fmt;
 use tracing::{info, warn};
 
 use crate::{
@@ -37,6 +38,28 @@ use crate::{
 /// boundary-sized artifact takes the multipart path instead of the one call
 /// that would be rejected.
 const MAX_SINGLE_COPY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Supported destination classes for an explicitly classed server-side copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyStorageClass {
+    Standard,
+    GlacierInstantRetrieval,
+}
+
+impl CopyStorageClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "STANDARD",
+            Self::GlacierInstantRetrieval => "GLACIER_IR",
+        }
+    }
+}
+
+impl fmt::Display for CopyStorageClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Characters `x-amz-copy-source` must carry percent-encoded.
 ///
@@ -90,8 +113,10 @@ impl S3ObjectStore {
         source: ObjectTarget<'_>,
         dest: ObjectTarget<'_>,
         source_size: u64,
+        storage_class: Option<CopyStorageClass>,
     ) -> Result<(), ObjectStoreError> {
         let copy_source = copy_source_value(source.bucket, source.key);
+        let storage_class = storage_class.map(|class| StorageClass::from(class.as_str()));
 
         if source_size <= MAX_SINGLE_COPY_BYTES {
             info!(
@@ -113,6 +138,7 @@ impl S3ObjectStore {
                 .bucket(dest.bucket)
                 .key(dest.key)
                 .copy_source(&copy_source)
+                .set_storage_class(storage_class)
                 .customize()
                 .config_override(self.op_config(creds, &dest, S3Operation::CopyObject))
                 .send()
@@ -131,8 +157,15 @@ impl S3ObjectStore {
             return Ok(());
         }
 
-        self.multipart_copy(creds, source, dest, &copy_source, source_size)
-            .await
+        self.multipart_copy(
+            creds,
+            source,
+            dest,
+            &copy_source,
+            source_size,
+            storage_class,
+        )
+        .await
     }
 
     /// `CreateMultipartUpload` → `UploadPartCopy` per range →
@@ -144,6 +177,7 @@ impl S3ObjectStore {
         dest: ObjectTarget<'_>,
         copy_source: &str,
         size: u64,
+        storage_class: Option<StorageClass>,
     ) -> Result<(), ObjectStoreError> {
         // Clamp the part size so a source above the single-copy threshold can
         // never plan down to one part: `UploadPartCopy` carries the same 5 GiB
@@ -172,6 +206,7 @@ impl S3ObjectStore {
             .create_multipart_upload()
             .bucket(dest.bucket)
             .key(dest.key)
+            .set_storage_class(storage_class)
             .customize()
             .config_override(self.op_config(creds, &dest, S3Operation::CreateMultipartUpload))
             .send()

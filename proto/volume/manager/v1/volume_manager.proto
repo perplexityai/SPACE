@@ -55,6 +55,12 @@ service VolumeManager {
     // the payload on this worker. The durable job survives caller disconnect.
     rpc SubmitCopyObject(CopyObjectRequest) returns (SubmitTransferResponse);
 
+    // Requires an explicit destination class. This is a separate RPC so an
+    // older server cannot ignore the class and enqueue an ordinary copy.
+    // The caller owns the destination key and must not share it across
+    // copies requesting different classes.
+    rpc SubmitClassedCopyObject(CopyObjectRequest) returns (SubmitTransferResponse);
+
     // Query the status of a previously submitted transfer job.
     rpc GetTransferJob(GetTransferJobRequest) returns (GetTransferJobResponse);
 
@@ -409,6 +415,13 @@ message CopyObjectRequest {
     string subject_id = 1;
     string source_s3_uri = 2;
     string destination_s3_uri = 3;
+    optional CopyStorageClass destination_storage_class = 4;
+}
+
+enum CopyStorageClass {
+    COPY_STORAGE_CLASS_UNSPECIFIED = 0;
+    COPY_STORAGE_CLASS_STANDARD = 1;
+    COPY_STORAGE_CLASS_GLACIER_INSTANT_RETRIEVAL = 2;
 }
 
 enum TransferJobStatus {

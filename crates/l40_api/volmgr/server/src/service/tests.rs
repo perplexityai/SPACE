@@ -8,6 +8,7 @@ async fn copy_jobs_deduplicate_live_work_without_claiming_a_pull_writer_barrier(
         subject_id: format!("sandbox:{}", pplx_space_sandbox_model::SandboxId::new()),
         source_s3_uri: "s3://example-artifacts/source?region=us-east-1".into(),
         destination_s3_uri: "s3://example-artifacts/destination?region=us-east-1".into(),
+        destination_storage_class: None,
     };
     let denied = service
         .submit_copy_object(service_request(request.clone(), users::SPACE_TMPLMGR))
@@ -56,6 +57,66 @@ async fn copy_jobs_deduplicate_live_work_without_claiming_a_pull_writer_barrier(
         .expect_err("S3 copies cannot promise the pull cancellation writer barrier");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(service.worker.list_jobs(None, None, 100).unwrap().len(), 1);
+
+    use crate::proto::CopyStorageClass;
+    for invalid in [None, Some(CopyStorageClass::Unspecified as i32), Some(42)] {
+        let invalid = crate::proto::CopyObjectRequest {
+            destination_storage_class: invalid,
+            ..request.clone()
+        };
+        assert_eq!(
+            service
+                .submit_classed_copy_object(root_request(invalid))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let mut classed_ids = Vec::new();
+    for class in [
+        CopyStorageClass::Standard,
+        CopyStorageClass::GlacierInstantRetrieval,
+    ] {
+        let classed = crate::proto::CopyObjectRequest {
+            destination_storage_class: Some(class as i32),
+            ..request.clone()
+        };
+        let error = service
+            .submit_classed_copy_object(service_request(classed.clone(), users::SPACE_TMPLMGR))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let error = service
+            .submit_copy_object(root_request(classed.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let reply = service
+                .submit_classed_copy_object(root_request(classed.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            let job = service
+                .worker
+                .get_job(&reply.job_id.parse().unwrap())
+                .unwrap()
+                .unwrap();
+            let payload: crate::proto::CopyObjectRequest = job.payload_as().unwrap();
+            assert_eq!(payload.destination_storage_class, Some(class as i32));
+            assert_eq!(
+                job_to_proto(job).unwrap().s3_uri,
+                request.destination_s3_uri
+            );
+            ids.push(reply.job_id);
+        }
+        assert_eq!(ids[0], ids[1]);
+        classed_ids.push(ids.pop().unwrap());
+    }
+    assert_ne!(classed_ids[0], classed_ids[1]);
+    assert_eq!(service.worker.list_jobs(None, None, 100).unwrap().len(), 3);
 }
 
 #[test]
