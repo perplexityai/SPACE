@@ -16,11 +16,14 @@
 //!   `SpaceCacheEncryptionKmsKeyArn=<key>`: the AMI's cache unit builds
 //!   `/space/cache` on LUKS under a data key from that key before kubelet
 //!   starts, and powers the node off if the key stops decrypting.
-//! - **Node group.** Created at size 0 with the boundary label
-//!   `node-restriction.kubernetes.io/space-node-group=<group>` and the taint
-//!   `space.pplx.net/dedicated-org=<org>`, so the pool plan sees its nodes as
-//!   the group's live nodes, grows it with `UpdateNodegroupConfig` and
-//!   releases nodes by drain and terminate, exactly as for a shared pool.
+//! - **Node group.** Created at size 0, its nodes registered with the taints
+//!   `space.pplx.net/dedicated-org=<org>` and `space.pplx.net/unassigned`, so
+//!   nothing else schedules on a node before it is assigned. The boundary
+//!   label `node-restriction.kubernetes.io/space-node-group` can't be set at
+//!   registration (kubelet refuses the prefix), so the pool plan assigns the
+//!   node exactly as for a shared pool: label, then lift `unassigned`. It
+//!   grows the group with `UpdateNodegroupConfig` and releases nodes by drain
+//!   and terminate.
 //!
 //! When the group's `desired_nodes` is 0 and none of its nodes are left in
 //! the cluster, the node group is deleted, then its access entry and role.
@@ -35,12 +38,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use pplx_space_aws_client::ec2::LaunchTemplateVersionRequest;
 use pplx_space_aws_client::eks::NewNodegroup;
 use pplx_space_aws_client::iam::NewRole;
-use pplx_space_sandbox_pod::{DEDICATED_NODE_TAINT_KEY, NODE_GROUP_LABEL};
+use pplx_space_sandbox_pod::DEDICATED_NODE_TAINT_KEY;
 use pplx_space_sql_locator::sql;
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
+use super::UNASSIGNED_TAINT_KEY;
 use crate::env_config;
 
 /// Instance, volume, node group and role tag naming the owner. Tag keys have
@@ -183,8 +187,6 @@ impl Config {
         node_role_arn: &str,
         launch_template_version: i64,
     ) -> NewNodegroup {
-        let mut labels = self.labels.clone();
-        labels.insert(NODE_GROUP_LABEL.to_string(), group.name.clone());
         NewNodegroup {
             name: group.name.clone(),
             node_role_arn: node_role_arn.to_string(),
@@ -193,11 +195,14 @@ impl Config {
             launch_template_id: self.launch_template_id.clone(),
             launch_template_version: launch_template_version.to_string(),
             max_size: self.max_nodes,
-            labels: labels.into_iter().collect(),
-            taints: vec![(
-                DEDICATED_NODE_TAINT_KEY.to_string(),
-                group.org_id.to_string(),
-            )],
+            labels: self.labels.clone().into_iter().collect(),
+            taints: vec![
+                (
+                    DEDICATED_NODE_TAINT_KEY.to_string(),
+                    group.org_id.to_string(),
+                ),
+                (UNASSIGNED_TAINT_KEY.to_string(), "true".to_string()),
+            ],
             tags: self.tags_for(&group.name),
         }
     }
