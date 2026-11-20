@@ -238,3 +238,122 @@ fn the_two_nesting_flags_arrive_stringified_from_flagd() {
         );
     });
 }
+
+/// The three limiter flags, read through real flagd the way `pplx-space-api`
+/// reads them: the constant `space-cluster` subject plus a `cluster_id`
+/// attribute.
+///
+/// A rule on `cluster_id` changes the cluster it names and falls through to
+/// the default everywhere else, including for a read with no attribute. The
+/// reference file, which has no rule, answers the same with or without the
+/// attribute.
+#[test]
+fn a_cluster_id_rule_on_the_limiter_flags_targets_one_cluster() {
+    fn cluster(cluster_id: &str) -> Attributes {
+        Attributes::from([("cluster_id".to_owned(), cluster_id.into())])
+    }
+    const SUBJECT: &str = "space-cluster";
+
+    let directory = tempfile::tempdir().expect("a temp dir for the flag file");
+    let path = directory.path().join("cluster-targeted-flags.json");
+    let rule = |variant: &str| {
+        format!(
+            r#"{{ "if": [{{ "==": [{{ "var": "cluster_id" }}, "cluster-a"] }}, "{variant}", null] }}"#
+        )
+    };
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{
+              "flags": {{
+                "{rate_limiter}": {{
+                  "state": "ENABLED",
+                  "defaultVariant": "on",
+                  "variants": {{ "on": true, "off": false }},
+                  "targeting": {off}
+                }},
+                "{concurrency}": {{
+                  "state": "ENABLED",
+                  "defaultVariant": "on",
+                  "variants": {{ "on": true, "off": false }},
+                  "targeting": {off}
+                }},
+                "{quotas}": {{
+                  "state": "ENABLED",
+                  "defaultVariant": "shared",
+                  "variants": {{ "shared": {{ "unspecified": 8 }}, "tight": {{ "unspecified": 2 }} }},
+                  "targeting": {tight}
+                }}
+              }}
+            }}"#,
+            rate_limiter = SPACE_CLUSTER_RATE_LIMITER_FLAG,
+            concurrency = SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
+            quotas = SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
+            off = rule("off"),
+            tight = rule("tight"),
+        ),
+    )
+    .expect("write the flag file");
+
+    flagd_client(path.to_str().expect("utf-8 temp path"), |client| {
+        for flag in [
+            SPACE_CLUSTER_RATE_LIMITER_FLAG,
+            SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
+        ] {
+            assert_eq!(
+                client.resolve_bool(flag, SUBJECT, cluster("cluster-a")),
+                Ok(false),
+                "{flag} in the named cluster"
+            );
+            assert_eq!(
+                client.resolve_bool(flag, SUBJECT, cluster("cluster-b")),
+                Ok(true),
+                "{flag} in another cluster"
+            );
+            assert_eq!(
+                client.resolve_bool(flag, SUBJECT, Attributes::default()),
+                Ok(true),
+                "{flag} with no cluster id"
+            );
+        }
+        let unspecified = |attributes: Attributes| {
+            client
+                .resolve_json(
+                    SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
+                    SUBJECT,
+                    attributes,
+                )
+                .ok()
+                .and_then(|value| value.get("unspecified").and_then(serde_json::Value::as_i64))
+        };
+        assert_eq!(unspecified(cluster("cluster-a")), Some(2));
+        assert_eq!(unspecified(cluster("cluster-b")), Some(8));
+        assert_eq!(unspecified(Attributes::default()), Some(8));
+    });
+
+    flagd_client(REFERENCE_PATH, |client| {
+        for flag in [
+            SPACE_CLUSTER_RATE_LIMITER_FLAG,
+            SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
+        ] {
+            assert_eq!(
+                client.resolve_bool(flag, SUBJECT, cluster("cluster-a")),
+                client.resolve_bool(flag, SUBJECT, Attributes::default()),
+                "{flag} from the reference"
+            );
+        }
+        assert_eq!(
+            client.resolve_json(
+                SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
+                SUBJECT,
+                cluster("cluster-a")
+            ),
+            client.resolve_json(
+                SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
+                SUBJECT,
+                Attributes::default()
+            ),
+            "the quotas flag from the reference"
+        );
+    });
+}

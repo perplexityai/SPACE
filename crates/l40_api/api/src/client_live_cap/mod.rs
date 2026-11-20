@@ -55,7 +55,9 @@ use std::time::Duration;
 
 use crate::metrics::sandbox::api::client_live_cap::{self, Check, Decision, Reason};
 use pplx_space_accounts::ClientId;
-use pplx_space_feature_flags::{FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG};
+use pplx_space_feature_flags::{
+    Attributes, FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
+};
 use pplx_space_sandbox_model::SandboxId;
 
 use crate::controllers::substrate::{
@@ -73,7 +75,6 @@ pub use reservation::{LiveHandoff, LiveReservation};
 const PER_CLIENT_ENV: &str = "SPACE_API_CLIENT_LIVE_CAP_PER_CLIENT";
 const UNKNOWN_ENV: &str = "SPACE_API_CLIENT_LIVE_CAP_UNKNOWN";
 const REDIS_URL_ENV: &str = "SPACE_REDIS_URL";
-const FLAG_SUBJECT: &str = "space-cluster";
 
 /// How long a pending member counts after its last renewal. Once its pod
 /// exists it only has to cover one watch delay.
@@ -316,6 +317,9 @@ struct Inner {
     store: Option<PendingSet>,
     config: ClientLiveCapConfig,
     feature_flags: FeatureFlagClient,
+    /// What the quotas flag is evaluated with besides its constant subject:
+    /// this process's cluster id (see [`crate::limiter_flags`]).
+    flag_attributes: Attributes,
     timing: PendingTiming,
     last_flag: FlagRetention,
 }
@@ -404,6 +408,7 @@ impl ClientLiveCap {
                 store,
                 config,
                 feature_flags,
+                flag_attributes: crate::limiter_flags::process_attributes(),
                 timing: PendingTiming {
                     ttl: LIVE_PENDING_TTL,
                     grace: LIVE_PENDING_GRACE,
@@ -444,6 +449,19 @@ impl ClientLiveCap {
         )
     }
 
+    /// This cap with its flag evaluated as if this process ran in
+    /// `cluster_id`.
+    #[cfg(test)]
+    fn with_flag_cluster_id(
+        mut self,
+        cluster_id: Option<&pplx_space_cluster_id::ClusterId>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("flag cluster id set before the cap is shared")
+            .flag_attributes = crate::limiter_flags::attributes(cluster_id);
+        self
+    }
+
     /// This cap with its pending set under its own prefix, and `timing`.
     #[cfg(test)]
     fn isolated(mut self, name: &str, timing: PendingTiming) -> Self {
@@ -467,10 +485,11 @@ impl ClientLiveCap {
         let flag = self
             .inner
             .feature_flags
-            .json_override(
+            .json_override_with_attributes(
                 config.any_cap(),
                 SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
-                FLAG_SUBJECT,
+                crate::limiter_flags::SUBJECT,
+                self.inner.flag_attributes.clone(),
             )
             .resolved();
         let flag = self.inner.last_flag.get(flag, std::time::Instant::now());

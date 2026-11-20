@@ -935,3 +935,79 @@ async fn limiter_observe_mode_never_rejects() -> TestResult {
     let _b = admit(limiter.try_acquire(Operation::Create, Some(&client)).await);
     Ok(())
 }
+
+/// A `cluster_id` rule on either limiter flag retunes the cluster it names and
+/// no other, and a process with no cluster id is never matched. With no rule,
+/// every cluster reads what it read before the attribute existed.
+#[test]
+fn a_cluster_id_rule_retunes_only_the_cluster_it_names() {
+    use crate::limiter_flags::tests::{cluster, targeting_one_cluster, without_a_rule};
+
+    let limiter_in = |flags: &FeatureFlagClient, cluster_id: Option<&str>| {
+        ClientConcurrencyLimiter::with_config(env_caps(), flags.clone())
+            .with_flag_cluster_id(cluster_id.map(cluster).as_ref())
+    };
+    let gate = SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG.key();
+    let quotas = SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG.key();
+
+    // The kill switch.
+    let off_in_a = targeting_one_cluster(gate, "cluster-a", serde_json::json!(false), None);
+    assert!(!limiter_in(&off_in_a, Some("cluster-a")).limiter_active());
+    assert!(limiter_in(&off_in_a, Some("cluster-b")).limiter_active());
+    assert!(limiter_in(&off_in_a, None).limiter_active());
+
+    // The quota map: cluster-a gets its own caps, the others keep the shared
+    // default.
+    let shared = serde_json::json!({"unspecified": 3});
+    let tight_in_a = targeting_one_cluster(
+        quotas,
+        "cluster-a",
+        serde_json::json!({"unspecified": 1}),
+        Some(shared.clone()),
+    );
+    let unspecified = |overrides: Option<QuotaOverrides>| overrides.and_then(|o| o.unspecified);
+    assert_eq!(
+        unspecified(limiter_in(&tight_in_a, Some("cluster-a")).quota_overrides()),
+        Some(1)
+    );
+    assert_eq!(
+        unspecified(limiter_in(&tight_in_a, Some("cluster-b")).quota_overrides()),
+        Some(3)
+    );
+    assert_eq!(
+        unspecified(limiter_in(&tight_in_a, None).quota_overrides()),
+        Some(3)
+    );
+
+    // No rule: each cluster gets the answer the attribute-free read gives.
+    for default in [Some(true), Some(false), None] {
+        let today = match default {
+            Some(value) => FeatureFlagClient::fixed_bools([(gate, value)]),
+            None => FeatureFlagClient::fixed_bools([("other", true)]),
+        };
+        let expected = limiter_in(&today, None).limiter_active();
+        let untargeted = without_a_rule(gate, default.map(serde_json::Value::Bool));
+        for cluster_id in [Some("cluster-a"), Some("cluster-b"), None] {
+            assert_eq!(
+                limiter_in(&untargeted, cluster_id).limiter_active(),
+                expected,
+                "gate default {default:?} in {cluster_id:?}"
+            );
+        }
+    }
+    for default in [Some(shared), None] {
+        let today = match &default {
+            Some(value) => FeatureFlagClient::fixed_json([(quotas, value.clone())]),
+            None => FeatureFlagClient::fixed_json([("other", serde_json::json!({}))]),
+        };
+        let expected = limiter_in(&today, None).quota_overrides();
+        let untargeted = without_a_rule(quotas, default.clone());
+        for cluster_id in [Some("cluster-a"), Some("cluster-b"), None] {
+            assert_eq!(
+                limiter_in(&untargeted, cluster_id).quota_overrides(),
+                expected,
+                "quotas default {default:?} in {cluster_id:?}"
+            );
+        }
+    }
+}
