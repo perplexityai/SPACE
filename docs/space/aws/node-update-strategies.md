@@ -219,8 +219,10 @@ Each `worker_capacity_groups` entry has an optional
 The non-blocking `worker_capacity_groups_on_latest_launch_template` check
 warns while any pin lags the latest version. During a plan that changes the
 LT, the latest version is not known until apply, so the check reports as
-unknown. A pin above the template's latest version fails a precondition
-at apply, before any node group update starts. The module does not require
+unknown. A pin above the template's latest version fails a precondition:
+at plan, or at apply when the same apply changes the template. In the
+second case it fails only when that node group is applied, and other node
+groups that do not depend on it may already be updating. The module does not require
 a populated group to be pinned, so make it a rule: pin a group to the
 version it runs before scaling it out from zero and before any change that
 publishes a new LT version. An unpinned group that is populated when the LT
