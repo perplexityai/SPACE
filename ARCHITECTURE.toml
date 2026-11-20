@@ -376,6 +376,7 @@ pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-firewall-rules-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
 ]
 pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-node-status-store = [

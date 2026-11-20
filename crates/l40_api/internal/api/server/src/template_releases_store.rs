@@ -176,12 +176,12 @@ impl TemplateReleasesStore {
         &self,
         node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
     ) -> Result<TemplateReadScope, sqlx::Error> {
-        let node_ids = self
-            .nodes_for_identity(node, &[NodeRole::Worker, NodeRole::Builder])
-            .await?
-            .into_iter()
-            .filter_map(|(id, uid_matches)| (uid_matches == Some(true)).then_some(id))
-            .collect();
+        let node_ids =
+            Self::nodes_for_identity(&self.pool, node, &[NodeRole::Worker, NodeRole::Builder])
+                .await?
+                .into_iter()
+                .filter_map(|(id, uid_matches)| (uid_matches == Some(true)).then_some(id))
+                .collect();
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
@@ -191,7 +191,7 @@ impl TemplateReleasesStore {
         &self,
         node: &pplx_space_rpc_auth::build::AuthenticatedBuildNode,
     ) -> Result<PublicationNode, sqlx::Error> {
-        let rows = self.nodes_for_identity(node, &[NodeRole::Builder]).await?;
+        let rows = Self::nodes_for_identity(&self.pool, node, &[NodeRole::Builder]).await?;
         if let Some((id, _)) = rows.iter().find(|(_, matches)| *matches == Some(true)) {
             Ok(PublicationNode::Registered(*id))
         } else if rows.iter().any(|(_, matches)| matches.is_none()) {
@@ -201,8 +201,10 @@ impl TemplateReleasesStore {
         }
     }
 
-    async fn nodes_for_identity(
-        &self,
+    /// Live registrations of the reviewed node name in `roles`, each with
+    /// whether its inventory UID matches (`None` when it has none).
+    pub(super) async fn nodes_for_identity(
+        executor: impl sqlx::PgExecutor<'_>,
         node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
         roles: &[NodeRole],
     ) -> Result<Vec<(NodeId, Option<bool>)>, sqlx::Error> {
@@ -217,7 +219,7 @@ impl TemplateReleasesStore {
         .bind(node.uid().as_str())
         .bind(SubstrateKind::Kubernetes)
         .bind(roles.iter().map(|role| role.as_str()).collect::<Vec<_>>())
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await
     }
 

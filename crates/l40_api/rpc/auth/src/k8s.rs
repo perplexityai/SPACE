@@ -458,6 +458,8 @@ pub(super) struct K8sTokenAuthConfig {
     template_transfer_usernames: BTreeSet<String>,
     node_api_internal_allowed_usernames: BTreeSet<String>,
     cluster_api_allowed_usernames: BTreeSet<String>,
+    /// Empty outside tests: no node-ctl principal is approved.
+    firewall_rules_fetch_usernames: BTreeSet<String>,
     pub(super) cache_ttl: Duration,
     negative_cache_ttl: Duration,
     pub(super) cache_max_entries: usize,
@@ -525,6 +527,7 @@ impl K8sTokenAuthConfig {
             cluster_api_allowed_usernames: qualified_env_set(
                 SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV,
             ),
+            firewall_rules_fetch_usernames: BTreeSet::new(),
             cache_ttl: Duration::from_secs(DEFAULT_TOKEN_REVIEW_CACHE_TTL_SECS),
             negative_cache_ttl: Duration::from_secs(DEFAULT_TOKEN_REVIEW_NEGATIVE_CACHE_TTL_SECS),
             cache_max_entries: DEFAULT_TOKEN_REVIEW_CACHE_MAX_ENTRIES,
@@ -536,6 +539,12 @@ impl K8sTokenAuthConfig {
             ),
             review_timeout: Duration::from_secs(DEFAULT_TOKEN_REVIEW_TIMEOUT_SECS),
         }))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn grant_firewall_rules_fetch(&mut self, service_account: &str) {
+        self.firewall_rules_fetch_usernames
+            .insert(service_account_username(&self.namespace, service_account));
     }
 
     pub(super) fn validate_for_role(&self, role: NodeRole) -> Result<(), AuthConfigError> {
@@ -618,6 +627,7 @@ impl K8sTokenAuthConfig {
             peer_node_usernames: &self.node_api_peer_node_usernames,
             trusted_policy_usernames,
             template_transfer_usernames: &self.template_transfer_usernames,
+            firewall_rules_fetch_usernames: &self.firewall_rules_fetch_usernames,
         })
     }
 }
@@ -653,6 +663,7 @@ struct AuthPolicy<'a> {
     peer_node_usernames: &'a BTreeSet<String>,
     trusted_policy_usernames: Option<&'a BTreeSet<String>>,
     template_transfer_usernames: &'a BTreeSet<String>,
+    firewall_rules_fetch_usernames: &'a BTreeSet<String>,
 }
 
 /// Guest operations retain their sandbox-scoped route-token checks downstream.
@@ -799,6 +810,12 @@ impl AuthPolicy<'_> {
         {
             caller.template_transfer_authority =
                 super::template_transfer::TemplateTransferAuthority::Granted;
+        }
+        if self.role == NodeRole::Cluster
+            && self.firewall_rules_fetch_usernames.contains(username)
+            && !self.guest_bridge_usernames.contains(username)
+        {
+            caller.firewall_rules_fetch_authority = super::FirewallRulesFetchAuthority::Granted;
         }
         caller
     }

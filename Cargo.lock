@@ -6302,6 +6302,8 @@ dependencies = [
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-execution-spec",
+ "pplx-space-firewall-rules-protocol",
+ "pplx-space-firewall-rules-store",
  "pplx-space-grpc-server",
  "pplx-space-ingress-admission",
  "pplx-space-k8s-ids",

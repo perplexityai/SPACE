@@ -1,0 +1,147 @@
+use pplx_space_accounts::NodeId;
+use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_sql_locator::sql;
+use pplx_space_test_env::TestResult;
+use sqlx::PgPool;
+
+use super::*;
+
+/// Two rules out of name order, the second with two comparisons.
+const ORDERED: &str = concat!(
+    r#"[{"id":"web","all_of":["#,
+    r#"{"left":{"payload":{"protocol":"tcp","field":"sport"}},"op":"==","right":1024},"#,
+    r#"{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}]},"#,
+    r#"{"id":"dns","all_of":["#,
+    r#"{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}]"#,
+);
+
+fn issued_at() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp_nanos(1_790_000_000_123_456_000).unwrap()
+}
+
+async fn insert_revision(pool: &PgPool, rules: &str) -> TestResult<RevisionId> {
+    let id = RevisionId(uuid::Uuid::now_v7());
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)
+         VALUES ($1, 1, $2::jsonb)"
+    ))
+    .bind(id)
+    .bind(rules)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+async fn assign(
+    pool: &PgPool,
+    node: NodeId,
+    generation: i64,
+    rules: &str,
+) -> TestResult<Assignment> {
+    let revision_id = insert_revision(pool, rules).await?;
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
+         VALUES ($1, $2, $3)"
+    ))
+    .bind(node)
+    .bind(generation)
+    .bind(revision_id)
+    .execute(pool)
+    .await?;
+    Ok(Assignment {
+        generation: generation.try_into()?,
+        revision_id,
+        revision: decode_revision(&format!(r#"{{"schema_version":1,"rules":{rules}}}"#))?,
+    })
+}
+
+/// An observation row with the given pending and accepted rounds.
+async fn observe(
+    pool: &PgPool,
+    node: NodeId,
+    pending: Option<i64>,
+    accepted: Option<i64>,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_node_observations (
+             node_id, manager_epoch, pending_round, pending_round_issued_at,
+             accepted_round, accepted_round_issued_at, accepted_report
+         )
+         VALUES ($1, 1, $2, CASE WHEN $2 IS NOT NULL THEN $4 END,
+                 $3, CASE WHEN $3 IS NOT NULL THEN $4 END,
+                 CASE WHEN $3 IS NOT NULL THEN '{}'::jsonb END)"
+    ))
+    .bind(node)
+    .bind(pending)
+    .bind(accepted)
+    .bind(issued_at())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Each part is read for this node only, from its own row: a round without an
+/// assignment survives, an empty revision is an assignment, rule order and
+/// the round's issue time are kept, and accepted evidence is no pending round.
+#[tokio::test]
+async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    // Another node's work, which no case may see.
+    let other = NodeId::new();
+    assign(pool, other, 9, "[]").await?;
+    observe(pool, other, Some(99), None).await?;
+
+    for (case, assignment, pending, accepted) in [
+        ("neither", None, None, None),
+        ("empty revision", Some((0, "[]")), None, None),
+        ("round only", None, Some(7), None),
+        ("both", Some((3, ORDERED)), Some(7), None),
+        ("accepted evidence only", None, None, Some(6)),
+    ] {
+        let node = NodeId::new();
+        let assignment = match assignment {
+            Some((generation, rules)) => Some(assign(pool, node, generation, rules).await?),
+            None => None,
+        };
+        if pending.is_some() || accepted.is_some() {
+            observe(pool, node, pending, accepted).await?;
+        }
+        let expected = NodeInstructions {
+            assignment,
+            pending_round: pending.map(|round| PendingRound {
+                round: round.try_into().unwrap(),
+                issued_at: issued_at(),
+            }),
+        };
+        assert_eq!(fetch_instructions(pool, node).await?, expected, "{case}");
+    }
+    Ok(())
+}
+
+/// A stored revision the strict decoder refuses is an error, not no work.
+#[tokio::test]
+async fn an_undecodable_revision_is_an_error() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = NodeId::new();
+    let revision = insert_revision(pool, r#"[{"id":"r","all_of":[],"extra":1}]"#).await?;
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
+         VALUES ($1, 1, $2)"
+    ))
+    .bind(node)
+    .bind(revision)
+    .execute(pool)
+    .await?;
+    let error = fetch_instructions(pool, node).await.unwrap_err();
+    assert!(
+        matches!(error, FetchError::StoredRevision { id, .. } if id == revision),
+        "{error}"
+    );
+    Ok(())
+}

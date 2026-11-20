@@ -7836,6 +7836,8 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
 mod activating_routes;
 mod backup_generation_fence;
 mod execution_currency;
+#[cfg(feature = "kubernetes")]
+mod firewall_rules;
 mod publication;
 mod restoring_routes;
 

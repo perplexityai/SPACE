@@ -1993,6 +1993,13 @@ impl ClusterApi for ClusterApiService {
     ) -> Result<Response<crate::proto::GetExecutionCurrencyResponse>, Status> {
         ClusterApiService::get_execution_currency(self, request).await
     }
+
+    async fn fetch_firewall_rules(
+        &self,
+        request: Request<crate::proto::FetchFirewallRulesRequest>,
+    ) -> Result<Response<crate::proto::FetchFirewallRulesResponse>, Status> {
+        ClusterApiService::fetch_firewall_rules(self, request).await
+    }
 }
 
 /// The node cache partition a release's stored binding puts its build in:

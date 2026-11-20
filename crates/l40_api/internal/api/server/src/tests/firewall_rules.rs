@@ -1,0 +1,493 @@
+//! `FetchFirewallRules` through the real auth layer and a TokenReview double.
+//! The store's tests cover which parts are present and how they decode.
+
+use super::*;
+use crate::firewall_rules::Enrollment;
+use crate::proto::{
+    FetchFirewallRulesRequest, FetchFirewallRulesResponse, FirewallRulesAssignment,
+    FirewallRulesPendingRound, cluster_api_client::ClusterApiClient,
+    cluster_api_server::ClusterApiServer,
+};
+use pplx_space_rpc_auth::{
+    NodeApiAuthConfig, NodeApiAuthLayer, NodeRole,
+    test_support::{
+        TokenReviewStatus, pod_bound_service_account_status, projected_token, serve_token_reviews,
+        service_account_status,
+    },
+};
+use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::task::AbortOnDropHandle;
+use tonic::transport::Channel;
+
+const AUDIENCE: &str = "space-cluster-api";
+const NODE_CTL: &str = "system:serviceaccount:space:space-node-ctl";
+const STATIC_TOKEN: &str = "synthetic-static-token";
+
+/// Two rules out of name order, the first with two comparisons, in canonical
+/// form, which jsonb's own text isn't.
+const ORDERED: &str = concat!(
+    r#"[{"id":"web","all_of":["#,
+    r#"{"left":{"payload":{"protocol":"tcp","field":"sport"}},"op":"==","right":1024},"#,
+    r#"{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}]},"#,
+    r#"{"id":"dns","all_of":["#,
+    r#"{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}]"#,
+);
+const SSH: &str = r#"[{"id":"ssh","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":22}]}]"#;
+
+/// A served ClusterApi behind the node-api auth layer.
+struct Harness {
+    client: ClusterApiClient<Channel>,
+    _server: AbortOnDropHandle<Result<(), tonic::transport::Error>>,
+    _reviewer: AbortOnDropHandle<std::io::Result<()>>,
+}
+
+/// Serve `service`, reviewing each `projected_token(label)` as its status.
+/// With `grant`, node-ctl holds the fetch authority production withholds.
+async fn serve(
+    service: ClusterApiService,
+    reviews: Vec<(&'static str, TokenReviewStatus)>,
+    grant: bool,
+) -> TestResult<Harness> {
+    let reviews: Vec<_> = reviews
+        .into_iter()
+        .map(|(label, status)| (projected_token(label), status))
+        .collect();
+    let review_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let kube_config =
+        kube::Config::new(format!("http://{}", review_listener.local_addr()?).parse()?);
+    let reviewer = AbortOnDropHandle::new(tokio::spawn(serve_token_reviews(
+        review_listener,
+        move |spec| {
+            reviews
+                .iter()
+                .find(|(token, _)| Some(token) == spec.token.as_ref())
+                .map(|(_, status)| status.clone())
+                .unwrap()
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )));
+    let mut env = pplx_space_test_env::TestEnv::default();
+    for (key, value) in [
+        ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
+        ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "true"),
+        ("SPACE_K8S_TOKEN_AUTH_NAMESPACE", "space"),
+        ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
+        (
+            "SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS",
+            "space-node-ctl,space-template-manager",
+        ),
+    ] {
+        env.set(key, value);
+    }
+    let mut config =
+        NodeApiAuthConfig::from_environment(&env, NodeRole::Cluster, STATIC_TOKEN.into(), None)?;
+    if grant {
+        config = config.grant_firewall_rules_fetch_for_test("space-node-ctl");
+    }
+    let auth =
+        NodeApiAuthLayer::with_k8s_client_for_test(config, kube::Client::try_from(kube_config)?);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = AbortOnDropHandle::new(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(auth)
+            .add_service(ClusterApiServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    }));
+    Ok(Harness {
+        client: ClusterApiClient::connect(endpoint).await?,
+        _server: server,
+        _reviewer: reviewer,
+    })
+}
+
+/// Fetch with `bearer`, or with no authorization header.
+async fn fetch(
+    client: &mut ClusterApiClient<Channel>,
+    bearer: Option<&str>,
+) -> TestResult<Result<FetchFirewallRulesResponse, Code>> {
+    let mut request = Request::new(FetchFirewallRulesRequest {});
+    if let Some(bearer) = bearer {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse()?);
+    }
+    Ok(client
+        .fetch_firewall_rules(request)
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| status.code()))
+}
+
+/// node-ctl's token, pod-bound to `name` and `uid`.
+fn node_ctl_on(name: &str, uid: &str) -> TokenReviewStatus {
+    pod_bound_service_account_status(AUDIENCE, NODE_CTL, name, uid)
+}
+
+/// A Kubernetes registration with its inventory name and UID.
+async fn register(
+    pool: &sqlx::PgPool,
+    role: &str,
+    state: &str,
+    address: &str,
+    name: &str,
+    uid: &str,
+) -> TestResult<NodeId> {
+    let node = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, $2::INET, $3, 'k8s', $4)"
+    ))
+    .bind(node)
+    .bind(address)
+    .bind(role)
+    .bind(state)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
+    ))
+    .bind(node)
+    .bind(name)
+    .bind(uid)
+    .execute(pool)
+    .await?;
+    Ok(node)
+}
+
+async fn insert_revision(pool: &sqlx::PgPool, rules: &str) -> TestResult<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_revisions (id, ruleset_format_version, ruleset)
+         VALUES ($1, 1, $2::jsonb)"
+    ))
+    .bind(id)
+    .bind(rules)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Give `node` an assignment to `revision` and a pending round, returning
+/// the response that carries them.
+async fn give_work(
+    pool: &sqlx::PgPool,
+    node: NodeId,
+    generation: u64,
+    (revision, rules): (Uuid, &str),
+    round: u64,
+) -> TestResult<FetchFirewallRulesResponse> {
+    let issued_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+        1_790_000_000_000_000_000 + i128::from(round) * 1_000_123_000,
+    )?;
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_node_assignments (node_id, assignment_generation, revision_id)
+         VALUES ($1, $2, $3)"
+    ))
+    .bind(node)
+    .bind(i64::try_from(generation)?)
+    .bind(revision)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO firewall_rules_node_observations (
+             node_id, manager_epoch, pending_round, pending_round_issued_at
+         )
+         VALUES ($1, 1, $2, $3)"
+    ))
+    .bind(node)
+    .bind(i64::try_from(round)?)
+    .bind(issued_at)
+    .execute(pool)
+    .await?;
+    Ok(response(
+        node,
+        generation,
+        (revision, rules),
+        round,
+        issued_at,
+    ))
+}
+
+fn response(
+    node: NodeId,
+    generation: u64,
+    (revision, rules): (Uuid, &str),
+    round: u64,
+    issued_at: time::OffsetDateTime,
+) -> FetchFirewallRulesResponse {
+    FetchFirewallRulesResponse {
+        node_id: node.to_string(),
+        assignment: Some(FirewallRulesAssignment {
+            generation,
+            revision_id: revision.to_string(),
+            revision: format!(r#"{{"schema_version":1,"rules":{rules}}}"#),
+        }),
+        pending_round: Some(FirewallRulesPendingRound {
+            round,
+            issued_at: Some(std::time::SystemTime::from(issued_at).into()),
+        }),
+    }
+}
+
+/// Only node-ctl, bound by reviewed name and UID to exactly one live,
+/// enrolled worker, learns that worker's instructions, and never by its
+/// address: the server's peer address is worker B's.
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
+    let fixture = cluster_fixture().await?.expect("Postgres required");
+    let mut service = fixture.service;
+    let pool = service.pool.clone();
+    let pool = &pool;
+    let ordered = insert_revision(pool, ORDERED).await?;
+    let ssh = insert_revision(pool, SSH).await?;
+
+    let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
+    let b = register(pool, "worker", "ready", "127.0.0.1", "worker-b", "uid-b").await?;
+    let unenrolled = register(pool, "worker", "ready", "192.0.2.11", "worker-u", "uid-u").await?;
+    let builder = register(pool, "builder", "ready", "192.0.2.12", "builder-x", "uid-x").await?;
+    let deleted = register(pool, "worker", "deleted", "192.0.2.13", "worker-d", "uid-d").await?;
+    let twin = register(pool, "worker", "ready", "192.0.2.14", "worker-t", "uid-t").await?;
+    let twin_peer = register(pool, "worker", "ready", "192.0.2.15", "worker-t", "uid-t2").await?;
+    let a_work = give_work(pool, a, 4, (ordered, ORDERED), 7).await?;
+    give_work(pool, b, 9, (ssh, SSH), 70).await?;
+    for node in [unenrolled, builder, deleted, twin, twin_peer] {
+        give_work(pool, node, 1, (ssh, SSH), 1).await?;
+    }
+    service.firewall_enrollment =
+        Enrollment::Fixture(vec![a, b, builder, deleted, twin, twin_peer]);
+
+    let mut malformed = node_ctl_on("worker-a", "uid-a");
+    malformed
+        .user
+        .as_mut()
+        .and_then(|user| user.extra.as_mut())
+        .unwrap()
+        .insert(
+            "authentication.kubernetes.io/node-uid".into(),
+            vec!["uid-a".into(), "uid-a".into()],
+        );
+    let mut harness = serve(
+        service,
+        vec![
+            ("node-ctl-a", node_ctl_on("worker-a", "uid-a")),
+            (
+                "other-workload-a",
+                pod_bound_service_account_status(
+                    AUDIENCE,
+                    "system:serviceaccount:space:space-template-manager",
+                    "worker-a",
+                    "uid-a",
+                ),
+            ),
+            ("stale-uid", node_ctl_on("worker-a", "stale-uid")),
+            ("no-claims", service_account_status(AUDIENCE, NODE_CTL)),
+            ("malformed", malformed),
+            ("unenrolled", node_ctl_on("worker-u", "uid-u")),
+            ("builder", node_ctl_on("builder-x", "uid-x")),
+            ("deleted", node_ctl_on("worker-d", "uid-d")),
+            ("ambiguous", node_ctl_on("worker-t", "uid-t")),
+        ],
+        true,
+    )
+    .await?;
+    let client = &mut harness.client;
+
+    // `Ok` is A's own instructions.
+    let denied = Err(Code::PermissionDenied);
+    for (bearer, expected) in [
+        (Some(projected_token("node-ctl-a")), Ok(())),
+        (Some(projected_token("other-workload-a")), denied),
+        (Some(projected_token("stale-uid")), denied),
+        (Some(projected_token("no-claims")), denied),
+        (Some(projected_token("malformed")), denied),
+        (Some(projected_token("unenrolled")), denied),
+        (Some(projected_token("builder")), denied),
+        (Some(projected_token("deleted")), denied),
+        (Some(projected_token("ambiguous")), denied),
+        (Some(STATIC_TOKEN.to_owned()), denied),
+        (None, Err(Code::Unauthenticated)),
+    ] {
+        let expected = expected.map(|()| a_work.clone());
+        assert_eq!(
+            fetch(client, bearer.as_deref()).await?,
+            expected,
+            "{bearer:?}"
+        );
+    }
+
+    // Fetching again changes nothing: the round isn't consumed and no row is
+    // touched.
+    let touched = || {
+        sqlx::query_scalar::<_, Vec<time::OffsetDateTime>>(sql!(
+            "SELECT ARRAY[a.updated_at, o.updated_at]
+             FROM firewall_rules_node_assignments a
+             JOIN firewall_rules_node_observations o USING (node_id)
+             WHERE node_id = $1"
+        ))
+        .bind(a)
+        .fetch_one(pool)
+    };
+    let before = touched().await?;
+    let node_ctl_a = projected_token("node-ctl-a");
+    assert_eq!(fetch(client, Some(&node_ctl_a)).await?, Ok(a_work));
+    assert_eq!(touched().await?, before);
+    // A denied fetch didn't revive the deleted registration.
+    let state = sqlx::query_scalar::<_, String>(sql!("SELECT state FROM nodes WHERE id = $1"))
+        .bind(deleted)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(state, "deleted");
+
+    // Without work, A learns that it has none, never B's.
+    for statement in [
+        sql!("DELETE FROM firewall_rules_node_assignments WHERE node_id = $1"),
+        sql!("DELETE FROM firewall_rules_node_observations WHERE node_id = $1"),
+    ] {
+        sqlx::query(statement).bind(a).execute(pool).await?;
+    }
+    assert_eq!(
+        fetch(client, Some(&node_ctl_a)).await?,
+        Ok(FetchFirewallRulesResponse {
+            node_id: a.to_string(),
+            assignment: None,
+            pending_round: None,
+        })
+    );
+    Ok(())
+}
+
+/// Production's defaults refuse an otherwise valid caller: no node-ctl
+/// principal holds the authority, and no worker is enrolled.
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestResult {
+    let fixture = cluster_fixture().await?.expect("Postgres required");
+    let pool = fixture.service.pool.clone();
+    let revision = insert_revision(&pool, SSH).await?;
+    let a = register(&pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
+    give_work(&pool, a, 1, (revision, SSH), 1).await?;
+
+    for (grant, enrollment, expected) in [
+        (false, Enrollment::Fixture(vec![a]), Code::PermissionDenied),
+        (true, Enrollment::Unapproved, Code::FailedPrecondition),
+    ] {
+        let mut service = fixture.service.clone();
+        service.firewall_enrollment = enrollment;
+        let mut harness = serve(
+            service,
+            vec![("node-ctl-a", node_ctl_on("worker-a", "uid-a"))],
+            grant,
+        )
+        .await?;
+        let token = projected_token("node-ctl-a");
+        assert_eq!(
+            fetch(&mut harness.client, Some(&token)).await?,
+            Err(expected),
+            "grant {grant}"
+        );
+    }
+    Ok(())
+}
+
+/// A Fetch overlapping a commit that moves the worker from (revision, round)
+/// to the next pair returns one whole pair, never a mix. The writer holds one
+/// table's lock so Fetch reads it only after the commit; each table in turn,
+/// so a split read in either order would return a mixed pair.
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
+    let fixture = cluster_fixture_with_max_connections(4)
+        .await?
+        .expect("Postgres required");
+    let mut service = fixture.service;
+    let pool = service.pool.clone();
+    let pool = &pool;
+    let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
+    service.firewall_enrollment = Enrollment::Fixture(vec![a]);
+    let revisions = [
+        (insert_revision(pool, ORDERED).await?, ORDERED),
+        (insert_revision(pool, SSH).await?, SSH),
+        (insert_revision(pool, "[]").await?, "[]"),
+    ];
+    let mut old = give_work(pool, a, 1, revisions[0], 7).await?;
+    let mut harness = serve(
+        service,
+        vec![("node-ctl-a", node_ctl_on("worker-a", "uid-a"))],
+        true,
+    )
+    .await?;
+    let token = projected_token("node-ctl-a");
+    assert_eq!(
+        fetch(&mut harness.client, Some(&token)).await?,
+        Ok(old.clone())
+    );
+
+    for (step, revision) in revisions[1..].iter().enumerate() {
+        let generation = u64::try_from(step)? + 2;
+        let round = 8 + u64::try_from(step)?;
+        let issued_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+            1_800_000_000_000_000_000 + i128::from(round) * 1_000_456_000,
+        )?;
+        let new = response(a, generation, *revision, round, issued_at);
+
+        let mut writer = pool.begin().await?;
+        sqlx::query(if step == 0 {
+            sql!("LOCK TABLE firewall_rules_node_observations IN ACCESS EXCLUSIVE MODE")
+        } else {
+            sql!("LOCK TABLE firewall_rules_node_assignments IN ACCESS EXCLUSIVE MODE")
+        })
+        .execute(&mut *writer)
+        .await?;
+        let (mut client, bearer) = (harness.client.clone(), token.clone());
+        let overlapping =
+            tokio::spawn(async move { fetch(&mut client, Some(&bearer)).await.unwrap() });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'"
+        ))
+        .fetch_one(pool)
+        .await?
+            == 0
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Fetch never blocked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        sqlx::query(sql!(
+            "UPDATE firewall_rules_node_assignments
+             SET revision_id = $2, assignment_generation = $3
+             WHERE node_id = $1"
+        ))
+        .bind(a)
+        .bind(revision.0)
+        .bind(i64::try_from(generation)?)
+        .execute(&mut *writer)
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE firewall_rules_node_observations
+             SET pending_round = $2, pending_round_issued_at = $3
+             WHERE node_id = $1"
+        ))
+        .bind(a)
+        .bind(i64::try_from(round)?)
+        .bind(issued_at)
+        .execute(&mut *writer)
+        .await?;
+        writer.commit().await?;
+
+        let overlapping = overlapping.await?;
+        assert!(
+            overlapping == Ok(old.clone()) || overlapping == Ok(new.clone()),
+            "step {step}: mixed pair {overlapping:?}"
+        );
+        assert_eq!(
+            fetch(&mut harness.client, Some(&token)).await?,
+            Ok(new.clone())
+        );
+        old = new;
+    }
+    Ok(())
+}
