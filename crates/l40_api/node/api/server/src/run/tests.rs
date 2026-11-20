@@ -704,7 +704,7 @@ async fn builder_readiness_turns_off_while_build_manager_drains() {
     );
 
     // A new build-manager comes up serving: node-api is ready again.
-    std::fs::remove_file(&build_manager_socket).ok();
+    let _ = std::fs::remove_file(&build_manager_socket);
     let (_manager_reporter, manager_shutdown, manager_server) =
         spawn_build_manager_health(&build_manager_socket).await;
     wait_for_readiness(
