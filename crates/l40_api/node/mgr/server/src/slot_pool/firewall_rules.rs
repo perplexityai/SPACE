@@ -165,15 +165,13 @@ impl NetworkPool {
 
     fn lookup_eligible(&self, slot_id: u32) -> Result<SlotRecord, NotRun> {
         let record = self.record(slot_id)?.ok_or(NotRun::NoSlot)?;
-        match (
-            record.state,
-            record.health,
-            record.info.sandbox_id.is_empty(),
-        ) {
-            (SlotState::Ready, SlotHealth::Healthy, true)
-            | (SlotState::Leased, SlotHealth::Healthy, false) => Ok(record),
-            (state, health, _) => Err(NotRun::Ineligible { state, health }),
+        if !eligible(record.state, record.health, &record.info.sandbox_id) {
+            return Err(NotRun::Ineligible {
+                state: record.state,
+                health: record.health,
+            });
         }
+        Ok(record)
     }
 
     /// Never waits: the DB lock is not held while taking the guard, and a
@@ -193,6 +191,15 @@ impl NetworkPool {
         let conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
         Ok(query_record_by_slot(&conn, slot_id)?)
     }
+}
+
+/// A healthy ready slot no sandbox holds, or a healthy leased one a sandbox does.
+fn eligible(state: SlotState, health: SlotHealth, sandbox_id: &str) -> bool {
+    matches!(
+        (state, health, sandbox_id.is_empty()),
+        (SlotState::Ready, SlotHealth::Healthy, true)
+            | (SlotState::Leased, SlotHealth::Healthy, false)
+    )
 }
 
 /// The accepted assignment, if it is the one `node` asked for at `generation`.
