@@ -18,7 +18,9 @@ use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
 
 use super::super::node_effects::tests::{Fixture, certified_target, fixture, remote_upgrade_wake};
-use super::super::rpc::tests::{authorization, operation, pod_upgrade, upgrade};
+use super::super::rpc::tests::{
+    authorization, operation, pod_upgrade, report, report_for_attempt, upgrade,
+};
 use crate::db::RuntimeUpgradeOperationId;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::{RuntimeUpgradeStageFrom, UpgradeRuntimeRequest, WakeTargetState};
@@ -382,16 +384,25 @@ async fn a_direct_wake_upgrade_keeps_refusing_a_stale_copy() {
 /// A copy nothing proves backed up may be the only copy of something: it is
 /// refused before any node work. The stub backs the
 /// decided checkpoint, so only a proof of the copy's own pin counts. An
-/// unpinned copy has no artifact to prove.
+/// unpinned copy has no artifact to prove. Nothing is recorded for the
+/// operation, since the copy may be backed up later and an outcome on record
+/// would stop a later pod's eviction of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unproven_stale_copy_is_refused_before_any_node_work() {
     with_cluster_api(BACKS_ONLY_DECIDED, async || {
         for pin in [Some(STALE), None] {
             let (f, cleanups) = stale_copy(false, pin);
-            let refused = f.pod_upgrade_error(operation()).await;
+            let operation_id = operation();
+            let refused = f.pod_upgrade_error(operation_id).await;
             assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
             assert!(refused.message().contains("backed up"), "{refused}");
             f.assert_copy_untouched(pin, &cleanups);
+            let reported = report(&f.service, &f.sandbox_id, operation_id);
+            assert_eq!(
+                reported.status,
+                crate::proto::RuntimeUpgradeStatus::Absent as i32,
+                "{reported:?}"
+            );
         }
     })
     .await;
@@ -501,7 +512,7 @@ async fn a_copy_after_this_operations_outcome_is_left_to_the_upgrade() {
                     target_state: crate::db::RuntimeUpgradeTargetState::Started,
                     authorization_id: authorization().authorization_id,
                 },
-                &crate::db::new_runtime_upgrade_attempt_id(),
+                Some(&crate::db::new_runtime_upgrade_attempt_id()),
             )
             .unwrap()
         );
@@ -511,6 +522,40 @@ async fn a_copy_after_this_operations_outcome_is_left_to_the_upgrade() {
         assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
         assert!(refused.message().contains("decided from"), "{refused}");
         f.assert_copy_untouched(Some(STALE), &cleanups);
+    })
+    .await;
+}
+
+/// An operation that was only refused before it fenced anything, for another
+/// attempt, never touched the copy: a later attempt's upgrade still replaces a
+/// backed-up stale copy rather than being refused by the earlier refusal's
+/// record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_operation_still_lets_a_later_attempt_replace_the_copy() {
+    with_cluster_api(BackupReadiness::backs(STALE), async || {
+        let (f, cleanups) = stale_copy(false, Some(STALE));
+        let operation_id = operation();
+        assert!(
+            crate::db::record_runtime_upgrade_refusal(
+                &f.service.db.lock().unwrap(),
+                &crate::db::RuntimeUpgradeRequestIdentity {
+                    operation_id,
+                    sandbox_id: f.sandbox_id.clone(),
+                    target_environment: f.target_environment().environment().unwrap(),
+                    target_state: crate::db::RuntimeUpgradeTargetState::Started,
+                    authorization_id: authorization().authorization_id,
+                },
+                "an-earlier-pod",
+                "the checkpoint isn't the one the upgrade was decided from",
+                None,
+            )
+            .unwrap()
+        );
+
+        let error = f.pod_upgrade_error(operation_id).await;
+
+        assert!(!error.message().contains("decided from"), "{error}");
+        f.assert_copy_evicted(&cleanups);
     })
     .await;
 }
@@ -1339,3 +1384,141 @@ async fn a_proven_named_snapshot_lets_the_disk_pressure_eviction_go() {
 }
 
 mod unrecorded;
+
+/// An attempt's finality survives an eviction of its sandbox's row, so its
+/// delayed retry never fences or boots. Attempt A, sent without `stage_from`,
+/// is refused for the stale copy; attempt B evicts the copy, deleting the
+/// row, and the sandbox is staged again under the same id, now pinning the
+/// decided checkpoint A's retry would otherwise pass. A's retry gets its
+/// refusal back before anything is staged, fenced or asked of node-manager,
+/// with `stage_from` while the sandbox is absent and without it once the
+/// sandbox is back, and so does a `GetRuntimeUpgrade` naming A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_attempts_retry_stays_refused_after_another_attempt_restages_the_sandbox() {
+    const ATTEMPT_A: &str = "attempt-a";
+    const ATTEMPT_B: &str = "attempt-b";
+    with_cluster_api(BackupReadiness::backs(STALE), async || {
+        let (f, cleanups) = stale_copy(false, Some(STALE));
+        let operation_id = operation();
+        let attempt_a = || {
+            let mut request = staged_pod_upgrade(&f, &f.target_environment(), operation_id);
+            request.stage_from = None;
+            request.attempt_id = Some(ATTEMPT_A.into());
+            request
+        };
+        let refused = upgrade(&f.service, attempt_a()).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
+        assert!(refused.message().contains("decided from"), "{refused}");
+
+        let mut attempt_b = staged_pod_upgrade(&f, &f.target_environment(), operation_id);
+        attempt_b.attempt_id = Some(ATTEMPT_B.into());
+        upgrade(&f.service, attempt_b)
+            .await
+            .expect_err("this harness has no object store to stage from");
+        f.assert_copy_evicted(&cleanups);
+        assert!(
+            f.service.lookup_sandbox(&f.sandbox_id).is_err(),
+            "the eviction deleted the sandbox's row"
+        );
+        // A's delayed retry with `stage_from`, while the sandbox is absent,
+        // gets its refusal back before anything is staged.
+        let calls_before_staged_retry = f._node.calls().len();
+        let mut staged_retry = staged_pod_upgrade(&f, &f.target_environment(), operation_id);
+        staged_retry.attempt_id = Some(ATTEMPT_A.into());
+        let staged_retried = upgrade(&f.service, staged_retry).await.unwrap_err();
+        assert_eq!(
+            staged_retried.code(),
+            tonic::Code::FailedPrecondition,
+            "{staged_retried}"
+        );
+        assert!(
+            staged_retried
+                .message()
+                .contains(&format!("was refused for attempt {ATTEMPT_A}")),
+            "{staged_retried}"
+        );
+        assert_eq!(
+            f._node.calls().len(),
+            calls_before_staged_retry,
+            "{:?}",
+            f._node.calls()
+        );
+        assert!(
+            f.service.lookup_sandbox(&f.sandbox_id).is_err(),
+            "nothing was staged for the retry"
+        );
+
+        // The stage attempt B's retry completes: the sandbox is back,
+        // suspended on the decided checkpoint.
+        {
+            let conn = f.service.db.lock().unwrap();
+            crate::db::fixture::insert_test_sandbox(&conn, &f.sandbox_id, SandboxState::Suspended);
+            crate::db::upsert_sandbox_execution_metadata(&conn, &f.sandbox_id, &f.source).unwrap();
+        }
+        f.adopt_checkpoint_as(artifact(DECIDED));
+        let calls_before_retry = f._node.calls().len();
+
+        let retried = upgrade(&f.service, attempt_a()).await.unwrap_err();
+
+        assert_eq!(retried.code(), tonic::Code::FailedPrecondition, "{retried}");
+        assert!(
+            retried
+                .message()
+                .contains(&format!("was refused for attempt {ATTEMPT_A}")),
+            "{retried}"
+        );
+        assert_eq!(
+            f._node.calls().len(),
+            calls_before_retry,
+            "{:?}",
+            f._node.calls()
+        );
+        let reported = report(&f.service, &f.sandbox_id, operation_id);
+        assert_eq!(
+            reported.status,
+            crate::proto::RuntimeUpgradeStatus::Absent as i32,
+            "nothing was fenced for the operation: {reported:?}"
+        );
+        // A caller waiting on attempt A gets A's refusal, as its retry did,
+        // though the operation's report went with the evicted row.
+        let for_a = report_for_attempt(&f.service, &f.sandbox_id, operation_id, ATTEMPT_A);
+        assert_eq!(
+            for_a.status,
+            crate::proto::RuntimeUpgradeStatus::Refused as i32,
+            "{for_a:?}"
+        );
+        assert_eq!(for_a.attempt_id.as_deref(), Some(ATTEMPT_A));
+        assert!(
+            for_a
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("decided from")),
+            "{for_a:?}"
+        );
+        // A caller naming another sandbox for the operation is refused, as
+        // it is while the report stands, by both RPCs.
+        let mut misnamed = attempt_a();
+        misnamed.sandbox_id = pplx_space_sandbox_model::SandboxId::new().to_string();
+        if let Some(start) = misnamed.start.as_mut() {
+            start.sandbox_id.clone_from(&misnamed.sandbox_id);
+        }
+        let misnamed = upgrade(&f.service, misnamed).await.unwrap_err();
+        assert_eq!(misnamed.code(), tonic::Code::InvalidArgument, "{misnamed}");
+        let elsewhere = f
+            .service
+            .get_runtime_upgrade(&crate::service::activation_support::internal_request(
+                crate::proto::GetRuntimeUpgradeRequest {
+                    sandbox_id: pplx_space_sandbox_model::SandboxId::new().to_string(),
+                    operation_id: operation_id.to_string(),
+                    attempt_id: Some(ATTEMPT_A.to_string()),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(
+            elsewhere.code(),
+            tonic::Code::InvalidArgument,
+            "{elsewhere}"
+        );
+    })
+    .await;
+}

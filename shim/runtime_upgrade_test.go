@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	gatewaypb "github.com/perplexityai/SPACE/shim/proto/net/gateway/v1"
 	pb "github.com/perplexityai/SPACE/shim/proto/sandbox/manager/v1"
 )
 
@@ -188,8 +189,51 @@ func TestARuntimeUpgradePodRunsTheUpgradedExecution(t *testing.T) {
 			if start.GetRouteIdentity().GetPodUid() != upgradeTestPodUID || start.GetRouteIdentity().GetExecutionGeneration() != 4 {
 				t.Fatalf("the upgrade's start must carry the pod's route identity: %+v", start.GetRouteIdentity())
 			}
+			if request.AttemptId == nil || request.GetAttemptId() != upgradeTestPodUID {
+				t.Fatalf("the upgrade must run as the pod's attempt, named by its pod UID: %v", request.AttemptId)
+			}
 			if request.StageFrom != nil || request.CheckpointLocalArtifactId != nil {
 				t.Fatalf("a stopped source has nothing to stage or check: %+v", request)
+			}
+		})
+	}
+}
+
+// The attempt is kubelet's pod UID, falling back to the CRI sandbox UID,
+// and never space.pplx.net/pod-uid, which the control plane writes and a
+// replacement pod could inherit. A pod with neither names no attempt, so
+// sbx-manager runs it as a fresh one; an empty attempt id is never sent.
+func TestARuntimeUpgradeRunsAsKubeletsPodUID(t *testing.T) {
+	const criSandboxUID = "7c1e2d3f-4a5b-4c6d-8e7f-9a0b1c2d3e40"
+	const annotatedPodUID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c50"
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        *string
+	}{
+		{"kubelet's pod UID", map[string]string{sandboxPodUIDAnnotation: annotatedPodUID}, ptr(upgradeTestPodUID)},
+		{"the CRI sandbox UID", map[string]string{kubernetesPodUIDAnnotation: "", kubernetesCriSandboxUIDAnnotation: criSandboxUID}, ptr(criSandboxUID)},
+		{"not the control plane's annotation", map[string]string{kubernetesPodUIDAnnotation: " ", sandboxPodUIDAnnotation: annotatedPodUID}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			annotations := runtimeUpgradeAnnotationsFor("started", false)
+			for key, value := range tc.annotations {
+				annotations[key] = value
+			}
+			intent, err := (&ociSpec{Annotations: annotations}).sandboxRuntimeUpgrade()
+			if err != nil {
+				t.Fatalf("sandboxRuntimeUpgrade() error = %v", err)
+			}
+			start := &pb.StartRequest{
+				SandboxId:     upgradeTestSandboxID,
+				RouteIdentity: &gatewaypb.SpaceApiRouteIdentity{PodUid: ptr(annotatedPodUID)},
+			}
+			got := runtimeUpgradeRequest(start, intent).AttemptId
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("attempt id = %q, want none", *got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Fatalf("attempt id = %v, want %q", got, *tc.want)
 			}
 		})
 	}

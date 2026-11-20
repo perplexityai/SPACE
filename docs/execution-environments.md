@@ -1714,18 +1714,158 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    on its old environment.
 
 A retry with the same operation id resumes from the row: an interrupted upgrade
-rolls back and starts again, and a verified one finishes its retirement. A
-rolled-back upgrade leaves no row, so a retry after it starts over. Its failure
-stays in `sandbox_runtime_upgrade_outcomes`, as does an upgrade that found the
-sandbox already on its target, for `GetRuntimeUpgrade` below. An upgrade
+rolls back, and a verified one finishes its retirement. A rolled-back upgrade
+leaves no row; its failure stays in `sandbox_runtime_upgrade_outcomes`, as does
+an upgrade that found the sandbox already on its target, for
+`GetRuntimeUpgrade` below. Both tables record the attempt each upgrade ran
+as: the request's opaque `attempt_id`, or an id the node generates for a
+request that names none. The node returns a generated id only in a successful
+response. A caller that needs retry finality after a failed request must send
+its own `attempt_id` on the first request. An unfiltered `GetRuntimeUpgrade`
+names the operation's latest attempt, which can be a later one, so a retry
+under that id would replay another attempt's outcome. On Kubernetes the shim
+sends kubelet's pod UID (`io.kubernetes.pod.uid`, or
+`io.kubernetes.cri.sandbox-uid` without it), never the control plane's
+`space.pplx.net/pod-uid` annotation, which a replacement pod could carry over:
+kubelet retries one pod's create under its UID and gives a replacement pod a
+new one, so a pod's retries are one attempt and a new pod is a new attempt. A
+CLI or SDK generates one and reuses it on retries. Sandbox-manager never reads
+the attempt id as a pod: it's opaque, and the only pod facts it reads are the
+start's route identity, in the guard below that keeps a VM's pod from being
+settled on.
+
+The api owns operation ids: it derives one from the sandbox, the activation,
+the cause, the move and what the upgrade boots (the checkpoint for a restore,
+the recorded execution for a start; `EnvironmentMove::operation_id` in
+`crates/l40_api/api/src/controllers/substrate/runtime_upgrade.rs`). A retry of
+the same decision keeps the operation id, under a new attempt when it's a new
+pod, and a sandbox that moved since gets a new operation id from its next
+decision.
+
+Attempt finality is off by default: `SPACE_SBXMGR_RUNTIME_UPGRADE_ATTEMPT_FINALITY_ENABLED`
+turns it on. The switch decides which attempts acquire finality, not which
+recorded finality is honored. Off, sandbox-manager makes no new outcome final
+for an attempt: it records no final rollback or refusal (no `refused` outcome
+and no refused activation), and an upgrade it begins or finds already on
+target, and a rollback it runs, names no attempt, then or after the switch is
+turned on, so that attempt's retry is decided again.
+Neither RPC names an attempt in a new answer (no `attempt_id` in an
+`UpgradeRuntime` response or a report, and no `refused_attempt_id`), as a node
+that predates attempt ids doesn't. What it recorded as final while the switch
+was on stays final: a retry of that attempt still gets its outcome back,
+`GetRuntimeUpgrade` still answers that attempt from it, and the operation id
+still names the request it recorded. Turning the switch off stops new
+finality; it doesn't release an attempt a caller may already have settled on.
+The rest of this section describes finality on.
+
+A rollback is final for its attempt. A retry with the same attempt id gets the
+recorded failure back with `FailedPrecondition` and never fences or boots
+again; only a new attempt starts over. The rollback records the attempt's
+final outcome in the transaction that makes it reportable, before its disk
+discard runs, so a discard that fails and a copy eviction that then deletes
+the sandbox's row can't let a retry of an attempt a caller already read as
+rolled back run again. A request that's refused before it
+fences anything for a reason no retry changes (the edge isn't certified, the
+checkpoint isn't the decided one, consent is missing, a stopped or suspended
+sandbox's local disk is missing or its runtime metadata doesn't parse) is
+recorded the same way, as a `refused` outcome for that attempt, final for it
+as a rollback is. Refusals from the stale-copy eviction and the staging that
+run before the upgrade aren't recorded, even one whose code says this node
+can't stage the start: both belong to the restore path, whose refusals depend
+on copies and transfers the upgrade doesn't own, some of which clear on their
+own (a canonical root another stage still publishes, say), so a retry of the
+same attempt evicts and stages again. Recording is best effort: a write that
+fails leaves a final refusal unrecorded. A refusal decided from the sandbox's
+row is recorded only while the row is still as the refusal read it (its state,
+local artifact and execution metadata), compared in the transaction that
+records it, so a sandbox that moved since isn't left with a final answer it
+no longer earns.
+Finality is decided once, where each refusal is made, as final or retryable
+(`Refusal` in
+`crates/l40_api/sbx/mgr/server/src/service/runtime_upgrade.rs`), and only a
+final refusal is ever recorded. It isn't read from the refusal's gRPC code, so
+every refusal answers the code it always did, and an error nothing classified
+is retryable. A refusal before the fence that a retry may not repeat (the
+sandbox isn't stopped or suspended yet, or its disk can't be inspected before
+it is, a disk that can't be read, the sandbox changed while it was inspected,
+a cleanup owns it, another upgrade fences it, node-manager failed or
+restarted) isn't recorded, so a retry of the same attempt tries again. After
+the fence there's no such refusal: a node-manager fault or restart mid-boot
+ends in a rollback, final for its attempt like any other. A refusal replaces an earlier attempt's
+rollback or refusal as the operation's outcome, so the report never gives a
+newer attempt's refusal an older attempt's reason, but never an
+already-on-target outcome, and it's recorded only while the node holds the
+sandbox. Each attempt's final outcome also stays in
+`sandbox_runtime_upgrade_attempt_outcomes`, one row per operation and attempt
+id, which the finality check reads: a later attempt's outcome replaces the
+earlier one in the report, but a delayed retry of the earlier attempt still
+gets its own outcome back and never fences again. That finality survives
+the sandbox row's deletion: the table declares no foreign key and keeps its
+rows when the sandbox is deleted, so an attempt refused for a stale suspended
+copy still gets its refusal back after a later attempt's eviction deleted the
+row and the sandbox was staged again under the same id. `GetRuntimeUpgrade`
+answers a caller that names that attempt and this sandbox from the same row,
+though the operation's report went with the deleted sandbox row: a rollback
+or refusal as its status, whatever report stands since, and a refused
+activation as `refused_attempt_id` with `ABSENT`, while no report stands or a
+later attempt's hasn't reached the target. Each of these rows also keeps what its operation asked
+for (target environment, target state and authorization id, beside the sandbox),
+so after the sandbox's row is gone the operation id still names that one
+request: `UpgradeRuntime` refuses, with `InvalidArgument`, a request under
+that operation id that names another sandbox, target or authorization id,
+for any attempt. It compares only the authorization's id, not its `reason`
+or `memory_loss`, so a request that changes only those isn't refused this way.
+`GetRuntimeUpgrade` carries no target or authorization, so it
+checks only the sandbox, and its report doesn't confirm a target or
+authorization. It refuses a request that names another sandbox the same way
+only when the request names an attempt. Without an attempt id it checks only
+the operation's report, so once the sandbox's row is gone it answers another
+sandbox with `ABSENT`, and that query can't confirm the sandbox. Both RPCs also
+refuse a request that names another sandbox for that attempt with
+`InvalidArgument`, and
+`UpgradeRuntime` refuses a stopped target's request for an attempt whose
+activation was refused the same way, as the operation's records did while
+they stood. Nothing prunes these rows yet. An upgraded or
+already-on-target outcome is answered to any attempt, but for a started
+target the attempt's start can still fail after it: the sandbox runs another
+pod's execution, moved off the execution the start was decided on, or the
+activation itself failed. The node records that refusal for the attempt
+as an `activation_refused` outcome in the same table, only while the
+operation's report is upgraded or already on target, and it's final for that attempt as a
+rollback is: the attempt's retries get it back with `FailedPrecondition` and
+never activate the sandbox, while a new attempt is answered afresh. Those are
+the activation's final refusals. A sandbox another call is moving, or a start
+claim another call won, is retryable and never recorded, and neither is a
+refusal the upgrade itself retries before it reaches the target. The store
+writes the record only while the sandbox's row is still the one the refusal
+was decided from (its runtime label, state, execution and route identity), in
+the same transaction, since a plain start, stop or suspend doesn't take the
+upgrade lock: one that moved the sandbox meanwhile leaves the refusal
+unrecorded, and the attempt's retry decides it again. Nothing is
+recorded while another activation or stop is moving the sandbox, whichever pod
+it runs for: it comes to rest on its own, and the attempt's retry is answered
+afresh then. Nor is anything recorded for a start the operation claimed that
+never began, admission or staging refusing it while the sandbox stayed at
+rest on the execution the claim found: the operation runs that start again
+for a retry. Nor is anything recorded while the sandbox may still hold the VM
+of the pod the start's route
+identity names: one running that pod's execution in any state but stopped or
+suspended, and one an activation is creating, starting or restoring, or a
+cleanup owns or left quarantined or failed, whichever pod its route identity
+names, since an activation writes that identity only once it runs. A caller
+that settled on the refusal would delete the pod and the VM with it. A retry
+of an attempt whose rollback or refusal is already final gets that back and
+records no refused activation, so it never replaces the later attempt a
+caller waits on. An upgrade
 that must end stopped leaves the sandbox as it finds it if the sandbox stopped,
 suspended or started another execution first. A
 sandbox-manager recovery loop settles unfinished upgrades at startup and every
 minute without booting or stopping anything: it rolls back, or retires, and
 leaves a sandbox it can't settle yet for the next pass. An upgrade that must end
 stopped stays verified while its sandbox runs, until its caller's retry stops it
-or the sandbox stops some other way. Deleting the sandbox deletes its
-upgrade rows; evicting it removes the preserved copy with the rest of its local
+or the sandbox stops some other way. Deleting the sandbox deletes its live
+upgrade row and its outcome, but keeps each attempt's final outcome; evicting
+it removes the preserved copy with the rest of its local
 presence, and the upgrade fails at its next claim.
 
 ### Booting an upgrade in its pod
@@ -1783,19 +1923,78 @@ doesn't render it yet.
   replayed, is answered only for a sandbox at rest; one that runs is refused.
   A Wake replaying a retired upgrade is refused once the sandbox holds another
   checkpoint than the one the upgrade names, even one the target produced:
-  the retry needs a new operation id. A replay never moves the
+  the operation never activates it again, and the sandbox's next decision
+  gets a new operation id (see the operation ids above). A replay never moves the
   sandbox, and a retry must name the
   sandbox, target and authorization the operation's recorded outcome names,
   as for a live row. An operation that found its sandbox on the target never
-  boots it on a replay; one that finds the sandbox moved since is refused. An
+  boots it on a replay, for a stopped target as for a started one, and its
+  replay holds only while the sandbox stays on that target: once it moves,
+  the same operation id is refused. An
   operation id names one upgrade of one sandbox across both tables.
   `GetRuntimeUpgrade` reports the upgrade's outcome, not the pod's: read it
   with the pod's status.
 - **`GetRuntimeUpgrade`.** The shim's response doesn't reach the control
   plane, which reads the outcome from this read-only RPC instead: absent, in
-  progress (with its phase), upgraded, rolled back (with its failure) or
-  already on target. Node-api forwards it on `WorkerApiInternal` only for a
-  caller with the control-plane authority a policy write needs.
+  progress (with its phase), upgraded, rolled back (with its failure),
+  refused (with its failure) or already on target, with the attempt the
+  reported outcome ran for (`attempt_id`). An upgraded or already-on-target
+  report also names the latest attempt whose activation it refused, with that
+  refusal (`refused_attempt_id`, `refused_attempt_failure`). A request that
+  names an attempt (`attempt_id`) gets that attempt's own answer instead, from
+  its own rows: its rollback or refusal, or `ABSENT` in place of another
+  attempt's, and its own refused activation, never another attempt's (with
+  `ABSENT` when it was kept from before the sandbox's row was deleted and no
+  report that reached the target stands), so a later attempt never changes
+  what the caller waiting on one reads. That holds for failures only: an
+  attempt with no rollback or refusal of its own gets the operation's
+  in-progress, upgraded or already-on-target report, whichever attempt it ran
+  for, so a caller checks the returned `attempt_id` and
+  `refused_attempt_id` before reading anything as its attempt's (see "Waiting
+  on an attempt" below). A set
+  `attempt_id` that `UpgradeRuntime` would refuse (empty, whitespace-only or
+  over 256 bytes) is refused here too, with `INVALID_ARGUMENT`. Node-api
+  forwards it on `WorkerApiInternal` only for a caller with the control-plane
+  authority a policy write needs.
+
+A failed upgrade fails the pod's sandbox create, so the pod stays pending in
+`ContainerCreating`, with no container ever ending, while kubelet retries the
+create under the same pod UID, and so as the same attempt. Per-attempt
+finality is what makes that safe to wait on: once the node records an
+attempt's rollback or final refusal, no retry of that attempt can still
+upgrade the disk, and the report names the attempt it's for (`attempt_id`,
+`refused_attempt_id`), so a caller waiting on one attempt can tell its own
+outcome from another's.
+
+#### Waiting on an attempt
+
+No consumer in this repository reads `GetRuntimeUpgrade` yet. A control plane
+waiting on attempt `A` of an operation (a pod whose UID is `A`) names `A` in
+the request and acts on the first row that matches the answer. `Release A` means the attempt
+is over and failed: delete the pod, and decide the sandbox's next move, which
+a new pod runs as a new attempt. `Done` means the attempt succeeded. Anything
+else waits, up to the caller's own deadline.
+
+| Answer | Action |
+| ------ | ------ |
+| Any status with `refused_attempt_id` = `A` | Release `A`: its retries get the same refused activation and never activate the sandbox |
+| `ROLLED_BACK` or `REFUSED` with `attempt_id` = `A` | Release `A`: its retries get the same failure and never fence again |
+| `UPGRADED` or `ALREADY_ON_TARGET` | Done once the pod runs (a started target) or its create succeeded (a stopped one), since the report alone doesn't say `A`'s sandbox runs; until then, wait |
+| `ROLLED_BACK` or `REFUSED` naming no attempt (finality off, or a node that predates attempt ids) | Wait: nothing in it is final for `A`, whose retry may still upgrade |
+| `IN_PROGRESS` or `ABSENT` | Wait: the upgrade is still running, the node has recorded nothing for `A`, or it holds another attempt's failure |
+| `INVALID_ARGUMENT` | Fix the request: the operation or attempt names another sandbox, or the attempt id is malformed |
+| `INTERNAL`, `UNAVAILABLE` or any other RPC error | Wait and read again; never settle on an error |
+
+`a_consumer_settles_an_attempt_only_on_its_own_final_answer` in
+`crates/l40_api/sbx/mgr/server/src/service/runtime_upgrade/rpc/tests.rs`
+drives a fake consumer through these answers against the node.
+
+An attempt's records live on the node that decided them, in its
+sandbox-manager database, and nothing deletes them: they survive the
+sandbox's deletion and eviction (above), and no pruning runs yet. A pod is
+bound to one node, so kubelet's retries of an attempt reach the node that
+holds its records. Finality is per node: a Direct caller that reuses an
+attempt id on another node gets a fresh decision there.
 
 After a verified boot to a `stopped` target, the sandbox runs the boot's
 execution unfenced until the upgrade stops it, and a suspend there would
@@ -1829,13 +2028,55 @@ sandbox-manager that predates activation answers `ALREADY_ON_TARGET` with no
 execution, and the shim fails the create.
 
 A sandbox-manager from this release applies the
-`sandbox_runtime_upgrade_outcomes` migration at startup, and an older one,
-from before SQLite rollbacks became image-only, refuses a database whose
-migration history holds a version it doesn't bundle.
-So a rollback build reverts the code but keeps that migration, its files under
-`db/sandbox-manager/` and its entry in the store's migration list, as
-`db/README.md` requires of any binary rollback. The table only adds rows, and
-nothing older reads it.
+`sandbox_runtime_upgrade_outcomes`, `sandbox_runtime_upgrade_attempt_id` and
+`sandbox_runtime_upgrade_attempt_outcomes` migrations at startup, and an
+older one, from before SQLite rollbacks became image-only, refuses a database
+whose migration history holds a version it doesn't bundle. So a rollback build
+reverts the code but keeps those migrations, their files under
+`db/sandbox-manager/` and their entries in the store's migration list, as
+`db/README.md` requires of any binary rollback. A
+binary rollback keeps the schema, so the down migrations' guards don't
+protect it. The older code never reads the new tables or columns, so it
+ignores per-attempt finality and refused activations; it doesn't delete the
+attempt outcomes with their sandbox either, so those rows stay, unread. A
+binary rollback to it therefore releases every attempt this release made
+final: a caller that settled on an attempt's rollback may see that attempt's
+retry fence and boot again. It
+can't parse a
+`refused` outcome: for an operation that recorded one, `GetRuntimeUpgrade`
+answers `INTERNAL`, and so does an `UpgradeRuntime` once it reads the
+operation's outcome. Only attempt finality writes `refused` outcomes and
+refused activations, so with the switch off, its default, a node writes
+neither, and a binary rollback reads every row this release wrote. Once the
+switch has been on, a rollback has to plan for what it wrote: nothing drains
+an attempt's retries first, so on the older binary a rolled-back or refused
+attempt's retry fences and boots again, and an operation that recorded a
+`refused` outcome answers `INTERNAL`. Turning the switch off again stops new
+final outcomes but keeps the ones written, and this release keeps honoring
+them with the switch off. So once a node has recorded a final outcome, roll
+its binary back only to a release that honors recorded finality, as this one
+does, not to one that predates it, whatever the switch says. This read-only
+query counts a node's final attempt outcomes; while it's nonzero, the node
+needs such a release:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes
+ WHERE target_environment IS NOT NULL;
+```
+
+The attempt id columns are nullable, and every row written before them reads
+as naming no attempt, which proves nothing to the control plane. The attempt id migration's down migration refuses while a
+`refused` outcome is recorded, since an older release can't read one. The
+attempt-outcomes migration's down migration refuses while any attempt's
+outcome is recorded, since an older release reads only the operation's latest
+outcome: it would let a delayed retry of an earlier attempt fence the sandbox
+again, and a refused attempt's retry activate it.
+
+A sandbox-manager that predates these fields returns no `attempt_id` or
+`refused_attempt_id`, and ignores a request's `attempt_id`, answering the
+latest outcome. A caller has to treat a report that doesn't name its attempt
+as an outcome it can't confirm, so deploy sandbox-manager before any control
+plane that relies on them.
 
 ### Upgrading at resume and start
 
@@ -1986,7 +2227,14 @@ is stranded.
    refused as retryable until the upload settles (when that upload is the
    pin's own backup, the pin isn't proven yet, and it's refused as unproven
    until the backup lands), and a sandbox the
-   operation already recorded an outcome for is left to that record. Once the
+   operation already ran on (it upgraded, rolled back or found the target)
+   is left to that record; an operation only refused before it fenced
+   anything never touched the copy, so a later attempt's eviction goes ahead,
+   and the refused attempt's own retries are still answered with its
+   refusal, which the eviction's delete of the row keeps.
+   The check reads the operation's latest outcome, which a later attempt's
+   refusal can replace, so after one an earlier rollback doesn't hold the
+   copy back. Once the
    copy is gone the sandbox is absent, so a retry stages it as it would any
    absent sandbox; the eviction's claim re-asserts the row's activation
    generations rather than its `updated_at`, which is kept in whole seconds;
