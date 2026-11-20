@@ -7,7 +7,8 @@
 //! renewal takes it), the item row, the node's `nodes` row (key share), the
 //! node's assignment row, and the wakeup's rows. The first three are
 //! [`lease_targets`](crate::lease_targets)' order; nothing in the lease verbs
-//! takes the rest. The control row isn't locked.
+//! takes the rest. The control row isn't locked. A release in
+//! [`issue_canary_and_release`] writes the item row it already holds.
 
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
 use crate::lease::{HANDOFF_LOCK, item_timestamp, stamped_work};
-use crate::{ItemPhase, LeasedTarget, Work, roll_back, rollout_phase};
+use crate::{ItemPhase, LeasedTarget, Path, Requeue, Work, requeue, roll_back, rollout_phase};
 
 /// The wakeup issuance queues for its node, on the issuing transaction.
 pub trait Wakeup {
@@ -40,7 +41,7 @@ pub struct Stamp {
     pub next_check_at: Option<Timestamp>,
 }
 
-/// What [`issue_first_assignment`] did.
+/// What [`issue_first_assignment`] or [`issue_canary_and_release`] did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Issuance {
     /// This call issued, and committed.
@@ -58,7 +59,8 @@ pub enum Refusal {
     CheckLease,
     /// The rollout has no such saved target.
     NotATarget,
-    /// The rollout isn't in canary or rolling.
+    /// The rollout isn't in canary or rolling, or for
+    /// [`issue_canary_and_release`] isn't in canary.
     NotIssuing,
     /// The item isn't in flight under this token, or its lease lapsed.
     LeaseLost,
@@ -87,6 +89,30 @@ pub async fn issue_first_assignment(
     first_check_in: Duration,
     wakeup: &mut impl Wakeup,
 ) -> Result<Issuance, sqlx::Error> {
+    issue_and_commit(conn, target, first_check_in, Path::Any, wakeup).await
+}
+
+/// [`issue_first_assignment`], only while the rollout is in canary, ending
+/// the lease with [`Requeue::Release`] before the same commit: the item is
+/// left pending and stamped, its attempt given back. A release that matches
+/// nothing is an error, and nothing commits. [`Issuance::AlreadyIssued`]
+/// releases nothing: the lease may now be a check's.
+pub async fn issue_canary_and_release(
+    conn: &mut PgConnection,
+    target: &LeasedTarget,
+    first_check_in: Duration,
+    wakeup: &mut impl Wakeup,
+) -> Result<Issuance, sqlx::Error> {
+    issue_and_commit(conn, target, first_check_in, Path::FirstCanary, wakeup).await
+}
+
+async fn issue_and_commit(
+    conn: &mut PgConnection,
+    target: &LeasedTarget,
+    first_check_in: Duration,
+    path: Path,
+    wakeup: &mut impl Wakeup,
+) -> Result<Issuance, sqlx::Error> {
     // A hint only: a first assignment is rechecked below, a check never issues.
     if target.work != Work::FirstAssignment {
         return Ok(Issuance::Refused(Refusal::CheckLease));
@@ -96,7 +122,19 @@ pub async fn issue_first_assignment(
     let mut tx = conn
         .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
         .await?;
-    match issue(&mut tx, target, first_check_in, wakeup).await {
+    let mut issued = issue(&mut tx, target, first_check_in, path, wakeup).await;
+    if path == Path::FirstCanary && matches!(issued, Ok(Issuance::Issued(_))) {
+        let release = Requeue::Release { error: None };
+        issued = match requeue(&mut *tx, target, &release).await {
+            Ok(true) => issued,
+            Ok(false) => Err(sqlx::Error::Protocol(format!(
+                "firewall rules item {}/{} issued but didn't release",
+                target.rollout_id, target.node_id
+            ))),
+            Err(error) => Err(error),
+        };
+    }
+    match issued {
         Ok(Issuance::Issued(stamp)) => {
             tx.commit().await?;
             Ok(Issuance::Issued(stamp))
@@ -112,6 +150,7 @@ async fn issue(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     target: &LeasedTarget,
     first_check_in: Duration,
+    path: Path,
     wakeup: &mut impl Wakeup,
 ) -> Result<Issuance, sqlx::Error> {
     let header = sqlx::query_as::<_, (bool, bool, uuid::Uuid)>(sql!(
@@ -128,6 +167,7 @@ async fn issue(
     let Some((issuing, canary, revision)) = header else {
         return Ok(Issuance::Refused(Refusal::NotATarget));
     };
+    let issuing = issuing && (canary || path == Path::Any);
     // Shared, as a renewal takes it. Without it, a claim on another rollout
     // could find this lease expired on its clock while this stamps it live on
     // an earlier one, and both commit. No test catches its removal.

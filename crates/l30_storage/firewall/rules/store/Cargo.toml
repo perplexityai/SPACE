@@ -20,11 +20,16 @@ postgres = [
 [lints]
 workspace = true
 
+[features]
+# Rollout seeding for other crates' tests; enable only from [dev-dependencies].
+test-support = ["dep:tokio"]
+
 [dependencies]
 jiff = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
 time = { workspace = true }
+tokio = { workspace = true, features = ["time"], optional = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
