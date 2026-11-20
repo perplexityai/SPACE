@@ -262,3 +262,30 @@ fn native_admission_reuses_only_sufficient_capacity_from_the_same_budget() {
         drop(lifetime);
     }
 }
+
+#[test]
+fn releasing_a_permit_frees_its_slots_for_every_clone_once() {
+    let slots = Arc::new(Semaphore::new(4));
+    let permit = RequestPermit::try_acquire(slots.clone(), 4, None).expect("admit");
+    let transport_clone = permit.clone();
+    let weak = permit.downgrade();
+    assert!(weak.held_for().is_some());
+    assert_eq!(slots.available_permits(), 0);
+
+    assert!(weak.release(), "the first release returns the slots");
+    assert_eq!(slots.available_permits(), 4, "every clone's slots are back");
+    assert_eq!(permit.slots(), 0);
+    assert!(weak.held_for().is_none());
+    assert!(!weak.release(), "a second release has nothing to return");
+
+    // A released permit cannot stand in for admission; the handler takes
+    // fresh slots instead of reusing it.
+    let reacquired =
+        RequestPermit::try_acquire(slots.clone(), 4, Some(transport_clone)).expect("reacquire");
+    assert_eq!(reacquired.slots(), 4);
+    assert_eq!(slots.available_permits(), 0);
+    drop(permit);
+    drop(reacquired);
+    assert_eq!(slots.available_permits(), 4);
+    assert!(!weak.release(), "nothing is left once every owner dropped");
+}

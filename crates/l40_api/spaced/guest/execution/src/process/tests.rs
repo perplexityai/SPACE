@@ -1562,6 +1562,96 @@ fn a_stalled_spawn_does_not_hold_up_other_starts() {
     });
 }
 
+// Payload admission fits two starts at once. Two starts stalled in `spawn`,
+// as under guest memory pressure, used to keep both admissions until the
+// kernel let them go, and refused every later start (a reconnect included)
+// with RESOURCE_EXHAUSTED for as long as that took. Past the hold limit their
+// slots return to the budget while they carry on, so a later start is admitted.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starts_stalled_in_spawn_release_admission_at_the_hold_limit() {
+    use pplx_space_spaced_guest_protocol::process_limits;
+    let (service, placement) = stalled_placement_service();
+    let start = |key: &'static str| {
+        let service = service.clone();
+        tokio::spawn(async move {
+            Process::start(
+                &service,
+                Request::new(StartRequest {
+                    command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                    idempotency_key: Some(key.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(drop)
+        })
+    };
+    let stalled = [start("stalled-1"), start("stalled-2")];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.inner.processes.records.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both starts reach their owners");
+    let slots = &service.inner.process_payload_slots;
+    assert_eq!(
+        slots.available_permits(),
+        process_limits::PAYLOAD_SLOTS - 2 * process_limits::START_PAYLOAD_SLOTS as usize,
+        "two stalled starts hold every start slot"
+    );
+
+    let refused = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            idempotency_key: Some("refused".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .map(drop)
+    .expect_err("a start is refused while both stalled starts are within the hold limit");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::ResourceExhausted,
+        "{refused:?}"
+    );
+
+    tokio::time::sleep(START_ADMISSION_HOLD_LIMIT + Duration::from_millis(100)).await;
+    assert!(
+        stalled.iter().all(|start| !start.is_finished()),
+        "both starts are still stalled in spawn"
+    );
+    assert_eq!(
+        slots.available_permits(),
+        process_limits::PAYLOAD_SLOTS,
+        "stalled starts return their slots at the hold limit"
+    );
+    let admitted = start("admitted");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.inner.processes.records.len() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a start is admitted once the stalled starts pass the hold limit");
+
+    placement.release();
+    for start in stalled {
+        start
+            .await
+            .unwrap()
+            .expect("a stalled start completes once its spawn resumes");
+    }
+    admitted
+        .await
+        .unwrap()
+        .expect("the admitted start completes");
+    shut_down(&service).await;
+}
+
 // A reconnect for an assigned id whose start is still inside its spawn must
 // not be told the process is attachable: nothing can be connected to yet. The
 // same key waits for the original start and replays it; another key is told

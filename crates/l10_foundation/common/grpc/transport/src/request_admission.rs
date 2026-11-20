@@ -1,7 +1,7 @@
 //! Bounded admission before Tonic decodes payload-bearing requests.
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -22,7 +22,11 @@ pub struct RequestPermit {
 
 #[derive(Debug)]
 struct PermitInner {
-    permit: OwnedSemaphorePermit,
+    /// `None` once [`WeakRequestPermit::release`] returned the slots early.
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    semaphore: Arc<Semaphore>,
+    slots: usize,
+    acquired_at: Instant,
     observation: Option<Budget>,
     cancelled_at: OnceLock<Instant>,
 }
@@ -32,21 +36,45 @@ impl PermitInner {
         if let Some(budget) = self.observation {
             self.cancelled_at.get_or_init(|| {
                 let now = Instant::now();
-                payload::cancelled(budget, self.permit.num_permits());
+                payload::cancelled(budget, self.slots);
                 now
             });
+        }
+    }
+
+    fn holds_slots(&self) -> bool {
+        self.permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Release the slots now, for every clone. Whether this call released them.
+    fn release(&self) -> bool {
+        let permit = self
+            .permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(permit) = permit else {
+            return false;
+        };
+        drop(permit);
+        self.record_cancelled_release();
+        true
+    }
+
+    fn record_cancelled_release(&self) {
+        if let (Some(budget), Some(started)) = (self.observation, self.cancelled_at.get()) {
+            payload::released_after_cancellation(budget, self.slots, started.elapsed());
         }
     }
 }
 
 impl Drop for PermitInner {
     fn drop(&mut self) {
-        if let (Some(budget), Some(started)) = (self.observation, self.cancelled_at.get()) {
-            payload::released_after_cancellation(
-                budget,
-                self.permit.num_permits(),
-                started.elapsed(),
-            );
+        if self.holds_slots() {
+            self.record_cancelled_release();
         }
     }
 }
@@ -75,14 +103,56 @@ impl Drop for RequestLifetime {
     }
 }
 
+/// Refers to a [`RequestPermit`] without keeping its slots held.
+#[derive(Clone, Debug)]
+pub struct WeakRequestPermit {
+    permit: Weak<PermitInner>,
+}
+
+impl WeakRequestPermit {
+    /// How long the permit has held its slots, while it still holds them.
+    pub fn held_for(&self) -> Option<std::time::Duration> {
+        let permit = self.permit.upgrade()?;
+        permit.holds_slots().then(|| permit.acquired_at.elapsed())
+    }
+
+    /// Return the slots to the budget now, for every clone, even though work
+    /// owning the permit continues. For work whose hold time must be bounded
+    /// where the budget cannot wait for it, such as a start stalled in the
+    /// kernel. Whether this call released them; `false` once every owner
+    /// dropped the permit or an earlier call released it.
+    pub fn release(&self) -> bool {
+        self.permit.upgrade().is_some_and(|permit| permit.release())
+    }
+}
+
 impl RequestPermit {
     fn new(permit: OwnedSemaphorePermit, observation: Option<Budget>) -> Self {
         Self {
             inner: Arc::new(PermitInner {
-                permit,
+                semaphore: Arc::clone(permit.semaphore()),
+                slots: permit.num_permits(),
+                permit: Mutex::new(Some(permit)),
+                acquired_at: Instant::now(),
                 observation,
                 cancelled_at: OnceLock::new(),
             }),
+        }
+    }
+
+    /// The slots in use, or 0 once released early.
+    pub fn slots(&self) -> usize {
+        if self.inner.holds_slots() {
+            self.inner.slots
+        } else {
+            0
+        }
+    }
+
+    /// A reference that does not keep the slots held.
+    pub fn downgrade(&self) -> WeakRequestPermit {
+        WeakRequestPermit {
+            permit: Arc::downgrade(&self.inner),
         }
     }
 
@@ -130,8 +200,8 @@ impl RequestPermit {
     ) -> Result<Self, TryAcquireError> {
         let supplied = admitted.is_some();
         if let Some(permit) = admitted
-            && Arc::ptr_eq(permit.inner.permit.semaphore(), &slots)
-            && permit.inner.permit.num_permits() >= weight as usize
+            && Arc::ptr_eq(&permit.inner.semaphore, &slots)
+            && permit.slots() >= weight as usize
         {
             if let Some(budget) = observation {
                 payload::admission(budget, Site::Handler, Outcome::Reused);

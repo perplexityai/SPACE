@@ -86,3 +86,14 @@ pub fn released_after_cancellation(budget: Budget, slots: usize, elapsed: std::t
         &tags,
     );
 }
+
+/// Slots released because their owner held them past its hold limit while
+/// its work continued, such as a process start stalled in `spawn`.
+/// `spaced.guest.payload.hold_limit_released_slots`, tagged by `budget`.
+pub fn released_at_hold_limit(budget: Budget, slots: usize) {
+    counter(
+        "spaced.guest.payload.hold_limit_released_slots",
+        slots as u64,
+        &[tag("budget", budget.as_str())],
+    );
+}

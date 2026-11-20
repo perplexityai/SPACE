@@ -105,6 +105,16 @@ const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";
 // the spawn returns, so a slow start names its cause. The account lookup
 // includes its wait for a blocking-pool thread.
 const SLOW_START_PHASE: Duration = Duration::from_secs(1);
+// The longest a start holds its payload admission. Admission bounds decoded
+// start requests, but a start can stall far longer in its account lookup or
+// `spawn` under memory pressure, and a same-key retry waits for it holding
+// admission of its own. Held past this, the slots return to the budget while
+// the start carries on, so stalled starts cannot refuse every later one.
+// Their threads stay bounded by the retained process records.
+#[cfg(not(test))]
+const START_ADMISSION_HOLD_LIMIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const START_ADMISSION_HOLD_LIMIT: Duration = Duration::from_millis(200);
 
 #[cfg(target_os = "linux")]
 type ExitObserver = ProcessExitObserver;
@@ -251,7 +261,8 @@ struct ProcessLaunch {
     spawn_thread: SpawnThread,
     claim: ProcessIdClaim,
     process_reservation: ProcessRecordReservation,
-    /// Held until the child is published.
+    /// Held until the child is published, or released at
+    /// [`START_ADMISSION_HOLD_LIMIT`] while the start carries on.
     start_admission: pplx_space_common_grpc::RequestPermit,
     account_lookup: Duration,
     inner: Arc<crate::execution::ExecutionServiceInner>,
@@ -555,6 +566,7 @@ async fn resolve_process_account(
         pplx_space_grpc_metrics::payload::Budget::GuestProcess,
         ingress,
     )?;
+    bound_start_admission_hold(&admission, START_ADMISSION_HOLD_LIMIT);
     // NSS may block on external account providers. Keep the existing Start
     // admission with the physical lookup even if its requesting future drops.
     admission
@@ -562,6 +574,31 @@ async fn resolve_process_account(
         .observe(tasks.spawn_blocking(move || resolve().map(|account| (account, admission))))
         .await
         .map_err(|error| Status::internal(format!("guest account lookup task failed: {error}")))?
+}
+
+/// Release `admission` once it has been held for `limit`, if it still is.
+/// Holds only a weak reference, so a start that finishes in time releases its
+/// slots as before and the timer then has nothing to do.
+fn bound_start_admission_hold(admission: &pplx_space_common_grpc::RequestPermit, limit: Duration) {
+    let admission = admission.downgrade();
+    tokio::spawn(async move {
+        tokio::time::sleep(limit).await;
+        let Some(held) = admission.held_for() else {
+            return;
+        };
+        let slots = pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS as usize;
+        if admission.release() {
+            pplx_space_grpc_metrics::payload::released_at_hold_limit(
+                pplx_space_grpc_metrics::payload::Budget::GuestProcess,
+                slots,
+            );
+            tracing::warn!(
+                held_ms = held.as_millis(),
+                slots,
+                "guest process start held its payload admission past the hold limit; released it while the start continues"
+            );
+        }
+    });
 }
 
 // TODO(spaced): persist or reconstruct the process registry if callers need
@@ -2325,7 +2362,8 @@ impl Process for ExecutionService {
         // outcome independent of the idempotency record's lifetime. Payload
         // admission in front of this handler, here and in spaced-host, still
         // applies: it runs before the request is decoded, so while every start
-        // slot is held by a stalled spawn, a reconnect waits or is refused there.
+        // slot is held by a stalled spawn, a reconnect waits or is refused there
+        // until `START_ADMISSION_HOLD_LIMIT` returns the stalled start's slots.
         // Only a published process can be reconnected to. A same-key retry of
         // a start that is still publishing goes on to wait for its outcome.
         if self.inner.processes.is_published(&process_id) {
