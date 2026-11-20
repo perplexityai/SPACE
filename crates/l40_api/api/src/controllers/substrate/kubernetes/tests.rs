@@ -8654,12 +8654,18 @@ mod kubernetes_tests {
             .handoff_started_recovery_execution(sandbox_id, generation, None)
             .await
             .expect_err("no restore source yet");
-        assert!(matches!(pre_check, SubstrateError::RestoreUploadSettling { .. }));
+        assert!(matches!(
+            pre_check,
+            SubstrateError::RestoreUploadSettling { .. }
+        ));
         let handoff = substrate
             .handoff_started_recovery_execution(sandbox_id, generation, past_pre_check())
             .await
             .expect_err("no restore source yet");
-        assert!(matches!(handoff, SubstrateError::RestoreUploadSettling { .. }));
+        assert!(matches!(
+            handoff,
+            SubstrateError::RestoreUploadSettling { .. }
+        ));
 
         // It maps to a retryable 503 with Retry-After.
         let response = crate::controllers::ControllerError::from(handoff.clone());
@@ -8685,7 +8691,10 @@ mod kubernetes_tests {
                 .handoff_started_recovery_execution(sandbox_id, generation, restore_context)
                 .await
                 .expect_err("no restore source");
-            assert!(matches!(error, SubstrateError::RestoreContextUnavailable { .. }));
+            assert!(matches!(
+                error,
+                SubstrateError::RestoreContextUnavailable { .. }
+            ));
         }
 
         // The settling error still completes the attempt as failed.
