@@ -238,6 +238,7 @@ fn arm(wanted: &mut Option<Wanted>, generation: u64) -> bool {
     match wanted {
         Some(armed) if armed.generation > generation => false,
         Some(armed) if armed.generation == generation => {
+            // A mismatch waits for a newer generation: nft lists some valid revisions differently.
             let retry = matches!(&armed.run, Run::Done(done) if done.outcome() == Outcome::NotRun);
             if retry {
                 armed.run = Run::Pending;
