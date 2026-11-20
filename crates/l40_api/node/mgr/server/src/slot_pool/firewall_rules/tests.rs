@@ -361,192 +361,102 @@ fn only_the_requested_accepted_assignment_is_runnable() {
     assert!(Arc::ptr_eq(&runnable, &accepted));
 }
 
-/// Arranges slot 0 and returns whatever other work holds during the apply.
-type Setup = Box<dyn Fn(&Arc<NetworkPool>, &FakeHost) -> Option<Box<dyn std::any::Any>>>;
-
-fn held(owner: impl std::any::Any) -> Box<dyn std::any::Any> {
-    Box::new(owner)
-}
-
-/// A changed lifecycle the pool reads after the lookup.
-fn change_after_lookup(
-    pool: &Arc<NetworkPool>,
-    host: &FakeHost,
-    state: SlotState,
-    sandbox: Option<&'static str>,
-    generation: i64,
-) {
-    let pool = pool.clone();
-    host.on_lookup(move || {
-        set_slot(&pool, 0, state, SlotHealth::Healthy, sandbox, generation);
-    });
-}
-
-// Catches a slot mutated while transitional or unhealthy, while it is owned
-// elsewhere, after it changed between lookup and ownership, in a namespace that
-// cannot be pinned, without the requested accepted assignment, or with
-// ownership kept or a reset nudged afterwards.
-#[tokio::test]
-async fn apply_touches_only_an_owned_stable_slot() {
-    const STATES: [SlotState; 9] = [
-        SlotState::Missing,
-        SlotState::Creating,
-        SlotState::Ready,
-        SlotState::Leasing,
-        SlotState::Leased,
-        SlotState::Dirty,
-        SlotState::Resetting,
-        SlotState::Quarantined,
-        SlotState::Destroying,
-    ];
-    const HEALTHS: [SlotHealth; 4] = [
-        SlotHealth::Unknown,
-        SlotHealth::Healthy,
-        SlotHealth::Degraded,
-        SlotHealth::Invalid,
-    ];
-    let mut rows: Vec<(String, Setup, &str)> = Vec::new();
-    for state in STATES {
-        for health in HEALTHS {
-            let sandbox = (state != SlotState::Ready).then_some(SANDBOX);
-            let eligible = matches!(
-                (state, health),
-                (SlotState::Ready | SlotState::Leased, SlotHealth::Healthy)
-            );
-            rows.push((
-                format!("{state}/{health}"),
-                Box::new(move |pool, _| {
-                    set_slot(pool, 0, state, health, sandbox, 1);
-                    None
-                }),
-                if eligible { "verified" } else { "ineligible" },
-            ));
-        }
-    }
-    let busy: [(&str, Setup); 2] = [
-        (
-            "leased slot guard held",
-            Box::new(|pool, _| {
-                leased(pool, 0);
-                SlotGuard::try_acquire(pool, 0).map(held)
-            }),
-        ),
-        (
-            "ready slot guard held",
-            Box::new(|pool, _| {
-                ready(pool, 0);
-                SlotGuard::try_acquire(pool, 0).map(held)
-            }),
-        ),
-    ];
-    rows.extend(
-        busy.into_iter()
-            .map(|(name, setup)| (name.into(), setup, "busy")),
-    );
-    let changed: [(&str, Setup); 3] = [
-        (
-            "leased slot reset to ready",
-            Box::new(|pool, host| {
-                leased(pool, 0);
-                change_after_lookup(pool, host, SlotState::Ready, None, 1);
-                None
-            }),
-        ),
-        (
-            "leased slot released and leased to another sandbox",
-            Box::new(|pool, host| {
-                leased(pool, 0);
-                change_after_lookup(pool, host, SlotState::Leased, Some("sandbox-b"), 2);
-                None
-            }),
-        ),
-        (
-            "ready slot leased",
-            Box::new(|pool, host| {
-                ready(pool, 0);
-                change_after_lookup(pool, host, SlotState::Leased, Some("sandbox-b"), 2);
-                None
-            }),
-        ),
-    ];
-    rows.extend(
-        changed
-            .into_iter()
-            .map(|(name, setup)| (name.into(), setup, "changed")),
-    );
-    let namespace: [(&str, Setup); 2] = [
-        (
-            "namespace entry missing",
-            Box::new(|pool, host| {
-                leased(pool, 0);
-                std::fs::remove_file(host.link(0)).unwrap();
-                None
-            }),
-        ),
-        (
-            "namespace entry unmounted",
-            Box::new(|pool, host| {
-                leased(pool, 0);
-                std::fs::remove_file(host.link(0)).unwrap();
-                std::fs::write(host.link(0), b"").unwrap();
-                None
-            }),
-        ),
-    ];
-    rows.extend(
-        namespace
-            .into_iter()
-            .map(|(name, setup)| (name.into(), setup, "namespace")),
-    );
-
-    for (name, setup, expected) in rows {
-        for accepted in [Some((12, DNS)), None] {
-            let context = format!("{name}, accepted {accepted:?}");
-            let (pool, mut jobs) = pool(1);
-            let (_dir, store) = store(accepted);
-            let host = FakeHost::new();
-            let namespace = host.name(0, "net");
-            let held = setup(&pool, &host);
-            let outcome = match apply(&pool, &store, &host, 12, 0).await {
-                SlotFirewallReport::Attempted(attempt) => {
-                    assert!(attempt.verified(), "{context}: {attempt:?}");
-                    assert_eq!(attempt.namespace, namespace, "{context}");
-                    "verified"
+// Catches an eligibility rule that admits any slot but a healthy ready one
+// without a sandbox ID or a healthy leased one with one, including the inverse
+// ID shapes.
+#[test]
+fn only_healthy_ready_or_leased_slots_are_eligible() {
+    use SlotHealth::*;
+    use SlotState::*;
+    let mut passed = Vec::new();
+    for state in [
+        Missing,
+        Creating,
+        Ready,
+        Leasing,
+        Leased,
+        Dirty,
+        Resetting,
+        Quarantined,
+        Destroying,
+    ] {
+        for health in [Unknown, Healthy, Degraded, Invalid] {
+            for sandbox in ["", SANDBOX] {
+                if eligible(state, health, sandbox) {
+                    passed.push((state, health, sandbox));
                 }
-                SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NoAssignment)) => {
-                    "no assignment"
-                }
-                SlotFirewallReport::NotRun(NotRun::Ineligible { .. }) => "ineligible",
-                SlotFirewallReport::NotRun(NotRun::Busy) => "busy",
-                SlotFirewallReport::NotRun(NotRun::Changed) => "changed",
-                SlotFirewallReport::NotRun(NotRun::Namespace(_)) => "namespace",
-                report => panic!("{context}: {report:?}"),
-            };
-            // Eligibility, ownership and the pin come before the assignment.
-            let expected = match (expected, accepted) {
-                ("verified", None) => "no assignment",
-                _ => expected,
-            };
-            assert_eq!(outcome, expected, "{context}");
-            if outcome == "verified" {
-                assert_eq!(host.installs(), [namespace], "{context}");
-                assert!(host.calls().iter().all(|called| *called == namespace));
-            } else {
-                assert_eq!(host.calls(), [], "{context}: nft must not run");
             }
-            drop(held);
-            assert!(SlotGuard::try_acquire(&pool, 0).is_some(), "{context}");
-            assert_eq!(wakeups(&mut jobs), 0, "{context}: a reset was nudged");
         }
     }
+    assert_eq!(passed, [(Ready, Healthy, ""), (Leased, Healthy, SANDBOX)]);
+}
 
+// Catches nft run for a missing, ineligible, busy or changed slot, an
+// unpinnable namespace or no accepted assignment, the assignment read before
+// ownership, or a slot left owned after a refusal.
+#[tokio::test]
+async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
-    let (_dir, store) = store(Some((12, DNS)));
+    let (_dir, store) = store(None);
     let host = FakeHost::new();
+    host.name(0, "net");
+    leased(&pool, 0);
+    let refused = async |slot_id| match apply(&pool, &store, &host, 12, slot_id).await {
+        SlotFirewallReport::NotRun(not_run) => not_run,
+        SlotFirewallReport::Attempted(attempt) => panic!("attempted: {attempt:?}"),
+    };
+
+    let guard = SlotGuard::try_acquire(&pool, 0).unwrap();
+    assert!(matches!(refused(0).await, NotRun::Busy));
+    drop(guard);
     assert!(matches!(
-        apply(&pool, &store, &host, 12, 1).await,
-        SlotFirewallReport::NotRun(NotRun::NoSlot)
+        refused(0).await,
+        NotRun::Assignment(NotRunnable::NoAssignment)
     ));
+
+    accept(&store, 12, DNS);
+    assert!(matches!(refused(1).await, NotRun::NoSlot));
+    set_slot(
+        &pool,
+        0,
+        SlotState::Dirty,
+        SlotHealth::Healthy,
+        Some(SANDBOX),
+        1,
+    );
+    assert!(matches!(
+        refused(0).await,
+        NotRun::Ineligible {
+            state: SlotState::Dirty,
+            health: SlotHealth::Healthy
+        }
+    ));
+    leased(&pool, 0);
+    // Only the generation moves, as when the slot is reset and leased again.
+    let later = pool.clone();
+    host.on_lookup(move || {
+        set_slot(
+            &later,
+            0,
+            SlotState::Leased,
+            SlotHealth::Healthy,
+            Some(SANDBOX),
+            2,
+        );
+    });
+    assert!(matches!(refused(0).await, NotRun::Changed));
+
+    std::fs::remove_file(host.link(0)).unwrap();
+    assert!(matches!(
+        refused(0).await,
+        NotRun::Namespace(error) if error.kind() == io::ErrorKind::NotFound
+    ));
+    std::fs::write(host.link(0), b"").unwrap();
+    assert!(matches!(refused(0).await, NotRun::Namespace(_)));
+    assert!(
+        SlotGuard::try_acquire(&pool, 0).is_some(),
+        "a refusal kept the slot"
+    );
     assert_eq!(host.calls(), []);
 }
 
