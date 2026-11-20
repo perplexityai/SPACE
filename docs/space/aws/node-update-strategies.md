@@ -139,6 +139,19 @@ surge node through `AZRebalance`, so the module refuses the two together.
 With the process suspended nothing evens the zones out, so check builder
 placement after a launch.
 
+To turn it off, set `builders_az_rebalance_suspended = false` and apply. The
+resource's destroy-time provisioner resumes `AZRebalance`, and a resume that
+fails, other than for an ASG that no longer exists, fails the apply and keeps
+the resource for the next one to retry. Do this before rolling the module back
+to a version without the input: removing the resource block skips the
+destroy-time provisioner, so `AZRebalance` stays suspended and nothing reports
+it. If a rollback already removed it, resume the process by hand:
+
+```bash
+aws autoscaling resume-processes --region <region> \
+  --auto-scaling-group-name <builders-asg> --scaling-processes AZRebalance
+```
+
 Keep builder LT changes in their own apply, separate from worker changes, so
 a builder capacity failure does not hold up unrelated work.
 

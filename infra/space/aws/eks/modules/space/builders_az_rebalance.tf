@@ -54,12 +54,16 @@ resource "terraform_data" "builders_az_rebalance_suspended" {
   }
 
   # Resumes the process when the variable is turned off or the group's ASG is
-  # replaced. A replaced group's old ASG is usually gone already, so a failure
-  # here doesn't fail the apply.
+  # replaced. A replaced group's old ASG is usually gone already, so an ASG
+  # that no longer exists is skipped. Any other failure, including the
+  # describe call, fails the apply and keeps this resource in state, so the
+  # next apply retries the resume instead of leaving AZRebalance suspended
+  # with nothing tracking it. Removing this block without first turning the
+  # variable off skips this provisioner; node-update-strategies.md covers the
+  # rollback.
   provisioner "local-exec" {
-    when       = destroy
-    on_failure = continue
-    command    = "for asg in $ASG_NAMES; do aws autoscaling resume-processes --region \"$AWS_REGION\" --auto-scaling-group-name \"$asg\" --scaling-processes AZRebalance; done"
+    when    = destroy
+    command = "set -e; for asg in $ASG_NAMES; do found=$(aws autoscaling describe-auto-scaling-groups --region \"$AWS_REGION\" --auto-scaling-group-names \"$asg\" --query 'length(AutoScalingGroups)' --output text); if [ \"$found\" = 0 ]; then echo \"builders ASG $asg is gone; nothing to resume\"; continue; fi; aws autoscaling resume-processes --region \"$AWS_REGION\" --auto-scaling-group-name \"$asg\" --scaling-processes AZRebalance; done"
     environment = {
       ASG_NAMES  = join(" ", self.triggers_replace.asg_names)
       AWS_REGION = self.triggers_replace.region
