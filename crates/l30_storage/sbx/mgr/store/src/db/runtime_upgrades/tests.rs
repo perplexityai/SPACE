@@ -1274,6 +1274,139 @@ fn the_report_names_the_attempt_each_outcome_was_recorded_for() {
     assert_eq!(report_with_attempt(&conn, gone.operation_id), None);
 }
 
+/// What a store without attempt tracking writes over a recorded outcome: its
+/// rollback and already-on-target upserts replace the outcome, failure and
+/// time but keep the row's `attempt_id`, as an image-only rollback's would.
+fn rewrite_outcome_as_a_store_without_attempts(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    outcome: RecordedRuntimeUpgradeOutcome,
+    failure: Option<&str>,
+) {
+    let updated = conn
+        .execute(
+            "UPDATE sandbox_runtime_upgrade_outcomes
+                SET outcome = ?2, failure = ?3, recorded_at = ?4
+              WHERE operation_id = ?1",
+            params![
+                operation_id.to_string(),
+                outcome.as_str(),
+                failure,
+                now().unwrap()
+            ],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+}
+
+/// A recorded outcome names its attempt only while that attempt's own row
+/// agrees. Once a store without attempt tracking rewrites the outcome, the
+/// kept `attempt_id` names an attempt that didn't produce it, so the report
+/// names none: a newer rollback, or an already-on-target outcome over a
+/// rollback or refusal. An already-on-target outcome this store recorded keeps
+/// naming the attempt that found the target.
+#[test]
+fn an_outcome_rewritten_by_a_store_without_attempts_names_no_attempt() {
+    // Each write lands in its own second, as an image-only rollback's would.
+    let _clock = crate::db::test_clock::ticking_from(1_000);
+    let conn = test_conn();
+    let envs = environments();
+    let id = sandbox(&conn, SandboxState::Stopped, &envs.source);
+    let identity = |operation_id| RuntimeUpgradeRequestIdentity {
+        target_environment: envs.target_reference,
+        ..on_target(operation_id, &id)
+    };
+    let rolled_back = |failure: &str| RuntimeUpgradeStatus::RolledBack {
+        failure: Some(failure.to_string()),
+    };
+    let attempt_a = Some("attempt-a".to_string());
+
+    // A rollback, then a newer rollback by a store without attempts, with the
+    // same failure.
+    let rewritten_rollback = operation();
+    fenced(begin_for_attempt(
+        &conn,
+        rewritten_rollback,
+        &id,
+        envs.target_reference,
+        false,
+        "attempt-a",
+    ));
+    assert!(roll_back_runtime_upgrade(&conn, rewritten_rollback, "boot failed").unwrap());
+    assert!(finish_runtime_upgrade_rollback(&conn, rewritten_rollback).unwrap());
+    assert_eq!(
+        report_with_attempt(&conn, rewritten_rollback),
+        Some((rolled_back("boot failed"), attempt_a.clone()))
+    );
+    rewrite_outcome_as_a_store_without_attempts(
+        &conn,
+        rewritten_rollback,
+        RecordedRuntimeUpgradeOutcome::RolledBack,
+        Some("boot failed"),
+    );
+    assert_eq!(
+        report_with_attempt(&conn, rewritten_rollback),
+        Some((rolled_back("boot failed"), None))
+    );
+    // The same rollback, then an already-on-target outcome.
+    rewrite_outcome_as_a_store_without_attempts(
+        &conn,
+        rewritten_rollback,
+        RecordedRuntimeUpgradeOutcome::AlreadyOnTarget,
+        None,
+    );
+    assert_eq!(
+        report_with_attempt(&conn, rewritten_rollback),
+        Some((
+            RuntimeUpgradeStatus::AlreadyOnTarget { activation: None },
+            None
+        ))
+    );
+
+    // A refusal, then an already-on-target outcome.
+    let rewritten_refusal = operation();
+    assert!(
+        record_runtime_upgrade_refusal(&conn, &identity(rewritten_refusal), "attempt-a", "busy")
+            .unwrap()
+    );
+    assert_eq!(
+        report_with_attempt(&conn, rewritten_refusal),
+        Some((
+            RuntimeUpgradeStatus::Refused {
+                failure: Some("busy".to_string())
+            },
+            attempt_a.clone()
+        ))
+    );
+    rewrite_outcome_as_a_store_without_attempts(
+        &conn,
+        rewritten_refusal,
+        RecordedRuntimeUpgradeOutcome::AlreadyOnTarget,
+        None,
+    );
+    assert_eq!(
+        report_with_attempt(&conn, rewritten_refusal),
+        Some((
+            RuntimeUpgradeStatus::AlreadyOnTarget { activation: None },
+            None
+        ))
+    );
+
+    // An already-on-target outcome this store recorded has no attempt row and
+    // still names its attempt.
+    let found = operation();
+    assert!(
+        record_runtime_upgrade_already_on_target(&conn, &identity(found), "attempt-a").unwrap()
+    );
+    assert_eq!(
+        report_with_attempt(&conn, found),
+        Some((
+            RuntimeUpgradeStatus::AlreadyOnTarget { activation: None },
+            attempt_a
+        ))
+    );
+}
+
 /// The operation's report keeps only its latest outcome, but each attempt
 /// keeps its own: a later attempt's rollback or refusal never erases an
 /// earlier attempt's, and an attempt's first final outcome stays. A second

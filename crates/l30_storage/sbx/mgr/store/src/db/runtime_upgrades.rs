@@ -813,6 +813,9 @@ pub fn finish_runtime_upgrade_rollback(
     operation_id: RuntimeUpgradeOperationId,
 ) -> Result<bool> {
     let tx = immediate_transaction(conn)?;
+    // One time for both rows: the report trusts the outcome's attempt only
+    // while the attempt's own row carries the same time.
+    let recorded_at = now()?;
     tx.execute(
         "INSERT INTO sandbox_runtime_upgrade_outcomes (
              operation_id, sandbox_id, outcome, target_environment, target_state,
@@ -838,7 +841,7 @@ pub fn finish_runtime_upgrade_rollback(
         params![
             operation_id.to_string(),
             RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
-            now()?
+            recorded_at
         ],
     )?;
     // The attempt's own final outcome: a later attempt's outcome replaces
@@ -857,7 +860,7 @@ pub fn finish_runtime_upgrade_rollback(
         params![
             operation_id.to_string(),
             RecordedAttemptOutcome::RolledBack.as_str(),
-            now()?
+            recorded_at
         ],
     )?;
     let changed = tx.execute(
@@ -1337,7 +1340,8 @@ pub struct RuntimeUpgradeReport {
     pub status: RuntimeUpgradeStatus,
     /// The attempt the reported outcome ran as, as its live row or recorded
     /// outcome names it; `None` for a row written before the node recorded
-    /// attempts.
+    /// attempts, or for a recorded outcome a store without attempts rewrote
+    /// since (see [`recorded_outcome_attempt`]).
     pub attempt_id: Option<String>,
     /// The latest attempt the operation refused after it reached its target,
     /// so the sandbox doesn't run for that attempt; see
@@ -1433,11 +1437,12 @@ db_private_outside_tests! {
             Option<String>,
             Option<String>,
             Option<String>,
+            String,
         );
         let row: Option<OutcomeRow> = conn
             .query_row(
                 "SELECT sandbox_id, outcome, failure, activation_claim_kind,
-                        activation_claimed_execution_id, attempt_id
+                        activation_claimed_execution_id, attempt_id, recorded_at
                    FROM sandbox_runtime_upgrade_outcomes
                   WHERE operation_id = ?1",
                 params![operation_id.to_string()],
@@ -1449,11 +1454,12 @@ db_private_outside_tests! {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(sandbox_id, outcome, failure, claim_kind, claimed_execution, attempt_id)| {
+        row.map(|(sandbox_id, outcome, failure, claim_kind, claimed_execution, attempt_id, recorded_at)| {
             let from_execution = claimed_execution
                 .map(|id| id.parse())
                 .transpose()
@@ -1471,10 +1477,21 @@ db_private_outside_tests! {
                     .into());
                 }
             };
-            let status = match outcome
+            let outcome: RecordedRuntimeUpgradeOutcome = outcome
                 .parse()
-                .map_err(|error| conversion_error(1, Type::Text, error))?
-            {
+                .map_err(|error| conversion_error(1, Type::Text, error))?;
+            let attempt_id = match attempt_id {
+                Some(attempt_id) => recorded_outcome_attempt(
+                    conn,
+                    operation_id,
+                    attempt_id,
+                    outcome,
+                    failure.as_deref(),
+                    &recorded_at,
+                )?,
+                None => None,
+            };
+            let status = match outcome {
                 RecordedRuntimeUpgradeOutcome::RolledBack => RuntimeUpgradeStatus::RolledBack { failure },
                 RecordedRuntimeUpgradeOutcome::Refused => RuntimeUpgradeStatus::Refused { failure },
                 RecordedRuntimeUpgradeOutcome::AlreadyOnTarget => {
@@ -1490,6 +1507,65 @@ db_private_outside_tests! {
         })
         .transpose()
     }
+}
+
+/// `attempt_id`, as the recorded `outcome` of `operation_id` names it, while
+/// the attempt's own row still agrees; `None` otherwise. A store from a
+/// release that has the attempt migrations but doesn't record attempts, such
+/// as an image-only rollback target, rewrites the outcome without touching
+/// its `attempt_id`, so the row can name an attempt that didn't produce it.
+/// This release writes a rollback or refusal and its attempt's row in one
+/// transaction, with one failure and one time. So a rolled-back or refused
+/// outcome names its attempt only while that attempt's row has the same
+/// outcome, failure and time. Times are whole seconds, so a rewrite with the
+/// same failure in the same second still names the old attempt. An
+/// already-on-target outcome has no attempt row of its own, and names its
+/// attempt unless that attempt's row says it rolled back or was refused.
+fn recorded_outcome_attempt(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    attempt_id: String,
+    outcome: RecordedRuntimeUpgradeOutcome,
+    failure: Option<&str>,
+    recorded_at: &str,
+) -> Result<Option<String>> {
+    let recorded: Option<(String, Option<String>, String)> = conn
+        .query_row(
+            "SELECT outcome, failure, recorded_at
+               FROM sandbox_runtime_upgrade_attempt_outcomes
+              WHERE operation_id = ?1
+                AND attempt_id = ?2",
+            params![operation_id.to_string(), attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let recorded = recorded
+        .map(|(attempt_outcome, attempt_failure, at)| {
+            attempt_outcome
+                .parse::<RecordedAttemptOutcome>()
+                .map(|attempt_outcome| (attempt_outcome, attempt_failure, at))
+                .map_err(|error| conversion_error(0, Type::Text, error))
+        })
+        .transpose()?;
+    let agrees = match (outcome, recorded) {
+        (
+            RecordedRuntimeUpgradeOutcome::RolledBack,
+            Some((RecordedAttemptOutcome::RolledBack, attempt_failure, at)),
+        )
+        | (
+            RecordedRuntimeUpgradeOutcome::Refused,
+            Some((RecordedAttemptOutcome::Refused, attempt_failure, at)),
+        ) => attempt_failure.as_deref() == failure && at == recorded_at,
+        (RecordedRuntimeUpgradeOutcome::RolledBack | RecordedRuntimeUpgradeOutcome::Refused, _) => {
+            false
+        }
+        (
+            RecordedRuntimeUpgradeOutcome::AlreadyOnTarget,
+            Some((RecordedAttemptOutcome::RolledBack | RecordedAttemptOutcome::Refused, _, _)),
+        ) => false,
+        (RecordedRuntimeUpgradeOutcome::AlreadyOnTarget, _) => true,
+    };
+    Ok(agrees.then_some(attempt_id))
 }
 
 #[cfg(test)]
