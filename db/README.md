@@ -434,6 +434,56 @@ byte-identical: `template_manager_migrations_keep_the_checksums_releases_reverse
 pins its checksum.
 Change the schema with a new migration, never by editing this one.
 
+## Sandbox-manager runtime upgrade attempts
+
+Sandbox-manager's `20261114030001_sandbox_runtime_upgrade_attempt_id` adds a
+nullable `attempt_id` column to `sandbox_runtime_upgrades` and
+`sandbox_runtime_upgrade_outcomes`.
+`20261114030002_sandbox_runtime_upgrade_attempt_outcomes` adds
+`sandbox_runtime_upgrade_attempt_outcomes`, which holds at most one final
+outcome per operation and attempt id. That table has no foreign key to
+`sandboxes`, so deleting a sandbox's row leaves its attempt outcomes in place.
+
+Each down refuses, before it changes the schema, while a row it guards is
+recorded:
+
+- `20261114030002`'s while the attempt-outcome table holds any row. Dropping
+  the table would lose it, and `sandbox_runtime_upgrade_outcomes` keeps only
+  one outcome per operation.
+- `20261114030001`'s while an operation's outcome in
+  `sandbox_runtime_upgrade_outcomes` is anything but `rolled_back` or
+  `already_on_target`, the two a release without these migrations parses.
+  It guards outcomes only, not the other columns an older release parses.
+
+A release that applies these migrations without writing either leaves the
+column NULL and the table empty, so both downs go through. A non-NULL
+`attempt_id` doesn't hold back `20261114030001`'s down: it drops the ids, which
+a release without the column never reads. Once a node has recorded a guarded
+row, the down that guards it refuses while the row stays. No store code deletes
+attempt outcomes, so `20261114030002`'s down refuses on that node until an
+operator deletes them. An image-only rollback runs no down, so after a node
+records an outcome the older release can't parse, such as `refused`, roll it
+back only to a release whose store parses that outcome. Bundling these
+migrations isn't enough: at the commit that adds them, the store's
+`RecordedRuntimeUpgradeOutcome` parses only `rolled_back` and
+`already_on_target`. While both migrations are applied, this read-only query
+counts the rows that block the reversal:
+
+```sql
+SELECT (SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes)
+     + (SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes
+         WHERE outcome NOT IN ('rolled_back', 'already_on_target'));
+```
+
+Once `20261114030002`'s down has run, its table is gone and that query fails.
+Only `20261114030001`'s guard is left then, and this read-only query counts
+the rows that hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes
+ WHERE outcome NOT IN ('rolled_back', 'already_on_target');
+```
+
 ## Console password provisioning
 
 The password hash marker `!` locks console password login and rejects existing
