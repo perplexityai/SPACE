@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::{ExitStatus, Output};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use pplx_space_firewall_rules_protocol::decode_revision;
 use rusqlite::params;
@@ -21,6 +22,15 @@ use crate::slot_pool::NetworkPoolConfig;
 mod linux;
 
 const NODE: NodeId = NodeId::from_uuid(Uuid::from_u128(1));
+/// Far beyond any wait a passing run makes, so it never trips on a slow runner.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// Fails the test instead of letting a wait that should end hang it.
+async fn bounded<T>(future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(BOUND, future)
+        .await
+        .expect("waited past the bound")
+}
 
 /// Generation `generation` drops TCP to the port of that number.
 fn document(generation: u64) -> String {
@@ -223,7 +233,7 @@ async fn apply(
         fake.reply(netns, args, stdin)
             .ok_or_else(|| io::ErrorKind::TimedOut.into())
     };
-    pool.apply_firewall_rules_with(store, request, host.clone(), Arc::new(nft))
+    bounded(pool.apply_firewall_rules_with(store, request, host.clone(), Arc::new(nft)))
         .await
         .unwrap()
 }
@@ -510,16 +520,17 @@ async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
     let (entered, entering) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel::<()>();
     hook(&host.installed, move || {
-        entered.send(()).unwrap();
-        released.recv().unwrap();
+        let _ = entered.send(());
+        // Also ends once a failed test drops `release`.
+        let _ = released.recv_timeout(BOUND);
     });
     let caller = tokio::spawn({
         let (pool, store, host) = (pool.clone(), store.clone(), host.clone());
         async move { apply(&pool, &store, &host, 12, 0).await }
     });
-    entering.await.unwrap();
+    bounded(entering).await.unwrap();
     caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(bounded(caller).await.unwrap_err().is_cancelled());
 
     assert!(SlotGuard::try_acquire(&pool, 0).is_none(), "released early");
     let progressed = attempted(apply(&pool, &store, &host, 12, 1).await);
@@ -528,7 +539,7 @@ async fn a_dropped_caller_keeps_the_slot_while_nft_runs() {
 
     release.send(()).unwrap();
     pool.task_tracker.close();
-    pool.task_tracker.wait().await;
+    bounded(pool.task_tracker.wait()).await;
     assert!(jobs.try_recv().is_err(), "a neutral release nudged reset");
     assert!(SlotGuard::try_acquire(&pool, 0).is_some(), "never released");
 }
