@@ -630,6 +630,7 @@ SELECTOR_VALUE_ENV = "SPACE_SANDBOX_NODE_SELECTOR_VALUE"
 SELECTOR_LABELS_ENV = "SPACE_SANDBOX_NODE_SELECTOR_LABELS"
 ADMISSION_ENABLED_ENV = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"
 # Non-pool sandbox pods: `build_pool_pod` stamps `pool-role`, a user create does not.
+POOL_ROLE_LABEL = "space.pplx.net/pool-role"
 KIND_SANDBOX_POD_SELECTOR = "app.kubernetes.io/name=space-sandbox,!space.pplx.net/pool-role"
 CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
 KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
@@ -762,6 +763,18 @@ ACTIVATION_CLIENT_LABEL = "space.pplx.net/client-id"
 # client-id label alone would also match a pod the API does not manage, and the
 # whole point of the count is to be the one the cap is working from.
 SANDBOX_MANAGED_BY_SELECTOR = "space.pplx.net/managed-by=space-api"
+# The node selector the Kind API pins sandbox pods with
+# (`sandboxNodeSelectorKey`/`Value` in charts/space-api-local), which is also
+# the set its slot check counts, and the extended resource every sandbox pod
+# requests one of. Read with `-o json` and parsed here rather than through a
+# jsonpath: the resource key carries dots and a slash, and kubectl answers a
+# malformed jsonpath with empty output instead of an error -- which would read
+# as "no capacity" and make a slot verdict pass over nothing.
+SANDBOX_NODE_SELECTOR = "node.kubernetes.io/space-enabled=true"
+SANDBOX_NETWORK_SLOTS_RESOURCE = "space.pplx.net/network-slots"
+# A node carrying this label is excluded from sandbox placement and from the
+# slot check's node set (the API's `node_not_placement_blocked`).
+SSD_PLACEMENT_BLOCKED_LABEL = "space.pplx.net/ssd-placement-blocked"
 # Whether the sandbox row can hold an activating client at all. Necessary for
 # the capability, never sufficient for it: migrations land in their own change
 # ahead of the code that reads them, so a tree can carry this column and none
@@ -5022,6 +5035,129 @@ ON CONFLICT (key_hash) DO NOTHING;
             if sandbox_id:
                 sandboxes.add(sandbox_id)
         return sorted(sandboxes)
+
+    def sandbox_node_slots(self) -> dict[str, dict[str, int]]:
+        """Per start-eligible sandbox node: network slots and sandbox pods on it.
+
+        `capacity` follows the slot check's own rule
+        (`node_network_slot_capacity` in the API's `node_eligibility.rs`): a
+        node whose `status.capacity` advertises no slots has none, and one that
+        does is read from `status.allocatable`, falling back to the capacity
+        while the kubelet hasn't derived allocatable yet.
+
+        Only the nodes the slot check counts are listed: those matching the
+        API's sandbox node selector, Ready and uncordoned (`node_schedulable`),
+        and not SSD-placement-blocked. A node outside that set can't take a
+        sandbox, so counting its slots would size a fill that never completes.
+
+        `used` counts non-terminating sandbox pods bound to the node, and
+        `terminating` counts the rest. The split matters and the two are not
+        interchangeable: the slot check stops counting a pod as soon as it's
+        deleting, while kube-scheduler charges its slot request until the pod
+        is actually gone. A caller asking whether the API sees a free slot
+        reads `used`; a caller waiting for room to place something reads
+        `used + terminating`.
+        """
+
+        # The node selector below is the API's default. A bench whose API
+        # composes a different one, or adds extras, counts other nodes, and a
+        # fill sized from these would never make the API's set full. Refuse
+        # that rather than mirror every selector form the API accepts.
+        selector_env = self._deployment_env_literals(
+            self._public_api_deployment(), (SELECTOR_KEY_ENV, SELECTOR_VALUE_ENV, SELECTOR_LABELS_ENV)
+        )
+        default_key, default_value = SANDBOX_NODE_SELECTOR.split("=", 1)
+        if (
+            selector_env[SELECTOR_KEY_ENV] not in (None, default_key)
+            or selector_env[SELECTOR_VALUE_ENV] not in (None, default_value)
+            or selector_env[SELECTOR_LABELS_ENV]
+        ):
+            raise SmokeConfigurationError(
+                "the public API's sandbox node selector isn't the default "
+                f"{SANDBOX_NODE_SELECTOR}, so its slot check counts nodes this read wouldn't: "
+                f"{selector_env}"
+            )
+        nodes = self.kubectl(
+            "get", "nodes", "-l", SANDBOX_NODE_SELECTOR, "-o", "json", timeout=15
+        )
+        _require_ok(nodes, "read the sandbox nodes' network-slot capacity")
+        slots: dict[str, dict[str, int]] = {}
+        for node in json.loads(nodes.stdout or "{}").get("items", []):
+            name = (node.get("metadata") or {}).get("name") or ""
+            status = node.get("status") or {}
+            ready = any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in status.get("conditions") or []
+            )
+            labels = (node.get("metadata") or {}).get("labels") or {}
+            if (
+                not ready
+                or (node.get("spec") or {}).get("unschedulable")
+                or labels.get(SSD_PLACEMENT_BLOCKED_LABEL) == "true"
+            ):
+                continue
+            advertised = str((status.get("capacity") or {}).get(SANDBOX_NETWORK_SLOTS_RESOURCE, "0"))
+            allocatable = str((status.get("allocatable") or {}).get(SANDBOX_NETWORK_SLOTS_RESOURCE, ""))
+            capacity = 0
+            if advertised.isdigit() and int(advertised) > 0:
+                capacity = int(allocatable) if allocatable.isdigit() else int(advertised)
+            slots[name] = {
+                "capacity": capacity,
+                "used": 0,
+                "terminating": 0,
+            }
+        pods = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            SANDBOX_MANAGED_BY_SELECTOR,
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(pods, "count the sandbox pods holding network slots")
+        for pod in json.loads(pods.stdout or "{}").get("items", []):
+            node_name = (pod.get("spec") or {}).get("nodeName") or ""
+            if node_name not in slots:
+                continue
+            phase = (pod.get("status") or {}).get("phase")
+            if phase in ("Succeeded", "Failed"):
+                # The API's slot index drops terminal pods outright
+                # (`!pod.is_terminal()`), so counting them here would call the
+                # cluster full while the API still sees headroom -- and the
+                # phase would red with a 201 it did not expect.
+                continue
+            terminating = bool((pod.get("metadata") or {}).get("deletionTimestamp"))
+            slots[node_name]["terminating" if terminating else "used"] += 1
+        return slots
+
+    def unbound_sandbox_pods(self) -> list[str]:
+        """User sandbox pods no node has been bound to, deleting ones included.
+
+        `sandbox_node_slots` only counts pods bound to a node, so a pod still
+        waiting for a slot is invisible to it -- and that pod takes the next
+        slot to come free. Pool pods are left out: they're the warm pool's,
+        not a create's, and a pool kept short of slots stays unbound.
+        """
+
+        pods = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},!{POOL_ROLE_LABEL}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(pods, "list the unbound sandbox pods")
+        return sorted(
+            (pod.get("metadata") or {}).get("name") or ""
+            for pod in json.loads(pods.stdout or "{}").get("items", [])
+            if not (pod.get("spec") or {}).get("nodeName")
+            and (pod.get("status") or {}).get("phase") not in ("Succeeded", "Failed")
+        )
 
     def redis_replicas(self) -> int:
         previous = _require_ok(

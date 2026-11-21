@@ -37,7 +37,7 @@ whose update failed. It restarts Tilt when Tilt was started with other values of
 the settings Tilt reads from its environment once, at start: the list is
 `TILT_SETTINGS` in `up.sh` (the telemetry, Datadog and storage credentials
 modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
-`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile,
+`SPACE_KIND_NETWORK_POOL_MAX_SLOTS`, `SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile,
 `SPACE_KIND_RUST_BUILD` and `SPACE_KIND_SUBSTRATE`), each compared with its default, plus the optional
 AWS credentials when storage credentials are `static`. Nothing else restarts
 it, so a refreshed AWS session token in the default mode keeps the running
@@ -2419,7 +2419,11 @@ Node's `status.capacity`, from its node-manager's `network_pool_max_slots`
 re-advertises it on every periodic tick, including after the Node object is
 recreated. That count is node-manager's own default unless the release sets
 `networkPoolMaxSlots` in `charts/space-node-manager-local`: a smoke can set a
-small count, such as 2, to fill each worker's slots with a few sandboxes. node-manager keeps no warm pool of slots, as deployed nodes do not
+small count, such as 2, to fill each worker's slots with a few sandboxes.
+`SPACE_KIND_NETWORK_POOL_MAX_SLOTS=2 infra/space/kind/scripts/up.sh` sets it on
+the sandbox workers' release and leaves the builders at the default; Kind CI's
+small-slot job brings its bench up that way to run
+`local.no_free_slot_refuses_cold_create`. node-manager keeps no warm pool of slots, as deployed nodes do not
 (`SPACE_NODEMGR_NETWORK_POOL_TARGET`, `_RETAIN_READY` and `_MIN_READY` are `0`
 in `charts/space-node-manager-local`): each slot, a sandbox's or a build's, is
 set up when it is allocated and torn down when it is released, and no slot is

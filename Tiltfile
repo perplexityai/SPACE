@@ -948,6 +948,12 @@ k8s_resource(
 # that. Inherited from the environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up`
 # reaches the pod; unset renders nothing and the default applies.
 LOOP_DEVICE_TARGET = os.getenv("SPACE_LOOP_DEVICE_TARGET", "")
+# SPACE_KIND_NETWORK_POOL_MAX_SLOTS sets `networkPoolMaxSlots` on the sandbox
+# workers' node-manager, so each advertises that many network slots and a
+# smoke can fill them with a few sandboxes. The builder release keeps
+# node-manager's default: builds take slots on the builders, and no smoke
+# fills those. Unset renders nothing and node-manager's own default applies.
+NETWORK_POOL_MAX_SLOTS = os.getenv("SPACE_KIND_NETWORK_POOL_MAX_SLOTS", "")
 # The release list is shared with the bring-up's DaemonSet waits.
 NODE_RELEASES = str(local(["bash", "infra/space/kind/lib/node-services.sh", "releases"], quiet = True)).strip().split("\n")
 watch_file("infra/space/kind/lib/node-services.sh")
@@ -961,6 +967,8 @@ for line in NODE_RELEASES:
     node_set = CHART_SET + ["node.role={}".format(role), "node.substrate=" + SUBSTRATE]
     if service == "node-manager" and LOOP_DEVICE_TARGET:
         node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
+    if service == "node-manager" and role == "worker" and NETWORK_POOL_MAX_SLOTS:
+        node_set.append("networkPoolMaxSlots={}".format(NETWORK_POOL_MAX_SLOTS))
     deploy_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))
     k8s_resource(
         "{}-{}".format(release, service),
