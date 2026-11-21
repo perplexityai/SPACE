@@ -23,7 +23,7 @@ import time
 from typing import TYPE_CHECKING
 
 from space_smoke.capabilities import RetainedOnlyCopyControl
-from space_smoke.runtime import Compensation, ResourceScope
+from space_smoke.runtime import Compensation, InconclusiveSmoke, ResourceScope
 
 if TYPE_CHECKING:
     from space_smoke.fixtures import KindEcw
@@ -31,20 +31,31 @@ if TYPE_CHECKING:
 # A public operation's settled states.
 TERMINAL_OPERATION_STATES = ("succeeded", "failed", "canceled")
 DISCARD_REASON = "space-smoke: the interrupted suspend's filesystem is disposable"
+# sandbox-manager's reason for refusing a discard inside the attempt's window
+# (`discard_capture_unfinished`). The in-window check requires it: any other
+# failure, a transport error or another unfinished-capture reason, doesn't show
+# the window refused the discard.
+IN_WINDOW_REFUSAL = "its suspend attempt is inside its recovery window"
 # How long before the window ends the in-window discard must run, so a slow
 # phase can't let the window close under it and turn the check into a no-op.
 WINDOW_MARGIN_SECONDS = 20
 # The node's row can't be read while node-manager is held (the read waits on
 # sandbox-manager, which waits on node-manager), so the fault waits for the
 # control plane to report the suspend, then this long for sandbox-manager to
-# admit it and reach its first node-manager call. If the kill lands earlier the
-# sandbox isn't quarantined as the only copy, and the delete and quarantine checks
-# fail; the scenario can't pass by accident.
+# admit it and reach its first node-manager call. The product doesn't require
+# the kill to come second: a suspend admitted after it also quarantines the
+# sandbox as its only copy, so the post-window waits are timed from the
+# quarantine, not the kill.
 SUSPEND_ADMISSION_GRACE_SECONDS = 5
-# How long after the window ends to wait before the discard that must succeed:
-# the attempt starts when sandbox-manager admits the suspend, a little after
-# the scenario issues it.
-WINDOW_SLACK_SECONDS = 15
+# How long after the window ends to wait before the discard that must succeed,
+# timed from when the scenario saw the row quarantined, by which the attempt had
+# started. A small margin: the node keeps whole-second times, which can only end
+# the window early, never late.
+WINDOW_SLACK_SECONDS = 3
+# Timed from the suspend's issue instead, when a failed run never saw the row
+# quarantined: the attempt starts when sandbox-manager admits the suspend,
+# normally a little after the issue.
+ISSUE_ADMISSION_SLACK_SECONDS = 15
 # What the failure-path discard may spend inside the scenario's cleanup budget
 # (`min(120 s, 10 %)` of its timeout): waiting out the rest of the window, then
 # the discard and the public delete.
@@ -63,6 +74,11 @@ class RetainedOnlyCopyAssertions:
         self._scope = scope
         self._node: str | None = None
         self._suspend_issued_at: float | None = None
+        # When the scenario saw the row quarantined: the node quarantines only a
+        # row whose suspend attempt has begun, so the attempt started before this.
+        self._quarantined_at: float | None = None
+        # Why the in-window discard could not run, when it could not.
+        self._in_window_missed: str | None = None
         self._failure_discard: Compensation | None = None
         self._node_manager: Compensation | None = None
 
@@ -134,8 +150,10 @@ class RetainedOnlyCopyAssertions:
         self._node_manager = node_manager
         try:
             self._control.hold_node_manager(self.node)
-            operation = self._control.suspend_without_waiting(self._sandbox_id)
+            # Sampled before the request: the attempt can start before the
+            # call returns, and the window is timed from no later than that.
             self._suspend_issued_at = time.monotonic()
+            operation = self._control.suspend_without_waiting(self._sandbox_id)
             self._fixture.record("suspend_operation", operation)
             self._expect_control_plane("suspending", timeout=60)
             self._fixture.wait(
@@ -152,6 +170,7 @@ class RetainedOnlyCopyAssertions:
         finally:
             node_manager.release()
         self.expect_row("quarantined", timeout=180)
+        self._quarantined_at = time.monotonic()
 
     def _expect_retained(self, after: str) -> None:
         self._fixture.verify(
@@ -201,6 +220,24 @@ class RetainedOnlyCopyAssertions:
         )
         self._expect_retained("the ordinary delete")
 
+    def _window_passed_at(self) -> float:
+        """A monotonic time by which the attempt's window has surely passed.
+
+        The in-window check times the window from the suspend's issue, the
+        earliest its attempt can have started. This times it from when the
+        scenario saw the row quarantined, which the node does only to a row
+        whose attempt has begun, so the discard that must succeed never comes
+        while the window is still open, however late sandbox-manager admitted
+        the attempt. A run that failed before then falls back to the issue plus
+        the admission slack.
+        """
+
+        if self._quarantined_at is not None:
+            return self._quarantined_at + self._window() + WINDOW_SLACK_SECONDS
+        if self._suspend_issued_at is None:
+            raise RuntimeError("interrupt_suspend() must run first")
+        return self._suspend_issued_at + self._window() + ISSUE_ADMISSION_SLACK_SECONDS
+
     def _window(self) -> int:
         return self._control.discard_attempt_window_seconds(self.node)
 
@@ -212,12 +249,21 @@ class RetainedOnlyCopyAssertions:
         window = self._window()
         elapsed = time.monotonic() - self._suspend_issued_at
         self._fixture.record("discard_window_seconds", window)
-        self._fixture.verify(
-            elapsed < window - WINDOW_MARGIN_SECONDS,
-            "the discard window closed before the in-window discard could run",
-            window_seconds=window,
-            elapsed_seconds=round(elapsed, 1),
-        )
+        self._fixture.record("in_window_discard_after_seconds", round(elapsed, 1))
+        # Timed from the suspend's issue, the earliest its attempt can have
+        # started. A bench slow enough to spend the window before getting here
+        # (reaching `suspending`, the admission grace, `quarantined`) leaves
+        # the check without its premise: the run goes on with every check that
+        # doesn't need the window, and `expect_in_window_checked` then makes it
+        # inconclusive, not failed.
+        if elapsed >= window - WINDOW_MARGIN_SECONDS:
+            self._in_window_missed = (
+                f"the discard window closed before the in-window discard could run: "
+                f"{elapsed:.1f} s after the suspend, with a {window} s window and a "
+                f"{WINDOW_MARGIN_SECONDS} s margin"
+            )
+            self._fixture.record("in_window_discard_missed", self._in_window_missed)
+            return
         result = self._control.node_sandbox_delete(
             self.node, self._sandbox_id, discard_reason=DISCARD_REASON
         )
@@ -226,19 +272,26 @@ class RetainedOnlyCopyAssertions:
             "the discard erased the sandbox while its suspend attempt could still finish",
             output=result.detail(),
         )
+        self._fixture.verify(
+            IN_WINDOW_REFUSAL in result.detail(),
+            "the in-window discard failed, but not because the attempt's window refused it",
+            expected=IN_WINDOW_REFUSAL,
+            output=result.detail(),
+        )
         self._expect_retained("the in-window discard")
+
+    def expect_in_window_checked(self) -> None:
+        """A run whose in-window discard could not run is inconclusive, once every other check ran."""
+
+        if self._in_window_missed is not None:
+            raise InconclusiveSmoke(self._in_window_missed)
 
     def expect_discard_erases(self) -> None:
         """Once the window has passed, the discard erases the sandbox and its filesystem."""
 
         if self._suspend_issued_at is None:
             raise RuntimeError("interrupt_suspend() must run first")
-        remaining = (
-            self._suspend_issued_at
-            + self._window()
-            + WINDOW_SLACK_SECONDS
-            - time.monotonic()
-        )
+        remaining = self._window_passed_at() - time.monotonic()
         if remaining > 0:
             self._fixture.wait(remaining, reason="the suspend attempt's discard window")
         result = self._control.node_sandbox_delete(
@@ -305,10 +358,7 @@ class RetainedOnlyCopyAssertions:
             self._node_manager.release()
         if self._node is not None and self._row() is not None:
             if self._suspend_issued_at is not None:
-                remaining = (
-                    self._suspend_issued_at + self._window() + WINDOW_SLACK_SECONDS
-                    - time.monotonic()
-                )
+                remaining = self._window_passed_at() - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(remaining, CLEANUP_WINDOW_WAIT_SECONDS))
             result = self._control.node_sandbox_delete(
