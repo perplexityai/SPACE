@@ -426,6 +426,7 @@ async fn copy_remote_disk(
                     subject_id: SubjectId::Sandbox(sandbox_id).to_string(),
                     source_s3_uri: artifact_uri(source, artifact),
                     destination_s3_uri: artifact_uri(destination, artifact),
+                    destination_storage_class: None,
                 })
                 .await
                 .map_err(|error| match error.code() {

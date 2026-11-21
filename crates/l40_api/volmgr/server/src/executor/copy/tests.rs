@@ -9,6 +9,7 @@ use std::sync::{
 struct CopyStore {
     source: Option<Vec<u8>>,
     destination: Mutex<Option<Vec<u8>>>,
+    supported_copy_class: Mutex<Option<CopyStorageClass>>,
     corrupt: bool,
     copies: AtomicUsize,
 }
@@ -48,6 +49,24 @@ impl ObjectStore for CopyStore {
         *self.destination.lock().unwrap() = Some(bytes);
         Ok(())
     }
+    async fn copy_object_with_storage_class(
+        &self,
+        _: &pplx_space_object_store::ObjectCredentials,
+        source: ObjectTarget<'_>,
+        destination: ObjectTarget<'_>,
+        size: u64,
+        class: CopyStorageClass,
+    ) -> Result<ObjectMeta, ObjectStoreError> {
+        if *self.supported_copy_class.lock().unwrap() != Some(class) {
+            return Err(ObjectStoreError::CopyStorageClassUnsupported);
+        }
+        assert_eq!(source.key, "source");
+        assert_eq!(destination.key, "destination");
+        let bytes = self.source.clone().expect("source exists");
+        assert_eq!(size, bytes.len() as u64);
+        *self.destination.lock().unwrap() = Some(bytes);
+        Ok(ObjectMeta { size, etag: None })
+    }
     async fn put_bytes(
         &self,
         _: &pplx_space_object_store::ObjectCredentials,
@@ -86,6 +105,7 @@ fn request() -> CopyObjectRequest {
         subject_id: format!("sandbox:{}", SandboxId::new()),
         source_s3_uri: "s3://example-artifacts/source?region=us-east-1".into(),
         destination_s3_uri: "s3://example-artifacts/destination?region=us-east-1".into(),
+        destination_storage_class: None,
     }
 }
 
@@ -95,8 +115,14 @@ fn durable_copy_payload_retains_exact_source_and_destination_uris() {
         subject_id: "sandbox:019f8000-0000-7000-8000-000000000002".into(),
         source_s3_uri: "s3://example-artifacts/source?endpoint=http://object-store.example:9000&region=us-east-1".into(),
         destination_s3_uri: "s3://example-artifacts/destination?region=us-east-1&endpoint=http://object-store.example:9000".into(),
+        destination_storage_class: None,
     };
     let payload = CopyPayload::try_from(request.clone()).unwrap();
+    assert_eq!(
+        payload.dedup_key(),
+        "copy_object:f27af3228b5fd723490fdcde8088b41ecd7c0c7b4c850feacf82362c117f39fa",
+        "existing queued copies must retain their original dedup key"
+    );
     insta::assert_snapshot!(
         "durable_copy_payload",
         serde_json::to_string_pretty(&payload).unwrap()
@@ -111,6 +137,7 @@ fn fixture(source: Option<Vec<u8>>, corrupt: bool) -> (Arc<CopyStore>, TransferE
         source,
         corrupt,
         destination: Mutex::new(None),
+        supported_copy_class: Mutex::new(None),
         copies: AtomicUsize::new(0),
     });
     let executor = TransferExecutor::new_for_test(
@@ -186,6 +213,44 @@ async fn cancellation_and_invalid_recovered_payloads_cannot_start_a_copy() {
     assert_eq!(error.failure_reason(), Some(JobFailureReason::InvalidInput));
     assert_eq!(store.copies.load(Ordering::SeqCst), 0);
     assert!(store.destination.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn classed_copies_never_execute_a_legacy_copy() {
+    let (store, executor, mut job) = fixture(Some(vec![1, 2, 3]), false);
+    let legacy_payload = job.payload.clone();
+    let mut request = request();
+    request.destination_storage_class = Some(WireCopyStorageClass::GlacierInstantRetrieval as i32);
+    let classed_payload = serde_json::to_string(&CopyPayload::try_from(request).unwrap()).unwrap();
+    for (kind, payload) in [
+        (CLASSED_KIND, &legacy_payload),
+        (KIND, &classed_payload),
+        (CLASSED_KIND, &classed_payload), // Backend has no class support yet.
+    ] {
+        job.kind = kind.to_string();
+        job.payload = payload.clone();
+        let error = executor
+            .execute(&job, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure_reason(), Some(JobFailureReason::InvalidInput));
+    }
+    assert_eq!(store.copies.load(Ordering::SeqCst), 0);
+    assert!(store.destination.lock().unwrap().is_none());
+
+    *store.supported_copy_class.lock().unwrap() = Some(CopyStorageClass::GlacierInstantRetrieval);
+    assert_eq!(
+        executor
+            .execute(&job, CancellationToken::new())
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        store.destination.lock().unwrap().as_deref(),
+        Some(&[1, 2, 3][..])
+    );
+    assert_eq!(store.copies.load(Ordering::SeqCst), 0);
 }
 
 #[test]

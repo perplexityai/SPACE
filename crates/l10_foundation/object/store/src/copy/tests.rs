@@ -2,7 +2,7 @@ use super::*;
 use crate::ObjectStore;
 use crate::test_support::{Recorder, credentials, every_class, serve, store, target};
 use axum::Router;
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,6 +59,87 @@ fn every_multipart_copy_part_stays_within_the_single_copy_limit() {
             offset += range.length;
         }
         assert_eq!(offset, size, "size={size} parts do not cover the object");
+    }
+}
+
+#[tokio::test]
+async fn explicit_copy_class_is_sent_and_verified_for_both_copy_paths() {
+    for size in [MAX_SINGLE_COPY_BYTES, MAX_SINGLE_COPY_BYTES + 1] {
+        for (class, reported_class, verified) in [
+            (CopyStorageClass::Standard, None, true),
+            (CopyStorageClass::Standard, Some("FUTURE_CLASS"), false),
+            (
+                CopyStorageClass::GlacierInstantRetrieval,
+                Some("GLACIER_IR"),
+                true,
+            ),
+            (CopyStorageClass::GlacierInstantRetrieval, None, false),
+        ] {
+            let endpoint = serve(Router::new().fallback(
+                move |method: Method, uri: Uri, headers: HeaderMap| async move {
+                    let query = uri.query().unwrap_or_default();
+                    if method == Method::HEAD {
+                        let mut response = StatusCode::OK.into_response();
+                        let headers = response.headers_mut();
+                        headers.insert("content-length", size.to_string().parse().unwrap());
+                        if let Some(value) = reported_class {
+                            headers.insert("x-amz-storage-class", value.parse().unwrap());
+                        }
+                        return response;
+                    }
+                    let class_header = headers.get("x-amz-storage-class");
+                    let body = match method {
+                        Method::PUT if query.contains("partNumber=") => {
+                            assert!(class_header.is_none());
+                            "<CopyPartResult><ETag>synthetic-etag</ETag></CopyPartResult>"
+                        }
+                        Method::PUT => {
+                            assert_eq!(size, MAX_SINGLE_COPY_BYTES);
+                            assert_eq!(class_header.unwrap(), class.as_str());
+                            "<CopyObjectResult><ETag>synthetic-etag</ETag></CopyObjectResult>"
+                        }
+                        Method::POST if query.contains("uploads") => {
+                            assert!(size > MAX_SINGLE_COPY_BYTES);
+                            assert_eq!(class_header.unwrap(), class.as_str());
+                            "<InitiateMultipartUploadResult><UploadId>synthetic-upload</UploadId></InitiateMultipartUploadResult>"
+                        }
+                        Method::POST if query.contains("uploadId=") => {
+                            assert!(class_header.is_none());
+                            "<CompleteMultipartUploadResult><ETag>synthetic-etag</ETag></CompleteMultipartUploadResult>"
+                        }
+                        _ => panic!("unexpected copy request: {method} {uri}"),
+                    };
+                    (StatusCode::OK, [("content-type", "application/xml")], body).into_response()
+                },
+            ))
+            .await;
+            let mut store = store(
+                every_class(Duration::from_secs(2), Duration::from_secs(10)),
+                Duration::from_secs(1),
+                &Arc::new(Recorder::default()),
+            );
+            store.multipart_part_size = usize::try_from(MAX_SINGLE_COPY_BYTES).unwrap();
+            let source = ObjectTarget {
+                key: "source",
+                ..target(&endpoint)
+            };
+            let dest = ObjectTarget {
+                key: "destination",
+                ..target(&endpoint)
+            };
+            let result = store
+                .copy_object_with_storage_class(&credentials(), source, dest, size, class)
+                .await;
+            if verified {
+                assert_eq!(result.unwrap().size, size);
+            } else {
+                assert!(matches!(
+                    result.unwrap_err(),
+                    ObjectStoreError::CopyStorageClassMismatch { expected, actual }
+                        if expected == class && actual == reported_class.unwrap_or("STANDARD")
+                ));
+            }
+        }
     }
 }
 
@@ -164,10 +245,11 @@ fn copy_error_server(
 ) -> Router {
     let failures = failures.clone();
     let aborted = aborted.clone();
-    Router::new().fallback(move |method: Method, uri: Uri| {
+    Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
         let failures = failures.clone();
         let aborted = aborted.clone();
         async move {
+            assert!(headers.get("x-amz-storage-class").is_none());
             let operation = match method {
                 Method::PUT if uri.query().is_some_and(|query| query.contains("partNumber=")) => {
                     S3Operation::UploadPartCopy
