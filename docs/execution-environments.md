@@ -2171,9 +2171,12 @@ as such a build may be rolled back to.
 The loop is off unless `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on
 ([configuration.md](configuration.md)). Off, it reads and writes no campaign
 table. What a kind's subjects are, and how one is upgraded, belong to that
-kind's driver. Only template campaigns have one ([Template runtime upgrade
-campaigns](#template-runtime-upgrade-campaigns)), so the admin API refuses to
-start a valid sandbox campaign (409), and the loop only reports one it finds. Each tick the
+kind's driver. Only template campaigns have one the controller runs
+([Template runtime upgrade campaigns](#template-runtime-upgrade-campaigns)), so
+the admin API refuses to start a valid sandbox campaign (409), and the loop
+only reports one it finds. The sandbox driver is built but not registered: it
+moves sandboxes through a node-side upgrade dispatcher that doesn't exist yet.
+Each tick the
 loop also returns a finished campaign's in-flight items whose leases lapsed to
 pending (see abort below), and for every unfinished campaign whose kind has a
 driver, it:
