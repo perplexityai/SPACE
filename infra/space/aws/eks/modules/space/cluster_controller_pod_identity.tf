@@ -283,3 +283,45 @@ resource "aws_iam_role_policy" "cluster_controller_snapshots_reap" {
   role   = aws_iam_role.db_client_pod_identity["cluster-controller"].name
   policy = data.aws_iam_policy_document.cluster_controller_snapshots_reap.json
 }
+
+// Template twin metadata for the `runtime_upgrade` loop's template campaigns.
+// A campaign gives a release a twin bound to another execution environment:
+// the controller reads the build's shared `metadata.json` (and, for a build
+// that records no execution metadata, its `manifest.json`, for the image's
+// architecture) and writes the twin's own `metadata.json` beside it, under
+// `environments/<environment>/`. It never writes the shared document or any
+// artifact, so the write grant names only the twins' keys. No `ListBucket`:
+// a missing document then reads as AccessDenied rather than NotFound, which
+// the loop retries either way.
+data "aws_iam_policy_document" "cluster_controller_template_twin_metadata" {
+  statement {
+    sid = "TemplateCampaignReadBuildMetadata"
+
+    actions = [
+      "s3:GetObject",
+    ]
+
+    resources = [
+      "${local.template_artifacts_bucket_arn}/templates/*/metadata.json",
+      "${local.template_artifacts_bucket_arn}/templates/*/manifest.json",
+    ]
+  }
+
+  statement {
+    sid = "TemplateCampaignWriteTwinMetadata"
+
+    actions = [
+      "s3:PutObject",
+    ]
+
+    resources = [
+      "${local.template_artifacts_bucket_arn}/templates/*/environments/*/metadata.json",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "cluster_controller_template_twin_metadata" {
+  name   = "${local.name}-cluster-controller-template-twin-metadata"
+  role   = aws_iam_role.db_client_pod_identity["cluster-controller"].name
+  policy = data.aws_iam_policy_document.cluster_controller_template_twin_metadata.json
+}

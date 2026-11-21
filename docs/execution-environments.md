@@ -1327,9 +1327,17 @@ A block also needs `strand: true` while an unfinished template runtime upgrade
 campaign moves releases off the environment, since it would stop the releases
 the campaign hasn't given a twin on its target yet; that refusal carries the
 same `at_risk` report when work is bound to the environment too. It skips an
-environment that already doesn't execute in the same way. The first default
-doesn't check campaigns yet, and a block checks a campaign's source, not its
-target.
+environment that already doesn't execute in the same way. A block checks a
+campaign's source, not its target. The first default needs `strand: true` the
+same way while such a campaign moves an environment it stops. A campaign waits
+for its target to be the default, so the way through is recording a state for
+the source first: `allowed` or `deprecated` keeps it executing. It reads each
+environment it stops that has template releases or an unfinished template
+campaign under the lock a campaign start for it takes, so no campaign can
+start on one before the default commits. A campaign on any other environment
+had no release to move when the default read them; one started there after
+that read, on a release registered after it, isn't caught. Both refusals name
+the campaign.
 Both writes take an optional `If-Match: <generation>` (`--if-generation` in the
 CLI) and answer 412 without changing anything unless the policy is still at
 that generation, so an operator writing from a stale read can't undo another's
@@ -1551,16 +1559,162 @@ config becomes operator-managed, so the autoscaler stops adjusting it, and it
 takes the original's disk size and disk I/O limits. The response reports the
 original's. The upsert reaches only the twin resolution picks when it runs: a
 twin picked later, after the default moves, gets no copy. An upsert that names
-a release (`template_release_id`, which the admin console sends when it edits or
-detaches an existing pool) changes exactly that release's config, so an edit of
-an earlier twin's pool stays on that twin after the default moves; named or
-resolved, only an original's upsert reaches a twin. Disabling an
+a twin's release (`template_release_id`, which the admin console sends when it
+edits or detaches an existing pool) changes exactly that twin's config, so an
+edit of an earlier twin's pool stays on that twin after the default moves. An
+upsert of an original, named or resolved, also reaches the twin creates pick;
+only an original's upsert reaches a twin. Disabling an
 original's config by its id disables the config for the same shape on every one
 of its twins, whether or not creates boot twins, so an earlier twin's
 operator-managed config doesn't keep warming slots; disabling a twin's config
 changes only that config, though without a policy the twin's cold creates then
 take the original's shape. An autoscaler-owned config that's disabled is
 enabled again on the autoscaler's next pass, as an original's is.
+
+### Template runtime upgrade campaigns
+
+A template campaign gives each release on its source a *twin*: a second
+`template_releases` row with the same template name and hash, bound to the
+campaign's target in `execution_metadata`. A release recorded without an
+environment counts as the initial environment's, since nodes cache unbound and
+initial-bound builds in the same legacy partition. The twin shares its
+original's artifacts and storage locations and has no tags. Its own
+`metadata.json` is the original's with the target's execution metadata, under
+`<build>/environments/<target>/metadata.json` beside the build's shared one,
+which isn't rewritten. Template-manager reads it when it pulls a twin's
+build, binding the build's shared `manifest.json` to the twin's document: the
+shared manifest keeps the source's execution metadata, and template-manager
+refuses a build whose manifest and metadata disagree. Template-manager's
+`GetCapabilities` answers `reads_twin_metadata: true`, and node-ctl reports
+that answer in its status (`reads_twin_metadata`); a template-manager that
+predates the RPC reports `false`, and one that doesn't answer reports
+nothing. A template campaign holds until every worker reports `true`, as
+below. The cluster controller reads the shared
+document and writes the twin's with its own object-storage credentials; the
+EKS module
+grants its role read access to builds' `metadata.json` and `manifest.json`,
+and write access only to `environments/*/metadata.json` keys
+(`infra/space/aws/eks/modules/space/cluster_controller_pod_identity.tf`). Each
+operator-managed (`manual`), plaintext Kubernetes warm pool
+config of the original is copied to the twin. The autoscaler moves
+autoscaler-owned pools itself ([Resolving creates to template
+twins](#resolving-creates-to-template-twins)).
+
+The driver holds every template campaign unless the cluster's pods boot the
+environment a twin is bound to (`twins_not_booted`): only a Kubernetes pod
+with the environment placement gate `on` requires its work's environment, and
+otherwise a create resolved to a twin still boots its build's legacy
+partition. A campaign that completed there would have moved nothing, and the
+environment block check would pass on it. The campaign read reports this hold
+(`held: {reason: "twins_not_booted", detail}`). It also holds a campaign until its target
+is the cluster default (`target_not_default`), the target is a compiled environment
+(`target_not_compiled`), for a compiled source, the catalog certifies the
+edge from it (`edge_not_certified`), and every worker reads a twin's own
+metadata (`nodes_dont_read_twins`). That last hold counts each of the
+substrate's workers, draining or not and whatever environments it lists,
+whose node status isn't current evidence of its environments (no snapshot, or
+an incomplete or stale one) or whose node-ctl `reads_twin_metadata` isn't
+`true`: node-ctl's labels decide where a create lands, and a draining node can
+still admit pods. A substrate with no worker registered holds too, since a
+node that joins later takes creates whatever it supports; a node that runs
+pods before its `nodes` row exists isn't seen at all. A node from before that
+report never sends it, so a fleet mid-rollout holds until its last old worker
+is replaced or removed. The campaign read reports this hold too
+(`held: {reason: "nodes_dont_read_twins", detail}`), and the cluster
+controller logs it with up to five of the holding workers' ids. A twin's
+commit checks the workers again and releases its item if one doesn't report
+it. That narrows the window between the plan and the commit but doesn't close
+it: the check takes no lock on node registration or status, so a change that
+commits after it isn't seen. Neither check reaches twins already made: if a worker's
+template-manager is rolled back after twins exist, creates resolved to a twin
+can still land there. Moving the default back makes the release bound to the
+new default win resolution, and that's the original only when the original is
+bound to it: where an earlier campaign made twins, the previous default's
+release may itself be a twin, so moving the default doesn't recover from a
+reader rollback. Twins made earlier would sit unresolved: a release
+bound to the default comes first, and until the default moves, that's each
+build's original when the original is on the default. Once the default moves,
+a template's creates move as its twin appears, at the campaign's pace.
+
+For each item, the driver:
+
+1. skips a release that's gone or whose template is being deleted;
+2. ends done when the release is already in the target's partition, or the
+   build already has a release there under either spelling of its hash;
+3. skips a release that's no longer on the source, and fails one whose
+   storage locations carry an owner-scoped encryption sidecar, which a twin
+   can't share yet. That release is still the campaign's to move, so it
+   counts against the failure budget rather than letting the campaign
+   complete without it;
+4. reads the build's `metadata.json` from the first of its storage locations
+   that serves it;
+5. checks that the build cold boots under the target and that the target
+   runs its guest image. A build recording no execution metadata in its
+   release or its `metadata.json` is checked against its `manifest.json`'s,
+   which template-manager reads first; a manifest the schema refuses fails.
+   Only a build recording none in any of the three is taken as the initial
+   environment's, and only when its image is x86_64, its architecture
+   resolved as template-manager resolves it; any other fails. Its
+   `manifest.json` comes from the location that served `metadata.json`, else
+   the first other location that has it;
+6. then makes its base's twin first, for a derived template, however deep
+   its lineage. The base is `base_resolved` in that `metadata.json`
+   (`<template>@<hash>`). The lease takes pending items in id order, so a
+   derived item that waited for its base's item could hold the base back.
+   Instead it makes the base's twin, and the base's own item then ends done.
+   A base that is its own ancestor fails the item. One item can therefore
+   commit several twins, and a canary's single item moves its lineage up to
+   the first base that already has a twin: the canary limits items, not
+   twins. The checks come first so
+   that a derived build the target can't run fails without moving its base,
+   whose twin would take the base's creates as soon as it committed;
+7. writes the twin's `metadata.json` beside the build in each storage
+   location that still serves the build's own `metadata.json` and
+   `manifest.json`, which every pull reads, and takes the write, then inserts
+   the twin with only those locations,
+   after rechecking under the policy row's share lock that the target is
+   still the cluster default (a default that moved while the item was in
+   flight returns it to pending without spending an attempt, and the plan
+   then holds the campaign),
+   in one transaction holding the template's row lock, which release
+   registration's lock conflicts with. Once nodes read the twin's document, a
+   pull from a location the write missed would find the source's, so the
+   twin keeps only the locations it reached;
+8. copies the manual, plaintext pool configs of every original of the build
+   on the campaign's source, under either hash spelling, to the twin in that
+   same transaction: a twin bound to the default wins resolution as soon as
+   it commits, so it never commits without them. Creates of both spellings
+   resolve to the one twin, and the other spelling's item finds it and ends
+   done, so the copy takes both originals' configs at the insert; for a shape
+   both configure, the newer original's settings win. A manual config the twin
+   already has for a shape is kept; one the autoscaler made for it first
+   takes the original's manual settings. An operator's pool-config disable
+   for the template, and an upsert where creates boot twins (the only case
+   it changes a twin), take the template's row lock before they look up the
+   twins they change too (the one creates resolve to, for an upsert; every
+   twin of the original, for a disable), so each either lands before the copy
+   reads the original's configs or sees the committed twin and changes its
+   config too. That holds for an edit or disable named by an original's
+   release ID. One named by a twin's release ID changes only that twin's
+   config, so after a later campaign, name the newest twin's release ID to
+   change its pool.
+   The original's configs stay enabled, so a rollback that moves the default
+   back finds its pools warm; until an operator disables them, each copied
+   pool warms slots for both releases, and only the twin's are claimed.
+
+A pass reads the releases on the source as it pages through them. A release
+registered on the source behind the cursor, by a builder that hasn't adopted
+the new default, is found by the next pass, as long as the current one leased
+work. Only a pass that leased nothing completes the campaign, so a release
+registered behind that final pass's cursor isn't moved. If a completed
+campaign leaves source releases that have no twin on the target, start
+another once builders have converged.
+
+While `idx_template_releases_template_name_hash_unique` still stands, no
+release can have a twin: the insert does nothing, and the item fails saying
+so, which counts against the failure budget. A release without storage
+locations that already holds the build's slot in the target's partition keeps
+the twin out the same way, and the item fails naming that release.
 
 ### Selecting a restore consumer
 
@@ -2017,8 +2171,9 @@ as such a build may be rolled back to.
 The loop is off unless `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on
 ([configuration.md](configuration.md)). Off, it reads and writes no campaign
 table. What a kind's subjects are, and how one is upgraded, belong to that
-kind's driver. No kind has a driver yet, so the admin API refuses to start a
-valid campaign (409), and the loop only reports a campaign it finds. Each tick the
+kind's driver. Only template campaigns have one ([Template runtime upgrade
+campaigns](#template-runtime-upgrade-campaigns)), so the admin API refuses to
+start a valid sandbox campaign (409), and the loop only reports one it finds. Each tick the
 loop also returns a finished campaign's in-flight items whose leases lapsed to
 pending (see abort below), and for every unfinished campaign whose kind has a
 driver, it:
@@ -2668,8 +2823,9 @@ Known limits until the cluster side carries partitions:
   lookup's pins for up to 10 minutes after the lookup's last acknowledged
   answer (or after the prefetch loop started), then prunes them as before
   environments; an answer that says the template is org-specific drops its
-  pins at once. No dedicated writer
-  creates twins yet, but once the old index is gone the build publisher can:
+  pins at once. The template campaign driver creates twins (see "Template
+  runtime upgrade campaigns"), and once the old index is gone the build
+  publisher can too:
   while a release has no storage location, a build of the same hash bound to
   another environment registers its execution metadata, and the registration
   inserts a twin when every tag it names is already on the hash (a twin
@@ -2680,7 +2836,8 @@ Known limits until the cluster side carries partitions:
   tag it names that isn't on the hash yet refuses it.
   After that, recreating the old index fails, so an image rollback past the
   drop isn't possible. A twin's own `metadata.json`
-  (`<build>/environments/<environment>/metadata.json`) has no writer. Node
+  (`<build>/environments/<environment>/metadata.json`) is written only by the
+  template campaign driver. Node
   inventory is still keyed by template and hash: node-ctl publishes a
   template's legacy-partition build, and another partition's only when it has
   none, so central inventory can't yet tell which nodes hold a twin's build.

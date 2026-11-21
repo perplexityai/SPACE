@@ -31,6 +31,11 @@ pub mod test_support;
 /// whether the node is reachable: a caller choosing a node to act on also
 /// requires `reachable IS TRUE`.
 ///
+/// Freshness is measured at the statement's own time (`clock_timestamp()`),
+/// not the transaction's start (`now()`): a caller that checks evidence
+/// after waiting on a lock inside a transaction mustn't count a snapshot that
+/// went stale while it waited.
+///
 /// Every value is the row's own or the database clock's, so a caller builds
 /// its statement once (a `LazyLock<String>`) and binds the rest.
 pub fn environment_evidence(snapshot_alias: &str) -> String {
@@ -42,8 +47,8 @@ pub fn environment_evidence(snapshot_alias: &str) -> String {
              FALSE\n\
          )",
         complete = inventory_complete(snapshot_alias),
-        fresh = snapshot_fresh(snapshot_alias),
-        arrays_fresh = arrays_fresh(snapshot_alias),
+        fresh = snapshot_fresh(snapshot_alias, STATEMENT_TIME),
+        arrays_fresh = arrays_fresh(snapshot_alias, STATEMENT_TIME),
     )
 }
 
@@ -74,23 +79,40 @@ pub fn environment_refusal(snapshot_alias: &str, environment: &str) -> String {
                  THEN '{not_usable}'\n\
          END",
         complete = inventory_complete(snapshot_alias),
-        fresh = snapshot_fresh(snapshot_alias),
-        arrays_fresh = arrays_fresh(snapshot_alias),
+        fresh = snapshot_fresh(snapshot_alias, TRANSACTION_TIME),
+        arrays_fresh = arrays_fresh(snapshot_alias, TRANSACTION_TIME),
     )
+}
+
+/// A boolean SQL predicate, TRUE iff the node status snapshot aliased as
+/// `snapshot_alias` says the node's template-manager reads a template twin's
+/// own metadata (`node_ctl.reads_twin_metadata`, from node-ctl's
+/// publication). A snapshot without the key, from a node that predates it,
+/// with it `null`, or with any value but JSON `true` is FALSE, never NULL, so
+/// the predicate can be negated safely. Says nothing about freshness: combine
+/// it with [`environment_evidence`].
+pub fn reads_twin_metadata(snapshot_alias: &str) -> String {
+    format!("COALESCE({snapshot_alias}.node_ctl -> 'reads_twin_metadata' = 'true'::jsonb, FALSE)")
 }
 
 fn inventory_complete(snapshot_alias: &str) -> String {
     format!("{snapshot_alias}.execution_inventory_status = 'complete'")
 }
 
-fn snapshot_fresh(snapshot_alias: &str) -> String {
-    format!("{snapshot_alias}.stale_after > now()")
+/// The clock [`environment_evidence`] measures freshness against.
+const STATEMENT_TIME: &str = "clock_timestamp()";
+/// The clock [`environment_refusal`] measures freshness against, as its
+/// placement callers always have.
+const TRANSACTION_TIME: &str = "now()";
+
+fn snapshot_fresh(snapshot_alias: &str, clock: &str) -> String {
+    format!("{snapshot_alias}.stale_after > {clock}")
 }
 
-fn arrays_fresh(snapshot_alias: &str) -> String {
+fn arrays_fresh(snapshot_alias: &str, clock: &str) -> String {
     format!(
         "{snapshot_alias}.environment_refs_received_at\n\
-             + ({snapshot_alias}.stale_after - {snapshot_alias}.observed_at) > now()"
+             + ({snapshot_alias}.stale_after - {snapshot_alias}.observed_at) > {clock}"
     )
 }
 

@@ -196,8 +196,12 @@ class AdminApi(Protocol):
         body: Mapping[str, object] | None = None,
         *,
         idempotency_key: str | None = None,
+        if_match: int | None = None,
     ) -> ConsoleApiResponse:
-        """One admin API request as the bench's operator; an error status is returned."""
+        """One admin API request as the bench's operator; an error status is returned.
+
+        `if_match` sends the generation the caller read as `If-Match`.
+        """
         ...
 
 
@@ -653,11 +657,13 @@ class ExecutionEnvironmentAdmission:
 
     # --- what runs ---------------------------------------------------------
 
-    def expect_running(self, sandbox_id: str, *, step: str) -> None:
-        """The sandbox's running VM is this environment's runtime ([`expect_runtime`])."""
+    def expect_running(
+        self, sandbox_id: str, *, step: str, environment: SelectableEnvironment | None = None
+    ) -> None:
+        """The sandbox's running VM is this environment's runtime, or `environment`'s ([`expect_runtime`])."""
 
         expect_runtime(
-            self._fixture, self._control, self.environment, sandbox_id,
+            self._fixture, self._control, environment or self.environment, sandbox_id,
             step=step, wait=self._wait, clock=self._clock,
         )
 

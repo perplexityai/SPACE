@@ -52,11 +52,10 @@ use crate::models::User;
 use crate::routes::AppState;
 
 /// Campaign kinds a cluster-controller driver moves, so the API starts
-/// campaigns of them. None yet: the template driver and the sandbox driver
-/// each add their kind here as they land, with the controller's
-/// `runtime_upgrade::Drivers` registration. A campaign of a kind without a
-/// driver would sit in canary forever.
-pub const RUNTIME_UPGRADE_DRIVEN_KINDS: &[CampaignKind] = &[];
+/// campaigns of them: templates. The sandbox driver adds its kind here as it
+/// lands, with the controller's `runtime_upgrade::Drivers` registration. A
+/// campaign of a kind without a driver would sit in canary forever.
+pub const RUNTIME_UPGRADE_DRIVEN_KINDS: &[CampaignKind] = &[CampaignKind::Templates];
 
 /// Campaigns per `GET /runtime-upgrade-campaigns` page.
 const PAGE_SIZE: u32 = 100;
@@ -108,10 +107,70 @@ struct CampaignResponse {
     /// one. A certified edge doesn't promise a node can make the move: that's
     /// the driver's call. `null` for a kind that doesn't define it yet.
     stranded: Option<u64>,
+    /// Why the reconciler can't move this unfinished campaign on this
+    /// deployment, whatever its policy or catalog; `null` when nothing here
+    /// holds it. Two holds are reported: `twins_not_booted` (the substrate)
+    /// and `nodes_dont_read_twins` (its workers). The controller's holds that
+    /// depend on the policy or the catalog (a target that isn't the default,
+    /// or isn't compiled, say) aren't.
+    held: Option<HeldResponse>,
+}
+
+/// A hold that no policy change clears, as the reconciler applies it.
+#[derive(Debug, Serialize)]
+struct HeldResponse {
+    /// The reconciler's hold label, as its `runtime_upgrade.campaign.held`
+    /// metric reports it.
+    reason: &'static str,
+    detail: &'static str,
+}
+
+/// The `twins_not_booted` hold: a template campaign moves nothing where
+/// creates don't boot the twin they resolve to
+/// (`crate::controllers::substrate::Substrate::boots_template_twins`).
+const TWINS_NOT_BOOTED: HeldResponse = HeldResponse {
+    reason: "twins_not_booted",
+    detail: "this deployment's creates don't boot a template twin's environment: that needs \
+             a substrate whose worker boots a create's required environment (Kubernetes) \
+             running with SPACE_ENVIRONMENT_PLACEMENT_GATE=on, which the substrate accepts only \
+             once its gap-table row for that mode closes; until then it refuses to start with it",
+};
+
+/// The `nodes_dont_read_twins` hold: a template campaign makes no twin until
+/// every worker of the substrate reports that its template-manager reads a
+/// twin's own metadata
+/// (`pplx_space_runtime_upgrade_campaign_store::workers_not_reading_twins`).
+const NODES_DONT_READ_TWINS: HeldResponse = HeldResponse {
+    reason: "nodes_dont_read_twins",
+    detail: "a worker of this deployment's substrate doesn't report that its template-manager \
+             reads a template twin's own metadata.json (node-ctl's reads_twin_metadata), or its \
+             node status isn't current, or no worker is registered; the cluster controller's \
+             log names up to five of the holding workers",
+};
+
+/// Whether the substrate's workers hold template campaigns
+/// (`NODES_DONT_READ_TWINS`), read only when one of `records` is an
+/// unfinished template campaign that nothing else holds here.
+async fn workers_hold_templates<'a>(
+    state: &AppState,
+    mut records: impl Iterator<Item = &'a CampaignRecord>,
+) -> Result<bool, Box<Response>> {
+    let boots_template_twins = state.sandbox_controller.boots_template_twins();
+    if !boots_template_twins
+        || !records.any(|record| {
+            record.campaign.kind == CampaignKind::Templates && !record.campaign.phase.finished()
+        })
+    {
+        return Ok(false);
+    }
+    store::workers_not_reading_twins(&state.pool, state.sandbox_controller.managed_by())
+        .await
+        .map(|readers| readers.holds())
+        .map_err(|error| Box::new(super::support::read_db_error(error)))
 }
 
 /// Why a read failed, as a response.
-fn campaign_read_error(error: ReadCampaignError) -> Response {
+pub(super) fn campaign_read_error(error: ReadCampaignError) -> Response {
     match error {
         ReadCampaignError::Database(err) => read_db_error(err),
         error => {
@@ -172,15 +231,28 @@ async fn edges_certified(
         .collect())
 }
 
-/// `record` with its item `counts` and its stranded count. `edge_certified`
-/// is the catalog's answer for [`edge_to_check`]'s edge, `None` when it names
-/// none.
+/// `record` with its item `counts`, its stranded count and its hold.
+/// `edge_certified` is the catalog's answer for [`edge_to_check`]'s edge,
+/// `None` when it names none. `boots_template_twins`: whether this
+/// deployment's creates boot the twin they resolve to. `workers_hold`:
+/// whether its workers hold template campaigns ([`workers_hold_templates`]).
 fn campaign_response(
     record: CampaignRecord,
     counts: ItemCounts,
     edge_certified: Option<bool>,
+    boots_template_twins: bool,
+    workers_hold: bool,
 ) -> CampaignResponse {
     let campaign = &record.campaign;
+    let held = if campaign.kind != CampaignKind::Templates || campaign.phase.finished() {
+        None
+    } else if !boots_template_twins {
+        Some(TWINS_NOT_BOOTED)
+    } else if workers_hold {
+        Some(NODES_DONT_READ_TWINS)
+    } else {
+        None
+    };
     let stranded = match (campaign.kind, edge_certified) {
         (CampaignKind::Templates, _) => None,
         (CampaignKind::Sandboxes, Some(false)) => Some(counts.pending),
@@ -206,6 +278,7 @@ fn campaign_response(
         finished_at: format_optional_time(record.finished_at),
         items: counts.into(),
         stranded,
+        held,
     }
 }
 
@@ -268,10 +341,23 @@ pub(super) async fn list_campaigns(
         Ok(certified) => certified,
         Err(response) => return *response,
     };
+    let workers_hold =
+        match workers_hold_templates(&state, records.iter().map(|(record, _)| record)).await {
+            Ok(hold) => hold,
+            Err(response) => return *response,
+        };
     let campaigns = records
         .into_iter()
         .zip(certified)
-        .map(|((record, counts), certified)| campaign_response(record, counts, certified))
+        .map(|((record, counts), certified)| {
+            campaign_response(
+                record,
+                counts,
+                certified,
+                state.sandbox_controller.boots_template_twins(),
+                workers_hold,
+            )
+        })
         .collect();
     Json(CampaignPage {
         campaigns,
@@ -316,8 +402,20 @@ pub(super) async fn get_campaign(
         Ok(certified) => certified.into_iter().next().flatten(),
         Err(response) => return *response,
     };
+    let workers_hold =
+        match workers_hold_templates(&state, campaign.iter().map(|(record, _)| record)).await {
+            Ok(hold) => hold,
+            Err(response) => return *response,
+        };
     let [(record, counts)] = campaign;
-    Json(campaign_response(record, counts, certified)).into_response()
+    Json(campaign_response(
+        record,
+        counts,
+        certified,
+        state.sandbox_controller.boots_template_twins(),
+        workers_hold,
+    ))
+    .into_response()
 }
 
 fn not_found(campaign_id: CampaignId) -> ApiError {

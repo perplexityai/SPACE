@@ -62,6 +62,15 @@ struct Campaign {
     finished_at: Option<String>,
     items: ItemCounts,
     stranded: Option<u64>,
+    /// Why this deployment can't move the unfinished campaign whatever its
+    /// policy; absent from an API that predates it.
+    held: Option<Held>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Held {
+    reason: String,
+    detail: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,6 +318,9 @@ fn render_campaign(campaign: &Campaign) -> String {
         out.push_str(&format!(
             "Stranded: {stranded} (pending items with no certified upgrade edge)\n"
         ));
+    }
+    if let Some(held) = &campaign.held {
+        out.push_str(&format!("Held: {} ({})\n", held.reason, held.detail));
     }
     out.push_str(&format!(
         "Reason: {}\nCreated: {} by {}\nUpdated: {} by {}",

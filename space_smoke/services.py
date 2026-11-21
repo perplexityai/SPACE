@@ -211,6 +211,11 @@ class SmokeServices:
             fixture._leader_election_control = cast(Any, kind)
             fixture._drain_gate_control = cast(Any, kind)
             fixture._console_control = cast(Any, kind)
+            fixture._execution_environment_control = cast(Any, kind)
+            fixture._campaign_control = cast(Any, kind)
+            fixture._environment_placement_gate_control = cast(Any, kind)
+            if isinstance(self.ecw, EcwSdk):
+                fixture._ecw_creator = self.ecw
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
                 from space_smoke.private_template_build import PrivateTemplateBuildAssertions
 
@@ -457,6 +462,7 @@ class SmokeServices:
             fixture._startup_recovery_control = cast(Any, kind)
             fixture._drain_gate_control = cast(Any, kind)
             fixture._console_control = cast(Any, kind)
+            fixture._campaign_control = cast(Any, kind)
             fixture._suspend_codec_control = cast(Any, kind)
             fixture._telemetry_control = cast(Any, kind)
             fixture._leader_election_control = cast(Any, kind)

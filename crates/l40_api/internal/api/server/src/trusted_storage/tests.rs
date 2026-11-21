@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_artifact_model::StorageUri;
 use pplx_space_test_env::TestEnv;
 use rstest::rstest;
 
@@ -10,7 +11,7 @@ fn unconfigured_policy_preserves_local_storage_endpoints(#[case] buckets: Option
     if let Some(value) = buckets {
         env.set(TRUSTED_BUCKETS_ENV, value);
     }
-    let policy = TrustedTemplateStorageBuckets::from_environment(&env).unwrap();
+    let policy = from_environment(&env).unwrap();
     let local =
         StorageUri::parse("s3://local-templates/x?region=us-east-1&endpoint=http://localhost:9000")
             .unwrap();
@@ -27,7 +28,7 @@ fn configured_buckets_are_trimmed_and_captured_at_startup() {
         TRUSTED_BUCKETS_ENV,
         " trusted-templates, mirror-templates, , trusted-templates ",
     );
-    let policy = TrustedTemplateStorageBuckets::from_environment(&env).unwrap();
+    let policy = from_environment(&env).unwrap();
     env.remove(TRUSTED_BUCKETS_ENV);
 
     for (bucket, allowed) in [

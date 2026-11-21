@@ -22,7 +22,15 @@ list of exact S3 bucket names. A configured policy rejects other buckets and
 all endpoint overrides before writing the release or its tags. An unset or
 empty policy preserves local S3-compatible storage. This policy does not audit
 existing releases or replace publisher authorization; provision the allowlist
-before promoting an enforcement image.
+before promoting an enforcement image. Set the same list on the cluster
+controller, whose template campaign driver uses only the storage locations it
+admits. With the list empty there, the driver refuses locations that override
+the endpoint unless `SPACE_TEMPLATE_STORAGE_ALLOW_ENDPOINT_OVERRIDES` opts in
+for S3-compatible storage at an `https://` endpoint, and the controller logs a
+warning naming the variable. It refuses a plain `http://` endpoint unless
+`SPACE_TEMPLATE_STORAGE_ALLOW_PLAINTEXT_ENDPOINTS` opts in for local storage
+such as the Kind object store. A twin keeps only the locations the driver admits, and a release
+with none fails its item once its attempts run out.
 
 ## Template lookup rollout
 

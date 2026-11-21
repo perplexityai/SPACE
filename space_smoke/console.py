@@ -661,6 +661,11 @@ class ConsoleAssertions:
         self._await_status(sandbox_id, "started")
         return sandbox_id
 
+    def delete_foreign_sandbox(self, sandbox_id: str) -> None:
+        """Force-delete a sandbox `create_foreign_sandbox` made, before its cleanup would."""
+
+        self._force_delete(sandbox_id)
+
     # --- the admin API: reads, and the cleanup writes ---------------------
 
     def _api(self, method: str, path: str, body: Mapping[str, object] | None = None, *, expect: tuple[int, ...] = (200,)) -> Any:

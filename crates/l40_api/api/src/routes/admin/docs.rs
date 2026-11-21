@@ -1071,7 +1071,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
             "put": {
                 "summary": "Set the cluster default execution environment",
                 "parameters": [if_match.clone()],
-                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified. No check yet for an unfinished template runtime upgrade campaign moving releases off an environment the first default stops; only a block checks campaigns.",
+                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. It also needs strand: true while an unfinished template runtime upgrade campaign moves an environment it stops. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified.",
                 "requestBody": {
                     "required": true,
                     "content": {
@@ -1086,7 +1086,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                                     "strand": {
                                         "type": "boolean",
                                         "default": false,
-                                        "description": "Set the first default even though work may depend on an environment it stops."
+                                        "description": "Set the first default even though work may depend on an environment it stops, or an unfinished template runtime upgrade campaign moves one."
                                     }
                                 }
                             }
@@ -1097,7 +1097,7 @@ fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
                     "200": { "description": "Object with the new generation and default_environment_ref" },
                     "400": { "description": "Invalid body, environment reference or reason" },
                     "403": { "description": "Managing organization administrator required" },
-                    "409": { "description": "The environment is blocked or has a stored state this server doesn't recognize, or the first default would stop work (at_risk carries the environments and counts)" },
+                    "409": { "description": "The environment is blocked or has a stored state this server doesn't recognize, the first default would stop work (at_risk carries the environments and counts), or an unfinished template runtime upgrade campaign moves an environment it stops (with at_risk when it would stop work too, since strand: true waives both)" },
                     "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" }
                 }
             }

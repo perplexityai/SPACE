@@ -7,6 +7,7 @@ use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
 use std::{path::Path, sync::Arc};
 use tracing_subscriber::layer::SubscriberExt as _;
 
+mod capabilities_rpc;
 mod digest_claim;
 mod export;
 mod lookup_rpc;

@@ -124,6 +124,14 @@ pub(super) async fn upsert_pool_config(
         )),
         None => ControllerError::not_found("template release not found"),
     })?;
+    // After the release lookup, which reads no config row, and before the
+    // config write: a template whose first release registered after a lock
+    // taken earlier found no row would otherwise go unlocked.
+    if boots_template_twins {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &request.template_name)
+            .await?;
+    }
     let upsert_error = |err: pplx_space_cluster_pool::PoolError| match err {
         pplx_space_cluster_pool::PoolError::EncryptableConfigFenced => {
             ControllerError::bad_request(err.to_string())
@@ -208,6 +216,15 @@ pub(super) async fn disable_pool_config(
         .begin()
         .await
         .map_err(|err| db_contention_error("failed to start transaction", &err))?;
+    // Before the config's row, as the upsert takes it: a twin insert holds
+    // the template's row and then locks the twin's config rows, and a twin
+    // it hasn't committed yet is one this disable's read of the twins below
+    // can't see.
+    if let Some(template_name) = store.pool_config_template(&mut tx, id).await? {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &template_name)
+            .await?;
+    }
     let disabled = WarmPoolStore::disable_config(&mut tx, id)
         .await
         .map_err(disable_error)?

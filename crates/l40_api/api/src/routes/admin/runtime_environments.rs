@@ -20,16 +20,16 @@
 //! stops the releases the campaign hasn't given a twin on its target yet. As
 //! for bound work, a block of an environment that already doesn't execute
 //! stops nothing new and needs no `strand`, unless another policy write lands
-//! while it waits, when the check runs in full.
+//! while it waits, when the check runs in full. The first default needs
+//! `strand: true` the same way while such a campaign moves any environment it
+//! stops.
 //!
 //! Not yet checked: that every node can run a new default (per-node usable
 //! environments are recorded, but a default change doesn't consult them yet),
-//! that no unfinished template runtime upgrade campaign moves releases off an
-//! environment the first default stops (only a block checks campaigns), or
-//! onto the environment a block stops (a block checks a campaign's source,
-//! not its target), and
-//! which nodes can't enforce a block (node status reports each node's
-//! applied generation; refusing on it is a later change).
+//! that no unfinished template runtime upgrade campaign moves releases onto
+//! the environment a block stops (a block checks a campaign's source, not its
+//! target), and which nodes can't enforce a block (node status reports each
+//! node's applied generation; refusing on it is a later change).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,6 +57,7 @@ use pplx_space_runtime_upgrade_campaign_store::{self as campaign_store, Campaign
 use super::audit::{self, AdminRuntimeEnvironmentAuditEntry};
 use super::node_store::{AdminNodeRow, AdminNodeStore};
 use super::runtime_environment_store as store;
+use super::runtime_upgrade_campaigns::campaign_read_error;
 use super::support::{
     ApiError, api_error, db_error, format_time, parse_environment_ref, parse_if_match_generation,
     parse_json_body, read_db_error, require_managing_org_admin,
@@ -178,7 +179,8 @@ struct SetDefaultRequest {
     environment_ref: String,
     reason: String,
     /// Set the first default even though work may depend on an environment
-    /// it stops: see [`AtRisk::of_first_default`].
+    /// it stops (see [`AtRisk::of_first_default`]), or an unfinished template
+    /// campaign moves one.
     #[serde(default)]
     strand: bool,
 }
@@ -310,20 +312,35 @@ impl AuditContext<'_> {
             .into_response()
     }
 
-    /// Audit and answer a block refused because an unfinished template
-    /// campaign still moves `environment`'s releases. `at_risk` is the work
-    /// the block would also stop, if any, since the `strand: true` that
-    /// overrides this refusal waives that check too.
+    /// Audit and answer a write refused because an unfinished template
+    /// campaign still moves the releases of `environment`, which the write
+    /// stops. `at_risk` is the work the write would also stop, if any, since
+    /// the `strand: true` that overrides this refusal waives that check too.
     fn refuse_template_campaign(
         &self,
         campaign_id: CampaignId,
         environment: EnvironmentReference,
+        write: StoppingWrite,
         at_risk: Option<AtRisk>,
     ) -> Response {
+        // A first default the campaign waits on (its target) can't wait for
+        // the campaign to complete, so the way through is keeping the source
+        // executing: a state for it.
+        let (stops, remedy, verb) = match write {
+            StoppingWrite::Block => ("", "let it complete or abort it first".to_owned(), "block"),
+            StoppingWrite::FirstDefault => (
+                ", which the cluster's first default stops",
+                format!(
+                    "record a state for {environment} first (allowed or deprecated keeps it \
+                     executing), or abort the campaign"
+                ),
+                "set the default",
+            ),
+        };
         let message = format!(
             "template runtime upgrade campaign {campaign_id} still moves environment \
-             {environment}'s releases; let it complete or abort it before blocking, or pass \
-             strand: true to block anyway{}",
+             {environment}'s releases{stops}; {remedy}, or pass strand: true to {verb} \
+             anyway{}",
             if at_risk.is_some() {
                 ", which also stops the work at_risk counts"
             } else {
@@ -484,6 +501,72 @@ async fn first_default_at_risk(
     )
 }
 
+/// A policy write that stops environments executing, as a refusal names it.
+#[derive(Clone, Copy)]
+enum StoppingWrite {
+    Block,
+    FirstDefault,
+}
+
+/// The unfinished template campaign, and its source, that moves an
+/// environment the cluster's first default `default` stops, if any. Runs on
+/// the write's transaction after the store's write, so it reads the policy as
+/// the write leaves it: every environment with no executing state, other than
+/// `default`, stops.
+///
+/// The candidate sources are every environment a template release is bound
+/// to, and every unfinished template campaign's source. Each one that stops
+/// is read under the advisory lock every campaign start for it takes
+/// ([`campaign_store::unfinished_from_locked`]), so none can start between the
+/// read and the commit. A campaign on any other environment had no release to
+/// move when the candidates were read; one started there afterwards, on a
+/// release registered after that read, isn't caught. The locks are taken in
+/// order; a campaign start takes only one, and another policy write waits on
+/// the policy row this transaction holds.
+async fn first_default_template_campaign(
+    tx: &mut sqlx::PgConnection,
+    default: EnvironmentReference,
+) -> Result<Option<(CampaignId, EnvironmentReference)>, Box<Response>> {
+    let policy = policy_store::get(&mut *tx)
+        .await
+        .map_err(|error| Box::new(policy_read_error(error)))?;
+    // An environment reference that doesn't parse can't be a campaign's
+    // source.
+    let mut sources: BTreeSet<EnvironmentReference> =
+        store::template_release_environments(&mut *tx)
+            .await
+            .map_err(|err| Box::new(read_db_error(err)))?
+            .iter()
+            .filter_map(|environment| environment.parse().ok())
+            .collect();
+    sources.extend(
+        campaign_store::list_unfinished(&mut *tx)
+            .await
+            .map_err(|error| Box::new(campaign_read_error(error)))?
+            .into_iter()
+            .filter(|campaign| campaign.kind == CampaignKind::Templates)
+            .map(|campaign| campaign.from),
+    );
+    for source in sources {
+        let stops = source != default
+            && policy
+                .environments
+                .get(&source)
+                .is_none_or(|state| !state.executes());
+        if !stops {
+            continue;
+        }
+        if let Some(campaign_id) =
+            campaign_store::unfinished_from_locked(&mut *tx, CampaignKind::Templates, source)
+                .await
+                .map_err(|err| Box::new(read_db_error(err)))?
+        {
+            return Ok(Some((campaign_id, source)));
+        }
+    }
+    Ok(None)
+}
+
 /// `PUT /runtime-environments/default`: make an environment the cluster
 /// default. It's recorded as `allowed` if it isn't already, and the old
 /// default stays `allowed`.
@@ -541,6 +624,17 @@ pub(super) async fn set_default_runtime_environment(
         Ok(tx) => tx,
         Err(err) => return audit.fail("the write failed", db_error(err).into_response()),
     };
+    // Whether this is the first default, read before the store's write takes
+    // the policy row lock: a default set concurrently only makes the
+    // campaign check below run when it needn't. Only the default, as for
+    // `at_risk`.
+    let first_default = if request.strand {
+        Ok(false)
+    } else {
+        policy_store::get_default(&mut *tx)
+            .await
+            .map(|existing| existing.is_none())
+    };
     let generation = match policy_store::set_default(&mut tx, environment, &change).await {
         Ok(generation) => generation,
         Err(SetDefaultError::Blocked(environment)) => {
@@ -579,16 +673,43 @@ pub(super) async fn set_default_runtime_environment(
         return audit.refuse_stale(expected, generation);
     }
     // After the store's own refusals, as for a block.
-    match at_risk {
-        Ok(None) => {}
-        Ok(Some(at_risk)) => {
-            drop(tx);
-            return audit.refuse_strand(at_risk);
-        }
+    let at_risk = match at_risk {
+        Ok(at_risk) => at_risk,
         Err(response) => {
             drop(tx);
             return audit.fail("couldn't check what the write would stop", *response);
         }
+    };
+    // As for a block: under the campaign start lock of each source the
+    // default stops, after the read of what else it stops, so the refusal
+    // reports that work too.
+    let template_campaign = match first_default {
+        Ok(true) => first_default_template_campaign(&mut tx, environment).await,
+        Ok(false) => Ok(None),
+        Err(error) => Err(Box::new(policy_read_error(error))),
+    };
+    match template_campaign {
+        Ok(None) => {}
+        Ok(Some((campaign_id, source))) => {
+            drop(tx);
+            return audit.refuse_template_campaign(
+                campaign_id,
+                source,
+                StoppingWrite::FirstDefault,
+                at_risk,
+            );
+        }
+        Err(response) => {
+            drop(tx);
+            return audit.fail(
+                "couldn't check for an unfinished template campaign",
+                *response,
+            );
+        }
+    }
+    if let Some(at_risk) = at_risk {
+        drop(tx);
+        return audit.refuse_strand(at_risk);
     }
     // A refusal drops the transaction, which discards anything queued in it,
     // and so does a failed enqueue, rolling the write back with it. The
@@ -806,7 +927,12 @@ pub(super) async fn set_runtime_environment_state(
         Ok(None) => {}
         Ok(Some(campaign_id)) => {
             drop(tx);
-            return audit.refuse_template_campaign(campaign_id, environment, at_risk);
+            return audit.refuse_template_campaign(
+                campaign_id,
+                environment,
+                StoppingWrite::Block,
+                at_risk,
+            );
         }
         Err(err) => {
             drop(tx);

@@ -633,12 +633,138 @@ async fn a_subject_skipped_after_its_page_is_upgraded_before_the_campaign_comple
     Ok(())
 }
 
-#[test]
-fn the_api_starts_campaigns_of_exactly_the_kinds_this_build_drives() {
+/// A pool that never connects: building the drivers touches no database.
+fn lazy_pool() -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/unused")
+        .expect("a lazy pool parses its URL")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_api_starts_campaigns_of_exactly_the_kinds_this_build_drives() {
     assert_eq!(
-        cluster_drivers().kinds(),
+        cluster_drivers(
+            lazy_pool(),
+            lazy_pool(),
+            false,
+            "k8s",
+            TemplateStorageOrigins::default()
+        )
+        .kinds(),
         pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS
     );
+}
+
+fn loop_on() -> ReconcilerConfig {
+    ReconcilerConfig {
+        enabled: true,
+        ..ReconcilerConfig::default()
+    }
+}
+
+#[test]
+fn the_trusted_template_buckets_are_the_internal_apis() {
+    let mut env = TestEnv::default();
+    env.set(
+        TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV,
+        " trusted-templates, ,mirror",
+    );
+    let mut on = loop_on();
+    assert_eq!(
+        template_storage_origins(&mut on, &env),
+        TemplateStorageOrigins {
+            trusted: TrustedStorageBuckets::from_buckets(["trusted-templates", "mirror"]),
+            allow_endpoint_overrides: false,
+            allow_plaintext_endpoints: false,
+        }
+    );
+    assert!(on.enabled);
+}
+
+/// With the loop on and no trusted buckets, the driver's client refuses a
+/// location that overrides the endpoint, unless an operator opts in.
+#[tokio::test(flavor = "current_thread")]
+async fn without_trusted_buckets_the_driver_refuses_endpoint_overrides_unless_allowed() {
+    let mut env = TestEnv::default();
+    let origins = template_storage_origins(&mut loop_on(), &env);
+    assert_eq!(origins, TemplateStorageOrigins::default());
+    let hash = format!("sha256:{}", "ab".repeat(32));
+    let overridden = pplx_space_template_release_store::TwinMetadataTarget::parse(
+        &format!(
+            "s3://templates-bucket/space/templates/seed/{hash}?region=us-east-1\
+             &endpoint=https://object-store.example:8443"
+        ),
+        "seed",
+        &hash,
+    )
+    .expect("a storage location");
+    use pplx_space_template_release_store::{ObjectAccessError, ReleaseObjects as _};
+    assert!(matches!(
+        origins.client().read_metadata(&overridden).await,
+        Err(ObjectAccessError::UntrustedOrigin { .. })
+    ));
+
+    env.set(ALLOW_TEMPLATE_STORAGE_ENDPOINT_OVERRIDES_ENV, "true");
+    assert!(template_storage_origins(&mut loop_on(), &env).allow_endpoint_overrides);
+}
+
+/// The driver's client refuses a plain `http://` storage endpoint unless an
+/// operator opts in for local S3-compatible storage; the opt-in allows
+/// endpoint overrides too.
+#[tokio::test(flavor = "current_thread")]
+async fn the_driver_refuses_plaintext_endpoints_unless_allowed() {
+    use pplx_space_template_release_store::{ObjectAccessError, ReleaseObjects as _};
+    let mut env = TestEnv::default();
+    let hash = format!("sha256:{}", "ab".repeat(32));
+    let plaintext = pplx_space_template_release_store::TwinMetadataTarget::parse(
+        &format!(
+            "s3://templates-bucket/space/templates/seed/{hash}?region=us-east-1\
+             &endpoint=http://object-store:8333&path_style=true"
+        ),
+        "seed",
+        &hash,
+    )
+    .expect("a storage location");
+    let origins = template_storage_origins(&mut loop_on(), &env);
+    assert!(!origins.allow_plaintext_endpoints);
+    assert!(matches!(
+        origins.client().read_metadata(&plaintext).await,
+        Err(ObjectAccessError::PlaintextEndpoint { .. })
+    ));
+
+    env.set(ALLOW_TEMPLATE_STORAGE_PLAINTEXT_ENDPOINTS_ENV, "true");
+    let origins = template_storage_origins(&mut loop_on(), &env);
+    assert!(origins.allow_plaintext_endpoints);
+    assert!(
+        origins.allow_endpoint_overrides,
+        "a plaintext endpoint is an override"
+    );
+}
+
+/// A list that isn't UTF-8 keeps the loop off rather than stopping the
+/// controller, and a disabled loop doesn't read the variables at all.
+#[test]
+fn unreadable_trusted_template_buckets_keep_the_loop_off() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut env = TestEnv::default();
+    env.set(
+        TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV,
+        std::ffi::OsStr::from_bytes(b"trusted-\xff"),
+    );
+    let mut on = loop_on();
+    assert_eq!(
+        template_storage_origins(&mut on, &env),
+        TemplateStorageOrigins::default()
+    );
+    assert!(!on.enabled, "the loop stays off");
+    env.set(ALLOW_TEMPLATE_STORAGE_ENDPOINT_OVERRIDES_ENV, "true");
+    let mut off = ReconcilerConfig::default();
+    assert_eq!(
+        template_storage_origins(&mut off, &env),
+        TemplateStorageOrigins::default()
+    );
+    assert!(!off.enabled);
 }
 
 #[test]

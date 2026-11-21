@@ -3059,13 +3059,15 @@ class ConsoleControl(Protocol):
         body: Mapping[str, object] | None = None,
         *,
         idempotency_key: str | None = None,
+        if_match: int | None = None,
     ) -> ConsoleApiResponse:
         """One request to `/admin/api/v1/...` or `/auth/v1/...` as the operator.
 
         An HTTP error status is returned, not raised, so a scenario judges a
         404 itself; a transport failure raises without the credential. The
         admin sandbox writes require an `Idempotency-Key`; replaying one
-        answers the operation it first created.
+        answers the operation it first created. `if_match` sends a generation
+        as `If-Match`, for the generation-checked admin writes.
         """
         ...
 

@@ -25,12 +25,14 @@ pub async fn node_ctl_status() -> NodeCtlStatus {
             error: None,
             reconciliations,
             sync_overrides,
+            reads_twin_metadata: None,
         },
         Err(error) => NodeCtlStatus {
             reachable: false,
             error: Some(error.message().to_string()),
             reconciliations: Vec::new(),
             sync_overrides: Vec::new(),
+            reads_twin_metadata: None,
         },
     }
 }
