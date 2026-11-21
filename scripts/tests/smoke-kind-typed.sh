@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Run the portable typed smoke inventory against the local Kind/Firecracker stack.
 # Usage: scripts/tests/smoke-kind-typed.sh [all|ecw|network_policy|local|native] [INDEX/COUNT]
+#        scripts/tests/smoke-kind-typed.sh SCENARIO_ID
+#   A scenario ID (one with a dot, such as local.no_free_slot_refuses_cold_create)
+#   runs that one scenario, manual-tier ones included, which run only by name,
+#   with its category target's preparation: a native.* ID on the native API
+#   surface, any other on the ECW surface. It takes no shard.
 #   Every target needs an admin session token: SPACE_API_TOKEN, or
 #   SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE to read one from, or the seeded root
 #   account this script logs in as when neither is set.
@@ -237,9 +242,33 @@ case "$TARGET" in
     env SPACE_SMOKE_API_SURFACE=ecw uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run --category "$TARGET" "${SHARD_ARGS[@]}"
     exit $?
     ;;
+  *.*)
+    if (( ${#SHARD_ARGS[@]} > 0 )); then
+      echo "ERROR: a single scenario takes no shard: $TARGET" >&2
+      exit 2
+    fi
+    # The same preparation its category target does, so a scenario run by
+    # name finds the prerequisites a category run would have provisioned.
+    surface=ecw
+    case "$TARGET" in
+      native.*)
+        prepare_native_kind
+        surface=native
+        ;;
+      local.*)
+        resolve_admin_token
+        ensure_build_foreign_org
+        ;;
+      *)
+        resolve_admin_token
+        ;;
+    esac
+    env SPACE_SMOKE_API_SURFACE="$surface" uv run "$UV_LOCK_MODE" --python 3.11 -m space_smoke run "$TARGET"
+    exit $?
+    ;;
   *)
     echo "ERROR: unknown typed smoke target: $TARGET" >&2
-    echo "       use all, ecw, network_policy, local, or native" >&2
+    echo "       use all, ecw, network_policy, local, native, or a scenario ID" >&2
     exit 2
     ;;
 esac

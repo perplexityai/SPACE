@@ -3,21 +3,29 @@
 # Kind smoke" step, and each smoke-kind-parallel.sh bench. An admin token file
 # and a cold-receipts directory from the seeded root account, a wait for the
 # data plane, then `smoke-kind-typed.sh all $SMOKE_SHARD`, its output kept in
-# <log>.
+# <log>. With SMOKE_TYPED_TARGET set to a scenario ID it runs just that
+# scenario instead, and SMOKE_SHARD isn't needed.
 #
 # Usage: kind-typed-shard.sh <log>
 # Exit status: smoke-kind-typed.sh's; 2 when a tool is missing, no admin token
 # can be had or the data plane never answers, and a failed command's own
 # status before that.
-# Env:   SMOKE_SHARD, SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE (removed on exit),
+# Env:   SMOKE_SHARD or SMOKE_TYPED_TARGET, SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE (removed on exit),
 #        SPACE_SMOKE_KIND_COLD_RECEIPTS, SPACE_CONSOLE_PASSWORD (default password)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 LOG="${1:?usage: kind-typed-shard.sh <log>}"
-: "${SMOKE_SHARD:?}" "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE:?}" "${SPACE_SMOKE_KIND_COLD_RECEIPTS:?}"
-export SKIP_BOOTSTRAP=1 SMOKE_SHARD SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE SPACE_SMOKE_KIND_COLD_RECEIPTS
+: "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE:?}" "${SPACE_SMOKE_KIND_COLD_RECEIPTS:?}"
+if [[ -n "${SMOKE_TYPED_TARGET:-}" ]]; then
+  TYPED_ARGS=("$SMOKE_TYPED_TARGET")
+else
+  : "${SMOKE_SHARD:?}"
+  export SMOKE_SHARD
+  TYPED_ARGS=(all "$SMOKE_SHARD")
+fi
+export SKIP_BOOTSTRAP=1 SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE SPACE_SMOKE_KIND_COLD_RECEIPTS
 [[ -n "${SPACE_M1_GENERATOR_MIRROR:-}" ]] || unset SPACE_M1_GENERATOR_MIRROR
 
 # Fails the shard, with an annotation in GitHub Actions.
@@ -54,7 +62,7 @@ curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1 \
 # passes every line through to stdout (the step log), as bytes so output that
 # isn't UTF-8 can't stop it; a failed events write stops only the events. It
 # stays in the pipeline, so the events are complete when this script exits.
-bash "$REPO_ROOT/scripts/tests/smoke-kind-typed.sh" all "$SMOKE_SHARD" 2>&1 \
+bash "$REPO_ROOT/scripts/tests/smoke-kind-typed.sh" "${TYPED_ARGS[@]}" 2>&1 \
   | tee "$LOG" \
   | python3 -u -c '
 import re, sys, time

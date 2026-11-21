@@ -572,6 +572,14 @@ class RateLimiterControl(Protocol):
         """The client's live sandboxes, counted the way the live cap counts them."""
         ...
 
+    def sandbox_node_slots(self) -> dict[str, dict[str, int]]:
+        """Per start-eligible sandbox node: advertised network slots and sandbox pods on it."""
+        ...
+
+    def unbound_sandbox_pods(self) -> list[str]:
+        """User sandbox pods no node has been bound to yet."""
+        ...
+
     def redis_replicas(self) -> int:
         """The Redis Deployment's current `.spec.replicas`, read without writing."""
         ...
