@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use pplx_space_public_api::{OperationId, OperationState};
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sandbox_portability::no_newer_full_snapshot;
+use pplx_space_sandbox_portability::{
+    capture_registered_at, no_newer_full_snapshot, restore_order_unordered,
+};
 use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, types::Json};
@@ -132,7 +134,17 @@ impl ForkOperationStore {
         &self,
         source_sandbox_id: SandboxId,
     ) -> Result<Option<(SnapshotId, Uuid)>, ForkOperationStoreError> {
+        // A pinned source forks from its pin, as its restore loads it,
+        // whatever capture order says: an operator may pin a capture that
+        // only a failed upload outranks. An unpinned one forks from its
+        // latest capture, if that capture first registered since the last
+        // placement, as an unpinned restore requires: a re-upload of an older
+        // capture registered after the placement isn't fresh. An unpinned
+        // source whose history is unordered has no source, as its restore
+        // refuses it, until an operator pins a capture.
         let no_newer = no_newer_full_snapshot("s", "sn");
+        let unordered = restore_order_unordered("s");
+        let captured = capture_registered_at("sn");
         let query = format!(
             "SELECT sn.id, ssl.id
              FROM sandboxes s
@@ -157,9 +169,10 @@ impl ForkOperationStore {
                     AND sn.local_artifact_id = s.current_local_artifact_id)
                    OR (s.current_local_artifact_id IS NULL
                        AND (s.placement_changed_at IS NULL
-                            OR sn.timestamp >= s.placement_changed_at))
+                            OR {captured} >= s.placement_changed_at)
+                       AND {no_newer}
+                       AND NOT {unordered})
                )
-               AND {no_newer}
              ORDER BY sn.timestamp DESC, sn.id DESC
              LIMIT 1"
         );

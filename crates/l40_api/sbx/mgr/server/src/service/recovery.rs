@@ -151,6 +151,7 @@ fn quarantine_recovery_no_progress_reason(
         // The control plane declined to serve it.
         crate::snapshot_restore::RestoreError::ClusterApiUnconfigured(..)
         | crate::snapshot_restore::RestoreError::SnapshotNotRegistered(..)
+        | crate::snapshot_restore::RestoreError::RestoreSourceUnordered(..)
         | crate::snapshot_restore::RestoreError::AdmissionRejected(..)
         | crate::snapshot_restore::RestoreError::QuarantineRecoveryPlanRpc { .. } => {
             crate::db::QuarantineRecoveryNoProgressReason::ControlPlaneRefused

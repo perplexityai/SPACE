@@ -1751,6 +1751,14 @@ pub trait SubstrateAdapter: Send + Sync {
         target: &NodeApiTarget<'_>,
     ) -> Result<String, SubstrateError>;
 
+    /// The node-api target of this substrate's registered node `node_id`, for
+    /// a loop that asks one node about one of its sandboxes. `None` when no
+    /// node of this substrate has that id.
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError>;
+
     /// Select a ready worker for node-local control-plane work using the
     /// substrate's placement and readiness policy.
     async fn select_ready_worker_node_api_target(
@@ -2439,6 +2447,10 @@ pub struct NodeReportedArtifact {
     /// SQLite state as-is. So a row that says `stopped` while its Firecracker
     /// process is running reports `STOPPED` here.
     pub reports_stopped: bool,
+    /// The node reports the sandbox's lifecycle as `suspended`, so its pin
+    /// names the artifact it suspended with. Same caveat as
+    /// [`Self::reports_stopped`]: check [`Self::vm_alive`] too.
+    pub reports_suspended: bool,
     /// The Firecracker process is alive.
     ///
     /// This outranks [`Self::reports_stopped`], and the existing observation
@@ -2661,6 +2673,9 @@ fn node_reported_artifact_from_info(
         // treats as the node disagreeing: a deferral, never a teardown.
         reports_stopped: info.observed_status().is_ok_and(|status| {
             status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped)
+        }),
+        reports_suspended: info.observed_status().is_ok_and(|status| {
+            status.is_unowned(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Suspended)
         }),
         // `namespace`, not `pid`: the node sets `namespace` from its live
         // process probe alone, while `pid` also needs the row's persisted pid,
@@ -3250,6 +3265,17 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.resolve_node_api_endpoint(target).await,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.resolve_node_api_endpoint(target).await,
+        }
+    }
+
+    async fn node_api_target(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<OwnedNodeApiTarget>, SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.node_api_target(node_id).await,
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.node_api_target(node_id).await,
         }
     }
 
