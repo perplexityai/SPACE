@@ -14,8 +14,10 @@
 //!   persist into the runtime sandbox,
 //!   which the SPACE `Recipe.Env` step type doesn't do — it only
 //!   propagates env into subsequent *build* steps' shells.
-//! * `WORKDIR [path]` -> `Run { mkdir -p path, root }` plus update
-//!   `current_workdir`.
+//! * `WORKDIR [path]` -> a root `Run` that creates `path` and chowns the
+//!   first newly created directory to `current_user`, plus update
+//!   `current_workdir`. A relative `path` resolves against the previous
+//!   workdir (or `/`). Mirrors e2b's `commands/workdir.go`.
 //! * `USER [name]` -> no recipe step; updates `current_user` for the
 //!   subsequent RUNs.
 //! * `COPY [src, dest, user, mode]` with `filesHash` -> `Recipe.Step.Copy
@@ -321,8 +323,12 @@ async fn translate_step(
                 .args
                 .first()
                 .ok_or_else(|| E2bApiError::bad_request("WORKDIR step requires exactly 1 arg"))?;
-            steps.push(run_step(&format!("mkdir -p {}", shell_quote(path)), "root"));
-            *current_workdir = Some(path.clone());
+            let target = resolve_workdir(current_workdir.as_deref(), path);
+            steps.push(run_step(
+                &create_workdir_command(&target, current_user),
+                "root",
+            ));
+            *current_workdir = Some(target);
         }
         "USER" => {
             let name = step
@@ -520,6 +526,44 @@ fn home_dir_for_user(user: &str) -> String {
 fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+/// e2b joins a relative WORKDIR onto the previous workdir, or `/` when
+/// none was set (Go `filepath.Join`, which also cleans `.`/`..`).
+/// Absolute paths are kept as given.
+fn resolve_workdir(current: Option<&str>, path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    let joined = format!("{}/{path}", current.unwrap_or("/"));
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// Create `target` and hand the directories this step creates to `user`,
+/// so later steps running as that user can write there. Same script as
+/// e2b's `commands/workdir.go`: an existing directory is left untouched.
+fn create_workdir_command(target: &str, user: &str) -> String {
+    let owner = shell_quote(&format!("{user}:{user}"));
+    format!(
+        "target={}\n\
+         if [ ! -d \"$target\" ]; then\n\
+         first_new=\"\"\n\
+         check=\"$target\"\n\
+         while [ ! -d \"$check\" ]; do first_new=\"$check\"; check=$(dirname \"$check\"); done\n\
+         mkdir -p \"$target\" && chown -R {owner} \"$first_new\"\n\
+         fi",
+        shell_quote(target)
+    )
 }
 
 fn run_in_workdir(command: &str, workdir: &str) -> String {
