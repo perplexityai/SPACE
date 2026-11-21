@@ -443,6 +443,9 @@ pub struct SandboxManagerService {
     credential_manager_client:
         Arc<tokio::sync::OnceCell<pplx_space_credmgr_client::CredentialManagerGrpcClient>>,
     network_credentials_enabled: bool,
+    /// Whether runtime upgrade attempts are final
+    /// ([`runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV`], off by default).
+    runtime_upgrade_attempt_finality: bool,
     node_manager: NodeManagerConnector,
     /// See [`SandboxManagerServiceOptions::volume_manager_socket_path`].
     volume_manager_socket_path: PathBuf,
@@ -1903,6 +1906,10 @@ impl SandboxManagerService {
                 std::env::var(NETWORK_CREDENTIALS_ENABLED_ENV)
                     .ok()
                     .as_deref(),
+                false,
+            ),
+            runtime_upgrade_attempt_finality: pplx_space_env_vars::env_flag_var(
+                runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV,
                 false,
             ),
             gateway_caller_client: options.node_manager.lazy(),

@@ -53,6 +53,10 @@ type runtimeUpgradeIntent struct {
 	authorization             *pb.RuntimeUpgradeAuthorization
 	targetState               pb.WakeTargetState
 	checkpointLocalArtifactID *string
+	// attemptID is the attempt the pod's create runs as: kubelet's pod UID
+	// (kubeletPodUID), or nil (a fresh attempt sbx-manager names) without
+	// one. An empty id is never sent; sbx-manager refuses one.
+	attemptID *string
 }
 
 // sandboxRuntimeUpgrade parses a runtime upgrade pod's annotations, or
@@ -89,6 +93,7 @@ func (s *ociSpec) sandboxRuntimeUpgrade() (*runtimeUpgradeIntent, error) {
 			AuthorizationId: annotation(sandboxRuntimeUpgradeAuthorizationIDAnnotation),
 			Reason:          annotation(sandboxRuntimeUpgradeAuthorizationReasonAnnotation),
 		},
+		attemptID: s.kubeletPodUID(),
 	}
 	for _, required := range []struct{ key, value string }{
 		{sandboxRuntimeUpgradeTargetEnvironmentAnnotation, intent.targetEnvironment},
@@ -130,6 +135,11 @@ func (s *ociSpec) sandboxRuntimeUpgrade() (*runtimeUpgradeIntent, error) {
 // readiness verifies. A suspended source (one that names its checkpoint)
 // carries the restore's storage URI and source node as where the node stages
 // a sandbox absent from it; a stopped one must be on this node already.
+// Kubelet's pod UID is the attempt id: kubelet retries a failed create under
+// the same pod UID, and gives a replacement pod a new one, so its retries are
+// one attempt, and sbx-manager (with attempt finality on) answers them with
+// that attempt's rollback or refusal once it's final rather than fencing and
+// booting again.
 func runtimeUpgradeRequest(start *pb.StartRequest, intent *runtimeUpgradeIntent) *pb.UpgradeRuntimeRequest {
 	var stageFrom *pb.RuntimeUpgradeStageFrom
 	if intent.checkpointLocalArtifactID != nil && start.SuspendRestoreStorageUri != nil {
@@ -154,6 +164,7 @@ func runtimeUpgradeRequest(start *pb.StartRequest, intent *runtimeUpgradeIntent)
 		TargetState:               intent.targetState,
 		StageFrom:                 stageFrom,
 		CheckpointLocalArtifactId: intent.checkpointLocalArtifactID,
+		AttemptId:                 intent.attemptID,
 	}
 }
 

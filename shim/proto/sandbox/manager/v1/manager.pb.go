@@ -1397,10 +1397,16 @@ const (
 	// recorded (`RUNTIME_UPGRADE_STATUS_REFUSED` lists which refusals the node
 	// records); or the sandbox was deleted from this node since, with its upgrade
 	// records. An abandonment is kept apart from those records and outlives the
-	// sandbox's row, so ABSENT may come with `abandoned` set. For a
-	// `GetRuntimeUpgrade` that names an attempt, ABSENT also stands in for
-	// another attempt's rollback or refusal: the named attempt has none recorded,
-	// but the operation may.
+	// sandbox's row, so ABSENT may come with `abandoned` set. Finality holds across
+	// the sandbox row's deletion too: an attempt's final outcome has no foreign key
+	// and survives `delete_sandbox_child_rows`, so a `GetRuntimeUpgrade` naming this
+	// sandbox and that attempt gets it instead: a rollback or refusal as the status,
+	// whatever report stands since, and a refused activation with ABSENT, through
+	// `refused_attempt_id`, while no report stands or a later attempt's hasn't
+	// reached the target. A request naming another sandbox for that attempt is
+	// refused with INVALID_ARGUMENT. For a `GetRuntimeUpgrade` that names an
+	// attempt, ABSENT also stands in for another attempt's rollback or refusal: the
+	// named attempt has none recorded, but the operation may.
 	RuntimeUpgradeStatus_RUNTIME_UPGRADE_STATUS_ABSENT RuntimeUpgradeStatus = 1
 	// The upgrade fences the sandbox, or its verified boot hasn't retired the
 	// old checkpoint yet. `phase` says which.
@@ -1417,20 +1423,19 @@ const (
 	// or INVALID_ARGUMENT; `failure` says why. This is the one list of which
 	// refusals are final. Recorded and final for the attempt: the edge isn't
 	// certified, the checkpoint isn't the decided one, consent is missing, the
-	// sandbox's local disk is missing or its runtime metadata doesn't parse, or
-	// staging refused the start with FAILED_PRECONDITION or INVALID_ARGUMENT
-	// after it adopted the sandbox's row. Left unrecorded, whatever the code,
-	// FAILED_PRECONDITION and INVALID_ARGUMENT included: a request refused before
-	// the node read it (malformed or unauthorized) or before it could take the
-	// sandbox's upgrade lock; one for a sandbox absent from the node, staging's
-	// included; one that names another sandbox, target or authorization than the
-	// operation's (INVALID_ARGUMENT), which isn't one of its attempts; a refusal
-	// from the stale-copy eviction that runs before staging, whatever it says;
-	// one for an operation the node recorded abandoned (see
-	// `AbandonRuntimeUpgrade`); one a retry may answer differently (the node busy
-	// or failing, the sandbox not yet at rest or changing under the request, a
-	// disk or catalog it can't read); and one whose refusal the node failed to
-	// write. Final for that attempt, as a rollback is. Recorded only on a node
+	// sandbox's local disk is missing or its runtime metadata doesn't parse. Left
+	// unrecorded, whatever the code, FAILED_PRECONDITION and INVALID_ARGUMENT
+	// included: a request refused before the node read it (malformed or
+	// unauthorized) or before it could take the sandbox's upgrade lock; one for a
+	// sandbox absent from the node, staging's included; one that names another
+	// sandbox, target or authorization than the operation's (INVALID_ARGUMENT),
+	// which isn't one of its attempts; a refusal from the stale-copy eviction or
+	// the staging that run before the upgrade, whatever it says; one for an
+	// operation the node recorded abandoned (see `AbandonRuntimeUpgrade`); one a
+	// retry may answer differently (the node busy or failing, the sandbox not yet
+	// at rest or changing under the request, a disk or catalog it can't read);
+	// and one whose refusal the node failed to write. Final for that attempt, as
+	// a rollback is. Recorded only with attempt finality on, and only on a node
 	// holding the sandbox; it replaces an earlier attempt's rollback or refusal
 	// as the reported outcome (each stays final for its own attempt), never an
 	// UPGRADED or ALREADY_ON_TARGET outcome. Once the operation reached either,
@@ -7097,7 +7102,8 @@ type UpgradeRuntimeRequest struct {
 	// answer with the live execution only when its route identity names the same
 	// pod (`pod_uid` and `execution_generation`), or to a caller whose `start`
 	// names no pod; anything else is refused with FAILED_PRECONDITION rather than
-	// moved, and trying again takes a new `operation_id`.
+	// moved, and the api's next decision for the sandbox names a new
+	// `operation_id` (see `UpgradeRuntimeRequest.attempt_id`).
 	TargetState WakeTargetState `protobuf:"varint,6,opt,name=target_state,json=targetState,proto3,enum=space.sandbox.manager.v1.WakeTargetState" json:"target_state,omitempty"`
 	// Requires `checkpoint_local_artifact_id`.
 	// Where to stage a suspended sandbox absent from this node from, before the
@@ -7145,7 +7151,9 @@ type UpgradeRuntimeRequest struct {
 	//     doesn't count), any later call, under any attempt id or none, gets that
 	//     execution only as `target_state` describes (its `start`'s route identity
 	//     names the execution's, or names none), and is otherwise refused with
-	//     FAILED_PRECONDITION; trying again then takes a new `operation_id`.
+	//     FAILED_PRECONDITION. The api derives operation ids from the sandbox,
+	//     the move and what it boots, so its next decision for a sandbox that
+	//     moved names a new `operation_id`.
 	//
 	// Abandonment stays scoped to the whole operation; see
 	// `AbandonRuntimeUpgrade`. A node that predates the field ignores it. A
@@ -7313,7 +7321,8 @@ type UpgradeRuntimeResponse struct {
 	Start *StartResponse `protobuf:"bytes,2,opt,name=start,proto3,oneof" json:"start,omitempty"`
 	// The attempt this call ran as: the request's `attempt_id`, or the id the
 	// node generated for a request that named none. Unset from a node that
-	// predates the field.
+	// predates the field, and from one with attempt finality off (see
+	// `UpgradeRuntime`), which makes no outcome final for an attempt.
 	AttemptId     *string `protobuf:"bytes,3,opt,name=attempt_id,json=attemptId,proto3,oneof" json:"attempt_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -7387,8 +7396,11 @@ type GetRuntimeUpgradeRequest struct {
 	// attempt never changes what this one is told. IN_PROGRESS, UPGRADED and
 	// ALREADY_ON_TARGET describe the operation whichever attempt began them, with
 	// `attempt_id` naming that attempt, even when a later attempt's call settled
-	// or finished it, and are answered as they are unfiltered. They don't say the
-	// named attempt's sandbox runs: a caller settles that attempt on success only
+	// or finished it, and are answered as they are unfiltered, except that the
+	// named attempt's refused activation, kept from before the sandbox's row was
+	// deleted, is answered as ABSENT in place of IN_PROGRESS (see
+	// `RUNTIME_UPGRADE_STATUS_ABSENT`). They don't say the named attempt's sandbox
+	// runs: a caller settles that attempt on success only
 	// from its own answer (its `UpgradeRuntimeResponse`, or the sandbox running
 	// its execution), and on failure when `refused_attempt_id` names it. Unset,
 	// the answer is the operation's latest outcome. A node that predates the
@@ -7564,31 +7576,37 @@ type GetRuntimeUpgradeResponse struct {
 	// its target starts the sandbox as a Wake does and claims nothing. Once
 	// anything has started the sandbox since, or the operation answered with a
 	// running execution, the operation never starts it again, and a sandbox that
-	// isn't running the caller's execution needs a new operation id; a start
-	// refused before its activation claimed the sandbox may be retried under the
-	// same one.
+	// isn't running the caller's execution is refused under it. The api derives
+	// operation ids from the sandbox, the move and what it boots, so once the
+	// sandbox moves its next decision names a new one. A start refused before its
+	// activation claimed the sandbox may be retried under the same one.
 	ActivationClaimed bool `protobuf:"varint,4,opt,name=activation_claimed,json=activationClaimed,proto3" json:"activation_claimed,omitempty"`
 	// The attempt the reported outcome ran for: the `attempt_id` of the
 	// `UpgradeRuntime` request that began it, or that was refused or found the
 	// target, or the id the node generated for one that named none. Unset for
-	// anything recorded by a node that predates this field, which proves
-	// nothing about any attempt. A ROLLED_BACK or REFUSED report is final for
-	// the attempt it names only: a caller waiting on an attempt settles on one
-	// only when it names that attempt, since until a later attempt reaches the
-	// node, the report is an earlier one's.
+	// anything recorded by a node that predates this field, and for an outcome
+	// decided with attempt finality off; either proves nothing about any
+	// attempt. A
+	// ROLLED_BACK or REFUSED report is final for the attempt it names only: a
+	// caller waiting on an attempt settles on one only when it names that
+	// attempt, since until a later attempt reaches the node, the report is an
+	// earlier one's.
 	AttemptId *string `protobuf:"bytes,5,opt,name=attempt_id,json=attemptId,proto3,oneof" json:"attempt_id,omitempty"`
 	// With UPGRADED or ALREADY_ON_TARGET: the latest attempt whose
-	// `UpgradeRuntime` for a STARTED target the node answered with an error after
-	// the operation reached that status, so the sandbox doesn't run for that
-	// attempt (a Kubernetes pod's create fails, and the pod stays pending while
-	// kubelet retries it). Final for that attempt, as a rollback is: its retries
-	// get the recorded error back with FAILED_PRECONDITION, whatever code first
-	// answered it, and never activate the sandbox, while a new attempt tries
-	// again (and is refused the same way once the operation has started the
-	// sandbox for another attempt; see `UpgradeRuntimeRequest.attempt_id`). A
-	// caller waiting on an attempt settles on it only when it names that attempt.
-	// Unset when no attempt was refused that way, and from a node that predates
-	// the field.
+	// `UpgradeRuntime` for a STARTED target the node answered with a final
+	// refusal after the operation reached that status (with ABSENT, the named
+	// attempt's, kept from before the sandbox's row was deleted, when no report
+	// stands or a later attempt's hasn't reached either), so the sandbox doesn't
+	// run for that attempt (a Kubernetes pod's create fails, and the pod stays
+	// pending while kubelet retries it). Final for that attempt, as a rollback
+	// is: its retries get the recorded error back with FAILED_PRECONDITION,
+	// whatever code first answered it, and never activate the sandbox, while a
+	// new attempt tries again (and is refused the same way once the operation has
+	// started the sandbox for another attempt; see
+	// `UpgradeRuntimeRequest.attempt_id`). A caller waiting on an attempt settles
+	// on it only when it names that attempt. Unset when no attempt was refused
+	// that way, from a node that predates the field, and for a refusal decided
+	// with attempt finality off, which records none.
 	RefusedAttemptId *string `protobuf:"bytes,6,opt,name=refused_attempt_id,json=refusedAttemptId,proto3,oneof" json:"refused_attempt_id,omitempty"`
 	// With `refused_attempt_id`: the error that attempt got, when recorded.
 	RefusedAttemptFailure *string `protobuf:"bytes,7,opt,name=refused_attempt_failure,json=refusedAttemptFailure,proto3,oneof" json:"refused_attempt_failure,omitempty"`
@@ -7599,8 +7617,9 @@ type GetRuntimeUpgradeResponse struct {
 	// upgrade may still start or restore the sandbox. With status ABSENT nothing
 	// of it runs here from now on: it never began here, or its records went with
 	// the sandbox's row and the abandonment stayed; or, for a request naming an
-	// attempt, it stands in for another attempt's rollback or refusal. With any
-	// other status the outcome above stands.
+	// attempt, it stands in for another attempt's rollback or refusal, or comes
+	// with that attempt's refused activation kept from before the sandbox's row
+	// was deleted. With any other status the outcome above stands.
 	Abandoned     bool `protobuf:"varint,8,opt,name=abandoned,proto3" json:"abandoned,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

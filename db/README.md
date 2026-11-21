@@ -484,6 +484,28 @@ SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes
  WHERE outcome NOT IN ('rolled_back', 'already_on_target');
 ```
 
+`20261120180000_sandbox_runtime_upgrade_attempt_identity` adds nullable
+`target_environment`, `target_state` and `authorization_id` columns to
+`sandbox_runtime_upgrade_attempt_outcomes`: what the operation an attempt
+outcome belongs to asked for, kept after the sandbox's row is deleted. A row
+that has them is final for its attempt; one without them is final for no
+attempt. Its down refuses, before it changes the schema, while any row has
+them, since dropping the columns would leave every final outcome final for no
+attempt and let a retry of an attempt its caller gave up run again. It goes
+through over rows without them, and keeps those. This read-only query counts
+the rows that hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes
+ WHERE target_environment IS NOT NULL;
+```
+
+Those rows also need `20261114030002`'s down to wait, which it does while the
+table holds any row. An image-only rollback runs no down, so once that count
+is nonzero, roll the binary back only to a release that honors recorded
+finality (see "Upgrading a sandbox's runtime" in
+`docs/execution-environments.md`).
+
 ## Console password provisioning
 
 The password hash marker `!` locks console password login and rejects existing
