@@ -355,6 +355,11 @@ async fn emit_tick(
     // as freshly observed just because its final command finished now.
     let observed_at = tokio::time::Instant::now();
     let targets = tokio::task::spawn_blocking(|| {
+        // Capacity is read even when the census below fails, so a full or
+        // unmeasurable cache still reports how full it is.
+        if let Some(status) = pplx_space_common_core::host::disk::read_cache_disk_status() {
+            crate::metrics::node_disk::cache_capacity(status);
+        }
         // Metadata-only adoption inventory is independent of the much slower
         // extent accounting below and never runs on a lifecycle request.
         rootfs_backing::emit_inventory(Path::new(CACHE_DIR), Path::new(TEMPLATE_DIR));
