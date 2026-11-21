@@ -416,6 +416,89 @@ impl WarmPoolStore {
         Ok(id)
     }
 
+    /// Give `twin` a copy of each operator-managed plaintext pool config of
+    /// `original`: same shape, namespace, targets, disk settings and
+    /// `enabled`. A create that resolves to a twin claims only the twin's
+    /// slots, so a twin without these would have no pool. The original's
+    /// configs are left as they are.
+    ///
+    /// Autoscaler-owned configs aren't copied: the autoscaler re-derives them
+    /// for the twin from demand ([`Self::autoscale_configs`]). A manual config
+    /// the twin already has for a shape is kept, so a retry copies nothing
+    /// twice; an autoscaler-owned one for the shape takes the original's
+    /// manual settings. Returns how many configs were copied or taken over.
+    /// Runs on the caller's connection, so the copy commits with the twin's
+    /// insert and a twin never wins resolution without its manual pools.
+    pub async fn copy_manual_configs_to_release(
+        conn: &mut PgConnection,
+        original: Uuid,
+        twin: Uuid,
+    ) -> std::result::Result<u64, sqlx::Error> {
+        Self::copy_manual_configs_from_releases(conn, &[original], twin).await
+    }
+
+    /// [`Self::copy_manual_configs_to_release`] from several originals at
+    /// once, such as one build's releases under both hash spellings, which
+    /// all resolve to the one twin. `originals` is in precedence order: a
+    /// shape more than one of them configures gets the first one's settings.
+    /// Everything else is as for the single-original copy.
+    pub async fn copy_manual_configs_from_releases(
+        conn: &mut PgConnection,
+        originals: &[Uuid],
+        twin: Uuid,
+    ) -> std::result::Result<u64, sqlx::Error> {
+        let copied = sqlx::query(sql!(
+            "INSERT INTO kubernetes_pool_configs (
+                 template_release_id, vcpu, memory_mib, disk_mib, encryptable,
+                 target_ready_slots, refill_per_tick, max_warming_slots,
+                 namespace, enabled, managed_by,
+                 disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
+             )
+             SELECT $2, c.vcpu, c.memory_mib, c.disk_mib, c.encryptable,
+                    c.target_ready_slots, c.refill_per_tick, c.max_warming_slots,
+                    c.namespace, c.enabled, c.managed_by,
+                    c.disk_io_max_operations_per_sec, c.disk_io_max_bandwidth_mib_per_sec
+             FROM (
+                 -- One config per shape: the first original's in `$1`'s
+                 -- order, so the insert's conflict clause never sees a shape
+                 -- twice.
+                 SELECT DISTINCT ON (pc.vcpu, pc.memory_mib, pc.encryptable) pc.*
+                 FROM kubernetes_pool_configs pc
+                 WHERE pc.template_release_id = ANY($1)
+                   AND pc.managed_by = $3
+                   AND NOT pc.encryptable
+                 ORDER BY pc.vcpu, pc.memory_mib, pc.encryptable,
+                          array_position($1, pc.template_release_id), pc.created_at, pc.id
+             ) c
+             ORDER BY c.created_at, c.id
+             -- idx_kubernetes_pool_configs_release_shape_kind. A manual config
+             -- the twin already has for the shape is kept. One the autoscaler
+             -- made, which it can for a release that's already committed
+             -- (one another inserter made in the target's partition), takes
+             -- the original's manual settings: the autoscaler never
+             -- overwrites a manual config, so the operator's override would
+             -- otherwise be lost.
+             ON CONFLICT (template_release_id, vcpu, memory_mib, encryptable) DO UPDATE
+             SET disk_mib = EXCLUDED.disk_mib,
+                 target_ready_slots = EXCLUDED.target_ready_slots,
+                 refill_per_tick = EXCLUDED.refill_per_tick,
+                 max_warming_slots = EXCLUDED.max_warming_slots,
+                 namespace = EXCLUDED.namespace,
+                 enabled = EXCLUDED.enabled,
+                 managed_by = EXCLUDED.managed_by,
+                 disk_io_max_operations_per_sec = EXCLUDED.disk_io_max_operations_per_sec,
+                 disk_io_max_bandwidth_mib_per_sec = EXCLUDED.disk_io_max_bandwidth_mib_per_sec,
+                 updated_at = NOW()
+             WHERE kubernetes_pool_configs.managed_by <> $3"
+        ))
+        .bind(originals)
+        .bind(twin)
+        .bind(PoolConfigOwner::Manual.as_str())
+        .execute(conn)
+        .await?;
+        Ok(copied.rows_affected())
+    }
+
     /// Disable a pool config and zero its target so the reconciler drains
     /// its open slots. `managed_by` is deliberately untouched: a disabled
     /// autoscaler-owned config stays autoscaler-owned. Returns `None` when

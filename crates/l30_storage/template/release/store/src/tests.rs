@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use bytes::Bytes;
+use pplx_space_artifact_model::{StorageOriginRejection, TrustedStorageBuckets};
 use pplx_space_content_digest::Digest;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_execution_spec::EnvironmentReference;
@@ -1271,9 +1272,10 @@ async fn an_artifactless_other_spelling_original_neither_blocks_nor_wins() -> Te
 
     // A location-less row under the exact same spelling occupies that
     // partition's unique-index slot without serving artifacts, so twinning
-    // into it refuses rather than claiming a usable Existing release.
+    // into it is refused with that row named, rather than claiming a usable
+    // Existing release or blaming the old index.
     let e3 = environment(3);
-    insert_release(&db.pool, TEMPLATE, HASH, Some(metadata(e3))).await?;
+    let bare_e3 = insert_release(&db.pool, TEMPLATE, HASH, Some(metadata(e3))).await?;
     assert_eq!(
         insert_twin(
             &db.pool,
@@ -1283,7 +1285,7 @@ async fn an_artifactless_other_spelling_original_neither_blocks_nor_wins() -> Te
             &prepared()
         )
         .await?,
-        InsertTwin::Refused
+        InsertTwin::SlotTaken(bare_e3)
     );
     Ok(())
 }
@@ -1341,7 +1343,7 @@ async fn the_s3_client_refuses_plaintext_endpoints_unless_allowed() -> TestResul
             Err(ObjectAccessError::PlaintextEndpoint { .. })
         ));
     }
-    let client = S3ReleaseObjects::new();
+    let client = S3ReleaseObjects::new().allowing_endpoint_overrides();
     for location in [
         LOCATION.to_owned(),
         format!("{LOCATION}&endpoint=https://object-store.example:8443"),
@@ -1351,6 +1353,74 @@ async fn the_s3_client_refuses_plaintext_endpoints_unless_allowed() -> TestResul
         client.admit(&target)?;
     }
     S3ReleaseObjects::allowing_plaintext_endpoints().admit(&plaintext)?;
+    Ok(())
+}
+
+/// With no trusted buckets configured, a client refuses a location that
+/// overrides the endpoint, unless it was built to allow overrides.
+#[tokio::test(flavor = "current_thread")]
+async fn the_s3_client_refuses_endpoint_overrides_unless_allowed() -> TestResult {
+    let overridden = target(&format!(
+        "{LOCATION}&endpoint=https://object-store.example:8443"
+    ))?;
+    let client = S3ReleaseObjects::new();
+    client.admit(&target(LOCATION)?)?;
+    assert!(matches!(
+        client.read_metadata(&overridden).await,
+        Err(ObjectAccessError::UntrustedOrigin {
+            reason: StorageOriginRejection::EndpointOverride,
+            ..
+        })
+    ));
+    assert!(matches!(
+        client.read_manifest(&overridden).await,
+        Err(ObjectAccessError::UntrustedOrigin { .. })
+    ));
+    assert!(matches!(
+        client
+            .write_twin_metadata(&overridden, environment(1), Bytes::from_static(b"{}"))
+            .await,
+        Err(ObjectAccessError::UntrustedOrigin { .. })
+    ));
+    S3ReleaseObjects::new()
+        .allowing_endpoint_overrides()
+        .admit(&overridden)?;
+    Ok(())
+}
+
+/// A client built with trusted buckets refuses a location in another bucket,
+/// or one that overrides the endpoint.
+#[tokio::test(flavor = "current_thread")]
+async fn the_s3_client_refuses_origins_its_trusted_buckets_refuse() -> TestResult {
+    let client = S3ReleaseObjects::allowing_plaintext_endpoints()
+        .trusting(TrustedStorageBuckets::from_list("templates-bucket"));
+    client.admit(&target(LOCATION)?)?;
+    for (location, rejection) in [
+        (
+            LOCATION.replace("templates-bucket", "other-bucket"),
+            StorageOriginRejection::UntrustedBucket,
+        ),
+        (
+            format!("{LOCATION}&endpoint=https://object-store.example:8443"),
+            StorageOriginRejection::EndpointOverride,
+        ),
+    ] {
+        let target = target(&location)?;
+        assert!(matches!(
+            client.read_metadata(&target).await,
+            Err(ObjectAccessError::UntrustedOrigin { reason, .. }) if reason == rejection
+        ));
+        assert!(matches!(
+            client.read_manifest(&target).await,
+            Err(ObjectAccessError::UntrustedOrigin { .. })
+        ));
+        assert!(matches!(
+            client
+                .write_twin_metadata(&target, environment(1), Bytes::from_static(b"{}"))
+                .await,
+            Err(ObjectAccessError::UntrustedOrigin { .. })
+        ));
+    }
     Ok(())
 }
 

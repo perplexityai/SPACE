@@ -10,7 +10,8 @@ use aws_credential_types::Credentials;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use bytes::Bytes;
 use pplx_space_artifact_model::{
-    StorageUri, StorageUriParseError, TemplateArtifact, template_environment_metadata_relative_key,
+    StorageOriginRejection, StorageUri, StorageUriParseError, TemplateArtifact,
+    TrustedStorageBuckets, template_environment_metadata_relative_key,
 };
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_object_store::{
@@ -31,6 +32,14 @@ pub enum ObjectAccessError {
     /// message: an endpoint URL can carry credentials.
     #[error("storage location in bucket {bucket:?} names a plaintext endpoint")]
     PlaintextEndpoint { bucket: String },
+    /// The client's trusted-origin policy refuses the location: its bucket
+    /// isn't trusted, or it overrides the endpoint. The endpoint isn't in the
+    /// message, for the same reason.
+    #[error("storage location in bucket {bucket:?} is refused: {reason}")]
+    UntrustedOrigin {
+        bucket: String,
+        reason: StorageOriginRejection,
+    },
     /// The location's key prefix isn't the release's own build directory
     /// (`<prefix>/templates/<name>/<hash>`), so a twin's metadata written
     /// under it would land in another build's directory, or in one that
@@ -348,10 +357,18 @@ pub trait ReleaseObjects: Send + Sync + 'static {
 /// [`ObjectAccessError::PlaintextEndpoint`], before loading any credentials.
 /// Local S3-compatible storage served over plain HTTP needs
 /// [`S3ReleaseObjects::allowing_plaintext_endpoints`], which an operator must
-/// opt into.
+/// opt into and which allows endpoint overrides too.
+///
+/// A client built with [`S3ReleaseObjects::trusting`] uses only the
+/// locations the deployment's trusted buckets admit. With no trusted buckets,
+/// a location that overrides the endpoint is refused unless the client was
+/// built with [`S3ReleaseObjects::allowing_endpoint_overrides`], an operator
+/// opt-in for S3-compatible storage at an `https://` endpoint.
 #[derive(Default)]
 pub struct S3ReleaseObjects {
     allow_plaintext_endpoints: bool,
+    allow_endpoint_overrides: bool,
+    trusted: TrustedStorageBuckets,
     store: OnceLock<S3ObjectStore>,
     provider: tokio::sync::OnceCell<SharedCredentialsProvider>,
     credentials: tokio::sync::Mutex<Option<Credentials>>,
@@ -362,26 +379,63 @@ pub struct S3ReleaseObjects {
 const CREDENTIAL_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 
 impl S3ReleaseObjects {
-    /// A client that refuses plaintext endpoints.
+    /// A client that refuses plaintext endpoints and, until trusted buckets
+    /// or [`Self::allowing_endpoint_overrides`] say otherwise, every endpoint
+    /// override.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A client that also sends its credentials to `http://` endpoints, for
-    /// local S3-compatible storage. Only for an operator's explicit opt-in.
+    /// A client that also uses `http://` endpoints, for local S3-compatible
+    /// storage. A plaintext endpoint is always an override, so this allows
+    /// endpoint overrides too. Only for an operator's explicit opt-in.
     pub fn allowing_plaintext_endpoints() -> Self {
         Self {
             allow_plaintext_endpoints: true,
+            allow_endpoint_overrides: true,
             ..Self::default()
         }
     }
 
-    /// Refuse `target` before any credentials are loaded when its endpoint
-    /// is plaintext and this client wasn't built to allow that.
+    /// This client, also using a location's `https://` endpoint override
+    /// while no trusted buckets are configured, for S3-compatible storage.
+    /// Only for an operator's explicit opt-in.
+    #[must_use]
+    pub fn allowing_endpoint_overrides(self) -> Self {
+        Self {
+            allow_endpoint_overrides: true,
+            ..self
+        }
+    }
+
+    /// This client, refusing every location `trusted` refuses, before
+    /// loading any credentials. An empty policy refuses none.
+    #[must_use]
+    pub fn trusting(self, trusted: TrustedStorageBuckets) -> Self {
+        Self { trusted, ..self }
+    }
+
+    /// Refuse `target` before any credentials are loaded when the trusted
+    /// buckets refuse it, when its endpoint is plaintext and this client
+    /// wasn't built to allow that, or when it overrides the endpoint, no
+    /// trusted buckets are configured to vet it (a configured list refuses
+    /// every override itself), and this client wasn't built to allow that.
     pub(crate) fn admit(&self, target: &TwinMetadataTarget) -> Result<(), ObjectAccessError> {
+        if let Err(reason) = self.trusted.check(&target.location) {
+            return Err(ObjectAccessError::UntrustedOrigin {
+                bucket: target.location.bucket.clone(),
+                reason,
+            });
+        }
         if !self.allow_plaintext_endpoints && target.has_plaintext_endpoint() {
             return Err(ObjectAccessError::PlaintextEndpoint {
                 bucket: target.location.bucket.clone(),
+            });
+        }
+        if !self.allow_endpoint_overrides && target.location.endpoint.is_some() {
+            return Err(ObjectAccessError::UntrustedOrigin {
+                bucket: target.location.bucket.clone(),
+                reason: StorageOriginRejection::EndpointOverride,
             });
         }
         Ok(())

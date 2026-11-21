@@ -5137,3 +5137,194 @@ async fn retention_and_demand_pick_the_digest_original(#[case] twins: bool) -> T
     }
     Ok(())
 }
+
+/// A campaign hands a release's operator-managed pools to its twin: each
+/// plaintext manual config is copied with its shape, targets and `enabled`,
+/// once, and autoscaler-owned configs are left for the autoscaler.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_gets_copies_of_its_originals_manual_configs() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, _) = seed_release(&fixture.pool, "seed", 0x71).await?;
+    let spec = ManualPoolConfigSpec {
+        vcpu: 4,
+        memory_mib: 2048,
+        disk_mib: Some(8192),
+        reset_disk_to_template_default: false,
+        target_ready_slots: 3,
+        refill_per_tick: 2,
+        max_warming_slots: 2,
+        namespace: "space",
+        enabled: true,
+        encryptable: false,
+    };
+    let mut tx = fixture.pool.begin().await?;
+    WarmPoolStore::upsert_manual_config(&mut tx, original, &spec).await?;
+    tx.commit().await?;
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots, refill_per_tick,
+             max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 2, 1024, 1, 1, 1, 'space', TRUE, 'autoscaler')",
+    )
+    .bind(original)
+    .execute(&fixture.pool)
+    .await?;
+    let twin = insert_twin_of(
+        &fixture.pool,
+        original,
+        &format!("sha256:{}", "7".repeat(64)),
+    )
+    .await?;
+
+    assert_eq!(
+        WarmPoolStore::copy_manual_configs_to_release(
+            &mut *fixture.pool.acquire().await?,
+            original,
+            twin
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        WarmPoolStore::copy_manual_configs_to_release(
+            &mut *fixture.pool.acquire().await?,
+            original,
+            twin
+        )
+        .await?,
+        0,
+        "a retry copies nothing twice"
+    );
+    let configs = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            i32,
+            i32,
+            Option<i32>,
+            i32,
+            i32,
+            i32,
+            String,
+            bool,
+            String,
+        ),
+    >(
+        "SELECT template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+                refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         FROM kubernetes_pool_configs
+         WHERE managed_by = 'manual'
+         ORDER BY created_at",
+    )
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[1].0, twin);
+    assert_eq!(
+        (
+            &configs[0].1,
+            &configs[0].2,
+            &configs[0].3,
+            &configs[0].4,
+            &configs[0].5,
+            &configs[0].6,
+            &configs[0].7,
+            &configs[0].8
+        ),
+        (
+            &configs[1].1,
+            &configs[1].2,
+            &configs[1].3,
+            &configs[1].4,
+            &configs[1].5,
+            &configs[1].6,
+            &configs[1].7,
+            &configs[1].8
+        ),
+    );
+    let autoscaled_on_twin: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kubernetes_pool_configs
+         WHERE template_release_id = $1 AND managed_by = 'autoscaler'",
+    )
+    .bind(twin)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(autoscaled_on_twin, 0);
+    Ok(())
+}
+
+/// The autoscaler can make a twin's config as soon as the twin exists, before
+/// the campaign copies the original's manual configs. A shape the autoscaler
+/// took first is handed to the original's manual settings, since the
+/// autoscaler never overwrites a manual config; one the operator already set
+/// on the twin is kept.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, _) = seed_release(&fixture.pool, "seed", 0x73).await?;
+    let mut tx = fixture.pool.begin().await?;
+    for (vcpu, memory_mib, target_ready_slots) in [(4, 2048, 3), (8, 4096, 5)] {
+        WarmPoolStore::upsert_manual_config(
+            &mut tx,
+            original,
+            &ManualPoolConfigSpec {
+                vcpu,
+                memory_mib,
+                disk_mib: Some(8192),
+                reset_disk_to_template_default: false,
+                target_ready_slots,
+                refill_per_tick: 2,
+                max_warming_slots: 2,
+                namespace: "space",
+                enabled: true,
+                encryptable: false,
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    let twin = insert_twin_of(
+        &fixture.pool,
+        original,
+        &format!("sha256:{}", "7".repeat(64)),
+    )
+    .await?;
+    // The autoscaler got to the 4x2048 shape first; the operator set 8x4096
+    // on the twin.
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots, refill_per_tick,
+             max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 4, 2048, 1, 1, 1, 'space', TRUE, 'autoscaler'),
+                ($1, 8, 4096, 9, 1, 1, 'space', FALSE, 'manual')",
+    )
+    .bind(twin)
+    .execute(&fixture.pool)
+    .await?;
+
+    WarmPoolStore::copy_manual_configs_to_release(
+        &mut *fixture.pool.acquire().await?,
+        original,
+        twin,
+    )
+    .await?;
+    let configs = sqlx::query_as::<_, (i32, i32, Option<i32>, i32, bool, String)>(
+        "SELECT vcpu, memory_mib, disk_mib, target_ready_slots, enabled, managed_by
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = $1
+         ORDER BY vcpu",
+    )
+    .bind(twin)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(
+        configs,
+        vec![
+            (4, 2048, Some(8192), 3, true, "manual".to_owned()),
+            (8, 4096, None, 9, false, "manual".to_owned()),
+        ]
+    );
+    Ok(())
+}

@@ -90,11 +90,9 @@ async fn a_start_for_a_kind_with_no_driver_is_refused() -> TestResult {
     let Some(h) = admin_router_harness().await? else {
         return Ok(());
     };
-    for kind in ["templates", "sandboxes"] {
-        let (status, body) = start(&h, start_body(kind, 1)).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
-        assert_error_contains(&body, "no cluster-controller driver moves");
-    }
+    let (status, body) = start(&h, start_body("sandboxes", 1)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, "no cluster-controller driver moves");
     // An invalid start is refused as invalid, not for its kind.
     let mut invalid = start_body("templates", 1);
     invalid["failure_budget"] = json!(0);
@@ -106,6 +104,37 @@ async fn a_start_for_a_kind_with_no_driver_is_refused() -> TestResult {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({"campaigns": [], "next_after": null}));
+    Ok(())
+}
+
+/// This build drives template campaigns, so the API starts them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_template_campaign_starts() -> TestResult {
+    let Some(h) = admin_router_harness().await? else {
+        return Ok(());
+    };
+    let (status, body) = start(&h, start_body("templates", 1)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["phase"], "canary");
+    // This deployment's creates don't boot a twin's environment, so the
+    // reconciler holds the campaign, and the read says why.
+    let id = body["id"].as_str().unwrap().to_owned();
+    let (status, body) = h
+        .as_operator(
+            Method::GET,
+            &format!("/runtime-upgrade-campaigns/{id}"),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["held"]["reason"], "twins_not_booted", "{body}");
+    assert!(
+        body["held"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("SPACE_ENVIRONMENT_PLACEMENT_GATE=on")),
+        "{body}"
+    );
     Ok(())
 }
 
@@ -702,4 +731,66 @@ async fn an_abort_of_a_paused_campaign_succeeds_and_a_stale_one_answers_412() ->
     let record = store::get_record(&h.db.pool, campaign).await?.unwrap();
     assert_eq!(record.updated_by, Some(h.operator.id));
     Ok(())
+}
+
+/// In every phase: an unfinished template campaign reports the substrate's
+/// hold first, then its workers' (`nodes_dont_read_twins`), and neither once
+/// nothing holds it; a finished one, or a sandbox campaign, reports none.
+#[test]
+fn a_template_campaign_reports_its_workers_hold_after_the_substrates() {
+    let record = |kind, phase| CampaignRecord {
+        campaign: store::Campaign {
+            id: CampaignId(uuid::Uuid::now_v7()),
+            from: environment(1),
+            to: environment(2),
+            kind,
+            phase,
+            max_in_flight_per_node: 1,
+            max_in_flight_per_cluster: 1,
+            failure_budget: 1,
+            include_running: false,
+            generation: 0,
+        },
+        reason: "test".to_owned(),
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        created_by: None,
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        updated_by: None,
+        finished_at: None,
+    };
+    let held = |kind, phase, boots, workers_hold| {
+        campaign_response(
+            record(kind, phase),
+            ItemCounts::default(),
+            None,
+            boots,
+            workers_hold,
+        )
+        .held
+        .map(|held| held.reason)
+    };
+    for &phase in CampaignPhase::ALL {
+        for (boots, workers_hold) in [(false, false), (false, true), (true, false), (true, true)] {
+            let expected = if phase.finished() {
+                None
+            } else if !boots {
+                Some("twins_not_booted")
+            } else if workers_hold {
+                Some("nodes_dont_read_twins")
+            } else {
+                None
+            };
+            assert_eq!(
+                held(CampaignKind::Templates, phase, boots, workers_hold),
+                expected,
+                "{phase:?} boots={boots} workers_hold={workers_hold}"
+            );
+            assert_eq!(
+                held(CampaignKind::Sandboxes, phase, boots, workers_hold),
+                None,
+                "{phase:?}"
+            );
+        }
+    }
+    assert!(NODES_DONT_READ_TWINS.detail.contains("reads_twin_metadata"));
 }

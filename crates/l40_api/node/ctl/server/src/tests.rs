@@ -427,11 +427,21 @@ async fn published_node_ctl_status_reports_the_node_status_poll_interval() {
     init_reconciliation_status(&db.lock().expect("lock node-ctl db"), configured_secs)
         .expect("reseed statuses");
 
-    let status = worker.node_ctl_status_for_publish();
+    let status = worker.node_ctl_status_for_publish(Some(true));
     assert_eq!(
         pplx_space_node_api_client::node_status_freshness::reported_status_poll_interval(&status),
         Some(Duration::from_secs(configured_secs)),
     );
+    // Template-manager's report rides in the published status as given.
+    assert_eq!(status.reads_twin_metadata, Some(true));
+    for report in [Some(false), None] {
+        assert_eq!(
+            worker
+                .node_ctl_status_for_publish(report)
+                .reads_twin_metadata,
+            report
+        );
+    }
 }
 
 /// When each outbound reconciler last completed a pass (0: never).

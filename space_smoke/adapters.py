@@ -305,6 +305,23 @@ def _recorded_environment_placement_gate(recorded: str) -> dict[str, str | None]
     return standing
 
 
+def _recorded_template_campaign_env(recorded: str) -> dict[str, str | None]:
+    """The standing campaign settings a Lease recorded, refused unless every entry is restorable."""
+
+    try:
+        standing = json.loads(recorded)
+    except json.JSONDecodeError as error:
+        raise SmokeConfigurationError("the recorded template campaign settings are not JSON") from error
+    if (
+        not isinstance(standing, dict)
+        or not standing
+        or not set(standing) <= set(TEMPLATE_CAMPAIGN_ENV_KEYS)
+        or not all(value is None or value in TEMPLATE_CAMPAIGN_ENV_VALUES for value in standing.values())
+    ):
+        raise SmokeConfigurationError("the recorded template campaign settings hold an entry a restore cannot write")
+    return standing
+
+
 def _holder_process_gone(holder: object) -> bool:
     """True only for a holder that was a process of this user on this host and has exited.
 
@@ -645,6 +662,9 @@ LIMITER_ENV_ANNOTATION = "space.pplx.net/smoke-limiter-env"
 # The gate literals the environment placement gate found standing, recorded
 # before it turns the gate on and cleared once they're back.
 ENVIRONMENT_PLACEMENT_GATE_ANNOTATION = "space.pplx.net/smoke-environment-placement-gate"
+# The template campaign's controller settings a run recorded before writing
+# them, put back by the next holder's repair as the gate's are.
+TEMPLATE_CAMPAIGN_ENV_ANNOTATION = "space.pplx.net/smoke-template-campaign-env"
 REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
 # A rollout a scenario starts only to apply or restore its env
 # (`KindHarness._fast_rollout`) runs with every replacement surged at once and
@@ -658,6 +678,17 @@ DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
 NODE_GROUP_LABELER_ENV = "SPACE_NODE_GROUP_LABELER_ENABLED"
+# What a template runtime-upgrade campaign needs on the cluster-controller
+# beside the environment placement gate, and no Kind chart sets
+# (`space_smoke/runtime_upgrade_campaign.py`): the campaign loop, and plain
+# `http://` object-store endpoints for the template driver.
+RUNTIME_UPGRADE_RECONCILER_ENABLED_ENV = "SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED"
+TEMPLATE_STORAGE_ALLOW_PLAINTEXT_ENDPOINTS_ENV = "SPACE_TEMPLATE_STORAGE_ALLOW_PLAINTEXT_ENDPOINTS"
+TEMPLATE_CAMPAIGN_ENV_KEYS = (
+    f"controller:{RUNTIME_UPGRADE_RECONCILER_ENABLED_ENV}",
+    f"controller:{TEMPLATE_STORAGE_ALLOW_PLAINTEXT_ENDPOINTS_ENV}",
+)
+TEMPLATE_CAMPAIGN_ENV_VALUES = frozenset({"", "true", "false"})
 SELECTOR_KEY_ENV = "SPACE_SANDBOX_NODE_SELECTOR_KEY"
 SELECTOR_VALUE_ENV = "SPACE_SANDBOX_NODE_SELECTOR_VALUE"
 SELECTOR_LABELS_ENV = "SPACE_SANDBOX_NODE_SELECTOR_LABELS"
@@ -3936,6 +3967,58 @@ ON CONFLICT (key_hash) DO NOTHING;
             ownership=ownership,
         )
 
+    # --- template campaign settings -----------------------------------------
+
+    def template_campaign_env(self) -> dict[str, str | None]:
+        """`controller:<key>` literals of the settings a template campaign needs."""
+
+        controller = self._deployment_env_literals(
+            self._controller_deployment(),
+            (RUNTIME_UPGRADE_RECONCILER_ENABLED_ENV, TEMPLATE_STORAGE_ALLOW_PLAINTEXT_ENDPOINTS_ENV),
+        )
+        return {f"controller:{k}": v for k, v in controller.items()}
+
+    def set_template_campaign_env(
+        self, values: Mapping[str, str | None], *, record: Mapping[str, str | None] | None = None
+    ) -> None:
+        """Write the allowlisted campaign settings and await the controller's rollout.
+
+        Only under the public API mutation Lease, which the environment
+        placement gate holds while it's on. `record`, written to the Lease in
+        the same guarded patch as its renewal before the write, is what the
+        next holder's repair puts back if this run is killed.
+        """
+
+        for value in values.values():
+            if value is not None and value not in TEMPLATE_CAMPAIGN_ENV_VALUES:
+                raise ValueError(f"refusing template campaign env value {value!r}")
+        action = "a template campaign settings write"
+        ownership = self._held_public_api_lease(action)
+        annotations = (
+            {TEMPLATE_CAMPAIGN_ENV_ANNOTATION: json.dumps(dict(record), sort_keys=True)}
+            if record is not None
+            else None
+        )
+        self._renew_lease(ownership, action, annotations)
+        self._write_template_campaign_env(values, ownership=ownership)
+
+    def clear_template_campaign_env_record(self) -> None:
+        action = "clearing the template campaign settings record"
+        self._renew_lease(
+            self._held_public_api_lease(action), action, {TEMPLATE_CAMPAIGN_ENV_ANNOTATION: None}
+        )
+
+    def _write_template_campaign_env(
+        self, values: Mapping[str, str | None], *, ownership: _LeaseOwnership
+    ) -> None:
+        self._apply_renderer_env(
+            values,
+            allowed=TEMPLATE_CAMPAIGN_ENV_KEYS,
+            controller_first=True,
+            what="template campaign",
+            ownership=ownership,
+        )
+
     # --- node-ctl admission fence -------------------------------------------
 
     @property
@@ -4742,6 +4825,29 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._renew_lease(
                 ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
             )
+        # Before the gate: a run turns the gate on first and these second.
+        recorded_campaign = annotations.get(TEMPLATE_CAMPAIGN_ENV_ANNOTATION)
+        if isinstance(recorded_campaign, str) and recorded_campaign:
+            standing_campaign = _recorded_template_campaign_env(recorded_campaign)
+            self._renew_lease(ownership, "an orphaned template campaign settings repair")
+            try:
+                self._write_template_campaign_env(standing_campaign, ownership=ownership)
+            except SmokeConfigurationError as error:
+                raise SmokeConfigurationError(
+                    f"could not put back the template campaign settings {standing_campaign} an earlier run "
+                    f"recorded: {error}; the record stays on the Lease, so the next preflight retries the repair"
+                ) from error
+            after_campaign = self.template_campaign_env()
+            if after_campaign != standing_campaign:
+                raise SmokeConfigurationError(
+                    f"the template campaign settings read {after_campaign} after their repair, not the "
+                    f"recorded {standing_campaign}"
+                )
+            self._renew_lease(
+                ownership,
+                "clearing the template campaign settings record",
+                {TEMPLATE_CAMPAIGN_ENV_ANNOTATION: None},
+            )
         recorded_gate = annotations.get(ENVIRONMENT_PLACEMENT_GATE_ANNOTATION)
         if isinstance(recorded_gate, str) and recorded_gate:
             standing_gate = _recorded_environment_placement_gate(recorded_gate)
@@ -4797,7 +4903,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         document = _lease_document(observed.stdout)
         annotations = _lease_annotations(document)
-        recorded_keys = (LIMITER_ENV_ANNOTATION, REDIS_REPLICAS_ANNOTATION, ENVIRONMENT_PLACEMENT_GATE_ANNOTATION)
+        recorded_keys = (
+            LIMITER_ENV_ANNOTATION,
+            REDIS_REPLICAS_ANNOTATION,
+            ENVIRONMENT_PLACEMENT_GATE_ANNOTATION,
+            TEMPLATE_CAMPAIGN_ENV_ANNOTATION,
+        )
         if not any(annotations.get(key) for key in recorded_keys):
             return False
         try:
@@ -4805,8 +4916,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         except SmokeConfigurationError as error:
             _, spec = _lease_parts(document)
             raise SmokeConfigurationError(
-                "refusing to run while the public API mutation Lease records a limiter fault or "
-                "environment placement gate "
+                "refusing to run while the public API mutation Lease records a limiter fault, an "
+                "environment placement gate or template campaign settings "
                 f"(holder {spec.get('holderIdentity') or '<none>'}): {error}"
             ) from error
         release()
@@ -5114,6 +5225,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         body: Mapping[str, object] | None = None,
         *,
         idempotency_key: str | None = None,
+        if_match: int | None = None,
     ) -> ConsoleApiResponse:
         self._require_isolated_kind("admin console scenarios")
         if not path.startswith(("/admin/api/v1/", "/auth/v1/")):
@@ -5127,6 +5239,8 @@ ON CONFLICT (key_hash) DO NOTHING;
             headers["Content-Type"] = "application/json"
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
+        if if_match is not None:
+            headers["If-Match"] = str(int(if_match))
         request = Request(
             self.config.api_url.rstrip("/") + path,
             method=method,

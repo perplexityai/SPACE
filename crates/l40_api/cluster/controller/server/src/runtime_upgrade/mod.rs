@@ -67,6 +67,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use pplx_space_artifact_model::{TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV, TrustedStorageBuckets};
+use pplx_space_env_vars::Environment;
 use pplx_space_runtime_upgrade_campaign_store::{
     self as store, Campaign, CampaignId, CampaignKind, CampaignPhase, ItemOutcome, ItemPhase,
     LeasedItem,
@@ -79,6 +81,7 @@ use crate::env_config::EnvConfig;
 use crate::metrics::cluster_reconciler::{self as reconciler_metrics, Loop};
 use crate::metrics::runtime_upgrade::{self as metrics, RedriveResult};
 
+mod templates;
 mod worker;
 
 #[cfg(test)]
@@ -87,6 +90,19 @@ mod tests;
 /// The switch: `1`, `true`, `yes`, `on` or `enabled` turns the loop on;
 /// unset or anything else keeps it off.
 pub const ENABLED_ENV: &str = "SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED";
+/// Lets the template driver use a storage location's `https://` endpoint
+/// override while [`TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV`] is empty, for
+/// S3-compatible storage. Off by default. A plain `http://` endpoint needs
+/// [`ALLOW_TEMPLATE_STORAGE_PLAINTEXT_ENDPOINTS_ENV`] instead.
+pub const ALLOW_TEMPLATE_STORAGE_ENDPOINT_OVERRIDES_ENV: &str =
+    "SPACE_TEMPLATE_STORAGE_ALLOW_ENDPOINT_OVERRIDES";
+/// Lets the template driver use a storage location's plain `http://`
+/// endpoint, for local S3-compatible storage such as the Kind object store.
+/// Off by default; it allows endpoint overrides too, since a plaintext
+/// endpoint is always one. A configured trusted list still refuses every
+/// override.
+pub const ALLOW_TEMPLATE_STORAGE_PLAINTEXT_ENDPOINTS_ENV: &str =
+    "SPACE_TEMPLATE_STORAGE_ALLOW_PLAINTEXT_ENDPOINTS";
 /// Test-hook override of the tick, in seconds.
 const TICK_TEST_ENV: &str = "SPACE_RUNTIME_UPGRADE_RECONCILER_TICK_SECS";
 
@@ -267,11 +283,125 @@ impl Drivers {
     }
 }
 
-/// The drivers this build runs: none yet. A driver added here adds its kind
-/// to `pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS` too, so
-/// the admin API starts campaigns of it; a test holds the two equal.
-pub fn cluster_drivers() -> Drivers {
-    Drivers::default()
+/// The drivers this build runs: templates ([`templates::TemplateDriver`]). A
+/// driver added here adds its kind to
+/// `pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS` too, so the
+/// admin API starts campaigns of it; a test holds the two equal. Building
+/// them reads nothing: a disabled loop never asks them anything.
+/// `boots_twins` is whether this cluster's pods boot the environment a
+/// template twin is bound to; without it template campaigns are held.
+/// `managed_by` is the substrate's nodes' `managed_by`. `origins` is which
+/// storage locations the template driver uses ([`template_storage_origins`]).
+pub fn cluster_drivers(
+    pool: PgPool,
+    credentials_pool: PgPool,
+    boots_twins: bool,
+    managed_by: &'static str,
+    origins: TemplateStorageOrigins,
+) -> Drivers {
+    Drivers::default().with(templates::TemplateDriver::new(
+        pool,
+        credentials_pool,
+        boots_twins,
+        managed_by,
+        origins,
+    ))
+}
+
+/// Which storage locations the template driver uses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TemplateStorageOrigins {
+    /// The deployment's trusted template buckets; empty trusts every bucket.
+    pub trusted: TrustedStorageBuckets,
+    /// Whether, with no trusted buckets, a location's endpoint override is
+    /// used rather than refused.
+    pub allow_endpoint_overrides: bool,
+    /// Whether a location's plain `http://` endpoint is used rather than
+    /// refused. Implies `allow_endpoint_overrides`.
+    pub allow_plaintext_endpoints: bool,
+}
+
+impl TemplateStorageOrigins {
+    /// The S3 client for these origins. It refuses a location the trusted
+    /// buckets refuse, and, unless allowed, a plaintext endpoint and an
+    /// endpoint override while no trusted buckets are configured.
+    pub fn client(&self) -> pplx_space_template_release_store::S3ReleaseObjects {
+        if self.allow_plaintext_endpoints {
+            return pplx_space_template_release_store::S3ReleaseObjects::allowing_plaintext_endpoints()
+                .trusting(self.trusted.clone());
+        }
+        let client = pplx_space_template_release_store::S3ReleaseObjects::new()
+            .trusting(self.trusted.clone());
+        if self.allow_endpoint_overrides {
+            client.allowing_endpoint_overrides()
+        } else {
+            client
+        }
+    }
+}
+
+/// The template driver's storage origins for a loop `config` turns on:
+/// [`TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV`], the internal API's registration
+/// policy, and [`ALLOW_TEMPLATE_STORAGE_ENDPOINT_OVERRIDES_ENV`]. A disabled
+/// loop asks its drivers nothing, so neither is read then. An empty bucket
+/// list admits every bucket but, unless overrides are allowed, no endpoint
+/// override, and is logged as a warning: set the list here as well as on the
+/// internal API. A list that
+/// isn't UTF-8, which the internal API refuses to start with, turns the loop
+/// off and is logged, rather than stopping the controller's other loops.
+pub fn template_storage_origins(
+    config: &mut ReconcilerConfig,
+    env: &dyn Environment,
+) -> TemplateStorageOrigins {
+    if !config.enabled {
+        return TemplateStorageOrigins::default();
+    }
+    let trusted = match env.var(TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV) {
+        Ok(list) => TrustedStorageBuckets::from_list(&list),
+        Err(std::env::VarError::NotPresent) => TrustedStorageBuckets::default(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!(
+                "runtime_upgrade: {TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV} must contain UTF-8 \
+                 bucket names; the loop stays off"
+            );
+            config.enabled = false;
+            return TemplateStorageOrigins::default();
+        }
+    };
+    let allow_plaintext_endpoints =
+        EnvConfig(env).flag(ALLOW_TEMPLATE_STORAGE_PLAINTEXT_ENDPOINTS_ENV, false);
+    let allow_endpoint_overrides = allow_plaintext_endpoints
+        || EnvConfig(env).flag(ALLOW_TEMPLATE_STORAGE_ENDPOINT_OVERRIDES_ENV, false);
+    if allow_plaintext_endpoints {
+        tracing::warn!(
+            "runtime_upgrade: {ALLOW_TEMPLATE_STORAGE_PLAINTEXT_ENDPOINTS_ENV} is set, so the \
+             template driver sends its requests to plain http storage endpoints; use it only for \
+             local S3-compatible storage"
+        );
+    }
+    if trusted == TrustedStorageBuckets::default() {
+        if allow_endpoint_overrides {
+            tracing::warn!(
+                "runtime_upgrade: {TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV} is empty and \
+                 {ALLOW_TEMPLATE_STORAGE_ENDPOINT_OVERRIDES_ENV} is set, so the template driver \
+                 uses storage locations' endpoint overrides; set the trusted buckets here as \
+                 well as on the internal API"
+            );
+        } else {
+            tracing::warn!(
+                "runtime_upgrade: {TRUSTED_TEMPLATE_STORAGE_BUCKETS_ENV} is empty, so the \
+                 template driver refuses storage locations that override the endpoint; set the \
+                 trusted buckets here as well as on the internal API, or set \
+                 {ALLOW_TEMPLATE_STORAGE_ENDPOINT_OVERRIDES_ENV} for S3-compatible storage at an \
+                 https endpoint"
+            );
+        }
+    }
+    TemplateStorageOrigins {
+        trusted,
+        allow_endpoint_overrides,
+        allow_plaintext_endpoints,
+    }
 }
 
 /// Where one campaign's scan of subjects is.

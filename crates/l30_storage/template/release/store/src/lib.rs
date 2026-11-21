@@ -325,6 +325,40 @@ pub async fn release_of_hash_in_partition(
     .await
 }
 
+/// Every release of `template_name`'s build in `selector`'s partition under
+/// either spelling of the hash, bare or `sha256:<hex>`, newest first (by
+/// `created_at`, then id). Unlike [`release_of_hash_in_partition`], a release
+/// without storage locations is included: its pool configs serve creates of
+/// its spelling too. Takes no lock.
+pub async fn releases_of_hash_in_partition(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    hash: &str,
+    selector: PartitionSelector,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let other_spelling = match objects::sha256_hex(hash) {
+        Some(hex) if hash.starts_with("sha256:") => hex.to_owned(),
+        Some(hex) => format!("sha256:{hex}"),
+        None => hash.to_owned(),
+    };
+    sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT r.id
+         FROM template_releases r
+         WHERE r.template_name = $1
+           AND r.hash IN ($2, $3)
+           AND (r.execution_metadata->>'environment' = $4
+                OR ($5 AND r.execution_metadata->>'environment' IS NULL))
+         ORDER BY r.created_at DESC, r.id DESC"
+    ))
+    .bind(template_name)
+    .bind(hash)
+    .bind(&other_spelling)
+    .bind(selector.environment.to_string())
+    .bind(selector.includes_unbound)
+    .fetch_all(executor)
+    .await
+}
+
 /// The storage connection strings of `release_id`, oldest first, encrypted
 /// or not: the application pool can't see the encryption sidecar, so check
 /// [`has_encrypted_storage_locations`] on the credentials pool before

@@ -87,6 +87,7 @@ mod admin;
 mod create;
 mod items;
 mod phase;
+mod twin_readers;
 
 pub use admin::{
     ChangePhaseError, PhaseChange, PhaseChanged, abort_campaign, pause_campaign, resume_campaign,
@@ -101,6 +102,7 @@ pub use items::{
 };
 pub use phase::{complete_if_drained, pause_if_over_budget};
 pub use pplx_space_rollout_queue::{MAX_LEASE, clamp_lease};
+pub use twin_readers::{HOLDING_SAMPLE, TwinReaders, workers_not_reading_twins};
 
 #[cfg(test)]
 mod tests;

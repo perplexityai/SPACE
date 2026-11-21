@@ -7,6 +7,7 @@ import json
 import secrets
 import shlex
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
@@ -130,6 +131,7 @@ from space_smoke.execution_environment import (
     catalog_reference,
     expect_runtime,
 )
+from space_smoke.runtime_upgrade_campaign import CampaignControl, TemplateCampaignAssertions
 from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
@@ -2894,6 +2896,86 @@ class KindAdmin(ScenarioFixture):
             )
         return self._console_assertions
 
+    _execution_environment_control: ExecutionEnvironmentControl | None = None
+
+    def _environment_control(self) -> ExecutionEnvironmentControl:
+        if self._execution_environment_control is None:
+            raise SmokeConfigurationError(
+                "execution-environment control is only available on the kind backend"
+            )
+        return self._execution_environment_control
+
+    def admit_execution_environment(self, name: str) -> ExecutionEnvironmentAdmission:
+        """An admission of `name` the scenario drives itself, stage by stage.
+
+        For a scenario that needs some nodes to run the environment and others
+        not; nothing is admitted until it calls `admit(roles)`. It withdraws
+        the admission after deleting what runs it, as setup's admission does.
+        """
+
+        return ExecutionEnvironmentAdmission(
+            self, self._environment_control(), self._context.scope, name
+        )
+
+    _environment_placement_gate_control: EnvironmentPlacementGateControl | None = None
+    _environment_placement_gate: EnvironmentPlacementGate | None = None
+
+    @property
+    def environment_placement_gate(self) -> EnvironmentPlacementGate:
+        """Turn the environment placement gate on for this scenario, and put it back."""
+
+        if self._environment_placement_gate_control is None:
+            raise SmokeConfigurationError(
+                "environment placement gate control is only available on the kind backend"
+            )
+        if self._environment_placement_gate is None:
+            self._environment_placement_gate = EnvironmentPlacementGate(
+                self, self._environment_placement_gate_control, self._context.scope
+            )
+        return self._environment_placement_gate
+
+    _ecw_creator: Any = None
+
+    def create_ecw_sandbox(self) -> str:
+        """A sandbox of this scenario's template created through the ECW API; its bare id.
+
+        It names no shape, so it can claim a default-shape warm-pool slot,
+        which an admin or native create doesn't. Until the create answers,
+        cleanup finds what it made by this call's own metadata, so a lost
+        reply leaves nothing behind; once it answers, cleanup kills that
+        sandbox by ID, which also succeeds once its timeout has removed it.
+        """
+
+        if self._ecw_creator is None:
+            raise SmokeConfigurationError("ECW creates need the ECW SDK surface")
+        creator = self._ecw_creator
+        metadata = {"space_smoke_ecw_create": uuid.uuid4().hex}
+        by_metadata = self._context.scope.defer(
+            "kill the ECW sandbox", lambda: creator.kill_matching(metadata), critical=True
+        )
+        sandbox = creator.create(template=self.sandbox_template_name(), timeout=600, metadata=metadata)
+        sandbox_id = str(sandbox.sandbox_id)
+        self._context.scope.defer(
+            f"kill ECW sandbox {sandbox_id}", lambda: creator.kill_sandbox(sandbox_id), critical=True
+        )
+        by_metadata.disarm()
+        return sandbox_id
+
+    _campaign_control: CampaignControl | None = None
+    _campaign_assertions: TemplateCampaignAssertions | None = None
+
+    @property
+    def template_campaigns(self) -> TemplateCampaignAssertions:
+        """Template runtime-upgrade campaigns, driven and read through the admin API."""
+
+        if self._campaign_control is None:
+            raise SmokeConfigurationError("campaign control is only available on the kind backend")
+        if self._campaign_assertions is None:
+            self._campaign_assertions = TemplateCampaignAssertions(
+                self, self._campaign_control, self._context.scope
+            )
+        return self._campaign_assertions
+
     def sandbox_template_name(self) -> str:
         """The bare template name (no tag or digest) selected for this scenario."""
 
@@ -3297,27 +3379,6 @@ class KindEcw(Ecw, KindAdmin):
             )
         return self._execution_environment
 
-    _execution_environment_control: ExecutionEnvironmentControl | None = None
-
-    def _environment_control(self) -> ExecutionEnvironmentControl:
-        if self._execution_environment_control is None:
-            raise SmokeConfigurationError(
-                "execution-environment control is only available on the kind backend"
-            )
-        return self._execution_environment_control
-
-    def admit_execution_environment(self, name: str) -> ExecutionEnvironmentAdmission:
-        """An admission of `name` the scenario drives itself, stage by stage.
-
-        For a scenario that needs some nodes to run the environment and others
-        not; nothing is admitted until it calls `admit(roles)`. It withdraws
-        the admission after deleting what runs it, as setup's admission does.
-        """
-
-        return ExecutionEnvironmentAdmission(
-            self, self._environment_control(), self._context.scope, name
-        )
-
     def bound_seed(self, environment: SelectableEnvironment) -> BoundSeed:
         """Seed bound to an environment every node already runs (E0), built under no tag.
 
@@ -3350,23 +3411,6 @@ class KindEcw(Ecw, KindAdmin):
         """The sandbox's running VM reports `environment`'s Firecracker."""
 
         expect_runtime(self, self._environment_control(), environment, sandbox_id, step=step)
-
-    _environment_placement_gate_control: EnvironmentPlacementGateControl | None = None
-    _environment_placement_gate: EnvironmentPlacementGate | None = None
-
-    @property
-    def environment_placement_gate(self) -> EnvironmentPlacementGate:
-        """Turn the environment placement gate on for this scenario, and put it back."""
-
-        if self._environment_placement_gate_control is None:
-            raise SmokeConfigurationError(
-                "environment placement gate control is only available on the kind backend"
-            )
-        if self._environment_placement_gate is None:
-            self._environment_placement_gate = EnvironmentPlacementGate(
-                self, self._environment_placement_gate_control, self._context.scope
-            )
-        return self._environment_placement_gate
 
     _cross_node_control: CrossNodeRestoreControl | None = None
     _cross_node_assertions: CrossNodeRestoreAssertions | None = None
