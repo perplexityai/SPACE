@@ -23,6 +23,8 @@ class ScenarioResult:
     evidence: Mapping[str, Any] = field(default_factory=dict)
     cleanup_failures: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    # The body's verdict when a critical cleanup failure replaced it.
+    promoted_from: Verdict | None = None
 
     @property
     def exit_code(self) -> int:

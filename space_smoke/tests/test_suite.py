@@ -14,7 +14,13 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from space_smoke.__main__ import _apply_substrate, _failure_detail, _run_all
+from space_smoke.__main__ import (
+    _apply_substrate,
+    _failure_detail,
+    _print_failure_rate,
+    _print_result,
+    _run_all,
+)
 from space_smoke.adapters import KindConfig, KindHarness
 from space_smoke.registry import ScenarioRegistry
 from space_smoke.runtime import CommandResult
@@ -673,6 +679,34 @@ class SmokeSuiteTests(unittest.TestCase):
                 self.assertIn("direct", registered.substrates)
                 self.assertIsNone(registered.quarantined)
                 self.assertEqual(registered.tier, "routine")
+
+    def test_failure_rate_counts_a_pass_that_critical_cleanup_promoted(self) -> None:
+        promoted = dataclasses.replace(
+            self.CLEANUP_FAILED,
+            report={**self.CLEANUP_FAILED.report, "promoted_from": "pass"},
+        )
+        infra_error = ScenarioProcessResult(
+            "ecw.command_round_trip", 2, "", "", {"verdict": "infra_error"}
+        )
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            _print_failure_rate((promoted, infra_error), "lifecycle-faults@1")
+
+        self.assertIn(
+            "1 of 1 conclusive scenario runs failed or left cleanup failures "
+            "(1000.0 per 1,000); 1 inconclusive or infrastructure errors excluded",
+            stdout.getvalue(),
+        )
+
+    def test_result_line_names_the_promoted_verdict_only_when_set(self) -> None:
+        def report(**promoted: str) -> dict[str, object]:
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                _print_result("a.b", "infra_error", "s", {}, ["x"], **promoted)
+            return json.loads(stdout.getvalue().removeprefix(RESULT_PREFIX))
+
+        self.assertEqual(report(promoted_from="pass")["promoted_from"], "pass")
+        self.assertNotIn("promoted_from", report())
 
 
 class BenchSubstrateTests(unittest.TestCase):
