@@ -284,19 +284,40 @@ async fn policy_free_resume_writes_resuming_only_over_paused() {
     assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
-/// A resident resume passes the VM launch-time admission before it asks
-/// node-manager to thaw the VM.
+/// Which public call resumes the paused VM.
+#[derive(Clone, Copy, Debug)]
+enum ResumeEntry {
+    Resume,
+    Wake,
+}
+
+/// A resident resume, by Resume or by a blocking Wake, passes the VM
+/// launch-time admission before it asks node-manager to thaw the VM. While
+/// the node is sealed the admission refuses it: node-manager is never asked
+/// and the row stays `paused`.
+#[rstest::rstest]
 #[tokio::test]
-async fn resident_resume_is_admitted_before_the_vm_resumes() {
+async fn resident_resume_is_admitted_before_the_vm_resumes(
+    #[values(ResumeEntry::Resume, ResumeEntry::Wake)] entry: ResumeEntry,
+    #[values(false, true)] sealed: bool,
+) {
     let scratch = tempfile::tempdir().unwrap();
     let admitted = Arc::new(Mutex::new(Vec::new()));
     let admitted_at_resume = Arc::new(Mutex::new(None));
+    let in_flight_at_resume = Arc::new(Mutex::new(None));
+    let seal_slot = Arc::new(Mutex::new(
+        None::<Arc<crate::activation_seal::ActivationSeal>>,
+    ));
     let node_manager = FakeNodeManager::default()
         .unary("ResumeSandbox", {
             let admitted = Arc::clone(&admitted);
             let admitted_at_resume = Arc::clone(&admitted_at_resume);
+            let in_flight_at_resume = Arc::clone(&in_flight_at_resume);
+            let seal_slot = Arc::clone(&seal_slot);
             move |_: ResumeSandboxRequest| -> Result<ResumeSandboxResponse, Status> {
                 *admitted_at_resume.lock().unwrap() = Some(admitted.lock().unwrap().clone());
+                let seal = seal_slot.lock().unwrap().clone().unwrap();
+                *in_flight_at_resume.lock().unwrap() = Some(seal.status().in_flight);
                 Err(Status::not_found("no Firecracker process for the sandbox"))
             }
         })
@@ -325,29 +346,71 @@ async fn resident_resume_is_admitted_before_the_vm_resumes() {
         .try_acquire(LimitedActivationKind::Cold)
         .expect("the test holds the limiter's only slot");
 
+    *seal_slot.lock().unwrap() = Some(Arc::clone(&service.activation_seal));
+    if sealed {
+        service.activation_seal.seal(&service.db, 5).unwrap();
+    }
+    let resume = async {
+        match entry {
+            ResumeEntry::Resume => service
+                .resume(internal_request(ResumeRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+            ResumeEntry::Wake => service
+                .wake(internal_request(crate::proto::WakeRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    blocking: true,
+                    ..Default::default()
+                }))
+                .await
+                .map(drop),
+        }
+    };
     let result = tokio::time::timeout(
         WAIT,
-        REQUESTED_VM_ACTIVATIONS.scope(
-            Arc::clone(&admitted),
-            service.resume(internal_request(ResumeRequest {
-                sandbox_id: sandbox_id.to_string(),
-                ..Default::default()
-            })),
-        ),
+        REQUESTED_VM_ACTIVATIONS.scope(Arc::clone(&admitted), resume),
     )
     .await
     .expect("the resume finishes within 30 seconds");
 
-    assert_eq!(
-        result.map(|_| ()).map_err(|status| status.code()),
-        Err(Code::Internal),
-        "the fake answers ResumeSandbox with the error a VM that is gone gets"
-    );
-    assert_eq!(
-        *admitted_at_resume.lock().unwrap(),
-        Some(vec![ActivationAdmissionKind::ResidentResume]),
-        "node-manager was asked to resume the VM only after it requested admission"
-    );
+    if sealed {
+        let refused = result.expect_err("a sealed node refuses the resume");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+        assert!(
+            refused
+                .message()
+                .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+            "{refused:?}"
+        );
+        assert_eq!(*admitted_at_resume.lock().unwrap(), None);
+        assert_eq!(
+            service
+                .lookup_sandbox(&sandbox_id.to_string())
+                .unwrap()
+                .state,
+            SandboxStatus::from(SandboxState::Paused)
+        );
+    } else {
+        assert_eq!(
+            result.map_err(|status| status.code()),
+            Err(Code::Internal),
+            "the fake answers ResumeSandbox with the error a VM that is gone gets"
+        );
+        assert_eq!(
+            *admitted_at_resume.lock().unwrap(),
+            Some(vec![ActivationAdmissionKind::ResidentResume]),
+            "node-manager was asked to resume the VM only after it requested admission"
+        );
+        assert_eq!(
+            *in_flight_at_resume.lock().unwrap(),
+            Some(vec![sandbox_id.to_string()]),
+            "the resume is in flight while it thaws the VM"
+        );
+    }
+    service.activation_seal.assert_quiesced();
     assert_eq!(
         *admitted.lock().unwrap(),
         vec![ActivationAdmissionKind::ResidentResume]

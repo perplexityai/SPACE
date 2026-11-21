@@ -247,8 +247,12 @@ impl SandboxManagerService {
             }
             result.map(|()| local_artifact_id)
         };
+        // Boxed so the test wrappers don't copy the work's state onto the
+        // stack.
         #[cfg(test)]
-        let work = super::pause_resume::inherit_guest_preparation(work);
+        let work = super::pause_resume::inherit_guest_preparation(
+            super::super::start_support::inherit_requested_vm_activations(Box::pin(work)),
+        );
         let publication =
             self.spawn_detached_state_writer("SuspendPublication", &task_sandbox_id, work)?;
         if !blocking {

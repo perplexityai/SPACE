@@ -3239,6 +3239,102 @@ func TestStoppedCheckpointContinuation(t *testing.T) {
 	}
 }
 
+type activationClient struct {
+	pb.SandboxManagerClient
+	answer func() error
+}
+
+func (f activationClient) Start(context.Context, *pb.StartRequest, ...grpc.CallOption) (*pb.StartResponse, error) {
+	if err := f.answer(); err != nil {
+		return nil, err
+	}
+	return &pb.StartResponse{Pid: 123}, nil
+}
+
+func (f activationClient) Wake(context.Context, *pb.WakeRequest, ...grpc.CallOption) (*pb.WakeResponse, error) {
+	if err := f.answer(); err != nil {
+		return nil, err
+	}
+	return &pb.WakeResponse{}, nil
+}
+
+// A Start or a Wake refused because sandbox-manager can't read its
+// activation seal is made again with the same request, backing off, until
+// the seal reads; after 30 s, or at the caller's deadline if that comes
+// first, the refusal is answered. Any other refusal, a sealed node's or
+// another Unavailable, is answered after the first call.
+func TestCallPastUnreadableSeal(t *testing.T) {
+	unreadable := status.Error(codes.Unavailable, "activation seal unreadable; retrying; refusing the cold activation of sandbox sandbox")
+	for _, tc := range []struct {
+		name     string
+		deadline time.Duration
+		refuse   func(call int) error
+		code     codes.Code
+		calls    int
+		elapsed  time.Duration
+	}{
+		{"unreadable then readable", 0, func(call int) error {
+			if call < 4 {
+				return unreadable
+			}
+			return nil
+		}, codes.OK, 4, 700 * time.Millisecond},
+		{"unreadable throughout", 0, func(int) error { return unreadable }, codes.Unavailable, 19, activationSealUnreadableWait},
+		{"unreadable past the caller's deadline", 5 * time.Second, func(int) error { return unreadable }, codes.Unavailable, 6, 5 * time.Second},
+		{"sealed", 0, func(int) error {
+			return status.Error(codes.FailedPrecondition, "node activations are sealed (generation 3); refusing the cold activation of sandbox sandbox")
+		}, codes.FailedPrecondition, 1, 0},
+		{"another unavailable", 0, func(int) error {
+			return status.Error(codes.Unavailable, "sandbox sandbox activation admission is busy; retry")
+		}, codes.Unavailable, 1, 0},
+	} {
+		for _, rpc := range []string{"Start", "Wake"} {
+			t.Run(rpc+"/"+tc.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx := context.Background()
+					if tc.deadline > 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, tc.deadline)
+						defer cancel()
+					}
+					calls := 0
+					client := activationClient{answer: func() error {
+						calls++
+						return tc.refuse(calls)
+					}}
+					began := time.Now()
+					var err error
+					switch rpc {
+					case "Start":
+						request := &pb.StartRequest{SandboxId: "sandbox"}
+						var response *pb.StartResponse
+						response, err = callPastUnreadableSeal(ctx, func(ctx context.Context) (*pb.StartResponse, error) {
+							return client.Start(ctx, request)
+						})
+						if err == nil && response.GetPid() != 123 {
+							t.Fatal("lost admitted runtime")
+						}
+					case "Wake":
+						request := &pb.WakeRequest{SandboxId: "sandbox"}
+						_, err = callPastUnreadableSeal(ctx, func(ctx context.Context) (*pb.WakeResponse, error) {
+							return client.Wake(ctx, request)
+						})
+					}
+					if status.Code(err) != tc.code {
+						t.Fatalf("code=%s want=%s err=%v", status.Code(err), tc.code, err)
+					}
+					if calls != tc.calls {
+						t.Fatalf("calls=%d want=%d", calls, tc.calls)
+					}
+					if waited := time.Since(began); waited != tc.elapsed {
+						t.Fatalf("waited %s want %s", waited, tc.elapsed)
+					}
+				})
+			})
+		}
+	}
+}
+
 type blockingLegacyTeardownClient struct {
 	pb.SandboxManagerClient
 
