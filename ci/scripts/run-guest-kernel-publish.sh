@@ -9,7 +9,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 KERNEL_DIR="${REPO_ROOT}/templates/firecracker/kernel"
 
 KERNEL_VERSION="${KERNEL_VERSION:-6.1.155}"
-ARTIFACT_VERSION="vmlinux-${KERNEL_VERSION}${CONFIG_FRAGMENT:+-bpf-modsig}"
+BUILD_VERSION="vmlinux-${KERNEL_VERSION}${CONFIG_FRAGMENT:+-bpf-modsig}"
+ARTIFACT_VERSION="${SPACE_GUEST_KERNEL_ARTIFACT_VERSION:-${BUILD_VERSION}}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 WORK_DIR=""
 S3_ACCESS_KEY_ID=""
@@ -20,6 +21,14 @@ die() {
   echo "ERROR: $*" >&2
   exit 1
 }
+
+# Keep separate builds of one Linux release addressable side by side without
+# permitting path traversal or publishing a mutable fleet-default alias.
+if [[ ! "$ARTIFACT_VERSION" =~ ^[a-zA-Z0-9._+-]{1,128}$ ]] \
+  || [[ "$ARTIFACT_VERSION" == "." || "$ARTIFACT_VERSION" == ".." ]] \
+  || [[ "$ARTIFACT_VERSION" == "default" || "$ARTIFACT_VERSION" == "legacy-default" ]]; then
+  die "invalid guest kernel artifact version: ${ARTIFACT_VERSION}"
+fi
 
 resolve_target_buckets() {
   local branch="${BUILDKITE_BRANCH:-$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)}"
@@ -236,7 +245,7 @@ main() {
   buckets_csv="$(resolve_target_buckets)"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT
-  artifact_dir="${WORK_DIR}/${ARTIFACT_VERSION}"
+  artifact_dir="${WORK_DIR}/${BUILD_VERSION}"
 
   echo "--- :linux: Building ${ARTIFACT_VERSION}"
   build_kernel "$WORK_DIR"
