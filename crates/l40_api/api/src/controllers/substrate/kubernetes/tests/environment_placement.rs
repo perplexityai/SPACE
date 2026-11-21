@@ -1305,23 +1305,3 @@ async fn a_pinned_restore_is_refused_before_its_pod_when_the_source_node_lacks_t
     );
     Ok(())
 }
-
-/// Startup checks the gate against the substrate's own resume-time upgrade
-/// switch: on runs while upgrades are off, and fails startup with them on.
-#[tokio::test(flavor = "current_thread")]
-async fn startup_refuses_on_only_alongside_resume_time_upgrades() -> Result<(), BoxError> {
-    use crate::controllers::substrate::runtime_upgrade::RuntimeUpgradeAtActivation;
-    // The check reads only the two switches, so the store never connects.
-    let mut substrate = substrate_with_unreachable_store();
-    substrate.k8s.environment_placement = EnvironmentPlacementGate::On;
-    substrate.k8s.runtime_upgrade_at_activation = RuntimeUpgradeAtActivation::Disabled;
-    substrate.k8s.check_environment_placement_support()?;
-    substrate.k8s.runtime_upgrade_at_activation = RuntimeUpgradeAtActivation::Enabled;
-    assert!(matches!(
-        substrate.k8s.check_environment_placement_support(),
-        Err(crate::controllers::substrate::SubstrateError::Unsupported { .. })
-    ));
-    substrate.k8s.environment_placement = EnvironmentPlacementGate::Shadow;
-    substrate.k8s.check_environment_placement_support()?;
-    Ok(())
-}

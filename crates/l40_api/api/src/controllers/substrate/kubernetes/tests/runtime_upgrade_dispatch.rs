@@ -24,6 +24,7 @@ use pplx_space_sandbox_pod::{
 };
 
 mod api_faults;
+mod pod_environment;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

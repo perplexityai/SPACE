@@ -323,6 +323,61 @@ async fn a_retry_reusing_its_pod_on_a_full_node_needs_no_new_slot(
     }
 }
 
+/// With the environment placement gate on, a node that doesn't publish the
+/// upgrade's target can't take a new upgrade pod, so the upgrade is refused,
+/// retryably, before it claims anything. A retry that will reuse the pod an
+/// earlier attempt left there, carrying the recorded operation, creates none:
+/// that pod is already bound to the node, so the retry reuses it and
+/// converges whatever the node publishes now. The case without the
+/// operation reaches the check only after the takeover branch already took
+/// and expired the held execution's claim, so its "nothing claimed" means
+/// nothing new: no claim beyond that one.
+#[rstest::rstest]
+#[case::carrying_the_operation(true)]
+#[case::without_the_operation(false)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_retry_reusing_its_pod_needs_no_target_label_on_its_node(
+    #[case] carried: bool,
+) -> Result<(), BoxError> {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let mut s = subject().await?;
+    held_execution(&s, "stopped", -3600).await?;
+    let operation = record_upgrade_on_held_execution(&s).await?;
+    if carried {
+        s.pods().annotate(&[
+            (
+                SANDBOX_RUNTIME_UPGRADE_OPERATION_ID_ANNOTATION,
+                &operation.to_string(),
+            ),
+            (SANDBOX_RUNTIME_UPGRADE_TARGET_STATE_ANNOTATION, "stopped"),
+        ]);
+    }
+    // The fixture's node publishes no environment, E1 included.
+    s.cache_the_pod();
+    s.substrate.k8s.environment_placement =
+        crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::On;
+
+    let outcome = s.upgrade().await;
+
+    if carried {
+        assert_eq!(upgraded(&outcome?), operation);
+        assert_eq!(s.pods().creates.load(Ordering::SeqCst), 0);
+        s.assert_stopped_without_execution("after the upgrade")
+            .await
+    } else {
+        let error = outcome.unwrap_err();
+        let SubstrateError::Unavailable { message } = &error else {
+            panic!("{error:?}");
+        };
+        assert!(message.contains(E1), "{message}");
+        s.assert_nothing_placed_or_sent("refused");
+        assert!(s.pods().exists());
+        Ok(())
+    }
+}
+
 /// A drain is moving the stopped sandbox's disk off its node: a retryable
 /// refusal until the disk is placed again, and nothing is placed meanwhile.
 #[tokio::test(flavor = "current_thread")]

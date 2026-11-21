@@ -152,7 +152,8 @@ impl KubernetesSubstrate {
     /// work, and while the gate is off.
     ///
     /// The work is what the pod will boot: the template build for an
-    /// on-demand pod ([`Self::template_pod_environment`]), the checkpoint a
+    /// on-demand pod ([`Self::template_pod_environment`]), the target of the
+    /// runtime upgrade a start's or resume's pod carries, the checkpoint a
     /// suspended sandbox restores, and the execution a stopped sandbox last
     /// published for a disk restore, which cold boots it. Like the
     /// node-group placement, it's resolved from the current rows at every
@@ -178,6 +179,69 @@ impl KubernetesSubstrate {
             }
             PodCreateContext::Restore(restore) => restore,
         };
+        let environment = match restore {
+            // The shim boots the sandbox through the upgrade, under its
+            // target, never under the environment the sandbox last ran
+            // under, which the upgrade moves off and which may no longer
+            // execute. The target comes from the decision the pod carries,
+            // so there's nothing to read.
+            RestoreContext::UserRestore {
+                runtime_upgrade: Some(upgrade),
+                ..
+            } => crate::controllers::substrate::environment_placement::pod_environment(
+                gate,
+                upgrade.target,
+            ),
+            RestoreContext::UserRestore {
+                runtime_upgrade: None,
+                ..
+            }
+            | RestoreContext::Evacuation { .. } => {
+                self.recorded_restore_environment(gate, sandbox, restore)
+                    .await?
+            }
+        };
+        // A pod pre-bound to its source node skips kube-scheduler, so only
+        // kubelet admission checks the label, and its refusal is terminal for
+        // a restore whose bytes are on that node. Pre-check the source node's
+        // live labels, as `resolve_node_group_placement` does its node group,
+        // so the restore is refused before any pod exists, with the same 409
+        // and the same way out: draining the node publishes the sandbox's
+        // snapshot to remote storage, after which it restores on any node
+        // that publishes the environment. A node the cache doesn't have keeps
+        // the pin, with kubelet as the backstop.
+        if let (Some(required), Some(node_name)) = (
+            environment
+                .as_ref()
+                .filter(|environment| environment.required),
+            context.direct_node_name(),
+        ) && let Some(node) = self.k8s.caches.node_by_name(node_name)
+            && !node.metadata.labels.as_ref().is_some_and(|labels| {
+                pplx_space_sandbox_pod::node_publishes_environment(labels, &required.reference)
+            })
+        {
+            return Err(SubstrateError::Conflict {
+                message: format!(
+                    "sandbox {} can only restore from node {node_name}, which doesn't publish \
+                     the environment {} its pod boots under while the environment placement \
+                     gate is on; drain that node to publish this sandbox's snapshot to remote \
+                     storage, after which it can restore on a node that publishes the \
+                     environment",
+                    sandbox.id, required.reference
+                ),
+            });
+        }
+        Ok(environment)
+    }
+
+    /// The environment a restore pod that carries no runtime upgrade boots
+    /// under, as its sandbox's rows record it.
+    async fn recorded_restore_environment(
+        &self,
+        gate: crate::controllers::substrate::environment_placement::EnvironmentPlacementGate,
+        sandbox: &Sandbox,
+        restore: &RestoreContext<'_>,
+    ) -> Result<Option<PodEnvironment>, SubstrateError> {
         let (storage_uri, pinned_disk) = match restore {
             RestoreContext::UserRestore {
                 suspend_restore_storage_uri,
@@ -209,38 +273,7 @@ impl KubernetesSubstrate {
                 .map(|recorded| recorded.and_then(|recorded| recorded.execution.environment)),
         };
         let value = places_as_off_in_shadow(gate, "the restore's", value)?;
-        let environment =
-            rendered_pod_environment(gate, format_args!("sandbox {}", sandbox.id), value)?;
-        // A pod pre-bound to its source node skips kube-scheduler, so only
-        // kubelet admission checks the label, and its refusal is terminal for
-        // a restore whose bytes are on that node. Pre-check the source node's
-        // live labels, as `resolve_node_group_placement` does its node group,
-        // so the restore is refused before any pod exists, with the same 409
-        // and the same way out: draining the node publishes the sandbox's
-        // snapshot to remote storage, after which it restores on any node
-        // that publishes the environment. A node the cache doesn't have keeps
-        // the pin, with kubelet as the backstop.
-        if let (Some(required), Some(node_name)) = (
-            environment
-                .as_ref()
-                .filter(|environment| environment.required),
-            context.direct_node_name(),
-        ) && let Some(node) = self.k8s.caches.node_by_name(node_name)
-            && !node.metadata.labels.as_ref().is_some_and(|labels| {
-                pplx_space_sandbox_pod::node_publishes_environment(labels, &required.reference)
-            })
-        {
-            return Err(SubstrateError::Conflict {
-                message: format!(
-                    "sandbox {} can only restore from node {node_name}, which doesn't publish \
-                     its environment {} while the environment placement gate is on; drain \
-                     that node to publish this sandbox's snapshot to remote storage, after \
-                     which it can restore on a node that publishes the environment",
-                    sandbox.id, required.reference
-                ),
-            });
-        }
-        Ok(environment)
+        rendered_pod_environment(gate, format_args!("sandbox {}", sandbox.id), value)
     }
 
     /// The environment a stopped sandbox's disk boots under: the one its

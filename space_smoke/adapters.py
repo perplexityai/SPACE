@@ -113,7 +113,6 @@ from space_smoke.capabilities import (
 from space_smoke.credmgr_socket import exchange_token, relay_argv
 from space_smoke.environment_placement_gate import (
     GATE_ENV as ENVIRONMENT_PLACEMENT_GATE_ENV,
-    RUNTIME_UPGRADE_ENV as RUNTIME_UPGRADE_AT_ACTIVATION_ENV,
 )
 from space_smoke.execution_environment import (
     ALLOWED_ENVIRONMENTS_ENV,
@@ -3857,9 +3856,8 @@ ON CONFLICT (key_hash) DO NOTHING;
     # --- environment placement gate -----------------------------------------
     #
     # `SPACE_ENVIRONMENT_PLACEMENT_GATE` on the Deployments whose substrate
-    # reads it (`space_smoke/environment_placement_gate.py`), beside the
-    # resume-time upgrade flag it refuses `on` with. The captured literals go
-    # back verbatim.
+    # reads it (`space_smoke/environment_placement_gate.py`). The captured
+    # literals go back verbatim.
 
     def _admin_api_deployment(self) -> str | None:
         """The dedicated admin API Deployment, None on a bench that doesn't run one."""
@@ -3882,7 +3880,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         return name
 
     def environment_placement_env(self) -> dict[str, str | None]:
-        keys = (ENVIRONMENT_PLACEMENT_GATE_ENV, RUNTIME_UPGRADE_AT_ACTIVATION_ENV)
+        keys = (ENVIRONMENT_PLACEMENT_GATE_ENV,)
         deployments: dict[str, str | None] = {
             "api": self._public_api_deployment(),
             "admin-api": self._admin_api_deployment(),

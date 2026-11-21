@@ -15,7 +15,8 @@ use super::KubernetesSubstrate;
 use super::pod_runtime_upgrade::PodUpgrade;
 use crate::controllers::substrate::SubstrateError;
 use crate::controllers::substrate::runtime_upgrade::{
-    EnvironmentMove, RuntimePlan, UpgradeActivation, attribute, decide, stranded_error,
+    EnvironmentMove, RuntimePlan, UpgradeActivation, UpgradeCause, attribute, decide,
+    stranded_error,
 };
 use pplx_space_runtime_environment_policy_store::RuntimeEnvironmentState;
 use pplx_space_sandbox_model::SandboxId;
@@ -37,7 +38,12 @@ impl KubernetesSubstrate {
             return Ok(None);
         }
         Ok(self
-            .decide_runtime_upgrade(sandbox_id, activation, restore_storage_uri)
+            .decide(
+                sandbox_id,
+                activation,
+                restore_storage_uri,
+                DeprecatedStart::StartsWhereTheTargetCant,
+            )
             .await?
             .map(|decided| decided.pod_upgrade(sandbox_id, PodRuntimeUpgradeTargetState::Started)))
     }
@@ -45,11 +51,30 @@ impl KubernetesSubstrate {
     /// [`Self::activation_runtime_upgrade`]'s decision, whatever the
     /// activation setting: the move and the upgrade that makes it, or `None`
     /// to stay on the recorded environment. A stranded sandbox is refused.
+    /// It upgrades a deprecated environment's stopped sandbox wherever its
+    /// disk is, as an upgrade that doesn't start the sandbox needs: that
+    /// one's disk-node check refuses a node without the target itself.
     pub(super) async fn decide_runtime_upgrade(
         &self,
         sandbox_id: SandboxId,
         activation: UpgradeActivation,
         restore_storage_uri: Option<&str>,
+    ) -> Result<Option<DecidedUpgrade>, SubstrateError> {
+        self.decide(
+            sandbox_id,
+            activation,
+            restore_storage_uri,
+            DeprecatedStart::AlwaysUpgrades,
+        )
+        .await
+    }
+
+    async fn decide(
+        &self,
+        sandbox_id: SandboxId,
+        activation: UpgradeActivation,
+        restore_storage_uri: Option<&str>,
+        deprecated_start: DeprecatedStart,
     ) -> Result<Option<DecidedUpgrade>, SubstrateError> {
         let policy = self
             .runtime_policy
@@ -97,6 +122,7 @@ impl KubernetesSubstrate {
         let from_catalog = catalog
             .iter()
             .find(|environment| environment.reference == from);
+        let mut fell_back = false;
         let plan = match decide(&policy, activation, from, from_catalog) {
             // The cached policy may be up to its TTL old. Before asking the
             // node to discard a checkpoint's memory, decide again on the
@@ -108,9 +134,77 @@ impl KubernetesSubstrate {
                 let current = self.store.runtime_environment_policy().await?;
                 decide(&current, activation, from, from_catalog)
             }
+            // A deprecated environment still executes, so a user's start
+            // needn't move off it. With the gate on, its pod is pinned to the
+            // node holding its disk and requires the target there, so where
+            // that node doesn't publish the target it starts as recorded
+            // rather than being refused.
+            RuntimePlan::ColdBootUpgrade(to_default)
+                if deprecated_start == DeprecatedStart::StartsWhereTheTargetCant
+                    && activation == UpgradeActivation::Start
+                    && to_default.cause == UpgradeCause::Deprecated
+                    && self.k8s.environment_placement.refuses()
+                    && self
+                        .disk_node_lacks_environment(sandbox_id, to_default.to)
+                        .await? =>
+            {
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    from = %to_default.from,
+                    to = %to_default.to,
+                    "the stopped sandbox's disk node doesn't publish the default environment \
+                     while the environment placement gate is on; starting it under its \
+                     deprecated one"
+                );
+                fell_back = true;
+                RuntimePlan::AsRecorded
+            }
             plan => plan,
         };
-        record(sandbox_id, activation, plan);
+        // The node loads a memory edge's checkpoint under the default, while
+        // the pod's environment is the checkpoint's producer
+        // (`resolve_pod_environment`): the gate would count and place it as
+        // an environment it doesn't boot. No memory edge is certified yet, so
+        // refuse rather than misplace one.
+        if let RuntimePlan::RestoreOnDefault(to_default) = plan
+            && self.k8s.environment_placement.evaluates()
+        {
+            crate::metrics::runtime_upgrade::activation_decision(
+                activation.as_str(),
+                "restore_on_default_refused",
+                to_default.cause.as_str(),
+            );
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                from = %to_default.from,
+                to = %to_default.to,
+                gate = %self.k8s.environment_placement,
+                "refused a memory-edge restore while the environment placement gate evaluates"
+            );
+            return Err(SubstrateError::Unsupported {
+                    message: format!(
+                        "sandbox {sandbox_id}'s checkpoint would restore under {} through a \
+                         memory edge from {}, which isn't supported while {} is {}: its pod \
+                         would record the environment it doesn't boot",
+                        to_default.to,
+                        to_default.from,
+                        crate::controllers::substrate::environment_placement::EnvironmentPlacementGate::ENV,
+                    self.k8s.environment_placement,
+                ),
+            });
+        }
+        if fell_back {
+            // `as_recorded` with cause `deprecated` is only this fallback: a
+            // deprecated sandbox without an edge counts as cause `none`, so
+            // the sandboxes an unlabeled node held back count on their own.
+            crate::metrics::runtime_upgrade::activation_decision(
+                activation.as_str(),
+                "as_recorded",
+                UpgradeCause::Deprecated.as_str(),
+            );
+        } else {
+            record(sandbox_id, activation, plan);
+        }
         match plan {
             RuntimePlan::AsRecorded | RuntimePlan::RestoreOnDefault(_) => Ok(None),
             RuntimePlan::ColdBootUpgrade(to_default) => Ok(Some(DecidedUpgrade {
@@ -122,6 +216,39 @@ impl KubernetesSubstrate {
             RuntimePlan::Stranded(to_default) => Err(stranded_error(sandbox_id, to_default)),
         }
     }
+}
+
+impl KubernetesSubstrate {
+    /// Whether the node holding stopped `sandbox_id`'s disk, which its start
+    /// is pinned to (`stopped_restore_plan`), is in the Node cache and
+    /// doesn't publish `environment`. A disk on no node, or on one the cache
+    /// doesn't have, answers `false`, as the pinned pod's own pre-check does.
+    async fn disk_node_lacks_environment(
+        &self,
+        sandbox_id: SandboxId,
+        environment: pplx_space_execution_spec::EnvironmentReference,
+    ) -> Result<bool, SubstrateError> {
+        let source = self.store.restore_source_plan(sandbox_id).await?;
+        Ok(source
+            .node_name
+            .filter(|_| !source.stopped_evacuation_unplaced)
+            .and_then(|node_name| self.k8s.caches.node_by_name(&node_name))
+            .is_some_and(|node| {
+                !node.metadata.labels.as_ref().is_some_and(|labels| {
+                    pplx_space_sandbox_pod::node_publishes_environment(labels, &environment)
+                })
+            }))
+    }
+}
+
+/// Whether a start-time decision upgrades a deprecated environment's stopped
+/// sandbox whose disk node doesn't publish the target, with the gate on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeprecatedStart {
+    /// A user's start: it starts as recorded instead.
+    StartsWhereTheTargetCant,
+    /// An upgrade without a start, which checks the node itself.
+    AlwaysUpgrades,
 }
 
 /// A cold-boot upgrade [`KubernetesSubstrate::decide_runtime_upgrade`] chose.

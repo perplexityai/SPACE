@@ -2032,10 +2032,7 @@ impl Substrate {
             match kubernetes::KubernetesSubstrate::try_from_env(pool, shutdown_token, task_tracker)
                 .await
             {
-                Ok(Some(substrate)) => {
-                    substrate.k8s.check_environment_placement_support()?;
-                    return Ok(Self::from_kubernetes(substrate));
-                }
+                Ok(Some(substrate)) => return Ok(Self::from_kubernetes(substrate)),
                 Ok(None) => {}
                 Err(err) => return Err(err),
             }
