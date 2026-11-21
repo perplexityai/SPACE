@@ -1325,6 +1325,36 @@ impl KubernetesSubstrate {
         Some(names)
     }
 
+    /// Names of cached Nodes whose `Ready` condition is not `True` (missing,
+    /// `False` or `Unknown`). `None` until the Node reflector's first list
+    /// completes, so a cold cache does not read as every node ready.
+    pub fn not_ready_node_names(&self) -> Option<std::collections::HashSet<String>> {
+        if !self.k8s.caches.nodes_ready() {
+            return None;
+        }
+        let names = self
+            .k8s
+            .caches
+            .nodes
+            .state()
+            .iter()
+            .filter(|node| {
+                !node
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_deref())
+                    .and_then(|conditions| {
+                        conditions
+                            .iter()
+                            .find(|condition| condition.type_ == "Ready")
+                    })
+                    .is_some_and(|condition| condition.status == "True")
+            })
+            .filter_map(|node| node.metadata.name.clone())
+            .collect();
+        Some(names)
+    }
+
     /// Each cached Node's `spec.unschedulable`, keyed by Node name. `None`
     /// until the Node reflector's first list completes, so a cold cache does
     /// not read as every node schedulable.

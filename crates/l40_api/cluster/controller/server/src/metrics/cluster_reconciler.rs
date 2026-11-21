@@ -48,7 +48,7 @@ use pplx_space_snapshot_model::SnapshotId;
 use std::fmt;
 use std::time::Instant;
 
-use pplx_space_metrics_emit::{counter, elapsed_ms, tag, timing_ms};
+use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, tag, timing_ms};
 
 /// The reconciler loop emitting the metric; the `loop` tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1093,6 +1093,35 @@ pub fn scanned(loop_: Loop, count: u64) {
         r#loop = loop_.as_str(),
         count,
         "reconciler scanned"
+    );
+}
+
+/// Sandboxes still pinned to `node` that lose state with it, from one
+/// stranded-sandbox census. `verdict` is `gone`, `not_ready` or
+/// `unverifiable`; `residency` is `running` or `at_rest` (suspended or
+/// stopped with no durable copy). `node` is the Kubernetes Node name, or the
+/// node id when the row is gone or has none. Published as 0 once when a
+/// series stops applying.
+pub fn stranded_sandboxes(node: &str, verdict: &str, reason: &str, residency: &str, count: u64) {
+    gauge(
+        "sandbox.stranded",
+        count as f64,
+        &[
+            tag("node", node),
+            tag("verdict", verdict),
+            tag("reason", reason),
+            tag("residency", residency),
+        ],
+    );
+}
+
+/// Nodes holding at least one stranded sandbox, per census verdict.
+/// Published every census for every verdict, 0 included.
+pub fn stranded_nodes(verdict: &str, count: u64) {
+    gauge(
+        "sandbox.stranded.nodes",
+        count as f64,
+        &[tag("verdict", verdict)],
     );
 }
 
