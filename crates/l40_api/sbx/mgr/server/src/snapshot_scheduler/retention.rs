@@ -168,6 +168,10 @@ pub(super) fn retention_candidate(
 /// with the locks released as the flush always ran, so the delete time does
 /// not separate it from the capture. Its value is handed to `capture` and
 /// returned.
+///
+/// Under the capture's locks, the capture asks the activation seal first
+/// ([`super::admit_scheduled_producer`]): on a sealed node, a sandbox that no
+/// longer has a VM is refused, and the tick fails with nothing captured.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prune_and_capture<T>(
     node_client: &mut NodeManagerGrpcClient,
@@ -214,6 +218,7 @@ pub(super) async fn prune_and_capture<T>(
         .auto_lifecycle
         .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
         .await;
+    let _producer = super::admit_scheduled_producer(ctx, "scheduled disk snapshot", sandbox_id)?;
     capture(node_client, &prepared).await?;
     Ok(prepared)
 }

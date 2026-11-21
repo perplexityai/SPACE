@@ -1210,6 +1210,7 @@ impl SandboxManagerService {
             .artifact_publication_locks(&sandbox.id, artifact_kind)
             .await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
+        let _producer = self.admit_artifact_producer("snapshot", &sandbox)?;
         self.ensure_memory_state_supported(&sandbox, "create snapshot")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "create snapshot")?;
         self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "create snapshot")?;
@@ -1256,6 +1257,7 @@ impl SandboxManagerService {
                 auto_lifecycle: self.auto_lifecycle.clone(),
                 health_lifecycle: self.watchdog.lifecycle_epochs(),
                 node_manager: self.node_manager.clone(),
+                activation_seal: Arc::clone(&self.activation_seal),
             };
 
             let completion = crate::snapshot_scheduler::do_checkpoint(&ctx, id, &snapshot_name)

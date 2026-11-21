@@ -11,6 +11,10 @@ use pplx_space_snapshot_model::ArtifactKind;
 /// Why a started sandbox the drain holds is pending ([`Wait::Hold`]).
 pub(super) const HOLD_REASON: &str = "kept running; suspended once the drain evacuates";
 
+/// Why a sandbox a node-local artifact producer works on is pending
+/// ([`Wait::Snapshot`]).
+pub(super) const SNAPSHOT_REASON: &str = "a snapshot is being published";
+
 /// Why a row whose cleanup failed is pending: nothing on the node moves it on.
 const CLEANUP_FAILED_REASON: &str = "cleanup failed";
 
@@ -155,6 +159,10 @@ pub(super) enum Wait {
     Disk,
     /// An activation admitted before the seal, still in flight.
     Activation,
+    /// A node-local artifact producer (a snapshot, an import, a publication)
+    /// still in flight, whose artifact the drain makes durable once it is
+    /// published.
+    Snapshot,
     /// The warm-pool reconciler's eviction of an unclaimed VM.
     WarmPoolEviction,
     /// A state or transition the drain doesn't drive.
@@ -170,7 +178,7 @@ impl Wait {
         match self {
             Self::Hold => crate::proto::DrainWait::Hold,
             Self::Work(_) | Self::Queued(_) | Self::Disk => crate::proto::DrainWait::Moving,
-            Self::Activation | Self::WarmPoolEviction | Self::Settle(_) => {
+            Self::Activation | Self::Snapshot | Self::WarmPoolEviction | Self::Settle(_) => {
                 crate::proto::DrainWait::External
             }
         }
@@ -185,6 +193,7 @@ impl Wait {
             }
             Self::Disk => "the drain's suspend, waiting for cache disk room".to_owned(),
             Self::Activation => "an activation admitted before the seal is in flight".to_owned(),
+            Self::Snapshot => SNAPSHOT_REASON.to_owned(),
             Self::WarmPoolEviction => {
                 "an unclaimed warm-pool VM, left to the warm-pool reconciler's eviction".to_owned()
             }
@@ -203,6 +212,7 @@ impl Wait {
             Self::Queued(_) => "queued".to_owned(),
             Self::Disk => "disk".to_owned(),
             Self::Activation => "activation".to_owned(),
+            Self::Snapshot => "snapshot".to_owned(),
             Self::WarmPoolEviction => "warm_pool_eviction".to_owned(),
             Self::Settle(status) => format!("settle:{}", status.legacy_label()),
             Self::Hold => "hold".to_owned(),
@@ -279,7 +289,7 @@ pub(super) struct PlanInputs {
     pub(super) local_only: LocalOnlyArtifacts,
     /// The drain's work in flight in this process.
     pub(super) running: BTreeMap<String, DrainAction>,
-    /// The last failure of the drain's work under this pass's epoch.
+    /// The last failure of the drain's work under this pass's generation.
     pub(super) failures: DrainFailures,
     /// How many suspends and disk publications may be in flight at once.
     pub(super) window: usize,
@@ -308,7 +318,7 @@ impl Default for PlanInputs {
 }
 
 impl PlanInputs {
-    /// Why `sandbox_id`'s `action` last failed under this epoch, as a
+    /// Why `sandbox_id`'s `action` last failed under this generation, as a
     /// pending row's reason.
     fn last_failure(&self, sandbox_id: &str, action: DrainAction) -> Option<String> {
         self.failures
@@ -363,7 +373,7 @@ impl DrainPlan {
     }
 
     /// Wait for `action` on `sandbox_id`, with its last failure as the
-    /// reason if it has failed under this epoch.
+    /// reason if it has failed under this generation.
     fn wait_for(&mut self, inputs: &PlanInputs, sandbox_id: &str, action: DrainAction) {
         self.wait_as(inputs, sandbox_id, action, Wait::Work(action));
     }

@@ -418,3 +418,54 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
         "the leak check fails on a forgotten token"
     );
 }
+
+/// A node-local artifact producer for a sandbox without a VM is refused on a
+/// node known sealed, with the plain sealed refusal, and admitted on a node
+/// never sealed or whose seal is unknown; one for a sandbox with a VM is
+/// admitted sealed too. Each admitted producer is in flight, apart from the
+/// activations, until its token drops.
+#[test]
+fn a_sealed_node_refuses_only_the_producers_of_sandboxes_without_a_vm() {
+    let db = SharedConnection::new(crate::db::test_conn());
+    let seal = ActivationSeal::load(&db.lock().unwrap());
+    let unsealed = seal.admit_producer("snapshot", SANDBOX, false).unwrap();
+    seal.seal(&db, 3).unwrap();
+    let refused = seal
+        .admit_producer("snapshot", "sandbox-2", false)
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused.message().starts_with(ACTIVATIONS_SEALED_MARKER),
+        "{refused:?}"
+    );
+    let with_vm = seal.admit_producer("snapshot", "sandbox-3", true).unwrap();
+    let status = seal.status();
+    assert_eq!(status.producers_in_flight, [SANDBOX, "sandbox-3"]);
+    assert!(status.in_flight.is_empty());
+    drop((unsealed, with_vm));
+    seal.assert_quiesced();
+
+    hide_seal_table(&db);
+    let unknown = ActivationSeal::load(&db.lock().unwrap());
+    assert!(unknown.read_error().is_some());
+    let admitted = unknown.admit_producer("snapshot", SANDBOX, false).unwrap();
+    assert_eq!(unknown.status().producers_in_flight, [SANDBOX]);
+    drop(admitted);
+    unknown.assert_quiesced();
+}
+
+/// A sandbox has a VM while no cleanup owns its row and its lifecycle is
+/// `started` or `paused`.
+#[test]
+fn only_a_started_or_paused_sandbox_has_a_vm() {
+    for state in SandboxStatus::sweep() {
+        assert_eq!(
+            has_vm(state),
+            matches!(
+                state,
+                SandboxStatus::Unowned(SandboxState::Started | SandboxState::Paused)
+            ),
+            "{state}"
+        );
+    }
+}

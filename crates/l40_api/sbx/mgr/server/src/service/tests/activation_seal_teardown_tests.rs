@@ -1,9 +1,12 @@
 //! Teardown and durability work on a sealed node.
 //!
-//! The seal refuses VM activations only. Each teardown or durability RPC runs
+//! The seal refuses VM activations, and on a sealed node an artifact
+//! producer for a sandbox without a VM. Each teardown or durability RPC runs
 //! three times against the same fixture, on an unsealed node, a sealed one
 //! and one whose seal row couldn't be read, and must answer the same each
-//! time without asking for activation admission. Node-manager is a fake that confirms cleanup,
+//! time without asking for activation admission, except the backup of a
+//! stopped sandbox, which publishes its disk first: a sealed node refuses
+//! that with its plain refusal. Node-manager is a fake that confirms cleanup,
 //! signals, pauses and the backup's disk snapshot, and the guest's snapshot
 //! preparation is stubbed. The fake's disk snapshot writes no file, so the
 //! backup stops at its upload's local-file check, under a snapshot name that
@@ -65,6 +68,13 @@ impl Teardown {
             Self::Suspend | Self::Stop | Self::Delete | Self::Kill => SandboxState::Started,
             Self::ArtifactBackup => SandboxState::Stopped,
         }
+    }
+
+    /// Whether a sealed node refuses the call with its plain refusal: the
+    /// backup publishes the stopped sandbox's disk first, an artifact
+    /// producer for a sandbox without a VM.
+    fn refused_while_sealed(self) -> bool {
+        matches!(self, Self::ArtifactBackup)
     }
 
     /// What each call answers on an unsealed node: an error's code and a
@@ -270,7 +280,17 @@ async fn teardown_and_durability_work_answers_the_same_on_a_sealed_or_unknown_no
                 message.contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER)
                     || message.contains(crate::activation_seal::ACTIVATION_SEAL_UNREADABLE_MARKER)
             });
-            if answered != unsealed || answered.1 || refused_by_seal {
+            let as_expected = if matches!(seal, Seal::Sealed) && teardown.refused_while_sealed() {
+                !answered.1
+                    && answered.0.as_ref().is_err_and(|(code, message)| {
+                        *code == tonic::Code::FailedPrecondition
+                            && message
+                                .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER)
+                    })
+            } else {
+                answered == unsealed && !answered.1 && !refused_by_seal
+            };
+            if !as_expected {
                 mismatches.push(format!(
                     "{teardown:?}: unsealed answered {unsealed:?}, {seal:?} answered \
                      {answered:?}"
