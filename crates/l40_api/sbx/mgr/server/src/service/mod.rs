@@ -93,6 +93,10 @@ mod template_apps;
 
 /// Enables the network-credential authority path (off by default).
 const NETWORK_CREDENTIALS_ENABLED_ENV: &str = "SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED";
+/// Lets a start of a suspended encrypted sandbox lay its pinned suspend
+/// checkpoint's COW, and a runtime upgrade finish the disk of a checkpoint
+/// staged without a launch. Off by default; see `docs/configuration.md`.
+pub(crate) const STAGED_CHECKPOINT_DISK_ENV: &str = "SPACE_SBXMGR_STAGED_CHECKPOINT_DISK";
 
 use self::drain::DrainState;
 pub use self::drain::{
@@ -443,6 +447,8 @@ pub struct SandboxManagerService {
     credential_manager_client:
         Arc<tokio::sync::OnceCell<pplx_space_credmgr_client::CredentialManagerGrpcClient>>,
     network_credentials_enabled: bool,
+    /// [`STAGED_CHECKPOINT_DISK_ENV`], read once at startup.
+    staged_checkpoint_disk: bool,
     node_manager: NodeManagerConnector,
     /// See [`SandboxManagerServiceOptions::volume_manager_socket_path`].
     volume_manager_socket_path: PathBuf,
@@ -1903,6 +1909,10 @@ impl SandboxManagerService {
                 std::env::var(NETWORK_CREDENTIALS_ENABLED_ENV)
                     .ok()
                     .as_deref(),
+                false,
+            ),
+            staged_checkpoint_disk: pplx_space_env_vars::env_flag_var(
+                STAGED_CHECKPOINT_DISK_ENV,
                 false,
             ),
             gateway_caller_client: options.node_manager.lazy(),

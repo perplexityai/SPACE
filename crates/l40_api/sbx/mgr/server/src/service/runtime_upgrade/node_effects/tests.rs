@@ -115,6 +115,11 @@ impl Fixture {
         self.service.lookup_sandbox(&self.sandbox_id).unwrap()
     }
 
+    /// The sandbox's cache directory.
+    pub(in crate::service::runtime_upgrade) fn dir(&self) -> PathBuf {
+        self.cache.join(&self.sandbox_id)
+    }
+
     pub(in crate::service::runtime_upgrade) fn checkpoint(&self) -> PathBuf {
         self.cache.join(&self.sandbox_id).join("snapshot")
     }
@@ -248,6 +253,189 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
     let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("COW"), "{error}");
+}
+
+/// A template digest that parses, naming the bytes an encrypted COW was
+/// written over.
+const DIGEST: &str = "sha256:5e0f1d2c3b4a59687766554433221100ffeeddccbbaa99887766554433221100";
+
+/// A node-manager answering `GetCloneCapabilities` with or without
+/// `staged_checkpoint_disk`.
+fn node_restoring_cow_only_copies(supported: bool) -> FakeNodeManager {
+    FakeNodeManager::default().unary(
+        "GetCloneCapabilities",
+        move |_: pplx_space_node_mgr_client::proto::CloneCapabilitiesRequest| {
+            Ok(
+                pplx_space_node_mgr_client::proto::CloneCapabilitiesResponse {
+                    prepared_clone_disposal: false,
+                    staged_checkpoint_disk: supported,
+                },
+            )
+        },
+    )
+}
+
+/// In a mixed-version rollout, an encrypted copy without its rootfs is
+/// refused before the fence by a node-manager that can't restore one, as it
+/// is by one older than `GetCloneCapabilities`. A copy with its rootfs needs
+/// no such node-manager and asks nothing.
+#[tokio::test]
+async fn a_cow_only_copy_needs_a_node_manager_that_restores_one() {
+    for node in [
+        node_restoring_cow_only_copies(false),
+        FakeNodeManager::default(),
+    ] {
+        let mut f = fixture(SandboxState::Suspended, true, node);
+        f.service.staged_checkpoint_disk = true;
+        f.service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET template_hash = ?2 WHERE id = ?1",
+                crate::db::fixture::params![f.sandbox_id, DIGEST],
+            )
+            .unwrap();
+        f.effects().inspect_local_disk(&f.row()).await.unwrap();
+        assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+
+        std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
+        let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert!(
+            error.message().contains("roll node-manager out first"),
+            "{error}"
+        );
+        assert_eq!(f._node.calls(), ["GetCloneCapabilities"]);
+    }
+}
+
+/// With the switch off, an encrypted copy without its rootfs is refused as
+/// it was before the switch existed, even by a node-manager that restores
+/// one, so a copy an earlier upgrade finished starts no new upgrade once the
+/// switch is turned off ahead of a node-manager downgrade.
+#[tokio::test]
+async fn the_switch_off_refuses_a_cow_only_copy() {
+    let f = fixture(
+        SandboxState::Suspended,
+        true,
+        node_restoring_cow_only_copies(true),
+    );
+    assert!(!f.service.staged_checkpoint_disk);
+    f.service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET template_hash = ?2 WHERE id = ?1",
+            crate::db::fixture::params![f.sandbox_id, DIGEST],
+        )
+        .unwrap();
+    std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error
+            .message()
+            .contains(crate::service::STAGED_CHECKPOINT_DISK_ENV),
+        "{error}"
+    );
+    assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+}
+
+#[tokio::test]
+async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin() {
+    // Its writes are all in the COW, over the template's rootfs, which the
+    // cold start clones when the instance has none, as a staged checkpoint's
+    // instance doesn't.
+    let mut f = fixture(
+        SandboxState::Suspended,
+        true,
+        node_restoring_cow_only_copies(true),
+    );
+    f.service.staged_checkpoint_disk = true;
+    let set_digest = |digest: Option<&str>| {
+        f.service
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sandboxes SET template_hash = ?2 WHERE id = ?1",
+                crate::db::fixture::params![f.sandbox_id, digest],
+            )
+            .unwrap();
+    };
+    set_digest(Some(DIGEST));
+    std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
+    f.effects().inspect_local_disk(&f.row()).await.unwrap();
+
+    // One that doesn't parse names nothing either.
+    set_digest(Some("not a digest"));
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert!(error.message().contains("template digest"), "{error}");
+
+    // Without a digest, nothing names the bytes the COW was written over.
+    f.service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET template_hash = NULL WHERE id = ?1",
+            crate::db::fixture::params![f.sandbox_id],
+        )
+        .unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("template digest"), "{error}");
+
+    // An origin on disk needs no digest, but must be one the rollback of the
+    // preserved copy restores: not empty, and not a link to a file.
+    let rootfs = f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4");
+    for digest in [None, Some(DIGEST)] {
+        set_digest(digest);
+        std::fs::write(&rootfs, b"").unwrap();
+        let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert!(error.message().contains("rootfs.ext4"), "{error}");
+        assert!(
+            error.message().contains("empty or not a regular file"),
+            "{error}"
+        );
+    }
+    let elsewhere = f.cache.join("elsewhere.ext4");
+    std::fs::write(&elsewhere, b"disk").unwrap();
+    std::fs::remove_file(&rootfs).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &rootfs).unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
+    std::fs::remove_file(&rootfs).unwrap();
+    std::fs::write(&rootfs, b"disk").unwrap();
+    set_digest(None);
+    f.effects().inspect_local_disk(&f.row()).await.unwrap();
+
+    // The COW must be a non-empty regular file, as the rollback of a
+    // preserved copy without the rootfs requires: not empty, and not a link
+    // to one that isn't.
+    let cow = f.cache.join(&f.sandbox_id).join("instance/cow.luks");
+    std::fs::write(&cow, b"").unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
+    let target = f.cache.join("elsewhere.luks");
+    std::fs::write(&target, b"cow").unwrap();
+    std::fs::remove_file(&cow).unwrap();
+    std::os::unix::fs::symlink(&target, &cow).unwrap();
+    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    assert!(
+        error.message().contains("empty or not a regular file"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -596,7 +784,10 @@ async fn a_stopped_sandbox_has_no_checkpoint_to_retire() {
     assert!(f.lane_garbage().is_empty());
 }
 
-fn set_execution(f: &Fixture, execution: SandboxActivationAttemptId) {
+pub(in crate::service::runtime_upgrade) fn set_execution(
+    f: &Fixture,
+    execution: SandboxActivationAttemptId,
+) {
     f.service
         .db
         .lock()

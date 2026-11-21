@@ -156,6 +156,7 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
             .unary("GetCloneCapabilities", |_: CloneCapabilitiesRequest| {
                 Ok(CloneCapabilitiesResponse {
                     prepared_clone_disposal: true,
+                    staged_checkpoint_disk: false,
                 })
             })
             .unary("CaptureVmState", move |_: CaptureVmStateRequest| {
@@ -643,6 +644,7 @@ impl<B> tower::Service<http::Request<B>> for CleanupPeer {
             use prost::Message;
             let response = pplx_space_node_mgr_client::proto::CloneCapabilitiesResponse {
                 prepared_clone_disposal: supported,
+                staged_checkpoint_disk: false,
             }
             .encode_to_vec();
             let mut frame = vec![0];

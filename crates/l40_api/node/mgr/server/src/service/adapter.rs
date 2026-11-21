@@ -79,6 +79,7 @@ impl NodeManager for NodeManagerService {
         self.authorize_peer(&request, "GetCloneCapabilities", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
         Ok(Response::new(CloneCapabilitiesResponse {
             prepared_clone_disposal: true,
+            staged_checkpoint_disk: true,
         }))
     }
 
@@ -608,6 +609,19 @@ impl NodeManager for NodeManagerService {
             "BtrfsCreateSandboxInstance",
             sandbox_id,
             NodeManagerService::btrfs_create_sandbox_instance(self, request),
+        )
+        .await
+    }
+
+    async fn materialize_staged_checkpoint_disk(
+        &self,
+        request: Request<crate::proto::MaterializeStagedCheckpointDiskRequest>,
+    ) -> Result<Response<crate::proto::MaterializeStagedCheckpointDiskResponse>, Status> {
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        observe_rpc(
+            "MaterializeStagedCheckpointDisk",
+            sandbox_id,
+            NodeManagerService::materialize_staged_checkpoint_disk(self, request),
         )
         .await
     }
