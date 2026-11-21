@@ -245,6 +245,31 @@ newer copy, so the reconciler leaves the sandbox to that node in two ways.
 The listing's skip has no metric of its own: such a sandbox is one the node
 reports while the control plane has no pod for it.
 
+## Sandbox disk is full
+
+A sandbox's root disk size is fixed when the sandbox is created, and the API
+cannot change it afterwards. An operator on the worker node can grow the root
+disk of a running or paused sandbox in place, without restarting it:
+
+```bash
+sudo space-nodemgr grow-rootfs <sandbox> --size-mib 30720
+```
+
+This makes the disk larger but does not grow the filesystem on it. Do that
+from inside the sandbox, as root, while it keeps running:
+
+```bash
+sudo resize2fs /dev/vda
+df -h /
+```
+
+What to expect:
+
+- Grow-only. The new size must be larger than the current one and within the platform maximum (128 GiB). Asking for the current size again is allowed; it only re-notifies the guest.
+- Plaintext root disks on Firecracker only. Sandboxes with an encrypted root disk are refused.
+- The grown disk is kept across pause, suspend, wake, fork and node-to-node moves. The size shown in the sandbox's stored configuration stays at its original value.
+- The extra space is allocated only as the guest writes to it, and it counts against the node's disk admission.
+
 ## Timeouts mean different things
 
 A client deadline limits how long the client waits; it does not cancel a lifecycle operation or establish that a process stopped. Inspect the resource before retrying or issuing another command.
