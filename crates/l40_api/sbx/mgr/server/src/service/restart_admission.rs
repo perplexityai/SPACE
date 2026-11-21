@@ -219,6 +219,12 @@ restart_rpcs! {
     SandboxListAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts", ReadOnlyWithNarrowStateWrites),
     SandboxAcknowledgeAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts", StateWriter),
     SandboxListPendingLocalBackups => ("/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups", ReadOnly),
+    // The call itself writes only the seal row. Each suspend, disk
+    // publication or upload it starts runs as a detached state writer.
+    SandboxDrainNode => ("/space.sandbox.manager.v1.SandboxManager/DrainNode", ReadOnlyWithNarrowStateWrites),
+    // Reads the rows, the drain's memory and node-manager's orphan
+    // inventory, and starts nothing.
+    SandboxPreviewDrainNode => ("/space.sandbox.manager.v1.SandboxManager/PreviewDrainNode", ReadOnly),
     SandboxState => ("/space.sandbox.manager.v1.SandboxManager/State", ReadOnly),
     SandboxGetHealth => ("/space.sandbox.manager.v1.SandboxManager/GetSandboxHealth", ReadOnly),
     SandboxGetEnv => ("/space.sandbox.manager.v1.SandboxManager/GetEnv", ReadOnly),

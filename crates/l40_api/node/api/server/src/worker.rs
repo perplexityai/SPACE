@@ -1531,6 +1531,22 @@ impl WorkerApiInternal for WorkerApiService {
         require_policy_mutation_authority(&r)?;
         fwd_sbx!(self, "GetRuntimeUpgrade", get_runtime_upgrade, r)
     }
+
+    async fn drain_node(
+        &self,
+        _request: Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>, Status> {
+        // Answered as by a server without the RPC until node-api relays it.
+        Err(Status::unimplemented(""))
+    }
+
+    async fn preview_drain_node(
+        &self,
+        _request: Request<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeResponse>, Status> {
+        // Answered as by a server without the RPC until node-api relays it.
+        Err(Status::unimplemented(""))
+    }
 }
 
 #[cfg(test)]
