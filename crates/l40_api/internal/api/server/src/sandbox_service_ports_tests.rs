@@ -30,7 +30,7 @@ async fn set_drain(
 /// it made ingress the one access path a gentle drain still broke, while every
 /// user-API path stayed open.
 ///
-/// The truth table is `NodeDrainState::blocks_placement`, shared with the
+/// The truth table is `NodeDrain::blocks_placement`, shared with the
 /// user-API drain gates so the two cannot drift.
 #[tokio::test(flavor = "current_thread")]
 async fn gentle_draining_node_does_not_block_a_service_port_open() -> TestResult {
