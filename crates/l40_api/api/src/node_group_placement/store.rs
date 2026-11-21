@@ -44,6 +44,8 @@ use pplx_space_node_model::{
 };
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateName, TemplateVisibility};
+use std::collections::BTreeSet;
+
 use uuid::Uuid;
 
 /// A template's compatibility slice together with the cluster's node groups —
@@ -62,6 +64,12 @@ pub struct NodeGroupCatalog {
     /// filtering in SQL would fork it. Empty means the cluster has no node
     /// groups at all.
     pub groups: Vec<NodeGroup>,
+    /// Orgs that own at least one `exclusive` dedicated group. Such an org is
+    /// confined to dedicated capacity: the resolver drops every generic group
+    /// from its candidate set. Kept beside the groups, not on
+    /// [`NodeGroup`], because it narrows the set rather than deciding whether
+    /// one group is compatible.
+    pub exclusive_orgs: BTreeSet<OrgId>,
 }
 
 /// Failure reading the catalog.
@@ -99,6 +107,7 @@ struct CatalogRow {
     group_org_id: Option<OrgId>,
     group_template_policy: Option<NodeGroupTemplatePolicy>,
     group_is_default: Option<bool>,
+    group_exclusive: Option<bool>,
     /// **Narrowed to the queried template.** The join filters
     /// `template_name = $1`, so this is `[]` or `[$1]` rather than the group's
     /// whole allowlist — see the statement below for why.
@@ -140,6 +149,7 @@ pub async fn catalog_for_template(
                 g.org_id AS group_org_id,
                 g.template_policy AS group_template_policy,
                 g.is_default AS group_is_default,
+                g.exclusive AS group_exclusive,
                 COALESCE(
                     ARRAY_AGG(c.template_name) FILTER (WHERE c.template_name IS NOT NULL),
                     ARRAY[]::TEXT[]
@@ -155,7 +165,8 @@ pub async fn catalog_for_template(
                    g.name,
                    g.org_id,
                    g.template_policy,
-                   g.is_default
+                   g.is_default,
+                   g.exclusive
           ORDER BY g.name ASC"
     ))
     .bind(template_name)
@@ -171,6 +182,7 @@ pub async fn catalog_for_template(
         visibility: first.template_visibility,
     };
     let mut groups = Vec::with_capacity(rows.len());
+    let mut exclusive_orgs = BTreeSet::new();
     for row in &rows {
         // The all-NULL group row: a template that exists on a cluster with no
         // node groups. One row in, zero groups out.
@@ -188,6 +200,11 @@ pub async fn catalog_for_template(
         // pins it to `default`, and `compatible` never consults an allowlist
         // for a generic group) and a dedicated group's `is_default`
         // (`node_groups_default_is_generic` pins it to false).
+        // `node_groups_exclusive_requires_org` keeps `exclusive` off generic
+        // groups, so only an owner can be recorded here.
+        if let (Some(org_id), Some(true)) = (row.group_org_id, row.group_exclusive) {
+            exclusive_orgs.insert(org_id);
+        }
         let policy = match row.group_org_id {
             None => NodeGroupPolicy::Generic { is_default },
             Some(org_id) => NodeGroupPolicy::Dedicated {
@@ -209,7 +226,11 @@ pub async fn catalog_for_template(
             template_allowlist,
         });
     }
-    Ok(Some(NodeGroupCatalog { template, groups }))
+    Ok(Some(NodeGroupCatalog {
+        template,
+        groups,
+        exclusive_orgs,
+    }))
 }
 
 /// Parses a template name, attaching the column it came from to a failure.

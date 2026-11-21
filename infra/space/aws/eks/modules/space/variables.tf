@@ -394,6 +394,24 @@ variable "workers_disk_size_gib" {
   default     = 100
 }
 
+variable "encrypted_worker_launch_templates" {
+  description = "Tenant-encrypted worker launch templates keyed by a short name. Each encrypts the root volume under kms_key_arn and tags instances so the AMI puts /space/cache on LUKS2 under a data key from that key, with a watchdog that powers the node off when the key is revoked. Requires the custom worker AMI. disk_size_gib defaults to workers_disk_size_gib."
+  type = map(object({
+    kms_key_arn   = string
+    disk_size_gib = optional(number)
+  }))
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for name, template in var.encrypted_worker_launch_templates :
+      can(regex("^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$", name)) &&
+      can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[0-9a-f-]+$", template.kms_key_arn))
+    ])
+    error_message = "Keys must be short lowercase slugs and kms_key_arn must be a KMS key ARN (not an alias: EBS and the cache watchdog need the key itself)."
+  }
+}
+
 variable "workers_ami_id" {
   description = "Custom AMI ID for the worker node groups; custom AMIs must include EKS bootstrap tooling. A worker AMI selector is required: this, or one of workers_ami_git_sha and workers_ami_name_pattern (mutually exclusive), which this overrides. When a lookup selector is also set, this must be known at plan time."
   type        = string

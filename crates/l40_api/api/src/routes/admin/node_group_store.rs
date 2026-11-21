@@ -27,6 +27,7 @@ pub(super) struct NodeGroupRow {
     pub(super) org_id: Option<OrgId>,
     pub(super) template_policy: NodeGroupTemplatePolicy,
     pub(super) is_default: bool,
+    pub(super) exclusive: bool,
     pub(super) created_at: OffsetDateTime,
     pub(super) nodes_count: i64,
 }
@@ -53,6 +54,7 @@ const NODE_GROUP_SELECT: &str = "SELECT g.id,
        g.org_id,
        g.template_policy,
        g.is_default,
+       g.exclusive,
        g.created_at,
        (SELECT COUNT(*) FROM nodes n
          WHERE n.role = 'worker'
@@ -157,17 +159,19 @@ pub(super) async fn insert_node_group(
     org_id: Option<OrgId>,
     template_policy: NodeGroupTemplatePolicy,
     is_default: bool,
+    exclusive: bool,
 ) -> Result<NodeGroupId, sqlx::Error> {
     let id = NodeGroupId::new();
     sqlx::query(sql!(
-        "INSERT INTO node_groups (id, name, org_id, template_policy, is_default)
-         VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO node_groups (id, name, org_id, template_policy, is_default, exclusive)
+         VALUES ($1, $2, $3, $4, $5, $6)"
     ))
     .bind(id)
     .bind(name)
     .bind(org_id)
     .bind(template_policy)
     .bind(is_default)
+    .bind(exclusive)
     .execute(pool)
     .await?;
     Ok(id)
@@ -279,7 +283,9 @@ pub(super) async fn org_exists_in_tx(
 /// the allowlist is cleared in the same transaction — a restricted allowlist
 /// curated for one org is meaningless (and partly illegal) under another org
 /// or under generic, and leaving it behind would silently resurrect if the
-/// group were later restricted again.
+/// group were later restricted again. `exclusive` is cleared by any org
+/// change for the same reason: confining an org to dedicated capacity is a
+/// decision about that org, not about the hardware.
 pub(super) async fn update_group_org_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_group_id: NodeGroupId,
@@ -297,7 +303,8 @@ pub(super) async fn update_group_org_in_tx(
     sqlx::query(sql!(
         "UPDATE node_groups
             SET org_id = $2,
-                template_policy = CASE WHEN $3 THEN 'default' ELSE template_policy END
+                template_policy = CASE WHEN $3 THEN 'default' ELSE template_policy END,
+                exclusive = exclusive AND org_id IS NOT DISTINCT FROM $2
           WHERE id = $1"
     ))
     .bind(node_group_id)

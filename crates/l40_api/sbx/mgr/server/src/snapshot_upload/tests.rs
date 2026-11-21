@@ -978,3 +978,19 @@ fn storage_uri_honours_key_prefix() {
         ),
     );
 }
+
+#[test]
+fn an_encrypted_cache_withholds_the_shared_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join(".space-cache-encrypted");
+
+    let plain = shared_upload_config_for_node(Some(fixture_config()), &marker);
+    assert_eq!(
+        plain.map(|config| config.bucket),
+        Some("test-bucket".to_string())
+    );
+
+    std::fs::write(&marker, b"").unwrap();
+    assert!(shared_upload_config_for_node(Some(fixture_config()), &marker).is_none());
+    assert!(shared_upload_config_for_node(None, &marker).is_none());
+}

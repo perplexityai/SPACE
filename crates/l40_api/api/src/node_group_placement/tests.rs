@@ -544,6 +544,141 @@ async fn warm_pool_resolves_generic_capacity_only() -> TestResult {
     Ok(())
 }
 
+async fn mark_exclusive(pool: &PgPool, group_id: Uuid) -> TestResult {
+    sqlx::query("UPDATE node_groups SET exclusive = TRUE WHERE id = $1")
+        .bind(group_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// An org that owns an exclusive group is confined to its own dedicated
+/// capacity for every template and every path: generic groups leave its set,
+/// and other orgs keep resolving shared capacity as before.
+#[tokio::test(flavor = "current_thread")]
+async fn exclusive_owner_is_confined_to_its_dedicated_groups() -> TestResult {
+    let Some(fixture) = fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.pool;
+    insert_template(pool, "seed", "generic", None).await?;
+    insert_group(
+        pool,
+        "workers",
+        None,
+        NodeGroupTemplatePolicy::Default,
+        true,
+    )
+    .await?;
+    let owned = insert_group(
+        pool,
+        "org-a-1",
+        Some(OrgId::from_uuid(ORG_A)),
+        NodeGroupTemplatePolicy::Default,
+        false,
+    )
+    .await?;
+    mark_exclusive(pool, owned).await?;
+    let resolver = enabled_resolver(pool);
+
+    for path in [
+        ResolvePath::Create,
+        ResolvePath::Restore,
+        ResolvePath::Evacuation,
+        ResolvePath::Materialize,
+    ] {
+        let resolved = resolver
+            .resolve(
+                path,
+                PlacementSubject::Sandbox(OrgId::from_uuid(ORG_A)),
+                "seed",
+            )
+            .await?;
+        let placement = placed(&resolved);
+        assert_eq!(candidate_names(placement), vec!["org-a-1"], "{path}");
+        assert!(placement.targets_dedicated_capacity(), "{path}");
+        assert!(!placement.admits_shared_capacity(), "{path}");
+    }
+
+    let other = resolver
+        .resolve(
+            ResolvePath::Create,
+            PlacementSubject::Sandbox(OrgId::from_uuid(ORG_B)),
+            "seed",
+        )
+        .await?;
+    assert_eq!(candidate_names(placed(&other)), vec!["workers"]);
+
+    let pooled = resolver
+        .resolve(ResolvePath::WarmPool, PlacementSubject::WarmPool, "seed")
+        .await?;
+    assert_eq!(candidate_names(placed(&pooled)), vec!["workers"]);
+    Ok(())
+}
+
+/// A confined org whose exclusive groups do not admit a template fails closed
+/// even for a generic template, where a non-confined org with no generic group
+/// would resolve `Unprovisioned` and render no boundary at all.
+#[tokio::test(flavor = "current_thread")]
+async fn exclusive_owner_without_a_compatible_group_fails_closed() -> TestResult {
+    let Some(fixture) = fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.pool;
+    insert_template(pool, "seed", "generic", None).await?;
+    insert_group(
+        pool,
+        "workers",
+        None,
+        NodeGroupTemplatePolicy::Default,
+        true,
+    )
+    .await?;
+    // Restricted with an empty allowlist: admits nothing.
+    let owned = insert_group(
+        pool,
+        "org-a-1",
+        Some(OrgId::from_uuid(ORG_A)),
+        NodeGroupTemplatePolicy::Restricted,
+        false,
+    )
+    .await?;
+    mark_exclusive(pool, owned).await?;
+
+    let refused = enabled_resolver(pool)
+        .resolve(
+            ResolvePath::Restore,
+            PlacementSubject::Sandbox(OrgId::from_uuid(ORG_A)),
+            "seed",
+        )
+        .await
+        .expect_err("a confined org has no shared fallback");
+    assert!(matches!(
+        refused,
+        NodeGroupPlacementResolveError::NoCompatibleNodeGroup { .. }
+    ));
+    Ok(())
+}
+
+/// The schema keeps `exclusive` off generic groups.
+#[tokio::test(flavor = "current_thread")]
+async fn a_generic_group_cannot_be_exclusive() -> TestResult {
+    let Some(fixture) = fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.pool;
+    let generic = insert_group(
+        pool,
+        "workers",
+        None,
+        NodeGroupTemplatePolicy::Default,
+        true,
+    )
+    .await?;
+    assert!(mark_exclusive(pool, generic).await.is_err());
+    Ok(())
+}
+
 // ── local-only restore pre-flight ───────────────────────────────────────────
 
 fn generic_group(name: &str) -> NodeGroup {

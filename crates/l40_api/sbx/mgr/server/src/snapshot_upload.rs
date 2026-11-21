@@ -42,6 +42,34 @@ use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotName};
 use pplx_space_volmgr_client::proto::PushFileRequest;
 
+/// Written by the node's cache mount unit when `/space/cache` sits on dm-crypt
+/// under an org-controlled KMS key. Its presence means snapshot bytes on this
+/// node belong to a tenant whose data must not reach the shared snapshot
+/// bucket.
+pub const ENCRYPTED_CACHE_MARKER: &str = "/space/cache/.space-cache-encrypted";
+
+/// The env-configured (shared) upload destination, withheld on a node whose
+/// cache is tenant-encrypted. Such a node may upload only to the owning org's
+/// own destination (`snapshot_base_object_storage_uri`), which is resolved per
+/// sandbox; with no override configured, suspend fails closed instead of
+/// writing tenant bytes to the shared bucket.
+pub fn shared_upload_config_for_node(
+    env: Option<SnapshotUploadConfig>,
+    encrypted_cache_marker: &Path,
+) -> Option<SnapshotUploadConfig> {
+    if encrypted_cache_marker.exists() {
+        if env.is_some() {
+            tracing::warn!(
+                marker = %encrypted_cache_marker.display(),
+                "node cache is tenant-encrypted; the shared snapshot destination is disabled \
+                 and only org-owned destinations are used"
+            );
+        }
+        return None;
+    }
+    env
+}
+
 /// Resolved S3 configuration for snapshot uploads.
 ///
 /// Built once at startup from env vars and then shared across suspend calls.

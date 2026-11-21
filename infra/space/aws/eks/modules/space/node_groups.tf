@@ -80,6 +80,7 @@ resource "aws_launch_template" "workers" {
       bootstrap_bucket           = var.bootstrap_bucket
       shim_dogstatsd_socket_path = var.worker_shim_dogstatsd_socket_path
       shim_environment           = var.environment
+      cache_encryption_required  = false
     },
   ))
 
@@ -102,6 +103,97 @@ resource "aws_launch_template" "workers" {
   tags = merge(local.worker_common_tags, {
     Name = "${local.name}-workers-cgnat"
   })
+}
+
+# Tenant-encrypted worker launch templates, one per entry in
+# `var.encrypted_worker_launch_templates`. Each is the shared worker template
+# with two differences, both keyed to the tenant's KMS key:
+#
+# - The root EBS volume (/space, swap, container images, logs) is encrypted
+#   under that key instead of the account default.
+# - The instance carries the `SpaceCacheEncryptionKmsKeyArn` tag, which the
+#   AMI's cache unit reads through instance metadata to put /space/cache on
+#   LUKS2 under a data key from that key, start the revocation watchdog, and
+#   write the marker that keeps sandbox-manager off the shared snapshot bucket.
+#
+# The user data refuses to boot when the AMI predates that unit, so an old AMI
+# can't silently format a plaintext cache. Each template has its own node role
+# (`aws_iam_role.workers_encrypted`, iam.tf) that may use the key for the cache;
+# the MNG built from the template must use that role. The key policy must allow
+# that role, and the Auto Scaling service-linked role for the root volume.
+resource "aws_launch_template" "workers_encrypted" {
+  for_each = var.encrypted_worker_launch_templates
+
+  name_prefix            = "${local.name}-workers-enc-${each.key}-"
+  image_id               = local.workers_ami_id
+  update_default_version = true
+  vpc_security_group_ids = [
+    module.eks.node_security_group_id,
+    module.eks.cluster_security_group_id,
+  ]
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      delete_on_termination = true
+      encrypted             = true
+      kms_key_id            = each.value.kms_key_arn
+      volume_size           = coalesce(each.value.disk_size_gib, var.workers_disk_size_gib)
+      volume_type           = "gp3"
+    }
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = var.node_instance_metadata_hop_limit
+    http_tokens                 = "required"
+    # Required: the cache unit reads its key ARN from the instance tags.
+    instance_metadata_tags = "enabled"
+  }
+
+  user_data = local.workers_ami_id == null ? null : base64encode(templatefile(
+    "${path.module}/templates/worker-bootstrap.sh.tftpl",
+    {
+      cluster_endpoint           = module.eks.cluster_endpoint
+      cluster_name               = module.eks.cluster_name
+      cluster_service_cidr       = var.cluster_service_cidr
+      cluster_ca_data            = module.eks.cluster_certificate_authority_data
+      space_cache_nvme_mount     = file("${path.module}/templates/space-cache-nvme-mount.sh")
+      bootstrap_bucket           = var.bootstrap_bucket
+      shim_dogstatsd_socket_path = var.worker_shim_dogstatsd_socket_path
+      shim_environment           = var.environment
+      cache_encryption_required  = true
+    },
+  ))
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = merge(local.worker_common_tags, {
+      Name                          = "${local.name}-workers-enc-${each.key}"
+      SpaceCacheEncryptionKmsKeyArn = each.value.kms_key_arn
+    })
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+
+    tags = merge(local.worker_common_tags, {
+      Name = "${local.name}-workers-enc-${each.key}"
+    })
+  }
+
+  tags = merge(local.worker_common_tags, {
+    Name = "${local.name}-workers-enc-${each.key}"
+  })
+
+  lifecycle {
+    precondition {
+      condition     = local.workers_ami_id != null
+      error_message = "An encrypted worker launch template needs the custom worker AMI: the cache encryption lives in its boot unit."
+    }
+  }
 }
 
 locals {
