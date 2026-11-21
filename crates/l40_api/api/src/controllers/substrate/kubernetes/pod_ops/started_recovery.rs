@@ -146,7 +146,11 @@ impl KubernetesSubstrate {
         if let Some(assignment) = activation_assignment
             && let Some(id) = replacement_claim.row.activation_attempt_id
         {
-            assignment.record_assigned(id, replacement_claim.row.generation);
+            assignment.record_assigned(
+                id,
+                replacement_claim.row.generation,
+                &replacement_claim.row.pod_name,
+            );
         }
         let replacement_event_details = started_recovery_replacement_event_details(
             SandboxEventDetails::default()
