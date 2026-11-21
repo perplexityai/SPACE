@@ -28,6 +28,7 @@ mod release;
 mod release_source;
 mod s3;
 pub(crate) mod source;
+pub(crate) mod space_kernels;
 mod staging;
 mod store;
 #[cfg(test)]

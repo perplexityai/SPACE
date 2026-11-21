@@ -134,6 +134,13 @@ struct Cli {
     /// above the `v<line>` release-line directories. Read anonymously.
     #[arg(long, default_value = FIRECRACKER_CI_KERNEL_SOURCE)]
     kernel_source: StorageUri,
+
+    /// Where SPACE's own Firecracker guest kernels are published: an `s3://`
+    /// URI whose key prefix holds `vmlinux-<version>/sha256:<hex>/vmlinux.bin`,
+    /// read with the default AWS credential chain. Only the catalog's
+    /// SPACE-published pins are offered from it. Unset, they are not offered.
+    #[arg(long)]
+    space_kernel_source: Option<StorageUri>,
 }
 
 /// `--runtime-releases`: a runtime and its release root.
@@ -203,7 +210,13 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
             },
             list_admission_timeout: Duration::from_secs(cli.list_admission_timeout_secs),
             kernel_sources: vec![
-                KernelSourceConfig::S3(cli.kernel_source),
+                match cli.space_kernel_source {
+                    None => KernelSourceConfig::S3(cli.kernel_source),
+                    Some(root) => KernelSourceConfig::SpacePublished {
+                        root,
+                        upstream: Box::new(KernelSourceConfig::S3(cli.kernel_source)),
+                    },
+                },
                 KernelSourceConfig::CloudHypervisor,
             ],
             catalog_dir: cli.catalog_dir,

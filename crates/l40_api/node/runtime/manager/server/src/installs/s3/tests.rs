@@ -54,6 +54,8 @@ fn the_public_source_addresses_lines_and_objects_by_key() {
 async fn the_public_bucket_lists_the_kernels_for_a_line() {
     let source = S3KernelSource::new(FIRECRACKER_CI_KERNEL_SOURCE.parse().unwrap());
     let catalog = pplx_space_node_runtime_core::catalog::RuntimeCatalog::compiled().unwrap();
+    let space_published =
+        pplx_space_node_runtime_core::catalog::RuntimeCatalog::space_published_kernels().unwrap();
     for line in ["1.15", "1.16", "1.17"] {
         for architecture in [Arch::X86_64, Arch::Aarch64] {
             let kernels = source.list(fc_line(line), architecture).await.unwrap();
@@ -62,6 +64,13 @@ async fn the_public_bucket_lists_the_kernels_for_a_line() {
                 &line.parse().unwrap(),
                 architecture,
             ) {
+                // SPACE publishes these itself; the public bucket never holds them.
+                if space_published
+                    .iter()
+                    .any(|space| space.version == pin.version && space.sha256 == pin.sha256)
+                {
+                    continue;
+                }
                 assert!(
                     kernels.iter().any(|kernel| {
                         kernel.version.artifact_version() == &pin.version && kernel.size == pin.size

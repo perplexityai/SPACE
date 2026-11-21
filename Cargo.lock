@@ -7209,6 +7209,7 @@ name = "pplx-space-node-runtime-manager"
 version = "0.8.2"
 dependencies = [
  "async-trait",
+ "aws-config",
  "aws-sdk-s3",
  "bytes",
  "flate2",
