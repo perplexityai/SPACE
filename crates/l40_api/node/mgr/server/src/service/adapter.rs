@@ -453,6 +453,13 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::deny_port(self, request).await
     }
 
+    async fn sync_firewall_rules(
+        &self,
+        request: Request<crate::proto::SyncFirewallRulesRequest>,
+    ) -> Result<Response<crate::proto::SyncFirewallRulesResponse>, Status> {
+        NodeManagerService::sync_firewall_rules(self, request).await
+    }
+
     async fn publish_artifact(
         &self,
         request: Request<PublishArtifactRequest>,
