@@ -1,0 +1,1 @@
+DROP TABLE snapshot_retention_checkpoint;
