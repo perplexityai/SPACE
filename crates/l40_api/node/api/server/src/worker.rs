@@ -65,6 +65,16 @@ fn check_policy_mutation_authority(
     }
 }
 
+/// The node drain's authority: the control plane's, which a policy mutation
+/// also needs, refused with a denial that names `rpc`.
+fn require_node_drain_authority<T>(request: &Request<T>, rpc: &str) -> Result<(), Status> {
+    require_policy_mutation_authority(request).map_err(|_| {
+        Status::permission_denied(format!(
+            "caller is not authorized to call {rpc}: only the control plane drains a node"
+        ))
+    })
+}
+
 fn classify_wait_ready_caller<T>(request: &Request<T>) -> SpaceApiBridgeCallerPolicy {
     classify_wait_ready_policy(
         request
@@ -1534,18 +1544,31 @@ impl WorkerApiInternal for WorkerApiService {
 
     async fn drain_node(
         &self,
-        _request: Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
+        r: Request<pplx_space_sbx_mgr_client::proto::DrainNodeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DrainNodeResponse>, Status> {
-        // Answered as by a server without the RPC until node-api relays it.
-        Err(Status::unimplemented(""))
+        // Seals the node and evacuates it: only the control plane drains.
+        require_node_drain_authority(&r, "DrainNode")?;
+        // Node-wide, so it takes no sandbox's permit; it changes the node's
+        // seal, so it is replayed only with proof it never reached
+        // sandbox-manager.
+        self.sbx_unary_with_handoff(
+            "DrainNode",
+            RpcReplaySafety::RequiresProof,
+            r,
+            |mut client, request| async move { client.drain_node(request).await },
+        )
+        .await
     }
 
     async fn preview_drain_node(
         &self,
-        _request: Request<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest>,
+        r: Request<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::PreviewDrainNodeResponse>, Status> {
-        // Answered as by a server without the RPC until node-api relays it.
-        Err(Status::unimplemented(""))
+        // Changes nothing, but answers what a drain would find on the whole
+        // node, so it takes the drain's authority. Node-wide, so it takes no
+        // sandbox's permit; it only reads, so it replays as a read.
+        require_node_drain_authority(&r, "PreviewDrainNode")?;
+        fwd_sbx_read!(self, "PreviewDrainNode", preview_drain_node, r)
     }
 }
 
