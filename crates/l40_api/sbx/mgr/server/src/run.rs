@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ use pplx_space_host_layout::{
 };
 use pplx_space_local_health::LocalHealthServer;
 use pplx_space_service_lifecycle::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_SERVICE_MUTEX_TIMEOUT};
-use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex, TakeoverGate, TakeoverGateError};
 use pplx_space_spaced_protocol::proto::host_control::host_control_server::HostControlServer;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -548,10 +548,11 @@ pub struct SbxMgrRunConfig {
     /// mutex is acquired.
     pub host_control_socket_path: PathBuf,
     /// Instance-local health Unix socket, bound after receiver verification so
-    /// readiness can pass while this instance is still passive.
+    /// readiness can pass while this instance is still passive, once its
+    /// database would be accepted.
     pub health_socket_path: Option<PathBuf>,
-    /// How long the passive instance waits for the predecessor to release the
-    /// service mutex before exiting non-zero.
+    /// How long the passive instance waits, once ready to take over, for the
+    /// predecessor to release the service mutex before exiting non-zero.
     pub service_mutex_timeout: Duration,
 }
 
@@ -567,6 +568,8 @@ pub enum RunSbxMgrError {
     HealthSocket(#[source] pplx_space_local_health::LocalHealthServerError),
     #[error("failed to acquire the sandbox-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
+    #[error("failed to check the sandbox-manager database before takeover: {0}")]
+    CheckMigrations(#[source] crate::db::OpenError),
     #[error("failed to migrate the sandbox-manager database: {0}")]
     Migrate(#[source] crate::db::OpenError),
     #[error("failed to open the sandbox-manager database: {0}")]
@@ -671,11 +674,17 @@ fn parse_node_managed_by(
     }
 }
 
-async fn start_takeover_health<C, Fut>(
+/// The pre-takeover phase: liveness answers from the start, and takeover
+/// readiness waits for node-manager and then for the takeover gate, whose
+/// `check` predicts whether migrating the database would be refused. Returns
+/// the mutex when the gate took it with no predecessor holding it.
+async fn start_takeover_health<C, Fut, K, KFut, B>(
     config: &SbxMgrRunConfig,
     shutdown_token: &CancellationToken,
+    service_mutex: &Path,
     connect: C,
-) -> Result<LocalHealthServer, RunSbxMgrError>
+    check: K,
+) -> Result<(LocalHealthServer, Option<ServiceMutex>), RunSbxMgrError>
 where
     C: FnMut() -> Fut,
     Fut: Future<
@@ -684,6 +693,9 @@ where
             pplx_space_node_mgr_client::ConnectError,
         >,
     >,
+    K: FnMut() -> KFut,
+    KFut: Future<Output = Result<Option<B>, crate::db::OpenError>>,
+    B: std::fmt::Display + PartialEq,
 {
     // A restarted process may have no predecessor left. Keep liveness available
     // while waiting, but never authorize takeover before the dependency answers.
@@ -696,22 +708,38 @@ where
         health_shutdown.clone(),
     )
     .map_err(RunSbxMgrError::HealthSocket)?;
-    let result = wait_for_node_manager(StartupPhase::BeforeTakeover, shutdown_token, connect).await;
+    let result =
+        match wait_for_node_manager(StartupPhase::BeforeTakeover, shutdown_token, connect).await {
+            Ok(()) => health
+                .gate_takeover(service_mutex, shutdown_token, check)
+                .await
+                .map_err(|error| match error {
+                    TakeoverGateError::Check(error) => RunSbxMgrError::CheckMigrations(error),
+                    TakeoverGateError::Mutex(error) => RunSbxMgrError::ServiceMutex(error),
+                }),
+            Err(NodeManagerStartupError::Cancelled) => Ok(TakeoverGate::PassiveExit),
+            Err(NodeManagerStartupError::Status(status)) => {
+                Err(RunSbxMgrError::NodeManagerStartup(status))
+            }
+        };
     match result {
-        Ok(()) => {
-            health.mark_takeover_ready();
+        Ok(TakeoverGate::Open) => {
             health_guard.disarm();
-            Ok(health)
+            Ok((health, None))
+        }
+        Ok(TakeoverGate::Acquired(mutex)) => {
+            health_guard.disarm();
+            Ok((health, Some(mutex)))
+        }
+        Ok(TakeoverGate::PassiveExit) => {
+            health_shutdown.cancel();
+            health.join().await;
+            Ok((LocalHealthServer::disabled(), None))
         }
         Err(error) => {
             health_shutdown.cancel();
             health.join().await;
-            match error {
-                NodeManagerStartupError::Cancelled => Ok(LocalHealthServer::disabled()),
-                NodeManagerStartupError::Status(status) => {
-                    Err(RunSbxMgrError::NodeManagerStartup(status))
-                }
-            }
+            Err(error)
         }
     }
 }
@@ -764,8 +792,14 @@ pub async fn run(
     ));
 
     let node_manager = crate::node_manager_transport::NodeManagerConnector::host();
-    let health_server =
-        start_takeover_health(&config, &shutdown_token, || node_manager.connect_once()).await?;
+    let (health_server, gated_mutex) = start_takeover_health(
+        &config,
+        &shutdown_token,
+        Path::new(SERVICE_MUTEX_PATH),
+        || node_manager.connect_once(),
+        crate::db::check_migrate,
+    )
+    .await?;
     let health_socket = config
         .health_socket_path
         .as_ref()
@@ -777,20 +811,25 @@ pub async fn run(
         "space-sbx-manager passive; waiting for service mutex"
     );
 
-    let service_mutex = match ServiceMutex::acquire_with_timeout(
-        SERVICE_MUTEX_PATH,
-        &shutdown_token,
-        config.service_mutex_timeout,
-    )
-    .await
-    .map_err(RunSbxMgrError::ServiceMutex)?
-    {
-        AcquireOutcome::Acquired(mutex) => mutex,
-        AcquireOutcome::PassiveExit => {
-            tracing::warn!("terminated while passive; exiting cleanly");
-            health_server.join().await;
-            return Ok(());
-        }
+    // The gate holds the mutex only when no predecessor did; otherwise the
+    // acquire budget starts here, after the gate opened.
+    let service_mutex = match gated_mutex {
+        Some(mutex) => mutex,
+        None => match ServiceMutex::acquire_with_timeout(
+            SERVICE_MUTEX_PATH,
+            &shutdown_token,
+            config.service_mutex_timeout,
+        )
+        .await
+        .map_err(RunSbxMgrError::ServiceMutex)?
+        {
+            AcquireOutcome::Acquired(mutex) => mutex,
+            AcquireOutcome::PassiveExit => {
+                tracing::warn!("terminated while passive; exiting cleanly");
+                health_server.join().await;
+                return Ok(());
+            }
+        },
     };
 
     tracing::info!(

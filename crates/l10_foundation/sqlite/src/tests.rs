@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use pplx_space_observability::test_capture::{RecordingVisitor, field_value};
@@ -1233,4 +1234,638 @@ async fn sqlx_refuses_a_history_that_changes_after_validation_accepted_a_newer_r
         pool.close().await;
         assert_eq!(stored_state(&path), before, "{case}");
     }
+}
+
+/// Every file below `directory`, with a hash of its contents and its
+/// modification time.
+fn files_below(directory: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut files = BTreeMap::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::fs::read(&path).unwrap().hash(&mut hasher);
+                files.insert(path, (hasher.finish(), modified));
+            }
+        }
+    }
+    files
+}
+
+fn file_names(directory: &Path) -> Vec<PathBuf> {
+    files_below(directory).into_keys().collect()
+}
+
+/// The refusal a check returned, failing on a read that couldn't tell.
+fn refusal(block: Option<MigrateBlock>) -> Option<Refusal> {
+    block.map(|block| match block.reason {
+        BlockReason::Refused(refusal) => refusal,
+        other => panic!("the read couldn't tell: {other:?}"),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_check_refuses_exactly_what_the_runner_refuses_and_writes_nothing() {
+    /// What a newer release left at the database path.
+    #[derive(Clone, Copy)]
+    enum AtPath {
+        NoDirectory,
+        NoFile,
+        /// A database file without either history.
+        NoTable,
+        /// The service and shared catalogs it migrated with.
+        Migrated(&'static [i64], Option<&'static [i64]>),
+    }
+    use AtPath::{Migrated, NoDirectory, NoFile, NoTable};
+    const BOTH: AtPath = Migrated(NEWER, Some(NEWER));
+    const SERVICE_GAP: &str = "_sqlx_migrations records newer migration 3 but not bundled \
+                               migration 2; see db/README.md";
+    const SHARED_GAP: &str = "_sqlx_migrations records newer migration 3 but \
+                              _space_common_schema_migrations does not record bundled migration \
+                              2; see db/README.md";
+    const SERVICE_GAP_BELOW_SHARED: &str = "_space_common_schema_migrations records newer \
+                                            migration 3 but _sqlx_migrations does not record \
+                                            bundled migration 2; see db/README.md";
+    const NO_SHARED_HISTORY: &str = "SQLite service history is present but shared history is \
+                                     missing; explicit repair is required";
+    const UNTRACKED: &str = "SQLite has untracked application schema; see db/README.md";
+    let invalid = |table: &str, version: i64| {
+        format!("{table} has failed, modified, or unbundled migration {version}; see db/README.md")
+    };
+    // (case, recorded, SQL run on it afterwards, what this release bundles of
+    // the service and shared catalogs, the runner's refusal if it refuses)
+    type Case = (
+        &'static str,
+        AtPath,
+        &'static str,
+        &'static [i64],
+        Option<&'static [i64]>,
+        Option<String>,
+    );
+    let cases: [Case; 22] = [
+        ("no directory", NoDirectory, "", NEWER, Some(NEWER), None),
+        ("no file", NoFile, "", NEWER, Some(NEWER), None),
+        ("no table", NoTable, "", NEWER, Some(NEWER), None),
+        ("same release", BOTH, "", NEWER, Some(NEWER), None),
+        (
+            "pending only",
+            Migrated(&[1], Some(&[1, 2])),
+            "",
+            NEWER,
+            Some(NEWER),
+            None,
+        ),
+        ("service newer", BOTH, "", &[1, 2], Some(NEWER), None),
+        ("common newer", BOTH, "", NEWER, Some(&[1, 2]), None),
+        ("both newer", BOTH, "", &[1], Some(&[1, 2]), None),
+        (
+            "no shared catalog, newer",
+            Migrated(NEWER, None),
+            "",
+            &[1, 2],
+            None,
+            None,
+        ),
+        (
+            "service withdrawn",
+            BOTH,
+            "",
+            &[1, 3],
+            Some(NEWER),
+            Some(invalid(SERVICE_HISTORY, 2)),
+        ),
+        (
+            "common withdrawn",
+            BOTH,
+            "",
+            NEWER,
+            Some(&[1, 3]),
+            Some(invalid(COMMON_HISTORY, 2)),
+        ),
+        (
+            "no shared catalog, withdrawn",
+            Migrated(NEWER, None),
+            "",
+            &[1, 3],
+            None,
+            Some(invalid(SERVICE_HISTORY, 2)),
+        ),
+        (
+            "newer but failed",
+            BOTH,
+            "UPDATE _sqlx_migrations SET success = 0 WHERE version = 3",
+            &[1, 2],
+            Some(NEWER),
+            Some(invalid(SERVICE_HISTORY, 3)),
+        ),
+        (
+            "bundled but failed",
+            BOTH,
+            "UPDATE _space_common_schema_migrations SET success = 0 WHERE version = 1",
+            NEWER,
+            Some(NEWER),
+            Some(invalid(COMMON_HISTORY, 1)),
+        ),
+        (
+            "bundled but modified",
+            BOTH,
+            "UPDATE _space_common_schema_migrations SET checksum = zeroblob(48) WHERE version = 2",
+            NEWER,
+            Some(NEWER),
+            Some(invalid(COMMON_HISTORY, 2)),
+        ),
+        (
+            "service newer with a malformed checksum",
+            BOTH,
+            "UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 3",
+            &[1, 2],
+            Some(NEWER),
+            Some(invalid(SERVICE_HISTORY, 3)),
+        ),
+        (
+            "common newer with a malformed checksum",
+            BOTH,
+            "UPDATE _space_common_schema_migrations SET checksum = x'00' WHERE version = 3",
+            NEWER,
+            Some(&[1, 2]),
+            Some(invalid(COMMON_HISTORY, 3)),
+        ),
+        (
+            "service newer but bundled missing",
+            BOTH,
+            "DELETE FROM _sqlx_migrations WHERE version = 2",
+            &[1, 2],
+            Some(NEWER),
+            Some(SERVICE_GAP.to_owned()),
+        ),
+        (
+            "service newer but bundled common missing",
+            BOTH,
+            "DELETE FROM _space_common_schema_migrations WHERE version = 2",
+            &[1, 2],
+            Some(NEWER),
+            Some(SHARED_GAP.to_owned()),
+        ),
+        (
+            "common newer but bundled service missing",
+            BOTH,
+            "DELETE FROM _sqlx_migrations WHERE version = 2",
+            NEWER,
+            Some(&[1, 2]),
+            Some(SERVICE_GAP_BELOW_SHARED.to_owned()),
+        ),
+        (
+            "shared history missing",
+            BOTH,
+            "DROP TABLE _space_common_schema_migrations",
+            NEWER,
+            Some(NEWER),
+            Some(NO_SHARED_HISTORY.to_owned()),
+        ),
+        (
+            "untracked schema",
+            BOTH,
+            "DROP TABLE _sqlx_migrations",
+            NEWER,
+            Some(NEWER),
+            Some(UNTRACKED.to_owned()),
+        ),
+    ];
+    // Each case has its own database, so they run at once.
+    let mut running = tokio::task::JoinSet::new();
+    for (case, recorded, change, service, common, refused) in cases {
+        running.spawn(async move {
+            let directory = tempfile::tempdir().unwrap();
+            let path = match recorded {
+                NoDirectory => directory.path().join("missing/database.sqlite"),
+                _ => directory.path().join("database.sqlite"),
+            };
+            match recorded {
+                NoDirectory | NoFile => {}
+                NoTable => {
+                    open_rusqlite(&path, RusqliteOpenOptions::default()).unwrap();
+                }
+                Migrated(newer_service, newer_common) => {
+                    let newer_service = numbered_catalog("service", newer_service);
+                    let newer_common =
+                        newer_common.map(|versions| numbered_catalog("common", versions));
+                    migrate_embedded(
+                        "test",
+                        &path,
+                        EmbeddedMigrators {
+                            service: &newer_service,
+                            common: newer_common.as_ref(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    // As the service leaves it: in WAL mode, closed.
+                    open_rusqlite(&path, RusqliteOpenOptions::default())
+                        .unwrap()
+                        .execute_batch(change)
+                        .unwrap();
+                }
+            }
+            let (service, common) = (
+                numbered_catalog("service", service),
+                common.map(|versions| numbered_catalog("common", versions)),
+            );
+            let migrators = EmbeddedMigrators {
+                service: &service,
+                common: common.as_ref(),
+            };
+            let before = files_below(directory.path());
+
+            let block = check_migrate_embedded("test", &path, migrators)
+                .await
+                .unwrap();
+
+            assert_eq!(files_below(directory.path()), before, "{case}");
+            if matches!(recorded, NoDirectory | NoFile) {
+                assert!(!path.exists(), "{case}");
+            }
+            let shown = block.as_ref().map(ToString::to_string);
+            let result = migrate_embedded("test", &path, migrators).await;
+            match (refusal(block), refused) {
+                (None, None) => assert!(result.is_ok(), "{case}: {result:?}"),
+                (Some(refusal), Some(refused)) => {
+                    assert_eq!(refusal.to_string(), refused, "{case}");
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        format!(
+                            "failed to migrate test SQLite at {}: {refused}",
+                            path.display()
+                        ),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        shown.unwrap(),
+                        format!(
+                            "this release refuses test SQLite at {}: {refused}",
+                            path.display()
+                        ),
+                        "{case}"
+                    );
+                }
+                (check, runner) => {
+                    panic!("{case}: the check found {check:?}, the runner {runner:?}")
+                }
+            }
+        });
+    }
+    while let Some(result) = running.join_next().await {
+        result.unwrap();
+    }
+}
+
+/// A database as [`newer_release_database`] leaves it, open in a writer that
+/// keeps its `-wal`, for a release that bundles service migrations 1 and 2
+/// and every shared one, so that it accepts service migration 3.
+async fn rolled_back_beside_a_writer(path: &Path) -> (Connection, Migrator, Migrator) {
+    newer_release_database(path).await;
+    let writer = open_rusqlite(path, RusqliteOpenOptions::default()).unwrap();
+    (
+        writer,
+        numbered_catalog("service", &[1, 2]),
+        numbered_catalog("common", NEWER),
+    )
+}
+
+fn record_newer(version: i64, checksum: &str) -> String {
+    format!(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES ({version}, 'newer', TRUE, {checksum}, 0)"
+    )
+}
+
+#[tokio::test]
+async fn the_check_reads_what_a_live_writer_committed() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database.sqlite");
+    let (writer, service, common) = rolled_back_beside_a_writer(&path).await;
+    let migrators = EmbeddedMigrators {
+        service: &service,
+        common: Some(&common),
+    };
+    writer
+        .execute_batch(&record_newer(4, "zeroblob(48)"))
+        .unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer.execute_batch(&record_newer(5, "x'00'")).unwrap();
+    let [db, wal, _] = database_files(&path);
+    let before = files_below(directory.path());
+    assert!(before.contains_key(&wal), "the writer keeps a WAL");
+
+    let uncommitted = check_migrate_embedded("test", &path, migrators)
+        .await
+        .unwrap();
+
+    // The reader may take a read mark in the shared-memory index, which every
+    // connection writes; the database and its WAL stay as they were.
+    let after = files_below(directory.path());
+    assert_eq!(
+        file_names(directory.path()),
+        before.keys().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(after[&db], before[&db]);
+    assert_eq!(after[&wal], before[&wal]);
+    assert_eq!(refusal(uncommitted), None, "accepted newer 3 and 4");
+    writer.execute_batch("COMMIT").unwrap();
+    let committed = check_migrate_embedded("test", &path, migrators)
+        .await
+        .unwrap();
+    assert_eq!(
+        refusal(committed),
+        Some(Refusal::Invalid {
+            table: SERVICE_HISTORY,
+            version: 5
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_check_beside_a_writer_committing_continuously() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    /// What each commit leaves, in turn. `Accepted` and `Pending` are both
+    /// accepted, but a read that takes the service history from `Accepted`
+    /// and the shared one from `Pending` finds a newer row above a gap and
+    /// refuses. `Failed` is refused.
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        /// Both histories as the newer release left them.
+        Accepted,
+        /// Service migration 3 and shared migration 2 removed.
+        Pending,
+        /// Service migration 3 failed.
+        Failed,
+    }
+    const CYCLE: [Shape; 4] = [
+        Shape::Pending,
+        Shape::Accepted,
+        Shape::Failed,
+        Shape::Accepted,
+    ];
+    const CHECKS: usize = 300;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database.sqlite");
+    let (writer, service, common) = rolled_back_beside_a_writer(&path).await;
+    let migrators = EmbeddedMigrators {
+        service: &service,
+        common: Some(&common),
+    };
+    let saved = |table: &str, version: i64| -> (i64, String, bool, Vec<u8>, i64) {
+        writer
+            .query_row(
+                &format!(
+                    "SELECT version, description, success, checksum, execution_time FROM {table}
+                     WHERE version = ?1"
+                ),
+                [version],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let (service_3, common_2) = (saved(SERVICE_HISTORY, 3), saved(COMMON_HISTORY, 2));
+    let names = file_names(directory.path());
+    let stop = Arc::new(AtomicBool::new(false));
+    let writing = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let restore = |table: &str, row: &(i64, String, bool, Vec<u8>, i64)| {
+                writer
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} (version, description, success, checksum,
+                             execution_time) VALUES (?1, ?2, ?3, ?4, ?5)"
+                        ),
+                        rusqlite::params![row.0, row.1, row.2, row.3, row.4],
+                    )
+                    .unwrap();
+            };
+            let (mut commits, mut slowest, mut shape) = (0_usize, Duration::ZERO, Shape::Accepted);
+            while !stop.load(Ordering::SeqCst) {
+                let next = CYCLE[commits % CYCLE.len()];
+                let started = Instant::now();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                match (shape, next) {
+                    (Shape::Accepted, Shape::Pending) => writer
+                        .execute_batch(
+                            "DELETE FROM _sqlx_migrations WHERE version = 3;
+                             DELETE FROM _space_common_schema_migrations WHERE version = 2;",
+                        )
+                        .unwrap(),
+                    (Shape::Pending, Shape::Accepted) => {
+                        restore(SERVICE_HISTORY, &service_3);
+                        restore(COMMON_HISTORY, &common_2);
+                    }
+                    (Shape::Accepted, Shape::Failed) => writer
+                        .execute_batch("UPDATE _sqlx_migrations SET success = 0 WHERE version = 3")
+                        .unwrap(),
+                    (Shape::Failed, Shape::Accepted) => writer
+                        .execute_batch("UPDATE _sqlx_migrations SET success = 1 WHERE version = 3")
+                        .unwrap(),
+                    unexpected => panic!("no step {unexpected:?}"),
+                }
+                // Application writes, so the WAL grows and checkpoints.
+                writer
+                    .execute_batch("INSERT INTO service_1 (id) VALUES (NULL)")
+                    .unwrap();
+                writer.execute_batch("COMMIT").unwrap();
+                slowest = slowest.max(started.elapsed());
+                commits += 1;
+                shape = next;
+            }
+            (commits, slowest, writer)
+        }
+    });
+
+    let (mut accepted, mut refused, mut unsettled) = (0, 0, 0);
+    let checking = Instant::now();
+    // Until both verdicts have come up, which shows the writer moved on
+    // between checks, within a bound.
+    while (accepted + refused + unsettled < CHECKS || accepted == 0 || refused == 0)
+        && checking.elapsed() < Duration::from_secs(30)
+    {
+        let block = check_migrate_embedded("test", &path, migrators)
+            .await
+            .unwrap();
+        match block.map(|block| block.reason) {
+            None => accepted += 1,
+            Some(BlockReason::Refused(Refusal::Invalid {
+                table: SERVICE_HISTORY,
+                version: 3,
+            })) => refused += 1,
+            // Neither accepted nor refused: the gate checks again.
+            Some(BlockReason::Locked(_) | BlockReason::Changed) => unsettled += 1,
+            Some(BlockReason::Refused(other)) => {
+                panic!("no committed state is refused so: {other}")
+            }
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (commits, slowest, writer) = writing.join().unwrap();
+
+    assert_eq!(
+        file_names(directory.path()),
+        names,
+        "the check creates no file"
+    );
+    drop(writer);
+    assert!(
+        accepted > 0 && refused > 0,
+        "{commits} commits beside {accepted} accepted, {refused} refused and {unsettled} \
+         unsettled checks"
+    );
+    // The check takes no lock the writer waits for, so no commit comes near
+    // the writer's busy timeout.
+    assert!(
+        slowest < RusqliteOpenOptions::default().busy_timeout / 5,
+        "slowest commit took {slowest:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_locked_database_is_neither_accepted_nor_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database.sqlite");
+    // Accepted as it stands, and refused once the writer commits.
+    let (writer, service, common) = rolled_back_beside_a_writer(&path).await;
+    let migrators = EmbeddedMigrators {
+        service: &service,
+        common: Some(&common),
+    };
+    // An exclusive-mode writer keeps its lock after it commits, so readers
+    // can't read through the WAL at all.
+    writer
+        .execute_batch(&format!(
+            "PRAGMA locking_mode = EXCLUSIVE; {}",
+            record_newer(4, "x'00'")
+        ))
+        .unwrap();
+    let names = file_names(directory.path());
+    let checksums = AcceptedChecksums::embedded().unwrap();
+
+    let block = check_once(
+        "test",
+        &path,
+        migrators,
+        &checksums,
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap()
+    .expect("a locked database blocks takeover");
+
+    assert!(
+        matches!(&block.reason, BlockReason::Locked(error) if error.contains("database is locked")),
+        "{block:?}"
+    );
+    assert!(block.to_string().ends_with("; checking again"), "{block}");
+    assert_eq!(file_names(directory.path()), names);
+    drop(writer);
+    let block = check_once(
+        "test",
+        &path,
+        migrators,
+        &checksums,
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refusal(block),
+        Some(Refusal::Invalid {
+            table: SERVICE_HISTORY,
+            version: 4
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_immutable_read_a_writer_raced_is_unsettled() {
+    // (case, whether the writer is still open when the read ends)
+    for (case, open) in [("writer still open", true), ("writer closed again", false)] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database.sqlite");
+        newer_release_database(&path).await;
+        let before = DatabaseFiles::observe(&path).unwrap().unwrap();
+        assert!(!before.wal, "{case}: closed, the database has no WAL");
+        // A writer opens after the files were observed and records a row this
+        // release refuses, which the read's immutable view of the main file
+        // doesn't show while it sits in the WAL.
+        let writer = open_rusqlite(&path, RusqliteOpenOptions::default()).unwrap();
+        writer.execute_batch(&record_newer(4, "x'00'")).unwrap();
+        if !open {
+            // Its close checkpoints the WAL into the main file and removes it.
+            drop(writer);
+        }
+        let names = file_names(directory.path());
+
+        let read = read_observed(&path, &before, true, Duration::from_millis(50)).unwrap();
+
+        assert!(
+            matches!(read, ReadWithoutWriting::Unsettled(BlockReason::Changed)),
+            "{case}"
+        );
+        assert_eq!(file_names(directory.path()), names, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn the_runner_validates_what_changed_after_the_check_passed() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database.sqlite");
+    newer_release_database(&path).await;
+    let (service, common) = (
+        numbered_catalog("service", &[1, 2]),
+        numbered_catalog("common", NEWER),
+    );
+    let migrators = EmbeddedMigrators {
+        service: &service,
+        common: Some(&common),
+    };
+    assert_eq!(
+        check_migrate_embedded("test", &path, migrators)
+            .await
+            .unwrap(),
+        None
+    );
+    // The predecessor records a row this release refuses before it hands over.
+    open_rusqlite(&path, RusqliteOpenOptions::default())
+        .unwrap()
+        .execute_batch("UPDATE _sqlx_migrations SET success = 0 WHERE version = 3")
+        .unwrap();
+    let before = stored_state(&path);
+
+    let result = migrate_embedded("test", &path, migrators).await;
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        format!(
+            "failed to migrate test SQLite at {}: {}",
+            path.display(),
+            Refusal::Invalid {
+                table: SERVICE_HISTORY,
+                version: 3
+            }
+        )
+    );
+    assert_eq!(stored_state(&path), before);
 }

@@ -1,4 +1,5 @@
 use super::*;
+use pplx_space_service_mutex::ServiceMutex;
 
 #[rstest::rstest]
 #[case(Some("6144"), Some(4096), Some(2048), Some(4096))]

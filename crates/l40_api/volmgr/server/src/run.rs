@@ -456,6 +456,13 @@ pub async fn run(
         service_mutex = SERVICE_MUTEX_PATH,
         "volume manager passive; waiting for service mutex"
     );
+    // Unlike the surge-rolled daemons, volume-manager has no takeover gate
+    // (`LocalHealthServer::take_over`) checking its database before readiness:
+    // it rolls out delete first, so its successor starts only once the
+    // predecessor has stopped and released the mutex. A gate would find the
+    // mutex free and start at once, as this does, and withholding readiness
+    // would keep no working pod serving. A refused migration below fails
+    // startup, which already holds the rollout at its unavailable budget.
     let Some(service_mutex) = acquire_service_mutex(
         Path::new(SERVICE_MUTEX_PATH),
         &shutdown_token,

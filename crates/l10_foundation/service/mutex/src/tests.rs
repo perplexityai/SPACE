@@ -221,3 +221,159 @@ async fn acquire_with_timeout_returns_timeout_error_on_deadline() {
         .expect_err("expected Timeout error");
     assert!(matches!(err, AcquireError::Timeout { .. }));
 }
+
+#[tokio::test(start_paused = true)]
+async fn takeover_gate_holds_only_while_blocked_and_the_mutex_is_held() {
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Open,
+        Acquired,
+        PassiveExit,
+        CheckFailed,
+    }
+    // (case, whether a predecessor holds the mutex at the start, and then
+    // when, in seconds, the check starts passing, the predecessor releases
+    // the mutex, shutdown is requested, and the check fails; the outcome and
+    // when it comes)
+    type Case = (
+        &'static str,
+        bool,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Outcome,
+        u64,
+    );
+    let cases: [Case; 7] = [
+        ("passing", true, Some(0), None, None, None, Outcome::Open, 0),
+        (
+            "blocked with no predecessor",
+            false,
+            None,
+            None,
+            None,
+            None,
+            Outcome::Acquired,
+            0,
+        ),
+        (
+            "blocked until the check passes",
+            true,
+            Some(1_800),
+            None,
+            None,
+            None,
+            Outcome::Open,
+            1_800,
+        ),
+        (
+            "blocked until the predecessor releases",
+            true,
+            None,
+            Some(602),
+            None,
+            None,
+            Outcome::Acquired,
+            605,
+        ),
+        (
+            "blocked until shutdown",
+            true,
+            None,
+            None,
+            Some(903),
+            None,
+            Outcome::PassiveExit,
+            903,
+        ),
+        (
+            "shut down before the gate",
+            true,
+            None,
+            None,
+            Some(0),
+            None,
+            Outcome::PassiveExit,
+            0,
+        ),
+        (
+            "blocked until the check fails",
+            true,
+            None,
+            None,
+            None,
+            Some(300),
+            Outcome::CheckFailed,
+            300,
+        ),
+    ];
+    for (case, held, passes, released, shutdown, fails, expected, at) in cases {
+        let dir = tempdir().unwrap();
+        let path = mutex_path(&dir);
+        let start = tokio::time::Instant::now();
+        let after = move |secs: u64| start + Duration::from_secs(secs);
+        let predecessor = held.then(|| ServiceMutex::try_acquire(&path).unwrap().unwrap());
+        let _predecessor = match released {
+            Some(secs) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(after(secs)).await;
+                    drop(predecessor);
+                });
+                None
+            }
+            None => predecessor,
+        };
+        let token = CancellationToken::new();
+        if let Some(secs) = shutdown {
+            let token = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(after(secs)).await;
+                token.cancel();
+            });
+        }
+        if shutdown == Some(0) {
+            token.cancel();
+        }
+        let checks = std::cell::Cell::new(0_u32);
+        let check = || {
+            checks.set(checks.get() + 1);
+            let now = tokio::time::Instant::now();
+            async move {
+                if fails.is_some_and(|secs| now >= after(secs)) {
+                    return Err(std::io::Error::other("unreadable database"));
+                }
+                Ok(passes
+                    .is_none_or(|secs| now < after(secs))
+                    .then_some("this release refuses the database"))
+            }
+        };
+
+        let outcome = gate_takeover(&path, &token, check).await;
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(start),
+            Duration::from_secs(at),
+            "{case}"
+        );
+        let (outcome, gate_mutex) = match outcome {
+            Ok(TakeoverGate::Open) => (Outcome::Open, None),
+            Ok(TakeoverGate::Acquired(mutex)) => (Outcome::Acquired, Some(mutex)),
+            Ok(TakeoverGate::PassiveExit) => (Outcome::PassiveExit, None),
+            Err(TakeoverGateError::Check(_)) => (Outcome::CheckFailed, None),
+            Err(error) => panic!("{case}: {error}"),
+        };
+        assert_eq!(outcome, expected, "{case}");
+        // A held gate rechecks on its interval rather than waiting silently.
+        let expected_checks = if shutdown == Some(0) {
+            0
+        } else {
+            at / TAKEOVER_RECHECK_INTERVAL.as_secs() + 1
+        };
+        assert_eq!(u64::from(checks.get()), expected_checks, "{case}");
+        // Only an acquired gate holds the mutex; the others leave it as found.
+        let free = ServiceMutex::try_acquire(&path).unwrap().is_some();
+        let predecessor_gone = !held || released.is_some();
+        assert_eq!(free, gate_mutex.is_none() && predecessor_gone, "{case}");
+    }
+}

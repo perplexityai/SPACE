@@ -314,3 +314,103 @@ fn health_server_answers_while_main_runtime_workers_are_blocked() {
     shutdown.cancel();
     runtime.block_on(server.join());
 }
+
+#[tokio::test(start_paused = true)]
+async fn take_over_withholds_readiness_while_gated_and_times_the_acquire_from_the_gate() {
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Clone, Copy, Debug)]
+    enum End {
+        /// The check passes and the predecessor later releases the mutex.
+        Released,
+        /// The check passes and the predecessor keeps the mutex.
+        Kept,
+        /// Shutdown while gated.
+        Shutdown,
+    }
+    const TIMEOUT: Duration = Duration::from_secs(70);
+    // Longer than the acquire budget, so a budget started before the gate
+    // would already have run out.
+    const GATED: Duration = Duration::from_secs(600);
+    for end in [End::Released, End::Kept, End::Shutdown] {
+        let dir = tempfile::tempdir().unwrap();
+        let mutex_path = dir.path().join("service.mutex");
+        let predecessor = ServiceMutex::try_acquire(&mutex_path).unwrap().unwrap();
+        let (health, activator) = local_health_pair_with_readiness(
+            "test",
+            LocalHealthLiveness::Process,
+            InitialReadiness::Waiting,
+        );
+        let server = LocalHealthServer::Enabled {
+            activator,
+            handle: tokio::spawn(async {}),
+        };
+        let shutdown = CancellationToken::new();
+        let blocked = AtomicBool::new(true);
+        let opened = OnceLock::new();
+        let check = || {
+            let block = blocked.load(Ordering::SeqCst);
+            if !block {
+                let _ = opened.set(tokio::time::Instant::now());
+            }
+            async move { Ok::<_, std::io::Error>(block.then_some("this release refuses")) }
+        };
+        let take_over = server.take_over(&mutex_path, &shutdown, TIMEOUT, check);
+        tokio::pin!(take_over);
+        let pending = async |take_over: &mut std::pin::Pin<&mut _>, wait: Duration| {
+            tokio::select! {
+                outcome = take_over => panic!("{end:?}: returned early: {outcome:?}"),
+                () = tokio::time::sleep(wait) => {}
+            }
+        };
+
+        pending(&mut take_over, GATED).await;
+        assert_eq!(
+            status(&health, "readiness").await,
+            ServingStatus::NotServing
+        );
+        assert_eq!(status(&health, "").await, ServingStatus::NotServing);
+        assert_eq!(status(&health, "liveness").await, ServingStatus::Serving);
+        if let End::Shutdown = end {
+            shutdown.cancel();
+            assert!(matches!(take_over.await, Ok(AcquireOutcome::PassiveExit)));
+            assert_eq!(
+                status(&health, "readiness").await,
+                ServingStatus::NotServing
+            );
+            continue;
+        }
+        blocked.store(false, Ordering::SeqCst);
+        pending(&mut take_over, TIMEOUT / 2).await;
+        let opened = *opened.get().expect("the gate opened");
+        assert_eq!(status(&health, "readiness").await, ServingStatus::Serving);
+        match end {
+            End::Released => {
+                drop(predecessor);
+                let Ok(AcquireOutcome::Acquired(_mutex)) = take_over.await else {
+                    panic!("{end:?}: expected the mutex");
+                };
+                server.mark_starting();
+                assert_eq!(
+                    status(&health, "readiness").await,
+                    ServingStatus::NotServing
+                );
+            }
+            End::Kept => {
+                let outcome = take_over.await;
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(TakeoverGateError::Mutex(
+                            pplx_space_service_mutex::AcquireError::Timeout { .. }
+                        ))
+                    ),
+                    "{outcome:?}"
+                );
+                assert_eq!(tokio::time::Instant::now() - opened, TIMEOUT);
+                drop(predecessor);
+            }
+            End::Shutdown => unreachable!(),
+        }
+    }
+}

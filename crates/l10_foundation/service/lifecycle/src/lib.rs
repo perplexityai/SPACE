@@ -19,7 +19,11 @@ use tokio_util::sync::CancellationToken;
 /// predecessor to release the service mutex before exiting non-zero. 10 s
 /// of headroom above the chart's `terminationGracePeriodSeconds: 60` so a
 /// predecessor SIGKILLed at the grace ceiling still releases the mutex
-/// before our timer expires.
+/// before our timer expires. The budget starts when the instance reports
+/// itself ready to take over, after any takeover gate
+/// (`pplx_space_service_mutex::gate_takeover`), because the rollout deletes
+/// the predecessor only then: an instance gated for longer must not time out
+/// while its predecessor serves.
 pub const DEFAULT_SERVICE_MUTEX_TIMEOUT: Duration = Duration::from_secs(70);
 
 /// Default upper bound on the active-instance drain on SIGTERM. Covers

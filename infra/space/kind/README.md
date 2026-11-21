@@ -2053,9 +2053,10 @@ service socket and build-manager on its gRPC health service.
 
 **Rollouts and termination.** Services that hold a node-wide service mutex
 (`/space/run/<service>/service.mutex`) roll with `maxSurge: 1, maxUnavailable: 0`:
-the successor starts beside the predecessor, reports ready while passive, and
-takes over, sockets replaced by rename, when the predecessor drains and releases
-the lock (credential-manager's agent releases it as its drain starts, so the
+the successor starts beside the predecessor, reports ready while passive, once
+those that migrate a SQLite store find it accepted (`db/README.md`, "What a
+refused rollback looks like"), and takes over, sockets replaced by rename, when
+the predecessor drains and releases the lock (credential-manager's agent releases it as its drain starts, so the
 successor serves while it finishes accepted RPCs). That covers node-manager,
 credential-manager, template-manager, sandbox-manager and node-ctl. volume-manager, runtime-manager, node-api and
 build-manager delete first. volume-manager runs as `space-volmgr`; clusters

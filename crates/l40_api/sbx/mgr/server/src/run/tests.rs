@@ -32,10 +32,18 @@ async fn takeover_wait_keeps_liveness_and_withholds_readiness() {
     #[derive(Clone, Copy)]
     enum Outcome {
         Ready,
+        /// The receiver answers, but the database would be refused while a
+        /// predecessor holds the mutex.
+        Gated,
         Rejected,
         Cancelled,
     }
-    for outcome in [Outcome::Ready, Outcome::Rejected, Outcome::Cancelled] {
+    for outcome in [
+        Outcome::Ready,
+        Outcome::Gated,
+        Outcome::Rejected,
+        Outcome::Cancelled,
+    ] {
         let root = tempfile::tempdir().unwrap();
         let receiver_socket = root.path().join("node.sock");
         let health_socket = root.path().join("health.sock");
@@ -64,10 +72,25 @@ async fn takeover_wait_keeps_liveness_and_withholds_readiness() {
             health_socket_path: Some(health_socket.clone()),
             service_mutex_timeout: Duration::from_secs(1),
         };
+        let mutex_path = root.path().join("service.mutex");
+        let _predecessor = ServiceMutex::try_acquire(&mutex_path).unwrap().unwrap();
+        let checked = Arc::new(tokio::sync::Notify::new());
         let start = tokio::spawn({
             let shutdown = shutdown.clone();
+            let checked = checked.clone();
             async move {
-                start_takeover_health(&config, &shutdown, || dial(receiver_socket.clone())).await
+                start_takeover_health(
+                    &config,
+                    &shutdown,
+                    &mutex_path,
+                    || dial(receiver_socket.clone()),
+                    || {
+                        checked.notify_one();
+                        let refused = matches!(outcome, Outcome::Gated);
+                        async move { Ok(refused.then_some("this release refuses the database")) }
+                    },
+                )
+                .await
             }
         });
         receiver.entered.notified().await;
@@ -96,13 +119,29 @@ async fn takeover_wait_keeps_liveness_and_withholds_readiness() {
             Outcome::Cancelled => shutdown.cancel(),
             _ => release.store(true, Ordering::SeqCst),
         }
+        if let Outcome::Gated = outcome {
+            checked.notified().await;
+            let response = health
+                .check(HealthCheckRequest {
+                    service: "readiness".into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                response.into_inner().status,
+                HealthStatus::NotServing as i32
+            );
+            assert!(!start.is_finished(), "a gated takeover waits");
+            shutdown.cancel();
+        }
         let result = tokio::time::timeout(Duration::from_secs(5), start)
             .await
             .unwrap()
             .unwrap();
         match outcome {
             Outcome::Ready => {
-                let server = result.unwrap();
+                let (server, mutex) = result.unwrap();
+                assert!(mutex.is_none(), "an open gate leaves the mutex alone");
                 let response = health
                     .check(HealthCheckRequest {
                         service: String::new(),
@@ -113,7 +152,10 @@ async fn takeover_wait_keeps_liveness_and_withholds_readiness() {
                 shutdown.cancel();
                 server.join().await;
             }
-            Outcome::Cancelled => assert!(matches!(result.unwrap(), LocalHealthServer::Disabled)),
+            Outcome::Cancelled | Outcome::Gated => assert!(matches!(
+                result.unwrap(),
+                (LocalHealthServer::Disabled, None)
+            )),
             Outcome::Rejected => {
                 let RunSbxMgrError::NodeManagerStartup(error) = result.err().unwrap() else {
                     panic!("unexpected error")

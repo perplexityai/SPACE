@@ -315,8 +315,8 @@ impl CleanupCompletion {
 /// background loops evict them.
 const STATEMENT_CACHE_CAPACITY: usize = 128;
 
-/// Opening or migrating the database failed. `Display` and `source` are the
-/// shared SQLite helpers' error's, unchanged.
+/// Opening, checking or migrating the database failed. `Display` and `source`
+/// are the shared SQLite helpers' error's, unchanged.
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct OpenError(#[from] pplx_space_sqlite::SqliteError);
@@ -328,17 +328,26 @@ pub async fn migrate() -> Result<(), OpenError> {
 
 /// [`migrate`] for the database at `db_path`.
 pub async fn migrate_at(db_path: &Path) -> Result<(), OpenError> {
-    use pplx_space_sbx_mgr_migrations::COMMON_SCHEMA_MIGRATOR;
     let target = migration::target();
-    Ok(pplx_space_sqlite::migrate_embedded(
-        target.name,
-        db_path,
-        pplx_space_sqlite::EmbeddedMigrators {
-            service: target.service,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
-        },
+    Ok(pplx_space_sqlite::migrate_embedded(target.name, db_path, migrators()).await?)
+}
+
+/// Whether [`migrate`] would refuse the database now, or the read can't tell
+/// yet, read without writing anything; see
+/// [`pplx_space_sqlite::check_migrate_embedded`].
+pub async fn check_migrate() -> Result<Option<pplx_space_sqlite::MigrateBlock>, OpenError> {
+    let target = migration::target();
+    Ok(
+        pplx_space_sqlite::check_migrate_embedded(target.name, Path::new(DB_PATH), migrators())
+            .await?,
     )
-    .await?)
+}
+
+fn migrators() -> pplx_space_sqlite::EmbeddedMigrators<'static> {
+    pplx_space_sqlite::EmbeddedMigrators {
+        service: migration::target().service,
+        common: Some(&pplx_space_sbx_mgr_migrations::COMMON_SCHEMA_MIGRATOR),
+    }
 }
 
 /// Open the migrated database, with the connection settings every store
