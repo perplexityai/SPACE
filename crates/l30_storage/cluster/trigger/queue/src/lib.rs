@@ -12,7 +12,11 @@ use time::OffsetDateTime;
 
 pub mod metrics;
 mod reconcile_refs;
+mod store;
 pub use reconcile_refs::{QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs};
+pub use store::{
+    NodeQueueDepthRow, NodeQueueLagRow, NodeQueueStaleClaimRow, TriggerDepthRow, TriggerQueueStore,
+};
 
 const TRIGGER_CLAIM_STALE_SECS: i64 = 60;
 const TRIGGER_MAX_ATTEMPTS: i32 = 16;
@@ -182,7 +186,7 @@ where
     Ok(queued.cast_unsigned())
 }
 
-pub async fn claim_triggers(
+pub(crate) async fn claim_triggers(
     pool: &PgPool,
     limit: u32,
 ) -> Result<StateReconciliationTriggerClaim, sqlx::Error> {
@@ -232,7 +236,7 @@ pub async fn claim_triggers(
     })
 }
 
-pub async fn fetch_trigger_targets(
+pub(crate) async fn fetch_trigger_targets(
     pool: &PgPool,
     node_ids: &[NodeId],
     live_node_names: Option<&HashSet<String>>,
@@ -287,7 +291,7 @@ pub async fn fetch_trigger_targets(
     })
 }
 
-pub async fn complete_claim(
+pub(crate) async fn complete_claim(
     pool: &PgPool,
     claim_token: &str,
     succeeded: &[NodeId],
@@ -373,7 +377,7 @@ pub async fn complete_claim(
     Ok(())
 }
 
-pub async fn dead_letter_claim(
+pub(crate) async fn dead_letter_claim(
     pool: &PgPool,
     claim_token: &str,
     failed: &[(NodeId, String)],
@@ -426,7 +430,7 @@ pub async fn dead_letter_claim(
     Ok(())
 }
 
-pub async fn sweep_dead_triggers(
+pub(crate) async fn sweep_dead_triggers(
     pool: &PgPool,
     older_than_secs: i64,
     limit: i64,

@@ -88,7 +88,9 @@ async fn ghost_fanout_fixture() -> TestDbResult<GhostFanoutFixture> {
         ReconcileReason::ManualNodeReconcile,
     )
     .await?;
-    let claim = claim_triggers(&db.pool, 2).await?;
+    let claim = TriggerQueueStore::new(db.pool.clone())
+        .claim_triggers(2)
+        .await?;
     let resolver = Arc::new(ReflectorBackedResolver {
         live_node_names: HashSet::from(["live-node".to_string()]),
         resolved_node_names: Mutex::new(Vec::new()),
@@ -118,7 +120,7 @@ async fn fanout_resolves_live_nodes_once_and_dead_letters_ghosts_without_resolvi
 
     let value_capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
     process_claim(
-        &db.pool,
+        &TriggerQueueStore::new(db.pool.clone()),
         resolver.clone(),
         Arc::new(TriggerNodeApiClientCache::default()),
         claim.clone(),
@@ -240,7 +242,8 @@ async fn a_claimed_firewall_rules_trigger_requests_only_a_wakeup() -> TestDbResu
     )
     .await?;
 
-    let requests = claim_triggers(&db.pool, 10)
+    let requests = TriggerQueueStore::new(db.pool.clone())
+        .claim_triggers(10)
         .await?
         .triggers
         .iter()
