@@ -40,8 +40,9 @@ use crate::db::{
     RuntimeUpgradeTargetState, SandboxRow,
 };
 use crate::proto::{
-    GetRuntimeUpgradeRequest, GetRuntimeUpgradeResponse, RuntimeUpgradeStageFrom, StartRequest,
-    StartResponse, UpgradeRuntimeRequest, UpgradeRuntimeResponse,
+    AbandonRuntimeUpgradeRequest, AbandonRuntimeUpgradeResponse, GetRuntimeUpgradeRequest,
+    GetRuntimeUpgradeResponse, RuntimeUpgradeStageFrom, StartRequest, StartResponse,
+    UpgradeRuntimeRequest, UpgradeRuntimeResponse,
 };
 use crate::state::SandboxState;
 
@@ -155,6 +156,9 @@ impl crate::service::SandboxManagerService {
         // the operation's isn't one of its attempts, so its refusal is never
         // recorded as the operation's refused activation.
         upgrader.refuse_another_request(&upgrade)?;
+        // Before staging, settling or an in-place start: an abandoned
+        // operation does nothing more on this node.
+        self.refuse_abandoned_runtime_upgrade(operation_id, &sandbox_id)?;
         // An attempt that already has a final outcome (its rollback, its
         // refusal before the fence, or its activation refused after the
         // operation reached its target) gets it back before anything records,
@@ -670,6 +674,65 @@ impl crate::service::SandboxManagerService {
         .ok_or_else(|| Refusal::Retry(Status::failed_precondition(refusal())))
     }
 
+    /// Give up `operation_id` on this node so no later call for it fences or
+    /// boots, from any pod. Under the sandbox's upgrade lock, which an
+    /// `UpgradeRuntime` holds for its whole call: an upgrade running now
+    /// finishes first, or the abandon answers UNAVAILABLE once the lock wait
+    /// runs out, and a call arriving later finds the operation abandoned. A
+    /// stay-stopped operation that hasn't settled is settled first, and a
+    /// settling that fails answers its own error and records nothing; a
+    /// started one that hasn't settled answers ABORTED.
+    pub(in crate::service) async fn abandon_runtime_upgrade(
+        &self,
+        request: Request<AbandonRuntimeUpgradeRequest>,
+    ) -> Result<AbandonRuntimeUpgradeResponse, Status> {
+        use crate::db::AbandonRuntimeUpgrade;
+        self.authorize_peer(
+            &request,
+            "AbandonRuntimeUpgrade",
+            crate::service::ALLOW_SANDBOX_RUNTIME_UPGRADE,
+        )?;
+        let (metadata, extensions, message) = request.into_parts();
+        let sandbox_id = parse_sandbox_id(&message.sandbox_id)?;
+        let operation_id = parse_operation_id(&message.operation_id)?;
+        let _guard = self.runtime_upgrade_guard(&sandbox_id).await?;
+        // A stay-stopped operation that hasn't settled is settled here first,
+        // as a retry of it would: an interrupted one rolls back, and a
+        // verified boot retires what it superseded and stops the sandbox.
+        // Its pod, whose kubelet retries would otherwise do that, may already
+        // be gone, and recovery doesn't stop a verified boot. A started
+        // target isn't settled here: it answers ABORTED below and is left to
+        // its own retry or to recovery. Whether it has settled is
+        // `RuntimeUpgradePhase::is_done_with_the_sandbox`, the store's test
+        // too, so a rolled-back row, which owes only its preserved copy's
+        // deletion, is abandoned as it stands for either target.
+        let upgrader = self.caller_upgrader(metadata, extensions);
+        if let Some(record) = upgrader.record(operation_id)?
+            && record.sandbox_id == sandbox_id
+            && record.target_state == RuntimeUpgradeTargetState::Stopped
+            && !record.phase.is_done_with_the_sandbox()
+        {
+            // Settling releases the fence the published state reports, so the
+            // sandbox is published again, even if the settling failed partway
+            // and released it before failing.
+            let settled = upgrader.settle(&record, true).await;
+            crate::node_state_sync::mark_sandbox_dirty(&self.db, &sandbox_id);
+            settled?;
+        }
+        match crate::db::abandon_runtime_upgrade(&*self.db_conn()?, &sandbox_id, operation_id)
+            .map_err(|error| Status::internal(format!("abandon runtime upgrade: {error}")))?
+        {
+            AbandonRuntimeUpgrade::Abandoned => Ok(AbandonRuntimeUpgradeResponse {}),
+            AbandonRuntimeUpgrade::Unsettled => Err(Status::aborted(format!(
+                "runtime upgrade {operation_id} of sandbox {sandbox_id} hasn't settled; retry \
+                 once it has"
+            ))),
+            AbandonRuntimeUpgrade::OperationNamesAnother => Err(Status::invalid_argument(format!(
+                "runtime upgrade {operation_id} names another sandbox"
+            ))),
+        }
+    }
+
     /// The node's report of the operation. It names an attempt only for an
     /// outcome that's final for that attempt, and only an attempt that ran
     /// with attempt finality on has one: with the switch off, a rollback
@@ -721,6 +784,18 @@ impl crate::service::SandboxManagerService {
         let db = self.db_conn()?;
         let report = crate::db::read::runtime_upgrade_report(&db, operation_id)
             .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?;
+        // The abandonment names its sandbox as the report does, and outlives
+        // the report when the sandbox's row goes.
+        let abandoned = match crate::db::read::runtime_upgrade_abandoned_sandbox(&db, operation_id)
+            .map_err(|error| Status::internal(format!("read runtime upgrade: {error}")))?
+        {
+            Some(abandoned_for) if abandoned_for != sandbox_id => {
+                return Err(Status::invalid_argument(format!(
+                    "runtime upgrade {operation_id} names another sandbox"
+                )));
+            }
+            abandoned_for => abandoned_for.is_some(),
+        };
         // The operation's final attempt outcomes name its sandbox, and
         // outlive the sandbox's row and the operation's report with it, as
         // when another attempt's upgrade evicted a stale copy and staged the
@@ -768,6 +843,7 @@ impl crate::service::SandboxManagerService {
                         status: status as i32,
                         failure: settled.failure,
                         attempt_id: Some(attempt.to_owned()),
+                        abandoned,
                         ..Default::default()
                     });
                 }
@@ -785,6 +861,7 @@ impl crate::service::SandboxManagerService {
                 status: Wire::Absent as i32,
                 refused_attempt_id,
                 refused_attempt_failure,
+                abandoned,
                 ..Default::default()
             }
         };
@@ -831,6 +908,7 @@ impl crate::service::SandboxManagerService {
                 .unwrap_or_default(),
         };
         let mut response = GetRuntimeUpgradeResponse {
+            abandoned,
             attempt_id: report.attempt_id,
             refused_attempt_id,
             refused_attempt_failure,

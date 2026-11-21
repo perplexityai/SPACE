@@ -227,8 +227,14 @@ async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
     );
 }
 
-/// The two runtime-upgrade migrations: the attempt id and the attempt outcomes.
-const RUNTIME_UPGRADE_MIGRATIONS: [i64; 2] = [20261114030001, 20261114030002];
+/// The four runtime-upgrade migrations: the attempt id, the attempt outcomes,
+/// the attempt identity and abandoned operations.
+const RUNTIME_UPGRADE_MIGRATIONS: [i64; 4] = [
+    20261114030001,
+    20261114030002,
+    ATTEMPT_IDENTITY_MIGRATION,
+    20261120230000,
+];
 /// The newest sandbox-manager migration that shipped before them.
 const BEFORE_RUNTIME_UPGRADE_MIGRATIONS: i64 = 20261114020000;
 /// The tables 20261114030001 adds `attempt_id` to.
@@ -269,7 +275,7 @@ fn tables_with_attempt_id(path: &Path) -> usize {
 
 /// The runtime-upgrade migrations come after every migration that shipped
 /// before them, next to each other, so a database at that earlier head takes
-/// them as its next two and a `down` reverts them, newest first, before it
+/// them as its next four and a `down` reverts them, newest first, before it
 /// reaches any earlier migration. Up, down and up again round-trip; newer
 /// migrations are rolled back first. The attempt-outcome table has no foreign
 /// key to `sandboxes`, and the downs drop that table and both `attempt_id`
@@ -362,7 +368,8 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
         let tables: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
-                     'sandbox_runtime_upgrade_attempt_outcomes'
+                     'sandbox_runtime_upgrade_attempt_outcomes',
+                     'sandbox_runtime_upgrade_abandoned'
                  )",
                 [],
                 |row| row.get(0),
@@ -387,6 +394,76 @@ async fn runtime_upgrade_migrations_follow_their_predecessors_and_round_trip() {
     }
 }
 
+/// The release before this one, which predates the abandoned-operations
+/// migration, starts on a database that holds it: an image-only rollback
+/// leaves the migration applied and every abandonment in place. That release
+/// never reads them, so a late call for an abandoned operation can stage,
+/// fence and boot under it; rolling forward applies nothing new, and the
+/// recorded abandonments refuse late calls again.
+#[tokio::test]
+async fn an_image_rollback_past_the_abandoned_migration_keeps_every_abandonment() {
+    static OLDER: std::sync::LazyLock<Migrator> = std::sync::LazyLock::new(|| {
+        Migrator::with_migrations(
+            pplx_space_sbx_mgr_store::db::migration::target()
+                .service
+                .migrations
+                .iter()
+                .filter(|migration| migration.version != RUNTIME_UPGRADE_MIGRATIONS[3])
+                .cloned()
+                .collect(),
+        )
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let current = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let older = SqliteDatabase {
+        migrator: &OLDER,
+        ..current
+    };
+    // A database the older release created takes this release's migration,
+    // and this release records an abandonment.
+    migrate_sqlite_up(older, &path).await.unwrap();
+    migrate_sqlite_up(current, &path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO sandbox_runtime_upgrade_abandoned
+             (operation_id, sandbox_id, recorded_at)
+         VALUES ('op', 'sandbox', '0')",
+        [],
+    )
+    .unwrap();
+    let kept = |conn: &Connection| -> (bool, i64) {
+        let applied = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?1 AND success",
+                [RUNTIME_UPGRADE_MIGRATIONS[3]],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let abandoned = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sandbox_runtime_upgrade_abandoned
+                  WHERE operation_id = 'op' AND sandbox_id = 'sandbox'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        (applied == 1, abandoned)
+    };
+
+    // The image rollback.
+    migrate_sqlite_up(older, &path).await.unwrap();
+    assert_eq!(
+        kept(&conn),
+        (true, 1),
+        "the older release keeps the abandonment"
+    );
+
+    // Rolling forward again.
+    migrate_sqlite_up(current, &path).await.unwrap();
+    assert_eq!(kept(&conn), (true, 1), "the roll-forward finds it recorded");
+}
+
 /// Each runtime-upgrade down refuses while a row it guards is recorded (an
 /// attempt outcome it would drop, or a per-operation outcome an older release
 /// can't parse), leaves its migration applied and its schema in place, and
@@ -405,7 +482,7 @@ async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_r
         .iter()
         .filter(|migration| {
             migration.migration_type.is_up_migration()
-                && migration.version > RUNTIME_UPGRADE_MIGRATIONS[1]
+                && migration.version > RUNTIME_UPGRADE_MIGRATIONS[3]
         })
         .count();
     let applied = || async {
@@ -485,6 +562,19 @@ async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_r
     // Newest first: each down's guarded rows, each tried alone and then
     // cleared.
     let guarded = [
+        (
+            RUNTIME_UPGRADE_MIGRATIONS[3],
+            vec![
+                "INSERT INTO sandbox_runtime_upgrade_abandoned
+                 (operation_id, sandbox_id, recorded_at)
+             VALUES ('op', 'sandbox', '0')"
+                    .to_string(),
+            ],
+            "DELETE FROM sandbox_runtime_upgrade_abandoned",
+        ),
+        // The attempt identity's guard has its own test below; here it only
+        // has to go through, over a table with no rows.
+        (RUNTIME_UPGRADE_MIGRATIONS[2], vec![], ""),
         (
             RUNTIME_UPGRADE_MIGRATIONS[1],
             vec![attempt_outcome("op", "'attempt-a'")],
