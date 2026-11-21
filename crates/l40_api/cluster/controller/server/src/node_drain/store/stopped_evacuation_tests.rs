@@ -660,7 +660,8 @@ async fn a_stopped_evacuation_is_re_placed_only_after_its_local_copy_is_gone() -
 }
 
 /// What the drain's teardown does to the cluster row, applied directly: the
-/// placement clear that `forget_pod_tracking` performs.
+/// placement clear that `release_published_stopped_evacuation` performs, minus
+/// its `placement_changed_at` bump, which a test that orders on it sets itself.
 async fn clear_placement(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
     sqlx::query(sql!(
         "UPDATE sandboxes
