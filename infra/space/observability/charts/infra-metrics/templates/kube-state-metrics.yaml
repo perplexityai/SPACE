@@ -1,0 +1,75 @@
+{{- if .Values.kubeStateMetrics.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-kube-state-metrics
+rules:
+  # Read-only, and only the groups values.yaml asks to export. Adding a
+  # resource here without adding it to kubeStateMetrics.resources grants a
+  # read nothing uses.
+  - apiGroups: [""]
+    resources: [namespaces, nodes, pods]
+    verbs: [list, watch]
+  - apiGroups: ["apps"]
+    resources: [deployments, daemonsets, statefulsets]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-kube-state-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector: {app: kube-state-metrics}
+  ports:
+    - {name: metrics, port: 8080, targetPort: 8080, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: kube-state-metrics}
+  template:
+    metadata:
+      labels:
+{{ include "common.podLabels" (dict "app" "kube-state-metrics" "profile" .Values.profile "owner" "infra-metrics") | indent 8 }}
+    spec:
+      serviceAccountName: kube-state-metrics
+{{ include "common.scheduling" .Values.scheduling | indent 6 }}
+      containers:
+        - name: kube-state-metrics
+          image: {{ .Values.images.kubeStateMetrics | quote }}
+          args:
+            - --resources={{ join "," .Values.kubeStateMetrics.resources }}
+            - --telemetry-port=8081
+          ports:
+            - {name: metrics, containerPort: 8080}
+          resources:
+            requests: {{ toYaml .Values.kubeStateMetrics.requests | nindent 14 }}
+            limits: {{ toYaml .Values.kubeStateMetrics.limits | nindent 14 }}
+{{ include "common.containerSecurityContext" . | indent 10 }}
+{{- end }}
