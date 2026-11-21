@@ -686,11 +686,23 @@ impl SandboxManagerService {
                 ..Default::default()
             };
             // An upgrade boots the staged disk, so the checkpoint is staged
-            // and left suspended rather than launched.
-            let staged = if start.runtime_upgrade.is_some() {
-                // Boxed, like the upgrade it precedes: inlined, the staging
-                // future would grow every Wake's state machine.
-                Box::pin(self.stage_missing_checkpoint(staging_start)).await
+            // and left suspended rather than launched. An abandoned one
+            // stages nothing. This runs outside the upgrade lock, so it only
+            // spares the transfer: the check under that lock, before the
+            // upgrade itself, is the one an abandon is ordered against.
+            // Each failure carries the reason its event names.
+            const STAGING: &str = "stage_from_checkpoint";
+            let staged = if let Some(upgrade) = &start.runtime_upgrade {
+                match self.abandoned_runtime_upgrade_refusal(upgrade.operation_id(), &sandbox_id) {
+                    // Boxed, like the upgrade it precedes: inlined, the
+                    // staging future would grow every Wake's state machine.
+                    Ok(None) => Box::pin(self.stage_missing_checkpoint(staging_start))
+                        .await
+                        .map_err(|error| (error, STAGING)),
+                    Ok(Some(refused)) => Err((refused, "runtime_upgrade_abandoned")),
+                    // A read that failed isn't an abandonment.
+                    Err(error) => Err((error, STAGING)),
+                }
             } else {
                 self.start_sandbox_with_authority(
                     staging_start,
@@ -699,15 +711,16 @@ impl SandboxManagerService {
                 )
                 .await
                 .map(drop)
+                .map_err(|error| (error, STAGING))
             };
-            if let Err(error) = staged {
+            if let Err((error, reason)) = staged {
                 emit_sandbox_event(
                     &sandbox_id,
                     SandboxEventType::WakeFailed,
                     SandboxEventSource::SbxManager,
                     SandboxEventDetails::default()
                         .target_state(target_state.to_string())
-                        .reason("stage_from_checkpoint")
+                        .reason(reason)
                         .error(error.to_string()),
                 );
                 return Err(error);
