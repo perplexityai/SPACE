@@ -395,6 +395,10 @@ pub enum SandboxRestoreProvenance {
     RemoteLocalMismatch,
     RemoteOnly,
     RemoteMetadataUnknown,
+    /// The sandbox was rolled back to the suspend it last woke from because
+    /// its node, and every change made after that suspend, was lost. The
+    /// sandbox's files are older than its last activity.
+    StaleAfterNodeLoss,
 }
 
 impl SandboxRestoreProvenance {
@@ -407,6 +411,7 @@ impl SandboxRestoreProvenance {
             Self::RemoteLocalMismatch => "remote_local_mismatch",
             Self::RemoteOnly => "remote_only",
             Self::RemoteMetadataUnknown => "remote_metadata_unknown",
+            Self::StaleAfterNodeLoss => "stale_after_node_loss",
         }
     }
 }

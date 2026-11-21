@@ -607,6 +607,130 @@ async fn started_recovery_treats_deleting_snapshot_as_unavailable() -> TestResul
 }
 
 #[tokio::test]
+async fn started_recovery_accepts_marker_with_newer_failed_upload() -> TestResult {
+    // Arrange: the shape a lost-started rollback leaves once the sandbox is
+    // woken again: the marker suspend is ready, the activity clocks sit at
+    // its timestamp, and the dead post-wake upload the rollback failed is
+    // newer than it.
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    let source_node_id = NodeId::new();
+    let artifact_id = Uuid::now_v7();
+    let snapshot_id = SnapshotId::new();
+    insert_sandbox(
+        &fixture.pool,
+        sandbox_id,
+        SandboxLifecycle::Started.as_str(),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.13', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(source_node_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, source_node_id, org_id,
+              local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'ready', NOW() - INTERVAL '1 hour', $3,
+                 '00000000-0000-0000-0000-000000000001',
+                 $4, 'full', 'suspend')"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(artifact_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations
+             (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://space-test/rolled-back-suspend?region=us-east-1',
+                 '00000000-0000-0000-0000-000000000001')"
+    ))
+    .bind(snapshot_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend',
+                last_command_at = (SELECT timestamp FROM snapshots WHERE id = $3),
+                last_access_at = (SELECT timestamp FROM snapshots WHERE id = $3)
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact_id)
+    .bind(snapshot_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, source_node_id, org_id,
+              local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'failed', NOW() - INTERVAL '30 minutes', $3,
+                 '00000000-0000-0000-0000-000000000001',
+                 $4, 'full', 'suspend')"
+    ))
+    .bind(SnapshotId::new())
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(Uuid::now_v7())
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, state, active)
+         VALUES ($1, 2, 'space-sbx-rolled-back-g2', 'space', 'recovering', TRUE)"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    // Act.
+    let context = fixture
+        .store
+        .started_recovery_restore_context(sandbox_id, ExecutionGeneration::new(2)?)
+        .await?;
+
+    // Assert: the failed row holds no bytes and doesn't veto the marker.
+    assert!(matches!(
+        context,
+        StartedRecoveryRestoreContext::Ready(StartedRecoveryRestoreSource::Remote { .. })
+    ));
+
+    // Act: a newer upload that is still `creating` does veto it.
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, source_node_id, org_id,
+              local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'creating', NOW() - INTERVAL '20 minutes', $3,
+                 '00000000-0000-0000-0000-000000000001',
+                 $4, 'full', 'suspend')"
+    ))
+    .bind(SnapshotId::new())
+    .bind(sandbox_id)
+    .bind(source_node_id)
+    .bind(Uuid::now_v7())
+    .execute(&fixture.pool)
+    .await?;
+    let context = fixture
+        .store
+        .started_recovery_restore_context(sandbox_id, ExecutionGeneration::new(2)?)
+        .await?;
+
+    // Assert.
+    assert!(matches!(
+        context,
+        StartedRecoveryRestoreContext::Unavailable
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn started_recovery_handoff_reports_lost_ownership() -> TestResult {
     // Arrange.
     let fixture = postgres_store().await?;

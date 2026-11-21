@@ -2132,6 +2132,84 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
     )
 }
 
+/// SQL row condition: the snapshot `sn` is a durable copy of the suspend
+/// artifact the marker of the sandbox aliased as `sandbox_alias` pins, even
+/// though that copy predates the last recorded command or access.
+///
+/// This is the evidence a lost started sandbox can be **rolled back** to once
+/// the node that ran it is gone. A `started` row keeps the marker of the
+/// suspend it last woke from (`current_local_artifact_*`, origin `suspend`).
+/// Every write after that wake lived only in the VM's memory and the node's
+/// local disk, so when the node dies those writes are gone for good, but the
+/// suspend bytes the sandbox woke from are still in object storage. Started
+/// recovery and [`started_restore_source_absent`] both refuse that copy,
+/// correctly, because restoring it silently would lose the post-wake writes.
+/// The lost-started give-up uses this fragment to tell "nothing survives"
+/// from "the last suspend survives": in the second case it reverts the
+/// sandbox to `suspended` on that snapshot and records the rollback, rather
+/// than failing it and discarding the bytes that are still there.
+///
+/// The copy must be the exact marker artifact (identity, kind, `suspend`
+/// origin), `ready`, with a storage location that isn't orphaned, and no
+/// newer full snapshot may exist in any state but `failed`. A `failed` row
+/// holds no bytes, so it can't be a better restore point. Anything else that
+/// is newer (a `ready` checkpoint, a `creating` upload, a `deleting` row)
+/// means the marker is not the most recent state the control plane knows
+/// about, and the rollback refuses. Callers fail the gone node's dead
+/// `creating` uploads first, so an upload that died with the node doesn't
+/// block its own sandbox's rollback.
+///
+/// Only the marker artifact qualifies, never a newer checkpoint or other
+/// full snapshot, because that is the only one a `suspended` row restores:
+/// with a marker set, the suspended restore selectors match the snapshot by
+/// the marker's exact artifact identity ([`matching_ready_backup_exists`]
+/// via [`artifact_identity_or_legacy`]), so a rollback onto any other
+/// snapshot would also have to repoint the marker. A newer `ready` full
+/// snapshot therefore vetoes the rollback instead of being skipped.
+///
+/// The activity clocks are deliberately not compared. Callers own the proof
+/// that no runtime can still write to the sandbox: the source node is gone,
+/// the active execution is the terminal `recovery_failed` owner with no pod,
+/// and the row is locked.
+///
+/// The row condition over `snapshots sn JOIN snapshot_storage_locations ssl
+/// ON ssl.snapshot_id = sn.id`, so a caller selects the marker snapshot
+/// itself (its id or timestamp) under exactly these rules.
+pub fn rollback_marker_suspend_backup_matches(sandbox_alias: &str) -> String {
+    let no_newer = no_newer_unfailed_full_snapshot(sandbox_alias, "sn");
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    format!(
+        "(sn.sandbox_id = {sandbox_alias}.id\n\
+                AND ssl.orphaned_at IS NULL\n\
+                AND {sandbox_alias}.current_local_artifact_origin = '{suspend}'\n\
+                AND sn.local_artifact_id = {sandbox_alias}.current_local_artifact_id\n\
+                AND sn.artifact_kind = {sandbox_alias}.current_local_artifact_kind\n\
+                AND sn.type = 'full'\n\
+                AND sn.state = 'ready'\n\
+                AND (sn.artifact_origin IS NULL OR sn.artifact_origin = '{suspend}')\n\
+                AND {no_newer})"
+    )
+}
+
+/// SQL fragment: no full snapshot newer than `{snapshot_alias}` exists in any
+/// state but `failed`. A `failed` row holds no bytes, so it is never a better
+/// restore point than the snapshot it postdates. Shared by the lost-started
+/// rollback and started recovery's restore selector, so a row the rollback
+/// leaves behind (the marker, plus the dead upload it failed) is one started
+/// recovery accepts.
+pub fn no_newer_unfailed_full_snapshot(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    format!(
+        "NOT EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots newer\n\
+              WHERE newer.sandbox_id = {sandbox_alias}.id\n\
+                AND newer.type = 'full'\n\
+                AND newer.state <> 'failed'\n\
+                AND newer.timestamp > {snapshot_alias}.timestamp\n\
+         )"
+    )
+}
+
 /// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
 /// is **portable for drain-completion**:
 ///
