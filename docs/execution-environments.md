@@ -1220,6 +1220,12 @@ running keep running and count as `no_evidence` in
 placement shadow" in [observability.md](observability.md)). Switching the
 gate to `shadow` stops new pods from requiring the label.
 
+The Kind smoke `local.environment_placement_gate_on_places_bound_pods` turns
+the gate `on` on a bench and checks this against kube-scheduler. A create bound
+to an environment no worker publishes is refused as unschedulable, an E0-bound
+create runs E0, and the first create runs once the workers publish its
+environment.
+
 #### Not covered
 
 On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` while

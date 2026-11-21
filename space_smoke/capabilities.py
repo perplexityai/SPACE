@@ -1135,6 +1135,9 @@ class SandboxPodRender:
     phase: str | None
     node_name: str | None
     pool_role: str | None
+    annotations: Mapping[str, str] = field(default_factory=dict)
+    required_node_terms: tuple[tuple[Mapping[str, Any], ...], ...] = ()
+    """The required node affinity's terms (ORed), each its `matchExpressions` (ANDed)."""
 
 
 class NodeSelectorExtrasControl(Protocol):
@@ -1411,6 +1414,7 @@ class EcwScenarioSandboxes(Protocol):
         *,
         network: NetworkConfig | None = None,
         allow_internet_access: bool | None = None,
+        template: str | None = None,
     ) -> EcwSandbox: ...
 
     def fork(
@@ -1426,6 +1430,8 @@ class EcwScenarioSandboxes(Protocol):
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        template: str | None = None,
+        refused_statuses: Collection[int] = (),
     ) -> EcwCreateAttempt: ...
 
     def delete(self, sandbox: CommandSandbox) -> int: ...

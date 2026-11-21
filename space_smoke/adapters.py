@@ -111,7 +111,16 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
-from space_smoke.execution_environment import ALLOWED_ENVIRONMENTS_ENV
+from space_smoke.environment_placement_gate import (
+    GATE_ENV as ENVIRONMENT_PLACEMENT_GATE_ENV,
+    RUNTIME_UPGRADE_ENV as RUNTIME_UPGRADE_AT_ACTIVATION_ENV,
+)
+from space_smoke.execution_environment import (
+    ALLOWED_ENVIRONMENTS_ENV,
+    BUILDER_ROLE,
+    NODE_ROLES,
+    WORKER_ROLE,
+)
 from space_smoke.leader_election import RECONCILER_TICK_ENV
 from space_smoke.reconcile_queue_gc import (
     GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
@@ -151,6 +160,7 @@ KIND_BOOTSTRAP_POST_API_TIMEOUT_SECONDS = 2400
 # Longer than the 30-minute scenario budget plus a full controller rollout.
 # A crashed owner eventually expires, while a live scenario cannot be taken
 # over before its body-level restore and release have had time to finish.
+# A holder with a longer budget asks for a longer Lease.
 RETENTION_MUTATION_LEASE_DURATION_SECONDS = 3600
 
 
@@ -272,6 +282,26 @@ def _recorded_limiter_env(recorded: str) -> dict[str, str | None]:
     ):
         raise SmokeConfigurationError("the recorded limiter env holds a value a restore cannot write")
     _require_limiter_env_keys(standing)
+    return standing
+
+
+def _recorded_environment_placement_gate(recorded: str) -> dict[str, str | None]:
+    """The standing gate literals a Lease recorded, refused unless every entry is restorable."""
+
+    try:
+        standing = json.loads(recorded)
+    except json.JSONDecodeError as error:
+        raise SmokeConfigurationError("the recorded environment placement gate is not JSON") from error
+    allowed = {f"{target}:{ENVIRONMENT_PLACEMENT_GATE_ENV}" for target in ("api", "admin-api", "controller")}
+    if (
+        not isinstance(standing, dict)
+        or not standing
+        or not set(standing) <= allowed
+        or not all(value is None or (isinstance(value, str) and value.strip().lower() == "off") for value in standing.values())
+    ):
+        raise SmokeConfigurationError(
+            "the recorded environment placement gate holds an entry a restore cannot write"
+        )
     return standing
 
 
@@ -570,9 +600,9 @@ UNANSWERED_TEMPLATE_EVICT_AFTER_BOUNDS = (10, 600)
 # execution-environment admission may set `ALLOWED_ENVIRONMENTS_ENV`
 # (`space_smoke/execution_environment.py`).
 NODE_MANAGER_DAEMONSETS = (f"space-{NODE_MANAGER}", f"space-builder-{NODE_MANAGER}")
-# Three hours: longer than the longest budget of a scenario that holds the
-# admission (150 minutes, its cleanup included).
-NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS = 3 * 3600
+# Four hours: longer than the longest budget of a scenario that holds the
+# admission (230 minutes, its cleanup included).
+NODE_MANAGER_MUTATION_LEASE_DURATION_SECONDS = 4 * 3600
 NODE_TEMPLATE_PRESENCE_PREFIX = "space.pplx.net/template-build-"
 # The node services that read the object store, by DaemonSet and the
 # container that does: each holds the store's static keys in
@@ -612,6 +642,9 @@ CORDONED_NODE_ANNOTATION = "space.pplx.net/smoke-cordoned-node"
 # failing mid-fault does not leave later scenarios on smoke-sized caps or
 # without the limiters' store.
 LIMITER_ENV_ANNOTATION = "space.pplx.net/smoke-limiter-env"
+# The gate literals the environment placement gate found standing, recorded
+# before it turns the gate on and cleared once they're back.
+ENVIRONMENT_PLACEMENT_GATE_ANNOTATION = "space.pplx.net/smoke-environment-placement-gate"
 REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
 # A rollout a scenario starts only to apply or restore its env
 # (`KindHarness._fast_rollout`) runs with every replacement surged at once and
@@ -729,6 +762,8 @@ UNSELECTED_POD_LABEL = "space.pplx.net/smoke-unselected"
 UNSELECTED_POD_IMAGE = "registry.k8s.io/pause:3.10"
 UNSELECTED_POD_READY_SECONDS = 120
 PUBLIC_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-api"
+# The dedicated admin API (`admin.enabled` in the space-api-local chart).
+ADMIN_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-admin-api"
 # "true" runs the API on the Kubernetes substrate, "false" on the Direct one.
 K8S_CONTROL_PLANE_ENV = "SPACE_K8S_CONTROL_PLANE"
 KIND_REDIS_DEPLOYMENT = "space-redis"
@@ -3756,8 +3791,13 @@ ON CONFLICT (key_hash) DO NOTHING;
         allowed: Collection[str],
         controller_first: bool,
         what: str,
+        ownership: _LeaseOwnership | None = None,
     ) -> None:
-        """Write allowlisted renderer env literals and await every affected rollout."""
+        """Write allowlisted renderer env literals and await every affected rollout.
+
+        `ownership` is the public API Lease of a repair running inside its
+        acquisition; otherwise the caller's held Lease guards the rollouts.
+        """
 
         self._require_isolated_kind(f"{what} env override")
         unknown = sorted(set(values) - set(allowed))
@@ -3774,10 +3814,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         # the default group and the labels anyway). Each runs at the fast pace
         # and ends once the replaced pods are gone; the slowest, the API's,
         # is about 15 s on kind, against about 38 s at the chart's pace.
-        order = [("controller", controller), ("api", api)] if controller_first else [("api", api), ("controller", controller)]
+        # The dedicated admin API serves no creates, so it rolls beside the public one.
+        admin = {k.split(":", 1)[1]: v for k, v in values.items() if k.startswith("admin-api:")}
+        apis = [("api", api), ("admin-api", admin)]
+        order = [("controller", controller), *apis] if controller_first else [*apis, ("controller", controller)]
         order.append(("internal-api", {k.split(":", 1)[1]: v for k, v in values.items() if k.startswith("internal-api:")}))
         deployments = {
             "api": self._public_api_deployment,
+            "admin-api": self._required_admin_api_deployment,
             "controller": self._controller_deployment,
             "internal-api": self._internal_api_deployment,
         }
@@ -3787,7 +3831,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 if not assignments:
                     continue
                 name = deployments[target]()
-                paces.enter_context(self._fast_rollout(name))
+                paces.enter_context(self._fast_rollout(name, ownership))
                 if self._set_deployment_env_only(name, assignments):
                     rolling.append(name)
             waits = [
@@ -3809,6 +3853,88 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def restore_node_group_env(self, standing: Mapping[str, str | None]) -> None:
         self._apply_node_group_env(standing, controller_first=False)
+
+    # --- environment placement gate -----------------------------------------
+    #
+    # `SPACE_ENVIRONMENT_PLACEMENT_GATE` on the Deployments whose substrate
+    # reads it (`space_smoke/environment_placement_gate.py`), beside the
+    # resume-time upgrade flag it refuses `on` with. The captured literals go
+    # back verbatim.
+
+    def _admin_api_deployment(self) -> str | None:
+        """The dedicated admin API Deployment, None on a bench that doesn't run one."""
+
+        result = self.kubectl(
+            "get", "deploy", "-l", ADMIN_API_DEPLOYMENT_SELECTOR,
+            "-o", "jsonpath={.items[*].metadata.name}", timeout=15,
+        )
+        names = _require_ok(result, "find the admin API Deployment").split()
+        if len(names) > 1:
+            raise SmokeConfigurationError(
+                f"expected at most one admin API Deployment ({ADMIN_API_DEPLOYMENT_SELECTOR}), found {names}"
+            )
+        return names[0] if names else None
+
+    def _required_admin_api_deployment(self) -> str:
+        name = self._admin_api_deployment()
+        if name is None:
+            raise SmokeConfigurationError("refusing an admin API env write on a bench that runs no admin API")
+        return name
+
+    def environment_placement_env(self) -> dict[str, str | None]:
+        keys = (ENVIRONMENT_PLACEMENT_GATE_ENV, RUNTIME_UPGRADE_AT_ACTIVATION_ENV)
+        deployments: dict[str, str | None] = {
+            "api": self._public_api_deployment(),
+            "admin-api": self._admin_api_deployment(),
+            "controller": self._controller_deployment(),
+        }
+        env: dict[str, str | None] = {}
+        for target, name in deployments.items():
+            if name is None:
+                continue
+            for key, value in self._deployment_env_literals(name, keys).items():
+                env[f"{target}:{key}"] = value
+        return env
+
+    def set_environment_placement_gate(
+        self,
+        values: Mapping[str, str | None],
+        *,
+        api_first: bool,
+        record: Mapping[str, str | None] | None = None,
+    ) -> None:
+        for value in values.values():
+            if value is not None and value.strip().lower() not in {"off", "shadow", "on"}:
+                raise ValueError(f"refusing environment placement gate value {value!r}")
+        action = "an environment placement gate write"
+        ownership = self._held_public_api_lease(action)
+        # Recorded, in the same guarded patch as the renewal, before the
+        # write: a run killed with the gate on leaves the standing literals on
+        # the Lease, and the next holder's repair puts them back.
+        annotations = (
+            {ENVIRONMENT_PLACEMENT_GATE_ANNOTATION: json.dumps(dict(record), sort_keys=True)}
+            if record is not None
+            else None
+        )
+        self._renew_lease(ownership, action, annotations)
+        self._write_environment_placement_gate(values, api_first=api_first, ownership=ownership)
+
+    def clear_environment_placement_gate_record(self) -> None:
+        action = "clearing the environment placement gate record"
+        self._renew_lease(
+            self._held_public_api_lease(action), action, {ENVIRONMENT_PLACEMENT_GATE_ANNOTATION: None}
+        )
+
+    def _write_environment_placement_gate(
+        self, values: Mapping[str, str | None], *, api_first: bool, ownership: _LeaseOwnership
+    ) -> None:
+        self._apply_renderer_env(
+            values,
+            allowed={f"{target}:{ENVIRONMENT_PLACEMENT_GATE_ENV}" for target in ("api", "admin-api", "controller")},
+            controller_first=not api_first,
+            what="environment placement gate",
+            ownership=ownership,
+        )
 
     # --- node-ctl admission fence -------------------------------------------
 
@@ -4570,11 +4696,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         context_hash = hashlib.sha256(self.config.context.encode()).hexdigest()[:16]
         return f"space-smoke-public-api-{context_hash}"
 
-    def acquire_public_api_mutation(self) -> Callable[[], None]:
+    def acquire_public_api_mutation(
+        self, *, duration_seconds: int = RETENTION_MUTATION_LEASE_DURATION_SECONDS
+    ) -> Callable[[], None]:
         ownership = self._acquire_named_mutation_lease(
             self._public_api_lease_name(),
             "public API deployment mutation",
             repair=self._repair_recorded_limiter_faults,
+            duration_seconds=duration_seconds,
         )
         self._public_api_lease_ownership = ownership
 
@@ -4613,14 +4742,44 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._renew_lease(
                 ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
             )
+        recorded_gate = annotations.get(ENVIRONMENT_PLACEMENT_GATE_ANNOTATION)
+        if isinstance(recorded_gate, str) and recorded_gate:
+            standing_gate = _recorded_environment_placement_gate(recorded_gate)
+            if self._admin_api_deployment() is None:
+                # A Deployment that's gone carries no gate to put back; the
+                # targets that remain are still restored before the record goes.
+                standing_gate = {
+                    key: value for key, value in standing_gate.items() if not key.startswith("admin-api:")
+                }
+            self._renew_lease(ownership, "an orphaned environment placement gate repair")
+            try:
+                self._write_environment_placement_gate(standing_gate, api_first=True, ownership=ownership)
+            except SmokeConfigurationError as error:
+                raise SmokeConfigurationError(
+                    f"could not put back the environment placement gate {standing_gate} an earlier run "
+                    f"recorded: {error}; the record stays on the Lease, so the next preflight retries the repair"
+                ) from error
+            self.wait_public_api_ready(timeout=300)
+            after = {
+                key: value for key, value in self.environment_placement_env().items() if key in standing_gate
+            }
+            if after != standing_gate:
+                raise SmokeConfigurationError(
+                    f"the environment placement gate reads {after} after its repair, not the recorded {standing_gate}"
+                )
+            self._renew_lease(
+                ownership,
+                "clearing the environment placement gate record",
+                {ENVIRONMENT_PLACEMENT_GATE_ANNOTATION: None},
+            )
 
     def repair_orphaned_limiter_faults(self) -> bool:
-        """Undo a limiter fault an earlier run left recorded, or refuse to proceed.
+        """Undo a limiter fault or gate an earlier run left recorded, or refuse to proceed.
 
-        Every Kind scenario runs this first: a run killed while Redis was down
-        or the caps were shrunk leaves its records on the public-API mutation
-        Lease, and only the three scenarios that take that Lease would repair
-        them. One Lease read when nothing is recorded. A recorded fault is
+        Every Kind scenario runs this first: a run killed while Redis was down,
+        the caps were shrunk or the environment placement gate was on leaves
+        its records on the public-API mutation Lease, and only the scenarios
+        that take that Lease would repair them. One Lease read when nothing is recorded. A recorded fault is
         repaired by acquiring the Lease, which is possible once it is released,
         expired or held by a holder proven dead; a live holder is a smoke
         mid-fault, and the caller must not run against it. True if a repair ran.
@@ -4638,14 +4797,16 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         document = _lease_document(observed.stdout)
         annotations = _lease_annotations(document)
-        if not any(annotations.get(key) for key in (LIMITER_ENV_ANNOTATION, REDIS_REPLICAS_ANNOTATION)):
+        recorded_keys = (LIMITER_ENV_ANNOTATION, REDIS_REPLICAS_ANNOTATION, ENVIRONMENT_PLACEMENT_GATE_ANNOTATION)
+        if not any(annotations.get(key) for key in recorded_keys):
             return False
         try:
             release = self.acquire_public_api_mutation()
         except SmokeConfigurationError as error:
             _, spec = _lease_parts(document)
             raise SmokeConfigurationError(
-                "refusing to run while the public API mutation Lease records a limiter fault "
+                "refusing to run while the public API mutation Lease records a limiter fault or "
+                "environment placement gate "
                 f"(holder {spec.get('holderIdentity') or '<none>'}): {error}"
             ) from error
         release()
@@ -5641,9 +5802,16 @@ ON CONFLICT (key_hash) DO NOTHING;
             what="node-manager",
         )
 
-    def node_manager_nodes(self) -> tuple[str, ...]:
+    def node_manager_daemonsets(self) -> Mapping[str, str]:
+        return dict(zip((WORKER_ROLE, BUILDER_ROLE), NODE_MANAGER_DAEMONSETS))
+
+    def node_manager_nodes(self, roles: Collection[str] = NODE_ROLES) -> tuple[str, ...]:
+        kind_roles = {WORKER_ROLE: KIND_WORKER_ROLE, BUILDER_ROLE: KIND_BUILDER_ROLE}
+        unknown = sorted(set(roles) - set(kind_roles))
+        if unknown:
+            raise ValueError(f"no node-manager role {unknown}; known: {sorted(kind_roles)}")
         nodes: set[str] = set()
-        for role in (KIND_WORKER_ROLE, KIND_BUILDER_ROLE):
+        for role in (kind_roles[role] for role in NODE_ROLES if role in roles):
             result = self.kubectl(
                 "get", "pods", "-l", _node_service_selector(NODE_MANAGER, role=role),
                 "-o", "jsonpath={.items[*].spec.nodeName}", timeout=15,
@@ -7670,6 +7838,15 @@ def _newest_pod_render(pod_list_json: str) -> SandboxPodRender | None:
         phase=(newest.get("status") or {}).get("phase"),
         node_name=spec.get("nodeName") or None,
         pool_role=(metadata.get("labels") or {}).get("space.pplx.net/pool-role"),
+        annotations={str(k): str(v) for k, v in (metadata.get("annotations") or {}).items()},
+        required_node_terms=tuple(
+            tuple(dict(expression) for expression in (term.get("matchExpressions") or ()))
+            for term in (
+                (((spec.get("affinity") or {}).get("nodeAffinity") or {})
+                 .get("requiredDuringSchedulingIgnoredDuringExecution") or {})
+                .get("nodeSelectorTerms") or ()
+            )
+        ),
     )
 
 
