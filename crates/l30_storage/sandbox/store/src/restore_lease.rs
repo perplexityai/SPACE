@@ -45,7 +45,13 @@ pub struct RestoreClaimRow {
 /// `stopped`, marker `'stopped'`, no `active_node_id`, and only when
 /// `evacuation_target` is [`SandboxLifecycle::Stopped`]. It writes no lease:
 /// the marker fences it, and the claim's `restore_lease_token` is always
-/// `NULL`. `lease_ttl_secs` is bound as `$2` but not written: it only
+/// `NULL`. A row under a live restore lease is left alone: only a start's
+/// claim of a handed-off stopped row writes one on a marked row
+/// ([`crate::drain_restore::claim_handed_off_stopped`]), and that start owns
+/// the re-placement while it lasts. A lapsed one is taken over and
+/// cleared, so the start's claim no longer takes the row. On a cluster
+/// with no v2 drain no marked row carries a lease, and the claim takes
+/// what it always took. `lease_ttl_secs` is bound as `$2` but not written: it only
 /// filters the returned row. The `UPDATE` in the statement's `WITH` runs
 /// whatever its value, so a negative value still moves the row to
 /// `restoring` and returns `None`. Pass a non-negative value.
@@ -75,11 +81,17 @@ pub async fn claim_evacuation_restore(
                           )
                         )
                         AND evacuation_restore_target IS NOT NULL
+                        AND (
+                          restore_lease_expires_at IS NULL
+                          OR restore_lease_expires_at <= NOW()
+                        )
                       FOR UPDATE
                  ),
                  updated AS (
                      UPDATE sandboxes s
-                        SET lifecycle = 'restoring'
+                        SET lifecycle = 'restoring',
+                            restore_lease_token = NULL,
+                            restore_lease_expires_at = NULL
                        FROM candidate c
                      WHERE s.id = c.id
                       RETURNING c.lifecycle

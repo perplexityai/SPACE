@@ -20,6 +20,7 @@ use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError}
 
 mod activity_tests;
 mod create_finish_tests;
+mod drain_restore_tests;
 mod insert_unplaced_tests;
 
 /// The three desired-state columns, read back raw.
