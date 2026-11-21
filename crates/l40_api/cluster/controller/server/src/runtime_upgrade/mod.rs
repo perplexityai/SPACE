@@ -83,11 +83,16 @@ use crate::env_config::EnvConfig;
 use crate::metrics::cluster_reconciler::{self as reconciler_metrics, Loop};
 use crate::metrics::runtime_upgrade::{self as metrics, RedriveResult};
 
+mod sandboxes;
 mod templates;
 mod worker;
 
 #[cfg(test)]
 mod tests;
+
+pub use sandboxes::{
+    DispatchError, GuardedStop, SandboxDriver, SandboxUpgradeDispatcher, StoppedUpgrade,
+};
 
 /// The switch: `1`, `true`, `yes`, `on` or `enabled` turns the loop on;
 /// unset or anything else keeps it off.
@@ -285,8 +290,10 @@ impl Drivers {
     }
 }
 
-/// The drivers this build runs: templates ([`templates::TemplateDriver`]). A
-/// driver added here adds its kind to
+/// The drivers this build runs: templates ([`templates::TemplateDriver`]).
+/// The sandbox driver ([`SandboxDriver`]) isn't one of them until a
+/// production [`SandboxUpgradeDispatcher`] exists. A driver added here adds
+/// its kind to
 /// `pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS` too, so the
 /// admin API starts campaigns of it; a test holds the two equal. Building
 /// them reads nothing: a disabled loop never asks them anything.

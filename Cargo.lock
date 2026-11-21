@@ -7900,6 +7900,7 @@ dependencies = [
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-test-env",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.20",
  "time",
