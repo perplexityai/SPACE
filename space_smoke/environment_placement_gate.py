@@ -6,14 +6,12 @@ controller. With it `on`, a sandbox pod bound to an environment requires
 node-ctl's `space.pplx.net/env-<alg>-<digest>=usable` label on its node, so a
 bound create with no such node is unschedulable and refused, and with it in
 shadow or off the same create places as it always did
-(docs/execution-environments.md). A Kind chart sets neither the gate nor
-resume-time runtime upgrades, so the bench runs it off.
+(docs/execution-environments.md). A Kind chart doesn't set the gate, so the
+bench runs it off.
 
 Under the public API mutation Lease, held for the scenario's whole budget,
-this reads both keys on each of those Deployments, refuses while resume-time
-upgrades are on (the substrate refuses `on` beside them at startup, so a
-rollout would never become ready) or while a gate literal an earlier run left
-behind is set to anything but `off`, arms the restore, records the standing
+this reads the gate on each of those Deployments, refuses while a gate literal
+an earlier run left behind is set to anything but `off`, arms the restore, records the standing
 literals on the Lease, writes `on` and awaits the rollouts. A run killed with
 the gate on leaves that record, and the Lease's next holder (any Kind
 scenario's preflight repair) puts the literals back: at once on the same host
@@ -38,7 +36,6 @@ from space_smoke.execution_environment import (
 from space_smoke.runtime import Compensation, ResourceScope, SmokeConfigurationError
 
 GATE_ENV = "SPACE_ENVIRONMENT_PLACEMENT_GATE"
-RUNTIME_UPGRADE_ENV = "SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED"
 GATE_ON = "on"
 # What the gate reads as off when it's set (an unset gate is off too).
 GATE_OFF = "off"
@@ -51,12 +48,6 @@ ROLLOUT_TIMEOUT_SECONDS = 300.0
 # Four hours: longer than the scenario's 230-minute budget, its cleanup
 # included, so the Lease can't expire while the gate is on.
 LEASE_DURATION_SECONDS = 4 * 3600
-
-
-def upgrade_flag_on(value: str | None) -> bool:
-    """Whether a `RUNTIME_UPGRADE_ENV` literal turns resume-time upgrades on (`env_flag`'s vocabulary)."""
-
-    return (value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
 def gate_left_behind(value: str | None) -> bool:
@@ -94,7 +85,7 @@ class EnvironmentPlacementGateControl(Protocol):
         ...
 
     def environment_placement_env(self) -> dict[str, str | None]:
-        """`<deployment>:<key>` literals for `GATE_ENV` and `RUNTIME_UPGRADE_ENV`, None where unset.
+        """`<deployment>:GATE_ENV` literals, None where unset.
 
         `<deployment>` is one of `GATE_DEPLOYMENTS` the bench runs.
         """
@@ -148,12 +139,6 @@ class EnvironmentPlacementGate:
         )
         env = self._control.environment_placement_env()
         self._fixture.record("environment_placement_env_before", dict(env))
-        upgrades = {key: value for key, value in env.items() if key.endswith(f":{RUNTIME_UPGRADE_ENV}") and upgrade_flag_on(value)}
-        if upgrades:
-            raise SmokeConfigurationError(
-                f"resume-time runtime upgrades are on ({upgrades}); the substrate refuses "
-                f"{GATE_ENV}={GATE_ON} beside them, so the gate can't be turned on"
-            )
         standing = {key: value for key, value in env.items() if key.endswith(f":{GATE_ENV}")}
         if not standing:
             raise SmokeConfigurationError("the bench runs no Deployment that reads the environment placement gate")

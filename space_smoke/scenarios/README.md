@@ -245,9 +245,8 @@ before the write that turns it on, and writes the API's literal before the
 controller's. The standing literals are recorded on the public API mutation
 Lease first, so a Kind scenario's preflight repairs a run killed with the
 gate on: the next one on the same host and user, or the first after the
-Lease's four hours elsewhere. It refuses while resume-time runtime upgrades are on, since the
-substrate refuses `on` beside them at startup, and it refuses a gate literal
-an earlier run left behind. It's manual
+Lease's four hours elsewhere. It refuses a gate literal an earlier run left
+behind. It's manual
 for the same reason as the scenario above, and it also rolls the API, the
 admin API and the cluster controller.
 

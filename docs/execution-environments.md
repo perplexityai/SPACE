@@ -1141,8 +1141,12 @@ boots that snapshot's disk artifact, the checkpoint's for a suspended
 sandbox's restore, and, for a stopped sandbox's start, its current disk
 artifact's. A drain's stopped re-placement takes its pinned disk artifact's.
 A disk's record outlives the node it was written on, and the execution the
-sandbox last published stands in only when the disk records none. With the gate `on`, the pod also requires its
-environment's label in every node-affinity term, so a node without it can't
+sandbox last published stands in only when the disk records none. A
+`runtime-upgrade` pod, a start's, a resume's or a stopped sandbox's upgrade
+without a start (see "Booting an upgrade in its pod"), records the upgrade's
+target instead, which is what its shim boots: the environment the sandbox
+moves off may no longer execute, and the node needn't publish it. With the
+gate `on`, the pod also requires its environment's label in every node-affinity term, so a node without it can't
 take the pod, and a pre-bound restore pod is refused by kubelet. With the
 gate `on`, a binding that can't be read or doesn't parse fails the pod build
 before any pod exists, and on the warm pool it stops that config from growing
@@ -1152,7 +1156,11 @@ A restore pinned to its source node skips kube-scheduler, and kubelet's
 refusal there is terminal for a restore whose bytes are on that node, so with
 the gate `on` it's refused before any pod exists, as a conflict, when the Node
 reflector shows the source node not publishing the environment. A node the reflector doesn't
-have keeps the pin, with kubelet as the backstop.
+have keeps the pin, with kubelet as the backstop. An upgrade of a stopped
+sandbox without a start checks its disk node the same way with its other
+disk-node checks, before it places a pod or claims anything new, and answers a
+retryable 503. Its retry that reuses the upgrade pod an earlier attempt left
+there skips the check, since that pod is already bound to the node.
 With the gate `on`, a create adopts a warm pod only from a node that publishes
 the environment of the pod's build: a warm pod built while the gate was off
 carries no requirement, and a node can lose its label under a pod it already
@@ -1205,9 +1213,9 @@ another environment. A restore, fork or stopped start
 pod boots through Start, not Create, and doesn't send it. In `shadow` the
 annotation is absent and the create names no environment.
 
-On Kubernetes, `on` runs while resume-time runtime upgrades are off; with
-`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` on it fails startup (see "Not
-covered"). It has no fleet-wide fallback and no E0 exemption. If every node lacks the
+On Kubernetes, `on` runs with resume-time runtime upgrades on or off: a
+`runtime-upgrade` pod requires its upgrade's target, which is what it boots.
+It has no fleet-wide fallback and no E0 exemption. If every node lacks the
 labels at once, as on a new cluster or after node-managers roll out an
 observation this node-ctl can't decode, kube-scheduler can place no new bound
 pod, E0 included, and every restore pinned to its source node is refused: by
@@ -1228,13 +1236,10 @@ environment.
 
 #### Not covered
 
-On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` while
-`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` is on: a runtime-upgrade
-activation's pod requires the recorded environment rather than the upgrade's
-target. With resume-time upgrades off no activation upgrades, so `on` runs.
-It also needs every worker on a shim that reads
+On Kubernetes, `on` needs every worker on a shim that reads
 `space.pplx.net/environment-required`, since an older shim ignores it.
-`shadow` runs: it records, labels and counts without changing placement.
+`shadow` runs: it records, labels and counts without changing placement. It
+also refuses a memory-edge restore, as `on` does (below).
 
 The gate doesn't yet:
 
@@ -1242,14 +1247,17 @@ The gate doesn't yet:
   holding its build report different ones. Direct gates each candidate by its
   own inventory row, but a pod requires one label, so with no agreed binding
   it places as unbound work;
-- cover Kubernetes runtime-upgrade pods. The API renders none yet; when it
-  does, such a pod's environment is the upgrade's target, not its
-  checkpoint's producer;
 - read the cluster's execution policy or exclude a node lagging a narrowing
   policy change;
 - admit a restore whose checkpoint loads under another environment through a
   memory edge. It requires the producer to be usable, which is all a restore
-  can use until a memory edge is certified.
+  can use until a memory edge is certified. On Kubernetes such a pod would
+  boot under the default while recording and requiring the producer, so
+  while the gate is `shadow` or `on` and resume-time runtime upgrades are on,
+  the API refuses that restore with `Unsupported` (501) before any pod. With
+  resume-time upgrades off the API doesn't decide the move, so it doesn't
+  refuse it either. The release that certifies a memory
+  edge has to make that pod require the default first.
 - distinguish restore readiness from cold-boot usability. A node lists an
   environment as usable when it can cold boot it, which a restore doesn't
   need: per "Restore inputs" above, a node whose local kernel image is
@@ -1519,8 +1527,7 @@ One definition of that order
 resolution, pod placement, pool claims, the warm-pool autoscaler and the block
 check above. It applies only where creates boot the twin they resolve to: a
 Kubernetes substrate with the placement gate `on`
-(`Substrate::boots_template_twins`), which the substrate refuses at startup
-today. The API and the cluster controller each read the gate
+(`Substrate::boots_template_twins`). The API and the cluster controller each read the gate
 (`SPACE_ENVIRONMENT_PLACEMENT_GATE`, [configuration.md](configuration.md)):
 creates and pool claims follow the API's, and the warm-pool autoscaler the
 controller's, so set it the same on both. Anywhere else all of them keep the
@@ -2239,12 +2246,20 @@ is stranded.
    the default, along the edges `runtime_environments` records for the
    sandbox's environment:
    - a resume with a memory edge restores as usual, and the node's
-     restore-consumer selection loads the checkpoint under the default;
+     restore-consumer selection loads the checkpoint under the default. On
+     Kubernetes, while the environment placement gate is `shadow` or `on`,
+     it's refused instead (see the gate's gaps); this decision only runs
+     while resume-time runtime upgrades are on;
    - an upgrade edge runs the runtime upgrade above instead, for a stopped
      sandbox, or for a suspended one whose environment an operator blocked;
      memory is discarded only under that block;
    - a stopped sandbox on a `deprecated` environment with no edge starts
-     where it is, since that environment still executes;
+     where it is, since that environment still executes. So does a user's
+     start of one with an edge on Kubernetes while the environment placement
+     gate is `on`, when the node holding its disk doesn't publish the
+     default: the start is pinned to that node, which couldn't take the
+     upgrade's pod. An upgrade that doesn't start the sandbox is refused
+     there instead, retryably;
    - anything else is stranded: the activation is refused with
      `FailedPrecondition` (412) naming both environments, and the restore
      claim is released, so the sandbox resumes once an operator allows its
