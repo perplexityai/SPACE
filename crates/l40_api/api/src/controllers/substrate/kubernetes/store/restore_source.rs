@@ -100,6 +100,16 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<UnplacedRestoreSource, SubstrateError> {
+        Self::restore_source_plan_in(&self.pool, sandbox_id).await
+    }
+
+    /// [`Self::restore_source_plan`] through `executor`, so a transaction
+    /// holding the sandbox row's lock reads the same facts it can't change
+    /// underneath it ([`Self::record_stopped_runtime_upgrade_in`]).
+    pub(super) async fn restore_source_plan_in<'e>(
+        executor: impl sqlx::PgExecutor<'e>,
+        sandbox_id: SandboxId,
+    ) -> Result<UnplacedRestoreSource, SubstrateError> {
         // The two name candidates come back *separately* rather than
         // pre-`COALESCE`d, and the placement's node id comes back with them, so
         // the missing-mapping WARN [`Self::restore_source_node_name`] emits can
@@ -109,7 +119,7 @@ impl K8sStore {
             execution_name,
             placement_node_id,
             stopped_evacuation_unplaced,
-        }) = restore_source::restore_source_plan(&self.pool, sandbox_id)
+        }) = restore_source::restore_source_plan(executor, sandbox_id)
             .await
             .db_context("failed to query Kubernetes restore node preference")?
         else {
@@ -128,6 +138,18 @@ impl K8sStore {
             node_name: mapped_name.or(execution_name),
             stopped_evacuation_unplaced,
         })
+    }
+
+    /// The Kubernetes node registered for the node the placement record says
+    /// holds the stopped sandbox's disk, with no fallback to execution history
+    /// ([`restore_source::disk_pin_node_name`]).
+    pub(in crate::controllers::substrate::kubernetes) async fn disk_pin_node_name(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<String>, SubstrateError> {
+        restore_source::disk_pin_node_name(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to read a stopped sandbox's disk pin")
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn selected_suspend_restore_storage_uri(

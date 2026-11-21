@@ -35,6 +35,8 @@ async fn owner_claims_restore_and_execution(
                 SandboxActivationAttemptId::new(),
                 SandboxTransitionTargetState::Started,
             )),
+            None,
+            None,
         )
         .await?;
     Ok(token)
