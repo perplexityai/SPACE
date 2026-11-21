@@ -38,6 +38,13 @@ async fn suspend_attempt_rollback_preserves_ownership_and_migration_history() {
             .await
             .unwrap();
     }
+    let newest: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(newest, 20261112160000, "suspend_attempt is the newest");
     let conn = Connection::open(&path).unwrap();
     conn.execute(
         "INSERT INTO sandboxes (id, uuid8, state, template, created_at, updated_at,
