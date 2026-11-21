@@ -224,6 +224,43 @@ impl ActivationCompletion {
 
 pub use pplx_space_sandbox_model::AbandonedRestoreRetirement;
 
+/// Whether a start moves a stopped sandbox off a node a v2 drain drained:
+/// hands it off, re-places it and boots it, or resumes a handed-off one
+/// (the stopped handoff, `pplx_space_sandbox_store::drain_restore`).
+///
+/// Off, a start takes main's path: a stopped row at home starts there, and
+/// a handed-off or v1-evacuated row, unplaced with v1's `stopped` marker,
+/// is refused until v1's restore sweep re-places it. The switch is the one
+/// that admits v2 drains, `SPACE_DRAIN_V2_ENABLED`, and ships off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoppedHandoffAtStart {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl StoppedHandoffAtStart {
+    /// `1`, `true`, `yes`, `on` or `enabled`, in any case, turns it on;
+    /// unset or anything else keeps it off.
+    pub const ENV: &'static str = "SPACE_DRAIN_V2_ENABLED";
+
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_enabled(pplx_space_env_vars::env_flag_var(Self::ENV, false))
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
 /// Whether SPACE records which client's activation created a sandbox's
 /// runtime: the `sandboxes.activating_client_id` record, the
 /// `space.pplx.net/client-id` pod label and the label patch at warm-pool

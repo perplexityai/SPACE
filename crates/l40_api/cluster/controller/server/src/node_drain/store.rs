@@ -677,8 +677,17 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
                         -- controller died mid-restore, or whose attempt failed
                         -- after the claim (a fresh stopped claim is never rolled
                         -- back). This arm is how it is re-driven; omitting it
-                        -- would strand exactly those rows.
-                        OR s.lifecycle = 'restoring'
+                        -- would strand exactly those rows. One a start claimed
+                        -- for a v2 drain's stopped handoff holds a restore
+                        -- lease while that start drives it, which the claim
+                        -- honours, so it isn't listed until the lease lapses.
+                        OR (
+                            s.lifecycle = 'restoring'
+                            AND (
+                                s.restore_lease_expires_at IS NULL
+                                OR s.restore_lease_expires_at <= NOW()
+                            )
+                        )
                     )
                     AND {disk_backup_ready}
                 )

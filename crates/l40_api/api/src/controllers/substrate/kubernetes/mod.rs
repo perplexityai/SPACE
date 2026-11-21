@@ -461,6 +461,10 @@ pub struct KubernetesState {
     /// Whether user restores fence their unsent Wake and re-drives take over
     /// an expired fence (`SPACE_RESTORE_DISPATCH_FENCE_ENABLED`, default off).
     pub restore_dispatch_fence: RestoreDispatchFence,
+    /// Whether a start hands off and re-places a stopped sandbox a v2 drain
+    /// drained, and resumes a handed-off one (`SPACE_DRAIN_V2_ENABLED`,
+    /// default off).
+    pub stopped_handoff_at_start: super::StoppedHandoffAtStart,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -535,6 +539,7 @@ impl KubernetesState {
                 )?,
             activation_client_attribution: super::ActivationClientAttribution::from_env(),
             restore_dispatch_fence: RestoreDispatchFence::from_env(),
+            stopped_handoff_at_start: super::StoppedHandoffAtStart::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
