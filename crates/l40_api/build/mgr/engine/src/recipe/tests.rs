@@ -63,9 +63,9 @@ fn step_descriptions_do_not_disclose_recipe_inputs() {
 }
 
 /// The BPF guest kernel the shared seed pins; see `templates/firecracker/recipes/seed.toml`.
-const SEED_KERNEL_VERSION: &str = "vmlinux-6.1.155-bpf-modsig";
+const SEED_KERNEL_VERSION: &str = "vmlinux-6.1.155-bpf-modsig-nft";
 const SEED_KERNEL_DIGEST: &str =
-    "sha256:15ea4431a450eedbfcb4b4d3d85dd8e941b829a0606db6cd0e0167530421f933";
+    "sha256:6e7fc9417db2b53cc4af5915a6734368875ea44dc897cd7eeff398da27423592";
 
 const KERNEL_VERSION: &str = "vmlinux-6.1.200-custom";
 const KERNEL_DIGEST: &str =
