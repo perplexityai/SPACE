@@ -332,8 +332,8 @@ hints only: new or renamed scenarios receive a 30-second estimate and still run;
 obsolete hints do not add scenarios. No assertion, timeout, or scenario is removed.
 Fourteen shards shorten the serial critical path but duplicate cluster startup and
 consume fourteen concurrent runners; queue time remains a separate constraint.
-At fourteen, the leader-election brownout's shard holds it alone and is the
-slowest, so more shards would not shorten the run.
+At fourteen, the longest scenario by hint (`space_smoke/sharding.py`) bounds
+the slowest shard, so more shards would not shorten the run below it.
 
 ## The whole suite on one host
 
@@ -542,7 +542,7 @@ the Kind services with no crate's `test-hooks` feature enabled:
 | `local.garbage_collectors_reclaim_independent_resources` | the chart's template GC interval and grace, prefetch latest-N, and `SPACE_SBX_GC_*` target, interval, grace and idle | release template GC uses an 1800 s grace and the snapshot reaper requires a day of idle time, beyond the combined scenario's budget |
 | `local.retention_claim_finish_forward`, `local.retention_restore_source_guard` | the retention sweeper's dry-run, tick and minimum age, which they stage | a release sweeper ticks every 300 s and keeps snapshots younger than an hour |
 | `local.rate_limiters_enforce_and_fail_open` | `SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST`, which it shrinks to 2 | draining the release burst of 60 would take sixty real boots |
-| `local.leader_election_brownout_keeps_one_leader`, `local.leader_election_refusal_does_not_restart` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, a replica spends its budget long after the outage's bound |
+| `local.leader_election_brownout_keeps_one_leader` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, the budget control and the refusal watch each take minutes longer |
 | `native_recovery.inline_wake_survives_api_pod_kill`, `native_recovery.inline_load_survives_leader_failover` | `SPACE_NATIVE_INLINE_TEST_HOLD_SECS` and `SPACE_NATIVE_INLINE_TEST_RELEASE_FILE`, which hold each claimed inline operation `running`, renewing its claim, until the scenario releases it or the bounded hold expires | a wake or create the API runs inline can end before the scenario kills its API pod or fails the controller's leadership over |
 
 The 40 GiB cache needs no replacement for the reservation hook: release
@@ -1867,16 +1867,16 @@ load-balanced entry, scaled on load.
   substrate: the Lease holder runs every reconciler and the other stands by,
   Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
-  exercises outage recovery; `local.leader_election_refusal_does_not_restart`
-  verifies that a contender refused Lease access remains unready without
-  restarting. Both run by default and can occupy separate CI shards. Each
+  exercises outage recovery, with both replicas cut off from the apiserver
+  in their own network namespaces, and verifies alongside it that a
+  contender refused Lease access remains unready without restarting. It
   needs `otel` mode, lowers the controller's lease TTL to its 18 s floor and
   the liveness budget to its 72 s floor, and restores the standing settings
   afterward. These hooks require the `test-hooks` feature used by Kind.
-  Both change the budget only while owning the mutation Lease and restore
+  It changes the budget only while owning the mutation Lease and restores
   it before another scenario runs. Shards start with the standing chart
   settings, so unrelated recovery tests do not inherit the shortened budget.
-  Run either alone with `uv run --frozen --python 3.11 -m space_smoke run`
+  Run it alone with `uv run --frozen --python 3.11 -m space_smoke run`
   followed by its scenario ID.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
   Service and rolls one at a time. It needs no election: its state is in

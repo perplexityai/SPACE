@@ -559,19 +559,20 @@ _LIVENESS_BUDGET_VALUE = re.compile(r"[1-9][0-9]{0,3}")
 # gets its own `app.kubernetes.io/name`, so no selector of the healthy
 # Deployment's, nor KIND_CONTROLLER_SELECTOR, overlaps it. It is a bare Pod
 # bound to a healthy replica's node, and an init container holds it until the
-# scenario opens a gate file through the node's CRI. So it can be placed
-# before an apiserver outage and start right after one: once the apiserver is
-# back, kubelets and the controller-manager take a minute or more to watch
-# new pods again, while a CRI exec needs neither.
+# scenario opens a gate file through the node's CRI, so it is placed while the
+# healthy replicas roll and released once one of them has renewed the Lease.
 REFUSED_CONTENDER_NAME = "space-cluster-controller-refused"
 BUDGET_CONTENDER_NAME = "space-cluster-controller-budget"
 REFUSED_CONTENDER_SELECTOR = f"app.kubernetes.io/name={REFUSED_CONTENDER_NAME}"
 REFUSED_CONTENDER_SERVICE_ACCOUNT = "space-api"
 REFUSED_CONTENDER_GATE_CONTAINER = "space-smoke-gate"
 REFUSED_CONTENDER_GATE_DIR = "/space-smoke-gate"
-# Outside kubelet's static-pod directory, which it reads every file of.
-APISERVER_MANIFEST = "/etc/kubernetes/manifests/kube-apiserver.yaml"
-APISERVER_PARKED_MANIFEST = "/etc/kubernetes/kube-apiserver.yaml.space-smoke-parked"
+# The chain that cuts one controller pod off from the apiserver, in that pod's
+# own network namespace: a REJECT with a TCP reset for the `kubernetes`
+# Service's ClusterIP and for each of its endpoints, so the pod's apiserver
+# calls fail as they do through a ClusterIP with no apiserver behind it.
+# Removing it needs nothing but its name.
+APISERVER_CUT_CHAIN = "SPACE-SMOKE-APISERVER-CUT"
 # Node services run one DaemonSet per service per role, as production's do
 # (infra/space/kind/lib/node-services.sh). Every pod carries its node role as
 # `app.kubernetes.io/name` (space-worker or space-builder) and its service as
@@ -2476,19 +2477,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         """
 
         raw = self._node_service_env(node_name, component).get(OTEL_METRIC_EXPORT_INTERVAL_ENV)
-        if raw is None or not raw.strip():
-            return OTEL_METRIC_EXPORT_DEFAULT_SECONDS
-        try:
-            millis = int(raw.strip())
-        except ValueError:
-            raise SmokeConfigurationError(
-                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not milliseconds"
-            ) from None
-        if millis <= 0:
-            raise SmokeConfigurationError(
-                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not positive"
-            )
-        return millis / 1000
+        return _metric_export_interval_seconds(raw, owner=f"{component} on {node_name}")
 
     def template_cache_gc_config(self, node_name: str) -> TemplateCacheGcConfig:
         return _template_cache_gc_config_from_env(
@@ -6300,11 +6289,12 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- cluster-controller leader election ------------------------------------
     #
-    # The two faults behind `local.leader_election_brownout_keeps_one_leader`:
-    # a refused third contender, and the apiserver's static pod taken away. The
-    # node reads go through `docker exec` and the node's CRI rather than
-    # kubectl, because they are the only reads that answer while the apiserver
-    # is down.
+    # The faults behind `local.leader_election_brownout_keeps_one_leader`: a
+    # refused third contender, an unreachable budget control, and the two
+    # healthy replicas cut off from the apiserver in their own network
+    # namespaces.
+    # Container exits and readiness markers are read through `docker exec` and
+    # the node's CRI, which see an exit kubelet has already cleaned up.
 
     def controller_replicas(self) -> int:
         result = self.kubectl(
@@ -6322,6 +6312,12 @@ ON CONFLICT (key_hash) DO NOTHING;
     def controller_reconciler_tick_env(self) -> dict[str, str | None]:
         return self._deployment_env_literals(self._controller_deployment(), tuple(RECONCILER_TICK_ENV))
 
+    def controller_metric_export_interval_seconds(self) -> float:
+        raw = self._deployment_env_literals(
+            self._controller_deployment(), (OTEL_METRIC_EXPORT_INTERVAL_ENV,)
+        )[OTEL_METRIC_EXPORT_INTERVAL_ENV]
+        return _metric_export_interval_seconds(raw, owner="the cluster-controller")
+
     def controller_liveness_budget_env(self, *, refused_contender: bool = False) -> str | None:
         if not refused_contender:
             return self._deployment_env_literals(
@@ -6338,9 +6334,8 @@ ON CONFLICT (key_hash) DO NOTHING;
         )[LIVENESS_BUDGET_ENV]
 
     def set_controller_liveness_budget_env(self, seconds: str, *, lease_ttl: str) -> None:
-        for name, value in (("liveness-budget", seconds), ("lease-TTL", lease_ttl)):
-            if _LIVENESS_BUDGET_VALUE.fullmatch(value) is None:
-                raise ValueError(f"refusing {name} value {value!r}")
+        # Refuses either value as a contender's placement would.
+        _contender_timings(seconds, lease_ttl)
         # Resolved here, in setup, so the restore in cleanup looks nothing up.
         deployment = self._controller_deployment()
         # The restore removes the TTL key rather than writing a captured
@@ -6412,9 +6407,12 @@ ON CONFLICT (key_hash) DO NOTHING;
         if wait:
             self._await_deployment_rollout(deployment, timeout=180)
 
-    def controller_lease(self) -> ControllerLease | None:
+    def await_controller_rollout(self, *, timeout: float = 180) -> None:
+        self._await_deployment_rollout(self._controller_deployment(), timeout=timeout)
+
+    def controller_lease(self, *, timeout: float = 15) -> ControllerLease | None:
         result = self.kubectl(
-            "get", "lease", CONTROLLER_LEASE_NAME, "-o", "json", timeout=15
+            "get", "lease", CONTROLLER_LEASE_NAME, "-o", "json", timeout=timeout
         )
         if result.returncode != 0 and "notfound" in result.detail().lower().replace(" ", ""):
             return None
@@ -6432,14 +6430,6 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "docker", "exec", "-i", self._kind_node_container(node_name), "sh", "-c",
                 "timeout 3600 ctr -n k8s.io events 'topic==\"/tasks/exit\"' & watch=$!; "
                 "cat >/dev/null; kill \"$watch\" 2>/dev/null; wait",
-            ]
-        )
-
-    def watch_controller_lease(self) -> KubectlLeaseWatch:
-        return KubectlLeaseWatch(
-            [
-                "kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE,
-                "get", "lease", CONTROLLER_LEASE_NAME, "--watch", "-o", "json",
             ]
         )
 
@@ -6467,15 +6457,21 @@ ON CONFLICT (key_hash) DO NOTHING;
                 (container.get("state") or {}).get("terminated")
                 or (container.get("lastState") or {}).get("terminated") or {}
             )
+            ready = next(
+                (
+                    condition
+                    for condition in status.get("conditions") or []
+                    if condition.get("type") == "Ready"
+                ),
+                {},
+            )
             pods.append(
                 ControllerPod(
                     name=str(metadata.get("name", "")),
                     uid=str(metadata.get("uid", "")),
                     node=str((item.get("spec") or {}).get("nodeName") or ""),
-                    ready=any(
-                        condition.get("type") == "Ready" and condition.get("status") == "True"
-                        for condition in status.get("conditions") or []
-                    ),
+                    ready=ready.get("status") == "True",
+                    ready_changed_at=_kube_epoch(ready.get("lastTransitionTime")),
                     deleting=bool(metadata.get("deletionTimestamp")),
                     restart_count=int(container.get("restartCount") or 0),
                     started_at=_kube_epoch(
@@ -6487,7 +6483,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return sorted(pods, key=lambda pod: pod.name)
 
-    def place_budget_contender(self) -> None:
+    def place_budget_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
         """Run the same controller against an unreachable, pod-local API endpoint."""
         self._require_isolated_kind("placing a leader-election budget control")
         result = self.kubectl("get", "deploy", self._controller_deployment(), "-o", "json", timeout=15)
@@ -6495,7 +6491,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         nodes = sorted({pod.node for pod in self.controller_pods() if pod.node})
         if not nodes:
             raise SmokeConfigurationError("no controller node for the budget control")
-        document = refused_contender_pod(deployment, node=nodes[0])
+        document = refused_contender_pod(
+            deployment, node=nodes[0], env=_contender_timings(liveness_budget, lease_ttl)
+        )
         document["metadata"]["name"] = BUDGET_CONTENDER_NAME
         document["metadata"]["labels"]["app.kubernetes.io/name"] = BUDGET_CONTENDER_NAME
         spec = document["spec"]
@@ -6529,8 +6527,9 @@ ON CONFLICT (key_hash) DO NOTHING;
                     raise SmokeConfigurationError("the old budget control outlived its deletion")
                 time.sleep(2)
 
-    def place_refused_contender(self) -> None:
+    def place_refused_contender(self, *, liveness_budget: str, lease_ttl: str) -> None:
         self._require_isolated_kind("placing a refused leader-election contender")
+        timings = _contender_timings(liveness_budget, lease_ttl)
         account = f"system:serviceaccount:{KIND_NAMESPACE}:{REFUSED_CONTENDER_SERVICE_ACCOUNT}"
         for verb in ("get", "update"):
             allowed = self.kubectl(
@@ -6556,7 +6555,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         _require_ok(
             self.kubectl(
                 "create", "-f", "-",
-                input_text=json.dumps(refused_contender_pod(deployment, node=nodes[0])),
+                input_text=json.dumps(refused_contender_pod(deployment, node=nodes[0], env=timings)),
                 timeout=30,
             ),
             "create the refused leader-election contender",
@@ -6568,8 +6567,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             time.sleep(2)
 
     def release_refused_contender(self) -> None:
-        # Read right after the apiserver answers again, while kubectl may still
-        # be reconnecting.
+        # A plain retry of the read, which kubectl can briefly fail.
         deadline = time.monotonic() + 60
         while True:
             result = self.kubectl(
@@ -6602,9 +6600,9 @@ ON CONFLICT (key_hash) DO NOTHING;
     def remove_refused_contender(self, *, wait: bool = True) -> None:
         # The Deployment is the shape earlier versions of the scenario ran the
         # contender as; one a killed run left behind would keep a pod under the
-        # contender's selector. Not `--wait`: right after an apiserver outage
-        # the node's kubelet can take a minute or more to see the deletion,
-        # which the poll below outlasts.
+        # contender's selector. Not `--wait`, so cleanup can bound the request
+        # at CLEANUP_REQUEST_SECONDS; with `wait`, the poll below outlasts the
+        # contender's teardown.
         _require_ok(
             self.kubectl(
                 "delete", f"pod/{REFUSED_CONTENDER_NAME}", f"deployment/{REFUSED_CONTENDER_NAME}",
@@ -6621,46 +6619,108 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise RuntimeError("the refused contender's pod outlived its deletion")
             time.sleep(2)
 
-    def control_plane_node(self) -> str:
-        result = self.kubectl(
-            "get", "nodes", "-l", "node-role.kubernetes.io/control-plane", "-o",
-            "jsonpath={.items[*].metadata.name}", timeout=15,
-        )
-        names = _require_ok(result, "find the Kind control-plane node").split()
-        if len(names) != 1:
-            raise SmokeConfigurationError(
-                f"expected one Kind control-plane node, found {names or 'none'}"
+    def cut_controllers_off_from_apiserver(
+        self, pod_names: Sequence[str], targets: Sequence[str], *, timeout: float
+    ) -> dict[str, tuple[float, float]]:
+        self._require_isolated_kind("cutting a cluster-controller pod off from the apiserver")
+        for target in targets:
+            if _APISERVER_TARGET.fullmatch(target) is None:
+                raise ValueError(f"refusing apiserver target {target!r}")
+        # Every lookup comes first, so the cuts follow one another.
+        nodes = {}
+        for pod_name in pod_names:
+            result = self.kubectl("get", "pod", _kube_pod_name(pod_name), "-o", "json", timeout=15)
+            spec = json.loads(_require_ok(result, f"read pod {pod_name}") or "{}").get("spec") or {}
+            if spec.get("hostNetwork"):
+                raise SmokeConfigurationError(
+                    f"{pod_name} shares its node's network namespace; cutting it off would cut the node off"
+                )
+            nodes[pod_name] = str(spec.get("nodeName") or "")
+        cuts = {}
+        for pod_name in pod_names:
+            started = time.time()
+            _require_ok(
+                self._docker_exec(
+                    nodes[pod_name], "sh", "-c", _APISERVER_CUT_SCRIPT, "sh",
+                    KIND_NAMESPACE, pod_name, APISERVER_CUT_CHAIN, "cut", *targets,
+                    timeout=timeout,
+                ),
+                f"cut {pod_name} off from the apiserver",
             )
-        return self._kind_node_container(names[0])
+            cuts[pod_name] = (started, time.time())
+        return cuts
 
-    def apiserver_answers(self) -> bool:
-        result = self.executor.run(
-            ["kubectl", "--context", self.config.context, "get", "--raw", "/readyz",
-             "--request-timeout=3s"],
-            timeout=10,
-        )
-        return result.returncode == 0 and result.stdout.strip() == "ok"
-
-    def park_apiserver(self, node_name: str) -> None:
-        self._require_isolated_kind("taking the Kind apiserver down")
+    def reconnect_controller_to_apiserver(
+        self, node_name: str, pod_name: str, *, timeout: float | None = None
+    ) -> None:
+        # One exec, which looks nothing up through the apiserver, so cleanup
+        # can bound it; a pod whose sandbox is gone has no cut left to remove.
         _require_ok(
             self._docker_exec(
-                node_name, "sh", "-c",
-                f"test ! -e {APISERVER_PARKED_MANIFEST} && mv {APISERVER_MANIFEST} {APISERVER_PARKED_MANIFEST}",
+                node_name, "sh", "-c", _APISERVER_CUT_SCRIPT, "sh",
+                KIND_NAMESPACE, _kube_pod_name(pod_name), APISERVER_CUT_CHAIN, "reconnect",
+                timeout=CLEANUP_REQUEST_SECONDS if timeout is None else timeout,
             ),
-            "park the apiserver manifest",
+            f"reconnect {pod_name} to the apiserver",
         )
 
-    def restore_apiserver(self, node_name: str, *, timeout: float = 30) -> None:
-        _require_ok(
-            self._docker_exec(
-                node_name, "sh", "-c",
-                f"if test -e {APISERVER_PARKED_MANIFEST}; then "
-                f"mv {APISERVER_PARKED_MANIFEST} {APISERVER_MANIFEST}; fi",
-                timeout=timeout,
-            ),
-            "restore the apiserver manifest",
+    def apiserver_cut_targets(self) -> list[str]:
+        """`ip:port` of each of the `kubernetes` Service's ClusterIPs and of each of its endpoints."""
+
+        service = json.loads(
+            _require_ok(
+                self.kubectl("-n", "default", "get", "service", "kubernetes", "-o", "json", timeout=15),
+                "read the kubernetes Service",
+            )
+            or "{}"
+        ).get("spec") or {}
+        slices = json.loads(
+            _require_ok(
+                self.kubectl(
+                    "-n", "default", "get", "endpointslices",
+                    "-l", "kubernetes.io/service-name=kubernetes", "-o", "json", timeout=15,
+                ),
+                "read the kubernetes Service's endpoints",
+            )
+            or "{}"
+        ).get("items") or []
+        # A dual-stack Service lists a second ClusterIP and a second slice of
+        # endpoints; a pod could reach the apiserver through either, and the
+        # cut covers IPv4 only, so either refuses the bench.
+        for item in slices:
+            address_type = item.get("addressType")
+            if address_type != "IPv4":
+                raise SmokeConfigurationError(
+                    f"the apiserver cut supports IPv4 only; the kubernetes Service has an "
+                    f"EndpointSlice of addressType {address_type!r}"
+                )
+        cluster_ips = [str(ip) for ip in service.get("clusterIPs") or [service.get("clusterIP") or ""]]
+        pairs = {
+            (cluster_ip, int(port["port"]))
+            for cluster_ip in cluster_ips
+            for port in service.get("ports") or []
+        }
+        pairs.update(
+            (str(address), int(port["port"]))
+            for item in slices
+            for endpoint in item.get("endpoints") or []
+            for address in endpoint.get("addresses") or []
+            for port in item.get("ports") or []
         )
+        targets = []
+        for address, port in sorted(pairs):
+            try:
+                ipaddress.IPv4Address(address)
+            except ValueError:
+                raise SmokeConfigurationError(
+                    f"the apiserver cut supports IPv4 only; the kubernetes Service names {address!r}"
+                ) from None
+            if not 0 < port < 65536:
+                raise ValueError(f"refusing apiserver port {port}")
+            targets.append(f"{address}:{port}")
+        if len(targets) < 2:
+            raise SmokeConfigurationError(f"expected the apiserver's ClusterIP and an endpoint, found {targets}")
+        return targets
 
     def node_controller_containers(self, node_name: str, pod_name: str) -> list[NodeContainer]:
         listing = self._docker_exec(
@@ -8108,59 +8168,6 @@ class KubectlPodWatch:
         self._stderr_reader.join(timeout=5)
 
 
-class KubectlLeaseWatch:
-    """`kubectl get lease --watch`, keeping the newest renewal it delivered.
-
-    The stream is a sequence of JSON documents, one per change; a reader
-    thread decodes them as they arrive. It ends by itself when the apiserver
-    goes away, and `stop` ends it otherwise.
-    """
-
-    def __init__(self, command: Sequence[str]) -> None:
-        self._process = subprocess.Popen(
-            list(command), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        self._latest: ControllerLease | None = None
-        self._lock = threading.Lock()
-        self._reader = threading.Thread(target=self._read, name="lease-watch", daemon=True)
-        self._reader.start()
-
-    def _read(self) -> None:
-        assert self._process.stdout is not None
-        decoder = json.JSONDecoder()
-        buffer = ""
-        for chunk in iter(lambda: self._process.stdout.read1(65536), b""):  # type: ignore[union-attr]
-            buffer += chunk.decode(errors="replace")
-            while True:
-                buffer = buffer.lstrip()
-                try:
-                    document, end = decoder.raw_decode(buffer)
-                except ValueError:
-                    break
-                buffer = buffer[end:]
-                try:
-                    lease = _controller_lease(document)
-                except (RuntimeError, ValueError, AttributeError):
-                    continue
-                with self._lock:
-                    if self._latest is None or lease.renew_time >= self._latest.renew_time:
-                        self._latest = lease
-
-    def latest(self) -> ControllerLease | None:
-        with self._lock:
-            return self._latest
-
-    def stop(self) -> None:
-        if self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=5)
-        self._reader.join(timeout=5)
-
-
 class CtrExitWatch:
     """containerd's task-exit events on one node, keyed by container id.
 
@@ -8264,14 +8271,16 @@ def task_exit(line: str) -> tuple[str, int, float] | None:
         return None
 
 
-def refused_contender_pod(deployment: Mapping[str, Any], *, node: str) -> dict[str, Any]:
+def refused_contender_pod(
+    deployment: Mapping[str, Any], *, node: str, env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
     """The live controller Deployment's pod template as one refused pod under another identity.
 
     Derived rather than written out, so the contender runs the image and env
-    of the replicas it is compared against. Only the name, the selector label
-    and the ServiceAccount change; the pod is bound to `node`, and an init
-    container on the controller's image waits for a gate file in a volume of
-    its own before the unchanged controller container starts.
+    of the replicas it is compared against. Only the name, the selector label,
+    the ServiceAccount and the controller's `env` entries change; the pod is
+    bound to `node`, and an init container on the controller's image waits for
+    a gate file in a volume of its own before the controller container starts.
     """
 
     template = json.loads(json.dumps((deployment.get("spec") or {}).get("template") or {}))
@@ -8284,6 +8293,11 @@ def refused_contender_pod(deployment: Mapping[str, Any], *, node: str) -> dict[s
     spec.pop("serviceAccount", None)
     spec["nodeName"] = node
     controller = (spec.get("containers") or [{}])[0]
+    if env:
+        controller["env"] = [
+            *(entry for entry in controller.get("env") or [] if entry.get("name") not in env),
+            *({"name": name, "value": value} for name, value in env.items()),
+        ]
     spec["initContainers"] = [
         *(spec.get("initContainers") or []),
         {
@@ -8316,6 +8330,103 @@ def refused_contender_pod(deployment: Mapping[str, Any], *, node: str) -> dict[s
         "spec": spec,
     }
 
+
+def _contender_timings(liveness_budget: str, lease_ttl: str) -> dict[str, str]:
+    """The budget and TTL hooks a contender is placed with, as the healthy replicas get them.
+
+    Refuses either value unless it is 1 to 9999 whole seconds; the healthy
+    replicas' env write checks its values here too.
+    """
+
+    for name, value in (("liveness-budget", liveness_budget), ("lease-TTL", lease_ttl)):
+        if _LIVENESS_BUDGET_VALUE.fullmatch(value) is None:
+            raise ValueError(f"refusing {name} value {value!r}")
+    return {LIVENESS_BUDGET_ENV: liveness_budget, LEASE_TTL_ENV: lease_ttl}
+
+
+# Run on the pod's node: `sh -c SCRIPT sh NAMESPACE POD CHAIN cut|reconnect
+# [IP:PORT...]`. The pod sandbox's network namespace outlives its containers,
+# so a container kubelet restarts stays cut off; the pause process's pid
+# names it. Each mode is one `iptables-restore --noflush` transaction, which
+# applies whole or not at all and waits at most 4 s for the xtables lock, so
+# the exec's 8 s holds it with the lookups and the lock-free `iptables-save`
+# reads around it. Either mode first deletes every jump to the chain the read
+# found, so a cut is never doubled; `cut` needs exactly one ready sandbox and
+# (re)creates the chain empty, adds a rule per target and one jump, and
+# `reconnect` deletes the chain and then checks that it is gone from a read
+# that must itself succeed, so an iptables that cannot run is a failure
+# rather than a removed cut. The local exec's timeout does not stop the
+# script on the node, so a transaction that waits on the lock long enough can
+# still land after its exec gave up; the next run's preflight removes it.
+_APISERVER_CUT_SCRIPT = r"""set -eu
+namespace=$1 pod=$2 chain=$3 mode=$4
+shift 4
+ids=$(crictl pods -q --state ready --namespace "$namespace" --label "io.kubernetes.pod.name=$pod")
+count=$(printf '%s\n' $ids | grep -c . || true)
+if [ "$mode" = cut ] && [ "$count" -ne 1 ]; then
+  echo "expected one ready sandbox for $pod, found $count" >&2
+  exit 1
+fi
+for id in $ids; do
+  pid=$(crictl inspectp -o go-template --template '{{.info.pid}}' "$id")
+  rules=$(nsenter -t "$pid" -n iptables-save -t filter)
+  jumps=$(printf '%s\n' "$rules" | grep -cx -- "-A OUTPUT -j $chain" || true)
+  exists=$(printf '%s\n' "$rules" | grep -c -- "^:$chain " || true)
+  if [ "$mode" = reconnect ] && [ "$jumps" -eq 0 ] && [ "$exists" -eq 0 ]; then
+    continue
+  fi
+  {
+    echo '*filter'
+    i=0
+    while [ "$i" -lt "$jumps" ]; do echo "-D OUTPUT -j $chain"; i=$((i + 1)); done
+    if [ "$mode" = cut ]; then
+      echo ":$chain - [0:0]"
+      for target in "$@"; do
+        echo "-A $chain -p tcp -d ${target%:*} --dport ${target##*:} -j REJECT --reject-with tcp-reset"
+      done
+      echo "-I OUTPUT -j $chain"
+    elif [ "$exists" -ne 0 ]; then
+      echo "-F $chain"
+      echo "-X $chain"
+    fi
+    echo COMMIT
+  } | nsenter -t "$pid" -n iptables-restore --noflush -w 4
+  if [ "$mode" = reconnect ]; then
+    rules=$(nsenter -t "$pid" -n iptables-save -t filter)
+    if printf '%s\n' "$rules" | grep -q -- "$chain"; then
+      echo "the cut on $pod outlived its removal" >&2
+      exit 1
+    fi
+  fi
+done
+"""
+
+
+def _metric_export_interval_seconds(raw: str | None, *, owner: str) -> float:
+    """`OTEL_METRIC_EXPORT_INTERVAL` as the Rust producers read it.
+
+    Unset or blank keeps the SDKs' 10 s; anything but a positive whole number
+    of milliseconds is refused, since such a producer exports no metrics at
+    all (`export_interval_from_value` in
+    crates/l10_foundation/observability/src/sink/otlp.rs).
+    """
+
+    if raw is None or not raw.strip():
+        return OTEL_METRIC_EXPORT_DEFAULT_SECONDS
+    try:
+        millis = int(raw.strip())
+    except ValueError:
+        raise SmokeConfigurationError(
+            f"{owner} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not milliseconds"
+        ) from None
+    if millis <= 0:
+        raise SmokeConfigurationError(
+            f"{owner} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not positive"
+        )
+    return millis / 1000
+
+
+_APISERVER_TARGET = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}")
 
 _RFC3339 = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})")
 
