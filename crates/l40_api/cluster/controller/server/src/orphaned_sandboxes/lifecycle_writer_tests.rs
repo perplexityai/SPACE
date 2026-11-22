@@ -17,8 +17,8 @@ use sqlx::PgPool;
 
 use super::*;
 use crate::lifecycle_writer_test_support::{
-    ExecutionSeed, SandboxSeed, insert_execution, insert_node, insert_sandbox, insert_snapshot,
-    pod_name, pod_uid,
+    ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_node, insert_sandbox,
+    insert_snapshot, pod_name, pod_uid, single_backend_pool, wait_until_blocked,
 };
 
 /// The Postgres rows a classification moves for one sandbox. The execution
@@ -309,5 +309,75 @@ async fn classification_acts_only_on_the_execution_its_guard_names() -> TestResu
             assert_eq!(after, before, "{case}");
         }
     }
+    Ok(())
+}
+
+/// Full `publish_sandbox_states` vs `recover_orphan_to_suspended` interleavings
+/// live in `published_state_lifecycle_race_tests`; here we pin `classify_orphan`'s
+/// own delta: `plan_orphan_in_tx(..., lock = true)` waits on the shared
+/// publication lock and returns `Deferred(NodeReportsLocalCopy)` once the
+/// publication commits, while dry-run `plan_orphan` (`lock = false`) stays
+/// lock-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classify_orphan_waits_for_uncommitted_publish_and_defers() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = insert_node(pool, None, None).await?;
+    let sandbox_id = SandboxId::new();
+    insert_orphan(pool, sandbox_id, node_id, "paused", Guard::PodName).await?;
+    insert_snapshot(pool, sandbox_id, "ready", 60).await?;
+    let before = row(pool, sandbox_id).await?;
+
+    let mut publish_holder = pool.begin().await?;
+    let holder_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *publish_holder)
+        .await?;
+    orphan::lock_published_sandbox_observations(&mut publish_holder, &[sandbox_id]).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_observed_states (
+             sandbox_id, node_id, status, runtime, sandbox_owner,
+             image_hash, snapshots_enabled, template, observed_at, updated_at
+         )
+         VALUES (
+             $1, $2, 'paused', 'fc', 'user:test',
+             'sha256:synthetic', FALSE, 'app-runtime', NOW(), NOW()
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(&mut *publish_holder)
+    .await?;
+
+    // Dry-run (`lock = false`) stays read-only and never blocks on an in-flight publish.
+    let dry_run_sink = SubstrateActionSink::new_without_substrate(pool.clone());
+    let dry_plan = bounded(async {
+        Ok(dry_run_sink
+            .plan_orphan(sandbox_id, classify_guard(Guard::PodName, sandbox_id)?)
+            .await?)
+    })
+    .await?;
+    assert_eq!(
+        dry_plan.map(|plan| plan.disposition),
+        Some(OrphanDisposition::RecoverSuspended)
+    );
+
+    // Live classification (`lock = true`) blocks in `plan_orphan_in_tx` until
+    // the publication commits, then defers with `NodeReportsLocalCopy`.
+    let (writer_pool, waiter_pid) = single_backend_pool(&db).await?;
+    let sink = SubstrateActionSink::new_without_substrate(writer_pool);
+    let guard = classify_guard(Guard::PodName, sandbox_id)?;
+    let classify = tokio::spawn(async move { sink.classify_orphan(sandbox_id, guard).await });
+
+    bounded(wait_until_blocked(pool, waiter_pid, holder_pid)).await?;
+    publish_holder.commit().await?;
+    let outcome = bounded(async { Ok(classify.await??) }).await?;
+    assert_eq!(
+        outcome,
+        ClassifyOutcome::Deferred {
+            from_lifecycle: SandboxLifecycle::Paused,
+            reason: OrphanDeferReason::NodeReportsLocalCopy,
+        }
+    );
+    assert_eq!(row(pool, sandbox_id).await?, before);
     Ok(())
 }

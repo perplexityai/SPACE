@@ -1201,6 +1201,7 @@ pub async fn publish_sandbox_states_with_retirement(
     }
 
     let mut absent_ids = Vec::new();
+    let mut present_ids = Vec::new();
     let mut rows = Vec::new();
     // Keyed rather than two parallel collections: the ids are reported to
     // callers and the payloads are written to `sandbox_observed_states`, and a
@@ -1234,6 +1235,7 @@ pub async fn publish_sandbox_states_with_retirement(
             absent_ids.push(sandbox_uuid);
             continue;
         }
+        present_ids.push(sandbox_uuid);
         let parsed_status = PublishedStatus::parse(state.status.as_deref());
         let status = parsed_status.as_ref();
         if state.state_degraded {
@@ -1579,6 +1581,14 @@ pub async fn publish_sandbox_states_with_retirement(
             publishes_network_policy |= row_publishes_network_policy;
         }
     }
+
+    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut *conn, &present_ids)
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "lock published sandbox observation advisory locks: {err}"
+            ))
+        })?;
 
     let mut accepted = 0_u64;
     if !absent_ids.is_empty() {

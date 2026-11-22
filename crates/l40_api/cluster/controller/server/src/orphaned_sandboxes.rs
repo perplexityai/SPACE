@@ -12,10 +12,12 @@
 //! A recovery to `suspended` restores the row's snapshot, which loses what
 //! the node holding the sandbox wrote since, and the activity clocks can't
 //! rule that out. The candidate listing skips a row whose active node has
-//! reported it, for as long as that observed state exists. A report that
-//! commits after the listing reaches the plan, which defers to the node, and
-//! the recovery's own statement checks it again; a publish still uncommitted
-//! when that statement runs isn't seen.
+//! reported it, for as long as that observed state exists. Live classification
+//! acquires the per-sandbox observation advisory lock before its plan read, so
+//! any `present: true` publication already holding the shared lock finishes
+//! first: if the active node's publication committed, the plan sees it and
+//! defers to the node, just as it does for an already-committed report, and
+//! `recover_orphan_to_suspended` re-checks the invariant itself.
 //!
 //! The reconciler's actions (deletes, recoveries to `suspended` and
 //! quarantines) are capped at `max_classifications_per_minute` in a 60-second
@@ -1582,6 +1584,9 @@ async fn plan_orphan_in_tx(
     guard: &ClassifyGuard,
     lock: bool,
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
+    if lock {
+        orphan::lock_orphan_observation(tx, sandbox_id).await?;
+    }
     let eligibility = orphan_recovery_revert_eligibility("s");
     let recoverable = eligibility.eligible;
     // internal-api writes a node's observed state only for the rows it is the
