@@ -1,9 +1,33 @@
 //! Template-manager metrics: template pulls and the get cache, rootfs
 //! expansion, prefetch and garbage collection.
+//!
+//! Every metric here carries `git_sha`, the revision of the deployed build,
+//! so pull, prefetch and GC outcomes split by build while two builds run side
+//! by side. The process `version` tag comes from deployment settings and is
+//! absent where a node service is started without them; `git_sha` is read
+//! from the image.
 
 use std::time::Instant;
 
-use pplx_space_metrics_emit::{counter, elapsed_ms, gauge, metric_vocabulary, tag, timing_ms};
+use pplx_space_metrics_emit::{elapsed_ms, metric_vocabulary, tag};
+
+fn with_build(tags: &[String]) -> Vec<String> {
+    let mut tags = tags.to_vec();
+    tags.push(tag("git_sha", pplx_space_observability::git_sha()));
+    tags
+}
+
+fn counter(name: &str, value: u64, tags: &[String]) {
+    pplx_space_metrics_emit::counter(name, value, &with_build(tags));
+}
+
+fn gauge(name: &str, value: f64, tags: &[String]) {
+    pplx_space_metrics_emit::gauge(name, value, &with_build(tags));
+}
+
+fn timing_ms(name: &str, value_ms: f64, tags: &[String]) {
+    pplx_space_metrics_emit::timing_ms(name, value_ms, &with_build(tags));
+}
 
 pub fn pull_duration(tags: &[String], result: &str, started_at: Instant) {
     let mut tags = tags.to_vec();
@@ -292,8 +316,9 @@ pub fn digest_pins_pruned(count: u64) {
     counter("template.digest_pins.pruned", count, &[]);
 }
 
-/// The requested content hash uses the legacy `version` tag on DogStatsD and
-/// `version.requested` on OTLP, separate from the emitting process version.
+/// The requested content hash is the `hash` tag, as on
+/// `template.prefetch.release.candidates`; `version` is left to the emitting
+/// process.
 pub fn fetch_error(name: &str, req_hash: &str, req_tag: &str, reason: &str) {
     let tags = vec![
         tag("template", name),
@@ -306,7 +331,7 @@ pub fn fetch_error(name: &str, req_hash: &str, req_tag: &str, reason: &str) {
             },
         ),
         tag(
-            "version",
+            "hash",
             if req_hash.is_empty() {
                 "<unset>"
             } else {

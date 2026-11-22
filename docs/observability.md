@@ -138,12 +138,20 @@ that logical dimension must use `service.role`. Native DogStatsD retains its
 existing wire tags, including both `service` values; its queries do not change.
 
 Per-measurement `version` tags similarly export as `version.requested` on
-OTLP, while the process version stays in resource `service.version`.
-`template.fetch.error` uses this dimension for the requested content hash
-(`"<unset>"` when absent), so failures for distinct hashes remain separate.
-The hash has unbounded cardinality; it shares the existing 2,000-attribute-set
-limit per instrument, with excess combinations going to the SDK overflow
-series. Native DogStatsD keeps the original `version` wire tags.
+OTLP, while the process version stays in resource `service.version`. Native
+DogStatsD keeps the original `version` wire tags.
+
+`template.fetch.error` tags the requested content hash as `hash` (`"<unset>"`
+when absent), so failures for distinct hashes remain separate. Older builds
+tag it `version` (`version.requested` on OTLP), so while both run, during a
+rollout or rollback, a query by hash reads both keys. The hash has unbounded cardinality; it
+shares the existing 2,000-attribute-set limit per instrument, with excess
+combinations going to the SDK overflow series.
+
+Every `template.*` metric the template manager emits also carries `git_sha`,
+the deployed build's revision (`unknown` without deployment metadata), so a
+rollout's old and new builds stay apart even when the node service runs
+without a process `version`.
 
 ### Mixed identity on the DogStatsD path
 
@@ -574,8 +582,9 @@ A Datadog organization can limit which tags it keeps or makes queryable for a
 metric, for example with an explicit per-metric tag configuration. A tag that
 configuration does not list is still sent but cannot be grouped or filtered
 on. That applies to tags added after the configuration was written, including
-the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
-and the `error_kind` on `template.build.latency_ms`,
+the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors,
+the `git_sha` on template-manager `template.*` metrics, the `hash` on
+`template.fetch.error`, and the `error_kind` on `template.build.latency_ms`,
 `template.build.step.latency_ms` and `snapshot.restore.failed`, the
 `fault` on `gateway.tcp.connection`, the `io_kind` on
 `gateway.tls.connection_error` and `gateway.tls.handshake`, and the
