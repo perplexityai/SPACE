@@ -168,6 +168,11 @@ pub(crate) struct TriggerRequestReason {
 }
 
 impl TriggerRequestReason {
+    /// Typed reasons only; a diagnostic string never matches.
+    pub(crate) fn includes(&self, reason: ReconcileReason) -> bool {
+        self.reasons.contains(&reason)
+    }
+
     fn diagnostic(reason: impl Into<String>) -> Self {
         let reason = normalize_reconcile_reason(&reason.into());
         Self {
