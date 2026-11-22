@@ -538,10 +538,20 @@ async fn rollback_last_postgres(
     ensure_sqlx_migrations_table_postgres(pool).await?;
     let applied_versions = applied_versions_postgres(pool).await?;
     rollback_last(migrator, &applied_versions, |target| async move {
-        migrator
-            .undo(pool, target)
-            .await
-            .map_err(RunDbMigrateError::RollbackPostgres)
+        let result = migrator.undo(pool, target).await;
+        // As `run_up` does for an up: a failed `-- no-transaction` down, such
+        // as a `CREATE INDEX CONCURRENTLY` that restores an index, can leave an
+        // INVALID index behind while the up's history row stays.
+        if let Err(MigrateError::ExecuteMigration(_, version)) = &result
+            && migrator.iter().any(|migration| {
+                migration.version == *version
+                    && migration.migration_type.is_down_migration()
+                    && migration.no_tx
+            })
+        {
+            migration_retry::report_invalid_indexes(pool, *version).await;
+        }
+        result.map_err(RunDbMigrateError::RollbackPostgres)
     })
     .await
 }

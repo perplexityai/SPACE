@@ -19,9 +19,10 @@
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
+use pplx_space_sql_locator::sql;
 use sqlx::migrate::{MigrateError, Migrator};
-use sqlx::{Connection as _, PgPool};
-use tracing::{info, warn};
+use sqlx::{Connection as _, PgExecutor, PgPool};
+use tracing::{error, info, warn};
 
 use crate::sqlstate;
 
@@ -240,8 +241,8 @@ pub(crate) async fn run_up(
                     error = %error,
                     "lock timeout in a `-- no-transaction` migration; not retrying, \
                      because such a file can leave partial state behind (an INVALID \
-                     index from a failed CONCURRENTLY build) that a re-run would adopt \
-                     or collide with"
+                     index from a failed CONCURRENTLY build or drop) that a re-run would \
+                     adopt or collide with"
                 );
             }
             RetryVerdict::Retry if policy.may_retry(attempt, retrying_for, backoff) => {
@@ -328,11 +329,61 @@ pub(crate) async fn run_up(
             warn!(error = %flush_error, "failed to flush the failed migration transaction");
         }
 
+        if let MigrateError::ExecuteMigration(_, version) = &error
+            && is_non_transactional(migrator, *version)
+        {
+            report_invalid_indexes(&mut *conn, *version).await;
+        }
+
         return Err(MigrationRunFailed {
             attempt,
             budget,
             source: error,
         });
+    }
+}
+
+/// Log each index Postgres holds as INVALID after the statement of the
+/// `-- no-transaction` up or down migration at `failed_version` failed.
+///
+/// Such a file runs outside a transaction, so a `CONCURRENTLY` build or drop
+/// that stopped partway leaves an INVALID index that `_sqlx_migrations` does
+/// not show: a failed up records no history row, and a failed down keeps the
+/// row of the up it was undoing. The query covers the whole database, so a
+/// listed index may also come from an earlier failure or another session's
+/// build; the line says only that it was INVALID when this migration failed.
+/// `ready` says whether writes still maintain it, which for a unique index
+/// decides whether it still refuses writes that violate it.
+pub(crate) async fn report_invalid_indexes<'c>(executor: impl PgExecutor<'c>, failed_version: i64) {
+    let indexes: Result<Vec<(String, String, bool)>, sqlx::Error> = sqlx::query_as(sql!(
+        r"
+        SELECT indexrelid::regclass::text, indrelid::regclass::text, indisready
+        FROM pg_index
+        WHERE NOT indisvalid
+        ORDER BY indexrelid::regclass::text
+        "
+    ))
+    .fetch_all(executor)
+    .await;
+    match indexes {
+        Ok(indexes) => {
+            for (index, table, ready) in indexes {
+                error!(
+                    failed_version,
+                    index = %index,
+                    table = %table,
+                    ready,
+                    "INVALID index present when a `-- no-transaction` migration failed; \
+                     `_sqlx_migrations` does not show it, and the index may be the failed \
+                     file's partial state or left by an earlier failure or another session"
+                );
+            }
+        }
+        Err(error) => warn!(
+            failed_version,
+            error = %error,
+            "failed to list INVALID indexes after a `-- no-transaction` migration failed"
+        ),
     }
 }
 

@@ -607,6 +607,14 @@ which is safe because SQLx rolls the file and its `_sqlx_migrations` row back
 together. A `-- no-transaction` migration is not retried at all, because a
 failed `CREATE INDEX CONCURRENTLY` can leave an INVALID index behind with no
 history row, and recovering that needs a `DROP INDEX CONCURRENTLY` and a rerun.
+A failed `DROP INDEX CONCURRENTLY` can leave one too, and so can a
+`-- no-transaction` down, whose failure keeps the up's history row. When the
+statement of a `-- no-transaction` file fails under `control-plane up`,
+`reset` or `down`, the migrator logs one error per INVALID index in the
+database before it exits, with the `failed_version`, the `index`, its `table`,
+and `ready` (whether writes still maintain it). The list is not capped or
+filtered to the failed file, so it can name an index from an earlier failure
+or another session's build; check which file names it before recovering.
 
 [The migration lint guard](../scripts/check-postgres-migrations-squawk.sh)
 checks changed `db/postgres/*.up.sql` files with Squawk. Squawk catches generic
