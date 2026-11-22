@@ -216,6 +216,8 @@ def consume_events(response, transcript, stdout, stderr):
             code = frame.get("exit_code")
             if type(code) is not int or code != 0:
                 raise RuntimeError(f"Command did not exit successfully: {code!r}")
+            if frame.get("output_truncated") is True:
+                raise RuntimeError("Command output was truncated; keep the transcript")
             completed = True
     if not completed:
         raise RuntimeError("Stream ended without a clean process_exited event")

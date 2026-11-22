@@ -229,6 +229,7 @@ class FirstSandboxExampleTests(unittest.TestCase):
             b'data: {"type":"error"}\n\n',
             b'data: {"type":"resync_required"}\n\n',
             GOOD + b'data: {"type":"resync_required"}\n\n',
+            b'data: {"type":"process_exited","exit_code":0,"output_truncated":true}\n\n',
             b'data: {"type":"stdout","data_base64":"bad!"}\n\n',
             b'data: {"type":"stdout","data_base64":"eA=="}\n\n',
             GOOD.rstrip(b"\n"),
