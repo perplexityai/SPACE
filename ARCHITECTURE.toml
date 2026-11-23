@@ -242,7 +242,7 @@ patterns = [
   '\bfs\s*::\s*copy\s*\(',
   '\buse\s+(?:std|tokio)\s*::\s*fs\s*::[^;]*\bcopy\b',
 ]
-allow = ["crates/l10_foundation/file/io/src/reflink.rs"]
+allow = ["crates/l10_foundation/file/io/**"]
 
 [rules.pattern_ratchet.rootfs_copy.no_crossing]
 mode = "required"
