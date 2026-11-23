@@ -14,11 +14,11 @@ workspace = true
 pplx-space-accounts = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-env-vars = { workspace = true }
-pplx-space-job-id = { workspace = true, optional = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
+pplx-space-uuid-id = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
@@ -35,7 +35,7 @@ serde = [
     "pplx-space-node-model/serde",
 ]
 sqlx = [
-    "dep:pplx-space-job-id",
     "dep:pplx-space-sql-codec",
+    "dep:pplx-space-uuid-id",
     "pplx-space-sql-codec/postgres",
 ]

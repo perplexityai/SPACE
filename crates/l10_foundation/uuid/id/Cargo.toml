@@ -1,0 +1,31 @@
+[package]
+name = "pplx-space-uuid-id"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+# The doc examples invoke the macros, so they need what a caller of each
+# needs: serde with `derive`, the codec facade with both drivers' items, and
+# rusqlite.
+pplx-space-sql-codec = { workspace = true, features = ["postgres", "sqlite"] }
+rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default = []
+# uuid_id! compiles its serde and sqlx impls when its caller's own `serde` and
+# `sqlx` features are on. The doc examples are such callers, so the features
+# are declared here too; the library itself uses neither.
+serde = []
+sqlx = []

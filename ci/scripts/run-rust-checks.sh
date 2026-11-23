@@ -394,7 +394,7 @@ run_clippy_checks() {
         -D warnings
 
     # Each feature of the account and job identity crates by itself, so one
-    # that relies on another being enabled fails here. Both call job-id's
+    # that relies on another being enabled fails here. Both call uuid-id's
     # uuid_id! macro, whose impls follow the calling crate's own features.
     # No workspace crate enables job-id's sqlx, so only the
     # --all-features builds and this loop compile its Postgres impls, and only

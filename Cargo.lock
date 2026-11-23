@@ -4828,6 +4828,7 @@ dependencies = [
  "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-sql-codec",
+ "pplx-space-uuid-id",
  "serde",
  "thiserror 2.0.20",
  "uuid",
@@ -6457,9 +6458,9 @@ name = "pplx-space-job-id"
 version = "0.8.2"
 dependencies = [
  "pplx-space-sql-codec",
+ "pplx-space-uuid-id",
  "rusqlite",
  "serde",
- "thiserror 2.0.20",
  "uuid",
 ]
 
@@ -7229,10 +7230,10 @@ name = "pplx-space-node-model"
 version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
- "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-sql-codec",
  "pplx-space-template-model",
+ "pplx-space-uuid-id",
  "serde",
  "thiserror 2.0.20",
  "uuid",
@@ -7836,11 +7837,11 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-byte-size",
  "pplx-space-env-vars",
- "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-linux-ids",
  "pplx-space-node-model",
  "pplx-space-sql-codec",
+ "pplx-space-uuid-id",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -8284,9 +8285,9 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-byte-size",
  "pplx-space-execution-spec",
- "pplx-space-job-id",
  "pplx-space-sql-codec",
  "pplx-space-template-model",
+ "pplx-space-uuid-id",
  "serde",
  "thiserror 2.0.20",
  "uuid",
@@ -9157,6 +9158,17 @@ name = "pplx-space-unix-socket-path"
 version = "0.8.2"
 dependencies = [
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-uuid-id"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-codec",
+ "rusqlite",
+ "serde",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

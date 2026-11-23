@@ -12,15 +12,15 @@ workspace = true
 
 [dependencies]
 pplx-space-sql-codec = { workspace = true, optional = true }
+pplx-space-uuid-id = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
-thiserror = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
-# The unit tests compile sqlite_uuid!(JobId) without the feature, and
-# postgres_uuid!'s doc example its impls.
-pplx-space-sql-codec = { workspace = true, features = ["postgres", "sqlite"] }
+# The unit tests compile sqlite_uuid!(JobId) without the feature.
+pplx-space-sql-codec = { workspace = true, features = ["sqlite"] }
 rusqlite = { workspace = true }
+# JobId's generated doc examples and the unit tests call uuid.
+uuid = { workspace = true }
 
 [features]
 default = []
