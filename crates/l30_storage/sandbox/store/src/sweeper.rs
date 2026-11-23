@@ -1224,7 +1224,7 @@ pub async fn fail_unrestorable_restoring(
 /// It never repairs a sandbox whose first activation never finished (the
 /// execution never reached `running` and still holds an activation attempt,
 /// or was given up by its last owner: no attempt, but a give-up expiry; see
-/// the sweeper's `LIST_FAILED_ACTIVE_EXECUTIONS_SQL`). The sweep fails a create in that
+/// [`crate::k8s_executions::list_failed_active_executions`]). The sweep fails a create in that
 /// state on purpose when it never became routable; putting it back to
 /// `started` would hand out a sandbox its create request never returned, and
 /// for any activation a `started` row with no pod IP to reach it at. This

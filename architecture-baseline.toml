@@ -156,7 +156,6 @@ postgres = [
   "sandbox_archives",
   "sandbox_direct_route_identities",
   "sandbox_direct_route_provenance",
-  "sandbox_ecw_credential_epochs",
   "sandbox_encrypted_fields",
   "sandbox_volume_encryption",
   "sessions",

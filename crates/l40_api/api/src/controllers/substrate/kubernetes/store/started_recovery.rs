@@ -9,24 +9,15 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<Duration, SubstrateError> {
-        let remaining_millis = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT GREATEST(
-                        CEIL(EXTRACT(EPOCH FROM (
-                            updated_at + make_interval(secs => $3) - NOW()
-                        )) * 1000)::BIGINT,
-                        0::BIGINT
-                    )
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1 AND generation >= $2 AND active
-             ORDER BY generation DESC
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(recovery_lease_ttl_secs())
-        .fetch_optional(&self.pool)
-        .await
-        .db_context("failed to read started recovery lease")?;
+        let remaining_millis =
+            pplx_space_sandbox_store::k8s_executions::started_recovery_lease_remaining_millis(
+                &self.pool,
+                sandbox_id,
+                generation,
+                recovery_lease_ttl_secs(),
+            )
+            .await
+            .db_context("failed to read started recovery lease")?;
         let Some(remaining_millis) = remaining_millis else {
             return Ok(Duration::ZERO);
         };

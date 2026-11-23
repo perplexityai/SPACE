@@ -539,20 +539,10 @@ pub(super) async fn apply_activation_rollback_candidates(
             continue;
         }
 
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-                SET apply_state = 'pending',
-                    last_applied_node_id = NULL,
-                    last_error = NULL,
-                    last_bridge_status = NULL,
-                    last_applied_bridge_generation = NULL,
-                    last_observed_at = NULL,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND desired_state = 'open'"
-        ))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *conn)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut *conn,
+            candidate.sandbox_id,
+        )
         .await
         .map_err(|error| Status::internal(format!("invalidate rollback port state: {error}")))?;
         let converged = pplx_space_sandbox_store::quarantine::converge_activation_rollback(

@@ -79,6 +79,18 @@
 //!   from the residency and portability fragments those gates read.
 //!   [`node_placements`] pages one node's placement history, every lifecycle
 //!   included.
+//! * **Sibling tables get a module each.** The unlocked reads and the
+//!   unguarded steps that callers ran on the sandbox-scoped tables this
+//!   crate declares, mostly inside a larger transaction, move into modules
+//!   named for the table: [`port_exposures`], [`observed_states`],
+//!   [`snapshot_inventory`], [`node_local_backup_pending`],
+//!   [`ecw_credential_epochs`] and [`k8s_executions`]. [`k8s_executions`]
+//!   holds unlocked reads only: the table's writes, the generation
+//!   allocation and its `FOR UPDATE` reads stay with the execution-ownership
+//!   paths that issue them. A step that is part of a transition statement
+//!   stays in that transition's module. A read of the `sandboxes` row
+//!   alone, such as [`runtime_access`], gets a module named for the
+//!   question it answers.
 //!
 //! # Fact kinds
 //!
@@ -126,21 +138,28 @@ pub mod create;
 pub mod delete;
 pub mod direct;
 pub mod drain;
+pub mod ecw_credential_epochs;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
+pub mod k8s_executions;
 mod lifecycle;
 pub mod lost;
 pub mod node_holds;
+pub mod node_local_backup_pending;
 pub mod node_placements;
+pub mod observed_states;
 pub mod orphan;
 pub mod pod_tracking;
+pub mod port_exposures;
 pub mod quarantine;
 pub mod repair;
 pub mod restore_dispatch_fence;
 pub mod restore_lease;
 pub mod restore_source;
+pub mod runtime_access;
 pub mod runtime_population;
+pub mod snapshot_inventory;
 pub mod stuck;
 pub mod suspend;
 pub mod sweeper;

@@ -487,6 +487,43 @@ pub struct SandboxPortExposure {
     pub updated_at: OffsetDateTime,
 }
 
+impl From<pplx_space_sandbox_store::port_exposures::PortExposureRecord> for SandboxPortExposure {
+    fn from(record: pplx_space_sandbox_store::port_exposures::PortExposureRecord) -> Self {
+        let pplx_space_sandbox_store::port_exposures::PortExposureRecord {
+            sandbox_id,
+            protocol,
+            guest_port,
+            visibility,
+            source,
+            desired_state,
+            apply_state,
+            last_applied_node_id,
+            last_error,
+            last_bridge_status,
+            last_applied_bridge_generation,
+            last_observed_at,
+            created_at,
+            updated_at,
+        } = record;
+        Self {
+            sandbox_id,
+            protocol,
+            guest_port,
+            visibility,
+            source,
+            desired_state,
+            apply_state,
+            last_applied_node_id,
+            last_error,
+            last_bridge_status,
+            last_applied_bridge_generation,
+            last_observed_at,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Template {
     pub name: String,

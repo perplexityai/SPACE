@@ -150,20 +150,11 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     .bind(expected.execution_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
-    ))
-    .bind(expected.sandbox_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "UPDATE sandbox_port_exposures SET apply_state = 'pending', last_applied_node_id = NULL,
-             last_error = NULL, last_bridge_status = NULL, last_applied_bridge_generation = NULL,
-             last_observed_at = NULL, updated_at = NOW()
-          WHERE sandbox_id = $1 AND desired_state = 'open'"
-    ))
-    .bind(expected.sandbox_id)
-    .execute(&mut *tx)
+    pplx_space_sandbox_store::observed_states::delete(&mut *tx, expected.sandbox_id).await?;
+    pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+        &mut *tx,
+        expected.sandbox_id,
+    )
     .await?;
     sqlx::query(sql!(
         "DELETE FROM sandbox_quarantine_state WHERE sandbox_id = $1"

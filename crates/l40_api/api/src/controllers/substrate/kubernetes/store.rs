@@ -384,6 +384,43 @@ pub(super) struct SandboxExecutionRow {
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
 }
 
+/// Parses `state` as the derive's `try_from` does, failing with the same
+/// column-decode error, so a stored state this crate does not know fails the
+/// store read as it fails this row's own statements.
+impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord>
+    for SandboxExecutionRow
+{
+    type Error = sqlx::Error;
+
+    fn try_from(
+        record: pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord,
+    ) -> Result<Self, Self::Error> {
+        let pplx_space_sandbox_store::k8s_executions::ActiveExecutionRecord {
+            generation,
+            pod_name,
+            pod_materialized,
+            state,
+            create_age_expired,
+            activation_attempt_id,
+            route_activation_id,
+        } = record;
+        let state =
+            ActiveExecutionState::try_from(state).map_err(|error| sqlx::Error::ColumnDecode {
+                index: "state".to_string(),
+                source: Box::new(error),
+            })?;
+        Ok(Self {
+            generation,
+            pod_name,
+            pod_materialized,
+            state,
+            create_age_expired,
+            activation_attempt_id,
+            route_activation_id,
+        })
+    }
+}
+
 impl SandboxExecutionRow {
     pub(super) fn bootstrap_route_activation_id(&self) -> Option<SandboxActivationAttemptId> {
         // Published route wins; the operation is a fallback only for legacy rows.
