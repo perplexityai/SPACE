@@ -110,6 +110,8 @@ pplx-space-template-store = { workspace = true, features = ["test-support"] }
 pplx-space-api-route = { workspace = true, features = ["test-support"] }
 pplx-space-ecw-credential = { workspace = true, features = ["test-support"] }
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
+pplx-space-firewall-rules-store = { workspace = true, features = ["test-support"] }
+pplx-space-node-status-store = { workspace = true, features = ["test-support"] }
 hex = { workspace = true }
 insta = { workspace = true, features = ["yaml", "redactions"] }
 prost = { workspace = true }

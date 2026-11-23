@@ -47,26 +47,29 @@ async fn assign(
     Ok(revision_id)
 }
 
-/// An observation row with the given pending and accepted rounds.
+/// An observation row with the given pending round, with the generation it
+/// asks about, and accepted round.
 async fn observe(
     pool: &PgPool,
     node: NodeId,
-    pending: Option<i64>,
+    pending: Option<(i64, i64)>,
     accepted: Option<i64>,
 ) -> TestResult {
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_node_observations (
              node_id, manager_epoch, pending_round, pending_round_issued_at,
+             pending_assignment_generation,
              accepted_round, accepted_round_issued_at, accepted_report
          )
-         VALUES ($1, 1, $2, CASE WHEN $2 IS NOT NULL THEN $4 END,
+         VALUES ($1, 1, $2, CASE WHEN $2 IS NOT NULL THEN $4 END, $5,
                  $3, CASE WHEN $3 IS NOT NULL THEN $4 END,
                  CASE WHEN $3 IS NOT NULL THEN '{}'::jsonb END)"
     ))
     .bind(node)
-    .bind(pending)
+    .bind(pending.map(|(round, _)| round))
     .bind(accepted)
     .bind(issued_at())
+    .bind(pending.map(|(_, generation)| generation))
     .execute(pool)
     .await?;
     Ok(())
@@ -74,7 +77,9 @@ async fn observe(
 
 /// Each part is read for this node only, from its own row: a round without an
 /// assignment survives, an empty revision is an assignment, rule order and
-/// the round's issue time are kept, and accepted evidence is no pending round.
+/// the round's issue time are kept, the round's generation is its own (zero
+/// included) rather than the assignment's, and accepted evidence is no
+/// pending round.
 #[tokio::test]
 async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -84,13 +89,18 @@ async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
     // Another node's work, which no case may see.
     let other = NodeId::new();
     assign(pool, other, 9, "[]").await?;
-    observe(pool, other, Some(99), None).await?;
+    observe(pool, other, Some((99, 9)), None).await?;
 
     for (case, assignment, pending, accepted) in [
         ("neither", None, None, None),
         ("empty revision", Some((0, "[]")), None, None),
-        ("round only", None, Some(7), None),
-        ("both", Some((3, ORDERED)), Some(7), None),
+        ("round only, for generation zero", None, Some((7, 0)), None),
+        (
+            "both, the round for an earlier generation",
+            Some((13, ORDERED)),
+            Some((7, 12)),
+            None,
+        ),
         ("accepted evidence only", None, None, Some(6)),
     ] {
         let node = NodeId::new();
@@ -107,9 +117,10 @@ async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
         }
         let expected = NodeInstructions {
             assignment,
-            pending_round: pending.map(|round| PendingRound {
+            pending_round: pending.map(|(round, generation)| PendingRound {
                 round: round.try_into().unwrap(),
                 issued_at: Timestamp::from_nanosecond(issued_at().unix_timestamp_nanos()).unwrap(),
+                assignment_generation: Some(generation.try_into().unwrap()),
             }),
         };
         let fetched = fetch_instructions(&mut *pool.acquire().await?, node).await?;

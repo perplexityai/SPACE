@@ -226,7 +226,9 @@ fn question(
     issued_at: OffsetDateTime,
     assignment_generation: u64,
 ) -> Result<Question, sqlx::Error> {
-    let PendingRound { round, issued_at } = pending_round(round, issued_at)?;
+    let PendingRound {
+        round, issued_at, ..
+    } = pending_round(round, issued_at, Some(assignment_generation))?;
     Ok(Question {
         round,
         assignment_generation,
