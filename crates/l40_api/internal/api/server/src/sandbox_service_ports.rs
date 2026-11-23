@@ -12,7 +12,7 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::{NodeApiClient, WorkerApiClient};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, NetworkProtocol};
-use pplx_space_node_model::{NodeDrainPhase, NodeDrainState, NodeManagedBy};
+use pplx_space_node_model::{NodeDrain, NodeDrainPhase, NodeManagedBy};
 use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
 use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
@@ -81,7 +81,7 @@ async fn ensure_sandbox_service_route_node_not_draining(
     // serving traffic. Blocking on the phase alone made ingress the one access
     // path a gentle drain still broke, while every user-API path stayed open.
     //
-    // `NodeDrainState::blocks_placement` is the shared truth table, so this
+    // `NodeDrain::blocks_placement` is the shared truth table, so this
     // guard and the user-API drain gates cannot drift: `forced` + `draining`
     // races the evacuation pipeline, and `drained` / `terminating` block in
     // either mode because the node is about to be destroyed.
@@ -104,14 +104,18 @@ async fn ensure_sandbox_service_route_node_not_draining(
         .map(NodeDrainPhase::parse)
         .transpose()
         .map_err(|err| Status::internal(format!("node has an unrecognized drain phase: {err}")))?;
-    let drain_state = NodeDrainState::from_columns(drain_phase, drain_mode.as_deref());
+    let drain_state = NodeDrain::from_v1_columns(drain_phase, drain_mode.as_deref());
     if let Some(state) = drain_state.filter(|state| state.blocks_placement()) {
-        return Err(Status::failed_precondition(format!(
-            "sandbox service route cannot open port while sandbox {sandbox_id} is on a \
-             {phase} node draining in {mode} mode",
-            phase = state.phase,
-            mode = state.mode,
-        )));
+        return Err(Status::failed_precondition(match state {
+            NodeDrain::V1 { phase, mode } => format!(
+                "sandbox service route cannot open port while sandbox {sandbox_id} is on a \
+                 {phase} node draining in {mode} mode"
+            ),
+            state => format!(
+                "sandbox service route cannot open port while sandbox {sandbox_id} is on a \
+                 node that is {state}"
+            ),
+        }));
     }
     Ok(())
 }

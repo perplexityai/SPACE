@@ -14,8 +14,7 @@ use pplx_space_admin_protocol::{
 };
 use pplx_space_node_execution_inventory_store::InstallationGuestRow;
 use pplx_space_node_model::{
-    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
-    NodeRole,
+    NodeAddress, NodeDrain, NodeDrainMode, NodeDrainPhase, NodeGroupId, NodeManagedBy, NodeRole,
 };
 use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
 use pplx_space_node_registration_store::drain_write::{self, DrainColumnsUpdate};
@@ -1172,7 +1171,7 @@ pub(super) async fn list_pinned_local_only_sandboxes(
 /// serving user traffic by design. Reading the phase alone here would let an
 /// `:undrain` + gentle `:drain` landing mid-fan-out look like the safe regime it
 /// isn't, which is the whole failure this re-check exists to prevent. Resolved
-/// through the same [`NodeDrainState::blocks_placement`] the gate itself uses.
+/// through the same [`NodeDrain::blocks_placement`] the gate itself uses.
 pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
@@ -1195,8 +1194,8 @@ pub(super) async fn is_node_wake_gate_closed(
             index: "0".to_owned(),
             source: source.into(),
         })?;
-    Ok(NodeDrainState::from_columns(phase, drain_mode.as_deref())
-        .is_some_and(NodeDrainState::blocks_placement))
+    Ok(NodeDrain::from_v1_columns(phase, drain_mode.as_deref())
+        .is_some_and(NodeDrain::blocks_placement))
 }
 
 /// The in-place update for a node that is already `draining`: rewrite

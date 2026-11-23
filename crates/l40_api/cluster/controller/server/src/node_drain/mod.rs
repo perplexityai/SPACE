@@ -626,7 +626,7 @@ pub struct ReconcilerConfig {
     /// the flag reaches — both halves of it, this pre-check and the completion
     /// write's guard scope, which is why two call sites read the field. The
     /// other half of the decision is therefore *reachability*, not safety, and
-    /// it is **conditional on the drain mode**. `NodeDrainState::blocks_placement`
+    /// it is **conditional on the drain mode**. `NodeDrain::blocks_placement`
     /// 409s a user `start` on a `drained` node in either mode;
     /// `blocks_user_calls_while_draining` is `matches!(self, Self::Forced)`, so a
     /// `draining` node blocks that `start` under a forced drain and leaves it
@@ -678,7 +678,7 @@ pub struct ReconcilerConfig {
     /// promise is that it does not touch residents, and a stopped evacuation
     /// does touch one: it gives up the node-local copy, after which a `start`
     /// is a retryable 503 until the re-placement lands. Under forced that
-    /// window costs nothing new — `NodeDrainState::blocks_placement` already
+    /// window costs nothing new — `NodeDrain::blocks_placement` already
     /// 409s a `start` on a forced-draining node for the whole drain — while
     /// under gentle it would be the first disruption the mode has ever caused.
     /// It also covers the motivating case as-is: a managed node group rollout
