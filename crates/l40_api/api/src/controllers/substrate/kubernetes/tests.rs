@@ -15256,17 +15256,13 @@ mod kubernetes_tests {
         ClientBuilder::new(service, "space").build()
     }
 
-    /// The in-VM stop addresses the *sandbox*, not the pod, so the address it
-    /// uses decides which VM gets stopped. A fenced teardown derives that
-    /// address from the pod the fence verified — never from the execution row,
-    /// and never by re-resolving whatever is active by then, which on a race
-    /// is the successor. Here the row advertises a runtime the verified pod
-    /// does not have: a teardown that trusted the row would try to stop
-    /// 127.0.0.1 and fail the retire; this one sees no runtime to stop and
-    /// proceeds straight to the pod delete.
+    /// Before kubelet publishes `status.podIP`, the row's node-reported IP for
+    /// the same pod UID is the fenced pod's runtime, so the retire must stop
+    /// and back it up before deleting the pod. Nothing answers at 127.0.0.1
+    /// here: the stop fails, the retire aborts and the pod is kept.
     #[tokio::test(flavor = "current_thread")]
-    async fn fenced_retire_ignores_a_runtime_the_fenced_pod_does_not_have() -> Result<(), BoxError>
-    {
+    async fn fenced_retire_stops_the_runtime_recorded_for_an_unpublished_pod()
+    -> Result<(), BoxError> {
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
@@ -15282,7 +15278,7 @@ mod kubernetes_tests {
             true,
         )
         .await?;
-        // The verified pod carries no IP; the execution row claims one.
+        // Kubelet has not published an IP; the row records the node's.
         let fenced_pod = Pod {
             metadata: kube::api::ObjectMeta {
                 name: Some(pod_name.clone()),
@@ -15303,22 +15299,28 @@ mod kubernetes_tests {
             Some(fenced_pod),
         );
 
-        let outcome = substrate
+        let result = substrate
             .retire_execution(RetireExecutionRequest::fenced(
                 sandbox_id,
                 PodIdentityFence::new(PodName::parse(&pod_name)?)
                     .with_pod_uid(PodUid::parse("uid-observed")?),
             ))
-            .await?;
+            .await;
 
-        assert_eq!(outcome, RetireExecutionOutcome::Retired);
-        assert_eq!(
+        assert!(
+            result.is_err(),
+            "the in-VM stop must be attempted: {result:?}"
+        );
+        assert!(
             captured_deletes
                 .lock()
                 .expect("capture mutex poisoned")
-                .len(),
-            1,
-            "the fenced pod is still deleted; only the in-VM stop was skipped"
+                .is_empty(),
+            "the pod is kept until its runtime is stopped"
+        );
+        assert_eq!(
+            active_execution_generations(&pool, sandbox_id).await,
+            vec![1]
         );
         Ok(())
     }
