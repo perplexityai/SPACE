@@ -360,6 +360,10 @@ mode = "advisory"
 # Each store's users: the l40_api and l30_storage crates that own its state
 # and use the store today.
 [rules.layers.store_users]
+pplx-space-admin-audit-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+]
 pplx-space-cluster-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",

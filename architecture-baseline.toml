@@ -135,7 +135,6 @@ pplx-space-volmgr = [
 
 [layers.unowned]
 postgres = [
-  "admin_audit_events",
   "api_keys",
   "clusters",
   "data_plane_session_output_events",

@@ -86,6 +86,7 @@ uuid = { workspace = true, features = ["v5", "v7", "serde"] }
 # build-manager is reached indirectly via space-node-api-svc (BuilderApi).
 # The recipe adapter keeps system builds on the same TOML contract as the builder CLI.
 pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-admin-audit-store = { workspace = true }
 pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-bearer-token = { workspace = true }
