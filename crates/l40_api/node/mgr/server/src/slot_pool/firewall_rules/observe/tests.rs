@@ -140,6 +140,41 @@ async fn the_census_accounts_for_every_record_and_managed_namespace() {
     assert_eq!(host.installs(), []);
 }
 
+// Catches an unbounded census, an overflow with no marker or a wrong count, a
+// different or reordered survivor set, or an overflowing census called complete.
+#[tokio::test]
+async fn an_overflowing_census_keeps_a_prefix_and_ends_in_a_count() {
+    const KEPT: usize = MAX_CENSUS_GAPS - 1;
+    let (pool, _jobs) = pool(1);
+    let (_dir, store) = store(Some(12));
+    let host = FakeHost::new(None);
+    set_slot(&pool, 0, SlotState::Leased, 1);
+    let verified = host.name(0, "net");
+    host.tables.lock().unwrap().insert(verified, installed(12));
+    let nft = fake_nft(&host);
+    let extra = |index: usize| host.link(0).with_file_name(format!("extra-{index:06}"));
+    let mut made = 0;
+    // Gaps at the last count that fits, one more, and well past.
+    for (total, omitted) in [(KEPT, None), (KEPT + 1, Some(1)), (KEPT + 134, Some(134))] {
+        for index in made..total {
+            std::fs::write(extra(index), b"").unwrap();
+        }
+        made = total;
+        let observed = observe(&pool, &store, host.clone(), &nft).await.unwrap();
+        let mut expected: Vec<_> = (0..KEPT)
+            .map(|index| CensusGap::Extra {
+                entry: extra(index),
+            })
+            .collect();
+        expected.extend(omitted.map(|omitted| CensusGap::Truncated { omitted }));
+        assert_eq!(observed.census.gaps.len(), expected.len(), "{total} gaps");
+        assert!(observed.census.gaps == expected, "{total} gaps");
+        assert!(!observed.census.complete());
+        let outcomes: Vec<_> = observed.slots.iter().map(|slot| slot.outcome).collect();
+        assert_eq!(outcomes, [SlotOutcome::Verified]);
+    }
+}
+
 // Catches a reading kept after its namespace or slot changed, a census judged
 // before the last read, or a superseded generation's readings returned.
 #[tokio::test]

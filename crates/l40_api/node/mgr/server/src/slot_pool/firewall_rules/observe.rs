@@ -1,9 +1,11 @@
 //! Reads what every slot's sandbox namespace enforces now against the accepted
 //! assignment, writing nothing to nft. The census pairs the pool's inventory
 //! with the directory the host declares only managed namespaces occupy; a host
-//! without one, as `/run/netns` is shared, reports that gap. Each reading is
-//! revalidated after the last one while its namespace is still pinned, since a
-//! released namespace's inode is soon reused.
+//! without one, as `/run/netns` is shared, reports that gap. A census carries
+//! at most [`MAX_CENSUS_GAPS`] gaps; beyond that it keeps the first ones in the
+//! order below and ends with one [`CensusGap::Truncated`], and is incomplete.
+//! Each reading is revalidated after the last one while its namespace is still
+//! pinned, since a released namespace's inode is soon reused.
 
 use std::fs::File;
 use std::io;
@@ -36,8 +38,15 @@ pub struct FirewallObservation {
     pub slots: Vec<SlotEvidence>,
 }
 
+/// The most gaps a census carries, counting the [`CensusGap::Truncated`] marker.
+/// Twice the largest slot pool, which can never overflow it alone.
+pub const MAX_CENSUS_GAPS: usize = 32_768;
+
 /// Complete when every eligible record was read with its namespace listed,
-/// and every listed entry is some record's.
+/// and every listed entry is some record's. Gaps come in this order: each
+/// eligible record's, by slot; the listing's failure; each extra entry, sorted
+/// by path. Past [`MAX_CENSUS_GAPS`], the rest are omitted and counted by a
+/// final `Truncated`, so the census is never complete then.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Census {
     pub gaps: Vec<CensusGap>,
@@ -63,10 +72,40 @@ pub enum CensusGap {
     Unread {
         slot_id: u32,
     },
-    /// A managed namespace no record accounts for.
+    /// A managed namespace no record accounts for. Its path stays local.
     Extra {
         entry: PathBuf,
     },
+    /// Ends an overflowing census: this many gaps were left out.
+    Truncated {
+        omitted: u64,
+    },
+}
+
+/// Gaps up to the bound, counting what falls past it.
+#[derive(Default)]
+struct Gaps {
+    kept: Vec<CensusGap>,
+    omitted: u64,
+}
+
+impl Gaps {
+    fn push(&mut self, gap: CensusGap) {
+        if self.kept.len() < MAX_CENSUS_GAPS - 1 {
+            self.kept.push(gap);
+        } else {
+            self.omitted += 1;
+        }
+    }
+
+    fn finish(mut self) -> Vec<CensusGap> {
+        if self.omitted > 0 {
+            self.kept.push(CensusGap::Truncated {
+                omitted: self.omitted,
+            });
+        }
+        self.kept
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,9 +309,9 @@ fn finalize(
             evidence.outcome = SlotOutcome::Unknown(Unknown::Unconfirmed);
         }
     }
-    let gaps = &mut observation.census.gaps;
+    let mut gaps = Gaps::default();
     let Some(now) = now else {
-        gaps.push(CensusGap::InventoryFailed);
+        observation.census.gaps = vec![CensusGap::InventoryFailed];
         return;
     };
     let paths: Vec<_> = now
@@ -302,9 +341,12 @@ fn finalize(
         Err(gap) => gaps.push(gap),
         Ok(listed) => {
             let extra = listed.into_iter().filter(|entry| !paths.contains(entry));
-            gaps.extend(extra.map(|entry| CensusGap::Extra { entry }));
+            for entry in extra {
+                gaps.push(CensusGap::Extra { entry });
+            }
         }
     }
+    observation.census.gaps = gaps.finish();
 }
 
 /// Every entry of the host's managed-namespace directory, sorted.
