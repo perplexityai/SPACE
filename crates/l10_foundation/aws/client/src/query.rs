@@ -228,7 +228,13 @@ impl<T: QueryTransport> AwsQueryClient<T> {
     }
 
     async fn sign_request(&self, body: String) -> Result<Request<Vec<u8>>, AwsClientError> {
-        let mut request = unsigned_request(self.endpoint()?, body)?;
+        let endpoint = self.endpoint()?;
+        let bytes = body.into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(endpoint.as_str())
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(bytes)?;
 
         let credentials_provider = self
             .credentials_provider
@@ -267,7 +273,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             .collect::<Result<Vec<_>, _>>()?;
         let signable_request = SignableRequest::new(
             "POST",
-            request.uri().to_string(),
+            endpoint,
             header_pairs.into_iter(),
             SignableBody::Bytes(request.body()),
         )?;
@@ -292,18 +298,6 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             region
         ))
     }
-}
-
-fn unsigned_request(
-    endpoint: impl reqwest::IntoUrl,
-    body: String,
-) -> Result<Request<Vec<u8>>, AwsClientError> {
-    // Use reqwest's URL encoding before signing: the path sent on the wire
-    // must match the path in the SigV4 canonical request.
-    let endpoint = endpoint.into_url()?;
-    Ok(Request::post(endpoint.as_str())
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(body.into_bytes())?)
 }
 
 fn encode_form(params: &[(&str, String)]) -> String {
