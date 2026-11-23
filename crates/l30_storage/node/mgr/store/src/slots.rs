@@ -545,7 +545,7 @@ pub fn current_lease_by_sandbox(
     static PREFIX_SQL: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
             "SELECT {SLOT_COLUMNS} FROM network_slots
-             WHERE sandbox_id LIKE ?1 AND state IN ('leasing', 'leased') ORDER BY slot_id"
+             WHERE sandbox_id LIKE ?1 ESCAPE '\\' AND state IN ('leasing', 'leased') ORDER BY slot_id"
         ))
     });
     let exact = slot_rows(conn, &EXACT_SQL, sandbox_id)?;
@@ -556,13 +556,25 @@ pub fn current_lease_by_sandbox(
         return Ok(None);
     }
 
-    let prefix = format!("{sandbox_id}%");
+    let prefix = format!("{}%", escape_like(sandbox_id));
     let records = slot_rows(conn, &PREFIX_SQL, &prefix)?;
     if records.len() == 1 {
         Ok(records.into_iter().next())
     } else {
         Ok(None)
     }
+}
+
+/// Escapes `LIKE`'s wildcards so `value` matches only itself under `ESCAPE '\'`.
+fn escape_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 fn slot_rows(conn: &Connection, sql: &str, value: &str) -> rusqlite::Result<Vec<SlotRow>> {
