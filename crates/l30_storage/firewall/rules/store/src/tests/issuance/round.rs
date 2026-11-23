@@ -33,9 +33,9 @@ fn spawn_open(
     tokio::spawn(async move { open_with(&pool, &target, Queue::Wake).await })
 }
 
-/// A rolling rollout's one target, issued and still leased.
-async fn issued_target(pool: &PgPool) -> TestResult<(RolloutId, LeasedTarget, Stamp)> {
-    let rollout = rollout(pool, "rolling").await?;
+/// The one target of a rollout in `phase`, issued and still leased.
+async fn issued_target(pool: &PgPool, phase: &str) -> TestResult<(RolloutId, LeasedTarget, Stamp)> {
+    let rollout = rollout(pool, phase).await?;
     let nodes = online_nodes(pool, 1).await?;
     save_targets(pool, rollout, &nodes).await?;
     let target = lease(pool, rollout, 1).await?.remove(0);
@@ -64,14 +64,15 @@ async fn accept(pool: &PgPool, node: NodeId) -> TestResult {
 /// Catches openers that serialize on neither the item nor the observation,
 /// which would open two rounds; a duplicate or a lost reply that opens again,
 /// refreshes the round's time or queues another wakeup; a round bound to
-/// anything but the item's generation or timed by its issuance; and an open
-/// that writes the assignment or the stamp.
+/// anything but the item's generation or timed by its issuance; an open that
+/// writes the assignment or the stamp; and one that refuses a canary, which
+/// is checked as a rolling target is.
 #[tokio::test(flavor = "current_thread")]
 async fn racing_and_repeated_opens_converge_on_one_round_and_one_wakeup() -> TestResult {
     let Some(db) = try_pg_test_db_with_max_connections(5).await? else {
         return Ok(());
     };
-    let (rollout, target, stamp) = issued_target(&db.pool).await?;
+    let (rollout, target, stamp) = issued_target(&db.pool, "canary").await?;
     let node = target.node_id;
     // An existing row, so the second opener can't just wait on the first's
     // insert.
@@ -143,7 +144,8 @@ async fn racing_and_repeated_opens_converge_on_one_round_and_one_wakeup() -> Tes
 /// unissued item, an assignment whose generation or revision moved on, a
 /// rollout that stopped checking, and another manager's observations would
 /// each open a round or queue a wakeup; and a pending round for a later
-/// generation would be replaced by an older question.
+/// generation, which only a hand-written row leaves, would be replaced by an
+/// older question or fail the open, which a retrying scheduler would repeat.
 #[tokio::test(flavor = "current_thread")]
 async fn unauthorized_opens_change_nothing() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -198,7 +200,6 @@ async fn unauthorized_opens_change_nothing() -> TestResult {
         assert_eq!(effects(&db.pool, rollout, forged.node_id).await?, before);
     }
 
-    let before = effects(&db.pool, rollout, node).await?;
     let moved = [
         (
             sql!(
@@ -235,12 +236,15 @@ async fn unauthorized_opens_change_nothing() -> TestResult {
     .await?;
     for (change, undo) in moved {
         set(change).await?;
+        let before = effects(&db.pool, rollout, node).await?;
         assert_eq!(
             open_with(&db.pool, target, Queue::Wake).await?,
             Opening::Refused(OpenRefusal::Superseded)
         );
+        assert_eq!(effects(&db.pool, rollout, node).await?, before);
         set(undo).await?;
     }
+    let before = effects(&db.pool, rollout, node).await?;
     for phase in ["paused", "aborted"] {
         set_phase(&db.pool, rollout, phase).await?;
         assert_eq!(
@@ -248,17 +252,9 @@ async fn unauthorized_opens_change_nothing() -> TestResult {
             Opening::Refused(OpenRefusal::NotChecking),
             "{phase}"
         );
+        assert_eq!(effects(&db.pool, rollout, node).await?, before, "{phase}");
     }
     set_phase(&db.pool, rollout, "rolling").await?;
-    assert_eq!(
-        effects(&db.pool, rollout, node).await?.assignment,
-        before.assignment
-    );
-    assert_eq!(
-        effects(&db.pool, rollout, node).await?.trigger,
-        before.trigger
-    );
-    assert_eq!(effects(&db.pool, rollout, node).await?.observation, None);
 
     // Another manager's row, and then a round for a later generation.
     set(sql!(
@@ -279,10 +275,10 @@ async fn unauthorized_opens_change_nothing() -> TestResult {
     ))
     .await?;
     let later = effects(&db.pool, rollout, node).await?;
-    let outcome = open_with(&db.pool, target, Queue::Wake).await;
-    let Err(_) = outcome else {
-        panic!("a round for a later generation didn't fail: {outcome:?}");
-    };
+    assert_eq!(
+        open_with(&db.pool, target, Queue::Wake).await?,
+        Opening::Refused(OpenRefusal::LaterGeneration)
+    );
     assert_eq!(effects(&db.pool, rollout, node).await?, later);
     Ok(())
 }
@@ -296,7 +292,7 @@ async fn the_first_to_lock_wins_a_change_of_intent_or_lease_against_opening() ->
     let Some(db) = try_pg_test_db_with_max_connections(5).await? else {
         return Ok(());
     };
-    let (rollout, target, _) = issued_target(&db.pool).await?;
+    let (rollout, target, _) = issued_target(&db.pool, "rolling").await?;
     let node = target.node_id;
     let before = effects(&db.pool, rollout, node).await?;
 
@@ -348,27 +344,23 @@ async fn the_first_to_lock_wins_a_change_of_intent_or_lease_against_opening() ->
     Ok(())
 }
 
-/// Catches a failure that commits part of an opening: a wakeup that fails or
-/// queues no node or several, or a lease that lapses while the wakeup runs,
-/// leaving a round, a trigger change or a changed observation behind. The
-/// lease check must read the clock at the round's write.
+/// Catches a failure that commits part of an opening: a wakeup that fails, or
+/// a lease that lapses while the wakeup runs, leaving a round, a trigger
+/// change or a changed observation behind. The lease check must read the
+/// clock at the round's write. A wakeup that queues no node or several fails
+/// in the check issuance shares, which its own rollback test covers.
 #[tokio::test(flavor = "current_thread")]
 async fn any_failure_rolls_back_the_whole_opening() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    let (rollout, target, _) = issued_target(&db.pool).await?;
+    let (rollout, target, _) = issued_target(&db.pool, "rolling").await?;
     let node = target.node_id;
     opened(&db.pool, &target).await?;
     accept(&db.pool, node).await?;
     let before = effects(&db.pool, rollout, node).await?;
 
-    for queue in [
-        Queue::Fails,
-        Queue::Reports(0),
-        Queue::Reports(2),
-        Queue::ThenLapses,
-    ] {
+    for queue in [Queue::Fails, Queue::ThenLapses] {
         let outcome = open_with(&db.pool, &target, queue).await;
         let lapsed = matches!(queue, Queue::ThenLapses);
         assert!(
@@ -385,14 +377,15 @@ async fn any_failure_rolls_back_the_whole_opening() -> TestResult {
 
 /// Catches a round numbered from only the pending or only the accepted round,
 /// which reissues a number a delayed answer may still carry; an accepted
-/// report a new round overwrites; and a round returned as already open for
-/// another generation.
+/// report a new round overwrites; a round returned as already open for
+/// another generation; and an unbound round, left from before rounds named
+/// their generation, that's returned or refused rather than replaced.
 #[tokio::test(flavor = "current_thread")]
 async fn each_new_question_takes_a_new_round() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    let (first, target, stamp) = issued_target(&db.pool).await?;
+    let (first, target, stamp) = issued_target(&db.pool, "rolling").await?;
     let node = target.node_id;
     let generation = stamp.assignment_generation;
     let asked = |q: Question| (q.round, q.assignment_generation);
@@ -419,6 +412,24 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     let target = lease(&db.pool, next, 1).await?.remove(0);
     let generation = issued(&db.pool, &target).await?.assignment_generation;
     assert_eq!(asked(opened(&db.pool, &target).await?), (3, generation));
+
+    // Round 3 unbound, as 20261123200458's down and up leave a round. The
+    // migration that then requires a generation won't apply over one, so its
+    // check is dropped first where the schema has it.
+    sqlx::query(sql!(
+        "ALTER TABLE firewall_rules_node_observations
+         DROP CONSTRAINT IF EXISTS firewall_rules_node_observations_pending_bound_check"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_node_observations
+         SET pending_assignment_generation = NULL WHERE node_id = $1"
+    ))
+    .bind(node)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(asked(opened(&db.pool, &target).await?), (4, generation));
 
     assert_eq!(accepted(effects(&db.pool, next, node).await?), evidence);
     Ok(())

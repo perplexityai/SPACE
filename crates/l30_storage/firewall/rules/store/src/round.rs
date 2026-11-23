@@ -4,20 +4,21 @@
 //!
 //! Locks, in order: the rollout row (shared, so a pause or abort waits), the
 //! lease handoff lock (shared), the item row, the node's assignment row
-//! (shared), its observation row, and the wakeup's rows; a writer of
-//! observations takes them in this order. Rounds
-//! are numbered one past the node's larger pending or accepted round, so none
-//! is reused while only acceptance or a larger round replaces a pending one.
+//! (shared), its observation row, and the wakeup's rows; a writer that takes
+//! any of them takes them in this order. The first three are issuance's.
+//! Rounds are numbered one past the node's larger pending or accepted round,
+//! so none is reused while only acceptance or a larger round replaces a
+//! pending one.
 
 use jiff::Timestamp;
-use pplx_space_accounts::NodeId;
-use pplx_space_rollout_queue::HeaderPhase;
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
-use crate::lease::{HANDOFF_LOCK, stamped_work};
-use crate::{ItemPhase, LeasedTarget, Wakeup, Work, roll_back, rollout_phase};
+use crate::fetch::{PendingRound, non_negative, pending_round};
+use crate::issue::wake_one;
+use crate::leased_item::{HeaderLock, lock_leased_item};
+use crate::{LeasedTarget, Wakeup, Work, roll_back};
 
 /// A round as the control plane asked it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +58,10 @@ pub enum OpenRefusal {
     EpochMismatch,
     /// The lease lapsed while opening waited.
     Lapsed,
+    /// The node's pending round asks about a later generation than the item
+    /// issued. Generations only rise, so only a hand-written row leaves one;
+    /// it isn't replaced by an older question.
+    LaterGeneration,
 }
 
 /// Open a round asking `target`'s node to verify the generation its item
@@ -68,9 +73,11 @@ pub enum OpenRefusal {
 /// flight under `target`'s live token and issued, and the node still assigned
 /// the generation and revision it issued. `manager_epoch` must match the
 /// node's observations, if it has any. A round already open for that
-/// generation is returned as it is; any other pending round is replaced by a
-/// new one. The lease is rechecked at the clock reading that times the round,
-/// after the wakeup, which can wait on a lock.
+/// generation is returned as it is, without rechecking the lease after the
+/// observation lock, since it changes nothing. One for a later generation is
+/// refused; any other pending round is replaced by a new one. The lease is
+/// rechecked at the clock reading that times the round, after the wakeup,
+/// which can wait on a lock.
 pub async fn open_round(
     conn: &mut PgConnection,
     target: &LeasedTarget,
@@ -101,74 +108,20 @@ async fn open(
     manager_epoch: i64,
     wakeup: &mut impl Wakeup,
 ) -> Result<Opening, sqlx::Error> {
-    let header = sqlx::query_as::<_, (bool, uuid::Uuid)>(sql!(
-        "SELECT phase IN ($2, $3), to_revision_id
-         FROM firewall_rules_rollouts
-         WHERE id = $1
-         FOR SHARE"
-    ))
-    .bind(target.rollout_id)
-    .bind(rollout_phase(HeaderPhase::Canary))
-    .bind(rollout_phase(HeaderPhase::Rolling))
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some((checking, revision)) = header else {
+    // The header shared: a pause or abort waits, other openings don't.
+    let Some(item) = lock_leased_item(tx, target, HeaderLock::Share).await? else {
         return Ok(Opening::Refused(OpenRefusal::NotATarget));
     };
-    // Shared, as issuance and renewal take it.
-    sqlx::query(sql!(
-        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
-    ))
-    .bind(HANDOFF_LOCK)
-    .execute(&mut **tx)
-    .await?;
-    // Locked before it's read, so the lease is judged on a clock read after
-    // any wait for the row.
-    sqlx::query(sql!(
-        "SELECT 1
-         FROM firewall_rules_rollout_items
-         WHERE rollout_id = $1
-           AND node_id = $2
-         FOR UPDATE"
-    ))
-    .bind(target.rollout_id)
-    .bind(target.node_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let item = sqlx::query_as::<_, (bool, Option<i64>, Option<OffsetDateTime>)>(sql!(
-        "SELECT phase = $4 AND lease_token = $3 AND lease_expires_at > clock_timestamp(),
-                issued_assignment_generation,
-                issued_at
-         FROM firewall_rules_rollout_items
-         WHERE rollout_id = $1
-           AND node_id = $2"
-    ))
-    .bind(target.rollout_id)
-    .bind(target.node_id)
-    .bind(target.lease_token)
-    .bind(ItemPhase::InFlight.as_str())
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some((leased, generation, issued_at)) = item else {
-        return Ok(Opening::Refused(OpenRefusal::NotATarget));
-    };
-    if !checking {
+    if !item.working {
         return Ok(Opening::Refused(OpenRefusal::NotChecking));
     }
-    if !leased {
+    if !item.leased {
         return Ok(Opening::Refused(OpenRefusal::LeaseLost));
     }
-    // The stamp, not the lease's hint, says what was issued.
-    let (
-        Some(generation),
-        Work::Check {
-            assignment_generation,
-            ..
-        },
-    ) = (
-        generation,
-        stamped_work(target.rollout_id, target.node_id, generation, issued_at)?,
-    )
+    let Work::Check {
+        assignment_generation,
+        ..
+    } = item.work(target)?
     else {
         return Ok(Opening::Refused(OpenRefusal::NotIssued));
     };
@@ -179,14 +132,17 @@ async fn open(
          FOR SHARE"
     ))
     .bind(target.node_id)
-    .bind(generation)
-    .bind(revision)
+    // Read from the item's non-negative column, so the cast is lossless.
+    .bind(assignment_generation.cast_signed())
+    .bind(item.revision)
     .fetch_optional(&mut **tx)
     .await?;
     if current != Some(true) {
         return Ok(Opening::Refused(OpenRefusal::Superseded));
     }
-    // Created on first use; a refusal rolls the row back with the rest.
+    // Created on first use; a refusal rolls the row back with the rest. The
+    // caller supplies the epoch and the first opener's sticks: nothing moves a
+    // node to another epoch yet, so `EpochMismatch` has no recovery.
     sqlx::query(sql!(
         "INSERT INTO firewall_rules_node_observations (node_id, manager_epoch)
          VALUES ($1, $2)
@@ -210,31 +166,22 @@ async fn open(
     if epoch != manager_epoch {
         return Ok(Opening::Refused(OpenRefusal::EpochMismatch));
     }
-    match (round, round_issued_at, bound) {
-        (Some(round), Some(issued_at), Some(bound)) if bound == generation => {
+    match (round, round_issued_at, bound.map(non_negative).transpose()?) {
+        (Some(round), Some(issued_at), Some(bound)) if bound == assignment_generation => {
             return Ok(Opening::AlreadyOpen(question(
-                target.node_id,
                 round,
-                assignment_generation,
                 issued_at,
+                assignment_generation,
             )?));
         }
-        // Generations only rise, so this round asks about a later assignment.
-        (_, _, Some(bound)) if bound > generation => {
-            return Err(invalid_observation(
-                target.node_id,
-                "a pending round for a later generation than its assignment",
-            ));
+        (_, _, Some(bound)) if bound > assignment_generation => {
+            return Ok(Opening::Refused(OpenRefusal::LaterGeneration));
         }
+        // Replaced: no round, one for an earlier generation, or an unbound
+        // one, left from before rounds named their generation.
         _ => {}
     }
-    let queued = wakeup.wake(tx, target.node_id).await?;
-    if queued != 1 {
-        return Err(sqlx::Error::Protocol(format!(
-            "firewall rules wakeup for node {} queued {queued} nodes, not 1",
-            target.node_id
-        )));
-    }
+    wake_one(tx, wakeup, target.node_id).await?;
     // After the wakeup, which may have waited, on one clock reading. The item
     // lock, held since the item was read, keeps its token as checked.
     let opened = sqlx::query_as::<_, (i64, OffsetDateTime)>(sql!(
@@ -254,7 +201,7 @@ async fn open(
          RETURNING o.pending_round, o.pending_round_issued_at"
     ))
     .bind(target.node_id)
-    .bind(generation)
+    .bind(assignment_generation.cast_signed())
     .bind(target.rollout_id)
     .fetch_optional(&mut **tx)
     .await?;
@@ -262,30 +209,21 @@ async fn open(
         return Ok(Opening::Refused(OpenRefusal::Lapsed));
     };
     Ok(Opening::Opened(question(
-        target.node_id,
         round,
-        assignment_generation,
         issued_at,
+        assignment_generation,
     )?))
 }
 
 fn question(
-    node: NodeId,
     round: i64,
-    assignment_generation: u64,
     issued_at: OffsetDateTime,
+    assignment_generation: u64,
 ) -> Result<Question, sqlx::Error> {
+    let PendingRound { round, issued_at } = pending_round(round, issued_at)?;
     Ok(Question {
-        round: u64::try_from(round)
-            .map_err(|_| invalid_observation(node, "a negative pending round"))?,
+        round,
         assignment_generation,
-        issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
-            .map_err(|_| invalid_observation(node, "an out-of-range round time"))?,
+        issued_at,
     })
-}
-
-/// A violation of the schema's or the opener's invariants is a decode error
-/// rather than a guess.
-fn invalid_observation(node: NodeId, what: &str) -> sqlx::Error {
-    sqlx::Error::Decode(format!("firewall rules observation of node {node} has {what}").into())
 }

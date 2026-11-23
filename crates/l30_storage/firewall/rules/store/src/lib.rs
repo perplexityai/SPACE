@@ -32,6 +32,7 @@ use pplx_space_rollout_queue::HeaderPhase;
 mod fetch;
 mod issue;
 mod lease;
+mod leased_item;
 mod read;
 mod round;
 mod start;
