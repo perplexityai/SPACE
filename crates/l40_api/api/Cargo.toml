@@ -142,6 +142,8 @@ pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-policy-authority = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 pplx-space-node-status-store = { workspace = true }
+pplx-space-node-group-store = { workspace = true }
+pplx-space-node-template-inventory-store = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-runtime-environment-catalog-store = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }

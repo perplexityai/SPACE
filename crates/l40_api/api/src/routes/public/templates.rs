@@ -15,7 +15,7 @@ use pplx_space_public_api::{
 };
 use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use serde::Deserialize;
-use sqlx::{FromRow, PgPool, types::Json as SqlJson};
+use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 
 use crate::{middleware::auth::AuthOrg, routes::AppState};
@@ -102,21 +102,8 @@ struct TemplateRow {
     updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, FromRow)]
-struct TemplateVariantRow {
-    template_name: String,
-    content_hash: String,
-    runtime: Option<String>,
-    arch: Option<String>,
-    built_at: Option<String>,
-    artifact_size_bytes: Option<i64>,
-    has_base_snapshot: bool,
-    base_snapshot_size_bytes: Option<i64>,
-    snapshots: SqlJson<Vec<PublicTemplateSnapshot>>,
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
-    disk_size_mb: Option<i32>,
-}
+type TemplateVariantRow =
+    pplx_space_node_template_inventory_store::TemplateVariant<Vec<PublicTemplateSnapshot>>;
 
 async fn fetch_template_rows(
     pool: &PgPool,
@@ -168,35 +155,7 @@ async fn fetch_template_variants(
         return Ok(Vec::new());
     }
 
-    sqlx::query_as::<_, TemplateVariantRow>(sql!(
-        "SELECT *
-         FROM (
-             SELECT DISTINCT ON (template_name, content_hash, COALESCE(runtime, ''))
-                    template_name,
-                    content_hash,
-                    runtime,
-                    arch,
-                    built_at,
-                    artifact_size_bytes,
-                    has_base_snapshot,
-                    base_snapshot_size_bytes,
-                    snapshots,
-                    vcpu,
-                    memory_mib,
-                    disk_size_mb
-             FROM node_template_inventory
-             WHERE template_name = ANY($1)
-               AND content_hash <> ''
-             ORDER BY template_name,
-                      content_hash,
-                      COALESCE(runtime, ''),
-                      observed_at DESC
-         ) variants
-         ORDER BY template_name ASC, built_at DESC NULLS LAST, content_hash ASC"
-    ))
-    .bind(template_names)
-    .fetch_all(pool)
-    .await
+    pplx_space_node_template_inventory_store::template_variants(pool, template_names).await
 }
 
 fn public_templates(

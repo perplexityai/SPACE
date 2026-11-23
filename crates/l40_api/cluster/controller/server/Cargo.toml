@@ -54,6 +54,7 @@ k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["client"], optional = true }
 pplx-space-artifact-model = { workspace = true }
 pplx-space-node-model = { workspace = true }
+pplx-space-node-group-store = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }
 pplx-space-template-model = { workspace = true }
 prost-types = { workspace = true }
