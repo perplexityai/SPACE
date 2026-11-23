@@ -651,14 +651,33 @@ async fn recover_pod_less_sandbox_locked(
         return Ok(PodLessRecovery::NotEligible(PodLessHold::SnapshotChanged));
     }
 
-    retire_executions(&mut tx, candidate.sandbox_id).await?;
-    WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut tx, candidate.sandbox_id)
+    retire_reverted_resident(&mut tx, candidate.sandbox_id).await?;
+
+    tx.commit().await?;
+    Ok(PodLessRecovery::RevertedToSuspended)
+}
+
+/// The bookkeeping that follows a revert of a pod-less resident to
+/// `suspended` on a gone or going node, in the revert's transaction: retire
+/// its executions as `suspended`, drop the warm-pool slot the retired
+/// execution claimed, re-queue its open port exposures for the next
+/// placement, and drop a `failed`, pid-less observed record.
+///
+/// Shared by the drain's pod-less give-up and the lost-started rollback
+/// (`lost_started_sandboxes`), so both reverts leave the same row shape for
+/// the next wake.
+pub(crate) async fn retire_reverted_resident(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<(), sqlx::Error> {
+    retire_executions(tx, sandbox_id).await?;
+    WarmPoolStore::delete_claimed_slot_for_retired_execution(tx, sandbox_id)
         .await
         .map_err(|err| match err {
             PoolError::Sql(err) => err,
             other => sqlx::Error::Protocol(format!("delete claimed pool slot: {other}")),
         })?;
-    reset_open_port_exposures(&mut tx, candidate.sandbox_id).await?;
+    reset_open_port_exposures(tx, sandbox_id).await?;
     // The observed guard tolerated a `failed`, pid-less record. Left behind,
     // it would keep a reverted row reading `failed` through the observed-state
     // overlay, and once the node is gone nothing would publish over it.
@@ -666,12 +685,10 @@ async fn recover_pod_less_sandbox_locked(
         "DELETE FROM sandbox_observed_states
           WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
     ))
-    .bind(candidate.sandbox_id)
-    .execute(&mut *tx)
+    .bind(sandbox_id)
+    .execute(&mut **tx)
     .await?;
-
-    tx.commit().await?;
-    Ok(PodLessRecovery::RevertedToSuspended)
+    Ok(())
 }
 
 async fn retire_executions(

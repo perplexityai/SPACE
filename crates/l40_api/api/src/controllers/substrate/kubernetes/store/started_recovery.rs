@@ -178,7 +178,12 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
     ) -> Result<StartedRecoveryRestoreContext, SubstrateError> {
-        let no_newer = no_newer_full_snapshot("s", "sn");
+        // A newer `failed` full snapshot doesn't veto: it holds no bytes, the
+        // activity clocks below already decide staleness, and it's exactly
+        // what a lost-started rollback leaves behind (the dead upload it
+        // failed). Same rule as the rollback, so started recovery accepts a
+        // rolled-back row it re-woke instead of 412ing it forever.
+        let no_newer = no_newer_unfailed_full_snapshot("s", "sn");
         let query = format!(
             "SELECT sn.state,
                     nk.k8s_node_name,
