@@ -173,6 +173,8 @@ async fn restart_drain_rejects_writers_but_serves_both_read_classes() {
     for path in [
         "/space.sandbox.manager.v1.SandboxManager/List",
         "/space.sandbox.manager.v1.SandboxManager/SpacedStat",
+        // A drain preview only reads, so a restart drain still serves it.
+        "/space.sandbox.manager.v1.SandboxManager/PreviewDrainNode",
     ] {
         let response = service
             .call(Request::builder().uri(path).body(()).unwrap())
@@ -211,7 +213,7 @@ async fn restart_drain_rejects_writers_but_serves_both_read_classes() {
             Some("true")
         );
     }
-    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert_eq!(calls.load(Ordering::Acquire), 3);
 }
 
 #[tokio::test]

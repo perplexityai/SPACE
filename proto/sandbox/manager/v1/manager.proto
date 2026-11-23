@@ -249,6 +249,16 @@ service SandboxManager {
   // cannot distinguish a short answer from a complete one.
   rpc ListPendingLocalBackups(ListPendingLocalBackupsRequest) returns (ListPendingLocalBackupsResponse);
 
+  // ── Node drain (node-local) ───────────────────────────────────────────────
+
+  // Level-triggered: each call states the desired drain and gets the node's state back;
+  // repeating a call is safe. One DrainNode call at a time per node: a call that arrives
+  // while another is in progress (drain or cancel, scans included) fails at once with
+  // ABORTED and DRAIN_CALL_IN_PROGRESS_MARKER and changes nothing.
+  rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
+  // Read-only: what an evacuating drain would find on this unsealed node now.
+  rpc PreviewDrainNode(PreviewDrainNodeRequest) returns (PreviewDrainNodeResponse);
+
   // Get the resolved effective network policy for a sandbox.
   rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
 
@@ -2300,6 +2310,69 @@ message ListPendingLocalBackupsRequest {}
 message ListPendingLocalBackupsResponse {
   repeated PendingLocalBackup pending = 1;
 }
+
+message DrainNodeRequest {
+  uint64 generation = 1;   // one drain of this node: opaque, strictly increasing per node
+  oneof op {               // unset: InvalidArgument
+    Drain drain = 2;
+    Cancel cancel = 3;
+  }
+  message Drain {
+    // false: hold (running sandboxes keep running; everything else is made durable).
+    // true: evacuate (suspend running sandboxes too, starting in this call). Once true under
+    // a generation, the node keeps evacuating for it (in memory; after a restart it holds
+    // until the next call).
+    bool evacuate = 1;
+  }
+  message Cancel {}        // unseal; remember `generation`; start, stop and hand back nothing
+}
+message DrainNodeResponse {
+  // Drain: the generation the node is sealed under (the request's). Cancel: the generation
+  // at or below which it now refuses seals.
+  uint64 generation = 1;
+  oneof result {           // matches the request's `op`
+    DrainReport drain = 2;
+    CancelResult cancel = 3;
+  }
+}
+// Rebuilt from the node's rows on every call. Invariant: every reason the node isn't finished
+// is an entry; the drain is finished exactly when `pending` and `blocked` are both empty.
+message DrainReport {
+  repeated DrainEvacuated evacuated = 1;
+  repeated DrainPending pending = 2;
+  repeated DrainBlocked blocked = 3;
+}
+message CancelResult {}
+message DrainEvacuated {                // durable elsewhere, whatever suspended or stopped it
+  string sandbox_id = 1;
+  ArtifactKind artifact_kind = 2;       // FULL: suspended snapshot; DISK: stopped disk
+  string artifact_id = 3;               // the stopped row's release fences on it
+}
+message DrainPending {                  // can't move yet
+  string sandbox_id = 1;
+  DrainWait wait = 2;
+  bool running = 3;                     // a started VM at the pass's planning read (paused: false)
+  string reason = 4;                    // human text: displayed, never parsed or asserted on
+  google.protobuf.Timestamp since = 5;  // when the row entered its state; display only
+  bool pool_member = 6;                 // a warm-pool member, not a user's sandbox
+}
+enum DrainWait {
+  DRAIN_WAIT_UNSPECIFIED = 0;  // unknown to this build: still pending
+  DRAIN_WAIT_HOLD = 1;         // kept running until the drain evacuates
+  DRAIN_WAIT_MOVING = 2;       // the drain is making it durable (suspend, publication, upload,
+                               //   or waiting for a window slot or disk room for one)
+  DRAIN_WAIT_EXTERNAL = 3;     // waits on work the drain doesn't drive (an activation or a
+                               //   user's snapshot in flight, a warm-pool eviction, a
+                               //   transition that isn't moving)
+}
+message DrainBlocked { string reason = 1; }   // node-wide only; repeated
+message PreviewDrainNodeRequest {}
+// An evacuating drain's view of this unsealed node, changing nothing. It doesn't run
+// node-manager's orphan inventory, so a drain may find more node-wide blockers (a fixed
+// caveat: docs and console). A sealed node refuses with FailedPrecondition naming its
+// generation. One preview at a time per node; another fails with ABORTED and
+// DRAIN_CALL_IN_PROGRESS_MARKER.
+message PreviewDrainNodeResponse { DrainReport report = 1; }
 
 // Node-local facts about the current legacy quarantine-recovery episode.
 // Consumers must not treat this observation as recovery authority.
