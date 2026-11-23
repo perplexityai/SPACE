@@ -1770,3 +1770,41 @@ async fn partition_selector_and_memory_release_objects_match_contracts() -> Test
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_release_is_published_once_a_storage_location_is_registered() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let template = "storage-vend-release";
+    let hash: ContentHash = format!("sha256:{}", "ab".repeat(32)).parse()?;
+    let unregistered: ContentHash = format!("sha256:{}", "cd".repeat(32)).parse()?;
+    insert_template(&db.pool, template).await?;
+    let release = insert_release(&db.pool, template, &hash.to_string(), None).await?;
+
+    // A release row without artifacts has not been published yet.
+    assert!(!release_published(&db.pool, template, &hash).await?);
+
+    insert_location(
+        &db.pool,
+        release,
+        "s3://artifacts/templates/storage-vend-release/x?region=us-east-1",
+    )
+    .await?;
+    assert!(release_published(&db.pool, template, &hash).await?);
+    assert!(!release_published(&db.pool, template, &unregistered).await?);
+
+    // A release registered before the `sha256:` prefix was required is stored
+    // bare, and is just as published.
+    let bare_hex = "ef".repeat(32);
+    let bare_release = insert_release(&db.pool, template, &bare_hex, None).await?;
+    insert_location(
+        &db.pool,
+        bare_release,
+        "s3://artifacts/templates/storage-vend-release/y?region=us-east-1",
+    )
+    .await?;
+    let legacy: ContentHash = format!("sha256:{bare_hex}").parse()?;
+    assert!(release_published(&db.pool, template, &legacy).await?);
+    Ok(())
+}

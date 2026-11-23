@@ -934,6 +934,47 @@ pub async fn snapshot_ids_after(
     .await
 }
 
+/// The live storage location recorded for a snapshot, as
+/// [`org_storage_location`] reads it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrgStorageLocation {
+    /// The verbatim base-table value, which may be an encrypted-row stand-in.
+    pub storage_connection_string: String,
+    /// The snapshot is a fork copy still in `creating`: its destination is
+    /// prepared and its bytes are not written yet.
+    pub creating_fork_copy: bool,
+}
+
+/// The storage location recorded for `snapshot_id`, when it is not orphaned
+/// and the snapshot belongs to `org_id` or to no organization. `None`
+/// otherwise, including when the snapshot is another organization's.
+pub async fn org_storage_location(
+    executor: impl sqlx::PgExecutor<'_>,
+    snapshot_id: SnapshotId,
+    org_id: OrgId,
+) -> Result<Option<OrgStorageLocation>, sqlx::Error> {
+    let row: Option<(String, Option<bool>)> = sqlx::query_as(sql!(
+        "SELECT location.storage_connection_string,
+                snapshot.artifact_origin = 'fork' AND snapshot.state = 'creating'
+         FROM snapshot_storage_locations location
+         JOIN snapshots snapshot ON snapshot.id = location.snapshot_id
+         WHERE location.snapshot_id = $1
+           AND location.orphaned_at IS NULL
+           AND COALESCE(snapshot.org_id, $2) = $2"
+    ))
+    .bind(snapshot_id)
+    .bind(org_id.as_uuid())
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(
+        |(storage_connection_string, creating_fork_copy)| OrgStorageLocation {
+            storage_connection_string,
+            // NULL when the snapshot has no artifact origin: not a fork copy.
+            creating_fork_copy: creating_fork_copy.unwrap_or(false),
+        },
+    ))
+}
+
 /// Fetch one snapshot catalog row by id.
 ///
 /// Returns the same typed model for every read. `None` means no row has this id.

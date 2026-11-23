@@ -78,8 +78,9 @@ const EXECUTION_CLAIM_INSERT: &str = sql!(
 );
 
 /// The credential manager's storage-vend node lookup
-/// (`storage_vend_store.rs` in the credmgr crate), without its target-node and
-/// snapshot legs, which read only `sandboxes` and `snapshots`.
+/// (`k8s_node_attribution::attributed_k8s_nodes` in `pplx-space-sandbox-store`),
+/// without its target-node and snapshot legs, which read only `sandboxes` and
+/// `snapshots`.
 const STORAGE_VEND_NODE_LOOKUP: &str = sql!(
     "WITH latest_execution AS (
          SELECT k8s_node_name

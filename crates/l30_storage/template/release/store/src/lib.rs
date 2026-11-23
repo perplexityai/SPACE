@@ -11,7 +11,10 @@
 //!
 //! Release registration (`RegisterTemplateRelease`, in internal-api) and the
 //! api's lookups and admin routes still run their own statements against these
-//! tables. Moving them here belongs to the change that touches them.
+//! tables. Moving them here belongs to the change that touches them. The
+//! credential manager asks [`release_published`] before it vends write
+//! credentials for a release's storage, and refuses them for a published
+//! release.
 //!
 //! # Rules the store enforces
 //!
@@ -42,6 +45,7 @@
 //!   ends, and when it fails, rolling back the savepoint releases them once
 //!   that rollback succeeds.
 
+use pplx_space_content_digest::ContentHash;
 use pplx_space_execution_spec::EnvironmentReference;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, Postgres};
@@ -397,6 +401,34 @@ pub async fn has_encrypted_storage_locations(
     ))
     .bind(release_id)
     .fetch_one(credentials_executor)
+    .await
+}
+
+/// Whether a storage location is registered for any release of
+/// `template_name` at `hash`, under either spelling of the hash: the
+/// canonical `sha256:<hex>`, or the bare hex a release registered before the
+/// prefix was required is stored under. A published release is immutable.
+/// Takes no lock.
+pub async fn release_published(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    hash: &ContentHash,
+) -> Result<bool, sqlx::Error> {
+    let canonical = hash.to_string();
+    let bare = canonical.trim_prefix("sha256:").to_string();
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM template_release_storage_locations location
+             JOIN template_releases release
+               ON release.id = location.template_release_id
+             WHERE release.template_name = $1
+               AND release.hash IN ($2, $3))"
+    ))
+    .bind(template_name)
+    .bind(canonical)
+    .bind(bare)
+    .fetch_one(executor)
     .await
 }
 

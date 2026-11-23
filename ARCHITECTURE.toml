@@ -375,6 +375,7 @@ pplx-space-cluster-trigger-queue = [
   "pplx-space-cluster-reconciler",
   "pplx-space-internal-api-server",
 ]
+pplx-space-byok-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-data-plane-session-store = [
   "pplx-space-api",
@@ -451,6 +452,7 @@ pplx-space-sandbox-routability = [
 pplx-space-sandbox-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
@@ -468,9 +470,11 @@ pplx-space-snapshot-storage = [
 pplx-space-snapshot-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
+pplx-space-storage-vend-store = ["pplx-space-credmgr"]
 pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
 pplx-space-template-release-original = [
   "pplx-space-api",
@@ -482,11 +486,14 @@ pplx-space-template-release-original = [
 # through the store, the cluster pool's autoscaler embeds its resolution SQL
 # so demand follows the release creates run, and the cluster controller's
 # template campaign driver pages a campaign's source releases, writes twins'
-# metadata.json through its objects, and inserts the twins.
+# metadata.json through its objects, and inserts the twins. The credential
+# manager checks whether a release is published before it vends write
+# credentials for its storage.
 pplx-space-template-release-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-cluster-pool",
+  "pplx-space-credmgr",
 ]
 
 # Edges the dependency matrix forbids, allowed by name.
