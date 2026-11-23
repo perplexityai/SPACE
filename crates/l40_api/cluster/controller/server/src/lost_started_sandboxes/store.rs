@@ -5,10 +5,17 @@ use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::SnapshotId;
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
-use pplx_space_sandbox_portability::started_restore_source_absent;
+use pplx_space_sandbox_portability::{
+    current_disk_artifact_backup_ready, started_restore_source_absent,
+};
+use pplx_space_sandbox_residency::{
+    ResidencyEvidence, occupies_node_predicate, resident_lifecycle,
+};
+use pplx_space_sandbox_store::admin_occupancy::fleet_occupancy;
 use pplx_space_sandbox_store::lost::{
     DEAD_UPLOAD_SETTLE, mark_started_lost, write_off_lost_sandboxes,
 };
@@ -16,7 +23,10 @@ use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use super::{LostCandidate, LostStartedSink, SourceNode};
+use super::{
+    DELETED_NODE_AT_REST_WINDOW, LostCandidate, LostStartedSink, NodeResidents, SourceNode,
+    StrandedCounts,
+};
 use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
 
 type CandidateRow = (SandboxId, i64, NodeId, bool, Option<String>, Option<String>);
@@ -67,13 +77,135 @@ static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// `$1` = [`SubstrateKind::Kubernetes`], `$2` =
+/// [`super::DELETED_NODE_AT_REST_WINDOW`] seconds. The stranded-sandbox
+/// census's cheap first pass: per node outside a drain, including nodes whose
+/// row is gone, how many Kubernetes sandboxes it may still hold state for,
+/// ordered by node id.
+///
+/// Three populations, each keyed on the column that names its node:
+///
+/// - residents by `active_node_id`, in [`resident_lifecycle`] or `stopped`;
+/// - `suspended` rows by `target_node_id`. A suspend clears `active_node_id`
+///   and leaves the source in `target_node_id`, which is where
+///   `admin_occupancy` and the drain gate look for a local snapshot;
+/// - in-flight full uploads by `source_node_id`, the admin console's other
+///   local-snapshot source.
+///
+/// `recent_residents` counts the residents plus only the suspends and
+/// uploads from within the window: the suspend's `lifecycle_changed_at`, the
+/// upload's heartbeat. `target_node_id` has no foreign key and nothing clears
+/// it, so most suspended rows name nodes deleted long ago, nearly all of them
+/// durable. The census uses `recent_residents` for a deleted node it didn't
+/// see deleted, so those nodes don't become suspects every tick.
+///
+/// The count is an upper bound with no durability check, only used to skip
+/// nodes holding nothing; the second pass applies the real definitions.
+/// Drain phases are excluded because `node_drain` and
+/// `drained_node_terminator` own those residents and report them
+/// (`node_drain.kube_node_gone_parked`).
+static NODE_RESIDENTS: LazyLock<String> = LazyLock::new(|| {
+    let resident = resident_lifecycle("s");
+    sql!(
+        format!(
+            "WITH held AS (
+                 SELECT s.active_node_id AS node_id, TRUE AS recent
+                   FROM sandboxes s
+                  WHERE s.managed_by = $1
+                    AND s.active_node_id IS NOT NULL
+                    AND ({resident} OR s.lifecycle = 'stopped')
+                 UNION ALL
+                 SELECT s.target_node_id,
+                        s.lifecycle_changed_at
+                            >= NOW() - make_interval(secs => $2::DOUBLE PRECISION)
+                   FROM sandboxes s
+                  WHERE s.managed_by = $1
+                    AND s.target_node_id IS NOT NULL
+                    AND s.lifecycle = 'suspended'
+                 UNION ALL
+                 SELECT sn.source_node_id,
+                        COALESCE(sn.last_attempt_at, sn.timestamp)
+                            >= NOW() - make_interval(secs => $2::DOUBLE PRECISION)
+                   FROM snapshots sn
+                   JOIN sandboxes s ON s.id = sn.sandbox_id
+                  WHERE sn.type = 'full'
+                    AND sn.state = 'creating'
+                    AND sn.source_node_id IS NOT NULL
+                    AND s.managed_by = $1
+             )
+             SELECT h.node_id,
+                    n.id IS NOT NULL AS node_row_exists,
+                    nk.k8s_node_name,
+                    COUNT(*) AS residents,
+                    COUNT(*) FILTER (WHERE h.recent) AS recent_residents
+               FROM held h
+               LEFT JOIN nodes n ON n.id = h.node_id
+               LEFT JOIN node_k8s nk ON nk.node_id = n.id
+              WHERE n.id IS NULL OR (n.managed_by = $1 AND n.drain_phase IS NULL)
+              GROUP BY h.node_id, n.id, nk.k8s_node_name
+              ORDER BY h.node_id"
+        )
+        .as_str()
+    )
+});
+
+/// `$1` = [`SubstrateKind::Kubernetes`], `$2` = suspect node ids. The half of
+/// the census's second pass keyed on `active_node_id`, under `residency`:
+///
+/// - `running`: the drain gate's residents, [`resident_lifecycle`] and
+///   [`occupies_node_predicate`], whose state lived only on the node;
+/// - `stopped_without_copy`: `stopped` residents whose pinned disk artifact
+///   has no ready backup ([`current_disk_artifact_backup_ready`], the proof
+///   a stopped evacuation releases its node on). A stopped sandbox keeps its
+///   filesystem on the node, and neither the resident include-list nor the
+///   admin console's local snapshots count it. A full suspend snapshot is
+///   not a copy of it: the rootfs moved on after the wake.
+///
+/// The at-rest half keyed on `target_node_id` is the admin console's
+/// `local_snapshots`, read through `admin_occupancy::fleet_occupancy`.
+fn active_node_counts(residency: ResidencyEvidence) -> String {
+    let resident = resident_lifecycle("s");
+    let occupies = occupies_node_predicate("s", "s.active_node_id", residency);
+    let durable = current_disk_artifact_backup_ready("s");
+    sql!(
+        format!(
+            "SELECT s.active_node_id,
+                    COUNT(*) FILTER (WHERE {resident} AND {occupies}) AS running,
+                    COUNT(*) FILTER (
+                        WHERE s.lifecycle = 'stopped' AND NOT {durable}
+                    ) AS stopped_without_copy
+               FROM sandboxes s
+              WHERE s.managed_by = $1
+                AND s.active_node_id = ANY($2::UUID[])
+                AND ({resident} OR s.lifecycle = 'stopped')
+              GROUP BY s.active_node_id"
+        )
+        .as_str()
+    )
+}
+
+static ACTIVE_NODE_COUNTS: LazyLock<String> =
+    LazyLock::new(|| active_node_counts(ResidencyEvidence::LifecycleOnly));
+static ACTIVE_NODE_COUNTS_CENSUS_AWARE: LazyLock<String> =
+    LazyLock::new(|| active_node_counts(ResidencyEvidence::NodeCensusAware));
+
+fn active_node_counts_statement(residency: ResidencyEvidence) -> &'static str {
+    match residency {
+        ResidencyEvidence::LifecycleOnly => &ACTIVE_NODE_COUNTS,
+        ResidencyEvidence::NodeCensusAware => &ACTIVE_NODE_COUNTS_CENSUS_AWARE,
+    }
+}
+
 pub struct LostStartedDbStore {
     pool: PgPool,
+    /// The residency evidence the drain and terminate gates read, so the
+    /// census counts a node's residents the way they do.
+    residency: ResidencyEvidence,
 }
 
 impl LostStartedDbStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, residency: ResidencyEvidence) -> Self {
+        Self { pool, residency }
     }
 }
 
@@ -111,6 +243,61 @@ impl LostStartedSink for LostStartedDbStore {
                 },
             )
             .collect())
+    }
+
+    async fn node_residents(&self) -> Result<Vec<NodeResidents>, sqlx::Error> {
+        let rows: Vec<(NodeId, bool, Option<String>, i64, i64)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(NODE_RESIDENTS.as_str()))
+                .bind(SubstrateKind::Kubernetes)
+                .bind(DELETED_NODE_AT_REST_WINDOW.as_secs_f64())
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(node_id, node_row_exists, name, residents, recent_residents)| NodeResidents {
+                    node_id,
+                    source_node: match (node_row_exists, name) {
+                        (false, _) => SourceNode::RowDeleted,
+                        (true, Some(k8s_node_name)) => SourceNode::Registered {
+                            k8s_node_name,
+                            k8s_node_uid: None,
+                        },
+                        (true, None) => SourceNode::Unverifiable,
+                    },
+                    residents: residents.unsigned_abs(),
+                    recent_residents: recent_residents.unsigned_abs(),
+                },
+            )
+            .collect())
+    }
+
+    async fn stranded_counts(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, StrandedCounts>, sqlx::Error> {
+        let mut counts: HashMap<NodeId, StrandedCounts> = HashMap::new();
+        // The admin console's local snapshots. Without the drainability
+        // counters the statement ignores residency and the long-runner age.
+        for occupancy in fleet_occupancy(&self.pool, node_ids, 0, false, self.residency).await? {
+            counts
+                .entry(occupancy.node_id)
+                .or_default()
+                .at_rest_without_copy += occupancy.local_snapshots.unsigned_abs();
+        }
+        let rows: Vec<(NodeId, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(
+            active_node_counts_statement(self.residency),
+        ))
+        .bind(SubstrateKind::Kubernetes)
+        .bind(node_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        for (node_id, running, stopped_without_copy) in rows {
+            let entry = counts.entry(node_id).or_default();
+            entry.running += running.unsigned_abs();
+            entry.at_rest_without_copy += stopped_without_copy.unsigned_abs();
+        }
+        Ok(counts)
     }
 
     async fn mark_lost(&self, candidate: &LostCandidate) -> Result<bool, sqlx::Error> {

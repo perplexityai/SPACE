@@ -3,6 +3,7 @@
 //! ## C - `ReconcilerConfig`
 //! - C1 `c1_default_is_disabled`
 //! - C2 `c2_enabled_env_var_turns_it_on`
+//! - C3 `c3_census_is_on_by_default_and_has_a_kill_switch`
 //!
 //! ## T - Tick behavior (fake sink and lookup)
 //! - T1 `t1_terminated_and_deleted_sources_are_marked_lost`
@@ -18,6 +19,17 @@
 //! - T11 `t11_run_stops_mid_tick_when_cancelled`
 //! - T12 `t12_absence_must_last_the_grace_and_restarts_on_return`
 //!
+//! ## S - Stranded-sandbox census (fake sink and lookup)
+//! - S1 `s1_census_separates_gone_from_unverifiable`
+//! - S2 `s2_live_ready_nodes_and_empty_counts_are_not_reported`
+//! - S3 `s3_not_ready_must_last_the_grace`
+//! - S4 `s4_disabled_give_up_still_runs_the_census_and_flips_nothing`
+//! - S5 `s5_census_lookups_are_capped_per_tick`
+//! - S6 `s6_cold_reflector_skips_the_census`
+//! - S7 `s7_census_reuses_the_give_up_verdict`
+//! - S8 `s8_census_lookups_resume_after_the_last_judged_node`
+//! - S9 `s9_deleted_node_at_rest_counts_only_within_the_window`
+//!
 //! ## P - Postgres-backed sink
 //! - P1 `p1_stale_snapshot_and_terminated_source_ends_lost`
 //! - P2 `p2_live_source_node_stays_retryable`
@@ -30,6 +42,9 @@
 //! - P9 `p9_only_recovery_failed_started_kubernetes_rows_are_listed`
 //! - P10 `p10_flip_rechecks_restore_sources_and_generation`
 //! - P11 `p11_flip_rechecks_placement_drain_lifecycle_and_substrate`
+//! - P12 `p12_census_counts_running_and_at_rest_residents`
+//! - P13 `p13_old_deleted_node_with_a_durable_suspend_is_not_a_suspect`
+//! - P14 `p14_recently_deleted_node_with_a_local_only_suspend_counts_at_rest`
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -99,6 +114,8 @@ impl InstanceLookup for Arc<FakeLookup> {
 /// `existing`.
 struct FakePresence {
     live: StdMutex<Option<HashSet<String>>>,
+    /// Listed names whose `Ready` condition isn't `True`.
+    not_ready: StdMutex<HashSet<String>>,
     existing: HashSet<String>,
     /// Names whose direct GET errors.
     failing: HashSet<String>,
@@ -109,10 +126,16 @@ impl FakePresence {
     fn listing(names: &[&str]) -> Self {
         Self {
             live: StdMutex::new(Some(names.iter().map(|name| (*name).to_string()).collect())),
+            not_ready: StdMutex::new(HashSet::new()),
             existing: HashSet::new(),
             failing: HashSet::new(),
             direct_calls: StdMutex::new(Vec::new()),
         }
+    }
+
+    fn not_ready(self, name: &str) -> Self {
+        self.not_ready.lock().unwrap().insert(name.to_string());
+        self
     }
 
     fn existing(mut self, name: &str) -> Self {
@@ -156,6 +179,14 @@ impl KubeNodePresence for Arc<FakePresence> {
         self.live.lock().unwrap().clone()
     }
 
+    fn not_ready_node_names(&self) -> Option<HashSet<String>> {
+        self.live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|_| self.not_ready.lock().unwrap().clone())
+    }
+
     async fn node_exists(&self, node_name: String) -> Result<bool, FakeNodeLookupError> {
         self.direct_calls.lock().unwrap().push(node_name.clone());
         if self.failing.contains(&node_name) {
@@ -172,6 +203,9 @@ struct FakeSinkState {
     mark_calls: Vec<SandboxId>,
     /// `None` means the flip errors.
     mark_result: Option<bool>,
+    residents: Vec<NodeResidents>,
+    stranded: HashMap<NodeId, StrandedCounts>,
+    count_calls: Vec<NodeId>,
 }
 
 struct FakeSink(StdMutex<FakeSinkState>);
@@ -183,6 +217,59 @@ impl FakeSink {
             mark_result: Some(true),
             ..FakeSinkState::default()
         })))
+    }
+
+    /// One resident row for `node_id`, with `counts` from the second pass.
+    fn with_node(&self, node_id: NodeId, source_node: SourceNode, counts: StrandedCounts) {
+        let mut state = self.0.lock().unwrap();
+        state.residents.push(NodeResidents {
+            node_id,
+            source_node,
+            residents: counts.running + counts.at_rest_without_copy,
+            recent_residents: counts.running + counts.at_rest_without_copy,
+        });
+        state.stranded.insert(node_id, counts);
+    }
+
+    /// Like [`Self::with_node`], but every resident is a suspend or upload
+    /// older than [`DELETED_NODE_AT_REST_WINDOW`].
+    fn with_old_node(&self, node_id: NodeId, source_node: SourceNode, counts: StrandedCounts) {
+        self.with_node(node_id, source_node, counts);
+        let mut state = self.0.lock().unwrap();
+        state.residents.last_mut().unwrap().recent_residents = 0;
+    }
+
+    fn set_source_node(&self, node_id: NodeId, source_node: SourceNode) {
+        let mut state = self.0.lock().unwrap();
+        for row in &mut state.residents {
+            if row.node_id == node_id {
+                row.source_node = source_node.clone();
+            }
+        }
+    }
+
+    /// Sets the first pass's resident count and the second pass's counts.
+    fn set_residents(&self, node_id: NodeId, residents: u64, counts: StrandedCounts) {
+        let mut state = self.0.lock().unwrap();
+        for row in &mut state.residents {
+            if row.node_id == node_id {
+                row.residents = residents;
+                row.recent_residents = residents;
+            }
+        }
+        state.stranded.insert(node_id, counts);
+    }
+
+    fn clear_count_calls(&self) {
+        self.0.lock().unwrap().count_calls.clear();
+    }
+
+    fn count_calls(&self) -> Vec<NodeId> {
+        self.0.lock().unwrap().count_calls.clone()
+    }
+
+    fn list_calls(&self) -> usize {
+        self.0.lock().unwrap().list_calls.len()
     }
 
     fn mark_calls(&self) -> Vec<SandboxId> {
@@ -208,6 +295,27 @@ impl LostStartedSink for Arc<FakeSink> {
         let mut state = self.0.lock().unwrap();
         state.mark_calls.push(candidate.sandbox_id);
         state.mark_result.ok_or(sqlx::Error::PoolTimedOut)
+    }
+
+    async fn node_residents(&self) -> Result<Vec<NodeResidents>, sqlx::Error> {
+        Ok(self.0.lock().unwrap().residents.clone())
+    }
+
+    async fn stranded_counts(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, StrandedCounts>, sqlx::Error> {
+        let mut state = self.0.lock().unwrap();
+        state.count_calls.extend_from_slice(node_ids);
+        Ok(node_ids
+            .iter()
+            .filter_map(|node_id| {
+                state
+                    .stranded
+                    .get(node_id)
+                    .map(|counts| (*node_id, *counts))
+            })
+            .collect())
     }
 }
 
@@ -256,6 +364,21 @@ fn c2_enabled_env_var_turns_it_on() {
     let mut env = pplx_space_test_env::TestEnv::default();
     env.set("SPACE_LOST_STARTED_SANDBOXES_ENABLED", "true");
     assert!(ReconcilerConfig::from_environment(&env).enabled);
+}
+
+#[test]
+fn c3_census_is_on_by_default_and_has_a_kill_switch() {
+    let env = pplx_space_test_env::TestEnv::default();
+    let config = ReconcilerConfig::from_environment(&env);
+    assert!(config.census_enabled);
+    assert_eq!(
+        config.max_census_lookups_per_tick,
+        DEFAULT_MAX_CENSUS_LOOKUPS_PER_TICK
+    );
+
+    let mut env = pplx_space_test_env::TestEnv::default();
+    env.set("SPACE_STRANDED_SANDBOX_CENSUS_ENABLED", "false");
+    assert!(!ReconcilerConfig::from_environment(&env).census_enabled);
 }
 
 // -----------------------------------------------------------------
@@ -474,6 +597,17 @@ impl LostStartedSink for HangingSink {
     async fn mark_lost(&self, _candidate: &LostCandidate) -> Result<bool, sqlx::Error> {
         unreachable!("the scan never returns")
     }
+
+    async fn node_residents(&self) -> Result<Vec<NodeResidents>, sqlx::Error> {
+        unreachable!("the scan never returns")
+    }
+
+    async fn stranded_counts(
+        &self,
+        _node_ids: &[NodeId],
+    ) -> Result<HashMap<NodeId, StrandedCounts>, sqlx::Error> {
+        unreachable!("the scan never returns")
+    }
 }
 
 #[tokio::test]
@@ -545,6 +679,7 @@ async fn t12_absence_must_last_the_grace_and_restarts_on_return() {
 
 mod postgres_backed {
     use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+    use pplx_space_sandbox_residency::ResidencyEvidence;
     use pplx_space_snapshot_model::SnapshotId;
     use pplx_space_sql_locator::sql;
     use pplx_space_test_env::TestResult;
@@ -704,7 +839,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let lookup = Arc::new(FakeLookup::default());
 
         let report = Reconciler::new(config(), store, lookup.clone(), presence())
@@ -738,7 +873,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let lookup = Arc::new(FakeLookup::default().live(NODE_NAME));
 
         let report = Reconciler::new(config(), store, lookup.clone(), presence())
@@ -769,7 +904,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, false).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidates = listed(&store).await?;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source_node, SourceNode::RowDeleted);
@@ -788,7 +923,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         assert_eq!(listed(&store).await?.len(), 1);
 
         // Newer than the last command and access: restoring it rolls nothing
@@ -815,7 +950,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
 
         // From another node: it may still finalize.
         let other_node = insert_snapshot(
@@ -875,7 +1010,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // A wake re-armed the execution after the scan.
@@ -901,7 +1036,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // A same-name replacement registered after the EC2 lookup.
@@ -939,8 +1074,327 @@ mod postgres_backed {
         .bind(seeded.node_id)
         .execute(&db.pool)
         .await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         assert!(listed(&store).await?.is_empty());
+        Ok(())
+    }
+
+    async fn census_counts(
+        store: &LostStartedDbStore,
+        node_id: NodeId,
+    ) -> TestResult<StrandedCounts> {
+        Ok(store
+            .stranded_counts(&[node_id])
+            .await?
+            .get(&node_id)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    /// A completed suspend on `node_id`: `active_node_id` cleared, the source
+    /// kept in `target_node_id`, and the only copy the local artifact the
+    /// returned id names, with no snapshot uploaded.
+    async fn seed_suspended_local_only(
+        pool: &PgPool,
+        node_id: NodeId,
+    ) -> TestResult<(SandboxId, uuid::Uuid)> {
+        let sandbox_id = SandboxId::new();
+        let artifact_id = uuid::Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes
+                (id, user_id, org_id, managed_by, lifecycle, placement,
+                 active_node_id, target_node_id, network_policy_generation,
+                 placement_changed_at, current_local_artifact_id,
+                 current_local_artifact_kind, current_local_artifact_origin,
+                 last_command_at, last_access_at)
+             VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'suspended', 'unplaced',
+                     NULL, $4, 1, NOW() - INTERVAL '1 hour', $5, 'full', 'suspend',
+                     NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')"
+        ))
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(node_id)
+        .bind(artifact_id)
+        .execute(pool)
+        .await?;
+        Ok((sandbox_id, artifact_id))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p12_census_counts_running_and_at_rest_residents() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let registered_node = seed_stuck(&db.pool, true).await?;
+        let deleted_row = seed_stuck(&db.pool, false).await?;
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
+
+        let residents = store.node_residents().await?;
+        let find = |residents: &[NodeResidents], node_id: NodeId| {
+            residents.iter().find(|row| row.node_id == node_id).cloned()
+        };
+        assert_eq!(
+            find(&residents, registered_node.node_id),
+            Some(NodeResidents {
+                node_id: registered_node.node_id,
+                source_node: SourceNode::Registered {
+                    k8s_node_name: NODE_NAME.to_string(),
+                    k8s_node_uid: None,
+                },
+                residents: 1,
+                recent_residents: 1,
+            })
+        );
+        assert_eq!(
+            find(&residents, deleted_row.node_id).map(|row| (row.source_node, row.residents)),
+            Some((SourceNode::RowDeleted, 1))
+        );
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 0)
+        );
+
+        // A suspended sandbox whose only copy is on the node: the suspend
+        // cleared active_node_id, so the census must find it through
+        // target_node_id.
+        let (suspended_id, artifact_id) =
+            seed_suspended_local_only(&db.pool, registered_node.node_id).await?;
+        let residents = store.node_residents().await?;
+        assert_eq!(
+            find(&residents, registered_node.node_id).map(|row| row.residents),
+            Some(2)
+        );
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 1)
+        );
+        // Batched: each node gets its own counts.
+        let both = store
+            .stranded_counts(&[registered_node.node_id, deleted_row.node_id])
+            .await?;
+        assert_eq!(
+            both.get(&registered_node.node_id).copied(),
+            Some(counts(1, 1))
+        );
+        assert_eq!(both.get(&deleted_row.node_id).copied(), Some(counts(1, 0)));
+
+        // Once the artifact has a durable copy it restores from object
+        // storage and no longer counts.
+        let snapshot_id = SnapshotId::new();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                (id, sandbox_id, org_id, type, state, timestamp, source_node_id,
+                 local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, $3::uuid, 'full', 'ready', NOW(), $4,
+                     $5, 'full', 'suspend')"
+        ))
+        .bind(snapshot_id)
+        .bind(suspended_id)
+        .bind(SEED_ORG_ID)
+        .bind(registered_node.node_id)
+        .bind(artifact_id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://bucket/snapshot')"
+        ))
+        .bind(snapshot_id)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 0)
+        );
+
+        // A stopped sandbox keeps its rootfs on the node. Its pinned disk
+        // artifact is a copy only once a disk backup of it is ready; a full
+        // snapshot of the same sandbox doesn't count.
+        let stopped_id = SandboxId::new();
+        let disk_artifact = uuid::Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes
+                (id, user_id, org_id, managed_by, lifecycle, placement,
+                 active_node_id, network_policy_generation, placement_changed_at,
+                 current_local_artifact_id, current_local_artifact_kind,
+                 current_local_artifact_origin)
+             VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'stopped', 'placed',
+                     $4, 1, NOW() - INTERVAL '1 hour', $5, 'disk', 'stop')"
+        ))
+        .bind(stopped_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(registered_node.node_id)
+        .bind(disk_artifact)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 1),
+            "a local-only stopped sandbox counts at rest"
+        );
+        let disk_snapshot = SnapshotId::new();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                (id, sandbox_id, org_id, type, state, timestamp, source_node_id,
+                 local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, $3::uuid, 'disk', 'ready', NOW(), $4,
+                     $5, 'disk', 'stop')"
+        ))
+        .bind(disk_snapshot)
+        .bind(stopped_id)
+        .bind(SEED_ORG_ID)
+        .bind(registered_node.node_id)
+        .bind(disk_artifact)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://bucket/disk')"
+        ))
+        .bind(disk_snapshot)
+        .execute(&db.pool)
+        .await?;
+        assert_eq!(
+            census_counts(&store, registered_node.node_id).await?,
+            counts(1, 0),
+            "a stopped sandbox with a ready disk backup has a copy"
+        );
+
+        // Terminal residents and drained nodes drop out of the first pass.
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"
+        ))
+        .bind(deleted_row.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_phase = 'draining' WHERE id = $1"
+        ))
+        .bind(registered_node.node_id)
+        .execute(&db.pool)
+        .await?;
+        let residents = store.node_residents().await?;
+        assert!(residents.iter().all(
+            |row| row.node_id != registered_node.node_id && row.node_id != deleted_row.node_id
+        ));
+        Ok(())
+    }
+
+    /// Give the suspend's local artifact a ready, stored snapshot, so it
+    /// restores from object storage.
+    async fn make_durable(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        node_id: NodeId,
+        artifact_id: uuid::Uuid,
+    ) -> TestResult {
+        let snapshot_id = SnapshotId::new();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                (id, sandbox_id, org_id, type, state, timestamp, source_node_id,
+                 local_artifact_id, artifact_kind, artifact_origin)
+             VALUES ($1, $2, $3::uuid, 'full', 'ready', NOW(), $4,
+                     $5, 'full', 'suspend')"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox_id)
+        .bind(SEED_ORG_ID)
+        .bind(node_id)
+        .bind(artifact_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+             VALUES ($1, 's3://bucket/snapshot')"
+        ))
+        .bind(snapshot_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Move the suspend's `lifecycle_changed_at` past the window. The
+    /// trigger only touches it when `lifecycle` changes.
+    async fn age_suspend(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle_changed_at = NOW() - make_interval(secs => $2::DOUBLE PRECISION)
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(DELETED_NODE_AT_REST_WINDOW.as_secs_f64() + 3600.0)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p13_old_deleted_node_with_a_durable_suspend_is_not_a_suspect() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        // A node whose row is long gone, still named by a durable suspend.
+        let node_id = NodeId::new();
+        let (sandbox_id, artifact_id) = seed_suspended_local_only(&db.pool, node_id).await?;
+        make_durable(&db.pool, sandbox_id, node_id, artifact_id).await?;
+        age_suspend(&db.pool, sandbox_id).await?;
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
+
+        let row = store
+            .node_residents()
+            .await?
+            .into_iter()
+            .find(|row| row.node_id == node_id);
+        assert_eq!(
+            row.map(|row| (row.source_node, row.residents, row.recent_residents)),
+            Some((SourceNode::RowDeleted, 1, 0)),
+            "counted, but not as recent"
+        );
+
+        let lookup = Arc::new(FakeLookup::default());
+        let report = Reconciler::new(config(), store, lookup.clone(), presence())
+            .tick()
+            .await;
+        assert_eq!(gone(&report), (0, 0));
+        assert!(lookup.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p14_recently_deleted_node_with_a_local_only_suspend_counts_at_rest() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
+
+        // Suspended on a node deleted just now: the suspend itself is recent.
+        let fresh_node = NodeId::new();
+        seed_suspended_local_only(&db.pool, fresh_node).await?;
+        let mut reconciler = Reconciler::new(
+            config(),
+            store,
+            Arc::new(FakeLookup::default()),
+            Arc::new(FakePresence::listing(&[NODE_NAME])),
+        );
+        let report = reconciler.tick().await;
+        assert_eq!(gone(&report), (1, 1));
+
+        // An old suspend on a live node, then the row is deleted outside a
+        // drain: the census saw it registered, so it still counts.
+        let watched = NodeId::new();
+        insert_node(&db.pool, watched, NODE_NAME).await?;
+        let (old_id, _) = seed_suspended_local_only(&db.pool, watched).await?;
+        age_suspend(&db.pool, old_id).await?;
+        let report = reconciler.tick().await;
+        assert_eq!(gone(&report), (1, 1), "the listed node is live");
+        sqlx::query(sql!("DELETE FROM nodes WHERE id = $1"))
+            .bind(watched)
+            .execute(&db.pool)
+            .await?;
+        let report = reconciler.tick().await;
+        assert_eq!(gone(&report), (2, 2));
         Ok(())
     }
 
@@ -950,7 +1404,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // Each source appears after the scan; the flip must still refuse.
@@ -1040,7 +1494,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, true).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         let candidate = listed(&store).await?.remove(0);
 
         // Each change lands after the scan and must refuse the flip; undoing
@@ -1092,7 +1546,7 @@ mod postgres_backed {
             return Ok(());
         };
         let seeded = seed_stuck(&db.pool, false).await?;
-        let store = LostStartedDbStore::new(db.pool.clone());
+        let store = LostStartedDbStore::new(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
         assert_eq!(listed(&store).await?.len(), 1);
 
         for (column_update, restore) in [
@@ -1122,4 +1576,342 @@ mod postgres_backed {
         assert_eq!(listed(&store).await?.len(), 1);
         Ok(())
     }
+}
+
+// -----------------------------------------------------------------
+// S — stranded-sandbox census
+// -----------------------------------------------------------------
+
+fn counts(running: u64, at_rest_without_copy: u64) -> StrandedCounts {
+    StrandedCounts {
+        running,
+        at_rest_without_copy,
+    }
+}
+
+fn gone(report: &TickReport) -> (u32, u64) {
+    verdict_totals(report, StrandedVerdict::Gone)
+}
+
+fn verdict_totals(report: &TickReport, verdict: StrandedVerdict) -> (u32, u64) {
+    (
+        report.stranded_nodes.get(&verdict).copied().unwrap_or(0),
+        report
+            .stranded_sandboxes
+            .get(&verdict)
+            .copied()
+            .unwrap_or(0),
+    )
+}
+
+#[tokio::test]
+async fn s1_census_separates_gone_from_unverifiable() {
+    let sink = FakeSink::new(Vec::new());
+    // Gone: the row is deleted, or the registered node is absent with no EC2
+    // instance and no Node.
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(2, 1));
+    sink.with_node(NodeId::new(), registered("terminated", None), counts(3, 0));
+    // Unverifiable: no Kubernetes name, a failed EC2 lookup, a failed Node GET.
+    sink.with_node(NodeId::new(), SourceNode::Unverifiable, counts(1, 0));
+    sink.with_node(NodeId::new(), registered("ec2-flaky", None), counts(1, 0));
+    sink.with_node(NodeId::new(), registered("get-flaky", None), counts(0, 1));
+    let lookup = Arc::new(FakeLookup::default().with("ec2-flaky", Err("throttled".to_string())));
+    let presence = Arc::new(FakePresence::listing(&["some-other-node"]).failing("get-flaky"));
+    let mut reconciler = Reconciler::new(config(), sink.clone(), lookup, presence);
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(gone(&report), (2, 6));
+    assert_eq!(
+        verdict_totals(&report, StrandedVerdict::Unverifiable),
+        (3, 3)
+    );
+    assert_eq!(verdict_totals(&report, StrandedVerdict::NotReady), (0, 0));
+    assert!(sink.mark_calls().is_empty(), "the census never flips");
+}
+
+#[tokio::test]
+async fn s2_live_ready_nodes_and_empty_counts_are_not_reported() {
+    let sink = FakeSink::new(Vec::new());
+    let listed = NodeId::new();
+    let ec2_live = NodeId::new();
+    let api_live = NodeId::new();
+    sink.with_node(listed, registered("listed", None), counts(4, 0));
+    sink.with_node(ec2_live, registered("ec2-live", None), counts(4, 0));
+    sink.with_node(api_live, registered("api-live", None), counts(4, 0));
+    // Gone, but every resident is at rest with a durable copy.
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(0, 0));
+    let lookup = Arc::new(FakeLookup::default().live("ec2-live"));
+    let presence = Arc::new(FakePresence::listing(&["listed"]).existing("api-live"));
+    let mut reconciler = Reconciler::new(config(), sink.clone(), lookup.clone(), presence);
+
+    let report = reconciler.tick().await;
+
+    for verdict in StrandedVerdict::ALL {
+        assert_eq!(verdict_totals(&report, verdict), (0, 0), "{verdict:?}");
+    }
+    assert!(
+        !lookup.calls().contains(&"listed".to_string()),
+        "a listed node costs no EC2 call"
+    );
+    let counted = sink.count_calls();
+    for live in [listed, ec2_live, api_live] {
+        assert!(!counted.contains(&live), "live nodes get no second pass");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn s3_not_ready_must_last_the_grace() {
+    let sink = FakeSink::new(Vec::new());
+    sink.with_node(NodeId::new(), registered("sick", None), counts(2, 0));
+    let lookup = Arc::new(FakeLookup::default());
+    let presence = Arc::new(FakePresence::listing(&["sick"]).not_ready("sick"));
+    let config = ReconcilerConfig {
+        absence_grace: Duration::from_secs(600),
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(config, sink.clone(), lookup.clone(), presence.clone());
+
+    let report = reconciler.tick().await;
+    assert_eq!(verdict_totals(&report, StrandedVerdict::NotReady), (0, 0));
+
+    tokio::time::advance(Duration::from_secs(601)).await;
+    let report = reconciler.tick().await;
+    assert_eq!(verdict_totals(&report, StrandedVerdict::NotReady), (1, 2));
+    assert_eq!(gone(&report), (0, 0), "not ready is never gone");
+    assert!(lookup.calls().is_empty(), "a listed node costs no EC2 call");
+
+    // Ready again restarts the clock.
+    presence.not_ready.lock().unwrap().clear();
+    assert_eq!(
+        verdict_totals(&reconciler.tick().await, StrandedVerdict::NotReady),
+        (0, 0)
+    );
+    presence
+        .not_ready
+        .lock()
+        .unwrap()
+        .insert("sick".to_string());
+    assert_eq!(
+        verdict_totals(&reconciler.tick().await, StrandedVerdict::NotReady),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn s4_disabled_give_up_still_runs_the_census_and_flips_nothing() {
+    let sink = FakeSink::new(vec![vec![candidate(SourceNode::RowDeleted)]]);
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(1, 0));
+    let config = ReconcilerConfig {
+        enabled: false,
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(
+        config,
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        presence(),
+    );
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(gone(&report), (1, 1));
+    assert_eq!(report.scanned, 0);
+    assert_eq!(
+        sink.list_calls(),
+        0,
+        "no candidate scan with the give-up off"
+    );
+    assert!(sink.mark_calls().is_empty());
+}
+
+#[tokio::test]
+async fn s5_census_lookups_are_capped_per_tick() {
+    let sink = FakeSink::new(Vec::new());
+    for name in ["dead-a", "dead-b", "dead-c"] {
+        sink.with_node(NodeId::new(), registered(name, None), counts(1, 0));
+    }
+    let lookup = Arc::new(FakeLookup::default());
+    let config = ReconcilerConfig {
+        max_census_lookups_per_tick: 2,
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(config, sink, lookup.clone(), presence());
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(lookup.calls().len(), 2);
+    assert_eq!(gone(&report), (2, 2));
+    assert_eq!(
+        verdict_totals(&report, StrandedVerdict::Unverifiable),
+        (1, 1),
+        "the node past the cap reads as lookup_budget"
+    );
+}
+
+#[tokio::test]
+async fn s6_cold_reflector_skips_the_census() {
+    let sink = FakeSink::new(Vec::new());
+    sink.with_node(NodeId::new(), SourceNode::RowDeleted, counts(1, 0));
+    let mut reconciler = Reconciler::new(
+        config(),
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        Arc::new(FakePresence::cold()),
+    );
+
+    let report = reconciler.tick().await;
+
+    assert!(report.stranded_nodes.is_empty());
+    assert!(sink.count_calls().is_empty());
+}
+
+#[tokio::test]
+async fn s7_census_reuses_the_give_up_verdict() {
+    let node_id = NodeId::new();
+    let mut stuck = candidate(registered("dead", None));
+    stuck.source_node_id = node_id;
+    let sink = FakeSink::new(vec![vec![stuck]]);
+    sink.with_node(node_id, registered("dead", None), counts(1, 0));
+    let lookup = Arc::new(FakeLookup::default());
+    let presence = presence();
+    let mut reconciler = Reconciler::new(config(), sink.clone(), lookup.clone(), presence.clone());
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.marked_lost, 1);
+    assert_eq!(gone(&report), (1, 1));
+    assert_eq!(
+        lookup.calls(),
+        vec!["dead".to_string()],
+        "one EC2 call per node"
+    );
+    assert_eq!(presence.direct_calls(), vec!["dead".to_string()]);
+}
+
+#[tokio::test]
+async fn s8_census_lookups_resume_after_the_last_judged_node() {
+    let sink = FakeSink::new(Vec::new());
+    for name in ["dead-a", "dead-b", "dead-c"] {
+        sink.with_node(NodeId::new(), registered(name, None), counts(1, 0));
+    }
+    let lookup = Arc::new(FakeLookup::default());
+    let config = ReconcilerConfig {
+        max_census_lookups_per_tick: 2,
+        ..config()
+    };
+    let mut reconciler = Reconciler::new(config, sink, lookup.clone(), presence());
+
+    let report = reconciler.tick().await;
+    let first: HashSet<String> = lookup.calls().into_iter().collect();
+    assert_eq!(first.len(), 2);
+    assert_eq!(gone(&report), (2, 2));
+    let report = reconciler.tick().await;
+    // Every node has been judged gone once; the one the budget defers on
+    // the second tick keeps that verdict.
+    assert_eq!(gone(&report), (3, 3));
+    assert_eq!(
+        verdict_totals(&report, StrandedVerdict::Unverifiable),
+        (0, 0)
+    );
+    let report = reconciler.tick().await;
+    assert_eq!(gone(&report), (3, 3), "rotating again zeroes nothing");
+
+    let calls = lookup.calls();
+    assert_eq!(calls.len(), 6, "the cap still holds per tick");
+    let skipped = ["dead-a", "dead-b", "dead-c"]
+        .into_iter()
+        .find(|name| !first.contains(*name))
+        .unwrap();
+    assert_eq!(
+        calls[2], skipped,
+        "the second tick starts with the node the first one skipped"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn s9_deleted_node_at_rest_counts_only_within_the_window() {
+    let sink = FakeSink::new(Vec::new());
+    // Deleted before this controller saw it, holding only old suspends.
+    let long_gone = NodeId::new();
+    sink.with_old_node(long_gone, SourceNode::RowDeleted, counts(0, 1));
+    // Seen registered, then deleted, holding the same old suspends.
+    let watched = NodeId::new();
+    sink.with_old_node(watched, registered("listed", None), counts(0, 1));
+    let presence = Arc::new(FakePresence::listing(&["listed"]));
+    let mut reconciler = Reconciler::new(
+        config(),
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        presence,
+    );
+
+    reconciler.tick().await;
+    assert!(
+        !sink.count_calls().contains(&long_gone),
+        "a node deleted before the window is not a suspect"
+    );
+
+    sink.set_source_node(watched, SourceNode::RowDeleted);
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert_eq!(sink.count_calls(), vec![watched]);
+    assert_eq!(gone(&report), (1, 1), "a node seen deleted counts at rest");
+
+    tokio::time::advance(DELETED_NODE_AT_REST_WINDOW).await;
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert!(sink.count_calls().is_empty(), "past the window it stops");
+    assert_eq!(gone(&report), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn s10_deleted_node_found_clear_is_not_recounted() {
+    let sink = FakeSink::new(Vec::new());
+    // Deleted, holding suspends that all have a ready copy.
+    let clear = NodeId::new();
+    sink.with_node(clear, SourceNode::RowDeleted, counts(0, 0));
+    sink.set_residents(clear, 2, counts(0, 0));
+    let stranded = NodeId::new();
+    sink.with_node(stranded, SourceNode::RowDeleted, counts(0, 1));
+    let mut reconciler = Reconciler::new(
+        config(),
+        sink.clone(),
+        Arc::new(FakeLookup::default()),
+        presence(),
+    );
+
+    let report = reconciler.tick().await;
+    let mut calls = sink.count_calls();
+    calls.sort();
+    let mut both = vec![clear, stranded];
+    both.sort();
+    assert_eq!(calls, both);
+    assert_eq!(gone(&report), (1, 1));
+
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert_eq!(
+        sink.count_calls(),
+        vec![stranded],
+        "a clear deleted node is not recounted"
+    );
+    assert_eq!(gone(&report), (1, 1));
+
+    // A ready copy lost at the same resident count shows within the recheck.
+    sink.set_residents(clear, 2, counts(0, 1));
+    tokio::time::advance(DELETED_NODE_CLEAR_RECHECK).await;
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert!(sink.count_calls().contains(&clear));
+    assert_eq!(gone(&report), (2, 2));
+
+    // Found clear again, a changed resident count recounts it at once.
+    sink.set_residents(clear, 2, counts(0, 0));
+    reconciler.tick().await;
+    sink.set_residents(clear, 1, counts(0, 1));
+    sink.clear_count_calls();
+    let report = reconciler.tick().await;
+    assert!(sink.count_calls().contains(&clear));
+    assert_eq!(gone(&report), (2, 2));
 }

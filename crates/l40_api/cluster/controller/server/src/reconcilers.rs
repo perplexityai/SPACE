@@ -36,7 +36,9 @@
 //! - `failed_restorable_repair`: moves `failed` Kubernetes sandboxes with a
 //!   restorable suspend snapshot back to `suspended`. Postgres only.
 //! - `lost_started_sandboxes`: fails `started` Kubernetes sandboxes whose
-//!   recovery found no restore source once their node is gone.
+//!   recovery found no restore source once their node is gone, and publishes
+//!   the stranded-sandbox census (`sandbox.stranded`), which runs even when
+//!   the give-up is disabled.
 //! - `kube_node_sync`: demotes `ready` node rows outside any drain to
 //!   `registered` once their Node is missing from the cluster's full Node
 //!   list (not only the labeled Nodes), their heartbeat is missing or older
@@ -893,15 +895,19 @@ pub async fn run_reconcilers(
             // Lost-started-sandbox give-up: flips `started` sandboxes whose
             // started recovery failed with no restore source to `failed` once
             // their source node is gone (row deleted, or absent from
-            // Kubernetes with no live EC2 instance). Opt-in; the AWS SDK is
-            // only initialized when it's enabled, like `orphaned_nodes`.
+            // Kubernetes with no live EC2 instance). Opt-in. Its read-only
+            // stranded-sandbox census is on by default and uses the same node
+            // verdict, so the loop and the AWS SDK start when either is on.
             let lost_started_config = lost_started_sandboxes::ReconcilerConfig::from_env();
-            if lost_started_config.enabled {
+            if lost_started_config.enabled || lost_started_config.census_enabled {
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
-                let sink = lost_started_sandboxes::LostStartedDbStore::new(pool.clone());
+                let sink = lost_started_sandboxes::LostStartedDbStore::new(
+                    pool.clone(),
+                    residency_evidence,
+                );
                 let presence = reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone());
                 handles.push(tokio::spawn(lost_started_sandboxes::run(
                     lost_started_config,
@@ -912,8 +918,8 @@ pub async fn run_reconcilers(
                 )));
             } else {
                 tracing::info!(
-                    "lost_started_sandboxes is disabled \
-                     (SPACE_LOST_STARTED_SANDBOXES_ENABLED unset); skipping AWS SDK init"
+                    "lost_started_sandboxes and the stranded-sandbox census are disabled; \
+                     skipping AWS SDK init"
                 );
             }
 
