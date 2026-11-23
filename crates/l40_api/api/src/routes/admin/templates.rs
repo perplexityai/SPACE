@@ -117,6 +117,18 @@ struct TemplateReleaseRow {
     created_at: OffsetDateTime,
 }
 
+impl From<pplx_space_template_release_store::lookup::VisibleRelease> for TemplateReleaseRow {
+    fn from(release: pplx_space_template_release_store::lookup::VisibleRelease) -> Self {
+        Self {
+            id: release.id,
+            template_name: release.template_name,
+            runtime: release.runtime,
+            content_hash: release.content_hash,
+            created_at: release.created_at,
+        }
+    }
+}
+
 #[derive(Debug, FromRow)]
 struct BaseSnapshotPolicyRow {
     template: String,
@@ -2351,18 +2363,12 @@ async fn query_template_releases(
     actor: &User,
 ) -> Result<Vec<TemplateReleaseResponse>, sqlx::Error> {
     let org_ids = authz::visible_org_ids(pool, actor).await?;
-    let rows = sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
-         FROM template_releases r
-         JOIN templates t ON t.name = r.template_name
-         WHERE t.desired_state = $2
-           AND (t.org_id IS NULL OR t.org_id = ANY($1))
-         ORDER BY r.template_name ASC, r.created_at DESC"
-    ))
-    .bind(&org_ids)
-    .bind(TemplateDesiredState::Present.as_str())
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        pplx_space_template_release_store::lookup::releases_unowned_or_owned_by(pool, &org_ids)
+            .await?
+            .into_iter()
+            .map(TemplateReleaseRow::from)
+            .collect();
     hydrate_template_releases(pool, rows).await
 }
 
@@ -2871,19 +2877,15 @@ pub async fn delete_template_release(
             ));
         }
         pplx_space_template_store::release_tags::delete_for_release(&mut *tx, release_id).await?;
-        sqlx::query(sql!(
-            "DELETE FROM template_release_storage_locations WHERE template_release_id = $1"
-        ))
-        .bind(release_id)
-        .execute(&mut *tx)
+        pplx_space_template_release_store::removal::delete_storage_locations_of_release(
+            &mut *tx, release_id,
+        )
         .await?;
-        let deleted = sqlx::query(sql!("DELETE FROM template_releases WHERE id = $1"))
-            .bind(release_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let deleted =
+            pplx_space_template_release_store::removal::delete_release(&mut *tx, release_id)
+                .await?;
         tx.commit().await?;
-        Ok(if deleted > 0 {
+        Ok(if deleted {
             DeleteRelease::Deleted
         } else {
             DeleteRelease::Refused("template release is missing or still tagged latest")

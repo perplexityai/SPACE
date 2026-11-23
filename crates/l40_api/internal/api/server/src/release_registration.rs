@@ -113,7 +113,7 @@ pub(super) async fn ensure_template_release(
         check_release_identity(original, runtime, org_id)?;
     }
 
-    if let Some(inserted) = super::template_releases_store::insert_release(
+    if let Some(inserted) = pplx_space_template_release_store::registration::insert_release(
         &mut **tx,
         template_name,
         runtime,
@@ -125,7 +125,7 @@ pub(super) async fn ensure_template_release(
     .map_err(|error| {
         crate::template_publication::storage_status("insert template release", &error)
     })? {
-        return Ok(inserted);
+        return Ok(TemplateReleaseRow::from(inserted));
     }
 
     // The insert conflicted: with a concurrent registration of the same
@@ -227,15 +227,11 @@ async fn first_registered_release_id(
     template_name: &str,
     hash: &str,
 ) -> Result<Option<Uuid>, Status> {
-    sqlx::query_scalar(sql!(
-        "SELECT id FROM template_releases
-         WHERE template_name = $1 AND hash = $2
-         ORDER BY created_at ASC, id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(hash)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::registration::first_registered_release_id(
+        &mut **tx,
+        template_name,
+        hash,
+    )
     .await
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
@@ -391,37 +387,21 @@ async fn find_partition_release_row(
 ) -> Result<Option<TemplateReleaseRow>, Status> {
     // The legacy partition matches an unbound release or one bound to the
     // initial environment.
-    let legacy = partition.environment().is_none();
-    let environment = partition
-        .environment()
-        .unwrap_or_else(pplx_space_execution_catalog::catalog::initial_environment_reference)
-        .to_string();
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
-                r.execution_metadata->>'environment' AS environment
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash = $2
-           AND ((r.execution_metadata IS NULL AND $5 AND $3)
-                OR (r.execution_metadata IS NOT NULL
-                    AND (r.execution_metadata->>'environment' = $4
-                         OR ($3 AND r.execution_metadata->>'environment' IS NULL))))
-         ORDER BY EXISTS (
-                      SELECT 1
-                      FROM template_release_storage_locations l
-                      WHERE l.template_release_id = r.id) DESC,
-                  (r.execution_metadata IS NOT NULL) DESC,
-                  r.created_at ASC,
-                  r.id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(hash)
-    .bind(legacy)
-    .bind(&environment)
-    .bind(evidence == Evidence::Any)
-    .fetch_optional(&mut **tx)
+    let selector = pplx_space_template_release_store::PartitionSelector {
+        environment: partition
+            .environment()
+            .unwrap_or_else(pplx_space_execution_catalog::catalog::initial_environment_reference),
+        includes_unbound: partition.environment().is_none(),
+    };
+    pplx_space_template_release_store::registration::partition_release(
+        &mut **tx,
+        template_name,
+        hash,
+        selector,
+        evidence == Evidence::Any,
+    )
     .await
+    .map(|release| release.map(TemplateReleaseRow::from))
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 

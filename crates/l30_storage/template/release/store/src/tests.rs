@@ -1808,3 +1808,62 @@ async fn a_release_is_published_once_a_storage_location_is_registered() -> TestR
     assert!(release_published(&db.pool, template, &legacy).await?);
     Ok(())
 }
+
+/// Widening an org-specific template whose content is wrapped under its
+/// owner's key to `generic` would make it launchable-but-undecryptable for
+/// every other org — the RFC forbids it and defers re-keying. The guard
+/// must report the per-template encryption sidecar so the handler refuses
+/// the widen; a template without a sidecar is safe to widen.
+#[tokio::test(flavor = "current_thread")]
+async fn widen_guard_detects_owner_encryption() -> TestResult {
+    // Seeded by the baseline migration's fixture data.
+    const ORG_A: Uuid = Uuid::from_u128(0x1);
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for name in ["plain-owned", "encrypted-owned"] {
+        sqlx::query(
+            "INSERT INTO templates (id, name, org_id, visibility)
+             VALUES ($1, $2, $3, 'org_specific')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(name)
+        .bind(ORG_A)
+        .execute(pool)
+        .await?;
+    }
+
+    let key_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO org_master_keys (id, org_id, provider, key_identifier)
+         VALUES ($1, $2, 'test', 'k')",
+    )
+    .bind(key_id)
+    .bind(ORG_A)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO template_encrypted_fields
+             (template_name, org_id, master_key_id, wrapped_dek, network_policy_json)
+         VALUES ('encrypted-owned', $1, $2, '\\x00'::BYTEA, '\\x00'::BYTEA)",
+    )
+    .bind(ORG_A)
+    .bind(key_id)
+    .execute(pool)
+    .await?;
+
+    assert!(
+        !template_has_owner_encryption(pool, "plain-owned").await?,
+        "a template with no encryption sidecar is safe to widen"
+    );
+    assert!(
+        template_has_owner_encryption(pool, "encrypted-owned").await?,
+        "a per-template encryption sidecar must block the widen"
+    );
+    assert!(
+        !template_has_owner_encryption(pool, "absent").await?,
+        "an unknown template has no sidecar"
+    );
+    Ok(())
+}

@@ -9,14 +9,36 @@
 //! `environments/<environment>/` key. A runtime upgrade campaign creates
 //! twins; this store is the campaign's reader and writer of releases.
 //!
-//! Release registration (`RegisterTemplateRelease`, in internal-api) and the
-//! api's lookups and admin routes still run their own statements against these
-//! tables. Moving them here belongs to the change that touches them. The
-//! credential manager asks [`release_published`] before it vends write
-//! credentials for a release's storage, and refuses them for a published
-//! release.
+//! Release registration (`RegisterTemplateRelease`, in internal-api) reads
+//! and inserts releases and their storage locations through
+//! [`registration`]'s verbs, the api's lookups and admin routes read them
+//! through [`lookup`]'s, and the template and admin release deletes remove
+//! rows through [`removal`]'s. The credential manager asks
+//! [`release_published`] before it vends write credentials for a release's
+//! storage, and refuses them for a published release. Other statements
+//! against these tables still run in api and internal-api:
+//!
+//! * the locking reads (`FOR UPDATE`, `FOR NO KEY UPDATE`) of registration
+//!   and the admin routes, and registration's guarded fills (`... IS NULL`)
+//!   of a release's execution metadata and of a found storage location's
+//!   owner, stay with their callers, whose locks and re-checks keep them
+//!   correct;
+//! * statements that interpolate `digest_original` or `spelling_original`
+//!   (in the api's resolvers, pool configs and admin routes, and in
+//!   internal-api's original lookup and `TemplateReleasesStore`) haven't
+//!   moved yet;
+//! * reads of other tables that join a release, and test fixtures, stay
+//!   where they are.
+//!
+//! Tag writes never move here (see "No tags on twins" below).
 //!
 //! # Rules the store enforces
+//!
+//! [`insert_twin`] keeps these rules itself. [`registration::insert_release`]
+//! stamps `clock_timestamp()` but checks nothing else: internal-api's
+//! registration picks the original's spelling, checks the runtime and owner
+//! against the original, and looks for the partition's release before it
+//! inserts, all under its publication lock.
 //!
 //! * **Originals come first.** A build's original release is the earliest one
 //!   registered for its digest, preferring an original that owns a storage
@@ -51,7 +73,10 @@ use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, Postgres};
 use uuid::Uuid;
 
+pub mod lookup;
 mod objects;
+pub mod registration;
+pub mod removal;
 mod resolution;
 mod twin;
 
@@ -429,6 +454,36 @@ pub async fn release_published(
     .bind(canonical)
     .bind(bare)
     .fetch_one(executor)
+    .await
+}
+
+/// Whether `template_name` carries an owner-scoped encryption sidecar: the
+/// per-template DEK (`template_encrypted_fields`) or a storage-location DEK of
+/// one of its releases
+/// (`template_release_storage_location_encrypted_fields`).
+///
+/// Both sidecars are credential-fenced: run this on the credentials pool,
+/// since the application pool has no grant on them. Takes no lock.
+pub async fn template_has_owner_encryption(
+    credentials_executor: impl PgExecutor<'_>,
+    template_name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+                 SELECT 1 FROM template_encrypted_fields WHERE template_name = $1
+             )
+             OR EXISTS (
+                 SELECT 1
+                   FROM template_release_storage_location_encrypted_fields e
+                   JOIN template_release_storage_locations l
+                     ON l.id = e.template_release_storage_location_id
+                   JOIN template_releases r
+                     ON r.id = l.template_release_id
+                  WHERE r.template_name = $1
+             )"
+    ))
+    .bind(template_name)
+    .fetch_one(credentials_executor)
     .await
 }
 

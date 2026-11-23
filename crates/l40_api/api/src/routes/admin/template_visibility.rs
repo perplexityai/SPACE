@@ -216,16 +216,20 @@ pub async fn set_template_visibility(
     if widening {
         // The encryption sidecars are credential-fenced, so this check runs on
         // the credential pool rather than the `space_user` flip transaction
-        // (which has no grant on those tables).
-        let owner_encrypted = match template_store::template_has_owner_encryption(
-            state.credentials_pool.pool(),
-            template_name.as_str(),
-        )
-        .await
-        {
-            Ok(has) => has,
-            Err(err) => return db_error(err).into_response(),
-        };
+        // (which has no grant on those tables). They're written at
+        // template-encrypt time and don't change during a flip, so this
+        // unlocked read is consistent with the flip's other best-effort
+        // quiescence guards.
+        let owner_encrypted =
+            match pplx_space_template_release_store::template_has_owner_encryption(
+                state.credentials_pool.pool(),
+                template_name.as_str(),
+            )
+            .await
+            {
+                Ok(has) => has,
+                Err(err) => return db_error(err).into_response(),
+            };
         if owner_encrypted {
             audit_failure("conflict: owner-encrypted template cannot widen");
             return (

@@ -396,7 +396,8 @@ async fn build_binding(
         }
         #[cfg(feature = "kubernetes")]
         BuildRelease::Id(release_id) => {
-            crate::template_releases_store::release_environment_by_id(pool, release_id).await?
+            pplx_space_template_release_store::lookup::release_environment_by_id(pool, release_id)
+                .await?
         }
     };
     match (release, scope) {
@@ -405,10 +406,11 @@ async fn build_binding(
         (None, BindingScope::ReleaseOrHolders) => {
             // A twin's build shares the template and hash, so its holders'
             // binding is the twin's, not this release's.
-            let twins = crate::template_releases_store::bound_release_environments(
+            let twins = pplx_space_template_release_store::lookup::bound_release_environments(
                 pool,
                 template,
                 content_hash,
+                pplx_space_execution_catalog::catalog::initial_environment_reference(),
             )
             .await?;
             crate::template_inventory_store::agreed_build_environment(

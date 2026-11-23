@@ -752,49 +752,6 @@ impl TemplateReleasesStore {
     }
 }
 
-/// Insert the release, or nothing when it conflicts with one already
-/// registered. The conflict target is left out on purpose: Postgres then
-/// treats a violation of any unique index as the conflict, so the statement
-/// works with the `(template_name, hash)` index, which admits no twin, and
-/// with `template_releases_template_name_hash_environment_key`, which admits
-/// one release per environment, together or alone.
-///
-/// The untargeted conflict clause also turns a violation of any other unique
-/// index into "nothing inserted"; today the others all include the generated
-/// `id`, so only the two `(template_name, hash, ..)` indexes can conflict.
-///
-/// `created_at` is the insert's own time, not the transaction's start: the
-/// caller holds the template's publication lock, so insert order is
-/// registration order, and the original release of a hash (the earliest by
-/// `created_at`) is the one inserted first even when a twin's transaction
-/// began earlier.
-pub(super) async fn insert_release(
-    executor: impl sqlx::PgExecutor<'_>,
-    template_name: &str,
-    runtime: &str,
-    hash: &str,
-    org_id: Option<OrgId>,
-    execution_metadata: Option<&serde_json::Value>,
-) -> Result<Option<super::TemplateReleaseRow>, sqlx::Error> {
-    sqlx::query_as::<_, super::TemplateReleaseRow>(sql!(
-        "INSERT INTO template_releases
-             (template_name, type, hash, org_id, execution_metadata, created_at)
-         SELECT $1, $2, $3, COALESCE($4, org_id), $5, clock_timestamp()
-         FROM templates
-         WHERE name = $1
-         ON CONFLICT DO NOTHING
-         RETURNING id, template_name, type, hash, org_id, created_at,
-                   execution_metadata->>'environment' AS environment"
-    ))
-    .bind(template_name)
-    .bind(runtime)
-    .bind(hash)
-    .bind(org_id)
-    .bind(execution_metadata)
-    .fetch_optional(executor)
-    .await
-}
-
 /// The caller holds the release row lock while comparing or filling evidence.
 pub(super) async fn fill_execution_metadata(
     executor: impl sqlx::PgExecutor<'_>,
