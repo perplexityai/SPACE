@@ -552,23 +552,27 @@ impl K8sStore {
         // generation it then finds running is that restore's. Until the row
         // is `started` that restore can still be rolled back, so it is no
         // recovery to hand out (see `join_restore_before_dial`).
-        let row = sqlx::query_as::<_, (i64, String, String, Option<String>, String)>(sql!(
-            "SELECT e.generation, e.state, e.pod_name, host(e.pod_ip), s.lifecycle
-             FROM sandbox_k8s_executions e
-             JOIN sandboxes s ON s.id = e.sandbox_id
-             WHERE e.sandbox_id = $1 AND e.generation >= $2 AND e.active
-               AND e.state IN ($3, $4, $5)"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(ActiveExecutionState::Creating.as_str())
-        .bind(ActiveExecutionState::Recovering.as_str())
-        .bind(ActiveExecutionState::Running.as_str())
-        .fetch_optional(&self.pool)
+        let row = pplx_space_sandbox_store::k8s_executions::recovering_execution(
+            &self.pool,
+            sandbox_id,
+            generation,
+            [
+                ActiveExecutionState::Creating.as_str(),
+                ActiveExecutionState::Recovering.as_str(),
+                ActiveExecutionState::Running.as_str(),
+            ],
+        )
         .await
         .db_context("failed to observe started sandbox recovery")?;
 
-        let Some((generation, state, pod_name, pod_ip, lifecycle)) = row else {
+        let Some(pplx_space_sandbox_store::k8s_executions::RecoveringExecution {
+            generation,
+            state,
+            pod_name,
+            pod_ip,
+            lifecycle,
+        }) = row
+        else {
             return Ok(StartedRecoveryObservation::Failed);
         };
         let state =

@@ -769,7 +769,7 @@ fn parse_sort(raw: Option<&str>) -> Result<AdminNodeSort, (StatusCode, Json<serd
 /// **Do not set the env var from a test and expect this to see it.** The first
 /// caller in a test binary fixes the value for every later test in that process,
 /// silently. Tests that need a specific policy pass it explicitly to
-/// [`node_store::sandbox_occupancy_for_node_in_tx`] and
+/// [`pplx_space_sandbox_store::admin_occupancy::terminate_occupancy`] and
 /// [`node_store::AdminNodeStore::occupancy_for_nodes`], which is why both take
 /// the evidence as a parameter rather than calling this.
 fn cluster_residency_evidence() -> ResidencyEvidence {
@@ -1024,12 +1024,7 @@ pub(super) async fn list_node_sandboxes(
                 {
                     Ok(rows) => rows
                         .into_iter()
-                        .map(|row| node_store::NodeSandboxRow {
-                            id: row.id,
-                            lifecycle: row.lifecycle.as_str().to_owned(),
-                            active_node_id: row.active_node_id,
-                            target_node_id: row.target_node_id,
-                        })
+                        .map(node_store::NodeSandboxRow::from)
                         .collect(),
                     Err(err) => return db_error(err).into_response(),
                 };
@@ -1832,8 +1827,8 @@ async fn apply_drain_action(
     //   but reads `group_occupancy_in_tx`, which is not census-aware.
     //   Its refusal to move an organization can therefore count phantom rows.
     if matches!(action, DrainAction::Terminate) {
-        let occupancy = match node_store::sandbox_occupancy_for_node_in_tx(
-            &mut tx,
+        let occupancy = match pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+            &mut *tx,
             node_id,
             cluster_residency_evidence(),
         )

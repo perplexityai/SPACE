@@ -69,6 +69,8 @@ impl K8sStore {
         sandbox_id: SandboxId,
     ) -> Result<SandboxExecutionClaim, SubstrateError> {
         let sandbox_uuid = sandbox_id;
+        // `pplx_space_sandbox_store::k8s_executions::unclaimed_generation`
+        // mirrors this allocation as a lock-free hint; change them together.
         let generation = sqlx::query_scalar::<_, i64>(sql!(
             "SELECT COALESCE(MAX(generation), 0) + 1
              FROM sandbox_k8s_executions
@@ -488,27 +490,9 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1
-                   FROM sandboxes s
-                  WHERE s.id = $1
-                    AND (
-                      s.current_local_artifact_id IS NOT NULL
-                      OR EXISTS (
-                          SELECT 1
-                            FROM snapshots sn
-                           WHERE sn.sandbox_id = s.id
-                             AND sn.type = 'full'
-                             AND sn.state IN ('creating', 'ready')
-                      )
-                    )
-             )"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_one(&self.pool)
-        .await
-        .db_context("failed to query sandbox prior state")
+        pplx_space_sandbox_store::row_reads::prior_state_exists(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to query sandbox prior state")
     }
 
     /// Tracked pod names for generations strictly older than `generation`.
@@ -524,15 +508,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<Vec<String>, SubstrateError> {
-        sqlx::query_scalar::<_, String>(sql!(
-            "SELECT pod_name
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND generation < $2"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .fetch_all(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::pod_names_before_generation(
+            &self.pool, sandbox_id, generation,
+        )
         .await
         .db_context("failed to query prior-generation Kubernetes execution pods")
     }
@@ -548,16 +526,9 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Vec<String>, SubstrateError> {
-        sqlx::query_scalar::<_, String>(sql!(
-            "SELECT pod_name
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND NOT active"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to query inactive Kubernetes execution pods")
+        pplx_space_sandbox_store::k8s_executions::inactive_pod_names(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to query inactive Kubernetes execution pods")
     }
 
     /// Return every pod name recorded for the sandbox so sandbox deletion can
@@ -566,13 +537,9 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Vec<String>, SubstrateError> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id = $1",
-        )
-        .bind(sandbox_id.as_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to query Kubernetes execution pods")
+        pplx_space_sandbox_store::k8s_executions::pod_names(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to query Kubernetes execution pods")
     }
 
     pub(super) async fn lock_sandbox_for_execution_mutation_in(
@@ -675,18 +642,9 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<i64>, SubstrateError> {
-        sqlx::query_scalar::<_, Option<i64>>(sql!(
-            "SELECT CASE
-                        WHEN BOOL_OR(active) THEN NULL
-                        ELSE COALESCE(MAX(generation), 0) + 1
-                    END
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_one(&self.pool)
-        .await
-        .db_context("failed to read the next Kubernetes execution generation")
+        pplx_space_sandbox_store::k8s_executions::unclaimed_generation(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to read the next Kubernetes execution generation")
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn ensure_active_execution_claim_for_lifecycle(
@@ -717,18 +675,12 @@ impl K8sStore {
             .await
             .db_context("failed to renew restore materialization ownership")?;
             if !renewed {
-                let lease_remaining_secs = sqlx::query_scalar::<_, f64>(sql!(
-                    "SELECT GREATEST(
-                                EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
-                                0.0
-                            )::float8
-                       FROM sandboxes
-                      WHERE id = $1"
-                ))
-                .bind(sandbox_id.as_uuid())
-                .fetch_one(&mut *tx)
-                .await
-                .db_context("failed to query replacement restore lease")?;
+                let lease_remaining_secs =
+                    pplx_space_sandbox_store::row_reads::restore_lease_remaining_secs(
+                        &mut *tx, sandbox_id,
+                    )
+                    .await
+                    .db_context("failed to query replacement restore lease")?;
                 return Err(Self::restore_ownership_collision(
                     sandbox_id,
                     lease_remaining_secs,
@@ -819,15 +771,12 @@ impl K8sStore {
             });
         }
 
-        let recovery_in_flight = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT state = $3
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1 AND generation = $2 AND active"
-        ))
-        .bind(sandbox_uuid)
-        .bind(generation)
-        .bind(ActiveExecutionState::Recovering.as_str())
-        .fetch_optional(&mut *tx)
+        let recovery_in_flight = pplx_space_sandbox_store::k8s_executions::active_in_state(
+            &mut *tx,
+            sandbox_uuid,
+            generation,
+            ActiveExecutionState::Recovering.as_str(),
+        )
         .await
         .db_context("failed to inspect replaced Kubernetes execution state")?
         .unwrap_or(false);
@@ -1114,18 +1063,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar(sql!(
-            "SELECT EXISTS(
-                 SELECT 1
-                   FROM sandbox_k8s_executions
-                  WHERE sandbox_id = $1
-                    AND generation = $2
-                    AND active
-             )"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .fetch_one(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::active_is_generation(
+            &self.pool, sandbox_id, generation,
+        )
         .await
         .db_context("failed to check active Kubernetes execution generation")
     }
@@ -1134,21 +1074,13 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<ActiveExecutionStatusRow>, SubstrateError> {
-        sqlx::query_as(sql!(
-            "SELECT e.generation, e.pod_name, NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-                    host(e.pod_ip) AS pod_ip, s.active_node_id AS current_node_id,
-                    e.k8s_node_name, e.state, s.lifecycle,
-                    e.updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
-                    e.activation_attempt_id,
-                    e.route_activation_id, s.activating_client_id
-             FROM sandbox_k8s_executions e
-             JOIN sandboxes s ON s.id = e.sandbox_id
-             WHERE e.sandbox_id = $1 AND e.active"
-        ))
-        .bind(sandbox_id)
-        .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
-        .fetch_optional(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::active_execution_status(
+            &self.pool,
+            sandbox_id,
+            super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+        )
         .await
+        .and_then(|status| status.map(ActiveExecutionStatusRow::try_from).transpose())
         .db_context("failed to query pod metadata")
     }
 }

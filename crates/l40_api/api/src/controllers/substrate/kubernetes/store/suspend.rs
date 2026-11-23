@@ -66,17 +66,11 @@ impl K8sStore {
         };
         let already_finalized = lifecycle == SandboxLifecycle::Suspended.as_str()
             && !execution_active
-            && !sqlx::query_scalar::<_, bool>(sql!(
-                "SELECT EXISTS (
-                     SELECT 1
-                       FROM sandbox_k8s_executions
-                      WHERE sandbox_id = $1
-                        AND generation > $2
-                 )"
-            ))
-            .bind(sandbox_id)
-            .bind(expected_generation.get())
-            .fetch_one(&mut *tx)
+            && !pplx_space_sandbox_store::k8s_executions::successor_exists(
+                &mut *tx,
+                sandbox_id,
+                expected_generation.get(),
+            )
             .await
             .db_context("failed to check for successor Kubernetes execution")?;
         let pending_finalization =
@@ -126,8 +120,6 @@ impl K8sStore {
         expected_pod_uid: &PodUid,
         published_artifact: super::super::super::PublishedLocalArtifact,
     ) -> Result<(), SubstrateError> {
-        let artifact_id = published_artifact.id.as_uuid();
-        let artifact_kind = published_artifact.kind.as_str();
         let mut tx = self
             .pool
             .begin()
@@ -214,37 +206,18 @@ impl K8sStore {
                 return Ok(());
             }
 
-            let exact_projection = sqlx::query_scalar::<_, bool>(sql!(
-                "SELECT EXISTS (
-                     SELECT 1
-                       FROM sandboxes s
-                       JOIN sandbox_k8s_executions e
-                         ON e.sandbox_id = s.id
-                        AND e.generation = $2
-                        AND e.pod_uid = $3
-                      WHERE s.id = $1
-                        AND s.lifecycle = 'suspended'
-                        AND s.current_local_artifact_id = $4
-                        AND s.current_local_artifact_kind = $5
-                        AND s.current_local_artifact_origin = $6
-                        AND e.state = $7
-                        AND NOT e.active
-                        AND NOT EXISTS (
-                            SELECT 1
-                              FROM sandbox_k8s_executions successor
-                             WHERE successor.sandbox_id = s.id
-                               AND successor.generation > e.generation
-                        )
-                 )"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .bind(generation.get())
-            .bind(expected_pod_uid.as_str())
-            .bind(artifact_id)
-            .bind(artifact_kind)
-            .bind(ArtifactOrigin::Suspend.as_str())
-            .bind(ActiveExecutionState::Suspended.as_str())
-            .fetch_one(&mut *tx)
+            let exact_projection = pplx_space_sandbox_store::suspend_reads::projection_matches(
+                &mut *tx,
+                sandbox_id,
+                pplx_space_sandbox_store::suspend_reads::ProjectedSuspend {
+                    generation,
+                    pod_uid: expected_pod_uid,
+                    artifact_id: published_artifact.id,
+                    artifact_kind: published_artifact.kind,
+                    artifact_origin: ArtifactOrigin::Suspend,
+                    execution_state: ActiveExecutionState::Suspended.as_str(),
+                },
+            )
             .await
             .db_context("failed to accept projected Kubernetes suspend commit")?;
             if exact_projection {
@@ -300,23 +273,12 @@ impl K8sStore {
             }
         }
 
-        let existing: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1
-                   FROM sandboxes s
-                   JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-                  WHERE s.id = $1
-                    AND s.lifecycle = 'suspending'
-                    AND e.generation = $2
-                    AND e.active
-                    AND e.pod_uid = $3
-                    AND e.state IN ('running', 'suspended')
-             )"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation.get())
-        .bind(expected_pod_uid.as_str())
-        .fetch_one(&self.pool)
+        let existing = pplx_space_sandbox_store::suspend_reads::claim_held(
+            &self.pool,
+            sandbox_id,
+            generation,
+            expected_pod_uid,
+        )
         .await
         .db_context("failed to verify Kubernetes suspend execution claim")?;
         if existing {
@@ -395,37 +357,18 @@ impl K8sStore {
         generation: ExecutionGeneration,
         expected_pod_uid: &PodUid,
     ) -> Result<Option<super::super::super::PublishedLocalArtifact>, SubstrateError> {
-        let marker: Option<CommittedSuspendArtifactRow> = sqlx::query_as(sql!(
-            "SELECT e.state AS execution_state,
-                    s.current_local_artifact_id AS artifact_id,
-                    s.current_local_artifact_kind AS artifact_kind,
-                    s.current_local_artifact_origin AS artifact_origin
-               FROM sandboxes s
-               JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id
-                AND e.generation = $2
-                AND e.pod_uid = $3
-              WHERE s.id = $1
-                AND (
-                    (s.lifecycle = 'suspending' AND e.active)
-                    OR (
-                        s.lifecycle = 'suspended'
-                        AND e.state = 'suspended'
-                        AND NOT e.active
-                        AND NOT EXISTS (
-                            SELECT 1
-                              FROM sandbox_k8s_executions successor
-                             WHERE successor.sandbox_id = s.id
-                               AND successor.generation > e.generation
-                        )
-                    )
-                )"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation.get())
-        .bind(expected_pod_uid.as_str())
-        .fetch_optional(&self.pool)
+        let marker = pplx_space_sandbox_store::suspend_reads::committed_marker(
+            &self.pool,
+            sandbox_id,
+            generation,
+            expected_pod_uid,
+        )
         .await
+        .and_then(|marker| {
+            marker
+                .map(CommittedSuspendArtifactRow::try_from)
+                .transpose()
+        })
         .db_context("failed to load committed Kubernetes suspend artifact")?;
         let Some(marker) = marker else {
             return Err(SubstrateError::Unavailable {
@@ -477,55 +420,24 @@ impl K8sStore {
         generation: ExecutionGeneration,
         expected_pod_uid: &PodUid,
     ) -> Result<Option<super::super::super::PublishedLocalArtifact>, SubstrateError> {
-        let row: Option<(Uuid, String)> = sqlx::query_as(sql!(
-            "SELECT sn.local_artifact_id, sn.artifact_kind
-               FROM sandboxes s
-               JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id
-                AND e.generation = $2
-                AND e.pod_uid = $3
-                AND e.active
-               JOIN snapshots sn
-                 ON sn.sandbox_id = s.id
-              WHERE s.id = $1
-                AND s.lifecycle = 'suspending'
-                AND sn.type = 'full'
-                AND sn.state = 'ready'
-                AND sn.artifact_origin = 'suspend'
-                AND sn.artifact_kind IS NOT NULL
-                AND sn.local_artifact_id IS NOT NULL
-                AND sn.source_node_id = s.active_node_id
-                AND sn.timestamp >= s.lifecycle_changed_at
-                AND EXISTS (
-                    SELECT 1
-                      FROM snapshot_storage_locations l
-                     WHERE l.snapshot_id = sn.id
-                       AND l.orphaned_at IS NULL
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                      FROM snapshots newer
-                     WHERE newer.sandbox_id = s.id
-                       AND newer.id <> sn.id
-                       AND newer.timestamp >= sn.timestamp
-                       AND (newer.state = 'creating' OR newer.type = 'full')
-                )"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation.get())
-        .bind(expected_pod_uid.as_str())
-        .fetch_optional(&self.pool)
+        let row = pplx_space_sandbox_store::suspend_reads::durable_suspend_artifact(
+            &self.pool,
+            sandbox_id,
+            generation,
+            expected_pod_uid,
+        )
         .await
         .db_context("failed to load durable Kubernetes suspend snapshot")?;
-        row.map(|(artifact_id, artifact_kind)| {
-            let kind =
-                ArtifactKind::try_from(artifact_kind).map_err(|error| SubstrateError::Failed {
+        row.map(|row| {
+            let kind = ArtifactKind::try_from(row.artifact_kind).map_err(|error| {
+                SubstrateError::Failed {
                     message: format!(
                         "durable suspend snapshot has an invalid artifact kind: {error}"
                     ),
-                })?;
+                }
+            })?;
             Ok(super::super::super::PublishedLocalArtifact {
-                id: LocalArtifactId::from_uuid(artifact_id),
+                id: LocalArtifactId::from_uuid(row.local_artifact_id),
                 kind,
             })
         })
@@ -544,13 +456,10 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        let suspending: Option<bool> = sqlx::query_scalar(sql!(
-            "SELECT LOWER(TRIM(lifecycle)) = 'suspending' FROM sandboxes WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .db_context("failed to read sandbox lifecycle for pod tracking cleanup")?;
+        let suspending =
+            pplx_space_sandbox_store::suspend_reads::lifecycle_is_suspending(&mut **tx, sandbox_id)
+                .await
+                .db_context("failed to read sandbox lifecycle for pod tracking cleanup")?;
         Ok(suspending.unwrap_or(false))
     }
 

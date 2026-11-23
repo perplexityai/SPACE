@@ -156,15 +156,10 @@ impl K8sStore {
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
             return Ok(true);
         }
-        let active_exists: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active
-             )"
-        ))
-        .bind(sandbox_id)
-        .fetch_one(&mut *tx)
-        .await
-        .db_context("failed to re-check execution absence")?;
+        let active_exists = pplx_space_sandbox_store::k8s_executions::exists(&mut *tx, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .db_context("failed to re-check execution absence")?;
         if active_exists {
             return Ok(false);
         }
@@ -437,20 +432,9 @@ impl K8sStore {
         generation: i64,
         pod_name: &str,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT EXISTS (
-                 SELECT 1
-                   FROM sandbox_k8s_executions
-                  WHERE sandbox_id = $1
-                    AND generation = $2
-                    AND pod_name = $3
-                    AND NOT active
-             )"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(pod_name)
-        .fetch_one(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::generation_retired(
+            &self.pool, sandbox_id, generation, pod_name,
+        )
         .await
         .db_context("failed to read execution retirement")
     }

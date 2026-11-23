@@ -326,7 +326,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
 
     async fn count_local_snapshots(&self, node_id: NodeId) -> Result<i64, sqlx::Error> {
         // Mirrors the admin `:terminate` snapshot guard
-        // (`sandbox_occupancy_for_node_in_tx`), routed through the same
+        // (`admin_occupancy::terminate_occupancy`), routed through the same
         // marker-aware `snapshot_durable_for_source_release` predicate, so the
         // two agree on portability: a `suspended` sandbox that is durably
         // restorable from S3 drops out of both.

@@ -122,23 +122,17 @@ impl K8sStore {
         if published == Some(activation_attempt_id.as_uuid()) {
             return Ok(());
         }
-        let current = sqlx::query_scalar::<_, Option<Uuid>>(sql!(
-            "SELECT route_activation_id
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND active
-                AND pod_uid = $3"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation)
-        .bind(expected_pod_uid)
-        .fetch_optional(&self.pool)
+        let current = pplx_space_sandbox_store::k8s_executions::active_route_activation_id(
+            &self.pool,
+            sandbox_id,
+            generation,
+            expected_pod_uid,
+        )
         .await
         .map_err(|error| SubstrateError::Failed {
             message: format!("failed to verify acknowledged legacy route identity: {error}"),
         })?;
-        if current.flatten() == Some(activation_attempt_id.as_uuid()) {
+        if current == Some(activation_attempt_id.as_uuid()) {
             Ok(())
         } else {
             Err(SubstrateError::Conflict {
@@ -155,18 +149,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                SELECT 1 FROM sandbox_k8s_executions execution
-                JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
-                WHERE execution.sandbox_id = $1 AND execution.generation = $2
-                  AND execution.active AND sandbox.lifecycle = 'stopped'
-                  AND execution.created_at <= sandbox.lifecycle_changed_at
-            )"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_one(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::predates_current_stop(
+            &self.pool, sandbox_id, generation,
+        )
         .await
         .db_context("failed to identify execution retired by stop")
     }

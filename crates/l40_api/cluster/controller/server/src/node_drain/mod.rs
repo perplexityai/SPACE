@@ -1110,7 +1110,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// `fresh_ready_snapshot_exists` SQL fragment so this count
     /// agrees with `drained_node_terminator::count_local_snapshots`
     /// and the admin `:terminate` endpoint's
-    /// `sandbox_occupancy_for_node_in_tx` guard: all three observe
+    /// `admin_occupancy::terminate_occupancy` guard: all three observe
     /// the same "is this sandbox portable?" answer, so a node whose
     /// only remaining sandbox is `suspended` + S3-backed advances
     /// uniformly through `draining → drained → terminating` without

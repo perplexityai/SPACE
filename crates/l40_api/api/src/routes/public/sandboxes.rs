@@ -1183,18 +1183,10 @@ async fn ensure_sandbox_owner(
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<(), PublicApiError> {
-    let found = sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS(
-             SELECT 1
-             FROM sandboxes
-             WHERE id = $1 AND org_id = $2
-         )"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(org_id)
-    .fetch_one(pool)
-    .await
-    .map_err(database_error)?;
+    let found =
+        pplx_space_sandbox_store::row_reads::org_owns(pool, SandboxId::from(sandbox_id), org_id)
+            .await
+            .map_err(database_error)?;
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }
