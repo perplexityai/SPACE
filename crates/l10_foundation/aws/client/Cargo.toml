@@ -22,4 +22,5 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

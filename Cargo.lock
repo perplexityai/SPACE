@@ -5121,6 +5121,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
  "form_urlencoded",

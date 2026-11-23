@@ -25,6 +25,8 @@ pub enum AwsClientError {
     Signing(#[from] aws_sigv4::http_request::SigningError),
     #[error("failed to build AWS HTTP request: {0}")]
     HttpBuild(#[from] http::Error),
+    #[error("invalid AWS endpoint: {0}")]
+    InvalidEndpoint(String),
     #[error("AWS HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("failed to convert AWS HTTP header to UTF-8: {0}")]
@@ -228,11 +230,11 @@ impl<T: QueryTransport> AwsQueryClient<T> {
     }
 
     async fn sign_request(&self, body: String) -> Result<Request<Vec<u8>>, AwsClientError> {
-        let endpoint = self.endpoint()?;
+        let target = self.target()?;
         let bytes = body.into_bytes();
         let mut request = Request::builder()
             .method("POST")
-            .uri(endpoint.as_str())
+            .uri(target.as_str())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(bytes)?;
 
@@ -273,7 +275,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             .collect::<Result<Vec<_>, _>>()?;
         let signable_request = SignableRequest::new(
             "POST",
-            endpoint,
+            target.as_str(),
             header_pairs.into_iter(),
             SignableBody::Bytes(request.body()),
         )?;
@@ -281,6 +283,21 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             sign_http_request(signable_request, &signing_params)?.into_parts();
         instructions.apply_to_request_http1x(&mut request);
         Ok(request)
+    }
+
+    /// The endpoint as url serializes it, which is the target reqwest sends.
+    fn target(&self) -> Result<reqwest::Url, AwsClientError> {
+        let endpoint = self.endpoint()?;
+        // http's parser keeps rejecting what it rejected before url could repair it.
+        let uri: http::Uri = endpoint.parse().map_err(http::Error::from)?;
+        // url resolves dot segments and `\` by its own rules; without them it only percent-encodes.
+        if uri.path().contains('\\') || uri.path().split('/').any(is_dot_segment) {
+            return Err(AwsClientError::InvalidEndpoint(
+                "its path has a dot segment or a backslash".to_string(),
+            ));
+        }
+        reqwest::Url::parse(&endpoint)
+            .map_err(|err| AwsClientError::InvalidEndpoint(err.to_string()))
     }
 
     fn endpoint(&self) -> Result<String, AwsClientError> {
@@ -298,6 +315,13 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             region
         ))
     }
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+    )
 }
 
 fn encode_form(params: &[(&str, String)]) -> String {
