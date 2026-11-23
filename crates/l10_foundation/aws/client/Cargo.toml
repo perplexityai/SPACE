@@ -22,4 +22,6 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
+jiff = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
