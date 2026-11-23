@@ -53,19 +53,13 @@ impl K8sStore {
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
     ) -> Result<Option<SandboxExecutionRow>, SubstrateError> {
-        sqlx::query_as::<_, SandboxExecutionRow>(sql!(
-            "SELECT generation, pod_name,
-                    NULLIF(BTRIM(pod_uid), '') IS NOT NULL AS pod_materialized,
-                    state,
-                    updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
-                    activation_attempt_id, route_activation_id
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1 AND active"
-        ))
-        .bind(sandbox_id)
-        .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
-        .fetch_optional(&mut *conn)
+        pplx_space_sandbox_store::k8s_executions::active_execution(
+            &mut *conn,
+            sandbox_id,
+            super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+        )
         .await
+        .and_then(|record| record.map(SandboxExecutionRow::try_from).transpose())
         .db_context("failed to query active Kubernetes execution row")
     }
 
@@ -454,20 +448,9 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
     ) -> Result<(), SubstrateError> {
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-             SET apply_state = 'pending',
-                 last_applied_node_id = NULL,
-                 last_error = NULL,
-                 last_bridge_status = NULL,
-                 last_applied_bridge_generation = NULL,
-                 last_observed_at = NULL,
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-               AND desired_state = 'open'"
-        ))
-        .bind(sandbox_id)
-        .execute(&mut **tx)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut **tx, sandbox_id,
+        )
         .await
         .db_context("failed to invalidate sandbox port exposure observations")?;
         Ok(())

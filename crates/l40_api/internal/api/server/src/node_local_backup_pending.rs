@@ -258,12 +258,10 @@ impl ParsedPendingLocalBackups {
     /// The three parallel arrays the set-replace's `UNNEST` takes, built in one
     /// pass so "these stay index-aligned" is a property of one expression
     /// rather than of three separate walks staying in step.
-    fn unnest_columns(&self) -> (Vec<SandboxId>, Vec<LocalArtifactId>, Vec<&'static str>) {
+    fn unnest_columns(&self) -> (Vec<SandboxId>, Vec<LocalArtifactId>, Vec<ArtifactKind>) {
         self.entries
             .iter()
-            .map(|(sandbox_id, entry)| {
-                (*sandbox_id, entry.artifact_id, entry.artifact_kind.as_str())
-            })
+            .map(|(sandbox_id, entry)| (*sandbox_id, entry.artifact_id, entry.artifact_kind))
             .collect()
     }
 }
@@ -573,26 +571,15 @@ pub(super) async fn reconcile(
     let upserted = if reported_sandbox_ids.is_empty() {
         0
     } else {
-        sqlx::query(sql!(
-        "INSERT INTO node_local_backup_pending (node_id, sandbox_id, artifact_id, artifact_kind)
-         SELECT $1, reported.sandbox_id, reported.artifact_id, reported.artifact_kind
-           FROM UNNEST($2::UUID[], $3::UUID[], $4::TEXT[])
-                AS reported(sandbox_id, artifact_id, artifact_kind)
-          WHERE EXISTS (
-                    SELECT 1 FROM sandboxes WHERE sandboxes.id = reported.sandbox_id
-                )
-         ON CONFLICT (node_id, sandbox_id) DO UPDATE
-            SET artifact_id = EXCLUDED.artifact_id,
-                artifact_kind = EXCLUDED.artifact_kind"
-    ))
-        .bind(node_id.as_uuid())
-        .bind(&reported_sandbox_ids)
-        .bind(&reported_artifact_ids)
-        .bind(&reported_artifact_kinds)
-        .execute(&mut *conn)
+        pplx_space_sandbox_store::node_local_backup_pending::upsert_reported(
+            &mut *conn,
+            node_id,
+            &reported_sandbox_ids,
+            &reported_artifact_ids,
+            &reported_artifact_kinds,
+        )
         .await
         .map_err(|err| Status::internal(format!("mirror reported pending local backups: {err}")))?
-        .rows_affected()
     };
 
     let deleted_durable = delete_durable_absent(conn, node_id, &reported_sandbox_ids).await?;
