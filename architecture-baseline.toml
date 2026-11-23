@@ -150,9 +150,6 @@ postgres = [
   "org_master_keys",
   "org_storage_vend_identities",
   "organizations",
-  "public_idempotency_records",
-  "public_operation_events",
-  "public_operations",
   "sandbox_archives",
   "sandbox_direct_route_identities",
   "sandbox_direct_route_provenance",
@@ -192,7 +189,6 @@ postgres = [
 ]
 "sqlite.runtime-manager" = [
   "jobs",
-  "operation_results",
 ]
 "sqlite.volume-manager" = [
   "jobs",

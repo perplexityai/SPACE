@@ -3,7 +3,6 @@ use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_sql_locator::sql;
 use std::num::NonZeroU32;
 use std::str::FromStr;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::metrics::operations::ClaimAttempt;
@@ -13,6 +12,8 @@ use pplx_space_public_api::{
     PublicOperationEvent, PublicOperationEventType, PublicOperationRecord, PublicOperationResult,
     RequestFingerprint,
 };
+use pplx_space_public_operation_store as operation_store;
+use pplx_space_public_operation_store::operations::{ClaimedPublicOperationRow, JoinableOperation};
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sha2::{Digest, Sha256};
@@ -25,46 +26,6 @@ use crate::public_store::{InvalidStoredEnum, parse_stored_enum};
 use pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle;
 
 const DEFAULT_OPERATION_GC_DAYS: i64 = 7;
-
-/// The columns every whole-operation read selects, in [`PublicOperationRow`]'s
-/// shape. Named rather than `*`: adding or dropping a `public_operations`
-/// column changes what `SELECT *` returns, and every pooled connection that
-/// already ran one then fails it with `0A000` ("cached plan must not change
-/// result type") until the pool recycles that connection. A new column a read
-/// needs is selected here and decoded in [`PublicOperationRow`]; a record
-/// that exposes it also needs the field and its line in that record's
-/// `TryFrom`. The two admin reads (`fetch_operation_admin`,
-/// `list_operations_admin`) also select the payload's `requested_by_user_id`
-/// and the joined actor's email, with every column qualified by its table, so
-/// they spell this list out and need the new column added there too.
-const PUBLIC_OPERATION_COLUMNS: &str = "operation_id,
-       org_id,
-       actor_user_id,
-       api_product,
-       kind,
-       target_type,
-       target_id,
-       state,
-       progress_message,
-       terminal_error_code,
-       terminal_error_json,
-       result_json,
-       attempts,
-       requested_at,
-       next_attempt_at,
-       created_at,
-       started_at,
-       completed_at,
-       updated_at";
-
-/// `sql` with `{public_operation_columns}` replaced by
-/// [`PUBLIC_OPERATION_COLUMNS`], the one fragment these statements take (the
-/// data-store skill's exception for one row type's column list). Each
-/// statement is otherwise complete, built once at its query site, and binds
-/// every value.
-fn public_operation_query(sql: &str) -> String {
-    sql.replace("{public_operation_columns}", PUBLIC_OPERATION_COLUMNS)
-}
 
 fn update_claimed_payload_sql() -> &'static str {
     sql!(
@@ -215,19 +176,11 @@ impl PublicOperationStore {
         operation_id: OperationId,
         hard_deadline: Duration,
     ) -> Result<Option<Duration>, PublicOperationStoreError> {
-        let seconds = sqlx::query_scalar::<_, i64>(pplx_space_sql_locator::sql!(
-            "SELECT GREATEST(
-                 0,
-                 FLOOR(EXTRACT(EPOCH FROM (
-                     created_at + ($2::BIGINT * INTERVAL '1 second') - NOW()
-                 )))::BIGINT
-             )
-             FROM public_operations
-             WHERE operation_id = $1"
-        ))
-        .bind(operation_id.as_uuid())
-        .bind(i64::try_from(hard_deadline.as_secs()).unwrap_or(i64::MAX))
-        .fetch_optional(&self.pool)
+        let seconds = operation_store::operations::remaining_deadline_secs(
+            &self.pool,
+            operation_id,
+            i64::try_from(hard_deadline.as_secs()).unwrap_or(i64::MAX),
+        )
         .await?;
         Ok(seconds.map(|seconds| Duration::from_secs(u64::try_from(seconds).unwrap_or(0))))
     }
@@ -237,17 +190,9 @@ impl PublicOperationStore {
         &self,
         operation_id: OperationId,
     ) -> Result<Option<Duration>, PublicOperationStoreError> {
-        let seconds = sqlx::query_scalar::<_, Option<f64>>(pplx_space_sql_locator::sql!(
-            "SELECT EXTRACT(EPOCH FROM NOW() - started_at)::DOUBLE PRECISION
-             FROM public_operations
-             WHERE operation_id = $1"
-        ))
-        .bind(operation_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(seconds
-            .flatten()
-            .map(|seconds| Duration::from_secs_f64(seconds.max(0.0))))
+        let seconds =
+            operation_store::operations::secs_since_first_claim(&self.pool, operation_id).await?;
+        Ok(seconds.map(|seconds| Duration::from_secs_f64(seconds.max(0.0))))
     }
 
     pub async fn fetch_operation(
@@ -255,22 +200,8 @@ impl PublicOperationStore {
         org_id: OrgId,
         operation_id: OperationId,
     ) -> Result<Option<PublicOperationRecord>, PublicOperationStoreError> {
-        static FETCH_OPERATION_SQL: LazyLock<String> = LazyLock::new(|| {
-            sql!(public_operation_query(
-                "SELECT {public_operation_columns}
-                 FROM public_operations
-                 WHERE org_id = $1 AND operation_id = $2"
-            ))
-        });
-        let row = sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(
-            FETCH_OPERATION_SQL.as_str(),
-        ))
-        .bind(org_id)
-        .bind(operation_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(PublicOperationRecord::try_from).transpose()
+        let row = operation_store::operations::fetch(&self.pool, org_id, operation_id).await?;
+        row.map(public_operation_record).transpose()
     }
 
     /// Queued creates have no sandbox row yet. Their durable actor is the
@@ -281,21 +212,12 @@ impl PublicOperationStore {
         subject_id: Option<UserId>,
         operation_id: OperationId,
     ) -> Result<bool, PublicOperationStoreError> {
-        Ok(sqlx::query_scalar(sql!(
-            "SELECT EXISTS(
-                 SELECT 1 FROM public_operations op
-                 LEFT JOIN users actor ON actor.id = op.actor_user_id
-                 WHERE op.org_id = $1 AND op.operation_id = $2
-                   AND ($3::UUID IS NULL OR op.api_product = 'native')
-                   AND (($3::UUID IS NOT NULL AND op.actor_user_id = $3)
-                     OR ($3::UUID IS NULL AND
-                         (op.actor_user_id IS NULL OR actor.owner_source = 'local')))
-             )"
-        ))
-        .bind(org_id)
-        .bind(operation_id.as_uuid())
-        .bind(subject_id)
-        .fetch_one(&self.pool)
+        Ok(operation_store::operations::in_owner_scope(
+            &self.pool,
+            org_id,
+            subject_id,
+            operation_id,
+        )
         .await?)
     }
 
@@ -374,24 +296,15 @@ impl PublicOperationStore {
         org_id: OrgId,
         operation_id: OperationId,
     ) -> Result<Option<ForkOperationOutcome>, PublicOperationStoreError> {
-        let row = sqlx::query_as::<
-            _,
-            (
-                String,
-                Option<Json<serde_json::Value>>,
-                Option<String>,
-                Option<Json<serde_json::Value>>,
-            ),
-        >(sql!(
-            "SELECT state, result_json, terminal_error_code, terminal_error_json
-             FROM public_operations
-             WHERE org_id = $1 AND operation_id = $2 AND kind = 'fork_sandbox'"
-        ))
-        .bind(org_id)
-        .bind(operation_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|(state, result, terminal_error_code, error)| {
+        let row =
+            operation_store::operations::fork_outcome(&self.pool, org_id, operation_id).await?;
+        row.map(|row| {
+            let operation_store::operations::ForkOutcomeRow {
+                state,
+                result_json: result,
+                terminal_error_code,
+                terminal_error_json: error,
+            } = row;
             let state = parse_stored_enum("state", &state)?;
             match state {
                 OperationState::Succeeded => {
@@ -441,15 +354,8 @@ impl PublicOperationStore {
         org_id: OrgId,
         operation_id: OperationId,
     ) -> Result<Option<Duration>, PublicOperationStoreError> {
-        let payload = sqlx::query_scalar::<_, Json<serde_json::Value>>(sql!(
-            "SELECT payload_json
-             FROM public_operations
-             WHERE org_id = $1 AND operation_id = $2 AND kind = 'fork_sandbox'"
-        ))
-        .bind(org_id)
-        .bind(operation_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+        let payload =
+            operation_store::operations::fork_payload(&self.pool, org_id, operation_id).await?;
 
         payload
             .map(|payload| {
@@ -460,108 +366,42 @@ impl PublicOperationStore {
             .transpose()
     }
 
-    /// The admin reads list every [`PublicOperationRow`] column and, for a
-    /// sandbox create, the payload's `requested_by_user_id`, which only the
-    /// admin record exposes. No other kind's payload defines that key, so
-    /// they never read it. They also join the actor's current email, so a
-    /// page of operations names its actors without a read per row.
-    ///
-    /// They spell the column list out rather than take
-    /// [`PUBLIC_OPERATION_COLUMNS`], whose fragment may only be a statement's
-    /// whole `SELECT` list.
+    /// The admin reads list every operation column and, for a sandbox
+    /// create, the payload's `requested_by_user_id`, which only the admin
+    /// record exposes. No other kind's payload defines that key, so they
+    /// never read it. They also join the actor's current email, so a page of
+    /// operations names its actors without a read per row.
     pub async fn fetch_operation_admin(
         &self,
         operation_id: OperationId,
     ) -> Result<Option<AdminPublicOperationRecord>, PublicOperationStoreError> {
-        let row = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
-            "SELECT op.operation_id,
-                        op.org_id,
-                        op.actor_user_id,
-                        op.api_product,
-                        op.kind,
-                        op.target_type,
-                        op.target_id,
-                        op.state,
-                        op.progress_message,
-                        op.terminal_error_code,
-                        op.terminal_error_json,
-                        op.result_json,
-                        op.attempts,
-                        op.requested_at,
-                        op.next_attempt_at,
-                        op.created_at,
-                        op.started_at,
-                        op.completed_at,
-                        op.updated_at,
-                        CASE WHEN op.kind = $2
-                             THEN op.payload_json ->> 'requested_by_user_id'
-                        END AS requested_by_user_id,
-                        actor.email AS actor_email
-               FROM public_operations op
-               LEFT JOIN users actor ON actor.id = op.actor_user_id
-              WHERE op.operation_id = $1"
-        ))
-        .bind(operation_id.as_uuid())
-        .bind(OperationKind::CreateSandbox.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = operation_store::operations::fetch_admin(&self.pool, operation_id).await?;
 
-        row.map(AdminPublicOperationRecord::try_from).transpose()
+        row.map(admin_public_operation_record).transpose()
     }
 
     pub async fn list_operations_admin(
         &self,
         input: ListAdminPublicOperations,
     ) -> Result<Vec<AdminPublicOperationRecord>, PublicOperationStoreError> {
-        let state = input.state.as_ref().map(OperationState::as_str);
-        let kind = input.kind.map(OperationKind::as_str);
-        let target_type = input.target_type.as_ref().map(OperationTargetType::as_str);
-        let rows = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
-            "SELECT op.operation_id,
-                        op.org_id,
-                        op.actor_user_id,
-                        op.api_product,
-                        op.kind,
-                        op.target_type,
-                        op.target_id,
-                        op.state,
-                        op.progress_message,
-                        op.terminal_error_code,
-                        op.terminal_error_json,
-                        op.result_json,
-                        op.attempts,
-                        op.requested_at,
-                        op.next_attempt_at,
-                        op.created_at,
-                        op.started_at,
-                        op.completed_at,
-                        op.updated_at,
-                        CASE WHEN op.kind = $7
-                             THEN op.payload_json ->> 'requested_by_user_id'
-                        END AS requested_by_user_id,
-                        actor.email AS actor_email
-               FROM public_operations op
-               LEFT JOIN users actor ON actor.id = op.actor_user_id
-              WHERE ($1::UUID IS NULL OR op.org_id = $1)
-                AND ($2::TEXT IS NULL OR op.state = $2)
-                AND ($3::TEXT IS NULL OR op.kind = $3)
-                AND ($4::TEXT IS NULL OR op.target_type = $4)
-                AND ($5::TEXT[] IS NULL OR op.target_id = ANY($5))
-              ORDER BY op.created_at DESC, op.operation_id DESC
-              LIMIT $6"
-        ))
-        .bind(input.org_id)
-        .bind(state)
-        .bind(kind)
-        .bind(target_type)
-        .bind(input.target_id.as_deref().map(admin_target_id_forms))
-        .bind(i64::from(input.limit))
-        .bind(OperationKind::CreateSandbox.as_str())
-        .fetch_all(&self.pool)
+        let state = input.state.as_ref();
+        let kind = input.kind;
+        let target_type = input.target_type.as_ref();
+        let rows = operation_store::operations::list_admin(
+            &self.pool,
+            operation_store::operations::AdminOperationFilter {
+                org_id: input.org_id,
+                state,
+                kind,
+                target_type,
+                target_ids: input.target_id.as_deref().map(admin_target_id_forms),
+                limit: i64::from(input.limit),
+            },
+        )
         .await?;
 
         rows.into_iter()
-            .map(AdminPublicOperationRecord::try_from)
+            .map(admin_public_operation_record)
             .collect()
     }
 
@@ -572,37 +412,22 @@ impl PublicOperationStore {
         after_sequence: Option<i64>,
         limit: i64,
     ) -> Result<Option<Vec<PublicOperationEvent>>, PublicOperationStoreError> {
-        let exists = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM public_operations
-                 WHERE org_id = $1 AND operation_id = $2
-             )"
-        ))
-        .bind(org_id)
-        .bind(operation_id.as_uuid())
-        .fetch_one(&self.pool)
-        .await?;
+        let exists =
+            operation_store::operations::exists_in_org(&self.pool, org_id, operation_id).await?;
         if !exists {
             return Ok(None);
         }
 
-        let rows = sqlx::query_as::<_, PublicOperationEventRow>(sql!(
-            "SELECT e.operation_id, e.sequence, e.event_type, e.event_json, e.created_at
-             FROM public_operation_events e
-             WHERE e.operation_id = $1
-               AND e.sequence > COALESCE($2, 0)
-             ORDER BY e.sequence ASC
-             LIMIT $3"
-        ))
-        .bind(operation_id.as_uuid())
-        .bind(after_sequence)
-        .bind(limit)
-        .fetch_all(&self.pool)
+        let rows = operation_store::events::list_after_sequence(
+            &self.pool,
+            operation_id,
+            after_sequence,
+            limit,
+        )
         .await?;
 
         rows.into_iter()
-            .map(PublicOperationEvent::try_from)
+            .map(public_operation_event)
             .collect::<Result<Vec<_>, _>>()
             .map(Some)
     }
@@ -618,49 +443,30 @@ impl PublicOperationStore {
     ) -> Result<Vec<PublicOperationEvent>, PublicOperationStoreError> {
         let target_ids = sandbox_target_id_forms(sandbox_id);
         let rows = if let Some(after) = after {
-            sqlx::query_as::<_, PublicOperationEventRow>(sql!(
-                "SELECT e.operation_id, e.sequence, e.event_type, e.event_json, e.created_at
-                 FROM public_operation_events e
-                 JOIN public_operations o ON o.operation_id = e.operation_id
-                 WHERE o.org_id = $1
-                   AND o.target_type = 'sandbox'
-                   AND o.target_id = ANY($2)
-                   AND (e.created_at, e.operation_id, e.sequence) > ($3, $4, $5)
-                 ORDER BY e.created_at ASC, e.operation_id ASC, e.sequence ASC
-                 LIMIT $6"
-            ))
-            .bind(org_id)
-            .bind(&target_ids[..])
-            .bind(after.created_at)
-            .bind(after.operation_id.as_uuid())
-            .bind(after.sequence)
-            .bind(limit)
-            .fetch_all(&self.pool)
+            operation_store::events::list_for_targets_after(
+                &self.pool,
+                org_id,
+                &target_ids[..],
+                operation_store::events::EventCursor {
+                    created_at: after.created_at,
+                    operation_id: after.operation_id.as_uuid(),
+                    sequence: after.sequence,
+                },
+                limit,
+            )
             .await?
         } else {
-            sqlx::query_as::<_, PublicOperationEventRow>(sql!(
-                "SELECT operation_id, sequence, event_type, event_json, created_at
-                 FROM (
-                     SELECT e.operation_id, e.sequence, e.event_type, e.event_json, e.created_at
-                     FROM public_operation_events e
-                     JOIN public_operations o ON o.operation_id = e.operation_id
-                     WHERE o.org_id = $1
-                       AND o.target_type = 'sandbox'
-                       AND o.target_id = ANY($2)
-                     ORDER BY e.created_at DESC, e.operation_id DESC, e.sequence DESC
-                     LIMIT $3
-                 ) recent
-                 ORDER BY created_at ASC, operation_id ASC, sequence ASC"
-            ))
-            .bind(org_id)
-            .bind(&target_ids[..])
-            .bind(limit)
-            .fetch_all(&self.pool)
+            operation_store::events::list_recent_for_targets(
+                &self.pool,
+                org_id,
+                &target_ids[..],
+                limit,
+            )
             .await?
         };
 
         rows.into_iter()
-            .map(PublicOperationEvent::try_from)
+            .map(public_operation_event)
             .collect::<Result<Vec<_>, _>>()
     }
 
@@ -846,21 +652,9 @@ impl PublicOperationStore {
         let mut tx = self.pool.begin().await?;
         lock_active_sandbox_operation(&mut tx, org_id, kind, target_id).await?;
         let existing = if kind == OperationKind::DeleteSandbox {
-            sqlx::query_scalar::<_, Uuid>(sql!(
-                "SELECT operation_id
-                   FROM public_operations
-                  WHERE org_id = $1
-                    AND kind = $3
-                    AND target_type = 'sandbox'
-                    AND target_id = $2
-                    AND state IN ('queued', 'running')
-                  ORDER BY requested_at, operation_id
-                  LIMIT 1"
-            ))
-            .bind(org_id)
-            .bind(target_id)
-            .bind(kind.as_str())
-            .fetch_optional(&mut *tx)
+            operation_store::operations::earliest_active_on_sandbox(
+                &mut *tx, org_id, kind, target_id,
+            )
             .await?
         } else {
             joinable_active_sandbox_operation(&mut tx, org_id, kind, target_id, None)
@@ -1196,6 +990,18 @@ pub struct CreatePublicOperationIdempotency<'a> {
     pub request_fingerprint: &'a RequestFingerprint,
 }
 
+impl CreatePublicOperationIdempotency<'_> {
+    /// This key as `org_id`'s record identity in the operation store.
+    fn store_key(&self, org_id: OrgId) -> operation_store::idempotency::IdempotencyKeyRef<'_> {
+        operation_store::idempotency::IdempotencyKeyRef {
+            org_id,
+            method: self.method.as_str(),
+            path_template: self.path_template.as_str(),
+            idempotency_key: self.key.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreatePublicOperationResult {
     Created(OperationId),
@@ -1234,36 +1040,8 @@ async fn claim_created_operation_tx(
     operation_id: OperationId,
 ) -> Result<(String, ClaimedPublicOperation), PublicOperationStoreError> {
     let claim_token = new_admission_claim_token();
-    let row = sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
-        "UPDATE public_operations
-         SET state = $3,
-             attempts = attempts + 1,
-             claim_token = $2,
-             claim_generation = claim_generation + 1,
-             claimed_at = clock_timestamp(),
-             started_at = COALESCE(started_at, clock_timestamp()),
-             progress_message = 'operation claimed',
-             updated_at = NOW()
-         WHERE operation_id = $1
-         RETURNING operation_id,
-                   org_id,
-                   actor_user_id,
-                   api_product,
-                   kind,
-                   target_type,
-                   target_id,
-                   payload_json,
-                   attempts,
-                   claim_generation,
-                   traceparent,
-                   FLOOR(EXTRACT(EPOCH FROM NOW() - created_at))::BIGINT
-                       AS age_at_first_claim_secs"
-    ))
-    .bind(operation_id.as_uuid())
-    .bind(&claim_token)
-    .bind(OperationState::Running.as_str())
-    .fetch_one(&mut **tx)
-    .await?;
+    let row =
+        operation_store::operations::claim_created(&mut **tx, operation_id, &claim_token).await?;
     let operation = ClaimedPublicOperation::try_from(row)?;
     append_operation_event_tx(
         tx,
@@ -1313,26 +1091,13 @@ async fn claim_created_if_sole_active_tx<P>(
     operation_id: OperationId,
     offer: InlineClaimOffer<impl FnOnce() -> Option<P>>,
 ) -> Result<InlineClaimDecision<P>, PublicOperationStoreError> {
-    let others_active = sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1
-               FROM public_operations
-              WHERE org_id = $1
-                AND target_type = $2
-                AND target_id = $3
-                AND kind <> ALL($4)
-                AND state IN ($5, $6)
-                AND operation_id <> $7
-         )"
-    ))
-    .bind(org_id)
-    .bind(OperationTargetType::Sandbox.as_str())
-    .bind(target_id)
-    .bind(outside_sandbox_queue_labels())
-    .bind(OperationState::Queued.as_str())
-    .bind(OperationState::Running.as_str())
-    .bind(operation_id.as_uuid())
-    .fetch_one(&mut **tx)
+    let others_active = operation_store::operations::other_active_on_sandbox(
+        &mut **tx,
+        org_id,
+        target_id,
+        OUTSIDE_SANDBOX_QUEUE_KINDS,
+        operation_id,
+    )
     .await?;
     if others_active {
         return Ok(InlineClaimDecision::Queued(InlineQueueReason::Busy));
@@ -2322,43 +2087,23 @@ pub async fn create_operation_tx(
     // Under the sandbox's queue lock no other insert for it commits between
     // this stamp and this transaction's commit, so its operations' request
     // order is their commit order.
-    sqlx::query(sql!(
-        "INSERT INTO public_operations (
-             operation_id,
-             org_id,
-             actor_user_id,
-             api_product,
-             kind,
-             target_type,
-             target_id,
-             payload_json,
-             gc_after,
-             traceparent,
-             requested_at
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8,
-             NOW() + ($9::TEXT || ' days')::INTERVAL,
-             $10,
-             clock_timestamp()
-         )"
-    ))
-    .bind(operation_id.as_uuid())
-    .bind(input.org_id)
-    .bind(input.actor_user_id)
-    .bind(input.api_product.as_str())
-    .bind(input.kind.as_str())
-    .bind(input.target_type.as_ref().map(OperationTargetType::as_str))
-    .bind(input.target_id)
-    .bind(Json(input.payload_json))
-    .bind(DEFAULT_OPERATION_GC_DAYS.to_string())
-    .bind(
-        input
-            .traceparent
-            .as_deref()
-            .filter(|traceparent| pplx_space_observability::is_storable_traceparent(traceparent)),
+    operation_store::operations::insert(
+        &mut **tx,
+        operation_store::operations::NewOperation {
+            operation_id,
+            org_id: input.org_id,
+            actor_user_id: input.actor_user_id,
+            api_product: input.api_product.as_str(),
+            kind: input.kind,
+            target_type: input.target_type.as_ref(),
+            target_id: input.target_id,
+            payload_json: input.payload_json,
+            gc_after_days: DEFAULT_OPERATION_GC_DAYS,
+            traceparent: input.traceparent.as_deref().filter(|traceparent| {
+                pplx_space_observability::is_storable_traceparent(traceparent)
+            }),
+        },
     )
-    .execute(&mut **tx)
     .await?;
 
     append_operation_event_tx(
@@ -2407,22 +2152,8 @@ async fn sandbox_creates_in_flight<'e>(
     org_id: OrgId,
     target: pplx_space_public_api::PublicSandboxId,
 ) -> Result<Vec<OperationId>, sqlx::Error> {
-    let creates = sqlx::query_scalar::<_, Uuid>(sql!(
-        "SELECT operation_id FROM public_operations
-         WHERE org_id = $1
-           AND target_type = $2
-           AND target_id = $3
-           AND kind = $4
-           AND state IN ($5, $6)"
-    ))
-    .bind(org_id)
-    .bind(OperationTargetType::Sandbox.as_str())
-    .bind(target.to_string())
-    .bind(OperationKind::CreateSandbox.as_str())
-    .bind(OperationState::Queued.as_str())
-    .bind(OperationState::Running.as_str())
-    .fetch_all(executor)
-    .await?;
+    let creates =
+        operation_store::operations::sandbox_creates_in_flight(executor, org_id, target).await?;
     Ok(creates.into_iter().map(OperationId::from_uuid).collect())
 }
 
@@ -2458,24 +2189,13 @@ async fn cancel_superseded_create_tx(
     carried_error: Option<serde_json::Value>,
 ) -> Result<(), PublicOperationStoreError> {
     let (progress_message, code, error) = superseded_create(create_id, delete_id, carried_error);
-    sqlx::query(sql!(
-        "UPDATE public_operations
-         SET state = $2,
-             claim_token = '',
-             completed_at = NOW(),
-             progress_message = $3,
-             terminal_error_code = $4,
-             terminal_error_json = $5,
-             payload_json = payload_json #- '{federated_create,service_grant_base64}'::text[],
-             updated_at = NOW()
-         WHERE operation_id = $1"
-    ))
-    .bind(create_id.as_uuid())
-    .bind(OperationState::Canceled.as_str())
-    .bind(&progress_message)
-    .bind(code.as_str())
-    .bind(Json(error.clone()))
-    .execute(&mut **tx)
+    operation_store::operations::cancel_superseded_create(
+        &mut **tx,
+        create_id,
+        &progress_message,
+        code.as_str(),
+        error.clone(),
+    )
     .await?;
     append_operation_event_tx(
         tx,
@@ -2547,31 +2267,7 @@ async fn superseding_delete_tx(
     tx: &mut Transaction<'_, Postgres>,
     create_id: OperationId,
 ) -> Result<Option<OperationId>, PublicOperationStoreError> {
-    let delete = sqlx::query_scalar::<_, Uuid>(sql!(
-        "SELECT delete_op.operation_id
-         FROM public_operations create_op
-         JOIN public_operations delete_op
-           ON delete_op.org_id = create_op.org_id
-          AND delete_op.target_type = create_op.target_type
-          AND delete_op.target_id = create_op.target_id
-         WHERE create_op.operation_id = $1
-           AND create_op.kind = $2
-           AND create_op.target_type = $3
-           AND delete_op.kind = $4
-           AND delete_op.state IN ($5, $6)
-           AND (delete_op.requested_at, delete_op.operation_id)
-               > (create_op.requested_at, create_op.operation_id)
-         ORDER BY delete_op.requested_at, delete_op.operation_id
-         LIMIT 1"
-    ))
-    .bind(create_id.as_uuid())
-    .bind(OperationKind::CreateSandbox.as_str())
-    .bind(OperationTargetType::Sandbox.as_str())
-    .bind(OperationKind::DeleteSandbox.as_str())
-    .bind(OperationState::Queued.as_str())
-    .bind(OperationState::Running.as_str())
-    .fetch_optional(&mut **tx)
-    .await?;
+    let delete = operation_store::operations::superseding_delete(&mut **tx, create_id).await?;
     Ok(delete.map(OperationId::from_uuid))
 }
 
@@ -2582,35 +2278,16 @@ async fn insert_idempotency_record_tx(
     idempotency: &CreatePublicOperationIdempotency<'_>,
     operation_id: OperationId,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "INSERT INTO public_idempotency_records (
-             id,
-             org_id,
-             api_product,
-             method,
-             path_template,
-             idempotency_key,
-             request_fingerprint,
-             operation_id,
-             expires_at
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8,
-             NOW() + ($9::TEXT || ' hours')::INTERVAL
-         )"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(org_id)
-    .bind(api_product.as_str())
-    .bind(idempotency.method.as_str())
-    .bind(idempotency.path_template.as_str())
-    .bind(idempotency.key.as_str())
-    .bind(idempotency.request_fingerprint.as_str())
-    .bind(operation_id.as_uuid())
-    .bind(DEFAULT_IDEMPOTENCY_TTL_HOURS.to_string())
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    operation_store::idempotency::insert_for_operation(
+        &mut **tx,
+        Uuid::now_v7(),
+        api_product.as_str(),
+        idempotency.store_key(org_id),
+        idempotency.request_fingerprint.as_str(),
+        operation_id.as_uuid(),
+        DEFAULT_IDEMPOTENCY_TTL_HOURS,
+    )
+    .await
 }
 
 /// Serialize creating or joining the active `kind` operation for one sandbox.
@@ -2712,13 +2389,6 @@ async fn lock_sandbox_queue(
     Ok(())
 }
 
-/// An active operation [`joinable_active_sandbox_operation`] found.
-struct JoinableOperation {
-    operation_id: Uuid,
-    /// No actor: the system's, as a command or process session queues it.
-    system: bool,
-}
-
 /// The queued or running `kind` operation on a sandbox that a new request
 /// joins, under [`lock_active_sandbox_operation`]. Only one that nothing else
 /// in the sandbox's queue is queued behind, in the dispatcher's order (a fork
@@ -2738,44 +2408,15 @@ async fn joinable_active_sandbox_operation(
     target_id: &str,
     joiner: Option<UserId>,
 ) -> Result<Option<JoinableOperation>, sqlx::Error> {
-    let joinable = sqlx::query_as::<_, (Uuid, bool)>(sql!(
-        "SELECT active.operation_id, active.actor_user_id IS NULL
-           FROM public_operations active
-          WHERE active.org_id = $1
-            AND active.kind = $3
-            AND active.target_type = 'sandbox'
-            AND active.target_id = $2
-            AND active.state IN ('queued', 'running')
-            AND ($4::UUID IS NULL
-                 OR (active.api_product = 'native'
-                     AND (active.actor_user_id = $4
-                          OR (active.actor_user_id IS NULL AND active.state = 'queued'))))
-            AND NOT EXISTS (
-                SELECT 1
-                  FROM public_operations later
-                 WHERE later.org_id = active.org_id
-                   AND later.target_type = 'sandbox'
-                   AND later.target_id = active.target_id
-                   AND later.kind <> active.kind
-                   AND later.kind <> ALL($5)
-                   AND later.state IN ('queued', 'running')
-                   AND (later.requested_at, later.operation_id)
-                       > (active.requested_at, active.operation_id)
-            )
-          ORDER BY active.requested_at, active.operation_id
-          LIMIT 1"
-    ))
-    .bind(org_id)
-    .bind(target_id)
-    .bind(kind.as_str())
-    .bind(joiner)
-    .bind(outside_sandbox_queue_labels())
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(joinable.map(|(operation_id, system)| JoinableOperation {
-        operation_id,
-        system,
-    }))
+    operation_store::operations::joinable_on_sandbox(
+        &mut **tx,
+        org_id,
+        kind,
+        target_id,
+        joiner,
+        OUTSIDE_SANDBOX_QUEUE_KINDS,
+    )
+    .await
 }
 
 fn new_claim_token() -> String {
@@ -3442,45 +3083,22 @@ async fn expire_overdue_queued_operations(
         .iter()
         .map(|expiry| Json(expired_event(expiry)))
         .collect::<Vec<_>>();
-    sqlx::query(sql!(
-        "UPDATE public_operations o
-         SET state = $1,
-             completed_at = NOW(),
-             progress_message = expiry.progress_message,
-             terminal_error_code = expiry.terminal_error_code,
-             terminal_error_json = expiry.terminal_error_json,
-             payload_json = CASE WHEN o.kind = 'create_sandbox'
-                 THEN o.payload_json #- '{federated_create,service_grant_base64}'::text[]
-                 ELSE o.payload_json END,
-             updated_at = NOW()
-         FROM UNNEST($2::UUID[], $3::TEXT[], $4::TEXT[], $5::JSONB[])
-              AS expiry(operation_id, progress_message, terminal_error_code, terminal_error_json)
-         WHERE o.operation_id = expiry.operation_id"
-    ))
-    .bind(OperationState::Expired.as_str())
-    .bind(&ids)
-    .bind(&messages)
-    .bind(&codes)
-    .bind(&errors)
-    .execute(&mut *tx)
+    operation_store::operations::expire_each(
+        &mut *tx,
+        operation_store::operations::Expiries {
+            operation_ids: &ids,
+            progress_messages: &messages,
+            terminal_error_codes: &codes,
+            terminal_error_jsons: &errors,
+        },
+    )
     .await?;
-    sqlx::query(sql!(
-        "INSERT INTO public_operation_events (operation_id, sequence, event_type, event_json)
-         SELECT expired.operation_id,
-                COALESCE(
-                    (SELECT MAX(event.sequence)
-                     FROM public_operation_events event
-                     WHERE event.operation_id = expired.operation_id),
-                    0
-                ) + 1,
-                $3,
-                expired.event_json
-         FROM UNNEST($1::UUID[], $2::JSONB[]) AS expired(operation_id, event_json)"
-    ))
-    .bind(&ids)
-    .bind(&events)
-    .bind(PublicOperationEventType::Expired.as_str())
-    .execute(&mut *tx)
+    operation_store::events::append_to_each(
+        &mut *tx,
+        &ids,
+        &events,
+        PublicOperationEventType::Expired,
+    )
     .await?;
     tx.commit().await?;
     Ok(overdue)
@@ -3645,23 +3263,11 @@ async fn gc_expired(
     .fetch_all(&mut *tx)
     .await?;
 
-    let dependent_idempotency_rows = sqlx::query_scalar::<_, Uuid>(sql!(
-        "DELETE FROM public_idempotency_records
-         WHERE operation_id = ANY($1::UUID[])
-         RETURNING id"
-    ))
-    .bind(&operation_ids)
-    .fetch_all(&mut *tx)
-    .await?;
+    let dependent_idempotency_rows =
+        operation_store::idempotency::delete_for_operations(&mut *tx, &operation_ids).await?;
 
-    let operation_rows = sqlx::query_scalar::<_, Uuid>(sql!(
-        "DELETE FROM public_operations
-         WHERE operation_id = ANY($1::UUID[])
-         RETURNING operation_id"
-    ))
-    .bind(&operation_ids)
-    .fetch_all(&mut *tx)
-    .await?;
+    let operation_rows =
+        operation_store::operations::delete_by_ids(&mut *tx, &operation_ids).await?;
 
     tx.commit().await?;
 
@@ -3803,27 +3409,7 @@ pub async fn append_operation_event_tx(
     event_type: PublicOperationEventType,
     event_json: serde_json::Value,
 ) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
-        "WITH next_sequence AS (
-             SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-             FROM public_operation_events
-             WHERE operation_id = $1
-         )
-         INSERT INTO public_operation_events (
-             operation_id,
-             sequence,
-             event_type,
-             event_json
-         )
-         SELECT $1, sequence, $2, $3
-         FROM next_sequence
-         RETURNING sequence"
-    ))
-    .bind(operation_id.as_uuid())
-    .bind(event_type.as_str())
-    .bind(Json(event_json))
-    .fetch_one(&mut **tx)
-    .await
+    operation_store::events::append(&mut **tx, operation_id, event_type, event_json).await
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3874,52 +3460,11 @@ struct PublicIdempotencyRecord {
 }
 
 #[derive(Debug, FromRow)]
-struct ClaimedPublicOperationRow {
-    operation_id: Uuid,
-    org_id: OrgId,
-    actor_user_id: Option<UserId>,
-    api_product: String,
-    kind: String,
-    target_type: Option<String>,
-    target_id: Option<String>,
-    payload_json: Json<serde_json::Value>,
-    attempts: i32,
-    claim_generation: i64,
-    traceparent: Option<String>,
-    age_at_first_claim_secs: Option<i64>,
-}
-
-#[derive(Debug, FromRow)]
 struct DispatcherClaimRow {
     #[sqlx(flatten)]
     operation: ClaimedPublicOperationRow,
     queue_wait_ms: f64,
     reclaimed: bool,
-}
-
-/// One whole operation, as [`PUBLIC_OPERATION_COLUMNS`] selects it. Both the
-/// public and the admin record are built from it.
-#[derive(Debug, FromRow)]
-struct PublicOperationRow {
-    operation_id: Uuid,
-    org_id: OrgId,
-    actor_user_id: Option<UserId>,
-    api_product: String,
-    kind: String,
-    target_type: Option<String>,
-    target_id: Option<String>,
-    state: String,
-    progress_message: String,
-    terminal_error_code: Option<String>,
-    terminal_error_json: Option<Json<serde_json::Value>>,
-    result_json: Option<Json<serde_json::Value>>,
-    attempts: i32,
-    requested_at: OffsetDateTime,
-    next_attempt_at: OffsetDateTime,
-    created_at: OffsetDateTime,
-    started_at: Option<OffsetDateTime>,
-    completed_at: Option<OffsetDateTime>,
-    updated_at: OffsetDateTime,
 }
 
 /// The `target_id` values an admin filter on `target_id` matches: the typed
@@ -3960,128 +3505,103 @@ fn sandbox_target_id_forms(sandbox_id: SandboxId) -> [String; 2] {
     ]
 }
 
-/// [`PublicOperationRow`] plus the columns only the admin record has: the
-/// payload's `requested_by_user_id` and the joined actor's email.
-#[derive(Debug, FromRow)]
-struct AdminPublicOperationRow {
-    #[sqlx(flatten)]
-    operation: PublicOperationRow,
-    requested_by_user_id: Option<String>,
-    actor_email: Option<String>,
-}
-
-#[derive(Debug, FromRow)]
-struct PublicOperationEventRow {
-    operation_id: Uuid,
-    sequence: i64,
-    event_type: String,
-    event_json: Json<serde_json::Value>,
-    created_at: OffsetDateTime,
-}
-
 #[derive(Debug, FromRow)]
 struct PublicIdempotencyRow {
     operation_id: Option<Uuid>,
     request_fingerprint: String,
 }
 
-impl TryFrom<PublicOperationRow> for PublicOperationRecord {
-    type Error = PublicOperationStoreError;
-
-    fn try_from(row: PublicOperationRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: OperationId::from_uuid(row.operation_id),
-            kind: parse_stored_enum("kind", &row.kind)?,
-            state: parse_stored_enum("state", &row.state)?,
-            target_type: row
-                .target_type
-                .as_deref()
-                .map(|value| parse_stored_enum("target_type", value))
-                .transpose()?,
-            target_id: row.target_id,
-            progress_message: row.progress_message,
-            terminal_error_code: row
-                .terminal_error_code
-                .as_deref()
-                .map(|value| parse_stored_enum("terminal_error_code", value))
-                .transpose()?,
-            terminal_error: row.terminal_error_json.map(|value| value.0),
-            result: row
-                .result_json
-                .map(|value| serde_json::from_value::<PublicOperationResult>(value.0))
-                .transpose()
-                .map_err(PublicOperationStoreError::InvalidStoredResult)?,
-            created_at: row.created_at,
-            started_at: row.started_at,
-            completed_at: row.completed_at,
-            updated_at: row.updated_at,
-        })
-    }
+fn public_operation_record(
+    row: operation_store::operations::PublicOperationRow,
+) -> Result<PublicOperationRecord, PublicOperationStoreError> {
+    Ok(PublicOperationRecord {
+        id: OperationId::from_uuid(row.operation_id),
+        kind: parse_stored_enum("kind", &row.kind)?,
+        state: parse_stored_enum("state", &row.state)?,
+        target_type: row
+            .target_type
+            .as_deref()
+            .map(|value| parse_stored_enum("target_type", value))
+            .transpose()?,
+        target_id: row.target_id,
+        progress_message: row.progress_message,
+        terminal_error_code: row
+            .terminal_error_code
+            .as_deref()
+            .map(|value| parse_stored_enum("terminal_error_code", value))
+            .transpose()?,
+        terminal_error: row.terminal_error_json.map(|value| value.0),
+        result: row
+            .result_json
+            .map(|value| serde_json::from_value::<PublicOperationResult>(value.0))
+            .transpose()
+            .map_err(PublicOperationStoreError::InvalidStoredResult)?,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        completed_at: row.completed_at,
+        updated_at: row.updated_at,
+    })
 }
 
-impl TryFrom<AdminPublicOperationRow> for AdminPublicOperationRecord {
-    type Error = PublicOperationStoreError;
-
-    fn try_from(row: AdminPublicOperationRow) -> Result<Self, Self::Error> {
-        let requested_by_user_id = row
-            .requested_by_user_id
-            .map(|value| {
-                value
-                    .parse::<UserId>()
-                    .map_err(|_| PublicOperationStoreError::InvalidStoredEnum {
-                        field: "requested_by_user_id",
-                        value,
-                    })
-            })
-            .transpose()?;
-        let actor_email = row.actor_email;
-        let row = row.operation;
-        Ok(Self {
-            id: OperationId::from_uuid(row.operation_id),
-            org_id: row.org_id,
-            actor_user_id: row.actor_user_id,
-            actor_email,
-            api_product: parse_stored_enum("api_product", &row.api_product)?,
-            kind: parse_stored_enum("kind", &row.kind)?,
-            state: parse_stored_enum("state", &row.state)?,
-            target_type: row
-                .target_type
-                .as_deref()
-                .map(|value| parse_stored_enum("target_type", value))
-                .transpose()?,
-            target_id: row.target_id,
-            requested_by_user_id,
-            progress_message: row.progress_message,
-            terminal_error_code: row
-                .terminal_error_code
-                .as_deref()
-                .map(|value| parse_stored_enum("terminal_error_code", value))
-                .transpose()?,
-            terminal_error: row.terminal_error_json.map(|value| value.0),
-            result: row.result_json.map(|value| value.0),
-            attempts: row.attempts,
-            requested_at: row.requested_at,
-            next_attempt_at: row.next_attempt_at,
-            created_at: row.created_at,
-            started_at: row.started_at,
-            completed_at: row.completed_at,
-            updated_at: row.updated_at,
+fn admin_public_operation_record(
+    row: operation_store::operations::AdminPublicOperationRow,
+) -> Result<AdminPublicOperationRecord, PublicOperationStoreError> {
+    let requested_by_user_id = row
+        .requested_by_user_id
+        .map(|value| {
+            value
+                .parse::<UserId>()
+                .map_err(|_| PublicOperationStoreError::InvalidStoredEnum {
+                    field: "requested_by_user_id",
+                    value,
+                })
         })
-    }
+        .transpose()?;
+    let actor_email = row.actor_email;
+    let row = row.operation;
+    Ok(AdminPublicOperationRecord {
+        id: OperationId::from_uuid(row.operation_id),
+        org_id: row.org_id,
+        actor_user_id: row.actor_user_id,
+        actor_email,
+        api_product: parse_stored_enum("api_product", &row.api_product)?,
+        kind: parse_stored_enum("kind", &row.kind)?,
+        state: parse_stored_enum("state", &row.state)?,
+        target_type: row
+            .target_type
+            .as_deref()
+            .map(|value| parse_stored_enum("target_type", value))
+            .transpose()?,
+        target_id: row.target_id,
+        requested_by_user_id,
+        progress_message: row.progress_message,
+        terminal_error_code: row
+            .terminal_error_code
+            .as_deref()
+            .map(|value| parse_stored_enum("terminal_error_code", value))
+            .transpose()?,
+        terminal_error: row.terminal_error_json.map(|value| value.0),
+        result: row.result_json.map(|value| value.0),
+        attempts: row.attempts,
+        requested_at: row.requested_at,
+        next_attempt_at: row.next_attempt_at,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        completed_at: row.completed_at,
+        updated_at: row.updated_at,
+    })
 }
 
-impl TryFrom<PublicOperationEventRow> for PublicOperationEvent {
-    type Error = PublicOperationStoreError;
-
-    fn try_from(row: PublicOperationEventRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            operation_id: OperationId::from_uuid(row.operation_id),
-            sequence: row.sequence,
-            event_type: parse_stored_enum("event_type", &row.event_type)?,
-            event: row.event_json.0,
-            created_at: row.created_at,
-        })
-    }
+fn public_operation_event(
+    row: operation_store::events::PublicOperationEventRow,
+) -> Result<PublicOperationEvent, PublicOperationStoreError> {
+    Ok(PublicOperationEvent {
+        operation_id: OperationId::from_uuid(row.operation_id),
+        sequence: row.sequence,
+        event_type: parse_stored_enum("event_type", &row.event_type)?,
+        event: row.event_json.0,
+        created_at: row.created_at,
+    })
 }
 
 impl TryFrom<PublicIdempotencyRow> for PublicIdempotencyRecord {

@@ -71,20 +71,14 @@ impl PublicResponseAdmission {
             idempotency.key,
         )
         .await?;
-        sqlx::query(sql!(
-            "INSERT INTO public_idempotency_records
-             (id, org_id, api_product, method, path_template, idempotency_key,
-              request_fingerprint, response_json)
-             VALUES ($1, $2, 'native', $3, $4, $5, $6, $7)"
-        ))
-        .bind(Uuid::now_v7())
-        .bind(self.org_id)
-        .bind(idempotency.method.as_str())
-        .bind(idempotency.path_template.as_str())
-        .bind(idempotency.key.as_str())
-        .bind(idempotency.request_fingerprint.as_str())
-        .bind(Json(response))
-        .execute(&mut *self.tx)
+        operation_store::idempotency::insert_reply(
+            &mut *self.tx,
+            Uuid::now_v7(),
+            ApiProduct::Native.as_str(),
+            idempotency.store_key(self.org_id),
+            idempotency.request_fingerprint.as_str(),
+            &response,
+        )
         .await?;
         self.tx.commit().await?;
         Ok(())

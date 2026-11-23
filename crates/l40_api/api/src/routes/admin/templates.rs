@@ -1026,17 +1026,7 @@ async fn delete_operation_is_active(
     pool: &sqlx::PgPool,
     operation_id: pplx_space_public_api::OperationId,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-             SELECT 1
-             FROM public_operations
-             WHERE operation_id = $1
-               AND state IN ('queued', 'running')
-         )"
-    ))
-    .bind(operation_id.as_uuid())
-    .fetch_one(pool)
-    .await
+    pplx_space_public_operation_store::operations::is_active(pool, operation_id).await
 }
 
 pub async fn delete_template(

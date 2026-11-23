@@ -4,6 +4,7 @@ use pplx_space_snapshot_model::SnapshotId;
 use std::time::Duration;
 
 use pplx_space_public_api::{OperationId, OperationState};
+use pplx_space_public_operation_store as operation_store;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::no_newer_full_snapshot;
 use pplx_space_snapshot_model::LocalArtifactId;
@@ -200,26 +201,20 @@ impl ForkOperationStore {
         .bind(generation)
         .execute(&mut *tx)
         .await?;
-        let rows = sqlx::query_as::<_, (Uuid, Json<serde_json::Value>)>(sql!(
-            "SELECT operation_id, payload_json
-             FROM public_operations
-             WHERE org_id = $1
-               AND kind = 'fork_sandbox'
-               AND target_id IN ($2, $5)
-               AND state IN ($3, $4)
-             ORDER BY created_at, operation_id"
-        ))
-        .bind(operation.org_id)
-        .bind(payload.source_sandbox_id().to_string())
-        .bind(OperationState::Queued.as_str())
-        .bind(OperationState::Running.as_str())
         // Forks of one source name it by either id form; see
         // `fork_operations::fork_operation_target_id`.
-        .bind(pplx_space_public_api::PublicSandboxId::from(payload.source_sandbox_id()).to_string())
-        .fetch_all(&mut *tx)
+        let rows = operation_store::operations::active_forks_of_source(
+            &mut *tx,
+            operation.org_id,
+            payload.source_sandbox_id(),
+        )
         .await?;
         let mut candidates = Vec::new();
-        for (candidate_id, candidate_json) in rows {
+        for operation_store::operations::ActiveForkRow {
+            operation_id: candidate_id,
+            payload_json: candidate_json,
+        } in rows
+        {
             let Ok(candidate) = decode_fork_payload(candidate_json.0) else {
                 continue;
             };
@@ -289,16 +284,12 @@ impl ForkOperationStore {
         expected_generation: i64,
         expected_lifecycle: ForkSourceLifecycle,
     ) -> Result<CaptureLeaderObservation, ForkOperationStoreError> {
-        let row = sqlx::query_as::<_, (String, Json<serde_json::Value>)>(sql!(
-            "SELECT state, payload_json
-             FROM public_operations
-             WHERE org_id = $1 AND operation_id = $2 AND kind = 'fork_sandbox'"
-        ))
-        .bind(org_id)
-        .bind(leader_id.as_uuid())
-        .fetch_optional(self.pool())
-        .await?;
-        let Some((state, leader_json)) = row else {
+        let row = operation_store::operations::fork_state(self.pool(), org_id, leader_id).await?;
+        let Some(operation_store::operations::ForkStateRow {
+            state,
+            payload_json: leader_json,
+        }) = row
+        else {
             return Ok(CaptureLeaderObservation::Missing);
         };
         let leader = decode_fork_payload(leader_json.0)?;

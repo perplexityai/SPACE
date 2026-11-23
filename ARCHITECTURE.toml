@@ -391,6 +391,7 @@ pplx-space-node-registration-store = [
   "pplx-space-credmgr",
   "pplx-space-internal-api-server",
 ]
+pplx-space-node-runtime-manager-store = ["pplx-space-node-runtime-manager"]
 pplx-space-node-status-store = [
   "pplx-space-api",
   "pplx-space-runtime-upgrade-campaign-store",
@@ -405,6 +406,7 @@ pplx-space-postgres-pool = [
   "pplx-space-credmgr",
   "pplx-space-internal-api-server",
 ]
+pplx-space-public-operation-store = ["pplx-space-api"]
 pplx-space-runtime-environment-catalog-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",

@@ -151,6 +151,8 @@ members = [
     "crates/l30_storage/data/plane/session/store",
     "crates/l30_storage/federated/grant/store",
     "crates/l30_storage/firewall/rules/store",
+    "crates/l30_storage/public/operation/store",
+    "crates/l30_storage/node/runtime/manager/store",
     "crates/l40_api/ingress/admission",
     "crates/l10_foundation/metrics/emit",
     "crates/l10_foundation/grpc/metrics",
@@ -433,6 +435,8 @@ pplx-space-events = { path = "crates/l20_domain/events" }
 pplx-space-data-plane-session-store = { path = "crates/l30_storage/data/plane/session/store" }
 pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/store" }
 pplx-space-firewall-rules-store = { path = "crates/l30_storage/firewall/rules/store" }
+pplx-space-public-operation-store = { path = "crates/l30_storage/public/operation/store" }
+pplx-space-node-runtime-manager-store = { path = "crates/l30_storage/node/runtime/manager/store" }
 pplx-space-ingress-admission = { path = "crates/l40_api/ingress/admission" }
 pplx-space-credmgr = { path = "crates/l40_api/credmgr/server" }
 pplx-space-credmgr-client = { path = "crates/l40_api/credmgr/client" }
