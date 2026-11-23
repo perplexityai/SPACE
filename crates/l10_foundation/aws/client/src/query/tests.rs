@@ -186,6 +186,12 @@ async fn signs_the_target_that_reqwest_sends() {
         ("http://127.0.0.1:{port}/café", "/caf%C3%A9/"),
         // Catches signing the written host: url lowercases it.
         ("http://LOCALHOST:{port}/", "/"),
+        // Catches refusing the dot segments url and SigV4 both resolve.
+        ("http://127.0.0.1:{port}/a/./../b", "/b/"),
+        // Catches checking the written path rather than SigV4's resolution of it.
+        ("http://127.0.0.1:{port}/a\\b/%2e/../../c", "/c/"),
+        // Catches refusing escapes url keeps: it resolves only whole `%2e` segments and `\`.
+        ("http://127.0.0.1:{port}/a%2E%5Cb", "/a%2E%5Cb/"),
     ] {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let endpoint =
@@ -222,9 +228,10 @@ async fn refuses_endpoints_before_sending() {
         (" http://127.0.0.1:9/x", true),
         ("http://127.0.0.1:9/a\tb", true),
         ("http:127.0.0.1:9/normal", true),
-        // Catches each case of the dot-segment and backslash guard.
-        ("http://127.0.0.1:9/one/../two", false),
-        ("http://127.0.0.1:9/a/./b", false),
+        // Catches signing where url resolves `..` unlike SigV4.
+        ("http://127.0.0.1:9/x/E|/../y", false),
+        ("http://127.0.0.1:9/a//../b", false),
+        // Catches each case of the `%2e` and backslash guard.
         ("http://127.0.0.1:9/one/%2e%2e/two", false),
         ("http://127.0.0.1:9/one/.%2e/two", false),
         ("http://127.0.0.1:9/one/%2e./two", false),
