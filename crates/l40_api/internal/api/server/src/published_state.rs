@@ -53,6 +53,9 @@ use pplx_space_template_mgr_client::proto::SnapshotInfo;
 
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use pplx_space_sandbox_store::ingest::SuspendedFinalizationCandidate;
+use pplx_space_sandbox_store::published_quarantine_candidates::{
+    self, PublishedQuarantineCandidate,
+};
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
 
@@ -1997,49 +2000,29 @@ pub async fn publish_sandbox_states_with_retirement(
         // automated cleanup until a healer or operator decides the next step.
         // Deleted still wins, but direct-managed rows are allowed to publish
         // the same hold state as Kubernetes-managed rows.
-        let claimed_rows =
-            sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, Uuid, Uuid)>(sql!(
-                "SELECT
-                     s.id,
-                     s.lifecycle,
-                     input.failure_reason,
-                     input.source,
-                     input.reason_code,
-                     input.quarantine_id,
-                     input.history_id
-                 FROM sandboxes s
-                 JOIN jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     failure_reason TEXT,
-                     source TEXT,
-                     reason_code TEXT,
-                     quarantine_id UUID,
-                     history_id UUID
-                 ) ON input.sandbox_id = s.id
-                 WHERE s.active_node_id = $1
-                   AND LOWER(TRIM(s.lifecycle)) NOT IN ('quarantined', 'deleted')"
-            ))
-            .bind(node_id)
-            .bind(quarantine_rows_json.clone())
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|err| Status::internal(format!("claim quarantined sandboxes: {err}")))?;
+        let claimed_rows = published_quarantine_candidates::list(
+            &mut *conn,
+            node_id,
+            quarantine_rows_json.clone(),
+        )
+        .await
+        .map_err(|err| Status::internal(format!("claim quarantined sandboxes: {err}")))?;
         let claimed = claimed_rows
             .into_iter()
             .map(
-                |(
-                    sandbox_id,
-                    from_lifecycle,
-                    failure_reason,
-                    source,
-                    reason_code,
-                    quarantine_id,
-                    history_id,
-                )|
+                |PublishedQuarantineCandidate {
+                     id,
+                     lifecycle,
+                     failure_reason,
+                     source,
+                     reason_code,
+                     quarantine_id,
+                     history_id,
+                 }|
                  -> Result<_, Status> {
                     Ok(ClaimedQuarantineProjection {
-                        sandbox_id: SandboxId::from_uuid(sandbox_id),
-                        from_lifecycle,
+                        sandbox_id: SandboxId::from_uuid(id),
+                        from_lifecycle: lifecycle,
                         failure_reason,
                         source: source.parse().map_err(|error| {
                             Status::internal(format!("parse claimed quarantine source: {error}"))

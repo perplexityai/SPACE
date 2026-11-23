@@ -635,9 +635,7 @@ async fn a_re_placement_every_worker_excludes_waits_unschedulable_and_backs_off(
         !swept.iter().any(|(id, _)| *id == sandbox_id),
         "the backoff must keep the re-placement out of the next sweep: {swept:?}"
     );
-    let pending: i64 = sqlx::query_scalar(stopped_replacements_pending_query())
-        .fetch_one(pool)
-        .await?;
+    let pending = pplx_space_sandbox_store::stopped_replacements::pending(pool).await?;
     assert_eq!(
         pending, 1,
         "the pending gauge must count the stuck re-placement"

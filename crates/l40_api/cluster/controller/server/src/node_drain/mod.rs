@@ -1488,7 +1488,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// a *work list*: it honours the retry backoff, so a re-placement that
     /// keeps failing leaves it for up to the backoff cap. Deriving the gauge
     /// from that list would make the alert go quiet exactly as the incident got
-    /// worse. See [`store::stopped_replacements_pending_query`].
+    /// worse. See
+    /// [`pplx_space_sandbox_store::stopped_replacements::pending`].
     fn count_stopped_replacements_pending(
         &self,
     ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;

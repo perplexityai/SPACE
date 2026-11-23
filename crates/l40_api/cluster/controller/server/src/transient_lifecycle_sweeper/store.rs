@@ -806,17 +806,7 @@ impl SweepSink for SubstrateSweepSink {
                 retire_reverted_restore_execution(&mut tx, sandbox_id, pod_fence).await?
             }
             RetireFence::NoExecution => {
-                !sqlx::query_scalar::<_, bool>(sql!(
-                    "SELECT EXISTS (
-                     SELECT 1
-                       FROM sandbox_k8s_executions
-                      WHERE sandbox_id = $1
-                        AND active
-                 )"
-                ))
-                .bind(sandbox_id)
-                .fetch_one(&mut *tx)
-                .await?
+                !pplx_space_sandbox_store::k8s_executions::exists(&mut *tx, sandbox_id).await?
             }
             // The candidate select always observes one of the two above; a
             // caller that observed nothing can't name the execution to retire.

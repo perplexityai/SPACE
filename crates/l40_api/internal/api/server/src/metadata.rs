@@ -112,20 +112,6 @@ pub(super) struct TemplateDesiredStateRow {
     pub(super) held_here: bool,
 }
 
-/// One row per requested id that exists. The desired-state payload
-/// columns are conditionally projected: populated only when the row is
-/// assigned to the querying node, NULL otherwise — rows that exist but
-/// live elsewhere are fetched solely for the exists/deleted partition,
-/// and shipping their jsonb policy fleet-wide would multiply the result
-/// bytes ~30x for data the handler discards.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SandboxDesiredStateRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) assigned_here: bool,
-    pub(super) snapshots_enabled_desired: Option<bool>,
-    pub(super) auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
-}
-
 #[derive(Debug, Clone, FromRow)]
 pub(super) struct SandboxPortExposureDesiredStateRow {
     pub(super) sandbox_id: SandboxId,

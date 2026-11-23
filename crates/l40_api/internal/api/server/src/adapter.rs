@@ -1259,19 +1259,11 @@ impl ClusterApi for ClusterApiService {
         // payload columns are projected only for assigned-here rows; other
         // rows contribute 17 bytes to the partition instead of their
         // jsonb policy.
-        let rows = sqlx::query_as::<_, SandboxDesiredStateRow>(sql!(
-            "SELECT id AS sandbox_id,
-                    (active_node_id = $2) IS TRUE AS assigned_here,
-                    CASE WHEN active_node_id = $2
-                         THEN snapshots_enabled_desired END AS snapshots_enabled_desired,
-                    CASE WHEN active_node_id = $2
-                         THEN auto_lifecycle_json END AS auto_lifecycle_json
-             FROM sandboxes
-             WHERE id = ANY($1)"
-        ))
-        .bind(&sandbox_ids)
-        .bind(origin.id)
-        .fetch_all(&self.pool)
+        let rows = pplx_space_sandbox_store::node_desired_state::partition(
+            &self.pool,
+            &sandbox_ids,
+            origin.id,
+        )
         .await
         .map_err(|err| Status::internal(format!("query sandbox desired state: {err}")))?;
 

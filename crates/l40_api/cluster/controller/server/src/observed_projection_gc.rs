@@ -213,14 +213,7 @@ impl ObservedProjectionDbStore {
     /// The newest observed-row id, used as a lap's high-water bound. `None`
     /// means the table is empty and there is nothing to sweep.
     async fn newest_observed_sandbox_id(&self) -> Result<Option<Uuid>, sqlx::Error> {
-        sqlx::query_scalar(sql!(
-            "SELECT sandbox_id
-             FROM sandbox_observed_states
-             ORDER BY sandbox_id DESC
-             LIMIT 1"
-        ))
-        .fetch_optional(&self.pool)
-        .await
+        Ok(pplx_space_sandbox_store::observed_states::newest(&self.pool).await?)
     }
 
     /// Measure the next sweep window over `sandbox_observed_states`: the id
@@ -235,18 +228,12 @@ impl ObservedProjectionDbStore {
         through: Uuid,
         window: i64,
     ) -> Result<Option<WindowRange<Uuid>>, sqlx::Error> {
-        let ids: Vec<Uuid> = sqlx::query_scalar(sql!(
-            "SELECT sandbox_id
-             FROM sandbox_observed_states
-             WHERE sandbox_id > $1
-               AND sandbox_id <= $2
-             ORDER BY sandbox_id
-             LIMIT $3"
-        ))
-        .bind(cursor)
-        .bind(through)
-        .bind(window.max(0))
-        .fetch_all(&self.pool)
+        let ids = pplx_space_sandbox_store::observed_states::window(
+            &self.pool,
+            cursor,
+            through,
+            window.max(0),
+        )
         .await?;
 
         let Some(last) = ids.last().copied() else {

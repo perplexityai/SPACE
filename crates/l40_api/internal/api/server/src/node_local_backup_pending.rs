@@ -163,6 +163,7 @@ use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, queued_artifact_recoverable_without_node,
 };
+use pplx_space_sandbox_store::node_local_backup_pending::PendingBackupDepth;
 use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, LocalArtifactIdParseError};
 use pplx_space_sql_locator::sql;
 use tonic::Status;
@@ -586,15 +587,14 @@ pub(super) async fn reconcile(
 
     // Counted after the delete, so what remains absent is exactly the
     // population that could not be confirmed durable.
-    let (depth, retained_absent): (i64, i64) = sqlx::query_as(sql!(
-        "SELECT COUNT(*),
-                COUNT(*) FILTER (WHERE NOT (sandbox_id = ANY($2)))
-           FROM node_local_backup_pending
-          WHERE node_id = $1"
-    ))
-    .bind(node_id.as_uuid())
-    .bind(&reported_sandbox_ids)
-    .fetch_one(&mut *conn)
+    let PendingBackupDepth {
+        depth,
+        retained_absent,
+    } = pplx_space_sandbox_store::node_local_backup_pending::depth(
+        &mut *conn,
+        node_id,
+        &reported_sandbox_ids,
+    )
     .await
     .map_err(|err| Status::internal(format!("count mirrored pending local backups: {err}")))?;
 

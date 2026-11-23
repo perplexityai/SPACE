@@ -269,14 +269,7 @@ impl PodLessHold {
 
 /// One pod name the sandbox has had, with the namespace and generation its
 /// execution row recorded for it.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub(crate) struct PodRef {
-    /// Decoded as [`ExecutionGeneration`], so a stored value that isn't one
-    /// fails the database read rather than reaching the node.
-    pub(crate) generation: ExecutionGeneration,
-    pub(crate) pod_namespace: String,
-    pub(crate) pod_name: String,
-}
+pub(crate) use pplx_space_sandbox_store::k8s_executions::ExecutionPodRef as PodRef;
 
 /// Uncached pod reads, behind a seam so the absence decision can be tested
 /// without a cluster.
@@ -357,15 +350,7 @@ pub(crate) async fn pod_refs(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> Result<Vec<PodRef>, sqlx::Error> {
-    sqlx::query_as(sql!(
-        "SELECT generation, pod_namespace, pod_name
-           FROM sandbox_k8s_executions
-          WHERE sandbox_id = $1
-          ORDER BY generation DESC"
-    ))
-    .bind(sandbox_id)
-    .fetch_all(pool)
-    .await
+    Ok(pplx_space_sandbox_store::k8s_executions::newest_first(pool, sandbox_id).await?)
 }
 
 /// The row-state guards, read once before the pod reads and again under the

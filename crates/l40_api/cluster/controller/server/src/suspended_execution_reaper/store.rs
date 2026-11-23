@@ -109,15 +109,13 @@ impl RetireSink for ExecutionDbStore {
     }
 
     async fn current_max_sandbox_id(&self) -> Result<Option<SandboxId>, sqlx::Error> {
-        // Pre-PG-15 has no `max(uuid)` aggregate, so ORDER BY DESC LIMIT 1
-        // over the primary key index instead.
-        let row: Option<(SandboxId,)> = sqlx::query_as(sql!(
-            "SELECT id FROM sandboxes WHERE managed_by = $1 ORDER BY id DESC LIMIT 1"
-        ))
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(id,)| id))
+        Ok(
+            pplx_space_sandbox_store::sandbox_id_bounds::newest_managed_by(
+                &self.pool,
+                SubstrateKind::Kubernetes,
+            )
+            .await?,
+        )
     }
 
     /// One transaction, mirroring the API-driven suspend's
