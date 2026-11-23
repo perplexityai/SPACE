@@ -8437,6 +8437,14 @@ mod kubernetes_tests {
             .fetch_one(&pool)
             .await?;
             assert_eq!(row, ("running".to_owned(), Some(expected_ip.to_owned())));
+            // A node report for a replaced pod is not written.
+            assert_eq!(
+                substrate
+                    .store
+                    .persist_node_reported_pod_ip(sandbox_id, 1, "replaced-uid", "10.0.0.6", None)
+                    .await?,
+                None
+            );
             // A node write committing late does not replace the recorded IP.
             assert_eq!(
                 substrate

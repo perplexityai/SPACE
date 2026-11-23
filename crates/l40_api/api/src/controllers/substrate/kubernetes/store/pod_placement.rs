@@ -87,6 +87,9 @@ impl K8sStore {
         else {
             return Ok(None);
         };
+        if pod_ip.reports_another_pod(&tracked, pod_uid) {
+            return Ok(None);
+        }
         if self.record_after(&tracked, pod_uid, pod_client).is_some() {
             // The record has to change, which needs the `sandboxes` row lock
             // taken before the execution row's: start over in that order,
@@ -139,6 +142,9 @@ impl K8sStore {
                 .db_context("failed to commit pod attribution transaction")?;
             return Ok(None);
         };
+        if pod_ip.reports_another_pod(&tracked, pod_uid) {
+            return Ok(None);
+        }
         let resulting = self
             .write_tracked_pod_in(
                 &mut tx, sandbox_id, generation, &tracked, pod_uid, pod_ip, pod_client,
@@ -435,4 +441,20 @@ impl K8sStore {
 enum ObservedPodIp<'a> {
     Published(Option<&'a str>),
     NodeReported(&'a str),
+}
+
+impl ObservedPodIp<'_> {
+    /// A node report is for the pod it observed; once the row records a
+    /// different pod UID, it describes a replaced pod and is not written.
+    fn reports_another_pod(
+        self,
+        tracked: &super::runtime_attribution::TrackedPod,
+        pod_uid: Option<&str>,
+    ) -> bool {
+        matches!(self, Self::NodeReported(_))
+            && tracked
+                .pod_uid
+                .as_deref()
+                .is_some_and(|recorded| pod_uid != Some(recorded))
+    }
 }
