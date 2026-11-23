@@ -75,8 +75,13 @@ async fn bind_slots(
     let mut service = service_for_unit_tests().await;
     let count = u32::try_from(states.len()).unwrap();
     service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(count));
+    let kinds = ["uts", "net", "ipc", "cgroup"];
+    assert!(
+        states.len() <= kinds.len(),
+        "more slots than namespace kinds"
+    );
     let mut namespaces = Vec::new();
-    for ((slot, state), kind) in (0..).zip(states).zip(["uts", "net", "ipc", "cgroup"]) {
+    for ((slot, state), kind) in (0..).zip(states).zip(kinds) {
         namespaces.push(host.name(slot, kind));
         set_slot(&service.pool, slot, *state, 1);
     }
@@ -395,7 +400,7 @@ fn attempted(readback: Verification, current: Result<(), Stale>) -> SlotFirewall
 }
 
 // Catches an outcome misreported, a changed target or an uncertain result
-// taken for the other, or anything else that ends.
+// taken for the other, or anything else that ends, in either mode.
 #[tokio::test]
 async fn each_report_is_one_outcome_and_ends_only_drift_or_uncertainty() {
     let cancelled = tokio::spawn(std::future::pending::<()>());
@@ -414,11 +419,19 @@ async fn each_report_is_one_outcome_and_ends_only_drift_or_uncertainty() {
     let inconclusive = || Verification::Inconclusive(String::new());
     let assignment = || Stale::Assignment(NotRunnable::NoAssignment);
     let poisoned = || SlotStoreError::LockPoisoned;
+    let replaced = || {
+        Ok(NamespaceIdentity {
+            device: 1,
+            inode: 2,
+        })
+    };
+    // Whether each ends an `All` binding and a `One` binding.
+    let (neither, one, both) = ((false, false), (false, true), (true, true));
     let rows = [
-        (Outcome::Unknown, Ends::Binding, vec![Err(unknown)]),
+        (Outcome::Unknown, both, vec![Err(unknown)]),
         (
             Outcome::NotRun,
-            Ends::Nothing,
+            neither,
             vec![
                 not_run(NotRun::Busy),
                 not_run(NotRun::ShuttingDown),
@@ -428,7 +441,7 @@ async fn each_report_is_one_outcome_and_ends_only_drift_or_uncertainty() {
         ),
         (
             Outcome::NotRun,
-            Ends::Target,
+            one,
             vec![
                 not_run(NotRun::NoSlot),
                 not_run(ineligible),
@@ -438,39 +451,47 @@ async fn each_report_is_one_outcome_and_ends_only_drift_or_uncertainty() {
         ),
         (
             Outcome::Matched,
-            Ends::Nothing,
+            neither,
             vec![current(Verification::Match)],
         ),
-        (
-            Outcome::Mismatched,
-            Ends::Nothing,
-            vec![current(mismatch())],
-        ),
+        (Outcome::Mismatched, neither, vec![current(mismatch())]),
         (
             Outcome::Inconclusive,
-            Ends::Binding,
+            both,
             vec![
                 current(inconclusive()),
                 attempt(inconclusive(), Err(assignment())),
+                attempt(inconclusive(), Err(Stale::Slot)),
             ],
         ),
-        (Outcome::Stale, Ends::Nothing, vec![stale(assignment())]),
+        (Outcome::Stale, neither, vec![stale(assignment())]),
         (
             Outcome::Stale,
-            Ends::Binding,
+            one,
             vec![
                 stale(Stale::Slot),
-                stale(Stale::SlotStore(poisoned())),
-                stale(Stale::Assignment(NotRunnable::Unavailable(Unavailable))),
                 stale(Stale::Namespace(Err(gone()))),
+                stale(Stale::Namespace(replaced())),
                 attempt(mismatch(), Err(Stale::Slot)),
             ],
         ),
+        (
+            Outcome::Stale,
+            both,
+            vec![
+                stale(Stale::SlotStore(poisoned())),
+                stale(Stale::Assignment(NotRunnable::Unavailable(Unavailable))),
+            ],
+        ),
     ];
-    for (outcome, ends, reports) in rows {
+    for (outcome, (all, one), reports) in rows {
         for report in reports {
-            let (done, ended) = dispatch(&report);
-            assert_eq!((done.outcome(), ended), (outcome, ends), "{report:?}");
+            let (done, ends) = dispatch(&report);
+            let ended = (
+                ends.binding(BoundSlots::All),
+                ends.binding(BoundSlots::One(SLOT)),
+            );
+            assert_eq!((done.outcome(), ended), (outcome, (all, one)), "{report:?}");
         }
     }
 }
@@ -642,9 +663,10 @@ async fn a_pass_keeps_each_slot_and_retries_only_what_never_reached_nft() {
 }
 
 // Catches a ready slot left out, an ineligible one listed, a replaced occupant
-// written or ending the pass, or a slot changed after nft that doesn't end it.
+// written, a slot changed before or while nft ran that ends the pass or is
+// submitted again, or a result nothing can confirm that doesn't end it.
 #[tokio::test]
-async fn a_replaced_slot_ends_only_its_work_and_drift_after_nft_ends_the_binding() {
+async fn a_replaced_slot_ends_only_its_work_and_an_unconfirmed_result_ends_the_binding() {
     use SlotState::{Dirty, Leased, Ready};
     let states = [Leased, Dirty, Leased, Ready];
     let bound = bind_slots(BoundSlots::All, None, None, WAIT, &states).await;
@@ -653,31 +675,59 @@ async fn a_replaced_slot_ends_only_its_work_and_drift_after_nft_ends_the_binding
     };
     // On slot 0's lookup, after listing and before slot 2's.
     let (pool, fake) = (bound.service.pool.clone(), bound.host.clone());
+    let (named, replacement) = oneshot::channel();
     hook(&bound.host.looked_up, move || {
         set_slot(&pool, 2, Leased, 2);
-        fake.name(2, "mnt");
+        let _ = named.send(fake.name(2, "mnt"));
     });
     sync_all(&bound.service, 12).await;
     let matched = Some(Outcome::Matched);
     let outcomes = [(0, matched), (2, Some(Outcome::NotRun)), (3, matched)];
     assert_eq!(passed(&bound.service, 12).await.unwrap(), outcomes);
+    // A redelivery never writes slot 2's new occupant.
+    sync_all(&bound.service, 12).await;
+    assert_eq!(passed(&bound.service, 12).await.unwrap(), outcomes);
     assert_eq!(bound.host.installs(), [first, ready]);
+    let replacement = replacement.await.unwrap();
 
-    // 13's first slot is reset while nft runs, so what its readback shows is moot.
-    let pool = bound.service.pool.clone();
-    hook(&bound.host.installed, move || set_slot(&pool, 0, Dirty, 1));
+    // In 13, slot 0's sandbox is deleted while its nft runs, then slot 2's
+    // namespace is replaced while its own runs. The pass goes on past both, and
+    // since both reached nft, a redelivery runs neither again.
+    let (pool, fake) = (bound.service.pool.clone(), bound.host.clone());
+    let (named, moved) = oneshot::channel();
+    hook(&bound.host.installed, move || {
+        set_slot(&pool, 0, Dirty, 1);
+        let next = fake.clone();
+        hook(&fake.installed, move || {
+            let _ = named.send(next.name(2, "pid"));
+        });
+    });
     sync_all(&bound.service, 13).await;
-    let outcomes = [(0, Some(Outcome::Stale)), (2, None), (3, None)];
+    let stale = Some(Outcome::Stale);
+    let outcomes = [(0, stale), (2, stale), (3, matched)];
     assert_eq!(passed(&bound.service, 13).await.unwrap(), outcomes);
-    let refused = sync(&bound.service, delivery(14)).await.unwrap_err();
+    let replayed = FirewallAssignmentAcceptance::Replayed;
+    assert_eq!(sync_all(&bound.service, 13).await, replayed);
+    assert_eq!(passed(&bound.service, 13).await.unwrap(), outcomes);
+    let installs = [first, ready, first, replacement, ready];
+    assert_eq!(bound.host.installs(), installs);
+    let moved = moved.await.unwrap();
+
+    // 14's store fails while slot 2's nft runs, so nothing confirms its result.
+    let pool = bound.service.pool.clone();
+    hook(&bound.host.installed, move || poison(&pool));
+    sync_all(&bound.service, 14).await;
+    let outcomes = [(2, stale), (3, None)];
+    assert_eq!(passed(&bound.service, 14).await.unwrap(), outcomes);
+    let refused = sync(&bound.service, delivery(15)).await.unwrap_err();
     assert_eq!(refused.code(), Code::FailedPrecondition);
-    assert_eq!(bound.host.installs(), [first, ready, first]);
+    assert_eq!(bound.host.installs(), [&installs[..], &[moved]].concat());
 }
 
 // Catches an older pass that installs its revision after a newer generation is
 // accepted, or a newer pass that doesn't list the pool afresh.
 #[tokio::test]
-async fn a_newer_generation_stops_an_older_pass() {
+async fn a_newer_generation_refuses_an_older_pass_and_lists_again() {
     use SlotState::{Leased, Ready};
     let bound = bind_slots(BoundSlots::All, None, None, WAIT, &[Leased, Leased, Ready]).await;
     // 12 pauses between slot 0's lookup and ownership.

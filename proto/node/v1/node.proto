@@ -462,7 +462,7 @@ enum FirewallSlotDispatchOutcome {
   // Submitted once, but the assignment, slot or namespace changed, or could no
   // longer be confirmed, before the final check.
   FIREWALL_SLOT_DISPATCH_OUTCOME_STALE = 7;
-  // The apply failed, and nft may have run.
+  // The slot apply's job ended without a result, so nft may have run.
   FIREWALL_SLOT_DISPATCH_OUTCOME_UNKNOWN = 8;
 }
 

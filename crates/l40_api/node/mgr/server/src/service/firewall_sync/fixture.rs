@@ -4,13 +4,30 @@
 //! one supersedes older work. Each `All` pass targets the slot incarnations it
 //! lists, and never redirects work to another occupant; a `One` pass's first
 //! attempt to reach nft fixes its target for the binding. Per-slot results live
-//! in memory only; no node-wide receipt. A production binding is meant to
-//! promote this worker.
+//! in memory only; no node-wide receipt.
 //!
-//! A result that may not describe what nft did to its target ends the whole
-//! binding for this process, as does any changed target under `One`. Under
-//! `All`, a target changed before nft reads not run and the pass goes on.
-//! Redelivery re-runs slots that never reached nft; nothing else is resubmitted.
+//! A result that may not describe what nft did ends the whole binding for this
+//! process: a slot job that ended without a result, an inconclusive readback,
+//! or a slot or assignment store that can no longer confirm the result. So
+//! does any changed target under `One`. Under `All`, a changed target whose
+//! readback is conclusive is that slot's result alone, and the pass goes on:
+//! changed before nft it reads not run, and changed while nft ran it reads
+//! stale, since a sandbox delete doesn't wait for the slot's guard. A delivery
+//! after a pass settles re-runs the slots that never reached nft, or lists
+//! again after a failed inventory; a delivery during the pass joins it. Nothing
+//! else is resubmitted, so a stale slot waits for the next generation to list
+//! it again.
+//!
+//! A production binding is expected to build on this worker. First it must
+//! revisit the node-wide end rule, re-listing on retry, and per-slot reporting,
+//! and it must ship behind a default-off switch. Under `All`, nothing signals a
+//! slot left on its earlier ruleset: one the pass never reaches because the
+//! binding ended, one not run when the pass reached it (busy, its namespace
+//! unpinnable, or a store unreadable) until a redelivery, one whose occupant
+//! changed after listing, one replaced while nft ran, one created after
+//! listing, or every slot after an empty first listing, which settles the pass
+//! so same-generation redeliveries never list again. The node-wide reply is the
+//! same in all of these cases.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +66,8 @@ pub(crate) struct FirewallSyncFixture {
     /// `NetworkPool::apply_firewall_rules_with`'s namespace and nft seams.
     pub host: Arc<dyn SlotHost>,
     pub nft: Arc<Nft<'static>>,
-    /// How long a delivery waits for its dispatch.
+    /// How long a `One` delivery waits for its dispatch. No effect under `All`,
+    /// whose reply carries none.
     pub wait: Duration,
 }
 
@@ -75,10 +93,22 @@ enum Left {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Ends {
     Nothing,
-    /// The target changed before nft: a `One` binding ends, an `All` slot doesn't.
+    /// The target changed, before nft or while it ran: a `One` binding ends,
+    /// and an `All` pass goes on.
     Target,
     /// What nft did to the target is uncertain.
     Binding,
+}
+
+impl Ends {
+    /// Whether the result ends a binding of `slots`.
+    fn binding(self, slots: BoundSlots) -> bool {
+        match self {
+            Ends::Binding => true,
+            Ends::Target => matches!(slots, BoundSlots::One(_)),
+            Ends::Nothing => false,
+        }
+    }
 }
 
 pub(crate) struct FirewallSync {
@@ -262,6 +292,9 @@ impl FirewallSync {
                 Left::Superseded => continue,
                 Left::Unlisted => {
                     let pass = self.list(&pool, &target).await;
+                    if let Err(error) = &pass {
+                        tracing::warn!(generation, %error, "fixture firewall slot inventory failed");
+                    }
                     self.update(generation, |wanted| wanted.pass = Some(pass));
                     match self.left(generation) {
                         Left::Slots(work) => work,
@@ -271,7 +304,8 @@ impl FirewallSync {
             };
             // Once superseded, the slot apply refuses the rest before nft, and their
             // results are dropped.
-            for (index, slot_id, expected) in work {
+            let listed = work.len();
+            for (ran, (index, slot_id, expected)) in (1..).zip(work) {
                 let request = SlotFirewallRequest {
                     node_id: self.fixture.node_id,
                     generation,
@@ -282,16 +316,13 @@ impl FirewallSync {
                 let report = pool
                     .apply_firewall_rules_with(&self.assignments, request, host, nft)
                     .await;
-                // Only a `One` pass lists it as the target.
-                if let Ok(SlotFirewallReport::Attempted(attempt)) = &report {
+                if let (BoundSlots::One(_), Ok(SlotFirewallReport::Attempted(attempt))) =
+                    (self.fixture.slots, &report)
+                {
                     target.get_or_insert_with(|| attempt.target());
                 }
                 let (done, ends) = dispatch(&report);
-                let ends = match ends {
-                    Ends::Binding => true,
-                    Ends::Target => matches!(self.fixture.slots, BoundSlots::One(_)),
-                    Ends::Nothing => false,
-                };
+                let ends = ends.binding(self.fixture.slots);
                 tracing::info!(
                     generation,
                     slot_id,
@@ -299,6 +330,15 @@ impl FirewallSync {
                     detail = done.detail,
                     "fixture firewall slot dispatch finished"
                 );
+                if ends {
+                    tracing::warn!(
+                        generation,
+                        slot_id,
+                        outcome = ?done.outcome(),
+                        not_reached = listed - ran,
+                        "fixture firewall sync binding ended"
+                    );
+                }
                 self.wanted.send_if_modified(|wanted| {
                     // Under the watch lock, so a waiter the end wakes reads this result,
                     // and no delivery that sees the result is admitted.
@@ -404,8 +444,9 @@ impl FirewallSync {
     }
 }
 
-/// Arms `generation` unless a newer one is armed. Redelivery joins a pass
-/// still running, and re-arms a settled one only for slots that never reached nft.
+/// Arms `generation` unless a newer one is armed. A delivery during a pass
+/// joins it; one after the pass settles re-arms it only for the slots that
+/// never reached nft, or to list again after a failed inventory.
 fn arm(wanted: &mut Option<Wanted>, generation: u64) -> bool {
     match wanted {
         Some(armed) if armed.generation > generation => false,
@@ -440,20 +481,18 @@ fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDisp
             (Verification::Inconclusive(why), _) => {
                 (Outcome::Inconclusive, why.clone(), Ends::Binding)
             }
-            // Only a changed assignment leaves the target trusted.
             (_, Err(stale)) => {
-                let assignment_changed = matches!(
-                    stale,
+                let ends = match stale {
                     Stale::Assignment(
                         NotRunnable::NoAssignment
-                            | NotRunnable::WrongNode { .. }
-                            | NotRunnable::NotCurrent { .. }
-                    )
-                );
-                let ends = if assignment_changed {
-                    Ends::Nothing
-                } else {
-                    Ends::Binding
+                        | NotRunnable::WrongNode { .. }
+                        | NotRunnable::NotCurrent { .. },
+                    ) => Ends::Nothing,
+                    Stale::Slot | Stale::Namespace(_) => Ends::Target,
+                    // Nothing can confirm the result.
+                    Stale::SlotStore(_) | Stale::Assignment(NotRunnable::Unavailable(_)) => {
+                        Ends::Binding
+                    }
                 };
                 (Outcome::Stale, format!("{stale:?}"), ends)
             }
