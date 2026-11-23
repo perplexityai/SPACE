@@ -12,6 +12,8 @@ workspace = true
 
 [features]
 default = []
+# `serve_firewall_wake_for_test`, for another crate's end-to-end test.
+test-support = []
 otel = [
     "pplx-space-observability/otel",
     "pplx-space-template-mgr-client/otel",

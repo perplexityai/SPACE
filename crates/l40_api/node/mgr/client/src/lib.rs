@@ -397,8 +397,13 @@ pub fn lazy() -> NodeManagerGrpcClient {
 /// immediately. Its channel's connection task runs on the calling Tokio
 /// runtime, which must outlive the client's calls.
 pub fn lazy_unshared() -> NodeManagerGrpcClient {
+    lazy_at(std::path::Path::new(SOCKET_PATH))
+}
+
+/// [`lazy_unshared`] for a node-manager listening on `socket_path`.
+pub fn lazy_at(socket_path: &std::path::Path) -> NodeManagerGrpcClient {
     let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
-        std::path::Path::new(SOCKET_PATH),
+        socket_path,
         endpoint().expect("static endpoint URI is valid"),
     );
     proto::node_manager_client::NodeManagerClient::new(wrap_grpc_client_channel(channel))

@@ -37,6 +37,7 @@ use pplx_space_node_mgr_client::{
 };
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_state_reconciliation::ReconcileReason;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
@@ -49,6 +50,7 @@ use tracing::Instrument as _;
 mod cluster_reconcile_trigger;
 mod dirty_state;
 mod facets;
+mod firewall_rules;
 #[cfg(feature = "kubernetes")]
 mod kubernetes_controller;
 pub mod metrics;
@@ -58,6 +60,8 @@ mod twin_metadata_report;
 mod util;
 
 use cluster_reconcile_trigger::{ClusterReconcileTrigger, trigger_request_reason};
+#[cfg(any(test, feature = "test-support"))]
+pub use firewall_rules::serve_firewall_wake_for_test;
 use outbound_retry::{OutboundOutcome, OutboundPass, OutboundRetry};
 
 /// The group node-ctl's clients reach its production socket through.
@@ -182,6 +186,18 @@ const ALLOW_NODE_CTL_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Role(LocalRole::Operator),
 ];
 
+fn peer_authorizer() -> UdsPeerAuthorizer {
+    UdsPeerAuthorizer::new_with_default_local_roles(
+        SERVICE_NAME,
+        [
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODEAPI.name, users::SPACE_NODEAPI.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_SBXMGR.name, users::SPACE_SBXMGR.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_TMPLMGR.name, users::SPACE_TMPLMGR.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODECTL.name, users::SPACE_NODECTL.uid),
+        ],
+    )
+}
+
 fn facet_scope_span_fields(scope: &facets::FacetScope) -> (&'static str, usize) {
     match scope {
         facets::FacetScope::Full => ("full", 0),
@@ -293,6 +309,25 @@ struct NodeCtlService {
     cluster_reconcile_trigger: cluster_reconcile_trigger::ClusterReconcileTrigger,
     db: Arc<Mutex<Connection>>,
     peer_authorizer: UdsPeerAuthorizer,
+    /// Firewall rule delivery, which only a test fixture turns on.
+    firewall_rules: Option<firewall_rules::Wake>,
+}
+
+impl NodeCtlService {
+    fn new(
+        tx: mpsc::Sender<WorkItem>,
+        cluster_reconcile_trigger: ClusterReconcileTrigger,
+        db: Arc<Mutex<Connection>>,
+        firewall_rules: Option<firewall_rules::Wake>,
+    ) -> Self {
+        Self {
+            tx,
+            cluster_reconcile_trigger,
+            db,
+            peer_authorizer: peer_authorizer(),
+            firewall_rules,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -681,32 +716,12 @@ pub async fn run(
         .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
         .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
-        .add_service(NodeCtlServer::new(NodeCtlService {
+        .add_service(NodeCtlServer::new(NodeCtlService::new(
             tx,
             cluster_reconcile_trigger,
             db,
-            peer_authorizer: UdsPeerAuthorizer::new_with_default_local_roles(
-                SERVICE_NAME,
-                [
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_NODEAPI.name,
-                        users::SPACE_NODEAPI.uid,
-                    ),
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_SBXMGR.name,
-                        users::SPACE_SBXMGR.uid,
-                    ),
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_TMPLMGR.name,
-                        users::SPACE_TMPLMGR.uid,
-                    ),
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_NODECTL.name,
-                        users::SPACE_NODECTL.uid,
-                    ),
-                ],
-            ),
-        }))
+            None,
+        )))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown);
 
     let mut service_mutex = Some(service_mutex);
@@ -1067,6 +1082,11 @@ impl NodeCtl for NodeCtlService {
             ALLOW_NODE_CTL_REFRESH,
         )?;
         let reason = trigger_request_reason(request.into_inner());
+        if let Some(firewall_rules) = &self.firewall_rules
+            && reason.includes(ReconcileReason::FirewallRulesChanged)
+        {
+            firewall_rules.wake();
+        }
         self.cluster_reconcile_trigger.trigger(reason).await?;
         Ok(Response::new(TriggerStateReconciliationResponse {}))
     }
