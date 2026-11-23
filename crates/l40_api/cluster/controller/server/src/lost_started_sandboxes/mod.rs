@@ -9,8 +9,9 @@
 //! covers `last_command_at` and `last_access_at`: an older one would silently
 //! roll the user back. With no such snapshot, the recovery fails, the
 //! execution drops back to `recovery_failed`, and the wake answers
-//! `RestoreContextUnavailable`. Nothing makes the sandbox terminal, so every
-//! later wake runs the same cycle.
+//! `RestoreContextUnavailable`, or the retryable `RestoreUploadSettling`
+//! while a suspend upload from its node may still become the source. Nothing
+//! makes the sandbox terminal, so every later wake runs the same cycle.
 //!
 //! Most of those failures are transient: the sandbox later suspends normally
 //! once its node finishes the snapshot it was taking. They aren't transient

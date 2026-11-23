@@ -29,8 +29,8 @@ use pplx_space_sandbox_model::{
 };
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
-    restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
-    snapshot_is_current_local_artifact,
+    pending_suspend_upload_may_become_source, restore_retry_source_snapshot_is_current,
+    restore_retry_suspended_revert_snapshot_exists, snapshot_is_current_local_artifact,
 };
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
 use pplx_space_sql_locator::sql;

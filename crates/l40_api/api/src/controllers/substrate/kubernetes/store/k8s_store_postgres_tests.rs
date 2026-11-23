@@ -505,6 +505,91 @@ async fn started_recovery_rejects_suspend_snapshot_older_than_recorded_activity(
 }
 
 #[tokio::test]
+async fn started_recovery_source_publishing_counts_only_uploads_that_can_become_the_source()
+-> TestResult {
+    // Arrange: a started sandbox on `active` with no restore source, as in
+    // the auto-suspend race before the node's upload lands. Its last command
+    // was an hour ago.
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    let active = NodeId::new();
+    let other = NodeId::new();
+    insert_sandbox(
+        &fixture.pool,
+        sandbox_id,
+        SandboxLifecycle::Started.as_str(),
+    )
+    .await?;
+    for (node_id, address) in [(active, "10.0.0.14"), (other, "10.0.0.15")] {
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, $2::INET, 'worker', 'k8s', 'ready')"
+        ))
+        .bind(node_id)
+        .bind(address)
+        .execute(&fixture.pool)
+        .await?;
+    }
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET active_node_id = $2, last_command_at = NOW() - INTERVAL '1 hour'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(active)
+    .execute(&fixture.pool)
+    .await?;
+    let publishing = || fixture.store.started_recovery_source_publishing(sandbox_id);
+    assert!(!publishing().await?, "nothing uploading");
+
+    // (origin, source node, snapshot age, latest attempt age, counts)
+    let cases = [
+        ("suspend", active, "0", "0", true),
+        ("suspend", active, "0", "11 minutes", false),
+        ("snapshot", active, "0", "0", false),
+        ("suspend", other, "0", "0", false),
+        ("suspend", active, "2 hours", "0", false),
+    ];
+    for (origin, source_node_id, age, attempt_age, expected) in cases {
+        // Act: one `creating` full upload of this shape.
+        let upload_id = SnapshotId::new();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots
+                 (id, sandbox_id, type, state, timestamp, last_attempt_at, source_node_id,
+                  org_id, local_artifact_id, artifact_kind, artifact_origin,
+                  artifact_snapshot_name)
+             VALUES ($1, $2, 'full', 'creating', NOW() - $5::INTERVAL,
+                     NOW() - $6::INTERVAL, $3,
+                     '00000000-0000-0000-0000-000000000001',
+                     $4, 'full', $7,
+                     CASE WHEN $7 = 'snapshot' THEN 'checkpoint' END)"
+        ))
+        .bind(upload_id)
+        .bind(sandbox_id)
+        .bind(source_node_id)
+        .bind(Uuid::now_v7())
+        .bind(age)
+        .bind(attempt_age)
+        .bind(origin)
+        .execute(&fixture.pool)
+        .await?;
+
+        // Assert.
+        assert_eq!(
+            publishing().await?,
+            expected,
+            "origin {origin}, from active node {}, age {age}, attempt age {attempt_age}",
+            source_node_id == active,
+        );
+        sqlx::query(sql!("DELETE FROM snapshots WHERE id = $1"))
+            .bind(upload_id)
+            .execute(&fixture.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn started_recovery_treats_deleting_snapshot_as_unavailable() -> TestResult {
     // Arrange: a started sandbox whose marker-matched suspend snapshot is a
     // valid remote restore source.

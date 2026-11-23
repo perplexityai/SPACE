@@ -347,46 +347,45 @@ impl K8sStore {
         generation: ExecutionGeneration,
         expected_pod_uid: &PodUid,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1
-                   FROM sandboxes s
-                   JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-                   JOIN node_facet_observed_status observed
-                     ON observed.node_id = s.active_node_id
-                    AND observed.facet = $4
-                    AND observed.element = s.id::TEXT
-                   JOIN snapshots sn
-                     ON sn.sandbox_id = s.id
-                    AND sn.source_node_id = observed.node_id
-                    AND sn.local_artifact_id::TEXT =
-                        observed.observed_payload -> $5::TEXT ->> 'local_artifact_id'
-                  WHERE s.id = $1
-                    AND s.lifecycle = 'started'
-                    AND e.generation = $2
-                    AND e.pod_uid = $3
-                    AND e.active
-                    AND e.state = 'recovering'
-                    AND observed.observed_payload -> $5::TEXT ->> 'execution_generation' = e.generation::TEXT
-                    AND observed.observed_payload -> $5::TEXT ->> 'pod_uid' = e.pod_uid
-                    AND sn.type = 'full'
-                    AND sn.artifact_kind = 'full'
-                    AND sn.artifact_origin = 'suspend'
-                    AND sn.state = 'creating'
-                    AND (s.last_command_at IS NULL OR sn.timestamp >= s.last_command_at)
-                    AND (s.last_access_at IS NULL OR sn.timestamp >= s.last_access_at)
-             )"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation.get())
-        .bind(expected_pod_uid.as_str())
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .bind(SANDBOX_LOCAL_SUSPEND_KEY)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| SubstrateError::Failed {
-            message: format!("failed to observe local suspend backup: {error}"),
-        })
+        static LOCAL_SUSPEND_BACKUP_PENDING: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+            || {
+                let may_become_source = pending_suspend_upload_may_become_source("s", "sn");
+                sql!(format!(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM sandboxes s
+                       JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+                       JOIN node_facet_observed_status observed
+                         ON observed.node_id = s.active_node_id
+                        AND observed.facet = $4
+                        AND observed.element = s.id::TEXT
+                       JOIN snapshots sn
+                         ON sn.local_artifact_id::TEXT =
+                            observed.observed_payload -> $5::TEXT ->> 'local_artifact_id'
+                      WHERE s.id = $1
+                        AND e.generation = $2
+                        AND e.pod_uid = $3
+                        AND e.active
+                        AND e.state = 'recovering'
+                        AND observed.observed_payload -> $5::TEXT ->> 'execution_generation' = e.generation::TEXT
+                        AND observed.observed_payload -> $5::TEXT ->> 'pod_uid' = e.pod_uid
+                        AND {may_become_source}
+                 )"
+            )
+            .as_str())
+            },
+        );
+        sqlx::query_scalar(sqlx::AssertSqlSafe(LOCAL_SUSPEND_BACKUP_PENDING.as_str()))
+            .bind(sandbox_id.as_uuid())
+            .bind(generation.get())
+            .bind(expected_pod_uid.as_str())
+            .bind(FACET_SANDBOX_DESIRED_STATE)
+            .bind(SANDBOX_LOCAL_SUSPEND_KEY)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| SubstrateError::Failed {
+                message: format!("failed to observe local suspend backup: {error}"),
+            })
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn committed_suspend_artifact(
