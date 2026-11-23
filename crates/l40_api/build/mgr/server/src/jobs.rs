@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use pplx_space_build_mgr::metrics::TemplateBuildResult;
 use pplx_space_build_mgr::{SystemPublicationGrantId, TemplateOrg, TenantPublicationGrantId};
 use pplx_space_build_mgr_client::proto::BuildState;
-use rusqlite::{Connection, OptionalExtension, params};
+pub use pplx_space_build_mgr_store::{
+    BUILD_JOB_KIND, BuildJobResult, BuildTerminalState, ParseBuildTerminalStateError,
+    count_other_active_builds_for_subject, get_build_result,
+};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-
-pub const BUILD_JOB_KIND: &str = "template_build";
 
 // The job kind remains stable for queue accounting and scheduling. Nest the
 // legacy fields so a downgraded worker cannot interpret selection as E0.
@@ -53,10 +55,6 @@ fn db_lock(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<MutexGuard<'_, Conne
     })
 }
 
-pub(super) fn sqlite_count_to_usize(count: i64) -> usize {
-    usize::try_from(count).unwrap_or(0)
-}
-
 /// Legacy flat jobs retain additive compatibility. New execution-critical
 /// semantics belong in a versioned envelope rather than an ignorable flat field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,101 +73,20 @@ pub struct BuildJobPayload {
     pub tenant_publication_grant_id: Option<TenantPublicationGrantId>,
 }
 
-#[derive(Clone, Debug)]
-pub struct BuildJobResult {
-    pub template_id: String,
-    pub state: BuildTerminalState,
-    pub content_hash: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuildTerminalState {
-    Succeeded,
-    Failed,
-    PublishFailed,
-}
-
-impl BuildTerminalState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::PublishFailed => "publish_failed",
-        }
-    }
-
-    pub fn as_metric_result(self) -> TemplateBuildResult {
-        match self {
-            Self::Succeeded => TemplateBuildResult::Success,
-            Self::Failed => TemplateBuildResult::Failed,
-            Self::PublishFailed => TemplateBuildResult::PublishFailed,
-        }
-    }
-
-    pub fn as_build_state(self) -> BuildState {
-        match self {
-            Self::Succeeded => BuildState::Succeeded,
-            Self::Failed => BuildState::Failed,
-            Self::PublishFailed => BuildState::PublishFailed,
-        }
+pub fn metric_result(state: BuildTerminalState) -> TemplateBuildResult {
+    match state {
+        BuildTerminalState::Succeeded => TemplateBuildResult::Success,
+        BuildTerminalState::Failed => TemplateBuildResult::Failed,
+        BuildTerminalState::PublishFailed => TemplateBuildResult::PublishFailed,
     }
 }
 
-impl std::fmt::Display for BuildTerminalState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+pub fn proto_build_state(state: BuildTerminalState) -> BuildState {
+    match state {
+        BuildTerminalState::Succeeded => BuildState::Succeeded,
+        BuildTerminalState::Failed => BuildState::Failed,
+        BuildTerminalState::PublishFailed => BuildState::PublishFailed,
     }
-}
-
-impl std::str::FromStr for BuildTerminalState {
-    type Err = ParseBuildTerminalStateError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "succeeded" => Ok(Self::Succeeded),
-            "failed" => Ok(Self::Failed),
-            "publish_failed" => Ok(Self::PublishFailed),
-            other => Err(ParseBuildTerminalStateError {
-                value: other.to_string(),
-            }),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("unknown build terminal state: {value}")]
-pub struct ParseBuildTerminalStateError {
-    value: String,
-}
-
-pub fn get_build_result(
-    conn: &Connection,
-    job_id: &pplx_space_common_jobs::JobId,
-) -> rusqlite::Result<Option<BuildJobResult>> {
-    conn.query_row(
-        "SELECT template_id, state, content_hash, error
-         FROM build_job_results
-         WHERE job_id = ?1",
-        params![job_id],
-        |row| {
-            let state: String = row.get(1)?;
-            let state = state.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok(BuildJobResult {
-                template_id: row.get(0)?,
-                state,
-                content_hash: row.get(2)?,
-                error: row.get(3)?,
-            })
-        },
-    )
-    .optional()
 }
 
 pub fn store_build_result(
@@ -178,24 +95,7 @@ pub fn store_build_result(
     result: &BuildJobResult,
 ) -> rusqlite::Result<()> {
     let conn = db_lock(db)?;
-    conn.execute(
-        "INSERT INTO build_job_results (job_id, template_id, state, content_hash, error)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(job_id) DO UPDATE SET
-             template_id = excluded.template_id,
-             state = excluded.state,
-             content_hash = excluded.content_hash,
-             error = excluded.error,
-             completed_at = datetime('now')",
-        params![
-            job_id,
-            result.template_id,
-            result.state.as_str(),
-            result.content_hash,
-            result.error,
-        ],
-    )?;
-    Ok(())
+    pplx_space_build_mgr_store::upsert_build_result(&conn, job_id, result)
 }
 
 pub fn store_build_result_if_lease_owner(
@@ -272,27 +172,6 @@ pub fn fail_expired_running_builds(
         Ok((row.get(0)?, row.get(1)?))
     })?
     .collect()
-}
-
-/// Number of build jobs for `subject_id` (the template) that are pending or
-/// running, excluding `exclude_job_id`. Gates the post-publish local prune:
-/// any active sibling may be mid-register/mid-publish on an artifact the
-/// prune would delete.
-pub fn count_other_active_builds_for_subject(
-    conn: &Connection,
-    subject_id: &str,
-    exclude_job_id: &pplx_space_common_jobs::JobId,
-) -> rusqlite::Result<usize> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM jobs
-         WHERE kind = ?1
-           AND subject_id = ?2
-           AND job_id != ?3
-           AND status IN ('pending', 'running')",
-        params![BUILD_JOB_KIND, subject_id, exclude_job_id],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(sqlite_count_to_usize)
 }
 
 #[cfg(test)]

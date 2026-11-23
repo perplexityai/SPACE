@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::params;
 
 #[tokio::test]
 async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {

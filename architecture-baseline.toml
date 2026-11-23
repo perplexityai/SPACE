@@ -151,10 +151,6 @@ postgres = [
   "user_credentials",
   "users",
 ]
-"sqlite.build-manager" = [
-  "build_job_results",
-  "jobs",
-]
 "sqlite.node-manager" = [
   "network_pool_meta",
   "network_slots",
@@ -162,10 +158,6 @@ postgres = [
 ]
 "sqlite.runtime-manager" = [
   "jobs",
-]
-"sqlite.volume-manager" = [
-  "jobs",
-  "volume_attachments",
 ]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such

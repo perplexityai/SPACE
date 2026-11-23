@@ -181,17 +181,6 @@ fn expired_running_build_reaper_marks_null_lease_rows_failed() {
     }
 }
 
-#[test]
-fn terminal_state_round_trips_wire_string() {
-    for state in [
-        BuildTerminalState::Succeeded,
-        BuildTerminalState::Failed,
-        BuildTerminalState::PublishFailed,
-    ] {
-        assert_eq!(state.as_str().parse::<BuildTerminalState>().unwrap(), state);
-    }
-}
-
 fn insert_build_job(conn: &Connection, job_id: &str, subject_id: &str, status: &str) {
     conn.execute(
         "INSERT INTO jobs (job_id, kind, payload, subject_id, status)

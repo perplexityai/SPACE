@@ -5299,6 +5299,7 @@ dependencies = [
  "futures-util",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
+ "pplx-space-build-mgr-store",
  "pplx-space-common-grpc",
  "pplx-space-common-jobs",
  "pplx-space-content-digest",
@@ -5323,6 +5324,16 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-build-mgr-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-job-id",
+ "pplx-space-sql-locator",
+ "rusqlite",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -9213,13 +9224,13 @@ dependencies = [
  "pplx-space-service-host",
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
- "pplx-space-sql-locator",
  "pplx-space-sqlite",
  "pplx-space-subject-model",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
  "pplx-space-volmgr-client",
+ "pplx-space-volmgr-store",
  "rstest",
  "rusqlite",
  "serde",
@@ -9276,6 +9287,18 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+]
+
+[[package]]
+name = "pplx-space-volmgr-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-job-id",
+ "pplx-space-sandbox-model",
+ "pplx-space-snapshot-model",
+ "pplx-space-sql-locator",
+ "rusqlite",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

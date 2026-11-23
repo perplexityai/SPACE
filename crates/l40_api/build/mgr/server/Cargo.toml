@@ -46,6 +46,7 @@ tracing = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
+pplx-space-build-mgr-store = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-observability = { workspace = true }
