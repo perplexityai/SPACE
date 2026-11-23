@@ -144,7 +144,7 @@ impl KubernetesSubstrate {
                     .to_string(),
             });
         }
-        let Some(pod_ip) = assigned_pod_ip(&pod)? else {
+        let Some(pod_ip) = current_pod_ip(&pod, Some(pod_uid), execution.pod_ip.as_deref())? else {
             return Ok(None);
         };
         let live_pod_ip = pod_ip.to_string();
