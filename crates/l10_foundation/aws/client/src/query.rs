@@ -101,7 +101,7 @@ impl HttpTransport {
                     .build(),
             )
             .sleep_impl(TokioSleep::new())
-            // reqwest honoured the same proxy variables.
+            // Honours HTTP(S)_PROXY and NO_PROXY, as the SDK's clients do.
             .proxy_config(ProxyConfig::from_env())
             .tls_provider(tls::Provider::Rustls(
                 tls::rustls_provider::CryptoMode::AwsLc,
@@ -328,7 +328,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
                 .map_err(|err| AwsClientError::InvalidEndpoint(err.to_string()))
         };
         let url = parse(&written)?;
-        // reqwest sent userinfo as a second, Basic, Authorization header.
+        // SigV4 endpoints carry no userinfo; url 2.5.8 sent it as a second Authorization header.
         if !url.username().is_empty() || url.password().is_some() {
             return Err(AwsClientError::InvalidEndpoint(
                 "endpoint carries userinfo".to_string(),

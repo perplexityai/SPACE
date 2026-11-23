@@ -175,16 +175,16 @@ async fn receive_and_verify(listener: TcpListener) -> (String, bool) {
 #[tokio::test(flavor = "current_thread")]
 async fn sends_and_signs_the_url_2_5_8_target() {
     for (endpoint, sent) in [
-        // Catches sending through url 2.5.9 or reqwest: they encode `^`.
-        ("http://127.0.0.1:{port}/a^b", "/a^b/"),
+        // Catches sending through url 2.5.9 or reqwest, or restoring left to right.
+        ("http://127.0.0.1:{port}/a^b^c", "/a^b^c/"),
         // Catches restoring every `%5E` rather than those url encoded.
         ("http://127.0.0.1:{port}/a%5Eb", "/a%5Eb/"),
         // Catches a signer that decodes before it signs.
         ("http://127.0.0.1:{port}/a%255Eb", "/a%255Eb/"),
         // Catches sending the written URI: url 2.5.8 encoded non-ASCII.
         ("http://127.0.0.1:{port}/café", "/caf%C3%A9/"),
-        // Catches sending the dot segments url 2.5.8 resolved.
-        ("http://127.0.0.1:{port}/a^b%5E/x/../c", "/a^b%5E/c/"),
+        // Catches restoring by position in the written path rather than url's.
+        ("http://127.0.0.1:{port}/x/../a^b%5E", "/a^b%5E/"),
         // Catches signing the written host: url lowercases it.
         ("http://LOCALHOST:{port}", "/"),
     ] {
