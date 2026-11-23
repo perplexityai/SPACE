@@ -119,7 +119,7 @@ impl SnapshotUploadInFlight {
     }
 
     /// How long the stalest blocking upload has gone without activity, as
-    /// [`crate::reconcile_queue::in_flight_snapshot_upload_idle_for`] reports it.
+    /// [`pplx_space_snapshot_store::upload::in_flight_idle_for`] reports it.
     pub(crate) fn idle_for(self) -> Duration {
         Duration::from_secs(u64::from(self.idle_secs))
     }

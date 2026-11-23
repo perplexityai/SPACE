@@ -61,21 +61,27 @@ CRUD.
 ## Current status
 
 Caller-backed APIs cover aggregate insertion, reads, and unguarded delete CRUD.
-Every read returns the same typed `SnapshotRecord`, containing the complete
+`get` returns the typed `SnapshotRecord`, containing the complete
 non-projection `snapshots` row and its optional linked
-`SnapshotStorageLocationRecord`. The duplicated scalar execution projections
-stay private to SQL writers; typed `execution_metadata` is canonical. Orphan
-storage locations have no owning snapshot and are not reachable through
-`get(snapshot_id)`.
+`SnapshotStorageLocationRecord`. Narrower reads return only what their
+question needs; `listing::stored_for_sandbox` leaves text columns unparsed, so
+a debug view can show rows that `get` would reject. The duplicated scalar
+execution projections stay private to SQL writers; typed `execution_metadata`
+is canonical. Orphan storage locations have no owning snapshot and are not
+reachable through `get(snapshot_id)`.
 
 The base location row's `storage_connection_string` is exposed by that schema
 name, not as a resolved URI. When an encrypted-fields sidecar exists, the base
 value is only a non-secret stand-in; this read API neither decrypts nor exposes
-sidecar secrets. Insert accepts one typed `NewSnapshot`, derives the duplicated
-scalar execution columns, and writes the snapshot plus its single location in
-the caller's transaction. `UNIQUE (snapshot_id)` provides the concurrency
-backstop for idempotent retries; reusing an id for a different snapshot identity
-or exact URI is rejected. Delete removes the storage locations before the
+sidecar secrets. `insert` accepts one typed `NewSnapshot`, derives the
+duplicated scalar execution columns, and writes the snapshot plus its single
+location in the caller's transaction. `UNIQUE (snapshot_id)` provides the
+concurrency backstop for idempotent retries; reusing an id for a different
+snapshot identity or exact URI is rejected.
+`disk_artifact::insert_creating_fork_copy` is a narrower insert: it writes only
+a `creating` fork-copy snapshot row, with no execution columns and no storage
+location, and leaves any row already registered under that id as it is. Delete
+removes the storage locations before the
 snapshot inside the caller's existing authorization-and-lock transaction. The
 store does not decide whether deletion or retry is safe and does not touch
 storage-backend bytes.
@@ -92,6 +98,13 @@ the table, and `list` projects the snapshot's age from the database clock.
 
 `snapshot_ids_after` pages snapshot ids in ascending order, in any state. It
 is the raw id page retention's discovery reads before it checks eligibility.
+
+Some narrower operations live in modules named for their question: `attempt`
+(one attempt's stored state), `disk_artifact` (the disk artifacts a fork reads
+and copies), `environment` (the environment a snapshot was produced under),
+`listing` (every row of a sandbox, unparsed, for debug views),
+`storage_location` (one live location's connection string) and `upload`
+(uploads still in flight).
 
 Add further typed CRUD incrementally with each migrated caller. Add claim/prune
 with its live retention workflow, after the workflow has a complete protection

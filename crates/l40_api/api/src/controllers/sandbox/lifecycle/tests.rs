@@ -921,12 +921,13 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
 
 /// The delete pre-flight's `55P03` is retryable, not an unrecoverable delete.
 ///
-/// `in_flight_snapshot_upload_idle_for` is the first database statement
-/// `delete_control_plane` runs, and it is a plain `SELECT` on `snapshots` — so
-/// under the role-level `lock_timeout` it aborts with `55P03` whenever DDL
-/// holds `ACCESS EXCLUSIVE` on that table. It answered a flat 500, telling the
-/// caller the delete had failed for good before anything at all had been
-/// written; nothing had, so the identical retry succeeds.
+/// `pplx_space_snapshot_store::upload::in_flight_idle_for` is the first
+/// database statement `delete_control_plane` runs, and it is a plain `SELECT`
+/// on `snapshots` — so under the role-level `lock_timeout` it aborts with
+/// `55P03` whenever DDL holds `ACCESS EXCLUSIVE` on that table. It answered a
+/// flat 500, telling the caller the delete had failed for good before
+/// anything at all had been written; nothing had, so the identical retry
+/// succeeds.
 ///
 /// Drives `delete_control_plane` rather than asserting `db_contention_error`'s
 /// answer, for the reason recorded on

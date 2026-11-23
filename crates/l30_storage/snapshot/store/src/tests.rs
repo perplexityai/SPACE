@@ -89,6 +89,34 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     .execute(&db.pool)
     .await?;
 
+    assert_eq!(
+        crate::attempt::status(&db.pool, snapshot_id).await?,
+        Some(crate::attempt::AttemptStatus {
+            state: "failed".to_string(),
+            failure_reason: Some("upload failed".to_string()),
+        })
+    );
+    assert_eq!(
+        crate::attempt::state(&db.pool, snapshot_id)
+            .await?
+            .as_deref(),
+        Some("failed")
+    );
+    assert_eq!(
+        crate::storage_location::live_connection_string(&db.pool, snapshot_id, location_id)
+            .await?
+            .as_deref(),
+        Some("s3://test-bucket/snapshots/catalog?region=us-east-1")
+    );
+    let listed = crate::listing::stored_for_sandbox(&db.pool, sandbox_id).await?;
+    assert_eq!(
+        listed
+            .iter()
+            .map(|row| (row.id, row.r#type.as_str(), row.state.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(snapshot_id, "full", "failed")]
+    );
+
     let record = get(&db.pool, snapshot_id)
         .await?
         .expect("populated snapshot exists");

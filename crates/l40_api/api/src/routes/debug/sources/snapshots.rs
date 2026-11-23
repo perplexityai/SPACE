@@ -13,29 +13,12 @@ pub(in crate::routes::debug) async fn fetch(
     sandbox_id: SandboxId,
 ) -> Result<SnapshotsSection, sqlx::Error> {
     let mut tx = begin_read_only(pool).await?;
-    let mut snapshots = sqlx::query_as::<_, Snapshot>(sql!(
-        "SELECT id,
-                sandbox_id,
-                type,
-                state,
-                timestamp,
-                source_node_id,
-                label,
-                retention_tier,
-                vcpu,
-                memory_mib,
-                size_bytes,
-                template_id,
-                content_hash,
-                org_id,
-                failure_reason
-           FROM snapshots
-          WHERE sandbox_id = $1
-          ORDER BY timestamp DESC, id DESC"
-    ))
-    .bind(sandbox_id)
-    .fetch_all(&mut *tx)
-    .await?;
+    let mut snapshots: Vec<Snapshot> =
+        pplx_space_snapshot_store::listing::stored_for_sandbox(&mut *tx, sandbox_id)
+            .await?
+            .into_iter()
+            .map(Snapshot::from)
+            .collect();
 
     let inventory = sqlx::query_as::<_, SnapshotInventory>(sql!(
         "SELECT sandbox_id,
