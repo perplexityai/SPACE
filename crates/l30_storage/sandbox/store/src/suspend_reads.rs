@@ -1,6 +1,7 @@
 //! Reads the Kubernetes suspend flow makes of `sandboxes` and its executions:
 //! whether a suspend is claimed, committed or projected, which artifact it
-//! committed, and the durable snapshot a node can no longer publish.
+//! committed, the durable snapshot a node can no longer publish, and whether a
+//! node-reported local suspend's upload is still `creating`.
 //!
 //! Plain reads: none takes a lock. Each runs on the executor its caller
 //! passes, so the ones the suspend flow makes after its row locks run in
@@ -11,6 +12,7 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_sql_locator::sql;
+use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
 use uuid::Uuid;
 
 /// Whether `sandbox_id` is `suspending` (compared trimmed and
@@ -221,5 +223,55 @@ pub async fn durable_suspend_artifact(
     .bind(generation.get())
     .bind(pod_uid.as_str())
     .fetch_optional(executor)
+    .await
+}
+
+/// Whether `sandbox_id` is `started` with an active, `recovering` Kubernetes
+/// execution at `generation` on `pod_uid`, and its active node's exact
+/// local-suspend observation of that execution matches a `creating` full
+/// suspend upload from that node, taken no earlier than the sandbox's last
+/// command or access.
+pub async fn local_backup_pending(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    generation: ExecutionGeneration,
+    pod_uid: &PodUid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+                 SELECT 1
+                   FROM sandboxes s
+                   JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+                   JOIN node_facet_observed_status observed
+                     ON observed.node_id = s.active_node_id
+                    AND observed.facet = $4
+                    AND observed.element = s.id::TEXT
+                   JOIN snapshots sn
+                     ON sn.sandbox_id = s.id
+                    AND sn.source_node_id = observed.node_id
+                    AND sn.local_artifact_id::TEXT =
+                        observed.observed_payload -> $5::TEXT ->> 'local_artifact_id'
+                  WHERE s.id = $1
+                    AND s.lifecycle = 'started'
+                    AND e.generation = $2
+                    AND e.pod_uid = $3
+                    AND e.active
+                    AND e.state = 'recovering'
+                    AND observed.observed_payload -> $5::TEXT ->> 'execution_generation' = e.generation::TEXT
+                    AND observed.observed_payload -> $5::TEXT ->> 'pod_uid' = e.pod_uid
+                    AND sn.type = 'full'
+                    AND sn.artifact_kind = 'full'
+                    AND sn.artifact_origin = 'suspend'
+                    AND sn.state = 'creating'
+                    AND (s.last_command_at IS NULL OR sn.timestamp >= s.last_command_at)
+                    AND (s.last_access_at IS NULL OR sn.timestamp >= s.last_access_at)
+             )"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(generation.get())
+    .bind(pod_uid.as_str())
+    .bind(FACET_SANDBOX_DESIRED_STATE)
+    .bind(SANDBOX_LOCAL_SUSPEND_KEY)
+    .fetch_one(executor)
     .await
 }

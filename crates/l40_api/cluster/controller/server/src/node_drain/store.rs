@@ -22,7 +22,9 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, SubstrateKind};
-use pplx_space_node_registration_store::drain_reads::{self, DrainPhaseCount, NodeInDrainPhase};
+use pplx_space_node_registration_store::drain_reads::{
+    self, DrainPhaseCount, NodeInDrainPhase, TerminatingK8sNode,
+};
 use pplx_space_node_registration_store::lookup::{
     self as node_lookup, K8sNodeIdentity, NodeApiTargetRow,
 };
@@ -5150,19 +5152,11 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let snapshot: Option<(String, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT n.role, nk.k8s_node_name
-         FROM nodes n
-         LEFT JOIN node_k8s nk ON nk.node_id = n.id
-         WHERE n.id = $1
-           AND n.drain_phase = 'terminating'
-           AND n.managed_by = $2"
-    ))
-    .bind(node_id)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((role, k8s_node_name)) = snapshot else {
+    let Some(TerminatingK8sNode {
+        role,
+        k8s_node_name,
+    }) = drain_reads::terminating_k8s_node(&mut *tx, node_id).await?
+    else {
         return Ok(false);
     };
     let result = sqlx::query(sql!(

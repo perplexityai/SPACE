@@ -44,3 +44,28 @@ pub async fn of_ready_disk_artifact(
     .await?
     .flatten())
 }
+
+/// The environment the newest ready disk snapshot of `sandbox_id`'s current
+/// local artifact was produced under; `None` when it records none or there's
+/// no such snapshot.
+pub async fn of_current_ready_disk_artifact(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Option<String>, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
+        "SELECT sn.execution_metadata->>'environment'
+               FROM sandboxes s
+               JOIN snapshots sn
+                 ON sn.sandbox_id = s.id
+                AND sn.local_artifact_id = s.current_local_artifact_id
+              WHERE s.id = $1
+                AND sn.type = 'disk'
+                AND sn.state = 'ready'
+              ORDER BY sn.timestamp DESC
+              LIMIT 1"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(executor)
+    .await?
+    .flatten())
+}

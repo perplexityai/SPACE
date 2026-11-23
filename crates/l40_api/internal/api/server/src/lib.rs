@@ -59,7 +59,6 @@ use pplx_space_events::{
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
 use pplx_space_node_registration_store::lookup as node_lookup;
-use pplx_space_rpc_contracts::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::snapshot_capture_fields::{self, SnapshotSandboxRow};
 use pplx_space_snapshot_model::{
@@ -1269,11 +1268,10 @@ impl ClusterApiService {
     /// restored), and the periodic sweep is the correctness fallback, so a
     /// failed or spurious NOTIFY only affects latency.
     async fn notify_evacuation_restore_ready(&self, sandbox_id: SandboxId) {
-        if let Err(err) = sqlx::query(sql!("SELECT pg_notify($1, $2)"))
-            .bind(EVACUATION_RESTORE_READY_CHANNEL)
-            .bind(sandbox_id.to_string())
-            .execute(&self.pool)
-            .await
+        if let Err(err) = pplx_space_cluster_trigger_queue::signal::notify_evacuation_restore_ready(
+            &self.pool, sandbox_id,
+        )
+        .await
         {
             tracing::warn!(
                 error = %err,
