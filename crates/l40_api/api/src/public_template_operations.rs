@@ -466,21 +466,16 @@ pub(crate) async fn mark_template_deleted(
         ReconcileElementRef::template_base_snapshot_policy(template.clone()),
     ];
     delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_release_storage_locations
-         WHERE template_release_id IN (
-           SELECT id FROM template_releases WHERE template_name = $1
-         )"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
+    pplx_space_template_release_store::removal::delete_storage_locations_of_template(
+        &mut *tx,
+        template.as_str(),
+    )
     .await?;
     pplx_space_template_store::release_tags::delete_for_template(&mut *tx, template).await?;
-    let releases = sqlx::query(sql!(
-        "DELETE FROM template_releases WHERE template_name = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
+    let releases = pplx_space_template_release_store::removal::delete_releases_of_template(
+        &mut *tx,
+        template.as_str(),
+    )
     .await;
     if let Err(error) = releases {
         // A reference that committed after the check above. A new slot or

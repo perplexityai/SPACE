@@ -841,18 +841,19 @@ async fn named_pool_template_release(
     template_name: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
-    sqlx::query_as::<_, PoolTemplateReleaseRow>(sql!(
-        "SELECT r.id, r.hash AS content_hash
-         FROM template_releases r
-         WHERE r.id = $1
-           AND r.template_name = $2
-           AND ($3::TEXT IS NULL OR r.hash = $3)"
-    ))
-    .bind(release_id)
-    .bind(template_name)
-    .bind(content_hash)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::lookup::named_release(
+        &mut **tx,
+        release_id,
+        template_name,
+        content_hash,
+    )
     .await
+    .map(|release| {
+        release.map(|release| PoolTemplateReleaseRow {
+            id: release.id,
+            content_hash: release.content_hash,
+        })
+    })
     .map_err(|err| db_contention_error("failed to read the named pool template release", &err))
 }
 

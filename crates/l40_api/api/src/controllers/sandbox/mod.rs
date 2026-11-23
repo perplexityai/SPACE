@@ -426,7 +426,7 @@ async fn classify_release_miss(
     if !matches!(access, TemplateAccess::Authorized { .. }) {
         return Ok(not_found);
     }
-    let has_release = crate::template_releases_store::template_has_visible_release(
+    let has_release = pplx_space_template_release_store::lookup::template_has_visible_release(
         pool,
         template.name(),
         caller_org,

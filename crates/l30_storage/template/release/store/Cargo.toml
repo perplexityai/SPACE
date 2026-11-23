@@ -25,17 +25,20 @@ aws-credential-types = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
+sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 uuid = { workspace = true }
 
 # internal
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-artifact-model = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-object-store = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-template-model = { workspace = true }
 pplx-space-template-release-original = { workspace = true }
 
 [dev-dependencies]

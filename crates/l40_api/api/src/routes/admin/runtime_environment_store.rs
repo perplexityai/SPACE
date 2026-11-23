@@ -169,19 +169,3 @@ pub(super) async fn template_release_population(
         .fetch_all(executor)
         .await
 }
-
-/// Every environment a template release is bound to, an unbound release
-/// counting as the initial environment's, as resolution and the campaign
-/// driver count it. A binding that isn't a string comes back as its JSON
-/// text, which no environment reference parses as. Takes no lock.
-pub(super) async fn template_release_environments(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
-        "SELECT DISTINCT COALESCE(execution_metadata ->> 'environment', $1)
-         FROM template_releases"
-    ))
-    .bind(pplx_space_execution_catalog::catalog::initial_environment_reference().to_string())
-    .fetch_all(executor)
-    .await
-}

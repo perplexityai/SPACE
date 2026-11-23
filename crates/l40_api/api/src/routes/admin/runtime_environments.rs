@@ -533,12 +533,15 @@ async fn first_default_template_campaign(
     // An environment reference that doesn't parse can't be a campaign's
     // source.
     let mut sources: BTreeSet<EnvironmentReference> =
-        store::template_release_environments(&mut *tx)
-            .await
-            .map_err(|err| Box::new(read_db_error(err)))?
-            .iter()
-            .filter_map(|environment| environment.parse().ok())
-            .collect();
+        pplx_space_template_release_store::lookup::release_environments(
+            &mut *tx,
+            pplx_space_execution_catalog::catalog::initial_environment_reference(),
+        )
+        .await
+        .map_err(|err| Box::new(read_db_error(err)))?
+        .iter()
+        .filter_map(|environment| environment.parse().ok())
+        .collect();
     sources.extend(
         campaign_store::list_unfinished(&mut *tx)
             .await

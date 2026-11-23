@@ -159,45 +159,6 @@ pub(super) async fn template_cached_rootfs_in_tx(
         .await
 }
 
-/// `true` when the template carries an owner-scoped encryption sidecar —
-/// either the per-template DEK (`template_encrypted_fields`) or a per-release
-/// storage-location DEK (`template_release_storage_location_encrypted_fields`,
-/// reached through the release its location belongs to). Widening such a
-/// template to `generic` would publish content wrapped under one org's key to
-/// every org — the "launchable-but-undecryptable" state the org-scoped
-/// templates RFC forbids. The re-key-on-widen transition is deferred to the
-/// encryption follow-up, so v1 refuses the widen rather than performing it.
-///
-/// Both sidecar tables are credential-fenced: `space_user` (the general
-/// application pool the visibility transaction runs on) has no grant on them,
-/// so this existence check runs on the credential pool as its own read rather
-/// than inside the flip transaction. The sidecars are written at
-/// template-encrypt time and do not change during a visibility flip, so an
-/// unlocked read here is consistent with the flip's other best-effort
-/// quiescence guards.
-pub(super) async fn template_has_owner_encryption(
-    credentials_pool: &sqlx::PgPool,
-    template_name: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-                 SELECT 1 FROM template_encrypted_fields WHERE template_name = $1
-             )
-             OR EXISTS (
-                 SELECT 1
-                   FROM template_release_storage_location_encrypted_fields e
-                   JOIN template_release_storage_locations l
-                     ON l.id = e.template_release_storage_location_id
-                   JOIN template_releases r
-                     ON r.id = l.template_release_id
-                  WHERE r.template_name = $1
-             )"
-    ))
-    .bind(template_name)
-    .fetch_one(credentials_pool)
-    .await
-}
-
 /// Write the new visibility, assigning an owner in the same statement when
 /// `new_org_id` is supplied (the `org_specific_requires_owner`
 /// CHECK demands owner and visibility move together for previously

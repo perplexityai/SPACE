@@ -445,6 +445,22 @@ pub(super) struct TemplateReleaseRow {
     pub(super) environment: Option<String>,
 }
 
+impl From<pplx_space_template_release_store::registration::RegisteredRelease>
+    for TemplateReleaseRow
+{
+    fn from(release: pplx_space_template_release_store::registration::RegisteredRelease) -> Self {
+        Self {
+            id: release.id,
+            template_name: release.template_name,
+            release_type: release.release_type,
+            hash: release.hash,
+            org_id: release.org_id,
+            created_at: release.created_at,
+            environment: release.environment,
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub(super) struct TemplateReleaseTagRow {
     pub(super) id: Uuid,
@@ -452,11 +468,25 @@ pub(super) struct TemplateReleaseTagRow {
     pub(super) created_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct TemplateReleaseStorageLocationRow {
     pub(super) id: Uuid,
     pub(super) storage_connection_string: String,
     pub(super) created_at: OffsetDateTime,
+}
+
+impl From<pplx_space_template_release_store::registration::RegisteredStorageLocation>
+    for TemplateReleaseStorageLocationRow
+{
+    fn from(
+        location: pplx_space_template_release_store::registration::RegisteredStorageLocation,
+    ) -> Self {
+        Self {
+            id: location.id,
+            storage_connection_string: location.storage_connection_string,
+            created_at: location.created_at,
+        }
+    }
 }
 
 /// SQLSTATE `undefined_column`, raised when the control-plane schema has no
@@ -1448,16 +1478,13 @@ async fn find_template_release_storage_location_row(
     release_id: Uuid,
     connection_string: &str,
 ) -> Result<Option<TemplateReleaseStorageLocationRow>, Status> {
-    sqlx::query_as::<_, TemplateReleaseStorageLocationRow>(sql!(
-        "SELECT id, storage_connection_string, created_at
-         FROM template_release_storage_locations
-         WHERE template_release_id = $1
-           AND storage_connection_string = $2"
-    ))
-    .bind(release_id)
-    .bind(connection_string)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::registration::storage_location(
+        &mut **tx,
+        release_id,
+        connection_string,
+    )
     .await
+    .map(|location| location.map(TemplateReleaseStorageLocationRow::from))
     .map_err(|err| {
         crate::template_publication::storage_status("query storage_connection_string", &err)
     })
@@ -1469,24 +1496,14 @@ async fn insert_template_release_storage_location_row(
     org_id: Option<OrgId>,
     connection_string: &str,
 ) -> Result<Option<TemplateReleaseStorageLocationRow>, Status> {
-    sqlx::query_as::<_, TemplateReleaseStorageLocationRow>(sql!(
-        "INSERT INTO template_release_storage_locations
-             (template_release_id, storage_connection_string, org_id)
-         SELECT $1, $3, COALESCE($2, org_id)
-         FROM template_releases
-         WHERE id = $1
-         ON CONFLICT (template_release_id, storage_connection_string) DO UPDATE
-             SET org_id = COALESCE(
-                 template_release_storage_locations.org_id,
-                 EXCLUDED.org_id
-             )
-         RETURNING id, storage_connection_string, created_at"
-    ))
-    .bind(release_id)
-    .bind(org_id)
-    .bind(connection_string)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::registration::insert_storage_location(
+        &mut **tx,
+        release_id,
+        org_id,
+        connection_string,
+    )
     .await
+    .map(|location| location.map(TemplateReleaseStorageLocationRow::from))
     .map_err(|err| {
         crate::template_publication::storage_status("insert storage_connection_string", &err)
     })

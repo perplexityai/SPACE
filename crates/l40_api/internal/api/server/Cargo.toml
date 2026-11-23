@@ -99,6 +99,7 @@ pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 pplx-space-template-release-original = { workspace = true }
+pplx-space-template-release-store = { workspace = true }
 pplx-space-template-store = { workspace = true }
 
 [dev-dependencies]

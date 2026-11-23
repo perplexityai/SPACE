@@ -485,17 +485,22 @@ pplx-space-template-release-original = [
   "pplx-space-template-release-store",
 ]
 # The API resolves creates, placement and pool claims to a release's twin
-# through the store, the cluster pool's autoscaler embeds its resolution SQL
-# so demand follows the release creates run, and the cluster controller's
-# template campaign driver pages a campaign's source releases, writes twins'
-# metadata.json through its objects, and inserts the twins. The credential
-# manager checks whether a release is published before it vends write
-# credentials for its storage.
+# through the store, reads releases for its lookups and admin routes,
+# deletes them with their template or one at a time, and checks a
+# template's encryption sidecars before a visibility widen; the cluster
+# pool's autoscaler embeds its resolution SQL so demand follows the release
+# creates run; the cluster controller's template campaign driver pages a
+# campaign's source releases, writes twins' metadata.json through its
+# objects, and inserts the twins; and the internal API's release
+# registration reads and inserts releases and their storage locations. The
+# credential manager checks whether a release is published before it vends
+# write credentials for its storage.
 pplx-space-template-release-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-cluster-pool",
   "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
 ]
 pplx-space-template-store = [
   "pplx-space-api",
