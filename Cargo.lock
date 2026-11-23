@@ -4834,6 +4834,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-admin-audit-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-admin-cli"
 version = "0.8.2"
 dependencies = [
@@ -4896,6 +4910,7 @@ dependencies = [
  "oci-spec",
  "percent-encoding",
  "pplx-space-accounts",
+ "pplx-space-admin-audit-store",
  "pplx-space-admin-protocol",
  "pplx-space-api-route",
  "pplx-space-artifact-model",
@@ -5353,6 +5368,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "pplx-space-accounts",
+ "pplx-space-admin-audit-store",
  "pplx-space-api",
  "pplx-space-api-route",
  "pplx-space-artifact-model",
