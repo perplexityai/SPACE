@@ -55,7 +55,11 @@
 //!   would change what it does.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
-//!   the lock. They stay at their call sites.
+//!   the lock. One moves here only as a lock verb: the statement verbatim, on
+//!   the caller's transaction, named and documented as a lock, in a module
+//!   named for the path that takes it (as [`fork_source_lifecycle`] is for
+//!   its advisory lock). The caller keeps its transaction and the re-checks
+//!   it runs under the lock.
 //! * **The node-local SQLite `sandboxes` table** (`crates/l30_storage/sbx/mgr/store`) is a
 //!   different database on a different machine and is out of scope.
 //!
