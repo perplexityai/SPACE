@@ -9,14 +9,13 @@ use std::time::Duration;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     DataPlaneAttachInfo, DataPlaneScope, DataPlaneSessionId, DataPlaneTokenTransport,
-    OperationKind, OperationState, OperationTargetType, PublicOperationEventType,
-    PublicOperationResult, PublicSandboxId, PublicSession, PublicSessionOperationResult,
-    RequestFingerprint, SessionKind, SessionState, SessionTargetProtocol,
-    data_plane_session_events_path,
+    OperationKind, OperationState, OperationTargetType, PublicOperationResult, PublicSandboxId,
+    PublicSession, PublicSessionOperationResult, RequestFingerprint, SessionKind, SessionState,
+    SessionTargetProtocol, data_plane_session_events_path,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, Postgres, Transaction, types::Json};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -25,6 +24,8 @@ use crate::public_operations::{ApiProduct, HttpOperationMethod, OperationPathTem
 use crate::public_store::{InvalidStoredEnum, parse_stored_enum};
 
 const API_PRODUCT_NATIVE: ApiProduct = ApiProduct::Native;
+/// How long a session create's idempotency record replays it.
+const IDEMPOTENCY_TTL_HOURS: i64 = 24;
 const SESSION_OPERATION_PROGRESS: &str = "session created";
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_ATTACH_DEADLINE: Duration = Duration::from_secs(60);
@@ -566,17 +567,12 @@ async fn fetch_operation_target_session(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: Uuid,
 ) -> Result<Option<DataPlaneSessionId>, PublicSessionStoreError> {
-    let value = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT target_id
-         FROM public_operations
-         WHERE operation_id = $1
-           AND kind = $2
-           AND target_type = $3"
-    ))
-    .bind(operation_id)
-    .bind(OperationKind::CreateSession.as_str())
-    .bind(OperationTargetType::Session.as_str())
-    .fetch_optional(&mut **tx)
+    let value = pplx_space_public_operation_store::operations::target_id(
+        &mut **tx,
+        operation_id,
+        OperationKind::CreateSession,
+        OperationTargetType::Session,
+    )
     .await?;
 
     value
@@ -649,59 +645,24 @@ async fn insert_completed_session_operation_tx(
     let result_json = serde_json::to_value(&result).expect("public session result serializes");
 
     // The operation is new, so its completion is its first event: sequence 1
-    // is what `append_operation_event_tx` would compute. The event's foreign
-    // key is checked at the end of the statement, after the operation row.
-    sqlx::query(sql!(
-        "WITH operation AS (
-         INSERT INTO public_operations (
-             operation_id,
-             org_id,
-             actor_user_id,
-             api_product,
-             kind,
-             target_type,
-             target_id,
-             state,
-             progress_message,
-             result_json,
-             started_at,
-             completed_at,
-             gc_after
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, $6, $7,
-             $8, $9, $10, NOW(), NOW(),
-             NOW() + ('7 days')::INTERVAL
-         )
-         RETURNING operation_id
-         )
-         INSERT INTO public_operation_events (
-             operation_id,
-             sequence,
-             event_type,
-             event_json
-         )
-         SELECT operation_id, 1, $11, $12
-         FROM operation"
-    ))
-    .bind(operation_id)
-    .bind(org_id)
-    .bind(actor_user_id)
-    .bind(API_PRODUCT_NATIVE.as_str())
-    .bind(OperationKind::CreateSession.as_str())
-    .bind(OperationTargetType::Session.as_str())
-    .bind(session_id.to_string())
-    .bind(OperationState::Succeeded.as_str())
-    .bind(SESSION_OPERATION_PROGRESS)
-    .bind(Json(result_json.clone()))
-    .bind(PublicOperationEventType::Completed.as_str())
-    .bind(Json(serde_json::json!({
-        "state": OperationState::Succeeded.as_str(),
-        "result": result_json,
-    })))
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    // is what `append_operation_event_tx` would compute.
+    pplx_space_public_operation_store::operations::insert_completed_session_create(
+        &mut **tx,
+        pplx_space_public_operation_store::operations::CompletedSessionCreate {
+            operation_id,
+            org_id,
+            actor_user_id,
+            api_product: API_PRODUCT_NATIVE.as_str(),
+            session_id: session_id.to_string(),
+            progress_message: SESSION_OPERATION_PROGRESS,
+            result_json: result_json.clone(),
+            event_json: serde_json::json!({
+                "state": OperationState::Succeeded.as_str(),
+                "result": result_json,
+            }),
+        },
+    )
+    .await
 }
 
 async fn insert_idempotency_record_tx(
@@ -711,34 +672,21 @@ async fn insert_idempotency_record_tx(
     request_fingerprint: &RequestFingerprint,
     operation_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "INSERT INTO public_idempotency_records (
-             id,
-             org_id,
-             api_product,
-             method,
-             path_template,
-             idempotency_key,
-             request_fingerprint,
-             operation_id,
-             expires_at
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8,
-             NOW() + ('24 hours')::INTERVAL
-         )"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(org_id)
-    .bind(API_PRODUCT_NATIVE.as_str())
-    .bind(idempotency.method.as_str())
-    .bind(idempotency.path_template.as_str())
-    .bind(idempotency.key.as_str())
-    .bind(request_fingerprint.as_str())
-    .bind(operation_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_public_operation_store::idempotency::insert_for_operation(
+        &mut **tx,
+        Uuid::now_v7(),
+        API_PRODUCT_NATIVE.as_str(),
+        pplx_space_public_operation_store::idempotency::IdempotencyKeyRef {
+            org_id,
+            method: idempotency.method.as_str(),
+            path_template: idempotency.path_template.as_str(),
+            idempotency_key: idempotency.key.as_str(),
+        },
+        request_fingerprint.as_str(),
+        operation_id,
+        IDEMPOTENCY_TTL_HOURS,
+    )
+    .await
 }
 
 fn request_fingerprint(

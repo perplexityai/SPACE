@@ -3,7 +3,7 @@ use pplx_space_accounts::OrgId;
 use pplx_space_credential_injection::validation::ValidatedCredentialReference;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::RequestFingerprint;
-use pplx_space_sql_locator::sql;
+use pplx_space_public_operation_store::idempotency as idempotency_store;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -46,30 +46,23 @@ impl<'a> Scope<'a> {
     fn path(&self) -> &'static str {
         pplx_space_public_api::routes::REGISTER_CREDENTIAL_REFERENCE.path()
     }
+    fn key(&self) -> idempotency_store::IdempotencyKeyRef<'_> {
+        idempotency_store::IdempotencyKeyRef {
+            org_id: self.organization,
+            method: self.method(),
+            path_template: self.path(),
+            idempotency_key: &self.key,
+        }
+    }
 }
 
-#[derive(Debug, sqlx::FromRow)]
-pub(super) struct Reply<T> {
-    pub(super) fingerprint: String,
-    pub(super) response: sqlx::types::Json<T>,
-}
+pub(super) use pplx_space_public_operation_store::idempotency::RecordedReply as Reply;
 
 pub(super) async fn get<T: DeserializeOwned + Send + Unpin + 'static>(
     executor: impl sqlx::PgExecutor<'_>,
     scope: &Scope<'_>,
 ) -> Result<Option<Reply<T>>, sqlx::Error> {
-    sqlx::query_as(sql!(
-        "SELECT request_fingerprint AS fingerprint, response_json AS response
-         FROM public_idempotency_records
-         WHERE org_id = $1 AND api_product = 'native' AND method = $4
-           AND path_template = $2 AND idempotency_key = $3"
-    ))
-    .bind(scope.organization.as_uuid())
-    .bind(scope.path())
-    .bind(&scope.key)
-    .bind(scope.method())
-    .fetch_optional(executor)
-    .await
+    idempotency_store::find_native_reply(executor, scope.key()).await
 }
 
 pub(super) async fn insert<T: Serialize + Sync>(
@@ -78,10 +71,12 @@ pub(super) async fn insert<T: Serialize + Sync>(
     fingerprint: &RequestFingerprint,
     response: &T,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(sql!(
-        "INSERT INTO public_idempotency_records (id, org_id, api_product, method, path_template, idempotency_key, request_fingerprint, response_json, expires_at)
-         VALUES ($1, $2, 'native', $7, $3, $4, $5, $6, 'infinity')
-         ON CONFLICT (org_id, api_product, method, path_template, idempotency_key) DO NOTHING"
-    )).bind(Uuid::now_v7()).bind(scope.organization.as_uuid()).bind(scope.path()).bind(&scope.key).bind(fingerprint.as_str()).bind(sqlx::types::Json(response)).bind(scope.method()).execute(executor).await?;
-    Ok(result.rows_affected() == 1)
+    idempotency_store::insert_permanent_native_reply(
+        executor,
+        Uuid::now_v7(),
+        scope.key(),
+        fingerprint.as_str(),
+        response,
+    )
+    .await
 }

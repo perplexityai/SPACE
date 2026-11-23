@@ -4969,6 +4969,7 @@ dependencies = [
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
+ "pplx-space-public-operation-store",
  "pplx-space-rpc-auth",
  "pplx-space-rpc-contracts",
  "pplx-space-runtime-environment-catalog-store",
@@ -7301,9 +7302,9 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
+ "pplx-space-node-runtime-manager-store",
  "pplx-space-observability",
  "pplx-space-s3-http-client",
- "pplx-space-sql-locator",
  "pplx-space-sqlite",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
@@ -7362,6 +7363,18 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+]
+
+[[package]]
+name = "pplx-space-node-runtime-manager-store"
+version = "0.8.2"
+dependencies = [
+ "jiff",
+ "pplx-space-content-digest",
+ "pplx-space-job-id",
+ "pplx-space-sql-locator",
+ "rusqlite",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7603,6 +7616,24 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-public-operation-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-public-api",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
  "uuid",
 ]
 

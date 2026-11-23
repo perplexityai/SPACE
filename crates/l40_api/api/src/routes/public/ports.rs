@@ -308,31 +308,20 @@ async fn record_idempotent_port_response(
     )
     .await
     .map_err(database_error)?;
-    let inserted = sqlx::query(sql!(
-        "INSERT INTO public_idempotency_records (
-             id,
-             org_id,
-             api_product,
-             method,
-             path_template,
-             idempotency_key,
-             request_fingerprint,
-             response_json
-         )
-         VALUES ($1, $2, 'native', 'POST', $3, $4, $5, $6)
-         ON CONFLICT (org_id, api_product, method, path_template, idempotency_key) DO NOTHING"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(org_id)
-    .bind(path_template.as_str())
-    .bind(key.as_str())
-    .bind(fingerprint.as_str())
-    .bind(SqlJson(response_json))
-    .execute(&mut *tx)
-    .await
-    .map_err(database_error)?;
+    let inserted =
+        pplx_space_public_operation_store::idempotency::insert_native_post_reply_if_absent(
+            &mut *tx,
+            Uuid::now_v7(),
+            org_id,
+            path_template.as_str(),
+            key.as_str(),
+            fingerprint.as_str(),
+            response_json,
+        )
+        .await
+        .map_err(database_error)?;
 
-    if inserted.rows_affected() == 1 {
+    if inserted {
         tx.commit().await.map_err(database_error)?;
         return Ok(response.clone());
     }
