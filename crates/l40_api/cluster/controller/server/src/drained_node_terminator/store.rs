@@ -1,5 +1,8 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_node_model::SubstrateKind;
+use pplx_space_node_model::{NodeDrainPhase, SubstrateKind};
+use pplx_space_node_registration_store::drain_reads;
+#[cfg(feature = "kubernetes")]
+use pplx_space_node_registration_store::lookup::{self as node_lookup, K8sNodeIdentity};
 use pplx_space_snapshot_model::SnapshotId;
 
 use pplx_space_sql_locator::sql;
@@ -315,12 +318,11 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
     async fn list_drained_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
         // Scoped to Kubernetes-managed rows. Direct/admin rows must not be
         // fed into the Kubernetes-specific annotation lookup path.
-        sqlx::query_scalar::<_, NodeId>(sql!(
-            "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2"
-        ))
-        .bind(PHASE_DRAINED)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&self.pool)
+        drain_reads::nodes_in_drain_phase(
+            &self.pool,
+            NodeDrainPhase::Drained,
+            SubstrateKind::Kubernetes,
+        )
         .await
     }
 
@@ -580,14 +582,13 @@ impl DrainKeepAnnotationLookup for KubeAnnotationLookup {
         &self,
         node_id: NodeId,
     ) -> Result<DrainKeepStatus, AnnotationLookupError> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT k8s_node_name, k8s_node_uid FROM node_k8s WHERE node_id = $1"
-        ))
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| AnnotationLookupError::Db(err.to_string()))?;
-        let (node_name, stored_uid) = row.ok_or(AnnotationLookupError::Unregistered(node_id))?;
+        let K8sNodeIdentity {
+            k8s_node_name: node_name,
+            k8s_node_uid: stored_uid,
+        } = node_lookup::k8s_node_identity(&self.pool, node_id)
+            .await
+            .map_err(|err| AnnotationLookupError::Db(err.to_string()))?
+            .ok_or(AnnotationLookupError::Unregistered(node_id))?;
 
         let nodes: kube::Api<k8s_openapi::api::core::v1::Node> =
             kube::Api::all(self.kube_client.clone());

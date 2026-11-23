@@ -28,7 +28,7 @@
 use pplx_space_accounts::NodeId;
 
 use kube::api::{DeleteParams, Preconditions};
-use pplx_space_sql_locator::sql;
+use pplx_space_node_registration_store::drain_reads::{self, TerminateTarget};
 use sqlx::PgPool;
 
 use super::{InstanceTerminator, TerminateError};
@@ -49,18 +49,16 @@ impl InstanceTerminator for KubeNodeDeleteTerminator {
         // Same row/UID re-fetch as Ec2InstanceTerminator. If the row
         // drifted under us (admin undrain), bail out before touching
         // kube.
-        let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT n.drain_phase, k.k8s_node_name, k.k8s_node_uid
-             FROM nodes n
-             LEFT JOIN node_k8s k ON k.node_id = n.id
-             WHERE n.id = $1"
-        ))
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| TerminateError::KubeLookup(err.to_string()))?;
+        let row = drain_reads::terminate_target(&self.pool, node_id)
+            .await
+            .map_err(|err| TerminateError::KubeLookup(err.to_string()))?;
 
-        let (phase, node_name, stored_uid) = row.ok_or_else(|| {
+        let TerminateTarget {
+            phase,
+            node_name,
+            stored_uid,
+            ..
+        } = row.ok_or_else(|| {
             TerminateError::KubeLookup(format!("node {node_id} row vanished before terminate"))
         })?;
 

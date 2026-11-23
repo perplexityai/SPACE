@@ -2,6 +2,7 @@
 //! artifact storage URI a restore reads.
 
 use super::*;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_store::restore_source;
 
 /// Which suspend snapshot a restore selects when no existing restore pod
@@ -26,13 +27,9 @@ impl K8sStore {
         sandbox: &Sandbox,
     ) -> Result<Option<String>, SubstrateError> {
         if let Some(node_id) = sandbox.target_node_id.or(sandbox.active_node_id) {
-            if let Some(node_name) = sqlx::query_scalar::<_, String>(sql!(
-                "SELECT k8s_node_name FROM node_k8s WHERE node_id = $1"
-            ))
-            .bind(node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .db_context("failed to query Kubernetes restore node preference")?
+            if let Some(node_name) = node_lookup::k8s_node_name(&self.pool, node_id)
+                .await
+                .db_context("failed to query Kubernetes restore node preference")?
             {
                 return Ok(Some(node_name));
             }

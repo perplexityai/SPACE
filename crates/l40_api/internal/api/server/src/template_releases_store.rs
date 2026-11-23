@@ -7,7 +7,8 @@
 //! [`WarmPoolStore`]: pplx_space_cluster_pool::WarmPoolStore
 
 use pplx_space_accounts::{NodeId, OrgId};
-use pplx_space_node_model::{NodeRole, SubstrateKind};
+use pplx_space_node_model::NodeRole;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_node_registration_store::nodes_for_identity;
 
 use std::net::IpAddr;
@@ -158,18 +159,7 @@ impl TemplateReleasesStore {
         &self,
         address: IpAddr,
     ) -> Result<TemplateReadScope, sqlx::Error> {
-        let node_ids = sqlx::query_scalar::<_, NodeId>(sql!(
-            "SELECT id
-             FROM nodes
-             WHERE address = $1::INET
-               AND managed_by IN ($2, $3)
-               AND COALESCE(state, 'registered') != 'deleted'"
-        ))
-        .bind(address.to_string())
-        .bind(SubstrateKind::Space)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&self.pool)
-        .await?;
+        let node_ids = node_lookup::live_nodes_at_address(&self.pool, address).await?;
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 

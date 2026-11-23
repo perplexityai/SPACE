@@ -139,7 +139,6 @@ postgres = [
   "clusters",
   "data_plane_session_output_events",
   "node_direct",
-  "node_k8s_tombstones",
   "org_credentials",
   "organizations",
   "sandbox_archives",
