@@ -18,7 +18,8 @@ use crate::firewall::rules::install::InstallOutcome;
 use crate::proto::FirewallRulesAssignment;
 use crate::service::tests::service_tests::service_for_unit_tests;
 use crate::slot_pool::firewall_rules::tests::{
-    BOUND, FakeHost, Fault, Hook, NODE, bounded, busy, document, hook, installed, poison, set_slot,
+    BOUND, FakeHost, Fault, Hook, NODE, bounded, busy, document, heal, hook, installed, poison,
+    set_slot,
 };
 use crate::slot_pool::{
     NamespaceIdentity, NetworkPoolConfig, NotRunnable, SlotFirewallAttempt, SlotHealth, SlotState,
@@ -657,8 +658,8 @@ async fn a_slot_replaced_after_listing_is_refused_and_ends_the_binding() {
     );
 }
 
-// Catches an older pass that goes on after a newer generation is accepted,
-// installs its revision late, or has its result counted for the newer one.
+// Catches an older pass that goes on after a newer generation is accepted, or
+// installs its revision late.
 #[tokio::test]
 async fn a_newer_generation_stops_an_older_pass() {
     use SlotState::{Leased, Ready};
@@ -689,7 +690,8 @@ async fn a_newer_generation_stops_an_older_pass() {
     );
 }
 
-// Catches an unreadable inventory reported as an empty, finished pass.
+// Catches an unreadable inventory reported as an empty, finished pass, or one
+// not retried on redelivery.
 #[tokio::test]
 async fn an_unreadable_inventory_is_an_incomplete_pass() {
     let bound = bind_slots(BoundSlots::All, None, None, WAIT, &[SlotState::Leased]).await;
@@ -702,4 +704,9 @@ async fn an_unreadable_inventory_is_an_incomplete_pass() {
         "a retryable failure ended the binding"
     );
     assert_eq!(bound.host.calls(), []);
+
+    heal(&bound.service.pool);
+    sync_all(&bound.service, 12).await;
+    let matched = [(0, Some(Outcome::Matched))];
+    assert_eq!(passed(&bound.service, 12).await.unwrap(), matched);
 }

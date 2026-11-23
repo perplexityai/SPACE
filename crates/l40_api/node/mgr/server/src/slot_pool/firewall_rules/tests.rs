@@ -104,6 +104,10 @@ pub(crate) fn poison(pool: &Arc<NetworkPool>) {
     .unwrap_err();
 }
 
+pub(crate) fn heal(pool: &NetworkPool) {
+    pool.db.clear_poison();
+}
+
 /// How the fake nft departs from a healthy one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Fault {

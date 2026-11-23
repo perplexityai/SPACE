@@ -144,7 +144,7 @@ impl FirewallSync {
         request: SyncFirewallRulesRequest,
     ) -> Result<SyncFirewallRulesResponse, Status> {
         // A delivery that races the end can still commit and arm, then replies NOT_RUN
-        // "the binding ended"; nothing reaches nft.
+        // "the binding ended" for one slot or no dispatch for all; nothing reaches nft.
         if self.ended.is_cancelled() {
             return Err(Status::failed_precondition(
                 "the firewall rule sync binding ended",
@@ -243,8 +243,9 @@ impl FirewallSync {
                 }
             };
             for (index, slot_id, expected) in work {
-                // A newer pass lists afresh; this one's targets may have moved on. One
-                // armed after this check can still see its slot refused as changed.
+                // A newer pass lists afresh; this one's targets may have moved on. A
+                // generation armed after this check can't stop this slot's apply, which
+                // may still be refused as changed and end the binding.
                 if !self.wants(generation) {
                     break;
                 }
