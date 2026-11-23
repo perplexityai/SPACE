@@ -5,9 +5,10 @@
 //! keys, the `state_reconciliation_reason` Postgres enum (`ReconcileReason`),
 //! the facet and element references a reconcile trigger names, the facet and
 //! claim generation counters, and network-policy targets. It depends only on
-//! sandbox-model's sandbox identifier, template-model's template name, sqlx
-//! and thiserror, so a crate that needs only this vocabulary can depend on it
-//! without a service runtime.
+//! sandbox-model's sandbox identifier, template-model's template name and
+//! thiserror, and, behind the `sqlx` feature, on the sql-codec facade for the
+//! enum's Postgres codec, so a crate that needs only this vocabulary can
+//! depend on it without a service runtime.
 
 use std::{fmt, str::FromStr};
 
@@ -163,8 +164,10 @@ impl fmt::Display for ReconcileFacet {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, sqlx::Type)]
-#[sqlx(type_name = "state_reconciliation_reason", rename_all = "snake_case")]
+/// Encoded, behind the `sqlx` feature, as the `state_reconciliation_reason`
+/// Postgres enum, whose labels are [`Self::as_str`], and its arrays as
+/// `state_reconciliation_reason[]`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ReconcileReason {
     NodeRegistered,
     NodeUpdated,
@@ -286,6 +289,57 @@ impl ReconcileReason {
 impl fmt::Display for ReconcileReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "sqlx")]
+const RECONCILE_REASON_PG_TYPE: &str = "state_reconciliation_reason";
+
+#[cfg(feature = "sqlx")]
+impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for ReconcileReason {
+    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
+        pplx_space_sql_codec::postgres::PgTypeInfo::with_name(RECONCILE_REASON_PG_TYPE)
+    }
+}
+
+#[cfg(feature = "sqlx")]
+impl pplx_space_sql_codec::postgres::PgHasArrayType for ReconcileReason {
+    fn array_type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
+        pplx_space_sql_codec::postgres::PgTypeInfo::array_of(RECONCILE_REASON_PG_TYPE)
+    }
+}
+
+#[cfg(feature = "sqlx")]
+impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres> for ReconcileReason {
+    fn encode_by_ref(
+        &self,
+        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
+    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
+    {
+        <&str as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode(
+            self.as_str(),
+            buf,
+        )
+    }
+
+    fn size_hint(&self) -> usize {
+        <&str as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::size_hint(
+            &self.as_str(),
+        )
+    }
+}
+
+#[cfg(feature = "sqlx")]
+impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for ReconcileReason {
+    fn decode(
+        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
+    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
+        let raw =
+            <&str as pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres>>::decode(
+                value,
+            )?;
+        Self::parse(raw)
+            .ok_or_else(|| format!("invalid value {raw:?} for enum ReconcileReason").into())
     }
 }
 
