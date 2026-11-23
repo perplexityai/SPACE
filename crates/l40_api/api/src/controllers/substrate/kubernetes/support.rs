@@ -1500,6 +1500,35 @@ pub(super) fn assigned_pod_ip(pod: &SandboxPodView) -> Result<Option<PodIp>, Sub
     pod.pod_ip().map(PodIp::parse).transpose()
 }
 
+/// The pod's IP: the one kubelet published in `status.podIP`, else the one
+/// recorded for the same pod UID. The node reports a pod's IP before kubelet
+/// publishes it, and a pod keeps one IP for its lifetime.
+pub(super) fn pod_ip_or_recorded<'a>(
+    published_ip: Option<&'a str>,
+    pod_uid: Option<&str>,
+    recorded_uid: Option<&str>,
+    recorded_ip: Option<&'a str>,
+) -> Option<&'a str> {
+    published_ip.or_else(|| recorded_ip.filter(|_| pod_uid.is_some() && pod_uid == recorded_uid))
+}
+
+/// [`assigned_pod_ip`], falling back to the IP recorded for the same pod UID
+/// (see [`pod_ip_or_recorded`]).
+pub(super) fn current_pod_ip(
+    pod: &SandboxPodView,
+    recorded_uid: Option<&PodUid>,
+    recorded_ip: Option<&str>,
+) -> Result<Option<PodIp>, SubstrateError> {
+    pod_ip_or_recorded(
+        pod.pod_ip(),
+        pod.uid(),
+        recorded_uid.map(PodUid::as_str),
+        recorded_ip,
+    )
+    .map(PodIp::parse)
+    .transpose()
+}
+
 pub(super) fn assigned_pod_node_name(pod: &SandboxPodView) -> Option<&str> {
     pod.node_name().filter(|node_name| !node_name.is_empty())
 }

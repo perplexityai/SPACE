@@ -280,7 +280,7 @@ impl KubernetesSubstrate {
         {
             return Ok(None);
         }
-        let pod_ip = assigned_pod_ip(&pod)?;
+        let pod_ip = current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
         // Let the owned path publish changed routing evidence before returning
         // a client; otherwise ingress would repeatedly resolve stale metadata.
         if row.pod_ip != pod_ip.map(|ip| ip.to_string())
@@ -542,7 +542,7 @@ impl KubernetesSubstrate {
         }
 
         let pod_uid = pod.uid().map(str::to_owned);
-        let pod_ip = assigned_pod_ip(&pod)?;
+        let pod_ip = current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())?;
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
         let pod_client = pod.client_id();
         if row.pod_uid.as_ref().map(PodUid::as_str) != pod_uid.as_deref()

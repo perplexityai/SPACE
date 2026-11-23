@@ -8375,6 +8375,73 @@ mod kubernetes_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn node_reported_pod_ip_holds_until_kubelet_publishes_one() -> Result<(), BoxError> {
+        // A create bound the IP its node reported; kubelet publishes
+        // `status.podIP` later, and may publish a different one.
+        for (published_ip, expected_ip) in [(None, "10.0.0.7"), (Some("10.0.0.9"), "10.0.0.9")] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            let pod_name = "space-sbx-node-bound-g1";
+            insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                     (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                      pod_ip, state, active)
+                 VALUES ($1, 1, $2, 'space', 'node-bound-uid',
+                         '10.0.0.7', 'running', TRUE)",
+            ))
+            .bind(sandbox_id)
+            .bind(pod_name)
+            .execute(&pool)
+            .await?;
+            let mut status = serde_json::json!({ "phase": "Running" });
+            if let Some(ip) = published_ip {
+                status["podIP"] = ip.into();
+            }
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": pod_name, "namespace": "space", "uid": "node-bound-uid" },
+                "status": status
+            }))?;
+            let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+                pool.clone(),
+                replace_existing_pod_kubernetes_client(
+                    pod.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                DEFAULT_SANDBOX_PROXY_PORT,
+                Some(pod),
+                Vec::new(),
+            );
+            let expected = Some(PodIp::parse(expected_ip)?);
+
+            assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                expected
+            );
+            // A hydration write that observed no published IP keeps the bound one.
+            substrate
+                .store
+                .persist_pod_metadata(sandbox_id, 1, Some("node-bound-uid"), published_ip, None)
+                .await?;
+            let row: (String, Option<String>) = sqlx::query_as(sql!(
+                "SELECT state, host(pod_ip)
+                   FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1 AND active",
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(row, ("running".to_owned(), Some(expected_ip.to_owned())));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn recent_succeeded_pod_without_suspend_ownership_is_cleaned_up() -> Result<(), BoxError>
     {
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;

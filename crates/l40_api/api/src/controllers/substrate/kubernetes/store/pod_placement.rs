@@ -124,6 +124,12 @@ impl K8sStore {
         pod_ip: Option<&str>,
         pod_client: Option<&ClientId>,
     ) -> Result<ActiveExecutionState, SubstrateError> {
+        let pod_ip = super::super::support::pod_ip_or_recorded(
+            pod_ip,
+            pod_uid,
+            tracked.pod_uid.as_deref(),
+            tracked.pod_ip.as_deref(),
+        );
         self.update_active_execution_pod_metadata(tx, sandbox_id, generation, pod_uid, pod_ip)
             .await?;
         if let Some(record) = self.record_after(tracked, pod_uid, pod_client) {
