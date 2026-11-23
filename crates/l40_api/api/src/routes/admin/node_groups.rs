@@ -111,6 +111,7 @@ fn node_group_response(row: NodeGroupRow, compat_templates: Vec<String>) -> Admi
         org_id: row.org_id,
         template_policy: row.template_policy,
         is_default: row.is_default,
+        exclusive: row.exclusive,
         created_at: format_time(row.created_at),
         nodes_count: row.nodes_count,
         compat_templates,
@@ -257,6 +258,13 @@ pub async fn create_node_group(
         )
         .into_response();
     }
+    if request.exclusive && request.org_id.is_none() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "only an org-owned node group can be exclusive",
+        )
+        .into_response();
+    }
     // A dedicated group must not be the cluster's first node group.
     //
     // Two things go wrong otherwise, and the second is why a doc note is not
@@ -301,6 +309,7 @@ pub async fn create_node_group(
         request.org_id,
         template_policy,
         request.is_default,
+        request.exclusive,
     )
     .await;
     let node_group_id = match insert {

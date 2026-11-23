@@ -101,6 +101,7 @@ async fn create_conflicts_and_default_move() -> TestResult {
         None,
         NodeGroupTemplatePolicy::Default,
         true,
+        false,
     )
     .await?;
 
@@ -109,6 +110,7 @@ async fn create_conflicts_and_default_move() -> TestResult {
         &group_name("workers-shared"),
         None,
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await
@@ -124,6 +126,7 @@ async fn create_conflicts_and_default_move() -> TestResult {
         None,
         NodeGroupTemplatePolicy::Default,
         true,
+        false,
     )
     .await
     .unwrap_err();
@@ -138,6 +141,7 @@ async fn create_conflicts_and_default_move() -> TestResult {
         &group_name("workers-other"),
         None,
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;
@@ -170,6 +174,7 @@ async fn check_constraints_backstop_handler_validation() -> TestResult {
         None,
         NodeGroupTemplatePolicy::Restricted,
         false,
+        false,
     )
     .await
     .unwrap_err();
@@ -184,6 +189,7 @@ async fn check_constraints_backstop_handler_validation() -> TestResult {
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Default,
         true,
+        false,
     )
     .await
     .unwrap_err();
@@ -208,6 +214,7 @@ async fn group_occupancy_counts_active_and_pinned() -> TestResult {
         &group_name("org-a-dedicated"),
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;
@@ -248,6 +255,7 @@ async fn group_occupancy_counts_restoring_target_pins() -> TestResult {
         &group_name("org-a-dedicated"),
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;
@@ -299,6 +307,7 @@ async fn concurrent_set_default_loser_hits_identifiable_conflict() -> TestResult
         None,
         NodeGroupTemplatePolicy::Default,
         false,
+        false,
     )
     .await?;
     let group_b = insert_node_group(
@@ -306,6 +315,7 @@ async fn concurrent_set_default_loser_hits_identifiable_conflict() -> TestResult
         &group_name("workers-b"),
         None,
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;
@@ -352,6 +362,7 @@ async fn group_occupancy_counts_inflight_uploads_from_group_nodes() -> TestResul
         &group_name("org-a-dedicated"),
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;
@@ -409,6 +420,7 @@ async fn stranded_cached_templates_respects_owner_and_visibility() -> TestResult
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Default,
         false,
+        false,
     )
     .await?;
     let node = insert_node_in_group(pool, group).await?;
@@ -462,6 +474,7 @@ async fn releasing_restricted_group_resets_policy_and_clears_compat() -> TestRes
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Restricted,
         false,
+        false,
     )
     .await?;
     insert_template(pool, "base-generic", "generic", None).await?;
@@ -500,6 +513,7 @@ async fn compat_replace_and_policy_switch_clear() -> TestResult {
         &group_name("org-a-restricted"),
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Restricted,
+        false,
         false,
     )
     .await?;
@@ -574,6 +588,7 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
         &group_name("org-a-restricted"),
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Restricted,
+        false,
         false,
     )
     .await?;
@@ -657,6 +672,7 @@ async fn default_group_nodes_count_includes_null_membership() -> TestResult {
         None,
         NodeGroupTemplatePolicy::Default,
         true,
+        false,
     )
     .await?;
     let dedicated = insert_node_group(
@@ -664,6 +680,7 @@ async fn default_group_nodes_count_includes_null_membership() -> TestResult {
         &group_name("org-a-dedicated"),
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;
@@ -703,6 +720,7 @@ async fn delete_blocked_by_node_fk() -> TestResult {
         &group_name("org-a-dedicated"),
         Some(OrgId::from_uuid(ORG_A)),
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;
@@ -761,6 +779,7 @@ async fn generic_group_existence_gates_dedicated_creation() -> TestResult {
         Some(org_id),
         NodeGroupTemplatePolicy::Default,
         false,
+        false,
     )
     .await?;
     assert!(
@@ -775,6 +794,7 @@ async fn generic_group_existence_gates_dedicated_creation() -> TestResult {
         &group_name("workers-extra"),
         None,
         NodeGroupTemplatePolicy::Default,
+        false,
         false,
     )
     .await?;

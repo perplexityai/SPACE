@@ -10,6 +10,15 @@
 set -euxo pipefail
 exec > /var/log/space-setup.log 2>&1
 
+%{ if cache_encryption_required ~}
+# This node's launch template encrypts /space/cache under a tenant KMS key.
+# Only the AMI's cache unit implements that; the fallback below would format
+# a plaintext cache, so an AMI without the unit stops the boot instead.
+if [[ ! -x /usr/local/sbin/space-cache-key-watchdog.sh || ! -f /etc/systemd/system/space-cache-nvme.service ]]; then
+  echo "this AMI cannot encrypt /space/cache; refusing to bootstrap a tenant-encrypted node" >&2
+  exit 1
+fi
+%{ endif ~}
 ${space_cache_nvme_mount}
 
 # Containerd shim — must exist before nodeadm starts containerd. Bootstrap
