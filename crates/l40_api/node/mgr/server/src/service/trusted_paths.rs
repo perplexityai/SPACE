@@ -156,7 +156,7 @@ pub(super) fn permission_inode(path: &Path) -> Result<File, Status> {
     Ok(file)
 }
 
-pub(super) fn open_regular_file(directory: &File, name: &std::ffi::OsStr) -> Result<File, Status> {
+pub(crate) fn open_regular_file(directory: &File, name: &std::ffi::OsStr) -> Result<File, Status> {
     open_regular_file_with_flags(directory, name, OFlag::O_RDONLY)
 }
 
