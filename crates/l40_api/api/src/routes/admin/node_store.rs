@@ -12,6 +12,7 @@ use pplx_space_accounts::NodeId;
 use pplx_space_admin_protocol::{
     AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters,
 };
+use pplx_space_node_execution_inventory_store::InstallationGuestRow;
 use pplx_space_node_model::{
     NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
     NodeRole,
@@ -90,17 +91,6 @@ pub(super) struct AdminNodeRow {
     pub(super) updated_at: Option<OffsetDateTime>,
     pub(super) deleted_at: Option<OffsetDateTime>,
     pub(super) substrate_node_id: Option<String>,
-}
-
-/// One guest platform of one runtime installation a node reported.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct NodeRuntimeInstallationRow {
-    pub(super) node_id: NodeId,
-    pub(super) runtime: String,
-    pub(super) runtime_version: String,
-    pub(super) observed_at: OffsetDateTime,
-    pub(super) guest_os: Option<String>,
-    pub(super) guest_arch: Option<String>,
 }
 
 impl AdminNodeRow {
@@ -482,24 +472,10 @@ impl AdminNodeStore {
     pub(super) async fn runtime_installations_for_nodes(
         &self,
         node_ids: &[NodeId],
-    ) -> Result<Vec<NodeRuntimeInstallationRow>, sqlx::Error> {
-        sqlx::query_as(sql!(
-            "SELECT i.node_id,
-                    i.runtime,
-                    i.runtime_version,
-                    i.observed_at,
-                    g.guest_os,
-                    g.guest_arch
-             FROM node_runtime_installations i
-             LEFT JOIN node_runtime_guests g
-               ON g.node_id = i.node_id
-              AND g.runtime = i.runtime
-              AND g.runtime_version = i.runtime_version
-             WHERE i.node_id = ANY($1)
-             ORDER BY i.node_id, i.runtime, i.runtime_version, g.guest_os, g.guest_arch"
-        ))
-        .bind(node_ids)
-        .fetch_all(&self.pool)
+    ) -> Result<Vec<InstallationGuestRow>, sqlx::Error> {
+        pplx_space_node_execution_inventory_store::list_installations_with_guests(
+            &self.pool, node_ids,
+        )
         .await
     }
 

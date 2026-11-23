@@ -97,6 +97,7 @@ members = [
     "crates/l30_storage/runtime/environment/catalog/store",
     "crates/l30_storage/runtime/upgrade/campaign/store",
     "crates/l30_storage/node/status/store",
+    "crates/l30_storage/node/execution/inventory/store",
     "crates/l30_storage/runtime/environment/policy/store",
     "crates/l20_domain/net/common",
     "crates/l10_foundation/transparent/proxy/socket",
@@ -429,6 +430,7 @@ pplx-space-runtime-environment-catalog-store = { path = "crates/l30_storage/runt
 pplx-space-runtime-environment-policy-store = { path = "crates/l30_storage/runtime/environment/policy/store" }
 pplx-space-runtime-upgrade-campaign-store = { path = "crates/l30_storage/runtime/upgrade/campaign/store" }
 pplx-space-node-status-store = { path = "crates/l30_storage/node/status/store" }
+pplx-space-node-execution-inventory-store = { path = "crates/l30_storage/node/execution/inventory/store" }
 pplx-space-feature-flags = { path = "crates/l10_foundation/feature/flags" }
 pplx-space-events = { path = "crates/l20_domain/events" }
 pplx-space-data-plane-session-store = { path = "crates/l30_storage/data/plane/session/store" }
