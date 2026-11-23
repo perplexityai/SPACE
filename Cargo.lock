@@ -5143,6 +5143,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
  "form_urlencoded",
@@ -5150,6 +5151,7 @@ dependencies = [
  "reqwest 0.13.5",
  "thiserror 2.0.20",
  "tokio",
+ "url",
 ]
 
 [[package]]
