@@ -14,10 +14,14 @@ use pplx_space_node_api_client::proto::{
 use pplx_space_node_mgr_client::NodeManagerGrpcClient;
 use pplx_space_node_mgr_client::proto as node_manager;
 use tokio::sync::Notify;
+use tokio_util::task::AbortOnDropHandle;
 use tonic::{Request, Response, Status};
 
 const FETCH_BUDGET: Duration = Duration::from_secs(10);
 const SYNC_BUDGET: Duration = Duration::from_secs(10);
+/// An outer bound only has to catch a hung connect, so it trails the request
+/// deadline enough for the deadline's answer to arrive first.
+const CONNECT_MARGIN: Duration = Duration::from_secs(2);
 
 /// Wakes the delivery task. At most one wake waits, so a wake during a
 /// delivery causes exactly one more fetch.
@@ -77,30 +81,31 @@ impl Hops for ClusterAndManager {
     }
 }
 
-/// Start the delivery task; deliveries never overlap.
+/// Start the delivery task, which stops when its handle drops; deliveries
+/// never overlap.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
     expect(dead_code, reason = "production enables no firewall delivery yet")
 )]
-pub(crate) fn spawn(hops: impl Hops) -> Wake {
+pub(crate) fn spawn(hops: impl Hops) -> (Wake, AbortOnDropHandle<()>) {
     let notify = Arc::new(Notify::new());
     let wake = Wake(notify.clone());
-    tokio::spawn(async move {
+    let delivery = tokio::spawn(async move {
         loop {
             notify.notified().await;
             deliver(&hops).await;
         }
     });
-    wake
+    (wake, AbortOnDropHandle::new(delivery))
 }
 
 async fn deliver(hops: &impl Hops) {
     let FetchFirewallRulesResponse {
         node_id,
         assignment,
-        // H25a neither acts on nor acknowledges a verification round.
+        // This PR neither acts on nor acknowledges a verification round.
         pending_round: _,
-    } = match tokio::time::timeout(FETCH_BUDGET, hops.fetch()).await {
+    } = match tokio::time::timeout(FETCH_BUDGET + CONNECT_MARGIN, hops.fetch()).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             tracing::warn!(%error, "firewall rules fetch failed");
@@ -129,7 +134,7 @@ async fn deliver(hops: &impl Hops) {
         }),
     };
     // A lost reply proves neither outcome, so this claims neither.
-    match tokio::time::timeout(SYNC_BUDGET, hops.sync(request)).await {
+    match tokio::time::timeout(SYNC_BUDGET + CONNECT_MARGIN, hops.sync(request)).await {
         Ok(Ok(response)) => tracing::debug!(?response, "node-manager answered firewall sync"),
         Ok(Err(error)) => {
             tracing::warn!(generation, %error, "node-manager didn't confirm firewall generation");
@@ -159,18 +164,18 @@ pub async fn serve_firewall_wake_for_test(
         .expect("cluster endpoint configured once per process");
     // Nothing drains the reconcile queue, so drains are dropped.
     let (tx, _) = tokio::sync::mpsc::channel(1);
-    let service = crate::NodeCtlService {
-        cluster_reconcile_trigger: crate::ClusterReconcileTrigger::new(tx.clone(), ""),
-        tx,
-        db: Arc::new(std::sync::Mutex::new(
+    let (wake, delivery) = spawn(ClusterAndManager {
+        manager: pplx_space_node_mgr_client::lazy_at(node_mgr_socket),
+    });
+    let service = crate::NodeCtlService::new(
+        tx.clone(),
+        crate::ClusterReconcileTrigger::new(tx, ""),
+        Arc::new(std::sync::Mutex::new(
             rusqlite::Connection::open_in_memory().expect("open in-memory SQLite"),
         )),
-        peer_authorizer: crate::peer_authorizer(),
-        firewall_rules: Some(spawn(ClusterAndManager {
-            manager: pplx_space_node_mgr_client::lazy_at(node_mgr_socket),
-        })),
-    };
-    pplx_space_grpc_server::grpc_server_builder()
+        Some(wake),
+    );
+    let served = pplx_space_grpc_server::grpc_server_builder()
         .add_service(
             pplx_space_node_api_client::proto::node_ctl_server::NodeCtlServer::new(service),
         )
@@ -178,7 +183,11 @@ pub async fn serve_firewall_wake_for_test(
             tokio_stream::wrappers::UnixListenerStream::new(listener),
             shutdown.cancelled_owned(),
         )
-        .await
+        .await;
+    // Stopping delivery wherever it is means no Sync starts after this returns.
+    delivery.abort();
+    let _stopped = delivery.await;
+    served
 }
 
 #[cfg(test)]

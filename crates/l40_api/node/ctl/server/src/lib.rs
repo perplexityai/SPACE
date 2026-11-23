@@ -313,6 +313,23 @@ struct NodeCtlService {
     firewall_rules: Option<firewall_rules::Wake>,
 }
 
+impl NodeCtlService {
+    fn new(
+        tx: mpsc::Sender<WorkItem>,
+        cluster_reconcile_trigger: ClusterReconcileTrigger,
+        db: Arc<Mutex<Connection>>,
+        firewall_rules: Option<firewall_rules::Wake>,
+    ) -> Self {
+        Self {
+            tx,
+            cluster_reconcile_trigger,
+            db,
+            peer_authorizer: peer_authorizer(),
+            firewall_rules,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum WorkItem {
     TimerTick { next_due_at: i64 },
@@ -699,13 +716,12 @@ pub async fn run(
         .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
         .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
-        .add_service(NodeCtlServer::new(NodeCtlService {
+        .add_service(NodeCtlServer::new(NodeCtlService::new(
             tx,
             cluster_reconcile_trigger,
             db,
-            peer_authorizer: peer_authorizer(),
-            firewall_rules: None,
-        }))
+            None,
+        )))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown);
 
     let mut service_mutex = Some(service_mutex);

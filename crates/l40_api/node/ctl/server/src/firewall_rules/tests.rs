@@ -60,25 +60,27 @@ struct Node {
     service: NodeCtlService,
     calls: mpsc::UnboundedReceiver<Call>,
     drains: mpsc::Receiver<WorkItem>,
+    _delivery: AbortOnDropHandle<()>,
 }
 
 impl Node {
     fn start() -> Self {
         let (calls_tx, calls) = mpsc::unbounded_channel();
         let (tx, drains) = mpsc::channel(8);
-        let service = NodeCtlService {
-            cluster_reconcile_trigger: crate::ClusterReconcileTrigger::new(tx.clone(), NODE),
-            tx,
-            db: Arc::new(std::sync::Mutex::new(
+        let (wake, delivery) = spawn(Scripted(calls_tx));
+        let service = NodeCtlService::new(
+            tx.clone(),
+            crate::ClusterReconcileTrigger::new(tx, NODE),
+            Arc::new(std::sync::Mutex::new(
                 rusqlite::Connection::open_in_memory().expect("open in-memory SQLite"),
             )),
-            peer_authorizer: crate::peer_authorizer(),
-            firewall_rules: Some(spawn(Scripted(calls_tx))),
-        };
+            Some(wake),
+        );
         Self {
             service,
             calls,
             drains,
+            _delivery: delivery,
         }
     }
 
