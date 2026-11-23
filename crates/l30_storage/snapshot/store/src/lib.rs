@@ -23,9 +23,15 @@ use sqlx::types::Json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod attempt;
 pub mod claimed;
+pub mod disk_artifact;
+pub mod environment;
+pub mod listing;
 pub mod lost;
 mod placement;
+pub mod storage_location;
+pub mod upload;
 pub use placement::{SnapshotStoragePlacement, storage_placements};
 
 /// Reading a snapshot catalog row failed.

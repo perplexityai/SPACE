@@ -819,12 +819,9 @@ impl ClusterApiService {
             // terminal state. Disambiguate so the caller gets the right
             // gRPC code: NOT_FOUND for missing, FAILED_PRECONDITION for
             // crossed terminal states.
-            let current_state: Option<String> =
-                sqlx::query_scalar(sql!("SELECT state FROM snapshots WHERE id = $1"))
-                    .bind(snapshot_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| Status::internal(format!("snapshot state lookup: {e}")))?;
+            let current_state = snapshot_store::attempt::state(&mut *tx, snapshot_id)
+                .await
+                .map_err(|e| Status::internal(format!("snapshot state lookup: {e}")))?;
             return match current_state {
                 None => Err(Status::not_found(format!(
                     "snapshot {snapshot_id} not found"
