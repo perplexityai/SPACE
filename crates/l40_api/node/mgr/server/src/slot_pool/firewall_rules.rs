@@ -21,13 +21,23 @@ use crate::firewall::rules::{Nft, nft, render};
 use crate::net::SlotInfo;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SlotFirewallRequest {
     pub node_id: NodeId,
     pub generation: u64,
     pub slot_id: u32,
+    /// When set, a slot or namespace that isn't this target is `Changed`.
+    pub expected: Option<SlotTarget>,
+}
+
+/// The occupant of a slot an attempt reached.
+#[derive(Clone, Debug)]
+pub struct SlotTarget {
+    pub slot_generation: u64,
+    pub sandbox_id: Option<String>,
+    pub namespace: NamespaceIdentity,
 }
 
 #[derive(Debug)]
@@ -114,10 +124,18 @@ impl SlotFirewallAttempt {
     pub fn verified(&self) -> bool {
         self.readback == Verification::Match && self.current.is_ok()
     }
+
+    pub fn target(&self) -> SlotTarget {
+        SlotTarget {
+            slot_generation: self.slot_generation,
+            sandbox_id: self.sandbox_id.clone(),
+            namespace: self.namespace,
+        }
+    }
 }
 
 /// What the operation reaches beyond the pool and nft; tests substitute it.
-pub(super) trait SlotHost: Send + Sync + 'static {
+pub(crate) trait SlotHost: Send + Sync + 'static {
     fn namespace_path(&self, slot: &SlotInfo) -> PathBuf;
     /// Test seam between the lookup and taking ownership.
     fn looked_up(&self) {}
@@ -153,7 +171,7 @@ impl NetworkPool {
             .await
     }
 
-    pub(super) async fn apply_firewall_rules_with(
+    pub(crate) async fn apply_firewall_rules_with(
         self: &Arc<Self>,
         assignments: &Arc<FirewallAssignments>,
         request: SlotFirewallRequest,
@@ -259,11 +277,24 @@ fn apply_blocking(
         Ok(owned) => owned,
         Err(not_run) => return SlotFirewallReport::NotRun(not_run),
     };
-    let path = host.namespace_path(&owned.record.info);
+    let info = &owned.record.info;
+    let sandbox_id = (!info.sandbox_id.is_empty()).then(|| info.sandbox_id.clone());
+    // Both checked under ownership, before nft runs.
+    let expected = request.expected.as_ref();
+    let changed = |target: &SlotTarget| {
+        (target.slot_generation, &target.sandbox_id) != (info.generation, &sandbox_id)
+    };
+    if expected.is_some_and(changed) {
+        return SlotFirewallReport::NotRun(NotRun::Changed);
+    }
+    let path = host.namespace_path(info);
     let (netns, namespace) = match pin(&path) {
         Ok(pinned) => pinned,
         Err(error) => return SlotFirewallReport::NotRun(NotRun::Namespace(error)),
     };
+    if expected.is_some_and(|target| target.namespace != namespace) {
+        return SlotFirewallReport::NotRun(NotRun::Changed);
+    }
     // Taken under ownership, so an invocation queued behind a newer one
     // cannot reinstall an older revision.
     let desired = match runnable(assignments.current(), request.node_id, request.generation) {
@@ -273,14 +304,13 @@ fn apply_blocking(
     let submitted = install_with(&render(&desired.revision), &netns, nft);
     let readback = verify_with(&desired.revision, &netns, nft);
     let current = still_current(pool, assignments, &desired, &owned.record, &path, namespace);
-    let info = &owned.record.info;
     SlotFirewallReport::Attempted(Box::new(SlotFirewallAttempt {
         node_id: desired.node_id,
         assignment_generation: desired.generation,
         revision_id: desired.revision_id,
         slot_id: info.slot,
         slot_generation: info.generation,
-        sandbox_id: (!info.sandbox_id.is_empty()).then(|| info.sandbox_id.clone()),
+        sandbox_id,
         namespace,
         submitted,
         readback,
