@@ -394,10 +394,10 @@ fn attempted(readback: Verification, current: Result<(), Stale>) -> SlotFirewall
     }))
 }
 
-// Catches an outcome misreported, or a binding that goes on after a changed
-// target or an unknown result, or ends after anything else.
+// Catches an outcome misreported, a changed target or an uncertain result
+// taken for the other, or anything else that ends.
 #[tokio::test]
-async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
+async fn each_report_is_one_outcome_and_ends_only_drift_or_uncertainty() {
     let cancelled = tokio::spawn(std::future::pending::<()>());
     cancelled.abort();
     let unknown = cancelled.await.unwrap_err();
@@ -415,10 +415,10 @@ async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
     let assignment = || Stale::Assignment(NotRunnable::NoAssignment);
     let poisoned = || SlotStoreError::LockPoisoned;
     let rows = [
-        (Outcome::Unknown, true, vec![Err(unknown)]),
+        (Outcome::Unknown, Ends::Binding, vec![Err(unknown)]),
         (
             Outcome::NotRun,
-            false,
+            Ends::Nothing,
             vec![
                 not_run(NotRun::Busy),
                 not_run(NotRun::ShuttingDown),
@@ -428,7 +428,7 @@ async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
         ),
         (
             Outcome::NotRun,
-            true,
+            Ends::Target,
             vec![
                 not_run(NotRun::NoSlot),
                 not_run(ineligible),
@@ -436,20 +436,28 @@ async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
                 not_run(NotRun::Namespace(gone())),
             ],
         ),
-        (Outcome::Matched, false, vec![current(Verification::Match)]),
-        (Outcome::Mismatched, false, vec![current(mismatch())]),
+        (
+            Outcome::Matched,
+            Ends::Nothing,
+            vec![current(Verification::Match)],
+        ),
+        (
+            Outcome::Mismatched,
+            Ends::Nothing,
+            vec![current(mismatch())],
+        ),
         (
             Outcome::Inconclusive,
-            true,
+            Ends::Binding,
             vec![
                 current(inconclusive()),
                 attempt(inconclusive(), Err(assignment())),
             ],
         ),
-        (Outcome::Stale, false, vec![stale(assignment())]),
+        (Outcome::Stale, Ends::Nothing, vec![stale(assignment())]),
         (
             Outcome::Stale,
-            true,
+            Ends::Binding,
             vec![
                 stale(Stale::Slot),
                 stale(Stale::SlotStore(poisoned())),
@@ -633,33 +641,41 @@ async fn a_pass_keeps_each_slot_and_retries_only_what_never_reached_nft() {
     assert_eq!(bound.host.installs(), [first, ready, held]);
 }
 
-// Catches a ready slot left out, an ineligible one listed, or work for a
-// replaced occupant run against its replacement.
+// Catches a ready slot left out, an ineligible one listed, a replaced occupant
+// written or ending the pass, or a slot changed after nft that doesn't end it.
 #[tokio::test]
-async fn a_slot_replaced_after_listing_is_refused_and_ends_the_binding() {
+async fn a_replaced_slot_ends_only_its_work_and_drift_after_nft_ends_the_binding() {
     use SlotState::{Dirty, Leased, Ready};
-    let states = [Leased, Dirty, Ready, Leased];
+    let states = [Leased, Dirty, Leased, Ready];
     let bound = bind_slots(BoundSlots::All, None, None, WAIT, &states).await;
-    // On slot 0's lookup, after listing and before slot 3's.
+    let [first, _, _, ready] = bound.namespaces[..] else {
+        unreachable!()
+    };
+    // On slot 0's lookup, after listing and before slot 2's.
     let (pool, fake) = (bound.service.pool.clone(), bound.host.clone());
     hook(&bound.host.looked_up, move || {
-        set_slot(&pool, 3, Leased, 2);
-        fake.name(3, "mnt");
+        set_slot(&pool, 2, Leased, 2);
+        fake.name(2, "mnt");
     });
     sync_all(&bound.service, 12).await;
     let matched = Some(Outcome::Matched);
-    let outcomes = [(0, matched), (2, matched), (3, Some(Outcome::NotRun))];
+    let outcomes = [(0, matched), (2, Some(Outcome::NotRun)), (3, matched)];
     assert_eq!(passed(&bound.service, 12).await.unwrap(), outcomes);
-    let refused = sync(&bound.service, delivery(12)).await.unwrap_err();
+    assert_eq!(bound.host.installs(), [first, ready]);
+
+    // 13's first slot is reset while nft runs, so what its readback shows is moot.
+    let pool = bound.service.pool.clone();
+    hook(&bound.host.installed, move || set_slot(&pool, 0, Dirty, 1));
+    sync_all(&bound.service, 13).await;
+    let outcomes = [(0, Some(Outcome::Stale)), (2, None), (3, None)];
+    assert_eq!(passed(&bound.service, 13).await.unwrap(), outcomes);
+    let refused = sync(&bound.service, delivery(14)).await.unwrap_err();
     assert_eq!(refused.code(), Code::FailedPrecondition);
-    assert_eq!(
-        bound.host.installs(),
-        [bound.namespaces[0], bound.namespaces[2]]
-    );
+    assert_eq!(bound.host.installs(), [first, ready, first]);
 }
 
-// Catches an older pass that goes on after a newer generation is accepted, or
-// installs its revision late.
+// Catches an older pass that installs its revision after a newer generation is
+// accepted, or a newer pass that doesn't list the pool afresh.
 #[tokio::test]
 async fn a_newer_generation_stops_an_older_pass() {
     use SlotState::{Leased, Ready};

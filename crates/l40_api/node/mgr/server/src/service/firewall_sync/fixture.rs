@@ -1,14 +1,16 @@
 //! The test binding of `SyncFirewallRules` to one node, assignment record and
 //! either one slot or every eligible slot. One tracked worker runs the latest
 //! accepted generation's pass; deliveries of a generation share it, and a newer
-//! one supersedes older work. An `All` pass targets each slot incarnation the
-//! pool listed when it started; a `One` pass's first attempt to reach nft fixes
-//! its target for the binding. Per-slot results live in memory only; no
-//! node-wide receipt. A production binding is meant to promote this worker.
+//! one supersedes older work. Each `All` pass targets the slot incarnations it
+//! lists, and never redirects work to another occupant; a `One` pass's first
+//! attempt to reach nft fixes its target for the binding. Per-slot results live
+//! in memory only; no node-wide receipt. A production binding is meant to
+//! promote this worker.
 //!
-//! Retry: nothing reached nft and the target isn't known to have changed, so
-//! redelivery runs that slot again. A changed target or an unknown result ends
-//! the whole binding for this process. Anything else is final, never resubmitted.
+//! A result that may not describe what nft did to its target ends the whole
+//! binding for this process, as does any changed target under `One`. Under
+//! `All`, a target changed before nft reads not run and the pass goes on.
+//! Redelivery re-runs slots that never reached nft; nothing else is resubmitted.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,6 +59,16 @@ pub(crate) enum BoundSlots {
     /// Every slot the slot apply would take when a generation's pass starts. A
     /// ready slot rebuilt in place keeps its generation, so it is still the target.
     All,
+}
+
+/// What a slot's result ends besides its own attempt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Ends {
+    Nothing,
+    /// The target changed before nft: a `One` binding ends, an `All` slot doesn't.
+    Target,
+    /// What nft did to the target is uncertain.
+    Binding,
 }
 
 pub(crate) struct FirewallSync {
@@ -242,13 +254,9 @@ impl FirewallSync {
                     self.unsettled(generation).unwrap_or_default()
                 }
             };
+            // Once superseded, the slot apply refuses the rest before nft, and their
+            // results are dropped.
             for (index, slot_id, expected) in work {
-                // A newer pass lists afresh; this one's targets may have moved on. A
-                // generation armed after this check can't stop this slot's apply, which
-                // may still be refused as changed and end the binding.
-                if !self.wants(generation) {
-                    break;
-                }
                 let request = SlotFirewallRequest {
                     node_id: self.fixture.node_id,
                     generation,
@@ -264,6 +272,11 @@ impl FirewallSync {
                     target.get_or_insert_with(|| attempt.target());
                 }
                 let (done, ends) = dispatch(&report);
+                let ends = match ends {
+                    Ends::Binding => true,
+                    Ends::Target => matches!(self.fixture.slots, BoundSlots::One(_)),
+                    Ends::Nothing => false,
+                };
                 tracing::info!(
                     generation,
                     slot_id,
@@ -353,13 +366,6 @@ impl FirewallSync {
         }
     }
 
-    fn wants(&self, generation: u64) -> bool {
-        let wanted = self.wanted.borrow();
-        wanted
-            .as_ref()
-            .is_some_and(|wanted| wanted.generation == generation)
-    }
-
     fn update(&self, generation: u64, edit: impl FnOnce(&mut Wanted)) {
         self.wanted.send_if_modified(|wanted| match wanted {
             Some(wanted) if wanted.generation == generation => {
@@ -405,34 +411,43 @@ fn arm(wanted: &mut Option<Wanted>, generation: u64) -> bool {
     }
 }
 
-/// The reply for `report`, and whether it ends the binding.
-fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDispatch, bool) {
+/// The reply for `report`, and what it ends.
+fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDispatch, Ends) {
     let (outcome, detail, ends) = match report {
-        Err(error) => (Outcome::Unknown, error.to_string(), true),
+        Err(error) => (Outcome::Unknown, error.to_string(), Ends::Binding),
         Ok(SlotFirewallReport::NotRun(not_run)) => {
             let drifted = matches!(
                 not_run,
                 NotRun::NoSlot | NotRun::Ineligible { .. } | NotRun::Changed | NotRun::Namespace(_)
             );
-            (Outcome::NotRun, not_run.to_string(), drifted)
+            let ends = if drifted { Ends::Target } else { Ends::Nothing };
+            (Outcome::NotRun, not_run.to_string(), ends)
         }
         Ok(SlotFirewallReport::Attempted(attempt)) => match (&attempt.readback, &attempt.current) {
-            (Verification::Inconclusive(why), _) => (Outcome::Inconclusive, why.clone(), true),
+            (Verification::Inconclusive(why), _) => {
+                (Outcome::Inconclusive, why.clone(), Ends::Binding)
+            }
             // Only a changed assignment leaves the target trusted.
-            (_, Err(stale)) => (
-                Outcome::Stale,
-                format!("{stale:?}"),
-                !matches!(
+            (_, Err(stale)) => {
+                let assignment_changed = matches!(
                     stale,
                     Stale::Assignment(
                         NotRunnable::NoAssignment
                             | NotRunnable::WrongNode { .. }
                             | NotRunnable::NotCurrent { .. }
                     )
-                ),
-            ),
-            (Verification::Match, Ok(())) => (Outcome::Matched, String::new(), false),
-            (Verification::Mismatch(why), Ok(())) => (Outcome::Mismatched, why.clone(), false),
+                );
+                let ends = if assignment_changed {
+                    Ends::Nothing
+                } else {
+                    Ends::Binding
+                };
+                (Outcome::Stale, format!("{stale:?}"), ends)
+            }
+            (Verification::Match, Ok(())) => (Outcome::Matched, String::new(), Ends::Nothing),
+            (Verification::Mismatch(why), Ok(())) => {
+                (Outcome::Mismatched, why.clone(), Ends::Nothing)
+            }
         },
     };
     let dispatch = FirewallSlotDispatch {
