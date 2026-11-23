@@ -16,7 +16,6 @@
 //! identity owns the observation row and its epoch; it should then refuse a
 //! missing row or a different epoch rather than create one.
 
-use jiff::Timestamp;
 use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
@@ -26,23 +25,15 @@ use crate::issue::wake_one;
 use crate::leased_item::{HeaderLock, lock_leased_item};
 use crate::{LeasedTarget, Wakeup, Work, roll_back};
 
-/// A round as the control plane asked it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Question {
-    pub round: u64,
-    /// The generation the target's item issued, which an answer must be about.
-    pub assignment_generation: u64,
-    /// When this round was opened, not when the assignment was issued.
-    pub issued_at: Timestamp,
-}
-
-/// What [`open_round`] did.
+/// What [`open_round`] did. A round is returned as Fetch reads it: bound to
+/// the generation the target's item issued, which an answer must be about,
+/// and timed when it was opened, not when the assignment was issued.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Opening {
     /// This call opened the round and queued the wakeup, and committed.
-    Opened(Question),
+    Opened(PendingRound),
     /// The round was already open for this generation; nothing changed.
-    AlreadyOpen(Question),
+    AlreadyOpen(PendingRound),
     /// Nothing changed.
     Refused(OpenRefusal),
 }
@@ -174,10 +165,10 @@ async fn open(
     }
     match (round, round_issued_at, bound.map(non_negative).transpose()?) {
         (Some(round), Some(issued_at), Some(bound)) if bound == assignment_generation => {
-            return Ok(Opening::AlreadyOpen(question(
+            return Ok(Opening::AlreadyOpen(pending_round(
                 round,
                 issued_at,
-                assignment_generation,
+                Some(assignment_generation),
             )?));
         }
         (_, _, Some(bound)) if bound > assignment_generation => {
@@ -214,24 +205,9 @@ async fn open(
     let Some((round, issued_at)) = opened else {
         return Ok(Opening::Refused(OpenRefusal::Lapsed));
     };
-    Ok(Opening::Opened(question(
+    Ok(Opening::Opened(pending_round(
         round,
         issued_at,
-        assignment_generation,
+        Some(assignment_generation),
     )?))
-}
-
-fn question(
-    round: i64,
-    issued_at: OffsetDateTime,
-    assignment_generation: u64,
-) -> Result<Question, sqlx::Error> {
-    let PendingRound {
-        round, issued_at, ..
-    } = pending_round(round, issued_at, Some(assignment_generation))?;
-    Ok(Question {
-        round,
-        assignment_generation,
-        issued_at,
-    })
 }

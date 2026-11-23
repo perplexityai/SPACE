@@ -407,7 +407,7 @@ async fn fetch_returns_the_round_its_writer_opened() -> TestResult {
     let Opening::Opened(question) = open_round(&mut conn, &target, 1, &mut Wake).await? else {
         panic!("no round was opened");
     };
-    assert_eq!(question.assignment_generation, asked);
+    assert_eq!(question.assignment_generation, Some(asked));
     let release = Requeue::Release { error: None };
     assert!(requeue(&mut *conn, &target, &release).await?);
     set_phase(pool, first, "completed").await?;
