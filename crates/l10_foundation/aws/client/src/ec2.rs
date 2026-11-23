@@ -2,7 +2,7 @@ use aws_smithy_xml::decode::{Document, ScopedDecoder, XmlDecodeError, try_data};
 use aws_types::SdkConfig;
 
 use crate::query::{
-    AwsClientError, AwsQueryClient, AwsQueryService, QueryTransport, ReqwestTransport,
+    AwsClientError, AwsQueryClient, AwsQueryService, HttpTransport, QueryTransport,
 };
 
 const DESCRIBE_INSTANCES_ACTION: &str = "DescribeInstances";
@@ -16,11 +16,11 @@ pub struct Instance {
 }
 
 #[derive(Debug, Clone)]
-pub struct Client<T = ReqwestTransport> {
+pub struct Client<T = HttpTransport> {
     query: AwsQueryClient<T>,
 }
 
-impl Client<ReqwestTransport> {
+impl Client<HttpTransport> {
     pub fn from_config(config: &SdkConfig) -> Self {
         Self {
             query: AwsQueryClient::from_config(AwsQueryService::Ec2, config),

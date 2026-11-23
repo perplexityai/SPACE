@@ -156,10 +156,10 @@ spec:
             # The fake EC2 endpoint; see `ec2` in values.yaml.
             - name: AWS_ENDPOINT_URL_EC2
               value: {{ required "ec2.fakeEndpoint.url must name the Kind fake EC2 endpoint" .Values.ec2.fakeEndpoint.url | quote }}
-            # The EC2 client's HTTPS trusts the platform roots
-            # (rustls-platform-verifier, through rustls-native-certs), which
-            # read SSL_CERT_DIR: the image's bundle plus the internal RPC CA
-            # that issued the fake's leaf.
+            # The EC2 client's HTTPS, the SDK's client, trusts the platform
+            # roots (rustls-native-certs), which read SSL_CERT_DIR: the
+            # image's bundle plus the internal RPC CA that issued the fake's
+            # leaf.
             - name: SSL_CERT_DIR
               value: /etc/ssl/certs:/etc/space-rpc-ca
             {{- end }}

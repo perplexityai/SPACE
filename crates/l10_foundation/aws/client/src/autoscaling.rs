@@ -1,18 +1,18 @@
 use aws_types::SdkConfig;
 
 use crate::query::{
-    AwsClientError, AwsQueryClient, AwsQueryService, QueryTransport, ReqwestTransport,
+    AwsClientError, AwsQueryClient, AwsQueryService, HttpTransport, QueryTransport,
 };
 
 const TERMINATE_INSTANCE_ACTION: &str = "TerminateInstanceInAutoScalingGroup";
 const AUTOSCALING_API_VERSION: &str = "2011-01-01";
 
 #[derive(Debug, Clone)]
-pub struct Client<T = ReqwestTransport> {
+pub struct Client<T = HttpTransport> {
     query: AwsQueryClient<T>,
 }
 
-impl Client<ReqwestTransport> {
+impl Client<HttpTransport> {
     pub fn from_config(config: &SdkConfig) -> Self {
         Self {
             query: AwsQueryClient::from_config(AwsQueryService::AutoScaling, config),

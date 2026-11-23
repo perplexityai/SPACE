@@ -3,4 +3,4 @@ pub mod ec2;
 
 mod query;
 
-pub use query::{AwsClientError, QueryResponse, QueryTransport, ReqwestTransport};
+pub use query::{AwsClientError, HttpTransport, QueryResponse, QueryTransport};
