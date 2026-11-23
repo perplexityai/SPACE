@@ -51,6 +51,14 @@ fn gap(kind: Gap, slot_id: Option<u32>) -> FirewallRulesCensusGap {
     FirewallRulesCensusGap {
         kind: kind.into(),
         slot_id,
+        omitted: None,
+    }
+}
+
+fn truncated(omitted: Option<u64>) -> FirewallRulesCensusGap {
+    FirewallRulesCensusGap {
+        omitted,
+        ..gap(Gap::Truncated, None)
     }
 }
 
@@ -781,8 +789,10 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
 /// accepted: 0 is a value, and an unset field never reads as 0. Catches a
 /// decoder that defaults an unset field or enum, accepts an unknown enum
 /// value, a duplicate slot, a reason or gap slot that doesn't fit, an
-/// incomplete census without gaps, an out-of-range integer, or an oversized
-/// report, and a bare census standing in for evidence.
+/// incomplete census without gaps, an out-of-range integer, an oversized
+/// report, a truncation that is repeated, empty, slotted or out of range, or
+/// a count on another gap, and a bare census standing in for evidence; a
+/// census of 32,767 gaps and a truncation is accepted wherever it lists it.
 #[tokio::test(flavor = "current_thread")]
 async fn malformed_reports_write_nothing() -> TestResult {
     let Some(mut r) = reporter(2).await? else {
@@ -800,7 +810,7 @@ async fn malformed_reports_write_nothing() -> TestResult {
     let before = row(pool, r.node).await?;
     let too_large = u64::try_from(i64::MAX)? + 1;
     type Malform = fn(&mut ReportFirewallRulesRequest, u64);
-    let malformations: [(&str, Malform); 29] = [
+    let malformations: [(&str, Malform); 35] = [
         ("node_id unset", |q, _| q.node_id.clear()),
         ("round unset", |q, _| q.round = None),
         ("generation unset", |q, _| q.assignment_generation = None),
@@ -820,12 +830,34 @@ async fn malformed_reports_write_nothing() -> TestResult {
         }),
         ("incomplete census without", |q, _| q.census_gaps.clear()),
         ("gap kind unset", |q, _| q.census_gaps[1].kind = 0),
-        ("unknown gap kind", |q, _| q.census_gaps[1].kind = 7),
+        ("unknown gap kind", |q, _| q.census_gaps[1].kind = 8),
         ("slot gap without its slot", |q, _| {
             q.census_gaps[0].slot_id = None
         }),
         ("slot on a gap without one", |q, _| {
             q.census_gaps[1].slot_id = Some(0);
+        }),
+        ("truncation without a count", |q, _| {
+            q.census_gaps.push(truncated(None));
+        }),
+        ("truncation omitting none", |q, _| {
+            q.census_gaps.push(truncated(Some(0)));
+        }),
+        ("truncation with a slot", |q, _| {
+            q.census_gaps.push(FirewallRulesCensusGap {
+                slot_id: Some(0),
+                ..truncated(Some(1))
+            });
+        }),
+        ("two truncations", |q, _| {
+            q.census_gaps
+                .extend([truncated(Some(1)), truncated(Some(2))]);
+        }),
+        ("a count on another gap", |q, _| {
+            q.census_gaps[1].omitted = Some(1);
+        }),
+        ("truncation count out of range", |q, n| {
+            q.census_gaps.push(truncated(Some(n)));
         }),
         ("too many gaps", |q, _| {
             q.census_gaps = vec![gap(Gap::Extra, None); 32_769];
@@ -872,5 +904,29 @@ async fn malformed_reports_write_nothing() -> TestResult {
         assert_eq!(row(pool, r.node).await?, before, "{label}");
     }
     assert_eq!(report(client, &r.token, base).await?, Ok(Outcome::Accepted));
+
+    // A census at the cap: 32,767 kept gaps and the marker, listed first.
+    ask(pool, r.node, (0, r.revision), 1, 0, Duration::ZERO).await?;
+    let mut overflow = answer(r.node, 1, (0, r.revision), 0);
+    overflow.census = Census::Incomplete.into();
+    overflow.census_gaps = vec![truncated(Some(5))];
+    overflow
+        .census_gaps
+        .extend(vec![gap(Gap::Extra, None); 32_767]);
+    assert_eq!(
+        report(client, &r.token, overflow).await?,
+        Ok(Outcome::Accepted)
+    );
+    let (gaps, last) = sqlx::query_as::<_, (i32, serde_json::Value)>(sql!(
+        "SELECT jsonb_array_length(accepted_report -> 'census_gaps'),
+                accepted_report -> 'census_gaps' -> 32767
+         FROM firewall_rules_node_observations
+         WHERE node_id = $1"
+    ))
+    .bind(r.node)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(gaps, 32_768);
+    assert_eq!(last, serde_json::json!({"gap": "truncated", "omitted": 5}));
     Ok(())
 }

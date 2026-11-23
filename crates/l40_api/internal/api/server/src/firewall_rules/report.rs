@@ -78,15 +78,17 @@ fn decode(request: ReportFirewallRulesRequest) -> Result<(NodeId, Report), Statu
 }
 
 fn gap(gap: &FirewallRulesCensusGap) -> Result<CensusGap, Status> {
-    match (FirewallRulesCensusGapKind::try_from(gap.kind), gap.slot_id) {
-        (Ok(FirewallRulesCensusGapKind::InventoryFailed), None) => Ok(CensusGap::InventoryFailed),
-        (Ok(FirewallRulesCensusGapKind::Unowned), None) => Ok(CensusGap::Unowned),
-        (Ok(FirewallRulesCensusGapKind::ListingFailed), None) => Ok(CensusGap::ListingFailed),
-        (Ok(FirewallRulesCensusGapKind::Missing), Some(slot)) => Ok(CensusGap::Missing(slot)),
-        (Ok(FirewallRulesCensusGapKind::Unread), Some(slot)) => Ok(CensusGap::Unread(slot)),
-        (Ok(FirewallRulesCensusGapKind::Extra), None) => Ok(CensusGap::Extra),
+    use FirewallRulesCensusGapKind as K;
+    match (K::try_from(gap.kind), gap.slot_id, gap.omitted) {
+        (Ok(K::InventoryFailed), None, None) => Ok(CensusGap::InventoryFailed),
+        (Ok(K::Unowned), None, None) => Ok(CensusGap::Unowned),
+        (Ok(K::ListingFailed), None, None) => Ok(CensusGap::ListingFailed),
+        (Ok(K::Missing), Some(slot), None) => Ok(CensusGap::Missing(slot)),
+        (Ok(K::Unread), Some(slot), None) => Ok(CensusGap::Unread(slot)),
+        (Ok(K::Extra), None, None) => Ok(CensusGap::Extra),
+        (Ok(K::Truncated), None, Some(omitted)) => Ok(CensusGap::Truncated(omitted)),
         _ => Err(malformed(
-            "a census gap is unset or unknown, or its slot_id doesn't fit it",
+            "a census gap is unset or unknown, or its slot_id or omitted doesn't fit it",
         )),
     }
 }

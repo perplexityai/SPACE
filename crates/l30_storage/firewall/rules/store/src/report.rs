@@ -19,8 +19,9 @@ use crate::{RevisionId, roll_back};
 /// Most slots one report may describe: one past node-mgr's largest pool,
 /// `MAX_IPV4_NETWORK_SLOTS`.
 const MAX_REPORT_SLOTS: usize = 16_384;
-/// Most census gaps one report may list: a slot gap per slot, the listing's
-/// gap, and as many stray namespaces. A worker with more can't report.
+/// Most census gaps one report may list, a truncation marker included: a slot
+/// gap per slot, the listing's gap, and as many stray namespaces. A worker
+/// with more lists the first `MAX_CENSUS_GAPS - 1` and a marker.
 const MAX_CENSUS_GAPS: usize = 2 * MAX_REPORT_SLOTS;
 /// The accepted document's only schema version. Any change to the document
 /// needs a new one: a retained document would otherwise compare as a conflict.
@@ -39,6 +40,10 @@ pub enum InvalidReport {
     DuplicateSlot(u32),
     #[error("an incomplete census lists no gap")]
     NoGaps,
+    #[error("a census lists more than one truncation")]
+    RepeatedTruncation,
+    #[error("a truncation omits no gaps")]
+    EmptyTruncation,
 }
 
 /// Whether the worker accounted for every managed namespace.
@@ -62,6 +67,8 @@ pub enum CensusGap {
     Unread(u32),
     /// A managed namespace no slot accounts for.
     Extra,
+    /// The list omits this many gaps, more than 0. At most one per report.
+    Truncated(u64),
 }
 
 impl CensusGap {
@@ -73,6 +80,7 @@ impl CensusGap {
             Self::Missing(_) => "missing",
             Self::Unread(_) => "unread",
             Self::Extra => "extra",
+            Self::Truncated(_) => "truncated",
         }
     }
 }
@@ -201,17 +209,35 @@ impl Report {
                 if gaps.len() > MAX_CENSUS_GAPS {
                     return Err(InvalidReport::TooManyGaps(gaps.len()));
                 }
+                let mut truncations = gaps
+                    .iter()
+                    .filter(|gap| matches!(gap, CensusGap::Truncated(_)));
+                if truncations.nth(1).is_some() {
+                    return Err(InvalidReport::RepeatedTruncation);
+                }
+                if gaps.contains(&CensusGap::Truncated(0)) {
+                    return Err(InvalidReport::EmptyTruncation);
+                }
                 gaps.sort_unstable();
-                let gaps = gaps.into_iter().map(|gap| {
-                    let mut entry = Map::new();
-                    entry.insert("gap".into(), gap.as_str().into());
-                    if let CensusGap::Missing(slot_id) | CensusGap::Unread(slot_id) = gap {
-                        entry.insert("slot_id".into(), slot_id.into());
-                    }
-                    Value::Object(entry)
-                });
+                let gaps = gaps
+                    .into_iter()
+                    .map(|gap| {
+                        let mut entry = Map::new();
+                        entry.insert("gap".into(), gap.as_str().into());
+                        match gap {
+                            CensusGap::Missing(slot_id) | CensusGap::Unread(slot_id) => {
+                                entry.insert("slot_id".into(), slot_id.into());
+                            }
+                            CensusGap::Truncated(omitted) => {
+                                entry.insert("omitted".into(), stored("omitted", omitted)?.into());
+                            }
+                            _ => {}
+                        }
+                        Ok(Value::Object(entry))
+                    })
+                    .collect::<Result<Vec<_>, InvalidReport>>()?;
                 document.insert("census".into(), "incomplete".into());
-                document.insert("census_gaps".into(), gaps.collect());
+                document.insert("census_gaps".into(), gaps.into());
             }
         }
         document.insert("slots".into(), slots.into());

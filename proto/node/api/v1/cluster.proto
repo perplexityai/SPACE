@@ -1570,8 +1570,8 @@ message ReportFirewallRulesRequest {
   optional uint64 manager_epoch = 5;
   FirewallRulesCensus census = 6;
   // At most 32768, in any order; empty exactly when `census` is COMPLETE. A
-  // worker with more gaps, which only stray namespaces can cause, can't
-  // report.
+  // worker with more gaps, which only stray namespaces can cause, lists the
+  // first 32767 it keeps and one TRUNCATED gap counting the rest.
   repeated FirewallRulesCensusGap census_gaps = 7;
   // At most 16384, each slot ID once, in any order.
   repeated FirewallRulesSlotEvidence slots = 8;
@@ -1589,6 +1589,8 @@ message FirewallRulesCensusGap {
   FirewallRulesCensusGapKind kind = 1;
   // Set exactly for MISSING and UNREAD.
   optional uint32 slot_id = 2;
+  // Set exactly for TRUNCATED: how many gaps the list omits, above 0.
+  optional uint64 omitted = 3;
 }
 
 enum FirewallRulesCensusGapKind {
@@ -1605,6 +1607,9 @@ enum FirewallRulesCensusGapKind {
   FIREWALL_RULES_CENSUS_GAP_KIND_UNREAD = 5;
   // A managed namespace no slot accounts for; one gap per namespace.
   FIREWALL_RULES_CENSUS_GAP_KIND_EXTRA = 6;
+  // The list omits `omitted` gaps. At most once, with no slot_id, and only in
+  // an INCOMPLETE census; its position in the list doesn't matter.
+  FIREWALL_RULES_CENSUS_GAP_KIND_TRUNCATED = 7;
 }
 
 message FirewallRulesSlotEvidence {
