@@ -1,6 +1,7 @@
 //! The node-group mirror's Postgres operations: the `node_groups` read, through
-//! `pplx-space-node-group-store`, and the bulk UPDATE of `nodes.node_group_id`,
-//! with the transaction it runs in.
+//! `pplx-space-node-group-store`, and the transaction the bulk UPDATE of
+//! `nodes.node_group_id` (`pplx_space_node_registration_store::node_group`)
+//! runs in.
 //!
 //! The read takes any executor. The write is a pair on one connection,
 //! [`begin_mirror_write`] then [`mirror_worker_groups`], because the statement
@@ -11,9 +12,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use pplx_space_node_model::{NODE_ROLE_WORKER, NodeGroupId, SubstrateKind};
+use pplx_space_node_model::NodeGroupId;
+use pplx_space_node_registration_store::node_group;
 use pplx_space_sql_locator::sql;
-use sqlx::{Connection, Executor, PgConnection, PgExecutor, Postgres, SqlSafeStr, Transaction};
+use sqlx::{Connection, PgConnection, PgExecutor, Postgres, Transaction};
 
 /// `node_groups` as `name -> id`.
 pub(super) async fn group_ids_by_name<'e>(
@@ -45,17 +47,7 @@ pub(super) async fn begin_mirror_write(
     .bind(format!("{}ms", idle_timeout.as_millis()))
     .execute(&mut *tx)
     .await?;
-    // The parameter types `mirror_worker_groups` binds, so the prepared
-    // statement is the one its execute would have prepared itself.
-    let parameters = [
-        <Vec<String> as sqlx::Type<Postgres>>::type_info(),
-        <Vec<Option<NodeGroupId>> as sqlx::Type<Postgres>>::type_info(),
-        <&str as sqlx::Type<Postgres>>::type_info(),
-        <SubstrateKind as sqlx::Type<Postgres>>::type_info(),
-    ];
-    (&mut *tx)
-        .prepare_with(MIRROR_UPDATE.into_sql_str(), &parameters)
-        .await?;
+    node_group::prepare_mirror_worker_node_groups(&mut *tx).await?;
     Ok(tx)
 }
 
@@ -82,26 +74,5 @@ pub(super) async fn mirror_worker_groups(
     node_names: &[String],
     group_ids: &[Option<NodeGroupId>],
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(MIRROR_UPDATE)
-        .bind(node_names)
-        .bind(group_ids)
-        .bind(NODE_ROLE_WORKER)
-        .bind(SubstrateKind::Kubernetes)
-        .execute(&mut **tx)
-        .await?;
-    Ok(result.rows_affected())
+    node_group::mirror_worker_node_groups(&mut **tx, node_names, group_ids).await
 }
-
-/// The bulk UPDATE, prepared by [`begin_mirror_write`] and executed by
-/// [`mirror_worker_groups`], which must send the same text for the execute to
-/// find the prepared statement in the cache.
-const MIRROR_UPDATE: &str = sql!(
-    "UPDATE nodes
-        SET node_group_id = u.group_id
-       FROM UNNEST($1::TEXT[], $2::UUID[]) AS u(k8s_node_name, group_id)
-       JOIN node_k8s nk ON nk.k8s_node_name = u.k8s_node_name
-      WHERE nodes.id = nk.node_id
-        AND nodes.role = $3
-        AND nodes.managed_by = $4
-        AND nodes.node_group_id IS DISTINCT FROM u.group_id"
-);

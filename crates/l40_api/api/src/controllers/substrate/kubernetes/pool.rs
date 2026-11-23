@@ -6,6 +6,7 @@ use pplx_space_cluster_pool::{
 };
 use pplx_space_execution_spec::VcpuCount;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use pplx_space_template_release_original::digest_original;
@@ -856,9 +857,7 @@ async fn named_pool_template_release(
     .map_err(|err| db_contention_error("failed to read the named pool template release", &err))
 }
 
-/// The worker registered under the slot pod's Kubernetes node name. Node ids
-/// are scoped by role, so a builder on the same host has its own row under
-/// that name.
+/// The worker registered under the slot pod's Kubernetes node name.
 async fn resolve_pool_slot_node_id(
     tx: &mut Transaction<'_, Postgres>,
     node_name: Option<&str>,
@@ -866,16 +865,7 @@ async fn resolve_pool_slot_node_id(
     let Some(node_name) = node_name else {
         return Ok(None);
     };
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT nk.node_id
-         FROM node_k8s nk
-         JOIN nodes n ON n.id = nk.node_id
-         WHERE nk.k8s_node_name = $1
-           AND n.role = 'worker'"
-    ))
-    .bind(node_name)
-    .fetch_optional(&mut **tx)
-    .await
+    node_lookup::worker_for_k8s_node_name(&mut **tx, node_name).await
 }
 
 async fn fetch_pool_config(

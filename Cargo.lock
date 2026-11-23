@@ -5419,6 +5419,7 @@ dependencies = [
  "pplx-space-node-api-sim",
  "pplx-space-node-group-store",
  "pplx-space-node-model",
+ "pplx-space-node-registration-store",
  "pplx-space-node-status-store",
  "pplx-space-observability",
  "pplx-space-policy-authority",
@@ -7242,6 +7243,7 @@ dependencies = [
  "pplx-space-sql-locator",
  "sqlx",
  "thiserror 2.0.20",
+ "time",
  "tokio",
 ]
 

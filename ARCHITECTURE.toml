@@ -397,6 +397,7 @@ pplx-space-node-group-store = [
 ]
 pplx-space-node-registration-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-credmgr",
   "pplx-space-internal-api-server",
 ]

@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use pplx_space_sql_locator::sql;
 use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
 
@@ -14,6 +13,7 @@ use pplx_space_network_roles::GuestPort;
 use pplx_space_node_api_client::{NodeApiClient, WorkerApiClient};
 use pplx_space_node_mgr_client::proto::{AllowPortRequest, NetworkProtocol};
 use pplx_space_node_model::{NodeDrainPhase, NodeDrainState, NodeManagedBy};
+use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
 use pplx_space_sandbox_model::{
     ExecutionGeneration, RouteGeneration, SandboxActivationAttemptId, SandboxId,
 };
@@ -85,18 +85,18 @@ async fn ensure_sandbox_service_route_node_not_draining(
     // guard and the user-API drain gates cannot drift: `forced` + `draining`
     // races the evacuation pipeline, and `drained` / `terminating` block in
     // either mode because the node is about to be destroyed.
-    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
-    ))
-    .bind(active_node_id.as_uuid())
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| {
-        Status::internal(format!(
-            "load sandbox service route node drain state: {error}"
-        ))
-    })?;
-    let Some((drain_phase, drain_mode)) = row else {
+    let row = drain_reads::drain_columns(pool, active_node_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "load sandbox service route node drain state: {error}"
+            ))
+        })?;
+    let Some(NodeDrainColumns {
+        drain_phase,
+        drain_mode,
+    }) = row
+    else {
         return Ok(());
     };
     let drain_phase = drain_phase

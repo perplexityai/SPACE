@@ -58,6 +58,7 @@ use pplx_space_events::{
 };
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_rpc_contracts::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_snapshot_model::{
@@ -381,13 +382,6 @@ struct NodeRow {
     updated_at: OffsetDateTime,
     deleted_at: Option<OffsetDateTime>,
     metadata_json: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct OriginNodeRow {
-    id: NodeId,
-    address: Option<String>,
-    role: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1494,26 +1488,9 @@ impl ClusterApiService {
                 "node role is required when origin_node_id is a Kubernetes node name",
             ));
         };
-        let role_hint_str = role_hint.as_str();
-        let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-            "SELECT n.id,
-                    host(n.address) AS address,
-                    n.role
-             FROM nodes n
-             JOIN node_k8s nk ON nk.node_id = n.id
-             WHERE nk.k8s_node_name = $1
-               AND n.managed_by = $3
-               AND n.role = $2
-               AND COALESCE(n.state, 'registered') != 'deleted'
-             ORDER BY nk.updated_at DESC, n.created_at DESC
-             LIMIT 1"
-        ))
-        .bind(&value)
-        .bind(role_hint_str)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| Status::internal(format!("resolve Kubernetes origin node: {err}")))?;
+        let row = node_lookup::live_k8s_node_by_name(&self.pool, &value, role_hint)
+            .await
+            .map_err(|err| Status::internal(format!("resolve Kubernetes origin node: {err}")))?;
         let Some(row) = row else {
             return Err(Status::not_found(format!(
                 "origin_node_id {value} is not registered"
@@ -1582,24 +1559,9 @@ async fn registered_origin_node(
     node_id: NodeId,
     role_hint: Option<SpaceNodeRole>,
 ) -> Result<OriginNode, Status> {
-    let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-        "SELECT n.id,
-                host(n.address) AS address,
-                n.role
-         FROM nodes n
-         WHERE n.id = $1
-           AND ($2::TEXT IS NULL OR n.role = $2)
-           AND n.managed_by IN ($3, $4)
-           AND COALESCE(n.state, 'registered') != 'deleted'
-         LIMIT 1"
-    ))
-    .bind(node_id.as_uuid())
-    .bind(role_hint.map(SpaceNodeRole::as_str))
-    .bind(SubstrateKind::Space)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(executor)
-    .await
-    .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
+    let row = node_lookup::live_node(executor, node_id, role_hint)
+        .await
+        .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
     let Some(row) = row else {
         return Err(Status::not_found(format!(
             "origin_node_id {display_id} is not registered"

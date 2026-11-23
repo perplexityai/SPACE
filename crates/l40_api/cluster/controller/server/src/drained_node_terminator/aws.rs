@@ -11,7 +11,7 @@
 
 use pplx_space_accounts::NodeId;
 
-use pplx_space_sql_locator::sql;
+use pplx_space_node_registration_store::lookup::{self as node_lookup, K8sNodeIdentity};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,19 +49,19 @@ impl InstanceStateLookup for Ec2InstanceStateLookup {
             // Read the private DNS and the kube Node uid in one query, so the
             // uid we carry into the guarded delete is the identity whose
             // instance we are about to confirm terminated.
-            let row: Option<(String, Option<String>)> = sqlx::query_as(sql!(
-                "SELECT k8s_node_name, k8s_node_uid FROM node_k8s WHERE node_id = $1"
-            ))
-            .bind(node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| {
-                InstanceLookupError::Backend(format!("node_k8s lookup failed: {err}"))
-            })?;
+            let row = node_lookup::k8s_node_identity(&self.pool, node_id)
+                .await
+                .map_err(|err| {
+                    InstanceLookupError::Backend(format!("node_k8s lookup failed: {err}"))
+                })?;
             // No `node_k8s` row means we can't resolve the private DNS to
             // cross-check EC2. Surface as a backend error so the recovery
             // path fails safe and parks the row rather than deleting blind.
-            let Some((private_dns, expected_uid)) = row else {
+            let Some(K8sNodeIdentity {
+                k8s_node_name: private_dns,
+                k8s_node_uid: expected_uid,
+            }) = row
+            else {
                 return Err(InstanceLookupError::Backend(format!(
                     "node {node_id} has no node_k8s row; cannot resolve private DNS for EC2 cross-check"
                 )));

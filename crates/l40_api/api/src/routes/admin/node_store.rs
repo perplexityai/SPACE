@@ -17,6 +17,8 @@ use pplx_space_node_model::{
     NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeManagedBy,
     NodeRole,
 };
+use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
+use pplx_space_node_registration_store::drain_write::{self, DrainColumnsUpdate};
 use pplx_space_sandbox_model::SandboxId;
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
@@ -851,12 +853,7 @@ impl AdminNodeStore {
     /// not mask the original substrate convergence failure, so this swallows
     /// the sqlx error and logs.
     pub(super) async fn record_drain_last_error(&self, node_id: NodeId, message: &str) {
-        if let Err(err) = sqlx::query(sql!("UPDATE nodes SET drain_last_error = $1 WHERE id = $2"))
-            .bind(message)
-            .bind(node_id)
-            .execute(&self.pool)
-            .await
-        {
+        if let Err(err) = drain_write::set_drain_last_error(&self.pool, node_id, message).await {
             tracing::warn!(
                 %node_id,
                 error = %err,
@@ -1180,14 +1177,25 @@ pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<bool, sqlx::Error> {
-    let row: Option<(Option<NodeDrainPhase>, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
-    ))
-    .bind(node_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row
-        .and_then(|(phase, mode)| NodeDrainState::from_columns(phase, mode.as_deref()))
+    let Some(NodeDrainColumns {
+        drain_phase,
+        drain_mode,
+    }) = drain_reads::drain_columns(pool, node_id).await?
+    else {
+        return Ok(false);
+    };
+    // An unknown phase fails the check with a decode error on column 0, the
+    // phase's position in `drain_columns`, so the fan-out aborts instead of
+    // reading the gate as open.
+    let phase = drain_phase
+        .as_deref()
+        .map(NodeDrainPhase::parse)
+        .transpose()
+        .map_err(|source| sqlx::Error::ColumnDecode {
+            index: "0".to_owned(),
+            source: source.into(),
+        })?;
+    Ok(NodeDrainState::from_columns(phase, drain_mode.as_deref())
         .is_some_and(NodeDrainState::blocks_placement))
 }
 
@@ -1307,29 +1315,17 @@ pub(super) async fn update_drain_phase(
     // would be read by nothing today, but a later drain that failed to write the
     // column would silently inherit it. The undrained steady state is "no drain,
     // no mode".
-    sqlx::query(sql!(
-        "UPDATE nodes
-            SET drain_phase = $2,
-                drain_started_at = CASE
-                    WHEN $3 THEN NOW()
-                    WHEN $4 THEN NULL
-                    ELSE drain_started_at
-                END,
-                drain_last_error = NULL,
-                terminate_decrement_capacity = COALESCE($5, terminate_decrement_capacity),
-                drain_mode = CASE
-                    WHEN $4 THEN NULL
-                    ELSE COALESCE($6, drain_mode)
-                END
-          WHERE id = $1"
-    ))
-    .bind(node_id)
-    .bind(new_phase)
-    .bind(set_started_at)
-    .bind(clear_started_at)
-    .bind(terminate_decrement_capacity)
-    .bind(drain_mode)
-    .execute(&mut **tx)
+    drain_write::update_drain_columns(
+        &mut **tx,
+        node_id,
+        DrainColumnsUpdate {
+            phase: new_phase,
+            set_started_at,
+            clear_started_at,
+            terminate_decrement_capacity,
+            drain_mode,
+        },
+    )
     .await?;
     Ok(())
 }
@@ -1366,3 +1362,6 @@ mod pinned_local_only_plan_tests;
 /// otherwise the agreement proves nothing.
 #[cfg(test)]
 pub(super) mod terminate_gate_agreement_tests;
+/// Postgres-backed decoding contract for [`is_node_wake_gate_closed`].
+#[cfg(test)]
+mod wake_gate_tests;

@@ -11,6 +11,7 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_node_model::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
+use pplx_space_node_registration_store::drain_reads;
 use pplx_space_postgres_pool::contention;
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
@@ -1248,19 +1249,12 @@ pub(super) async fn fetch_active_node_drain_state(
     // whether the gate fires. Preferring a blocking sibling happens below, in
     // Rust, so the mode policy stays where `from_column_str` is rather than
     // being restated in an `ORDER BY`.
-    let siblings: Vec<(NodeDrainPhase, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT n.drain_phase, n.drain_mode
-           FROM node_k8s nk
-           JOIN nodes n ON n.id = nk.node_id
-          WHERE nk.k8s_node_name = $1
-            AND n.drain_phase IS NOT NULL"
-    ))
-    .bind(k8s_node_name)
-    .fetch_all(pool)
-    .await?;
+    let siblings = drain_reads::draining_nodes_for_k8s_node_name(pool, &k8s_node_name).await?;
     let siblings: Vec<NodeDrainState> = siblings
         .into_iter()
-        .filter_map(|(phase, mode)| NodeDrainState::from_columns(Some(phase), mode.as_deref()))
+        .filter_map(|node| {
+            NodeDrainState::from_columns(Some(node.drain_phase), node.drain_mode.as_deref())
+        })
         .collect();
     // Precedence: any blocking candidate wins, whichever side it came from; else
     // the primary if it had a phase at all (so a caller can still see "draining,
