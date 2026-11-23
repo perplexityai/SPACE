@@ -11,7 +11,7 @@ use pplx_space_firewall_rules_protocol::decode_revision;
 use super::super::{Verification, verify};
 use crate::firewall::rules::install::{InstallOutcome, install};
 use crate::firewall::rules::{TableConstruction, render};
-use crate::netns_tests::{TestNamespace, contained, ip};
+use crate::netns_tests::{TestNamespace, contained, inside, link_guest};
 
 const PRIVILEGE: &str = "create network namespaces and nftables tables";
 const DNS: &str = r#"{"id":"dns","all_of":[{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}"#;
@@ -29,20 +29,6 @@ fn pinned(namespace: &TestNamespace) -> File {
 fn committed(construction: &TableConstruction, netns: &File) {
     let outcome = contained(|| install(construction, netns));
     assert!(matches!(outcome, InstallOutcome::Committed), "{outcome:?}");
-}
-
-/// Runs `f` on a thread inside `namespace`; sockets it opens stay there.
-fn inside<T: Send>(namespace: &TestNamespace, f: impl FnOnce() -> T + Send) -> T {
-    let netns = pinned(namespace);
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                nix::sched::setns(&netns, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-                f()
-            })
-            .join()
-            .unwrap()
-    })
 }
 
 // Catches a verifier that misreads a correct live table, depends on kernel
@@ -108,21 +94,17 @@ fn verified_table_drops_denied_and_established_traffic_only() {
     let target = TestNamespace::create();
     let guest = TestNamespace::create();
     // A veth named tap0 replaces the dummy, so the guest side can send.
-    let (t, g) = (target.name(), guest.name());
-    ip(&["-n", t, "link", "del", "tap0"]);
-    ip(&[
-        "-n", t, "link", "add", "tap0", "type", "veth", "peer", "name", "eth0", "netns", g,
-    ]);
-    ip(&["-n", t, "addr", "add", "10.0.0.1/24", "dev", "tap0"]);
-    ip(&["-n", g, "addr", "add", "10.0.0.2/24", "dev", "eth0"]);
-    ip(&["-n", t, "link", "set", "tap0", "up"]);
-    ip(&["-n", g, "link", "set", "eth0", "up"]);
+    link_guest(&target, &guest);
 
-    let listener = inside(&target, || TcpListener::bind("10.0.0.1:8080").unwrap());
-    let denied = inside(&target, || UdpSocket::bind("10.0.0.1:53").unwrap());
-    let allowed = inside(&target, || UdpSocket::bind("10.0.0.1:54").unwrap());
-    let sender = inside(&guest, || UdpSocket::bind("10.0.0.2:0").unwrap());
-    let mut client = inside(&guest, || TcpStream::connect("10.0.0.1:8080").unwrap());
+    let listener = inside(target.name(), || {
+        TcpListener::bind("10.0.0.1:8080").unwrap()
+    });
+    let denied = inside(target.name(), || UdpSocket::bind("10.0.0.1:53").unwrap());
+    let allowed = inside(target.name(), || UdpSocket::bind("10.0.0.1:54").unwrap());
+    let sender = inside(guest.name(), || UdpSocket::bind("10.0.0.2:0").unwrap());
+    let mut client = inside(guest.name(), || {
+        TcpStream::connect("10.0.0.1:8080").unwrap()
+    });
     client.set_nodelay(true).unwrap();
     let (mut server, _) = listener.accept().unwrap();
     for socket in [&denied, &allowed] {

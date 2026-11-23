@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::service::artifact_fs::{self, AtomicWriteError, BoundedReadError, MAX_RECORD_BYTES};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 const RECORD_FORMAT_VERSION: u32 = 1;
 

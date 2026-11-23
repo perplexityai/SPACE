@@ -10,13 +10,18 @@ use uuid::Uuid;
 
 use super::{
     AcceptError, Acceptance, AtomicWriteError, DesiredAssignment, FirewallAssignments,
-    IncomingAssignment, OpenError, Unavailable, write_record,
+    IncomingAssignment, OpenError, Ordering, Unavailable, write_record,
 };
 use crate::service::artifact_fs;
 
 const NODE: NodeId = NodeId::from_uuid(Uuid::from_u128(1));
 const DNS: &str = r#"{"id":"dns","all_of":[{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":53}]}"#;
 const WEB: &str = r#"{"id":"web","all_of":[{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}]}"#;
+
+/// Makes `store` unavailable, as an unsynced write does.
+pub(crate) fn make_unavailable(store: &FirewallAssignments) {
+    store.unavailable.store(true, Ordering::Release);
+}
 
 fn document(rules: &[&str]) -> String {
     format!(r#"{{"schema_version":1,"rules":[{}]}}"#, rules.join(","))

@@ -17,20 +17,26 @@ struct PreparationOwnership {
 }
 
 impl NodeManagerService {
-    async fn launch_admitted_runtime(
+    pub(super) async fn launch_admitted_runtime(
         &self,
-        sandbox_id: &str,
+        lease: &SlotInfo,
         request: pplx_space_node_runtime_core::proto::LaunchRuntimeRequest,
     ) -> Result<pplx_space_node_runtime_core::proto::LaunchRuntimeResponse, Status> {
+        let sandbox_id = lease.sandbox_id.as_str();
         let expected_environment = request
             .verified_runtime
             .as_ref()
             .map(|verified| verified.environment_reference.clone());
+        let namespace = request.network_namespace.clone();
+        let launch = async {
+            self.runtime_supervisor
+                .launch_runtime(request)
+                .await
+                .map_err(pplx_space_node_runtime_core::launch_admission::supervisor_launch_status)
+        };
         let launched = self
-            .runtime_supervisor
-            .launch_runtime(request)
-            .await
-            .map_err(pplx_space_node_runtime_core::launch_admission::supervisor_launch_status)?
+            .admit_launch(lease, &namespace, launch)
+            .await?
             .into_inner();
         if expected_environment
             .is_some_and(|reference| launched.accepted_environment_reference != reference)
@@ -720,7 +726,7 @@ impl NodeManagerService {
             self.ensure_guest_dhcp(sandbox_id, req.execution_fence.as_ref())
                 .await?;
         }
-        let launched = self.launch_admitted_runtime(sandbox_id, request).await?;
+        let launched = self.launch_admitted_runtime(&lease, request).await?;
         let fc_pid = launched.pid;
         if let Err(error) = self.pool.set_pid(sandbox_id, fc_pid) {
             tracing::error!(

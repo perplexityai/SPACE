@@ -964,7 +964,7 @@ async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
         });
         let result = service
             .launch_admitted_runtime(
-                &lease.sandbox_id,
+                &lease,
                 proto::LaunchRuntimeRequest {
                     sandbox_id: lease.sandbox_id.clone(),
                     runtime: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,

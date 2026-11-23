@@ -27,6 +27,7 @@ use crate::slot_pool::{
 
 mod linux;
 mod observe;
+mod start;
 
 const SLOT: u32 = 1;
 /// Within `BOUND`, so a reply always comes before the test gives up.
