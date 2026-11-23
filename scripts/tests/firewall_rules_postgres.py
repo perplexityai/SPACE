@@ -1,12 +1,17 @@
 """Postgres helpers for the firewall rules schema tests: a server to create
-databases on, and the db/postgres migrations applied as SQLx applies them."""
+databases on, the db/postgres migrations applied as SQLx applies them, and a
+new database migrated to just before one of them."""
 
 from __future__ import annotations
 
 import os
+import unittest
+import uuid
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from required_test_deps import unavailable_dependency
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "db" / "postgres"
@@ -51,3 +56,29 @@ def apply_migrations(url: str, files: list[Path] | None = None) -> None:
             else:
                 with conn.transaction():
                     conn.execute(text)
+
+
+def fresh_database(test: unittest.TestCase, *, before: int) -> str:
+    """Create a database for `test`, dropped when it ends, with every up
+    migration older than version `before` applied, and return its URL."""
+    admin_url = database_url()
+    database = f"firewall_rules_{uuid.uuid4().hex}"
+    try:
+        admin = psycopg.connect(admin_url, autocommit=True)
+    except psycopg.OperationalError as error:
+        unavailable_dependency("postgres", str(error))
+    with admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+
+    def drop() -> None:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database))
+            )
+
+    test.addCleanup(drop)
+    url = make_conninfo(admin_url, dbname=database)
+    apply_migrations(
+        url, [path for path in migration_files() if int(path.name.split("_", 1)[0]) < before]
+    )
+    return url

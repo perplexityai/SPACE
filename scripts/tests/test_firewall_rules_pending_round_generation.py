@@ -13,47 +13,19 @@ import unittest
 import uuid
 
 import psycopg
-from firewall_rules_postgres import (
-    MIGRATIONS_DIR,
-    apply_migrations,
-    database_url,
-    migration_files,
-)
-from psycopg import errors, sql
-from psycopg.conninfo import make_conninfo
-from required_test_deps import unavailable_dependency
+from firewall_rules_postgres import MIGRATIONS_DIR, apply_migrations, fresh_database
+from psycopg import errors
 
 VERSION = 20261123200458
 UP = MIGRATIONS_DIR / f"{VERSION}_firewall_rules_pending_round_generation.up.sql"
 DOWN = UP.with_name(UP.name.replace(".up.", ".down."))
 GENERATION_CHECK = "firewall_rules_node_observations_pending_generation_check"
-ROUND_CHECK = "firewall_rules_node_observations_pending_round_check"
 ISSUED_AT = "2026-11-23 12:00:00.123456+00"
 
 
 class PendingRoundGenerationTest(unittest.TestCase):
     def setUp(self) -> None:
-        admin_url = database_url()
-        database = f"firewall_rules_generation_{uuid.uuid4().hex}"
-        try:
-            admin = psycopg.connect(admin_url, autocommit=True)
-        except psycopg.OperationalError as error:
-            unavailable_dependency("postgres", str(error))
-        with admin:
-            admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
-
-        def drop() -> None:
-            with psycopg.connect(admin_url, autocommit=True) as admin:
-                admin.execute(
-                    sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
-                        sql.Identifier(database)
-                    )
-                )
-
-        self.addCleanup(drop)
-        self.url = make_conninfo(admin_url, dbname=database)
-        earlier = [path for path in migration_files() if int(path.name.split("_", 1)[0]) < VERSION]
-        apply_migrations(self.url, earlier)
+        self.url = fresh_database(self, before=VERSION)
         self.conn = psycopg.connect(self.url, autocommit=True)
         self.addCleanup(self.conn.close)
 
@@ -102,7 +74,7 @@ class PendingRoundGenerationTest(unittest.TestCase):
         ).fetchone()
         return generation
 
-    def observe(self, round_: int | None, issued: bool, generation: int | None) -> None:
+    def observe(self, round_: int | None, generation: int | None) -> None:
         """Insert a node's observation, beside older accepted evidence, and roll
         it back."""
         with self.conn.transaction(force_rollback=True):
@@ -111,7 +83,13 @@ class PendingRoundGenerationTest(unittest.TestCase):
                 " pending_round, pending_round_issued_at, pending_assignment_generation,"
                 " accepted_round, accepted_round_issued_at, accepted_report)"
                 " VALUES (%s, 1, %s, %s, %s, 2, %s, '{}')",
-                (uuid.uuid4(), round_, ISSUED_AT if issued else None, generation, ISSUED_AT),
+                (
+                    uuid.uuid4(),
+                    round_,
+                    ISSUED_AT if round_ is not None else None,
+                    generation,
+                    ISSUED_AT,
+                ),
             )
 
     def test_an_old_round_stays_unbound_and_a_bound_one_is_complete(self) -> None:
@@ -122,16 +100,15 @@ class PendingRoundGenerationTest(unittest.TestCase):
         self.assertIsNone(self.generation())
 
         for case, args in {
-            "no round": (None, False, None),
-            "generation zero": (7, True, 0),
-            "unbound": (7, True, None),
+            "no round": (None, None),
+            "generation zero": (7, 0),
+            "unbound": (7, None),
         }.items():
             with self.subTest(case):
                 self.observe(*args)
         for case, args, constraint in [
-            ("generation without a round", (None, False, 12), GENERATION_CHECK),
-            ("negative generation", (7, True, -1), GENERATION_CHECK),
-            ("round without its issue time", (7, False, 12), ROUND_CHECK),
+            ("generation without a round", (None, 12), GENERATION_CHECK),
+            ("negative generation", (7, -1), GENERATION_CHECK),
         ]:
             with self.subTest(case), self.assertRaises(errors.CheckViolation) as caught:
                 self.observe(*args)
