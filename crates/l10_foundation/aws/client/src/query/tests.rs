@@ -237,6 +237,10 @@ async fn refuses_endpoints_before_sending() {
         ("http://127.0.0.1:9/one/%2e./two", false),
         ("http://127.0.0.1:9/one/%2E/two", false),
         ("http://127.0.0.1:9/a\\b", false),
+        // Catches sending userinfo, which reqwest sends as a Basic Authorization header.
+        ("http://user:pw@127.0.0.1:9/", false),
+        ("http://user@127.0.0.1:9/", false),
+        ("http://:pw@127.0.0.1:9/", false),
         // Catches signing an endpoint with no authority, which panics in aws-sigv4.
         ("/relative", false),
     ] {

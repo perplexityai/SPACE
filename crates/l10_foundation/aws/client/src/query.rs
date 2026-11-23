@@ -292,6 +292,12 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         let uri: http::Uri = endpoint.parse().map_err(http::Error::from)?;
         let target = reqwest::Url::parse(&endpoint)
             .map_err(|err| AwsClientError::InvalidEndpoint(err.to_string()))?;
+        // reqwest sends userinfo as a second, Basic, Authorization header, which nothing verifies.
+        if !target.username().is_empty() || target.password().is_some() {
+            return Err(AwsClientError::InvalidEndpoint(
+                "endpoint carries userinfo".to_string(),
+            ));
+        }
         // Send only if url and SigV4 resolve the written path alike, up to url's percent-encoding.
         let written = signed_segments(uri.path());
         let mut expected = target.clone();
