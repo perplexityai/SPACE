@@ -32,12 +32,23 @@ pub struct SlotFirewallRequest {
     pub expected: Option<SlotTarget>,
 }
 
-/// The occupant of a slot an attempt reached.
+/// The occupant of a slot, as discovered or as an attempt reached it.
 #[derive(Clone, Debug)]
 pub struct SlotTarget {
     pub slot_generation: u64,
     pub sandbox_id: Option<String>,
-    pub namespace: NamespaceIdentity,
+    /// Unset until an attempt pinned it.
+    pub namespace: Option<NamespaceIdentity>,
+}
+
+impl SlotTarget {
+    fn of(info: &SlotInfo) -> Self {
+        Self {
+            slot_generation: info.generation,
+            sandbox_id: (!info.sandbox_id.is_empty()).then(|| info.sandbox_id.clone()),
+            namespace: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -129,7 +140,7 @@ impl SlotFirewallAttempt {
         SlotTarget {
             slot_generation: self.slot_generation,
             sandbox_id: self.sandbox_id.clone(),
-            namespace: self.namespace,
+            namespace: Some(self.namespace),
         }
     }
 }
@@ -185,6 +196,18 @@ impl NetworkPool {
         self.task_tracker
             .spawn_blocking(move || apply_blocking(&pool, &assignments, request, &*host, &*nft))
             .await
+    }
+
+    /// Every slot an apply would take now, at the incarnation read. The pool
+    /// lock is released on return, before any namespace or nft work.
+    pub fn firewall_targets(&self) -> Result<Vec<(u32, SlotTarget)>, SlotStoreError> {
+        let records = self.all_records()?;
+        let eligible = records
+            .iter()
+            .filter(|record| eligible(record.state, record.health, &record.info.sandbox_id));
+        Ok(eligible
+            .map(|record| (record.info.slot, SlotTarget::of(&record.info)))
+            .collect())
     }
 
     fn lookup_eligible(&self, slot_id: u32) -> Result<SlotRecord, NotRun> {
@@ -278,11 +301,15 @@ fn apply_blocking(
         Err(not_run) => return SlotFirewallReport::NotRun(not_run),
     };
     let info = &owned.record.info;
-    let sandbox_id = (!info.sandbox_id.is_empty()).then(|| info.sandbox_id.clone());
+    let SlotTarget {
+        slot_generation,
+        sandbox_id,
+        ..
+    } = SlotTarget::of(info);
     // Both checked under ownership, before nft runs.
     let expected = request.expected.as_ref();
     let changed = |target: &SlotTarget| {
-        (target.slot_generation, &target.sandbox_id) != (info.generation, &sandbox_id)
+        (target.slot_generation, &target.sandbox_id) != (slot_generation, &sandbox_id)
     };
     if expected.is_some_and(changed) {
         return SlotFirewallReport::NotRun(NotRun::Changed);
@@ -292,7 +319,7 @@ fn apply_blocking(
         Ok(pinned) => pinned,
         Err(error) => return SlotFirewallReport::NotRun(NotRun::Namespace(error)),
     };
-    if expected.is_some_and(|target| target.namespace != namespace) {
+    if expected.is_some_and(|target| target.namespace.is_some_and(|pinned| pinned != namespace)) {
         return SlotFirewallReport::NotRun(NotRun::Changed);
     }
     // Taken under ownership, so an invocation queued behind a newer one
@@ -309,7 +336,7 @@ fn apply_blocking(
         assignment_generation: desired.generation,
         revision_id: desired.revision_id,
         slot_id: info.slot,
-        slot_generation: info.generation,
+        slot_generation,
         sandbox_id,
         namespace,
         submitted,

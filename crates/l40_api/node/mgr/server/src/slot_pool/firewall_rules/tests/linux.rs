@@ -4,12 +4,12 @@
 use super::*;
 use crate::netns_tests::{TestNamespace, contained};
 
-/// The slot's namespace entry, redirected to a test one.
-pub(crate) struct Redirected(pub(crate) String);
+/// Each slot's namespace entry, redirected to the test one at its index.
+pub(crate) struct Redirected(pub(crate) Vec<String>);
 
 impl SlotHost for Redirected {
-    fn namespace_path(&self, _: &SlotInfo) -> PathBuf {
-        format!("/run/netns/{}", self.0).into()
+    fn namespace_path(&self, slot: &SlotInfo) -> PathBuf {
+        format!("/run/netns/{}", self.0[slot.slot as usize]).into()
     }
 }
 
@@ -45,7 +45,7 @@ fn applies_the_accepted_revision_only_to_the_slot_namespace() {
     let (pool, _jobs) = pool(1);
     let (_dir, store) = store(Some(12));
     set_slot(&pool, 0, SlotState::Leased, 1);
-    let host = Arc::new(Redirected(target.name().to_string()));
+    let host = Arc::new(Redirected(vec![target.name().to_string()]));
     let request = SlotFirewallRequest {
         node_id: NODE,
         generation: 12,

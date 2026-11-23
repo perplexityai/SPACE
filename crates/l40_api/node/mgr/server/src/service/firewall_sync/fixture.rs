@@ -1,19 +1,14 @@
-//! The test binding of `SyncFirewallRules` to one node, slot and assignment
-//! record. One tracked worker applies the latest accepted generation to that
-//! slot: deliveries of a generation share its one attempt, and a newer
-//! generation supersedes older work. The attempt state lives in memory only;
-//! it is no receipt and does not survive a restart. A production binding is
-//! meant to promote this worker as is; only where the binding comes from changes.
+//! The test binding of `SyncFirewallRules` to one node, assignment record and
+//! either one slot or every eligible slot. One tracked worker runs the latest
+//! accepted generation's pass; deliveries of a generation share it, and a newer
+//! one supersedes older work. An `All` pass targets each slot incarnation the
+//! pool listed when it started; a `One` pass's first attempt to reach nft fixes
+//! its target for the binding. Per-slot results live in memory only; no
+//! node-wide receipt. A production binding is meant to promote this worker.
 //!
-//! Three cases decide whether sync goes on. Retry: nothing was applied and the
-//! target isn't known to have changed, so redelivery runs it again. Target
-//! changed: the slot number no longer proves it's the same sandbox. Unknown:
-//! what the attempt did can't be told. The last two end the binding for this
-//! process, so waiting work never runs against a new occupant and a later
-//! success can't hide the uncertainty. Any other result neither retries nor
-//! ends; a completed attempt is never resubmitted.
-//! The first attempt to reach nft fixes the target, so a slot or namespace
-//! replaced between attempts is a changed target.
+//! Retry: nothing reached nft and the target isn't known to have changed, so
+//! redelivery runs that slot again. A changed target or an unknown result ends
+//! the whole binding for this process. Anything else is final, never resubmitted.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +33,7 @@ use crate::proto::{
 };
 use crate::slot_pool::firewall_rules::SlotHost;
 use crate::slot_pool::{
-    NetworkPool, NotRun, NotRunnable, SlotFirewallReport, SlotFirewallRequest, Stale,
+    NetworkPool, NotRun, NotRunnable, SlotFirewallReport, SlotFirewallRequest, SlotTarget, Stale,
 };
 
 #[cfg(test)]
@@ -47,13 +42,21 @@ mod tests;
 /// What the binding trusts instead of the wire.
 pub(crate) struct FirewallSyncFixture {
     pub node_id: NodeId,
-    pub slot_id: u32,
+    pub slots: BoundSlots,
     pub assignment_path: PathBuf,
     /// `NetworkPool::apply_firewall_rules_with`'s namespace and nft seams.
     pub host: Arc<dyn SlotHost>,
     pub nft: Arc<Nft<'static>>,
     /// How long a delivery waits for its dispatch.
     pub wait: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BoundSlots {
+    One(u32),
+    /// Every slot the slot apply would take when a generation's pass starts. A
+    /// ready slot rebuilt in place keeps its generation, so it is still the target.
+    All,
 }
 
 pub(crate) struct FirewallSync {
@@ -64,16 +67,53 @@ pub(crate) struct FirewallSync {
     ended: CancellationToken,
 }
 
-/// The latest generation armed for the slot, and how far it got.
+/// The latest generation armed, and how far its pass got.
 struct Wanted {
     generation: u64,
-    run: Run,
+    claimed: bool,
+    /// Unset until listed; `Err` if the pool's inventory could not be read.
+    pass: Option<Result<Vec<Item>, String>>,
 }
 
-enum Run {
-    Pending,
-    Running,
-    Done(FirewallSlotDispatch),
+struct Item {
+    slot_id: u32,
+    expected: Option<SlotTarget>,
+    /// Unset until this run of the pass reaches the slot.
+    dispatch: Option<FirewallSlotDispatch>,
+}
+
+impl Wanted {
+    /// Every slot has a result, or the inventory failed.
+    fn settled(&self) -> bool {
+        match &self.pass {
+            Some(Ok(items)) => items.iter().all(|item| item.dispatch.is_some()),
+            Some(Err(_)) => true,
+            None => false,
+        }
+    }
+
+    /// Clears what never reached nft so it runs again, if anything didn't.
+    fn retry(&mut self) -> bool {
+        let retry = match &mut self.pass {
+            Some(Ok(items)) => {
+                let mut retry = false;
+                for item in items {
+                    let not_run = |done: &FirewallSlotDispatch| done.outcome() == Outcome::NotRun;
+                    if item.dispatch.as_ref().is_some_and(not_run) {
+                        item.dispatch = None;
+                        retry = true;
+                    }
+                }
+                retry
+            }
+            _ => {
+                self.pass = None;
+                true
+            }
+        };
+        self.claimed &= !retry;
+        retry
+    }
 }
 
 impl NodeManagerService {
@@ -142,17 +182,22 @@ impl FirewallSync {
         Ok(SyncFirewallRulesResponse {
             accepted_generation: generation,
             acceptance: acceptance.into(),
-            dispatch: Some(self.settled(generation).await),
+            // A reply describes one slot at most, never the node.
+            dispatch: match self.fixture.slots {
+                BoundSlots::One(_) => Some(self.settled(generation).await),
+                BoundSlots::All => None,
+            },
         })
     }
 
-    /// `generation`'s dispatch once settled, or as of the end of the wait.
+    /// The one slot's dispatch for `generation` once settled, or as of the end
+    /// of the wait.
     async fn settled(&self, generation: u64) -> FirewallSlotDispatch {
         let mut wanted = self.wanted.subscribe();
         let settled = wanted.wait_for(|wanted| {
-            wanted.as_ref().is_some_and(|wanted| {
-                wanted.generation != generation || matches!(wanted.run, Run::Done(_))
-            })
+            wanted
+                .as_ref()
+                .is_some_and(|wanted| wanted.generation != generation || wanted.settled())
         });
         tokio::select! {
             _ = tokio::time::timeout(self.fixture.wait, settled) => {}
@@ -165,9 +210,11 @@ impl FirewallSync {
         match self.wanted.borrow().as_ref() {
             Some(wanted) if wanted.generation > generation => reply(Outcome::Superseded, ""),
             Some(Wanted {
-                run: Run::Done(done),
+                pass: Some(Ok(items)),
                 ..
-            }) => done.clone(),
+            }) if let Some(done) = items.first().and_then(|item| item.dispatch.as_ref()) => {
+                done.clone()
+            }
             // The worker ended before claiming it.
             _ if self.ended.is_cancelled() => reply(Outcome::NotRun, "the binding ended"),
             _ => reply(Outcome::Pending, ""),
@@ -187,54 +234,147 @@ impl FirewallSync {
                     _ = changed.changed() => continue,
                 }
             };
-            let request = SlotFirewallRequest {
-                node_id: self.fixture.node_id,
-                generation,
-                slot_id: self.fixture.slot_id,
-                expected: target.clone(),
+            let work = match self.unsettled(generation) {
+                Some(work) => work,
+                None => {
+                    let pass = self.list(&pool, &target).await;
+                    self.update(generation, |wanted| wanted.pass = Some(pass));
+                    self.unsettled(generation).unwrap_or_default()
+                }
             };
-            let (host, nft) = (self.fixture.host.clone(), self.fixture.nft.clone());
-            let report = pool
-                .apply_firewall_rules_with(&self.assignments, request, host, nft)
-                .await;
-            if let Ok(SlotFirewallReport::Attempted(attempt)) = &report {
-                target.get_or_insert_with(|| attempt.target());
-            }
-            let (done, ends) = dispatch(&report);
-            tracing::info!(
-                generation,
-                slot_id = self.fixture.slot_id,
-                outcome = ?done.outcome(),
-                detail = done.detail,
-                "fixture firewall slot dispatch finished"
-            );
-            self.wanted.send_if_modified(|wanted| {
-                // Under the watch lock, so a waiter the end wakes reads this result,
-                // and no delivery that sees the result is admitted.
-                if ends {
-                    self.ended.cancel();
+            for (index, slot_id, expected) in work {
+                // A newer pass lists afresh; this one's targets may have moved on. One
+                // armed after this check can still see its slot refused as changed.
+                if !self.wants(generation) {
+                    break;
                 }
-                // A newer generation replaced this one, so its result is dropped.
-                match wanted {
-                    Some(wanted) if wanted.generation == generation => {
-                        wanted.run = Run::Done(done);
-                        true
+                let request = SlotFirewallRequest {
+                    node_id: self.fixture.node_id,
+                    generation,
+                    slot_id,
+                    expected,
+                };
+                let (host, nft) = (self.fixture.host.clone(), self.fixture.nft.clone());
+                let report = pool
+                    .apply_firewall_rules_with(&self.assignments, request, host, nft)
+                    .await;
+                // Only a `One` pass lists it as the target.
+                if let Ok(SlotFirewallReport::Attempted(attempt)) = &report {
+                    target.get_or_insert_with(|| attempt.target());
+                }
+                let (done, ends) = dispatch(&report);
+                tracing::info!(
+                    generation,
+                    slot_id,
+                    outcome = ?done.outcome(),
+                    detail = done.detail,
+                    "fixture firewall slot dispatch finished"
+                );
+                self.wanted.send_if_modified(|wanted| {
+                    // Under the watch lock, so a waiter the end wakes reads this result,
+                    // and no delivery that sees the result is admitted.
+                    if ends {
+                        self.ended.cancel();
                     }
-                    _ => false,
+                    // A newer generation replaced this one, so its result is dropped,
+                    // though an end still ends the binding.
+                    match wanted {
+                        Some(wanted) if wanted.generation == generation => {
+                            if let Some(Ok(items)) = &mut wanted.pass
+                                && let Some(item) = items.get_mut(index)
+                            {
+                                item.dispatch = Some(done);
+                            }
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+                if ends {
+                    return;
                 }
-            });
-            if ends {
-                return;
             }
         }
     }
 
-    /// Marks the pending generation running and returns it.
+    /// The pass's slots: the bound one, or every eligible one at the
+    /// incarnation read.
+    async fn list(
+        &self,
+        pool: &Arc<NetworkPool>,
+        target: &Option<SlotTarget>,
+    ) -> Result<Vec<Item>, String> {
+        let found = match self.fixture.slots {
+            BoundSlots::One(slot_id) => vec![(slot_id, target.clone())],
+            BoundSlots::All => {
+                let reader = pool.clone();
+                // Off the runtime, as pool.db's lock blocks.
+                let found = pool
+                    .task_tracker
+                    .spawn_blocking(move || reader.firewall_targets())
+                    .await;
+                match found {
+                    Ok(Ok(found)) => found
+                        .into_iter()
+                        .map(|(slot_id, found)| (slot_id, Some(found)))
+                        .collect(),
+                    Ok(Err(error)) => return Err(error.to_string()),
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        };
+        let item = |(slot_id, expected)| Item {
+            slot_id,
+            expected,
+            dispatch: None,
+        };
+        Ok(found.into_iter().map(item).collect())
+    }
+
+    /// `generation`'s slots still to run, or None until it is listed. Empty
+    /// once a newer generation replaced it.
+    fn unsettled(&self, generation: u64) -> Option<Vec<(usize, u32, Option<SlotTarget>)>> {
+        match self.wanted.borrow().as_ref() {
+            Some(wanted) if wanted.generation == generation => {
+                let Some(Ok(items)) = &wanted.pass else {
+                    return None;
+                };
+                let left = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.dispatch.is_none());
+                Some(
+                    left.map(|(index, item)| (index, item.slot_id, item.expected.clone()))
+                        .collect(),
+                )
+            }
+            _ => Some(Vec::new()),
+        }
+    }
+
+    fn wants(&self, generation: u64) -> bool {
+        let wanted = self.wanted.borrow();
+        wanted
+            .as_ref()
+            .is_some_and(|wanted| wanted.generation == generation)
+    }
+
+    fn update(&self, generation: u64, edit: impl FnOnce(&mut Wanted)) {
+        self.wanted.send_if_modified(|wanted| match wanted {
+            Some(wanted) if wanted.generation == generation => {
+                edit(wanted);
+                true
+            }
+            _ => false,
+        });
+    }
+
+    /// Marks the pending generation claimed and returns it.
     fn claim(&self) -> Option<u64> {
         let mut claimed = None;
         self.wanted.send_if_modified(|wanted| match wanted {
-            Some(wanted) if matches!(wanted.run, Run::Pending) => {
-                wanted.run = Run::Running;
+            Some(wanted) if !wanted.claimed => {
+                wanted.claimed = true;
                 claimed = Some(wanted.generation);
                 true
             }
@@ -244,23 +384,20 @@ impl FirewallSync {
     }
 }
 
-/// Arms `generation` unless a newer one is armed. Redelivery re-arms only a
-/// generation that never reached nft.
+/// Arms `generation` unless a newer one is armed. Redelivery joins a pass
+/// still running, and re-arms a settled one only for slots that never reached nft.
 fn arm(wanted: &mut Option<Wanted>, generation: u64) -> bool {
     match wanted {
         Some(armed) if armed.generation > generation => false,
         Some(armed) if armed.generation == generation => {
             // A mismatch waits for a newer generation: nft lists some valid revisions differently.
-            let retry = matches!(&armed.run, Run::Done(done) if done.outcome() == Outcome::NotRun);
-            if retry {
-                armed.run = Run::Pending;
-            }
-            retry
+            armed.claimed && armed.settled() && armed.retry()
         }
         _ => {
             *wanted = Some(Wanted {
                 generation,
-                run: Run::Pending,
+                claimed: false,
+                pass: None,
             });
             true
         }

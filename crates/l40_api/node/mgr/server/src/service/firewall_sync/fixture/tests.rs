@@ -18,7 +18,7 @@ use crate::firewall::rules::install::InstallOutcome;
 use crate::proto::FirewallRulesAssignment;
 use crate::service::tests::service_tests::service_for_unit_tests;
 use crate::slot_pool::firewall_rules::tests::{
-    BOUND, FakeHost, Fault, Hook, NODE, bounded, busy, document, hook, installed, set_slot,
+    BOUND, FakeHost, Fault, Hook, NODE, bounded, busy, document, hook, installed, poison, set_slot,
 };
 use crate::slot_pool::{
     NamespaceIdentity, NetworkPoolConfig, NotRunnable, SlotFirewallAttempt, SlotHealth, SlotState,
@@ -35,13 +35,32 @@ struct Bound {
     _dir: TempDir,
     path: PathBuf,
     host: Arc<FakeHost>,
-    /// The bound slot's namespace.
-    namespace: NamespaceIdentity,
+    /// Each slot's namespace.
+    namespaces: Vec<NamespaceIdentity>,
     service: NodeManagerService,
+}
+
+impl Bound {
+    /// The bound slot's namespace.
+    fn namespace(&self) -> NamespaceIdentity {
+        self.namespaces[SLOT as usize]
+    }
 }
 
 /// Two leased slots, `SLOT` bound, and `accepted` already in the record.
 async fn bind(fault: Option<Fault>, accepted: Option<u64>, wait: Duration) -> Bound {
+    let leased = [SlotState::Leased; 2];
+    bind_slots(BoundSlots::One(SLOT), fault, accepted, wait, &leased).await
+}
+
+/// A healthy slot in each of `states`, each with its own namespace.
+async fn bind_slots(
+    slots: BoundSlots,
+    fault: Option<Fault>,
+    accepted: Option<u64>,
+    wait: Duration,
+    states: &[SlotState],
+) -> Bound {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("assignment.json");
     if let Some(generation) = accepted {
@@ -52,12 +71,13 @@ async fn bind(fault: Option<Fault>, accepted: Option<u64>, wait: Duration) -> Bo
             .unwrap();
     }
     let host = FakeHost::new(fault);
-    host.name(0, "uts");
-    let namespace = host.name(SLOT, "net");
     let mut service = service_for_unit_tests().await;
-    service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(2));
-    for slot in [0, SLOT] {
-        set_slot(&service.pool, slot, SlotState::Leased, 1);
+    let count = u32::try_from(states.len()).unwrap();
+    service.pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(count));
+    let mut namespaces = Vec::new();
+    for ((slot, state), kind) in (0..).zip(states).zip(["uts", "net", "ipc", "cgroup"]) {
+        namespaces.push(host.name(slot, kind));
+        set_slot(&service.pool, slot, *state, 1);
     }
     let fake = host.clone();
     let nft = move |netns: &File, args: &[&str], stdin: &[u8], _| {
@@ -67,7 +87,7 @@ async fn bind(fault: Option<Fault>, accepted: Option<u64>, wait: Duration) -> Bo
     let service = service
         .with_firewall_sync(FirewallSyncFixture {
             node_id: NODE,
-            slot_id: SLOT,
+            slots,
             assignment_path: path.clone(),
             host: host.clone(),
             nft: Arc::new(nft),
@@ -78,7 +98,7 @@ async fn bind(fault: Option<Fault>, accepted: Option<u64>, wait: Duration) -> Bo
         _dir: dir,
         path,
         host,
-        namespace,
+        namespaces,
         service,
     }
 }
@@ -294,7 +314,7 @@ async fn a_fresh_assignment_is_durable_before_the_bound_slot_applies_it() {
             Outcome::Matched
         )
     );
-    assert_eq!(bound.host.installs(), [bound.namespace]);
+    assert_eq!(bound.host.installs(), [bound.namespace()]);
 }
 
 // Catches a dispatch tied to its caller, a joining delivery that starts a
@@ -325,7 +345,7 @@ async fn deliveries_of_a_generation_share_its_one_attempt() {
     applied(&bound.service).await;
     let finished = reply(sync(&bound.service, delivery(12)).await);
     assert_eq!(finished, (12, replayed, Outcome::Matched));
-    assert_eq!(bound.host.installs(), [bound.namespace]);
+    assert_eq!(bound.host.installs(), [bound.namespace()]);
     assert_eq!(std::fs::read(&bound.path).unwrap(), record);
 }
 
@@ -352,7 +372,7 @@ async fn a_busy_slot_runs_nothing_until_redelivery() {
         retried,
         (12, FirewallAssignmentAcceptance::Replayed, Outcome::Matched)
     );
-    assert_eq!(bound.host.installs(), [bound.namespace]);
+    assert_eq!(bound.host.installs(), [bound.namespace()]);
 }
 
 fn attempted(readback: Verification, current: Result<(), Stale>) -> SlotFirewallReport {
@@ -470,7 +490,7 @@ async fn a_target_replaced_between_attempts_ends_the_binding() {
         assert_eq!(refused.message(), "the firewall rule sync binding ended");
     }
     assert_eq!(std::fs::read(&bound.path).unwrap(), record);
-    assert_eq!(bound.host.installs(), [bound.namespace]);
+    assert_eq!(bound.host.installs(), [bound.namespace()]);
 }
 
 // Catches older work run or reported after a newer generation is accepted.
@@ -501,9 +521,9 @@ async fn a_newer_generation_supersedes_older_work() {
         let replied = bounded(delivered).await.unwrap();
         assert_eq!(replied, (generation, committed, outcome));
     }
-    assert_eq!(bound.host.installs(), [bound.namespace; 2]);
+    assert_eq!(bound.host.installs(), [bound.namespace(); 2]);
     let tables = bound.host.tables.lock().unwrap();
-    assert_eq!(tables[&bound.namespace], installed(13));
+    assert_eq!(tables[&bound.namespace()], installed(13));
 }
 
 // Catches work queued behind an attempt that ends the binding run, or reported
@@ -532,5 +552,154 @@ async fn work_queued_when_the_binding_ends_never_runs() {
     // Only the worker is left on the tracker, so this waits for it to exit.
     bound.service.device_op_tasks.close();
     bounded(bound.service.device_op_tasks.wait()).await;
-    assert_eq!(bound.host.installs(), [bound.namespace]);
+    assert_eq!(bound.host.installs(), [bound.namespace()]);
+}
+
+/// Each listed slot and its outcome once `generation`'s pass settles or the
+/// binding ends, or the inventory error.
+async fn passed(
+    service: &NodeManagerService,
+    generation: u64,
+) -> Result<Vec<(u32, Option<Outcome>)>, String> {
+    let sync = service.firewall_sync.clone().unwrap();
+    let mut wanted = sync.wanted.subscribe();
+    let settled = wanted.wait_for(|wanted| {
+        wanted.as_ref().is_some_and(|wanted| {
+            wanted.generation == generation && wanted.claimed && wanted.settled()
+        })
+    });
+    tokio::select! {
+        biased;
+        () = sync.ended.cancelled() => {}
+        settled = bounded(settled) => drop(settled.unwrap()),
+    }
+    let wanted = sync.wanted.borrow();
+    let wanted = wanted.as_ref().unwrap();
+    assert_eq!(wanted.generation, generation);
+    let outcome = |item: &Item| (item.slot_id, item.dispatch.as_ref().map(|d| d.outcome()));
+    match wanted.pass.as_ref().unwrap() {
+        Ok(items) => Ok(items.iter().map(outcome).collect()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// A node-wide delivery's acceptance; its reply never carries a dispatch.
+async fn sync_all(service: &NodeManagerService, generation: u64) -> FirewallAssignmentAcceptance {
+    let reply = sync(service, delivery(generation)).await.unwrap();
+    assert_eq!(reply.accepted_generation, generation);
+    assert_eq!(reply.dispatch, None);
+    reply.acceptance()
+}
+
+// Catches a duplicate delivery that starts a second pass, a may-have-submitted
+// slot submitted again, a busy slot not retried, or one slot's result lost to
+// another's.
+#[tokio::test]
+async fn a_pass_keeps_each_slot_and_retries_only_what_never_reached_nft() {
+    use SlotState::{Leased, Ready};
+    let bound = bind_slots(BoundSlots::All, None, None, WAIT, &[Leased, Leased, Ready]).await;
+    let [first, held, ready] = bound.namespaces[..] else {
+        unreachable!()
+    };
+    // Slot 0 then lists another revision, so its readback mismatches.
+    let (fake, (enter, entered)) = (bound.host.clone(), oneshot::channel());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    hook(&bound.host.installed, move || {
+        fake.tables.lock().unwrap().insert(first, installed(11));
+        let _ = enter.send(());
+        let _ = released.recv_timeout(BOUND);
+    });
+    let busy = busy(&bound.service.pool, 1);
+    let committed = FirewallAssignmentAcceptance::Committed;
+    let replayed = FirewallAssignmentAcceptance::Replayed;
+    assert_eq!(sync_all(&bound.service, 12).await, committed);
+    bounded(entered).await.unwrap();
+    assert_eq!(sync_all(&bound.service, 12).await, replayed);
+    release.send(()).unwrap();
+    let not_run = (1, Some(Outcome::NotRun));
+    let first_pass = [
+        (0, Some(Outcome::Mismatched)),
+        not_run,
+        (2, Some(Outcome::Matched)),
+    ];
+    assert_eq!(passed(&bound.service, 12).await.unwrap(), first_pass);
+    assert_eq!(bound.host.installs(), [first, ready]);
+
+    drop(busy);
+    assert_eq!(sync_all(&bound.service, 12).await, replayed);
+    let retried = [first_pass[0], (1, Some(Outcome::Matched)), first_pass[2]];
+    assert_eq!(passed(&bound.service, 12).await.unwrap(), retried);
+    assert_eq!(bound.host.installs(), [first, ready, held]);
+}
+
+// Catches a ready slot left out, an ineligible one listed, or work for a
+// replaced occupant run against its replacement.
+#[tokio::test]
+async fn a_slot_replaced_after_listing_is_refused_and_ends_the_binding() {
+    use SlotState::{Dirty, Leased, Ready};
+    let states = [Leased, Dirty, Ready, Leased];
+    let bound = bind_slots(BoundSlots::All, None, None, WAIT, &states).await;
+    // On slot 0's lookup, after listing and before slot 3's.
+    let (pool, fake) = (bound.service.pool.clone(), bound.host.clone());
+    hook(&bound.host.looked_up, move || {
+        set_slot(&pool, 3, Leased, 2);
+        fake.name(3, "mnt");
+    });
+    sync_all(&bound.service, 12).await;
+    let matched = Some(Outcome::Matched);
+    let outcomes = [(0, matched), (2, matched), (3, Some(Outcome::NotRun))];
+    assert_eq!(passed(&bound.service, 12).await.unwrap(), outcomes);
+    let refused = sync(&bound.service, delivery(12)).await.unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        bound.host.installs(),
+        [bound.namespaces[0], bound.namespaces[2]]
+    );
+}
+
+// Catches an older pass that goes on after a newer generation is accepted,
+// installs its revision late, or has its result counted for the newer one.
+#[tokio::test]
+async fn a_newer_generation_stops_an_older_pass() {
+    use SlotState::{Leased, Ready};
+    let bound = bind_slots(BoundSlots::All, None, None, WAIT, &[Leased, Leased, Ready]).await;
+    // 12 pauses between slot 0's lookup and ownership.
+    let (entered, release) = gate(&bound.host.looked_up);
+    sync_all(&bound.service, 12).await;
+    bounded(entered).await.unwrap();
+    sync_all(&bound.service, 13).await;
+    // A create takes the ready slot 12 listed.
+    set_slot(&bound.service.pool, 2, Leased, 2);
+    let leased = bound.host.name(2, "cgroup");
+    release.send(()).unwrap();
+
+    let matched = Some(Outcome::Matched);
+    let outcomes = [(0, matched), (1, matched), (2, matched)];
+    assert_eq!(passed(&bound.service, 13).await.unwrap(), outcomes);
+    let [first, second, _] = bound.namespaces[..] else {
+        unreachable!()
+    };
+    let expected = [first, second, leased].map(|namespace| (namespace, installed(13)));
+    assert_eq!(bound.host.submissions(), expected);
+    let tables = bound.host.tables.lock().unwrap();
+    assert!(
+        expected
+            .iter()
+            .all(|(namespace, _)| tables[namespace] == installed(13))
+    );
+}
+
+// Catches an unreadable inventory reported as an empty, finished pass.
+#[tokio::test]
+async fn an_unreadable_inventory_is_an_incomplete_pass() {
+    let bound = bind_slots(BoundSlots::All, None, None, WAIT, &[SlotState::Leased]).await;
+    poison(&bound.service.pool);
+    sync_all(&bound.service, 12).await;
+    passed(&bound.service, 12).await.unwrap_err();
+    let sync = bound.service.firewall_sync.clone().unwrap();
+    assert!(
+        !sync.ended.is_cancelled(),
+        "a retryable failure ended the binding"
+    );
+    assert_eq!(bound.host.calls(), []);
 }

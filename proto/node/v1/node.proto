@@ -173,9 +173,10 @@ service NodeManager {
   // Deny inbound traffic to a guest port (remove from sandbox allowlist).
   rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
 
-  // Durably accept the node's firewall assignment, then apply it to one slot.
-  // Acceptance and that slot's dispatch are reported separately; neither is
-  // node-wide. A node that can't sync answers FAILED_PRECONDITION after
+  // Durably accept the node's firewall assignment, then apply it to one slot
+  // or to every eligible slot. Acceptance and a single slot's dispatch are
+  // reported separately; neither is node-wide, and node-wide work leaves the
+  // dispatch unset. A node that can't sync answers FAILED_PRECONDITION after
   // authorization.
   rpc SyncFirewallRules(SyncFirewallRulesRequest) returns (SyncFirewallRulesResponse);
 
@@ -475,6 +476,7 @@ message SyncFirewallRulesResponse {
   // The request's generation, now durably accepted.
   uint64 accepted_generation = 1;
   FirewallAssignmentAcceptance acceptance = 2;
+  // Unset when the work spans slots.
   FirewallSlotDispatch dispatch = 3;
 }
 
