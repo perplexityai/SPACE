@@ -4914,6 +4914,7 @@ dependencies = [
  "pplx-space-credential-injection",
  "pplx-space-credential-injection-store",
  "pplx-space-credmgr-client",
+ "pplx-space-data-plane-session-store",
  "pplx-space-db-test-fixtures",
  "pplx-space-durations",
  "pplx-space-ecw-credential",
@@ -5882,6 +5883,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-data-plane-session-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "pplx-space-data-plane-svc"
 version = "0.8.2"
 dependencies = [
@@ -6302,6 +6318,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
+ "pplx-space-data-plane-session-store",
  "pplx-space-db-test-fixtures",
  "pplx-space-durations",
  "pplx-space-ecw-credential",

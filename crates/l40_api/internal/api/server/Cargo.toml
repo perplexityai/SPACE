@@ -53,6 +53,7 @@ pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
+pplx-space-data-plane-session-store = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
