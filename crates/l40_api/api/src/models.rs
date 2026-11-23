@@ -1,7 +1,6 @@
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_sandbox_model::SandboxId;
 
-use crate::api_surface::ApiSurface;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::FromRow;
 use std::collections::BTreeMap;
@@ -29,61 +28,17 @@ use pplx_space_cluster_pool::PoolConfigOwner;
 /// api's existing `crate::models::SandboxMetadata` paths keep resolving.
 pub use pplx_space_sandbox_store::{SandboxMetadata, SandboxMetadataValue};
 
-mod sandbox_state;
-pub use sandbox_state::{SandboxStateInput, is_tombstone};
+/// The account rows, owned by the accounts store and re-exported here so the
+/// api's existing `crate::models::{Organization, User, ApiKey, Cluster}` paths
+/// keep resolving.
+pub use pplx_space_accounts_store::{ApiKey, Cluster, Organization, User};
 
-// --- Database models ---
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct Organization {
-    pub id: OrgId,
-    pub name: String,
-    pub slug: String,
-    pub parent_id: Option<Uuid>,
-    pub theme_primary: Option<String>,
-    pub theme_secondary: Option<String>,
-    pub logo_url: Option<String>,
-    /// Advisory BYOK opt-in flag. Signals callers to route writes
-    /// through credmgr + populate the matching `*_encrypted_fields`
-    /// sidecar; does not itself encrypt or decrypt anything.
-    pub byok_enabled: bool,
-    /// Per-org object storage override for base snapshot uploads.
-    /// `s3://bucket/prefix?region=...` URI. When set, snapshot files
-    /// are uploaded to the org's own bucket instead of the cluster
-    /// default. NULL falls through to the cluster-wide env-var config.
-    pub snapshot_base_object_storage_uri: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct Cluster {
-    pub id: Uuid,
-    pub name: String,
-    pub managing_org_id: OrgId,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct User {
-    pub id: UserId,
-    pub email: String,
-    #[serde(skip_serializing)]
-    pub password_hash: String,
-    pub display_name: String,
-    pub org_id: OrgId,
-    pub role: UserRole,
-    #[serde(skip_serializing)]
-    pub owner_source: SandboxOwnerSource,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
+/// Which users may sign in to the console: the api's rules over the
+/// accounts store's `User` row.
+pub trait ConsoleSignIn {
+    fn password_login_configured(&self) -> bool;
+    /// Whether a verified external console identity may act as this user.
+    fn external_console_sign_in_allowed(&self) -> bool;
 }
 
 // Bootstrap service users created before password markers were normalized
@@ -91,8 +46,8 @@ pub struct User {
 // service-user provisioning writes the shared `!` marker.
 const LEGACY_DISABLED_SERVICE_ACCOUNT: &str = "disabled-service-account";
 
-impl User {
-    pub fn password_login_configured(&self) -> bool {
+impl ConsoleSignIn for User {
+    fn password_login_configured(&self) -> bool {
         self.owner_source == SandboxOwnerSource::Local
             && self.password_hash != "!"
             && self.password_hash != LEGACY_DISABLED_SERVICE_ACCOUNT
@@ -105,11 +60,16 @@ impl User {
     /// stays disabled. A local user whose password is locked (`!`) remains
     /// eligible: the external authenticator replaces the password, and its
     /// admission policy decides which identities reach this lookup at all.
-    pub fn external_console_sign_in_allowed(&self) -> bool {
+    fn external_console_sign_in_allowed(&self) -> bool {
         self.owner_source == SandboxOwnerSource::Local
             && self.password_hash != LEGACY_DISABLED_SERVICE_ACCOUNT
     }
 }
+
+mod sandbox_state;
+pub use sandbox_state::{SandboxStateInput, is_tombstone};
+
+// --- Database models ---
 
 /// User metadata returned only by the authenticated admin surface.
 ///
@@ -139,22 +99,6 @@ pub struct Session {
     pub token_hash: String,
     pub expires_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub struct ApiKey {
-    pub id: Uuid,
-    pub org_id: OrgId,
-    pub name: String,
-    pub key_hash: String,
-    pub created_by: Option<Uuid>,
-    pub last_used_at: Option<OffsetDateTime>,
-    pub federated_owner_assertions_enabled: bool,
-    /// Surfaces this credential may authenticate against. Enforced at the
-    /// lookup rather than by each caller, so a new surface cannot forget.
-    pub allowed_surfaces: Vec<ApiSurface>,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

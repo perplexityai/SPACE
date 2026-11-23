@@ -105,6 +105,7 @@ pplx-space-credential-injection-store = { workspace = true }
 pplx-space-ecw-credential = { workspace = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-feature-flags = { workspace = true }
+pplx-space-accounts-store = { workspace = true }
 pplx-space-federated-grant-store = { workspace = true }
 pplx-space-federated-identity = { workspace = true }
 pplx-space-firewall-rules-model = { workspace = true }

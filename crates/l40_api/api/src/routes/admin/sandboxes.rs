@@ -1,4 +1,3 @@
-use pplx_space_sql_locator::sql;
 use std::str::FromStr;
 
 use axum::{
@@ -9,6 +8,7 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_accounts_store::{organizations, users};
 use pplx_space_env_vars::env_flag_var;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_node_model::NodePoolName;
@@ -236,13 +236,9 @@ async fn admin_create_precheck(
         |node_pool| sandbox_controller.check_node_pool_placement(node_pool),
     )?;
 
-    let org_exists: bool = sqlx::query_scalar(sql!(
-        "SELECT EXISTS (SELECT 1 FROM organizations WHERE id = $1)"
-    ))
-    .bind(org_id.as_uuid())
-    .fetch_one(pool)
-    .await
-    .map_err(|error| create_precheck_failure(org_id, &error))?;
+    let org_exists = organizations::organization_exists(pool, org_id)
+        .await
+        .map_err(|error| create_precheck_failure(org_id, &error))?;
     if !org_exists {
         return Err(AdminSandboxActionError::new(
             StatusCode::NOT_FOUND,
@@ -268,21 +264,13 @@ async fn create_sandbox_for_org(
     // The create executor resolves the operation's actor as a user of the
     // operation's org, so the owner must genuinely belong to the target org.
     let owner_id: Option<UserId> = match request.user_id {
-        Some(user_id) => {
-            sqlx::query_scalar(sql!("SELECT id FROM users WHERE id = $1 AND org_id = $2"))
-                .bind(user_id)
-                .bind(org_id.as_uuid())
-                .fetch_optional(pool)
-                .await
-                .map_err(|error| create_precheck_failure(org_id, &error))?
-        }
-        None => sqlx::query_scalar(sql!(
-            "SELECT id FROM users WHERE org_id = $1 ORDER BY created_at, id LIMIT 1"
-        ))
-        .bind(org_id.as_uuid())
-        .fetch_optional(pool)
-        .await
-        .map_err(|error| create_precheck_failure(org_id, &error))?,
+        Some(user_id) => users::user_in_organization(pool, org_id, user_id)
+            .await
+            .map_err(|error| create_precheck_failure(org_id, &error))?
+            .then_some(user_id),
+        None => users::first_organization_user_id(pool, org_id)
+            .await
+            .map_err(|error| create_precheck_failure(org_id, &error))?,
     };
     let Some(owner_id) = owner_id else {
         return Err(AdminSandboxActionError::new(

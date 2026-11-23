@@ -430,9 +430,7 @@ impl ForkOperationStore {
     }
 
     pub async fn user(&self, user_id: UserId) -> Result<Option<User>, ForkOperationStoreError> {
-        sqlx::query_as(sql!("SELECT * FROM users WHERE id = $1"))
-            .bind(user_id)
-            .fetch_optional(self.pool())
+        pplx_space_accounts_store::users::get_user(self.pool(), user_id)
             .await
             .map_err(Into::into)
     }

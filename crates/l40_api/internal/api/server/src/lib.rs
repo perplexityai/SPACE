@@ -14,7 +14,6 @@
 pub use pplx_space_node_api_client::proto;
 pub use pplx_space_rpc_auth as auth;
 
-mod api_key_store;
 pub mod metrics;
 pub mod node_info;
 pub use node_info::ClusterNodeInfoService;

@@ -6,11 +6,14 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use pplx_space_accounts_store::{
+    NewOrganization, NewUser, OrganizationPatch, UserProfilePatch, clusters, organizations,
+    sessions, users,
+};
 use pplx_space_byok_model::{KekProvider, platform_default_kek_provider};
 use pplx_space_sandbox_store::UserSandboxRows;
 use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
-use uuid::Uuid;
 
 use super::super::authz;
 use super::support;
@@ -436,20 +439,14 @@ pub(super) async fn list_orgs(
     Extension(AuthUser(actor)): Extension<AuthUser>,
 ) -> Result<Json<Vec<Organization>>, IdentityAdminError> {
     if is_managing_org_admin(&state, &actor).await? {
-        return Ok(Json(
-            sqlx::query_as::<_, Organization>(sql!(
-                "SELECT * FROM organizations ORDER BY name, id"
-            ))
-            .fetch_all(&state.pool)
-            .await?,
-        ));
+        return Ok(Json(organizations::list_organizations(&state.pool).await?));
     }
 
     Ok(Json(
-        sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
-            .bind(actor.org_id)
-            .fetch_all(&state.pool)
-            .await?,
+        organizations::get_organization(&state.pool, actor.org_id)
+            .await?
+            .into_iter()
+            .collect(),
     ))
 }
 
@@ -464,21 +461,18 @@ pub(super) async fn create_org(
         request.theme_secondary.as_deref(),
         request.logo_url.as_deref(),
     )?;
-    let org = sqlx::query_as::<_, Organization>(sql!(
-        "INSERT INTO organizations (
-             id, name, slug, parent_id, theme_primary, theme_secondary, logo_url
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING *"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(request.name)
-    .bind(request.slug)
-    .bind(request.parent_id)
-    .bind(request.theme_primary)
-    .bind(request.theme_secondary)
-    .bind(request.logo_url)
-    .fetch_one(&state.pool)
+    let org = organizations::create_organization(
+        &state.pool,
+        NewOrganization {
+            id: OrgId::new(),
+            name: request.name,
+            slug: request.slug,
+            parent_id: request.parent_id,
+            theme_primary: request.theme_primary,
+            theme_secondary: request.theme_secondary,
+            logo_url: request.logo_url,
+        },
+    )
     .await?;
 
     Ok((StatusCode::CREATED, Json(org)))
@@ -490,9 +484,7 @@ pub(super) async fn get_org(
     Path(org_id): Path<OrgId>,
 ) -> Result<Json<Organization>, IdentityAdminError> {
     require_org_visible(&state, &actor, org_id).await?;
-    let org = sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
-        .bind(org_id)
-        .fetch_optional(&state.pool)
+    let org = organizations::get_organization(&state.pool, org_id)
         .await?
         .ok_or(IdentityAdminError::NotFound)?;
     Ok(Json(org))
@@ -555,33 +547,20 @@ pub(super) async fn update_org(
             stored.logo_url.as_deref(),
         ),
     )?;
-    let org = sqlx::query_as::<_, Organization>(sql!(
-        "UPDATE organizations
-         SET name = COALESCE($2, name),
-             slug = COALESCE($3, slug),
-             theme_primary = CASE WHEN $4 THEN $5 ELSE theme_primary END,
-             theme_secondary = CASE WHEN $6 THEN $7 ELSE theme_secondary END,
-             logo_url = CASE WHEN $8 THEN $9 ELSE logo_url END,
-             snapshot_base_object_storage_uri =
-                 CASE WHEN $10 THEN $11 ELSE snapshot_base_object_storage_uri END,
-             byok_enabled = COALESCE($12, byok_enabled),
-             updated_at = NOW()
-         WHERE id = $1
-         RETURNING *"
-    ))
-    .bind(org_id)
-    .bind(request.name)
-    .bind(request.slug)
-    .bind(theme_primary_present)
-    .bind(theme_primary)
-    .bind(theme_secondary_present)
-    .bind(theme_secondary)
-    .bind(logo_url_present)
-    .bind(logo_url)
-    .bind(snapshot_base_object_storage_uri_present)
-    .bind(snapshot_base_object_storage_uri)
-    .bind(request.byok_enabled)
-    .fetch_optional(tx.as_mut())
+    let org = organizations::update_organization(
+        tx.as_mut(),
+        org_id,
+        OrganizationPatch {
+            name: request.name,
+            slug: request.slug,
+            theme_primary: theme_primary_present.then_some(theme_primary),
+            theme_secondary: theme_secondary_present.then_some(theme_secondary),
+            logo_url: logo_url_present.then_some(logo_url),
+            snapshot_base_object_storage_uri: snapshot_base_object_storage_uri_present
+                .then_some(snapshot_base_object_storage_uri),
+            byok_enabled: request.byok_enabled,
+        },
+    )
     .await?
     .ok_or(IdentityAdminError::NotFound)?;
     tx.commit().await?;
@@ -666,12 +645,8 @@ pub(super) async fn delete_org(
     if org_id == cluster.managing_org_id {
         return Err(IdentityAdminError::Forbidden);
     }
-    let result = sqlx::query(sql!("DELETE FROM organizations WHERE id = $1"))
-        .bind(org_id)
-        .execute(&state.pool)
-        .await;
-    let result = match result {
-        Ok(result) => result,
+    let deleted = match organizations::delete_organization(&state.pool, org_id).await {
+        Ok(deleted) => deleted,
         Err(error) => {
             return Err(match OrgDeleteBlocker::from_delete_error(&error) {
                 Some(blocker) => {
@@ -681,7 +656,7 @@ pub(super) async fn delete_org(
             });
         }
     };
-    if result.rows_affected() == 0 {
+    if !deleted {
         return Err(IdentityAdminError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -693,12 +668,7 @@ pub(super) async fn list_users_for_org(
     Path(org_id): Path<OrgId>,
 ) -> Result<Json<Vec<AdminUserResponse>>, IdentityAdminError> {
     require_org_visible(&state, &actor, org_id).await?;
-    let users = sqlx::query_as::<_, User>(sql!(
-        "SELECT * FROM users WHERE org_id = $1 ORDER BY email ASC, id ASC"
-    ))
-    .bind(org_id)
-    .fetch_all(&state.pool)
-    .await?;
+    let users = users::list_organization_users(&state.pool, org_id).await?;
     Ok(Json(users.into_iter().map(Into::into).collect()))
 }
 
@@ -711,18 +681,17 @@ pub(super) async fn create_user_for_org(
     if !authz::can_create_user_with_role(&state.pool, &actor, org_id, request.role).await? {
         return Err(IdentityAdminError::Forbidden);
     }
-    let user = sqlx::query_as::<_, User>(sql!(
-        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING *"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(request.email)
-    .bind(hash_password(&request.password)?)
-    .bind(request.display_name)
-    .bind(org_id)
-    .bind(request.role)
-    .fetch_one(&state.pool)
+    let user = users::create_user(
+        &state.pool,
+        NewUser {
+            id: UserId::new(),
+            email: request.email,
+            password_hash: hash_password(&request.password)?,
+            display_name: request.display_name,
+            org_id,
+            role: request.role,
+        },
+    )
     .await
     .map_err(IdentityAdminError::from_user_write)?;
 
@@ -760,28 +729,20 @@ pub(super) async fn update_user(
         None => None,
     };
     let mut tx = state.pool.begin().await?;
-    let user = sqlx::query_as::<_, User>(sql!(
-        "UPDATE users
-         SET email = COALESCE($2, email),
-             password_hash = COALESCE($3, password_hash),
-             display_name = COALESCE($4, display_name),
-             updated_at = NOW()
-         WHERE id = $1
-         RETURNING *"
-    ))
-    .bind(user_id)
-    .bind(request.email)
-    .bind(password_hash)
-    .bind(request.display_name)
-    .fetch_optional(tx.as_mut())
+    let user = users::update_user_profile(
+        tx.as_mut(),
+        user_id,
+        UserProfilePatch {
+            email: request.email,
+            password_hash,
+            display_name: request.display_name,
+        },
+    )
     .await
     .map_err(IdentityAdminError::from_user_write)?
     .ok_or(IdentityAdminError::NotFound)?;
     if password_changed {
-        sqlx::query(sql!("DELETE FROM sessions WHERE user_id = $1"))
-            .bind(user_id)
-            .execute(tx.as_mut())
-            .await?;
+        sessions::delete_user_sessions(tx.as_mut(), user_id).await?;
     }
     tx.commit().await?;
     Ok(Json(user.into()))
@@ -800,14 +761,9 @@ pub(super) async fn update_user_role(
     if !authz::can_update_user_role(&state.pool, &actor, &target, request.role).await? {
         return Err(IdentityAdminError::Forbidden);
     }
-    let user = sqlx::query_as::<_, User>(sql!(
-        "UPDATE users SET role = $2, updated_at = NOW() WHERE id = $1 RETURNING *"
-    ))
-    .bind(user_id)
-    .bind(request.role)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(IdentityAdminError::NotFound)?;
+    let user = users::set_user_role(&state.pool, user_id, request.role)
+        .await?
+        .ok_or(IdentityAdminError::NotFound)?;
     Ok(Json(user.into()))
 }
 
@@ -821,12 +777,8 @@ pub(super) async fn delete_user(
     }
     let target = fetch_user(&state, user_id).await?;
     require_org_admin(&state, &actor, target.org_id).await?;
-    let result = sqlx::query(sql!("DELETE FROM users WHERE id = $1"))
-        .bind(user_id)
-        .execute(&state.pool)
-        .await;
-    let result = match result {
-        Ok(result) => result,
+    let deleted = match users::delete_user(&state.pool, user_id).await {
+        Ok(deleted) => deleted,
         Err(error) => {
             return Err(match UserDeleteBlocker::from_delete_error(&error) {
                 Some(blocker) => {
@@ -836,7 +788,7 @@ pub(super) async fn delete_user(
             });
         }
     };
-    if result.rows_affected() == 0 {
+    if !deleted {
         return Err(IdentityAdminError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -854,43 +806,27 @@ pub(super) async fn update_cluster(
     Json(request): Json<UpdateClusterRequest>,
 ) -> Result<Json<Cluster>, IdentityAdminError> {
     require_managing_org_admin(&state, &actor).await?;
-    let cluster = sqlx::query_as::<_, Cluster>(sql!(
-        "UPDATE clusters
-         SET managing_org_id = $1, updated_at = NOW()
-         WHERE singleton
-         RETURNING *"
-    ))
-    .bind(request.managing_org_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(IdentityAdminError::NotFound)?;
+    let cluster = clusters::set_cluster_managing_org(&state.pool, request.managing_org_id)
+        .await?
+        .ok_or(IdentityAdminError::NotFound)?;
     Ok(Json(cluster))
 }
 
 async fn fetch_user(state: &AppState, user_id: UserId) -> Result<User, IdentityAdminError> {
-    sqlx::query_as::<_, User>(sql!("SELECT * FROM users WHERE id = $1"))
-        .bind(user_id)
-        .fetch_optional(&state.pool)
+    users::get_user(&state.pool, user_id)
         .await?
         .ok_or(IdentityAdminError::NotFound)
 }
 
 async fn require_org_exists(state: &AppState, org_id: OrgId) -> Result<(), IdentityAdminError> {
-    let exists: bool = sqlx::query_scalar(sql!(
-        "SELECT EXISTS (SELECT 1 FROM organizations WHERE id = $1)"
-    ))
-    .bind(org_id)
-    .fetch_one(&state.pool)
-    .await?;
-    if exists {
+    if organizations::organization_exists(&state.pool, org_id).await? {
         return Ok(());
     }
     Err(IdentityAdminError::NotFound)
 }
 
 async fn fetch_cluster(state: &AppState) -> Result<Cluster, IdentityAdminError> {
-    sqlx::query_as::<_, Cluster>(sql!("SELECT * FROM clusters WHERE singleton"))
-        .fetch_optional(&state.pool)
+    clusters::get_cluster(&state.pool)
         .await?
         .ok_or(IdentityAdminError::NotFound)
 }

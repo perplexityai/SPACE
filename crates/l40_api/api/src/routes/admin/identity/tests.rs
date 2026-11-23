@@ -1,6 +1,7 @@
 use super::*;
 use axum::body::to_bytes;
 use pplx_space_accounts::OrgId;
+use uuid::Uuid;
 
 #[tokio::test(flavor = "current_thread")]
 async fn password_update_revokes_existing_sessions_but_profile_update_does_not()
@@ -1028,6 +1029,14 @@ async fn org_branding_updates_answer_a_field_error_for_invalid_values()
         org["logo_url"],
         serde_json::Value::Null,
         "null still clears"
+    );
+    assert_eq!(
+        org["theme_primary"], "#0a7",
+        "a field the patch omits is kept"
+    );
+    assert_eq!(
+        org["theme_secondary"], "#00AA77",
+        "a field the patch omits is kept"
     );
 
     // A value stored before validation existed is re-sent unchanged by the
