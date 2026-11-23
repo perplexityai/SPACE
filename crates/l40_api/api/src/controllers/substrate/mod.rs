@@ -2694,6 +2694,8 @@ fn backup_source_to_proto(
     }
 }
 
+// A forwarding impl that omits a defaulted method silently gives both substrates the default.
+#[deny(clippy::missing_trait_methods)]
 impl SubstrateAdapter for Substrate {
     fn managed_by(&self) -> &'static str {
         match &self.inner {
