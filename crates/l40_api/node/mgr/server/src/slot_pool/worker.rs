@@ -546,20 +546,11 @@ pub(super) fn claim_missing_for_create(pool: &NetworkPool, repair: bool) -> Opti
         return None;
     };
     let tx = conn.transaction().ok()?;
-    if meta_bool(&tx, "draining").ok()? {
+    if meta::meta_bool(&tx, "draining").ok()? {
         return None;
     }
     let health = if repair { "degraded" } else { "unknown" };
-    let (slot_id, generation) = tx
-        .query_row(
-            "SELECT slot_id, generation FROM network_slots
-             WHERE state = 'missing' AND health = ?1 AND slot_id < ?2
-             ORDER BY slot_id
-             LIMIT 1",
-            params![health, config.max_slots],
-            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, SqliteU64>(1)?.0)),
-        )
-        .optional()
+    let (slot_id, generation) = slots::missing_slot_to_create(&tx, health, config.max_slots)
         .ok()
         .flatten()?;
     let changed = tx
@@ -609,20 +600,7 @@ pub(super) fn claim_ready_for_destroy(pool: &NetworkPool) -> Result<Option<u32>,
     // A zero-sized pool can retire interrupted, unowned setup directly rather
     // than needing a successful rebuild before teardown. Quarantine still
     // requires an explicit operator repair to authorize this transition.
-    let slot_id = tx
-        .query_row(
-            "SELECT slot_id FROM network_slots
-             WHERE sandbox_id IS NULL AND sandbox_uid IS NULL AND pid IS NULL
-               AND ((state = 'ready' AND
-                    (SELECT COUNT(*) FROM network_slots WHERE state = 'ready') > ?1)
-                 OR (?1 = 0 AND state = 'missing' AND
-                     (health != 'unknown' OR pod_netns_path IS NOT NULL)))
-             ORDER BY slot_id DESC
-             LIMIT 1",
-            params![retained],
-            |row| row.get::<_, u32>(0),
-        )
-        .optional()?;
+    let slot_id = slots::slot_to_destroy(&tx, retained)?;
     let Some(slot_id) = slot_id else {
         return Ok(None);
     };

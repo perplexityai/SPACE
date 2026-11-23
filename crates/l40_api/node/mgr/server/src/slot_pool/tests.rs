@@ -1662,7 +1662,7 @@ mod slot_pool_tests {
             )
             .unwrap();
 
-            backfill_active_memory_reservations(&conn, 8320).unwrap();
+            slots::backfill_active_memory_reservations(&conn, 8320).unwrap();
         }
 
         assert_eq!(record(&pool, 0).memory_reservation_mib, Some(8320));

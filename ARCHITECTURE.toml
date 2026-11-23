@@ -403,6 +403,7 @@ pplx-space-node-registration-store = [
   "pplx-space-credmgr",
   "pplx-space-internal-api-server",
 ]
+pplx-space-node-mgr-store = ["pplx-space-node-mgr"]
 pplx-space-node-runtime-manager-store = ["pplx-space-node-runtime-manager"]
 pplx-space-node-status-store = [
   "pplx-space-api",

@@ -145,7 +145,7 @@ pub(super) fn reset_candidates(
         .active_resets
         .lock()
         .map_err(|_| SlotStoreError::LockPoisoned)?;
-    let candidates = query_reset_candidates(&conn, cursor, (RESET_CONCURRENCY * 2) as u32)?;
+    let candidates = slots::reset_candidates(&conn, cursor, (RESET_CONCURRENCY * 2) as u32)?;
     let next_cursor = candidates.last().map_or(cursor, |(slot, _)| *slot);
     Ok(ResetPage {
         next_cursor,
@@ -202,7 +202,7 @@ pub(super) fn recover_abandoned_work(
         .active_resets
         .lock()
         .map_err(|_| SlotStoreError::LockPoisoned)?;
-    let candidates = query_abandoned_maintenance(&conn, cursor, (RESET_CONCURRENCY * 2) as u32)?;
+    let candidates = slots::abandoned_maintenance(&conn, cursor, (RESET_CONCURRENCY * 2) as u32)?;
     let mut next_cursor = cursor;
     let mut destroying = Vec::new();
     for (slot, generation, state) in candidates {

@@ -151,11 +151,6 @@ postgres = [
   "user_credentials",
   "users",
 ]
-"sqlite.node-manager" = [
-  "network_pool_meta",
-  "network_slots",
-  "sandbox_executions",
-]
 "sqlite.runtime-manager" = [
   "jobs",
 ]
