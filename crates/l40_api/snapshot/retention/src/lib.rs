@@ -40,25 +40,25 @@
 //!
 //! The pin isn't the only protection, though. A stopped sandbox's **current
 //! stop disk** is never swept, pinned or not
-//! (`sandbox_portability::snapshot_is_current_stop_disk`): the newest `stop`
-//! row with a durable copy, registered since the sandbox entered `stopped`.
-//! A stopped Kubernetes row usually carries no pin while its node still
-//! holds the rootfs, so that stored disk is the only other copy, and a node
-//! drain that hands the sandbox off restores from it. The guard keeps at
-//! most one row per stopped sandbox. The row becomes prunable again once the
-//! sandbox leaves `stopped` or a newer stop disk is durable.
+//! (`sandbox_portability::snapshot_is_current_stop_disk`): its newest `stop`
+//! row with a durable copy. A stopped Kubernetes row usually carries no pin
+//! while its node still holds the rootfs, so that stored disk is the only
+//! other copy, and a node drain that hands the sandbox off restores from it.
+//! The guard keeps at most one row per stopped sandbox. The row becomes
+//! prunable again once the sandbox leaves `stopped` or a newer stop disk is
+//! durable.
 //!
 //! Node drain can reuse an unpinned `stop` row: when sbx-mgr finds a `ready`
 //! backup of the node's current artifact, drain pins that artifact instead of
-//! uploading it again. The current-stop-disk guard keeps such a row if it was
-//! registered since the recorded stop. One registered earlier can still be
-//! pruned before the pin lands, which costs an upload, not the data. The
-//! stopped evacuation's teardown waits for a
-//! `ready` disk row matching the pin before it releases the source node,
-//! whose termination takes the rootfs, and the next drain tick finds no
-//! backup and uploads again. If the sweep claims the row between sbx-mgr's
-//! check and the pin write, and the pin lands before finalize, finalize also
-//! reports a current-artifact breach for it, though nothing is lost.
+//! uploading it again. If that row is the stopped sandbox's newest stored
+//! stop disk, the sweep keeps it. An older one can still be pruned before the
+//! pin lands, which costs an upload, not the data. The stopped
+//! evacuation's teardown waits for a `ready` disk row matching the pin before
+//! it releases the source node, whose termination takes the rootfs, and the
+//! next drain tick finds no backup and uploads again. If the sweep claims the
+//! row between sbx-mgr's check and the pin write, and the pin lands before
+//! finalize, finalize also reports a current-artifact breach for it, though
+//! nothing is lost.
 //!
 //! ## Validity
 //!

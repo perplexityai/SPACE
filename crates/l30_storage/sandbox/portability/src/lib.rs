@@ -706,7 +706,7 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 /// Returns a boolean SQL fragment evaluating to TRUE iff the snapshot aliased
 /// as `snapshot_alias` is the **current stop disk** of the sandbox aliased as
 /// `sandbox_alias`: the sandbox is `stopped`, and the snapshot is its newest
-/// durable `stop` disk taken since it stopped.
+/// durable `stop` disk.
 ///
 /// The conditions:
 ///
@@ -715,19 +715,26 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 /// * The snapshot is a `disk` of origin `stop`, and it has a durable copy
 ///   ([`snapshot_has_durable_copy`]: `ready`, with a storage location that
 ///   isn't orphaned).
-/// * `timestamp >= lifecycle_changed_at`: registered since the row entered
-///   `stopped`. A disk from an earlier stop predates a later stop's
-///   `lifecycle_changed_at`, so it no longer counts.
 /// * No newer durable `stop` disk of the sandbox exists, by `(timestamp, id)`.
 ///   A newer one still uploading, failed, or without a usable location
 ///   doesn't take over, so the older durable copy stays current until a
-///   newer one is durable.
+///   newer one is durable. Named and fork disks don't take over either.
 ///
 /// It deliberately ignores the row's pin. On Kubernetes, a stopped row usually
 /// carries no `current_local_artifact_id`, while its node still holds the
 /// rootfs, so the stored disk is the only other copy. A pinned disk is
 /// already covered by [`snapshot_is_live_restore_source`]; this covers the
 /// newest stored disk either way.
+///
+/// It also deliberately has no freshness term, such as `timestamp >=
+/// lifecycle_changed_at`. `snapshots.timestamp` is the catalog registration
+/// time, not when the disk was captured. A stopped re-placement moves the row
+/// through `restoring` back to `stopped`, which moves `lifecycle_changed_at`
+/// past the registration of the disk it was re-placed from, while that disk
+/// is still the sandbox's current one. A freshness term would release exactly
+/// that disk. Without one, the
+/// newest stored disk can be from an earlier stop (when a later stop stored
+/// none), which costs storage but never deletes a disk a restore needs.
 ///
 /// The snapshot retention sweep uses it as a deletion guard next to
 /// [`snapshot_is_live_restore_source`]: retention never deletes a stopped
@@ -737,10 +744,9 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 ///
 /// ## NULL-safety
 ///
-/// Callers negate this, so it must never be NULL. `lifecycle`, `type`,
-/// `timestamp` and `lifecycle_changed_at` are all `NOT NULL`;
-/// `artifact_origin` is compared with `IS NOT DISTINCT FROM`; the rest are
-/// `EXISTS` probes, which are never NULL.
+/// Callers negate this, so it must never be NULL. `lifecycle`, `type` and
+/// `timestamp` are all `NOT NULL`; `artifact_origin` is compared with
+/// `IS NOT DISTINCT FROM`; the rest are `EXISTS` probes, which are never NULL.
 pub fn snapshot_is_current_stop_disk(sandbox_alias: &str, snapshot_alias: &str) -> String {
     let stopped = SandboxLifecycle::Stopped.as_str();
     let stop = ArtifactOrigin::Stop.as_str();
@@ -751,7 +757,6 @@ pub fn snapshot_is_current_stop_disk(sandbox_alias: &str, snapshot_alias: &str) 
              {sandbox_alias}.lifecycle = '{stopped}'\n\
              AND {snapshot_alias}.type = 'disk'\n\
              AND {snapshot_alias}.artifact_origin IS NOT DISTINCT FROM '{stop}'\n\
-             AND {snapshot_alias}.timestamp >= {sandbox_alias}.lifecycle_changed_at\n\
              AND {durable}\n\
              AND NOT EXISTS (\n\
                  SELECT 1\n\

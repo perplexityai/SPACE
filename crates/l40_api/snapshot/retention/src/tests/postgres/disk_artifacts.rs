@@ -36,40 +36,21 @@ async fn pin_stop_disk(
     lifecycle: &str,
     artifact_id: Uuid,
 ) -> TestResult {
-    sqlx::query("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1")
-        .bind(sandbox_id)
-        .bind(lifecycle)
-        .execute(pool)
-        .await?;
+    set_lifecycle(pool, sandbox_id, lifecycle).await?;
     pin_artifact(pool, sandbox_id, artifact_id, STOP_DISK).await
 }
 
 /// The `(kind, origin)` a stopped sandbox's disk artifact carries.
 const STOP_DISK: (&str, &str) = ("disk", "stop");
 
-/// Move the sandbox to `lifecycle`, entered `secs_ago` seconds in the past.
-/// Two writes, because the row's trigger stamps `lifecycle_changed_at` with
-/// `NOW()` whenever the lifecycle changes.
-async fn enter_lifecycle(
-    pool: &PgPool,
-    sandbox_id: SandboxId,
-    lifecycle: &str,
-    secs_ago: i64,
-) -> TestResult {
+/// Move the sandbox to `lifecycle`. The row's trigger stamps
+/// `lifecycle_changed_at` with `NOW()`.
+async fn set_lifecycle(pool: &PgPool, sandbox_id: SandboxId, lifecycle: &str) -> TestResult {
     sqlx::query("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1")
         .bind(sandbox_id)
         .bind(lifecycle)
         .execute(pool)
         .await?;
-    sqlx::query(
-        "UPDATE sandboxes
-            SET lifecycle_changed_at = NOW() - make_interval(secs => $2::BIGINT)
-          WHERE id = $1",
-    )
-    .bind(sandbox_id)
-    .bind(secs_ago)
-    .execute(pool)
-    .await?;
     Ok(())
 }
 
@@ -204,33 +185,45 @@ async fn restoring_stopped_evacuation_keeps_its_pinned_disk_source() -> TestResu
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_stopped_sandbox_keeps_its_current_stop_disk_unpinned() -> TestResult {
+async fn a_stopped_sandbox_keeps_its_newest_stored_stop_disk_unpinned() -> TestResult {
     // A stopped row with no pin, as a stopped Kubernetes row usually is. Its
-    // newest durable stop disk taken since the stop is the only copy off the
-    // node, so the sweep keeps it. Everything else follows today's rules: the
-    // disk from before the stop, an older disk taken since, and the full row
-    // outside keep-N are all prunable.
+    // newest durable stop disk is the only copy off the node, so the sweep
+    // keeps it, however old. An older stop disk and the full row outside
+    // keep-N are prunable, as before.
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
     let sandbox = insert_sandbox(pool).await?;
-    enter_lifecycle(pool, sandbox, "stopped", 5000).await?;
+    set_lifecycle(pool, sandbox, "stopped").await?;
     // Oldest-first, so ids increase with recency.
-    let before_stop = insert_unpinned_stop_disk(pool, sandbox, 6000).await?;
+    let older = insert_unpinned_stop_disk(pool, sandbox, 6000).await?;
     let older_full = insert_snapshot(pool, sandbox, "full", "ready", 4900).await?;
-    let superseded = insert_unpinned_stop_disk(pool, sandbox, 4800).await?;
     insert_snapshot(pool, sandbox, "full", "ready", 4700).await?;
     let current = insert_unpinned_stop_disk(pool, sandbox, 4600).await?;
     // A newer upload still in flight doesn't take over yet.
     let uploading = insert_unpinned_stop_disk(pool, sandbox, 4000).await?;
     set_snapshot_state(pool, uploading, "creating").await?;
+    // A stopped re-placement: through `restoring` and back, which moves
+    // `lifecycle_changed_at` past every disk's registration while `current`
+    // is still the sandbox's disk.
+    set_lifecycle(pool, sandbox, "restoring").await?;
+    set_lifecycle(pool, sandbox, "stopped").await?;
+    let moved_past: bool = sqlx::query_scalar(
+        "SELECT sb.lifecycle_changed_at > s.timestamp
+           FROM sandboxes sb JOIN snapshots s ON s.sandbox_id = sb.id
+          WHERE s.id = $1",
+    )
+    .bind(current)
+    .fetch_one(pool)
+    .await?;
+    assert!(moved_past, "the fixture must stop the row after the disk");
 
     let store = SnapshotRetentionDbStore::new(pool.clone());
     assert_eq!(
         candidate_ids(&store, 1).await?,
-        vec![before_stop, older_full, superseded],
-        "only the current stop disk and the full keep-set survive"
+        vec![older, older_full],
+        "only the newest stored stop disk and the full keep-set survive"
     );
     assert_eq!(
         store.claim_prune(current, 1).await?,
@@ -243,7 +236,7 @@ async fn a_stopped_sandbox_keeps_its_current_stop_disk_unpinned() -> TestResult 
     set_snapshot_state(pool, uploading, "ready").await?;
     assert_eq!(
         candidate_ids(&store, 1).await?,
-        vec![before_stop, older_full, superseded, current]
+        vec![older, older_full, current]
     );
     expect_claimed(store.claim_prune(current, 1).await?);
     assert_eq!(
@@ -255,9 +248,8 @@ async fn a_stopped_sandbox_keeps_its_current_stop_disk_unpinned() -> TestResult 
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_sandbox_that_left_stopped_keeps_no_stop_disk() -> TestResult {
-    // A stop disk registered after the row entered each of these lifecycles,
-    // so only the `stopped` condition separates it from a current stop disk.
-    // Each one is prunable, as before.
+    // Each sandbox's only stop disk, which would be its current one were the
+    // row `stopped`. Each one is prunable, as before.
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -265,8 +257,9 @@ async fn a_sandbox_that_left_stopped_keeps_no_stop_disk() -> TestResult {
     let mut disks = Vec::new();
     for lifecycle in ["started", "suspended", "deleted"] {
         let sandbox = insert_sandbox(pool).await?;
-        enter_lifecycle(pool, sandbox, lifecycle, 5000).await?;
+        set_lifecycle(pool, sandbox, "stopped").await?;
         disks.push(insert_unpinned_stop_disk(pool, sandbox, 4000).await?);
+        set_lifecycle(pool, sandbox, lifecycle).await?;
     }
 
     let store = SnapshotRetentionDbStore::new(pool.clone());

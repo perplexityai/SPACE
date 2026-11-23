@@ -252,8 +252,8 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // failed restore branch's later artifacts) push it down.
         //
         // `NOT (current_stop_disk)` keeps a stopped sandbox's newest stored
-        // stop disk taken since its stop, pinned or not. Its node still holds
-        // the rootfs, and the stored disk is the only other copy.
+        // stop disk, pinned or not. Its node still holds the rootfs, and the
+        // stored disk is the only other copy.
         //
         // Rows in `deleting` are deliberately absent: outstanding claims
         // page through [`Self::list_claimed`] on their own cursor, so this
