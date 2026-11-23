@@ -65,6 +65,10 @@ pub enum TeardownBackupRefusalReplay {
     AdmittedNotCleared,
     /// The cluster's answer says nothing about a new attempt.
     NotSuperseded,
+    /// The cluster refuses this node as the backup's source node. A
+    /// placement change, or a control plane that attributes the capture to
+    /// this node, lifts it; until then the pod stays terminating.
+    SourceNodeRefused,
     /// The cluster couldn't be asked.
     Unanswered,
 }
@@ -75,6 +79,7 @@ impl TeardownBackupRefusalReplay {
             Self::Superseded => "superseded",
             Self::AdmittedNotCleared => "admitted_not_cleared",
             Self::NotSuperseded => "not_superseded",
+            Self::SourceNodeRefused => "source_node_refused",
             Self::Unanswered => "unanswered",
         }
     }

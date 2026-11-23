@@ -6,7 +6,8 @@
 //! a typed record, `sql!` locators, and a small error enum. Verbs
 //! so far: [`get`], [`update_desired_state`], [`user_sandbox_rows`],
 //! [`org_has_sandbox_rows`], [`any_undescribed_artifact_owner`],
-//! [`network_policy_inputs_placed_on`], [`snapshot_storage_placed_on`].
+//! [`network_policy_inputs_placed_on`], [`snapshot_storage_placed_on`],
+//! [`snapshot_capture_fields::snapshot_capture_source`].
 //!
 //! # Boundaries
 //!
@@ -393,9 +394,15 @@ pub struct SandboxSnapshotStorage {
 }
 
 /// The organization snapshot storage of `sandbox_id`, when that sandbox is
-/// placed on one of `node_ids`: active there, or the target of a pending
-/// migration or restore. A sandbox placed elsewhere is `None`, not an error:
-/// the caller is a node asking about its own set.
+/// placed on one of `node_ids`: active there, the target of a pending
+/// migration or restore, or, on a row with no active node, the one live
+/// worker registered under the Kubernetes node name of the newest execution
+/// that is active or has run a pod. That last is where a teardown of that
+/// execution's pod uploads from (see
+/// [`snapshot_capture_fields::SnapshotCaptureSource::source_node_id`]),
+/// and it must upload to the organization's storage. A sandbox placed
+/// elsewhere is `None`, not an error: the caller is a node asking about its
+/// own set.
 pub async fn snapshot_storage_placed_on(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,
@@ -406,7 +413,25 @@ pub async fn snapshot_storage_placed_on(
          FROM sandboxes s
          JOIN organizations o ON o.id = s.org_id
          WHERE s.id = $1
-           AND (s.active_node_id = ANY($2) OR s.target_node_id = ANY($2))"
+           AND (s.active_node_id = ANY($2)
+                OR s.target_node_id = ANY($2)
+                OR (s.active_node_id IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                          FROM (SELECT e.k8s_node_name
+                                  FROM sandbox_k8s_executions e
+                                 WHERE e.sandbox_id = s.id
+                                   AND (e.active
+                                        OR e.pod_materialized_at IS NOT NULL
+                                        OR NULLIF(BTRIM(e.pod_uid), '') IS NOT NULL)
+                                 ORDER BY e.generation DESC
+                                 LIMIT 1) newest
+                          JOIN node_k8s nk ON nk.k8s_node_name = newest.k8s_node_name
+                          JOIN nodes n ON n.id = nk.node_id
+                         WHERE n.role = 'worker'
+                           AND COALESCE(n.state, 'registered') != 'deleted'
+                        HAVING COUNT(*) = 1
+                           AND bool_or(nk.node_id = ANY($2)))))"
     ))
     .bind(sandbox_id)
     .bind(node_ids)

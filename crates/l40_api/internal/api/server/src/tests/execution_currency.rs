@@ -6,50 +6,6 @@ use super::*;
 
 use crate::proto::{ExecutionCurrency, GetExecutionCurrencyRequest};
 
-/// Record `k8s_node_name` for the registered node at `node_ip`.
-async fn name_node(
-    pool: &sqlx::PgPool,
-    node_ip: std::net::IpAddr,
-    k8s_node_name: &str,
-) -> TestResult {
-    sqlx::query(
-        "INSERT INTO node_k8s (node_id, k8s_node_name)
-         SELECT id, $2 FROM nodes WHERE host(address) = $1",
-    )
-    .bind(node_ip.to_string())
-    .bind(k8s_node_name)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-async fn insert_execution_on(
-    pool: &sqlx::PgPool,
-    sandbox_id: SandboxId,
-    generation: i64,
-    active: bool,
-    k8s_node_name: &str,
-) -> TestResult {
-    sqlx::query(
-        "INSERT INTO sandbox_k8s_executions (
-             sandbox_id, generation, pod_name, pod_namespace, state, active, k8s_node_name
-         )
-         VALUES ($1, $2, $3, 'space', $4, $5, $6)",
-    )
-    .bind(sandbox_id)
-    .bind(generation)
-    .bind(format!(
-        "space-sbx-{}-g{generation}",
-        sandbox_id.as_uuid().simple()
-    ))
-    .bind(if active { "running" } else { "replaced" })
-    .bind(active)
-    .bind(k8s_node_name)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// A retired generation reads as retired and the active one as current, to
 /// the node the pods were placed on. A generation with no row, and any other
 /// caller, get no answer.
