@@ -10,9 +10,15 @@ use pplx_space_state_reconciliation::{
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 
+mod depth;
 pub mod metrics;
 mod reconcile_refs;
-pub use reconcile_refs::{QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs};
+pub use depth::{
+    ReconcileQueueDepth, TriggerQueueDepth, reconcile_queue_depth, trigger_queue_depth,
+};
+pub use reconcile_refs::{
+    QueuedReconcileRefs, QueuedRefConflict, claimed_ref_attempts, queue_node_reconcile_refs,
+};
 
 const TRIGGER_CLAIM_STALE_SECS: i64 = 60;
 const TRIGGER_MAX_ATTEMPTS: i32 = 16;

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pplx_space_durations::PositiveDuration;
+use pplx_space_sandbox_teardown::observed_status::{self, ObservedStatusKey};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -157,23 +158,16 @@ struct FacetLap {
     high_water: FacetKey,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FacetKey {
-    node_id: NodeId,
-    facet: String,
-    element: String,
-}
+type FacetKey = ObservedStatusKey;
 
-impl FacetKey {
-    /// Sorts at or before every real key: `node_id` is a FK to `nodes`, so a
-    /// live row with the nil UUID (let alone empty facet and element) cannot
-    /// exist.
-    fn origin() -> Self {
-        Self {
-            node_id: NodeId::from_uuid(Uuid::nil()),
-            facet: String::new(),
-            element: String::new(),
-        }
+/// Sorts at or before every real key: `node_id` is a FK to `nodes`, so a
+/// live row with the nil UUID (let alone empty facet and element) cannot
+/// exist.
+fn facet_key_origin() -> FacetKey {
+    FacetKey {
+        node_id: NodeId::from_uuid(Uuid::nil()),
+        facet: String::new(),
+        element: String::new(),
     }
 }
 
@@ -246,19 +240,7 @@ impl ObservedProjectionDbStore {
     }
 
     async fn newest_facet_key(&self) -> Result<Option<FacetKey>, sqlx::Error> {
-        let row: Option<(NodeId, String, String)> = sqlx::query_as(sql!(
-            "SELECT node_id, facet, element
-             FROM node_facet_observed_status
-             ORDER BY node_id DESC, facet DESC, element DESC
-             LIMIT 1"
-        ))
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(node_id, facet, element)| FacetKey {
-            node_id,
-            facet,
-            element,
-        }))
+        observed_status::greatest_key(&self.pool).await
     }
 
     /// Facet-table counterpart of [`Self::observed_window_range`], row-wise
@@ -269,36 +251,14 @@ impl ObservedProjectionDbStore {
         through: &FacetKey,
         window: i64,
     ) -> Result<Option<WindowRange<FacetKey>>, sqlx::Error> {
-        let rows: Vec<(NodeId, String, String)> = sqlx::query_as(sql!(
-            "SELECT node_id, facet, element
-             FROM node_facet_observed_status
-             WHERE (node_id, facet, element) > ROW($1, $2, $3)
-               AND (node_id, facet, element) <= ROW($4, $5, $6)
-             ORDER BY node_id, facet, element
-             LIMIT $7"
-        ))
-        .bind(cursor.node_id)
-        .bind(&cursor.facet)
-        .bind(&cursor.element)
-        .bind(through.node_id)
-        .bind(&through.facet)
-        .bind(&through.element)
-        .bind(window.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            observed_status::keys_in_window(&self.pool, cursor, through, window.max(0)).await?;
 
         let exhausted = (rows.len() as i64) < window;
-        let Some((node_id, facet, element)) = rows.into_iter().last() else {
+        let Some(last) = rows.into_iter().last() else {
             return Ok(None);
         };
-        Ok(Some(WindowRange {
-            last: FacetKey {
-                node_id,
-                facet,
-                element,
-            },
-            exhausted,
-        }))
+        Ok(Some(WindowRange { last, exhausted }))
     }
 }
 
@@ -399,7 +359,7 @@ impl ProjectionGcSink for ObservedProjectionDbStore {
                 None => match self.newest_facet_key().await? {
                     Some(high_water) => {
                         let lap = FacetLap {
-                            cursor: FacetKey::origin(),
+                            cursor: facet_key_origin(),
                             high_water,
                         };
                         self.store_facet_lap(Some(lap.clone()));

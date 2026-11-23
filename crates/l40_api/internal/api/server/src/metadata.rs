@@ -364,17 +364,12 @@ pub(super) async fn clear_facet_apply_failed_condition(
     node_id: NodeId,
     reference: &QueuedFacetRefRow,
 ) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "DELETE FROM node_facet_conditions
-         WHERE node_id = $1
-           AND facet = $2
-           AND element = COALESCE($3, '')
-           AND condition_type = 'ApplyFailed'"
-    ))
-    .bind(node_id)
-    .bind(&reference.facet)
-    .bind(reference.element.as_deref())
-    .execute(&mut **tx)
+    pplx_space_sandbox_teardown::conditions::clear_apply_failed(
+        &mut **tx,
+        node_id,
+        &reference.facet,
+        reference.element.as_deref(),
+    )
     .await
     .map_err(|err| Status::internal(format!("clear facet apply condition: {err}")))?;
     Ok(())
@@ -386,46 +381,22 @@ pub(super) async fn record_facet_apply_failed_condition(
     reference: &QueuedFacetRefRow,
     error: &str,
 ) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_at, updated_at
-         )
-         VALUES ($1, $2, COALESCE($3, ''), NOW(), NOW())
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET updated_at = NOW()"
-    ))
-    .bind(node_id)
-    .bind(&reference.facet)
-    .bind(reference.element.as_deref())
-    .execute(&mut **tx)
+    pplx_space_sandbox_teardown::observed_status::touch(
+        &mut **tx,
+        node_id,
+        &reference.facet,
+        reference.element.as_deref(),
+    )
     .await
     .map_err(|err| Status::internal(format!("ensure facet status for condition: {err}")))?;
 
-    sqlx::query(
-        sql!("INSERT INTO node_facet_conditions (
-             node_id, facet, element, condition_type, condition_status,
-             reason, message, last_transition_at, updated_at
-         )
-         VALUES (
-             $1, $2, COALESCE($3, ''), 'ApplyFailed', 'True',
-             'ReconcileFailed', $4, NOW(), NOW()
-         )
-         ON CONFLICT (node_id, facet, element, condition_type) DO UPDATE
-         SET condition_status = EXCLUDED.condition_status,
-             reason = EXCLUDED.reason,
-             message = EXCLUDED.message,
-             last_transition_at = CASE
-                 WHEN node_facet_conditions.condition_status IS DISTINCT FROM EXCLUDED.condition_status
-                 THEN NOW()
-                 ELSE node_facet_conditions.last_transition_at
-             END,
-             updated_at = NOW()"),
+    pplx_space_sandbox_teardown::conditions::record_apply_failed(
+        &mut **tx,
+        node_id,
+        &reference.facet,
+        reference.element.as_deref(),
+        error,
     )
-    .bind(node_id)
-    .bind(&reference.facet)
-    .bind(reference.element.as_deref())
-    .bind(error)
-    .execute(&mut **tx)
     .await
     .map_err(|err| Status::internal(format!("record facet apply condition: {err}")))?;
     Ok(())

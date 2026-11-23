@@ -81,11 +81,13 @@ pplx-space-reconcile-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-postgres-pool = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
+pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-execution-common = { workspace = true }

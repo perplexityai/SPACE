@@ -45,15 +45,8 @@ impl K8sStore {
         conn: &mut PgConnection,
         config_id: Uuid,
     ) -> Result<Option<String>, SubstrateError> {
-        sqlx::query_scalar::<_, String>(sql!(
-            "SELECT r.template_name
-             FROM kubernetes_pool_configs c
-             JOIN template_releases r ON r.id = c.template_release_id
-             WHERE c.id = $1"
-        ))
-        .bind(config_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .db_context("failed to read the pool config's template")
+        pplx_space_cluster_pool::pool_config_template_name(&mut *conn, config_id)
+            .await
+            .db_context("failed to read the pool config's template")
     }
 }

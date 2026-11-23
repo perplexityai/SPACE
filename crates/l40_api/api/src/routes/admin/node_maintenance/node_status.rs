@@ -2,16 +2,10 @@
 
 use super::*;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct NodeStatusRow {
-    pub(super) node_id: NodeId,
-    pub(super) stale_after: OffsetDateTime,
-    pub(super) reachable: bool,
-    pub(super) error: Option<String>,
-    pub(super) health_healthy: Option<bool>,
-    pub(super) services: sqlx::types::Json<Vec<ServiceHealthResponse>>,
-    pub(super) node_ctl: Option<sqlx::types::Json<NodeCtlStatusResponse>>,
-}
+pub(super) type NodeStatusRow = pplx_space_node_status_store::NodeStatusSummary<
+    Vec<ServiceHealthResponse>,
+    NodeCtlStatusResponse,
+>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ServiceHealthResponse {
@@ -160,20 +154,7 @@ pub(super) async fn fetch_node_status_map(
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
-    sqlx::query_as::<_, NodeStatusRow>(sql!(
-        "SELECT node_id,
-                stale_after,
-                reachable,
-                error,
-                health_healthy,
-                services,
-                node_ctl
-         FROM node_status_snapshots
-         WHERE node_id = ANY($1)"
-    ))
-    .bind(node_ids)
-    .fetch_all(pool)
-    .await
+    pplx_space_node_status_store::status_summaries(pool, node_ids).await
 }
 
 pub(super) async fn node_status_refresh_needed(

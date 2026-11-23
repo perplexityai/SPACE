@@ -56,6 +56,7 @@ use pplx_space_sandbox_store::ingest::SuspendedFinalizationCandidate;
 use pplx_space_sandbox_store::published_quarantine_candidates::{
     self, PublishedQuarantineCandidate,
 };
+use pplx_space_sandbox_teardown::{conditions, observed_status};
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
 
@@ -807,22 +808,13 @@ pub async fn publish_template_states(
             .iter()
             .map(|template| format!("template:{template}"))
             .collect::<Vec<_>>();
-        sqlx::query(sql!(
-            "DELETE FROM node_facet_observed_status
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = ANY($3)"
-        ))
-        .bind(node_id)
-        .bind(FACET_NETWORK_POLICY)
-        .bind(&elements)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            Status::internal(format!(
-                "delete absent template network policy facet status: {err}"
-            ))
-        })?;
+        observed_status::delete_for_elements(&mut *conn, node_id, FACET_NETWORK_POLICY, &elements)
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "delete absent template network policy facet status: {err}"
+                ))
+            })?;
     }
 
     if rows.is_empty() {
@@ -886,59 +878,12 @@ pub async fn publish_template_states(
     )
     .await?;
 
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_json JSONB,
-                 network_policy_generation BIGINT,
-                 network_policy_authority TEXT
-             )
-         )
-         INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_generation, observed_payload,
-             applied_source, applied_authority, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             'template:' || template_name,
-             network_policy_generation,
-             network_policy_json,
-             NULL,
-             network_policy_authority,
-             NOW(),
-             NOW()
-         FROM input
-         WHERE network_policy_generation IS NOT NULL
-           AND EXISTS (
-               SELECT 1 FROM node_template_inventory inventory
-               WHERE inventory.node_id = $1 AND inventory.template_name = input.template_name
-           )
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_generation = EXCLUDED.observed_generation,
-             observed_payload = EXCLUDED.observed_payload,
-             applied_source = EXCLUDED.applied_source,
-             applied_authority = EXCLUDED.applied_authority,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE (
-             node_facet_observed_status.observed_generation,
-             node_facet_observed_status.observed_payload,
-             node_facet_observed_status.applied_source,
-             node_facet_observed_status.applied_authority
-         ) IS DISTINCT FROM (
-             EXCLUDED.observed_generation,
-             EXCLUDED.observed_payload,
-             EXCLUDED.applied_source,
-             EXCLUDED.applied_authority
-         )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
+    observed_status::upsert_template_network_policies(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
+        FACET_NETWORK_POLICY,
+    )
     .await
     .map_err(|err| {
         Status::internal(format!(
@@ -946,30 +891,12 @@ pub async fn publish_template_states(
         ))
     })?;
 
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_generation BIGINT
-             )
-         )
-         DELETE FROM node_facet_conditions nfc
-         USING input
-         WHERE nfc.node_id = $1
-           AND nfc.facet = $3
-           AND nfc.element = 'template:' || input.template_name
-           AND input.network_policy_generation IS NOT NULL
-           AND nfc.condition_type = 'ApplyFailed'
-           AND EXISTS (
-               SELECT 1 FROM node_template_inventory inventory
-               WHERE inventory.node_id = $1 AND inventory.template_name = input.template_name
-           )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
+    conditions::clear_template_apply_failed(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
+        FACET_NETWORK_POLICY,
+    )
     .await
     .map_err(|err| {
         Status::internal(format!(
@@ -1602,45 +1529,23 @@ pub async fn publish_sandbox_states_with_retirement(
             .iter()
             .map(|id| NetworkPolicyTarget::sandbox(*id).as_element_string())
             .collect::<Vec<_>>();
-        sqlx::query(sql!(
-            "DELETE FROM node_facet_observed_status
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = ANY($3)"
-        ))
-        .bind(node_id)
-        .bind(FACET_NETWORK_POLICY)
-        .bind(&elements)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            Status::internal(format!("delete absent network policy facet status: {err}"))
-        })?;
+        observed_status::delete_for_elements(&mut *conn, node_id, FACET_NETWORK_POLICY, &elements)
+            .await
+            .map_err(|err| {
+                Status::internal(format!("delete absent network policy facet status: {err}"))
+            })?;
 
         let sandbox_elements = absent_ids
             .iter()
             .map(SandboxId::to_string)
             .collect::<Vec<_>>();
-        sqlx::query(sql!(
-            "UPDATE node_facet_observed_status
-             SET observed_payload = COALESCE(observed_payload, '{}'::JSONB)
-                                        - 'quarantine_recovery'
-                                        - $4::TEXT,
-                 observed_at = NOW(),
-                 updated_at = NOW()
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = ANY($3)
-               AND (
-                   observed_payload ? 'quarantine_recovery'
-                   OR observed_payload ? $4::TEXT
-               )"
-        ))
-        .bind(node_id)
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .bind(&sandbox_elements)
-        .bind(SANDBOX_FAILURE_EPISODE_KEY)
-        .execute(&mut *conn)
+        observed_status::clear_quarantine_recovery_and_key(
+            &mut *conn,
+            node_id,
+            FACET_SANDBOX_DESIRED_STATE,
+            &sandbox_elements,
+            SANDBOX_FAILURE_EPISODE_KEY,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!("clear absent sandbox facet observations: {err}"))
@@ -2257,32 +2162,12 @@ pub async fn publish_sandbox_states_with_retirement(
         .await
         .map_err(|err| Status::internal(format!("upsert network policy facet status: {err}")))?;
 
-        sqlx::query(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_generation BIGINT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE (s.id IS NULL OR s.active_node_id = $1)
-                   AND input.observed_network_policy_generation IS NOT NULL
-             )
-             DELETE FROM node_facet_conditions nfc
-             USING publishable
-             WHERE nfc.node_id = $1
-               AND nfc.facet = $3
-               AND nfc.element = 'sandbox:' || publishable.sandbox_id::text
-               AND nfc.condition_type = 'ApplyFailed'"
-        ))
-        .bind(node_id)
-        .bind(rows_json.clone())
-        .bind(FACET_NETWORK_POLICY)
-        .execute(&mut *conn)
+        conditions::clear_sandbox_apply_failed(
+            &mut *conn,
+            node_id,
+            &rows_json.0,
+            FACET_NETWORK_POLICY,
+        )
         .await
         .map_err(|err| Status::internal(format!("clear network policy apply condition: {err}")))?;
     }
@@ -3342,36 +3227,12 @@ async fn reconcile_recovery_observations(
                     "serialize recovery observation withdrawals: {error}"
                 ))
             })?);
-        sqlx::query(sql!(
-            "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         clearable AS (
-             SELECT input.sandbox_id
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NULL
-         )
-         UPDATE node_facet_observed_status observed
-         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
-                                    - 'quarantine_recovery',
-             observed_at = NOW(),
-             updated_at = NOW()
-         FROM clearable
-         WHERE observed.node_id = $1
-           AND observed.facet = $3
-           AND observed.element = clearable.sandbox_id::TEXT
-           AND observed.observed_payload ? 'quarantine_recovery'"
-        ))
-        .bind(node_id)
-        .bind(clear_recovery_rows)
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .execute(&mut *conn)
+        observed_status::clear_quarantine_recovery(
+            &mut *conn,
+            node_id,
+            &clear_recovery_rows.0,
+            FACET_SANDBOX_DESIRED_STATE,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!(

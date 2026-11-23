@@ -78,10 +78,10 @@ async fn node_queue_metrics_cover_depth_and_stale_claim_counts() -> TestResult {
     .await?;
     insert_queue_row(&db.pool, node_id, FACET_NODE_STATUS, "dead", "dead").await?;
 
-    let depth = node_queue_depth_counts(&db.pool)
+    let depth = pplx_space_cluster_trigger_queue::reconcile_queue_depth(&db.pool)
         .await?
         .into_iter()
-        .map(|(facet, state, count)| ((facet, state), count))
+        .map(|row| ((row.facet, row.state), row.count))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(
         depth.get(&(FACET_NETWORK_POLICY.to_string(), "ready".to_string())),

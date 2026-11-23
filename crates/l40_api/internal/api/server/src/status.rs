@@ -1,7 +1,6 @@
 use pplx_space_accounts::NodeId;
 
 use super::*;
-use pplx_space_sql_locator::sql;
 
 /// Reconcile a node's complete sandbox census against the cluster's own state,
 /// through [`pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes`].
@@ -135,14 +134,13 @@ pub(super) enum LocalBackupInventoryReport {
 }
 
 impl LocalBackupInventoryReport {
-    /// Whether `local_backup_inventory_reported_at` advances to `NOW()`.
-    pub(super) const fn stamps_reported_at(self) -> bool {
-        matches!(self, Self::Mirrored)
-    }
-
-    /// Whether the gate is cleared outright rather than preserved.
-    pub(super) const fn clears_reported_at(self) -> bool {
-        matches!(self, Self::Invalidated)
+    /// What happens to `local_backup_inventory_reported_at`.
+    pub(super) const fn reported_at(self) -> pplx_space_node_status_store::LocalBackupReportedAt {
+        match self {
+            Self::Mirrored => pplx_space_node_status_store::LocalBackupReportedAt::Stamp,
+            Self::Absent => pplx_space_node_status_store::LocalBackupReportedAt::Preserve,
+            Self::Invalidated => pplx_space_node_status_store::LocalBackupReportedAt::Withdraw,
+        }
     }
 }
 
@@ -209,218 +207,35 @@ pub(super) async fn upsert_node_status_from_publish(
         ),
         None => (None, None, None, None, None, None, None, None, None, None),
     };
-    sqlx::query(sql!(
-        "INSERT INTO node_status_snapshots (
-             node_id,
-             observed_at,
-             stale_after,
-             reachable,
-             error,
-             role,
-             node_id_reported,
-             scheduling_status,
-             scheduling_reason,
-             network_slots_ready,
-             network_pool_min_ready,
-             network_slots_degraded,
-             network_slots_quarantined,
-             network_slots_total,
-             network_slots_leased,
-             network_pool_max_slots,
-             health_healthy,
-             services,
-             node_ctl,
-             sandbox_inventory_pruned_at,
-             local_backup_inventory_reported_at,
-             execution_policy,
-             execution_policy_received_at,
-             execution_inventory_status,
-             execution_inventory_received_at,
-             usable_environment_refs,
-             known_environment_refs,
-             environment_refs_received_at,
-             updated_at
-         )
-         SELECT n.id,
-                NOW(),
-                NOW() + make_interval(
-                    secs => COALESCE($2::DOUBLE PRECISION, $18::DOUBLE PRECISION)
-                ),
-                TRUE,
-                NULL,
-                n.role,
-                NULL,
-                $3::TEXT,
-                $4::TEXT,
-                $5::INT,
-                $6::INT,
-                $7::INT,
-                $8::INT,
-                $9::INT,
-                $10::INT,
-                $11::INT,
-                CASE WHEN $12::JSONB IS NULL THEN NULL ELSE TRUE END,
-                '[]'::JSONB,
-                $12::JSONB,
-                CASE WHEN $13::BOOLEAN THEN NOW() ELSE NULL END,
-                CASE WHEN $14::BOOLEAN THEN NOW() ELSE NULL END,
-                $17::JSONB,
-                CASE WHEN $17::JSONB IS NOT NULL THEN clock_timestamp() ELSE NULL END,
-                $16::TEXT,
-                CASE WHEN $16::TEXT IS NOT NULL THEN clock_timestamp() ELSE NULL END,
-                $19::TEXT[],
-                $20::TEXT[],
-                CASE WHEN $19::TEXT[] IS NOT NULL THEN clock_timestamp() ELSE NULL END,
-                NOW()
-         FROM nodes n
-         WHERE n.id = $1
-         ON CONFLICT (node_id) DO UPDATE
-         SET observed_at = EXCLUDED.observed_at,
-             -- No usable interval: keep the row's stored window.
-             stale_after = CASE
-                 WHEN $2::DOUBLE PRECISION IS NULL
-                 THEN EXCLUDED.observed_at
-                     + (node_status_snapshots.stale_after - node_status_snapshots.observed_at)
-                 ELSE EXCLUDED.stale_after
-             END,
-             reachable = TRUE,
-             error = NULL,
-             role = EXCLUDED.role,
-             scheduling_status = COALESCE(
-                 EXCLUDED.scheduling_status,
-                 node_status_snapshots.scheduling_status
-             ),
-             scheduling_reason = COALESCE(
-                 EXCLUDED.scheduling_reason,
-                 node_status_snapshots.scheduling_reason
-             ),
-             network_slots_ready = COALESCE(
-                 EXCLUDED.network_slots_ready,
-                 node_status_snapshots.network_slots_ready
-             ),
-             network_pool_min_ready = COALESCE(
-                 EXCLUDED.network_pool_min_ready,
-                 node_status_snapshots.network_pool_min_ready
-             ),
-             network_slots_degraded = COALESCE(
-                 EXCLUDED.network_slots_degraded,
-                 node_status_snapshots.network_slots_degraded
-             ),
-             network_slots_quarantined = COALESCE(
-                 EXCLUDED.network_slots_quarantined,
-                 node_status_snapshots.network_slots_quarantined
-             ),
-             network_slots_total = COALESCE(
-                 EXCLUDED.network_slots_total,
-                 node_status_snapshots.network_slots_total
-             ),
-             network_slots_leased = COALESCE(
-                 EXCLUDED.network_slots_leased,
-                 node_status_snapshots.network_slots_leased
-             ),
-             network_pool_max_slots = COALESCE(
-                 EXCLUDED.network_pool_max_slots,
-                 node_status_snapshots.network_pool_max_slots
-             ),
-             health_healthy = COALESCE(
-                 EXCLUDED.health_healthy,
-                 node_status_snapshots.health_healthy
-             ),
-             services = CASE
-                 WHEN EXCLUDED.health_healthy IS NULL
-                 THEN node_status_snapshots.services
-                 ELSE EXCLUDED.services
-             END,
-             node_ctl = COALESCE(EXCLUDED.node_ctl, node_status_snapshots.node_ctl),
-             -- Preserve, never overwrite: this runs on every publication, and
-             -- the facets that do not prune send NULL here. A plain
-             -- `= EXCLUDED.x` would blank the census timestamp on the template
-             -- facet's tick, moments after the census facet set it.
-             sandbox_inventory_pruned_at = COALESCE(
-                 EXCLUDED.sandbox_inventory_pruned_at,
-                 node_status_snapshots.sandbox_inventory_pruned_at
-             ),
-             -- Three-way, unlike the column above. A facet tick carries no
-             -- pending-backup report and must leave the gate alone, same as
-             -- the prune stamp. But a *census* that pruned the inventory and
-             -- still could not mirror has told us the queue is stale, and
-             -- preserving a recent timestamp there would leave a reader's
-             -- freshness window certifying an empty queue the server knows
-             -- it did not refresh. `$15` distinguishes the two.
-             local_backup_inventory_reported_at = CASE
-                 WHEN $15::BOOLEAN THEN NULL
-                 ELSE COALESCE(
-                     EXCLUDED.local_backup_inventory_reported_at,
-                     node_status_snapshots.local_backup_inventory_reported_at
-                 )
-             END,
-             execution_policy = CASE
-                 WHEN $16::TEXT IS NOT NULL THEN EXCLUDED.execution_policy
-                 ELSE node_status_snapshots.execution_policy
-             END,
-             execution_policy_received_at = CASE
-                 WHEN $16::TEXT IS NOT NULL THEN EXCLUDED.execution_policy_received_at
-                 ELSE node_status_snapshots.execution_policy_received_at
-             END,
-             execution_inventory_status = COALESCE(
-                 EXCLUDED.execution_inventory_status,
-                 node_status_snapshots.execution_inventory_status
-             ),
-             execution_inventory_received_at = CASE
-                 WHEN $16::TEXT IS NOT NULL THEN clock_timestamp()
-                 ELSE node_status_snapshots.execution_inventory_received_at
-             END,
-             -- Written together or not at all, as the row's CHECK requires:
-             -- a complete inventory records or clears all three, and any
-             -- other publication leaves them to age out by their receipt.
-             usable_environment_refs = CASE
-                 WHEN $21::BOOLEAN THEN EXCLUDED.usable_environment_refs
-                 ELSE node_status_snapshots.usable_environment_refs
-             END,
-             known_environment_refs = CASE
-                 WHEN $21::BOOLEAN THEN EXCLUDED.known_environment_refs
-                 ELSE node_status_snapshots.known_environment_refs
-             END,
-             environment_refs_received_at = CASE
-                 WHEN $21::BOOLEAN THEN EXCLUDED.environment_refs_received_at
-                 ELSE node_status_snapshots.environment_refs_received_at
-             END,
-             updated_at = NOW()"
-    ))
-    .bind(node_id)
-    .bind(reported_window.map(|window| window.as_secs_f64()))
-    .bind(scheduling_status)
-    .bind(scheduling_reason)
-    .bind(network_slots_ready)
-    .bind(network_pool_min_ready)
-    .bind(network_slots_degraded)
-    .bind(network_slots_quarantined)
-    .bind(network_slots_total)
-    .bind(network_slots_leased)
-    .bind(network_pool_max_slots)
-    .bind(node_ctl.map(Json))
-    .bind(inventory_prune.stamps_pruned_at())
-    .bind(local_backup_report.stamps_reported_at())
-    .bind(local_backup_report.clears_reported_at())
-    .bind(
-        execution_observation
-            .as_ref()
-            .map(|observation| observation.status.as_str()),
+    pplx_space_node_status_store::upsert_from_publish(
+        &mut *conn,
+        &pplx_space_node_status_store::NodeStatusPublication {
+            node_id,
+            reported_window_secs: reported_window.map(|window| window.as_secs_f64()),
+            scheduling_status: scheduling_status.as_deref(),
+            scheduling_reason: scheduling_reason.as_deref(),
+            network_slots_ready,
+            network_pool_min_ready,
+            network_slots_degraded,
+            network_slots_quarantined,
+            network_slots_total,
+            network_slots_leased,
+            network_pool_max_slots,
+            node_ctl: node_ctl.as_ref(),
+            stamps_sandbox_inventory_pruned_at: inventory_prune.stamps_pruned_at(),
+            local_backup_inventory_reported_at: local_backup_report.reported_at(),
+            execution_inventory_status: execution_observation
+                .as_ref()
+                .map(|observation| observation.status.as_str()),
+            execution_policy: execution_observation
+                .as_ref()
+                .and_then(|observation| observation.policy.as_ref()),
+            default_window_secs:
+                pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS
+                    .as_secs_f64(),
+            environment_refs: environments.write(),
+        },
     )
-    .bind(
-        execution_observation
-            .as_ref()
-            .and_then(|observation| observation.policy.as_ref())
-            .map(Json),
-    )
-    .bind(
-        pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS
-            .as_secs_f64(),
-    )
-    .bind(environments.usable())
-    .bind(environments.known())
-    .bind(environments.writes())
-    .execute(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("upsert node status from publish: {err}")))?;
     Ok(())
