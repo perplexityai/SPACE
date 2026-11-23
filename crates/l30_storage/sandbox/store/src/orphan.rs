@@ -20,7 +20,66 @@ use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_residency::node_observes_sandbox;
 use pplx_space_sql_locator::sql;
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgConnection, Postgres, Transaction};
+
+/// Stable namespace for the per-sandbox advisory transaction lock that
+/// coordinates node-state publication (`SHARED`) with orphan classification
+/// and revert (`EXCLUSIVE`).
+pub const ORPHAN_OBSERVATION_LOCK_SEED: i64 = 847_291_653;
+
+/// Acquire shared per-sandbox advisory transaction locks for published
+/// `present: true` sandboxes in ascending [`SandboxId`] order.
+///
+/// Node-state publication runs this in its own statement inside an open
+/// transaction before reading `sandboxes` or writing `sandbox_observed_states`
+/// (outside a transaction, `pg_advisory_xact_lock_shared` releases as soon as
+/// this statement finishes). Shared mode keeps concurrent publications
+/// non-blocking and doesn't lock `sandboxes` rows against ordinary lifecycle
+/// mutations, while blocking [`lock_orphan_observation`] until the publication
+/// transaction finishes and making a concurrent publication wait for an
+/// in-flight orphan revert to finish.
+pub async fn lock_published_sandbox_observations(
+    conn: &mut PgConnection,
+    sandbox_ids: &[SandboxId],
+) -> Result<(), sqlx::Error> {
+    if sandbox_ids.is_empty() {
+        return Ok(());
+    }
+    let mut ordered = sandbox_ids.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended(sandbox_id::text, $2))
+           FROM UNNEST($1::uuid[]) WITH ORDINALITY AS ids(sandbox_id, ord)
+          ORDER BY ord"
+    ))
+    .bind(&ordered)
+    .bind(ORPHAN_OBSERVATION_LOCK_SEED)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Acquire the exclusive per-sandbox advisory transaction lock against
+/// [`lock_published_sandbox_observations`].
+///
+/// Callers must run this in its own statement before locking `sandboxes`
+/// (`FOR UPDATE OF`), both to keep lock ordering acyclic and so the following
+/// `READ COMMITTED` statement snapshots `sandbox_observed_states` after any
+/// concurrent `present: true` publication holding the shared lock has finished.
+pub async fn lock_orphan_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
+    ))
+    .bind(sandbox_id)
+    .bind(ORPHAN_OBSERVATION_LOCK_SEED)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// The classification guard a statement here re-checks, with the values it
 /// binds: the reconciler's own guard, converted at its call site, and the
@@ -73,15 +132,17 @@ impl OrphanResolution {
 /// row no longer matches.
 ///
 /// Writes an **inference**: the reconciler concluding, from a missing pod and
-/// durable artifact evidence, that the sandbox is at rest. The statement
-/// re-checks the guard and the restart eligibility itself, and that the
-/// sandbox's active node hasn't reported it: that node's copy may hold writes
-/// the snapshot lacks, and a report its publish committed after the caller's
-/// plan read is visible to this statement. A publish that hasn't committed
-/// when this statement runs isn't. Its first CTE locks
+/// durable artifact evidence, that the sandbox is at rest. [`lock_orphan_observation`]
+/// runs first in its own statement so any `present: true` node publication
+/// already holding the shared lock finishes before `WITH pre` takes its
+/// `READ COMMITTED` snapshot, and any publication reaching that lock afterward
+/// waits until this transaction finishes. The statement then re-checks the
+/// guard, restart eligibility, and that the sandbox's active node hasn't
+/// reported it: that node's copy may hold writes the snapshot lacks.
+/// Its first CTE locks
 /// the sandbox row and, for [`OrphanGuard::PodName`], the matched execution
 /// (`FOR UPDATE OF`). The other rows its predicates read, such as `snapshots`
-/// and `snapshot_storage_locations`, are not locked; the statement reads them
+/// and `snapshot_storage_locations`, aren't locked; the statement reads them
 /// again when it runs. The caller runs it in the transaction whose plan read
 /// already locked the same rows and decided the same predicates, so a re-check
 /// can change the outcome only for a caller without that read, or when one of
@@ -92,6 +153,7 @@ pub async fn recover_orphan_to_suspended(
     stop_lifecycles: &[&str],
     guard: &OrphanGuard<'_>,
 ) -> Result<Option<OrphanResolution>, sqlx::Error> {
+    lock_orphan_observation(tx, sandbox_id).await?;
     let eligibility = orphan_recovery_revert_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
