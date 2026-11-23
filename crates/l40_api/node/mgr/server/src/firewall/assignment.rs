@@ -176,6 +176,15 @@ impl FirewallAssignments {
         expected_node: NodeId,
         incoming: IncomingAssignment<'_>,
     ) -> Result<Acceptance, AcceptError> {
+        self.accept_with_limit(expected_node, incoming, MAX_RECORD_BYTES)
+    }
+
+    fn accept_with_limit(
+        &self,
+        expected_node: NodeId,
+        incoming: IncomingAssignment<'_>,
+        max_record_bytes: u64,
+    ) -> Result<Acceptance, AcceptError> {
         if incoming.node_id != expected_node {
             return Err(AcceptError::WrongNode {
                 expected: expected_node,
@@ -214,7 +223,7 @@ impl FirewallAssignments {
             }
         }
         let bytes = encode_record(&assignment);
-        if bytes.len() as u64 > MAX_RECORD_BYTES {
+        if bytes.len() as u64 > max_record_bytes {
             return Err(AcceptError::TooLarge);
         }
         #[cfg(test)]
