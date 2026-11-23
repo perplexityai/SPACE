@@ -225,6 +225,7 @@ class SmokeServices:
             fixture._execution_environment_control = cast(Any, kind)
             fixture._campaign_control = cast(Any, kind)
             fixture._environment_placement_gate_control = cast(Any, kind)
+            fixture._template_default_lifecycle_control = cast(Any, kind)
             if isinstance(self.ecw, EcwSdk):
                 fixture._ecw_creator = self.ecw
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
