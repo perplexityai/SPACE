@@ -211,6 +211,7 @@ pub(crate) async fn create_native_sandbox_operation(
     inline: Option<&InlineLifecycle>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
     let (request, mut fingerprint) = prepare_native_create_request(request)?;
+    let request = with_native_create_defaults(pool, request).await?;
     if let Some(profiles) = federated_create
         .as_ref()
         .and_then(|context| context.egress_profiles.as_ref())
@@ -612,14 +613,33 @@ fn prepare_native_create_request(
         request.idle_timeout = None;
         request.idle_action = None;
     }
-    Ok((with_native_create_defaults(request), fingerprint))
+    Ok((request, fingerprint))
 }
 
-fn with_native_create_defaults(mut request: CreateSandboxRequest) -> CreateSandboxRequest {
-    request.auto_lifecycle.get_or_insert_with(|| {
-        crate::e2b::access_idle_policy(DEFAULT_NATIVE_IDLE_TIMEOUT_SECS, true, false)
-    });
-    request
+/// Resolve an omitted policy at admission: the template's default
+/// auto-lifecycle policy, else suspend after six idle hours. The operation
+/// payload always records a concrete policy, so executors never apply their
+/// own fallback and every API version executes the same admitted policy.
+async fn with_native_create_defaults(
+    pool: &PgPool,
+    mut request: CreateSandboxRequest,
+) -> Result<CreateSandboxRequest, PublicApiError> {
+    if request.auto_lifecycle.is_none() {
+        let template_default =
+            crate::controllers::sandbox::template_desired_default_auto_lifecycle(
+                pool,
+                request.template.name().as_str(),
+            )
+            .await
+            .map_err(database_error)?;
+        request.auto_lifecycle =
+            Some(template_default.unwrap_or_else(native_server_default_auto_lifecycle));
+    }
+    Ok(request)
+}
+
+fn native_server_default_auto_lifecycle() -> AutoLifecyclePolicy {
+    crate::e2b::access_idle_policy(DEFAULT_NATIVE_IDLE_TIMEOUT_SECS, true, false)
 }
 
 pub async fn list_sandboxes(
