@@ -7150,6 +7150,7 @@ dependencies = [
  "pplx-space-node-ctl-client",
  "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-mgr-store",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-rpc-contracts",
@@ -7234,6 +7235,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "pplx-space-node-mgr-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-node-mgr-protocol",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "pplx-space-sqlite",
+ "rusqlite",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
