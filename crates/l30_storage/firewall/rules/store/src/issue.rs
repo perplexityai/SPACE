@@ -22,7 +22,8 @@ use time::OffsetDateTime;
 use crate::lease::{HANDOFF_LOCK, item_timestamp, stamped_work};
 use crate::{ItemPhase, LeasedTarget, Requeue, Scope, Work, requeue, roll_back, rollout_phase};
 
-/// The wakeup issuance queues for its node, on the issuing transaction.
+/// The wakeup issuance or a round's opening queues for its node, on its
+/// transaction.
 pub trait Wakeup {
     /// Queue `node`'s wakeup on `tx`, returning how many nodes it queued.
     fn wake(
