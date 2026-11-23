@@ -2,7 +2,7 @@
 
 Each test builds a small Cargo workspace in a temporary git repository: two
 layers, a family of crates split across them where one would nest inside
-another, a renamed library crate, a legacy crate that stays, and the kinds of
+another, a renamed library crate, a crate that stays, and the kinds of
 reference the move rewrites. `cargo check` on the moved workspace is the
 oracle for the relative paths.
 """
@@ -58,7 +58,7 @@ FILES = {
             "crates/libs/gadget/client",
             "crates/libs/gadget/protocol",
             "crates/libs/gadgetsvc",
-            "crates/libs/legacy",
+            "crates/libs/anchor",
         ]
 
         [workspace.dependencies]
@@ -72,8 +72,8 @@ FILES = {
 
         [rules.layers.unmoved]
         l20_domain = [
+          "pplx-space-anchor",
           "pplx-space-gadget-protocol",
-          "pplx-space-legacy",
           "pplx-space-widget",
         ]
         l40_api = [
@@ -81,9 +81,6 @@ FILES = {
           "pplx-space-gadget-client",
           "pplx-space-gadgetsvc",
         ]
-
-        [rules.layers]
-        legacy = ["pplx-space-legacy"]
         """,
     # Archcheck's order, each comment over the entries after it.
     "architecture-baseline.toml": """\
@@ -139,11 +136,11 @@ FILES = {
     "crates/libs/gadget/protocol/Cargo.toml": manifest("pplx-space-gadget-protocol"),
     "crates/libs/gadget/protocol/src/lib.rs": library("The gadget wire protocol"),
     "crates/libs/gadget/AGENTS.md": "# The gadget crates\n",
-    "crates/libs/legacy/Cargo.toml": manifest(
-        "pplx-space-legacy", 'pplx-space-widget = { path = "../model/widget" }\n'
+    "crates/libs/anchor/Cargo.toml": manifest(
+        "pplx-space-anchor", 'pplx-space-widget = { path = "../model/widget" }\n'
     ),
-    "crates/libs/legacy/src/lib.rs": library("A legacy crate", "pub use pplx_space_widget::PROTO;\n"),
-    "ci/paths.txt": "crates/libs/gadget/**\ncrates/libs/legacy/**\n",
+    "crates/libs/anchor/src/lib.rs": library("A crate that stays", "pub use pplx_space_widget::PROTO;\n"),
+    "ci/paths.txt": "crates/libs/gadget/**\ncrates/libs/anchor/**\n",
     "docs/notes.md": """\
         The widget lives in `crates/libs/model/widget/src/lib.rs`, the gadget
         family in `crates/libs/gadget` ([its server](../crates/libs/gadget/server/src/lib.rs)),
@@ -158,6 +155,7 @@ REVIEWED = """\
     [crates]
     "pplx-space-gadget" = { to = "crates/l40_api/gadget/server" }
     "pplx-space-gadgetsvc" = { to = "crates/l40_api/gadgets/svc", rename = "pplx-space-gadgets-svc" }
+    "pplx-space-anchor" = { stay = "stays for the test" }
 
     [stale_paths]
     "scripts/move_crates.toml" = "the mapping names crates as they were"
@@ -275,7 +273,7 @@ def test_generate_keeps_the_reviewed_leaf_and_rename(repo: Path) -> None:
         "pplx-space-gadget-client": {"to": "crates/l40_api/gadget/client"},
         "pplx-space-gadget-protocol": {"to": "crates/l20_domain/gadget/protocol"},
         "pplx-space-gadgetsvc": {"to": "crates/l40_api/gadgets/svc", "rename": "pplx-space-gadgets-svc"},
-        "pplx-space-legacy": "stay",
+        "pplx-space-anchor": {"stay": "stays for the test"},
     }
     # Most of the family goes to l40_api, so its AGENTS.md does too.
     assert mapping["files"] == {
@@ -297,14 +295,14 @@ def test_apply_moves_crates_and_rewrites_what_names_them(repo: Path) -> None:
         "crates/l40_api/gadget/server/src/lib.rs",
         "crates/l40_api/gadgets/svc/src/lib.rs",
         "crates/l40_api/gadget/AGENTS.md",
-        "crates/libs/legacy/src/lib.rs",
+        "crates/libs/anchor/src/lib.rs",
     } <= files
     assert not any(f.startswith(("crates/libs/model", "crates/libs/gadget")) for f in files)
     # The relative paths out of moved crates, and into one from a crate that
     # stays, still resolve; the renamed library builds under its new name.
     check = cargo_check(repo)
     assert check.returncode == 0, check.stderr
-    assert 'path = "../../l20_domain/widget"' in (repo / "crates/libs/legacy/Cargo.toml").read_text()
+    assert 'path = "../../l20_domain/widget"' in (repo / "crates/libs/anchor/Cargo.toml").read_text()
     assert "pplx_space_gadgets_svc::NAME" in (repo / "crates/l40_api/gadget/server/src/lib.rs").read_text()
     # A climb from the manifest directory in a format string, and one from a
     # script's own directory, which the script still finds once moved.
@@ -315,7 +313,7 @@ def test_apply_moves_crates_and_rewrites_what_names_them(repo: Path) -> None:
     # A directory of crates split across layers: one list line per layer, a
     # brace glob in prose.
     assert (repo / "ci/paths.txt").read_text() == (
-        "crates/l20_domain/gadget/**\ncrates/l40_api/gadget/**\ncrates/libs/legacy/**\n"
+        "crates/l20_domain/gadget/**\ncrates/l40_api/gadget/**\ncrates/libs/anchor/**\n"
     )
     notes = (repo / "docs/notes.md").read_text()
     assert "`crates/l20_domain/widget/src/lib.rs`" in notes
@@ -333,7 +331,7 @@ def test_apply_moves_crates_and_rewrites_what_names_them(repo: Path) -> None:
         in architecture
     )
     assert "patterns = ['\\bpplx_space_gadgets_svc\\b']" in architecture
-    assert "pplx-space-widget" not in architecture and "pplx-space-legacy" in architecture
+    assert "pplx-space-widget" not in architecture and "pplx-space-anchor" in architecture
     # Each comment keeps the entries it heads.
     assert (repo / "architecture-baseline.toml").read_text() == textwrap.dedent(
         """\
@@ -372,7 +370,7 @@ def test_apply_names_each_crate_of_a_family_another_crate_joins(repo: Path) -> N
         "crates/l40_api/gadget/server/**\n"
         "crates/l40_api/gadget/AGENTS.md\n"
         "crates/l40_api/gadget/CLAUDE.md\n"
-        "crates/libs/legacy/**\n"
+        "crates/libs/anchor/**\n"
     )
     assert result.returncode == 1
     assert "docs/notes.md:2: crates/libs/gadget splits into" in result.stderr
@@ -409,7 +407,7 @@ def dirty_the_tree(repo: Path) -> None:
 
 def drop_a_row(repo: Path) -> None:
     text = (repo / "scripts/move_crates.toml").read_text()
-    write(repo, "scripts/move_crates.toml", text.replace('"pplx-space-legacy" = "stay"\n', ""))
+    write(repo, "scripts/move_crates.toml", text.replace('"pplx-space-anchor" = { stay = "stays for the test" }\n', ""))
     git(repo, "commit", "-qam", "drop a row")
 
 
@@ -516,7 +514,7 @@ def test_apply_resumes_a_partial_move(repo: Path) -> None:
     check = cargo_check(repo)
     assert check.returncode == 0, check.stderr
     assert 'pplx-space-widget-model = { path = "../../l20_domain/widget/model" }' in (
-        repo / "crates/libs/legacy/Cargo.toml"
+        repo / "crates/libs/anchor/Cargo.toml"
     ).read_text()
     server = (repo / "crates/l40_api/gadget/server/src/lib.rs").read_text()
     assert "pplx_space_gadgets_svc::NAME, pplx_space_widget_model::BLOB" in server
@@ -537,7 +535,7 @@ def test_verify_reports_old_paths_and_names(repo: Path) -> None:
     git(repo, "commit", "-qm", "move")
     write(repo, "docs/stale.md", "See crates/libs/model/widget/build.rs.\n")
     write(repo, "docs/pattern.toml", "patterns = ['\\bpplx_space_gadgetsvc\\b']\n")
-    write(repo, "crates/libs/legacy/build.rs", 'fn main() { let _ = "../model/widget/build.rs"; }\n')
+    write(repo, "crates/libs/anchor/build.rs", 'fn main() { let _ = "../model/widget/build.rs"; }\n')
     # A moved file's climbs, written as they were before the move.
     write(
         repo,
@@ -552,13 +550,13 @@ def test_verify_reports_old_paths_and_names(repo: Path) -> None:
     assert stale.returncode == 1
     assert "docs/stale.md:1: crates/libs/model/widget/build.rs" in stale.stderr
     assert "docs/pattern.toml:1: pplx_space_gadgetsvc" in stale.stderr
-    assert "crates/libs/legacy/build.rs:1: ../model/widget/build.rs reached a tracked path" in stale.stderr
+    assert "crates/libs/anchor/build.rs:1: ../model/widget/build.rs reached a tracked path" in stale.stderr
     assert "crates/l20_domain/widget/src/stale.rs:2: ../../../../data/blob.txt reached a tracked path" in stale.stderr
     assert "crates/l20_domain/widget/gen.sh:1: ../../../proto follows an expansion" in stale.stderr
 
     mapping = repo / "scripts/move_crates.toml"
     allow = (
-        '"docs/stale.md" = "a dated record"\n"docs/pattern.toml" = "x"\n"crates/libs/legacy/build.rs" = "x"\n'
+        '"docs/stale.md" = "a dated record"\n"docs/pattern.toml" = "x"\n"crates/libs/anchor/build.rs" = "x"\n'
         '"crates/l20_domain/widget/src/stale.rs" = "x"\n"crates/l20_domain/widget/gen.sh" = "x"\n'
     )
     mapping.write_text(mapping.read_text() + allow)

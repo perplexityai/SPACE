@@ -15,12 +15,12 @@ Usage:
   move_crates.py --verify [--base REV] [--mapping FILE] [--skip-arch]
 
 The mapping (scripts/move_crates.toml) has one row per workspace crate in
-`[crates]`: its target directory, an optional new package name, or `"stay"` for
-a legacy crate (`[rules.layers] legacy`), which stays until it is dissolved
-(another crate stays only as `{ stay = "<reason>" }`). `[files]` maps each
-tracked file below `crates/apps` or `crates/libs` outside a crate, such as a
-family's AGENTS.md, to where it goes, or `"stay"`. `[stale_paths]` maps each
-file the move leaves as it is, and that may keep naming old paths, to why.
+`[crates]`: its target directory and an optional new package name, or
+`{ stay = "<reason>" }` for a crate that stays for a reviewed reason. `[files]`
+maps each tracked file below `crates/apps` or `crates/libs` outside a crate,
+such as a family's AGENTS.md, to where it goes, or `"stay"`. `[stale_paths]`
+maps each file the move leaves as it is, and that may keep naming old paths, to
+why.
 
 --generate rewrites the mapping from `cargo metadata --no-deps`, the `unmoved`
 list and the name rule, keeping every choice the file already makes (a rename,
@@ -177,7 +177,7 @@ class Crate:
 class Row:
     to: str | None  # None: stays
     rename: str | None = None
-    reason: str | None = None  # why a crate that is not legacy stays
+    reason: str | None = None  # why the crate stays
 
 
 @dataclass
@@ -211,11 +211,10 @@ def workspace(root: Path) -> dict[str, Crate]:
     return crates
 
 
-def architecture(root: Path) -> tuple[dict[str, str], set[str]]:
-    """`[rules.layers.unmoved]` as package -> layer, and `legacy`."""
+def architecture(root: Path) -> dict[str, str]:
+    """`[rules.layers.unmoved]` as package -> layer."""
     rules = tomllib.loads((root / "ARCHITECTURE.toml").read_text())["rules"]["layers"]
-    unmoved = {pkg: layer for layer, pkgs in rules.get("unmoved", {}).items() for pkg in pkgs}
-    return unmoved, set(rules.get("legacy", []))
+    return {pkg: layer for layer, pkgs in rules.get("unmoved", {}).items() for pkg in pkgs}
 
 
 def baseline_packages(root: Path) -> dict[str, list[str]]:
@@ -321,8 +320,7 @@ def dump_mapping(mapping: Mapping, notes: dict[str, str]) -> str:
         "# reviewed. A crate's target is crates/<layer>/ and its package name without",
         "# `pplx-space-`, split on `-`, with a leaf where another crate's path would",
         "# nest inside it; `rename` changes the package name only, never a binary's.",
-        "# A legacy crate stays until it is dissolved; another stays only for a",
-        "# reviewed reason.",
+        "# A crate stays only for a reviewed reason.",
         "",
         "[crates]",
     ]
@@ -335,10 +333,8 @@ def dump_mapping(mapping: Mapping, notes: dict[str, str]) -> str:
             continue
         out.append(f"# {layer} ({len(rows)})")
         for package, row in rows:
-            if row.to is None and row.reason:
+            if row.to is None:
                 line = f"{q(package)} = {{ {STAY} = {q(row.reason)} }}"
-            elif row.to is None:
-                line = f"{q(package)} = {q(STAY)}"
             else:
                 fields = [f"to = {q(row.to)}"]
                 if row.rename:
@@ -371,7 +367,7 @@ def dump_mapping(mapping: Mapping, notes: dict[str, str]) -> str:
 def generate(root: Path, existing: Mapping) -> tuple[Mapping, dict[str, str], list[str]]:
     """The mapping for today's workspace, the per-row notes, and what changed."""
     crates = workspace(root)
-    unmoved, legacy = architecture(root)
+    unmoved = architecture(root)
     baselined = baseline_packages(root)
     errors: list[str] = []
     changes: list[str] = []
@@ -389,16 +385,11 @@ def generate(root: Path, existing: Mapping) -> tuple[Mapping, dict[str, str], li
         if layer is None:
             errors.append(f"{name} at {crate.dir}: no layer (not in a layer directory or `unmoved`)")
             continue
-        if name in legacy:
-            if row is not None and row.to is not None:
-                errors.append(f"{name} is legacy and stays, but its row moves it to {row.to}")
-            result.crates[key] = Row(None)
-            continue
         if row is not None and row.to is None:
             if row.reason:
                 result.crates[key] = row
             else:
-                errors.append(f"{name}: only a legacy crate stays without a reason")
+                errors.append(f'{name}: a crate stays only as {{ {STAY} = "<reason>" }}')
             continue
         rename = row.rename if row else None
         if rename and key == name and rename in names:

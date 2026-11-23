@@ -281,10 +281,7 @@ service: `sbx-mgr` beside `sbx-mgr-client` is at
 `crates/l40_api/sbx/mgr/server`. The crates that predate the layer
 directories are listed by layer in `[rules.layers.unmoved]` until they move;
 a new crate goes in a layer directory, and a crate changes layer by moving
-into that layer's directory, not by editing its entry. `[rules.layers]
-legacy`, an optional list, names the crates being dissolved, which predate
-the layers and mix SPACE-specific code in until they are split up: every
-check covers them like any other crate, with today's edges baselined.
+into that layer's directory, not by editing its entry.
 
 Normal and build dependencies follow this matrix; the checks below say what
 each finding means and how to fix it.
@@ -316,7 +313,6 @@ helpers = ["pplx-space-s3-http-client", "pplx-space-sqlite"]  # every storage he
 sqlx = ["Type", "postgres::PgTypeInfo"]   # paths below each driver's root, each exactly
 
 [rules.layers]
-legacy = ["pplx-space-old-models"]     # optional: crates being dissolved; see Storage access below
 protocols = ["pplx-space-events"]      # protocols without a *-protocol or *-proto name; see Domain
 
 [rules.layers.domain_fences]           # packages no Domain crate depends on, by family
@@ -378,17 +374,15 @@ The checks, each with its own mode:
   which can't depend on one, moving the read into the owning store; or, if
   the crate owns the state, listing it.
 - `stale_entries`: an `unmoved` entry for a crate that is gone or now in a
-  layer directory; a `legacy` entry for a crate that is gone; a `store_users`
-  entry for something that isn't a store, or listing a crate that is gone, a
-  client, or one outside API and Storage, which allows nothing, or a user
-  that no longer uses the store: one with no normal or build dependency on
-  it, directly or through a `legacy` crate that depends on it, since the list
-  says who uses the store today; an `allowed_edges` entry whose normal or
-  build dependency is gone, that needs no exception, or that is for a
-  `test_only` edge, which it can't exempt; a `[rules.layers.storage]`
-  `helpers` entry that is gone, outside `l10_foundation` or also `legacy`; a
-  `codec_facades` entry that is gone, outside `l10_foundation`, also
-  `legacy` or also a helper, and one of its exports that no file of the
+  layer directory; a `store_users` entry for something that isn't a store,
+  or listing a crate that is gone, a client, or one outside API and Storage,
+  which allows nothing, or a user that no longer uses the store: one with no
+  normal or build dependency on it, since the list says who uses the store
+  today; an `allowed_edges` entry whose normal or build dependency is gone,
+  that needs no exception, or that is for a `test_only` edge, which it can't
+  exempt; a `[rules.layers.storage]` `helpers` entry that is gone or outside
+  `l10_foundation`; a `codec_facades` entry that is gone, outside
+  `l10_foundation` or also a helper, and one of its exports that no file of the
   facade re-exports, an empty export list, or an export key for no driver
   it depends on; a `protocols` entry that is gone, outside `l20_domain` or a protocol by its
   name already; a `[rules.layers.domain_fences]` package that is a driver or
@@ -402,8 +396,8 @@ The checks, each with its own mode:
 - `policy_changed`: every difference in `[rules.layers]` from the base
   branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
   `unmoved` entry added or moved to another layer, a store user or allowed
-  edge added or removed, a legacy crate or a protocol added or removed, a
-  driver, helper or codec facade added to or removed from
+  edge added or removed, a protocol added or removed, a driver, helper or
+  codec facade added to or removed from
   `[rules.layers.storage]`, a facade's export added or removed, a
   package added to, removed from or moved between
   `[rules.layers.domain_fences]` families, a shared catalog, or one of its
@@ -509,18 +503,13 @@ that means:
   position: without proc-macro2's `span-locations` feature, which would
   build proc-macro2 a second time in a workspace build and rebuild every
   proc macro once, syn gives no line numbers. A listed crate that is outside
-  `l10_foundation`, `legacy` or a helper is no facade, and its entry is a
+  `l10_foundation` or a helper is no facade, and its entry is a
   `stale_entries` finding. Once the facade's library is `src/lib.rs`,
   these are `stale_entries` findings too, so the lists only shrink: an
   empty list, a driver key naming no driver the facade has a normal
   dependency on, and, when every file reads cleanly, a listed path that no
   file of its `src/` re-exports. Only a driver whose list is non-empty, and
   that the facade depends on, gets the hint to use the facade.
-- `[rules.layers] legacy` (see [Layers](#layers)): for these checks, a
-  legacy `l10_foundation` crate is no helper, listed or with a required
-  driver dependency, so it is checked like every other crate, with today's
-  edges baselined, and a crate that depends on one does not reach storage
-  through it. Test support and tools are left out of both checks.
 
 Two checks, each with the three baselined behaviours above and a table
 keyed by package:
@@ -595,8 +584,9 @@ keyed by package:
   checked: depending on a store is how an API crate reaches storage, and a
   feature that reaches a driver only through a store's is no driver feature.
 
-Dev-dependencies are not checked: tests may open a database. A finding that
-is stale names the reason: the crate or the dependency is gone, the crate is
+Dev-dependencies are not checked: tests may open a database. Test support
+and tools are left out of both checks. A finding that is stale names the
+reason: the crate or the dependency is gone, the crate is
 now a store, a helper or left out, the target is no longer a driver, helper
 or facade, a Foundation or Domain crate's dependency on a facade or its
 enabling behind its own feature is a codec, a facade's driver dependency is
@@ -631,10 +621,10 @@ behaviours above and a table keyed by package:
   `kube`, is an exact list of package names, so a new package is added by
   hand. tonic and prost are not listed: protocols build on them. The
   workspace's own I/O crates are derived, as storage helpers are: an
-  `l10_foundation` crate, legacy or not, with a required (normal or build,
-  not optional) dependency on a fenced package is fenced under that
-  package's family, to a fixpoint, so a crate wrapping such a crate is fenced
-  too, and the finding names the dependency that fenced it. Features are
+  `l10_foundation` crate with a required (normal or build, not optional)
+  dependency on a fenced package is fenced under that package's family, to a
+  fixpoint, so a crate wrapping such a crate is fenced too, and the finding
+  names the dependency that fenced it. Features are
   not followed, neither in that derivation nor in the features a Domain
   crate turns on, so a crate that does I/O only behind a feature is listed,
   such as `pplx-space-observability` under `runtime`, whose `otel` feature
@@ -875,10 +865,8 @@ so a new table is declared by its owner before its migration lands (see
 
 ### Limits
 
-- The checks see direct dependencies only. An edge through a re-export, such
-  as a `legacy` crate's, is not seen. Only `stale_entries` looks one crate
-  further: a store user that depends on a `legacy` crate depending on the
-  store still uses it, so its entry stays.
+- The checks see direct dependencies only: an edge through a re-export is
+  not seen.
 - A Foundation crate that gains a required driver dependency gets a
   `storage_access` finding until it is added to `helpers`, and is no helper
   before: its dependents get `storage_access` findings only once it is
