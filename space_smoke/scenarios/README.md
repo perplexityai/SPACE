@@ -201,9 +201,9 @@ restored filesystem state and working data-plane execution.
 
 Kind nodes run node-manager's default policy, E0 and `legacy`, and bootstrap
 stages only E0's Firecracker. A scenario that needs another compiled
-environment names it in `SandboxConfig.kind_execution_environment`. Setup then
-does three things under the node-manager mutation Lease
-(`space_smoke/execution_environment.py`):
+environment names it in `SandboxConfig.kind_execution_environment`, or calls
+`KindAdmin.admit_execution_environment`. Setup then does three things under the
+node-manager mutation Lease (`space_smoke/execution_environment.py`):
 
 - It adds the environment to `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS` on the
   worker and builder node-manager DaemonSets, keeping the E0 default, and arms
@@ -213,24 +213,52 @@ does three things under the node-manager mutation Lease
   `GET /admin/api/v1/runtime-environments/nodes` allows the environment and
   every Node carries node-ctl's `space.pplx.net/env-...=usable` label for it.
 
-Setup then builds seed bound to the environment through the admin
-system-template build, publishing no named tag. The sandbox is created from
+For a sandbox, setup also builds seed bound to the environment through the
+admin system-template build, publishing no tag. The sandbox is created from
 that build's digest, so `latest` never moves. The scenario deletes the sandbox,
 then calls `withdraw()`, which deletes the seed release, puts the allowlist
 back and checks that it took. On a failure, cleanup does the same in that
 order, so such a scenario raises its cleanup budget to cover two rollouts. A
-run killed before its restore keeps the Lease for three hours, during which
+run killed before its restore keeps the Lease for four hours, during which
 another admission is refused as the Lease's; after that, admission refuses
 the widened allowlist and names the manual fix. An
 installed runtime stays installed, since a compiled binding's artifacts are
 removal-protected. Which environment a sandbox runs is read from its running
 VM: what its Firecracker executable reports for `--version`.
 
-`local.selected_environment_survives_suspend_and_cross_node_restore` runs a
-sandbox bound to Firecracker 1.17.0 / Linux 6.1.155 through create, suspend and
-restore, and a cross-node restore from object storage. It checks the running
-executable and the guest's state each time. It's manual: it rolls every
-node-manager, so run it on a bench no other scenario shares while it runs.
+- `local.selected_environment_survives_suspend_and_cross_node_restore` runs a
+  sandbox bound to Firecracker 1.17.0 / Linux 6.1.155 through create, suspend
+  and restore, and a cross-node restore from object storage. It checks the
+  running executable and the guest's state each time.
+- `local.template_campaign_canary_rolls_and_pauses` starts a templates
+  campaign from E0 to that environment through the admin API. The canary moves
+  one template and waits; resumed, the campaign rolls; paused mid-wave, it
+  leases nothing more over several loop ticks; resumed again, it completes. It
+  ends inconclusive, naming what's missing, until the bench serves the campaign
+  admin API, runs the cluster-controller's runtime-upgrade loop and has the
+  template driver.
+
+Both are manual. They roll every node-manager, so run them on a bench no other
+scenario shares while they run.
+
+`local.environment_placement_gate_on_places_bound_pods` turns
+`SPACE_ENVIRONMENT_PLACEMENT_GATE` on (`space_smoke/environment_placement_gate.py`)
+and proves what enforcement does to placement. It drives the admission itself
+in two stages: Firecracker 1.17.0 / Linux 6.1.155 on the builders only, so its
+seed can be built while no worker runs it, then on the workers. Beside it, it
+builds seed bound to E0 under no tag. With the gate on, the E0 create runs E0
+on a worker, and its pod requires E0's usable label. The other create is
+refused with 503 as unschedulable and leaves no sandbox. Once the workers run
+the environment, the same create runs it there. The gate's restore is armed
+before the write that turns it on, and writes the API's literal before the
+controller's. The standing literals are recorded on the public API mutation
+Lease first, so a Kind scenario's preflight repairs a run killed with the
+gate on: the next one on the same host and user, or the first after the
+Lease's four hours elsewhere. It refuses while resume-time runtime upgrades are on, since the
+substrate refuses `on` beside them at startup, and it refuses a gate literal
+an earlier run left behind. It's manual
+for the same reason as the scenario above, and it also rolls the API, the
+admin API and the cluster controller.
 
 ## Garbage collection coverage
 
@@ -425,6 +453,7 @@ uv run --frozen --python 3.11 -m space_smoke.inventory --check
 | [local.encrypted_disk_fork](local_encrypted_disk_fork.py) | routine | `kind_ecw`; kind; kubernetes | Fork a sealed encrypted disk, replay it, and restore independently of its source. |
 | [local.encrypted_live_disk_fork](local_encrypted_live_disk_fork.py) | routine | `kind_ecw`; kind; kubernetes | Capture encrypted disk state without suspending or restarting its guest. |
 | [local.encrypted_resuspend_preserves_cow](local_encrypted_resuspend_preserves_cow.py) | routine | `kind_ecw`; kind; kubernetes | A BYOK sandbox survives suspend, restore, re-suspend, and a second restore with one stable sparse LUKS memory base and intact guest state. |
+| [local.environment_placement_gate_on_places_bound_pods](local_environment_placement_gate_on_places_bound_pods.py) | manual | `kind_ecw`; kind; kubernetes | With the gate on, a create bound to an environment no worker can run is refused as unschedulable and leaves no sandbox, a create bound to E0 runs E0 on a worker labelled for it, and once the workers run the other environment its create runs it there. Gate and allowlists are back to what they were at the end.<br>Manual: Rolls the API, admin API and cluster controller to turn the environment placement gate on, rolls every node-manager to admit Firecracker 1.17.0 / Linux 6.1.155, installs that runtime on every node from its upstream release, and builds two seeds: run it on a bench no other scenario shares while it runs. |
 | [local.forced_drain_evacuates_sandbox](local_forced_drain_evacuates_sandbox.py) | routine | `kind_ecw`; kind; kubernetes | A `:drain` with `mode: forced` parks the resident's worker in `draining` in forced mode and cordons it; the drain reconciler suspends the sandbox and restores it onto the other worker, from object storage, as `started`, with its filesystem intact and its data plane executing; the emptied node then reaches `drained` on its own with the guarded Kubernetes node still present; `:undrain` returns it to schedulable with no drain phase. |
 | [local.fork_saturation_safety](local_fork_saturation_safety.py) | manual | `kind_ecw`; kind; kubernetes | Fork waves have distinct children with intact independent disks while a colocated, existing sandbox keeps answering commands and file reads. The source remains suspended, and each wave is deleted before the next one. This is a bounded load check, not a maximum-capacity or latency benchmark.<br>Manual: Explicit bounded fork-pressure run on a dedicated Kind bench |
 | [local.fork_suspended_cross_node](local_fork_suspended_cross_node.py) | routine | `kind_ecw`; kind; kubernetes | Off-source placement preserves disk data without resuming the suspended source. |
@@ -450,6 +479,7 @@ uv run --frozen --python 3.11 -m space_smoke.inventory --check
 | [local.storage_exchange_scoping](local_storage_exchange_scoping.py) | routine | `kind_ecw`; kind; kubernetes | A read-scoped session that a sandbox worker's credential-manager agent vends on its volume socket, as volume-manager asks, for one object of a sandbox's suspend snapshot, reads that object; the object store refuses it for another sandbox's snapshot object and listing, for the templates bucket, and for a small write to its own object, which stays unchanged; and the authority refuses to vend that sandbox's subject for the other sandbox's object at all. Afterwards the session, and a fresh one, still read the object, so no refusal was a session that stopped working. A builder's agent likewise vends a read session for one published file of the sandboxes' template, as the builder volume-manager asks for a template pull; it reads that file, and the store refuses it another file of the same release, the sandbox's snapshot object and, when another template is published, that template's file; the authority refuses to vend the template's subject for another template's file at all. The same closing controls follow. |
 | [local.suspend_snapshot_rows_are_per_attempt](local_suspend_snapshot_rows_are_per_attempt.py) | routine | `kind_ecw`; kind; kubernetes | Two suspends of one sandbox leave two ready snapshot rows with distinct ids and distinct id-named storage prefixes; the first row's facts are unchanged by the second publish; and the restore after the second suspend brings back the second suspend's bytes. |
 | [local.telemetry_reaches_local_backends](local_telemetry_reaches_local_backends.py) | routine | `kind_ecw`; kind; kubernetes | Once a sandbox has run a command, Tempo returns containerd-shim-space-v2's create in the space-api trace that created it, parented by the API's pod materialization span, Prometheus holds create latency from that shim and from space-api since the scenario began, Loki holds a SPACE pod log line naming the sandbox, and fresh guest-memory observations arrive for its template and node. |
+| [local.template_campaign_canary_rolls_and_pauses](local_template_campaign_canary_rolls_and_pauses.py) | manual | `kind_admin`; kind; kubernetes | Started through the admin API, a templates campaign from E0 to E1 moves nothing until every worker reads twins and E1 is the default; then it moves one template and waits in canary; resumed, it rolls; paused mid-wave, it moves nothing more over several loop ticks; resumed again, it completes with no failed item. A create then boots its template's twin under E1, an ECW create claims a slot of the twin's copy of the warm pool the template's original had and runs E1 too, and once the default is back on E0, a create boots the original under E0.<br>Manual: Turns on the environment placement gate, the campaign loop and plaintext object-store endpoints for the template driver, rolls every node-manager to admit Firecracker 1.17.0, and moves the cluster default; a completed campaign leaves each template's E1 twin on the bench, so a later run is inconclusive until they're gone, and a bench with no default keeps E0 as its default. |
 | [local.template_startup_recovery_decision_table](local_template_startup_recovery_decision_table.py) | routine | `kind_ecw`; kind; kubernetes | After a worker's template-manager restarts, startup recovery keeps a build whose row and bytes agree, prunes a row whose bytes are gone, adopts row-less bytes only when the artifact hashes to the directory name, removes row-less bytes whose hash disagrees, and removes bytes whose size disagrees with the manifest even with a row — leaving disk and catalog consistent and the sandbox on the other worker running. |
 | [local.unanswered_template_deleted_after_wait](local_unanswered_template_deleted_after_wait.py) | routine | `kind_ecw`; kind; kubernetes | With node-ctl's unanswered-template wait shortened, a worker keeps an org template through a full sync past the wait while a sandbox of it runs there, keeps it through two full syncs after the sandbox is deleted but before the wait has passed, and deletes it (unlisted, its bytes and then its Node template-build metadata gone) in the first full sync after the wait; a sandbox of the same template placed on that worker afterwards pulls it again and boots. |
 | [native.aws_secret_network_credential_injection](native_aws_secret_network_credential_injection.py) | manual | `command_sandbox`; deployed, kind; direct, kubernetes | A flat AWS reference injects its secret only after a policy binds it.<br>Manual: Requires an explicitly provisioned AWS secret and a selected echo endpoint. |

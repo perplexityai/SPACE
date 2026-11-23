@@ -8,7 +8,7 @@ import secrets
 import shutil
 import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from threading import Lock
@@ -211,6 +211,11 @@ class SmokeServices:
             fixture._leader_election_control = cast(Any, kind)
             fixture._drain_gate_control = cast(Any, kind)
             fixture._console_control = cast(Any, kind)
+            fixture._execution_environment_control = cast(Any, kind)
+            fixture._campaign_control = cast(Any, kind)
+            fixture._environment_placement_gate_control = cast(Any, kind)
+            if isinstance(self.ecw, EcwSdk):
+                fixture._ecw_creator = self.ecw
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
                 from space_smoke.private_template_build import PrivateTemplateBuildAssertions
 
@@ -457,6 +462,7 @@ class SmokeServices:
             fixture._startup_recovery_control = cast(Any, kind)
             fixture._drain_gate_control = cast(Any, kind)
             fixture._console_control = cast(Any, kind)
+            fixture._campaign_control = cast(Any, kind)
             fixture._suspend_codec_control = cast(Any, kind)
             fixture._telemetry_control = cast(Any, kind)
             fixture._leader_election_control = cast(Any, kind)
@@ -464,6 +470,8 @@ class SmokeServices:
             fixture._storage_exchange_control = cast(Any, kind)
             fixture._template_selector = template
             fixture._execution_environment = admission
+            fixture._execution_environment_control = cast(Any, kind)
+            fixture._environment_placement_gate_control = cast(Any, kind)
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate
             if isinstance(kind, KindHarness) and isinstance(self.ecw, EcwSdk):
@@ -870,6 +878,7 @@ class _ScenarioSandboxes:
         *,
         network: NetworkConfig | None = None,
         allow_internet_access: bool | None = None,
+        template: str | None = None,
     ) -> EcwSandbox:
         if self._before_create is not None:
             self._before_create()
@@ -887,7 +896,7 @@ class _ScenarioSandboxes:
                 if attempt and self._before_create is not None:
                     self._before_create()
                 sandbox = self._ecw.create(
-                    template=self._template,
+                    template=self._template if template is None else template,
                     timeout=self._timeout,
                     metadata=create_metadata,
                     lifecycle=self._lifecycle,
@@ -910,14 +919,21 @@ class _ScenarioSandboxes:
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        template: str | None = None,
+        refused_statuses: Collection[int] = (),
     ) -> EcwCreateAttempt:
-        """Issue a tracked raw create when the HTTP response is the invariant."""
+        """Issue a tracked raw create when the HTTP response is the invariant.
+
+        `refused_statuses` names server statuses the scenario expects as a
+        refusal its create path undoes, such as the 503 of an unschedulable
+        create, which deletes its row.
+        """
 
         create_metadata = self._create_metadata()
         observed_ids: list[str] = []
         cleanup = self._arm_cleanup(create_metadata, [], observed_ids=observed_ids)
         observed = self._ecw.attempt_create(
-            template=self._template,
+            template=self._template if template is None else template,
             timeout=self._timeout,
             metadata=create_metadata,
             allow_internet_access=allow_internet_access,
@@ -927,6 +943,12 @@ class _ScenarioSandboxes:
         # commit-ambiguous, so run-marker reconciliation stays armed for them.
         if 400 <= observed.status_code < 500:
             cleanup.disarm()
+        elif observed.status_code in refused_statuses and observed.sandbox_id is None:
+            # Trusted only once the run's markers list no sandbox. One the list
+            # doesn't show is one cleanup's reconciliation couldn't find either.
+            listed = self._ecw.list_pages(create_metadata, limit=10, max_pages=1)
+            if not listed.has_more and not any(listed.pages):
+                cleanup.disarm()
         if observed.sandbox_id is not None:
             observed_ids.append(observed.sandbox_id)
             self._context.record("sandbox_id", observed.sandbox_id)

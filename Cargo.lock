@@ -2289,9 +2289,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -4905,6 +4905,7 @@ dependencies = [
  "pplx-space-build-mgr-client",
  "pplx-space-byok-model",
  "pplx-space-byte-size",
+ "pplx-space-cluster-id",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-grpc",
@@ -4973,6 +4974,7 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
  "pplx-space-template-release-store",
  "pplx-space-template-runtime",
  "pplx-space-test-env",
@@ -5360,6 +5362,7 @@ dependencies = [
  "pplx-space-cluster-reconciler",
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
+ "pplx-space-cpu-arch",
  "pplx-space-db-test-fixtures",
  "pplx-space-durations",
  "pplx-space-env-vars",
@@ -5384,6 +5387,7 @@ dependencies = [
  "pplx-space-public-api",
  "pplx-space-rpc-contracts",
  "pplx-space-runtime-environment-catalog-store",
+ "pplx-space-runtime-environment-policy-store",
  "pplx-space-runtime-upgrade-campaign-store",
  "pplx-space-sandbox-model",
  "pplx-space-sandbox-pod",
@@ -5399,7 +5403,9 @@ dependencies = [
  "pplx-space-snapshot-store",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
+ "pplx-space-template-manifest",
  "pplx-space-template-model",
+ "pplx-space-template-release-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "prost-types",
@@ -5456,7 +5462,9 @@ dependencies = [
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
  "pplx-space-template-release-store",
+ "rstest",
  "serde",
  "sqlx",
  "thiserror 2.0.20",
@@ -6339,6 +6347,8 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
+ "pplx-space-template-release-store",
  "pplx-space-test-env",
  "prost",
  "prost-types",
@@ -7702,6 +7712,7 @@ dependencies = [
  "pplx-space-byte-size",
  "pplx-space-content-digest",
  "pplx-space-env-vars",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-spec",
  "pplx-space-guest-process",
  "pplx-space-net-common",
@@ -8665,6 +8676,7 @@ dependencies = [
  "blake3",
  "futures-util",
  "hex",
+ "http-body-util",
  "jiff",
  "nix 0.31.3",
  "pplx-space-accounts",
@@ -8720,6 +8732,7 @@ dependencies = [
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
  "pplx-space-volmgr-client",
+ "prost",
  "prost-types",
  "rand 0.10.2",
  "rstest",
@@ -8849,6 +8862,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-release-original"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-template-release-store",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-template-release-store"
 version = "0.8.2"
 dependencies = [
@@ -8863,6 +8889,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-object-store",
  "pplx-space-sql-locator",
+ "pplx-space-template-release-original",
  "pplx-space-test-env",
  "serde_json",
  "sqlx",
@@ -11587,9 +11614,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",

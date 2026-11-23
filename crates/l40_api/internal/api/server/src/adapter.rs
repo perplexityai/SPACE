@@ -487,7 +487,7 @@ impl ClusterApi for ClusterApiService {
         // A selected lookup answers with one release: where it matches a
         // release under each spelling of the digest, only the first one's
         // storage locations go with it. An unselected lookup gets only the
-        // tagged release's rows from the store.
+        // digest original's rows from the store.
         let release_id = rows.first().map(|first| first.release_id);
         let storage_locations = rows
             .into_iter()
@@ -680,7 +680,7 @@ impl ClusterApi for ClusterApiService {
                     id: release.id.to_string(),
                     template_name: release.template_name,
                     runtime: release.runtime,
-                    hash: release.hash,
+                    hash: cached_build_hash(release.hash),
                     created_at: format_time(release.created_at),
                     environment: release.environment,
                 }),
@@ -736,7 +736,7 @@ impl ClusterApi for ClusterApiService {
                 .into_iter()
                 .map(|release| WarmPoolTemplateRelease {
                     template_name: release.template_name,
-                    hash: release.content_hash,
+                    hash: cached_build_hash(release.content_hash),
                 })
                 .collect(),
         }))
@@ -2011,4 +2011,15 @@ fn release_cache_partition(environment: Option<&str>) -> Option<&str> {
         *environment
             != pplx_space_execution_catalog::catalog::initial_environment_reference().to_string()
     })
+}
+
+/// The spelling template-manager keys its cached builds, release pins and GC
+/// protections on: a bare digest gains its `sha256:` prefix, as the
+/// manager's pull records it. The latest listing and the warm-pool set name
+/// one release per digest, which can be the bare spelling's, so returning
+/// `template_releases.hash` as stored would leave that build unpinned and
+/// unprotected on the node. A value that doesn't parse goes out as stored.
+fn cached_build_hash(hash: String) -> String {
+    hash.parse::<pplx_space_content_digest::ContentHash>()
+        .map_or(hash, |parsed| parsed.to_string())
 }

@@ -156,7 +156,15 @@ fn timeout_after_dispatch_is_unknown_and_reaps_the_child() {
         submit(
             &udp_port(53),
             &pinned(&target),
-            fake.to_str().unwrap(),
+            &|netns, args, stdin, budget| {
+                crate::net::command_output_in_pinned_ns(
+                    netns,
+                    fake.to_str().unwrap(),
+                    args,
+                    stdin,
+                    budget,
+                )
+            },
             Duration::from_millis(500),
         )
     });

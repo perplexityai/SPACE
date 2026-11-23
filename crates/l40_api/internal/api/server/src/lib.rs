@@ -232,10 +232,15 @@ fn scheduling_status_label(status: i32) -> &'static str {
     }
 }
 
+/// The `node_status_snapshots.node_ctl` document. A field a publication
+/// leaves out is written as `null`, so a publication from a node that no
+/// longer reports one clears it. `reads_twin_metadata` is read by
+/// `pplx_space_node_status_store::reads_twin_metadata`.
 fn node_ctl_status_json(status: NodeCtlStatus) -> serde_json::Value {
     serde_json::json!({
         "reachable": status.reachable,
         "error": status.error,
+        "reads_twin_metadata": status.reads_twin_metadata,
         "reconciliations": status
             .reconciliations
             .into_iter()
@@ -608,7 +613,7 @@ impl ClusterApiService {
             pplx_space_ecw_credential::EcwCredentialKeyring::load_from_env()
                 .expect("ClusterApiService ECW credential configuration must be valid"),
         );
-        let trusted_template_storage = trusted_storage::TrustedTemplateStorageBuckets::from_env()
+        let trusted_template_storage = trusted_storage::from_env()
             .expect("ClusterApiService template storage configuration must be valid");
         Self {
             trusted_template_storage,
@@ -708,9 +713,8 @@ impl ClusterApiService {
         let mut service =
             Self::with_security_state(pool, route_ed25519_authority, ecw_credential_keyring);
         service.reserved_template_names = template_publication::ReservedTemplateNames::from_env()?;
-        service.trusted_template_storage =
-            trusted_storage::TrustedTemplateStorageBuckets::from_env()
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        service.trusted_template_storage = trusted_storage::from_env()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         service.runtime_desired_state = runtime_desired_state::RuntimeDesiredState::from_env();
         service.runtime_provisioning_cohort =
             runtime_provisioning_cohort::RuntimeProvisioningCohort::from_env()

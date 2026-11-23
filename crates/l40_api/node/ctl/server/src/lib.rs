@@ -54,6 +54,7 @@ mod kubernetes_controller;
 pub mod metrics;
 mod orphan_inventory;
 mod outbound_retry;
+mod twin_metadata_report;
 mod util;
 
 use cluster_reconcile_trigger::{ClusterReconcileTrigger, trigger_request_reason};
@@ -1720,7 +1721,7 @@ impl NodeCtlWorker {
             network_slots_total: scheduling.total,
             network_slots_leased: scheduling.leased,
             network_pool_max_slots: scheduling.max_slots,
-            node_ctl: Some(self.node_ctl_status_for_publish()),
+            node_ctl: Some(self.node_ctl_status_for_publish(twin_metadata_report::read().await)),
         })
     }
 
@@ -1892,7 +1893,9 @@ impl NodeCtlWorker {
         }
     }
 
-    fn node_ctl_status_for_publish(&self) -> NodeCtlStatus {
+    /// `reads_twin_metadata` is this node's template-manager's own report
+    /// ([`twin_metadata_report::read`]), carried in every outcome.
+    fn node_ctl_status_for_publish(&self, reads_twin_metadata: Option<bool>) -> NodeCtlStatus {
         let reconciliations = match read_reconciliation_statuses(&self.db) {
             Ok(reconciliations) => reconciliations,
             Err(error) => {
@@ -1902,6 +1905,7 @@ impl NodeCtlWorker {
                     error: Some(format!("read reconciliation status failed: {error}")),
                     reconciliations: Vec::new(),
                     sync_overrides: Vec::new(),
+                    reads_twin_metadata,
                 };
             }
         };
@@ -1914,6 +1918,7 @@ impl NodeCtlWorker {
                     error: Some(format!("read sync overrides failed: {error}")),
                     reconciliations: Vec::new(),
                     sync_overrides: Vec::new(),
+                    reads_twin_metadata,
                 };
             }
         };
@@ -1922,6 +1927,7 @@ impl NodeCtlWorker {
             error: None,
             reconciliations,
             sync_overrides,
+            reads_twin_metadata,
         }
     }
 

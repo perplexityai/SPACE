@@ -17,7 +17,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use pplx_space_env_vars::{env_flag_var, parse_positive_f64_env, valid_positive_f64};
-use pplx_space_feature_flags::{FeatureFlagClient, SPACE_CLUSTER_RATE_LIMITER_FLAG};
+use pplx_space_feature_flags::{Attributes, FeatureFlagClient, SPACE_CLUSTER_RATE_LIMITER_FLAG};
 use pplx_space_sandbox_metrics::admission::{
     AdmissionDecision, AdmissionOperationClass, AdmissionRejectReason,
 };
@@ -52,11 +52,6 @@ const SLOT_CHECK_ENABLED_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CH
 const BURST_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST";
 const REFILL_RPS_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS";
 const REDIS_URL_ENV: &str = "SPACE_REDIS_URL";
-
-/// The limiter is a single cluster-wide bucket, so every replica evaluates the
-/// flag against one constant subject: the assignment is a pure cluster on/off,
-/// not a per-sandbox or per-org percentage rollout.
-const CLUSTER_ADMISSION_FLAG_SUBJECT: &str = "space-cluster";
 
 /// Smallest `Retry-After` the header can carry, and so the floor of every hint
 /// this module produces: delay-seconds form is an integer, and
@@ -164,6 +159,9 @@ pub struct ClusterSandboxAdmission {
     bucket: Option<RedisTokenBucket>,
     config: ClusterSandboxAdmissionConfig,
     feature_flags: FeatureFlagClient,
+    /// What the rate-limiter flag is evaluated with besides its constant
+    /// subject: this process's cluster id (see [`crate::limiter_flags`]).
+    flag_attributes: Attributes,
     /// The per-client live cap, which runs on its own switch: the cluster
     /// bucket being off doesn't turn it off.
     live_cap: ClientLiveCap,
@@ -314,8 +312,20 @@ impl ClusterSandboxAdmission {
             bucket,
             config: sanitize_config(config),
             feature_flags,
+            flag_attributes: crate::limiter_flags::process_attributes(),
             live_cap,
         }
+    }
+
+    /// This admission with its flag evaluated as if this process ran in
+    /// `cluster_id`. The embedded live cap keeps its own attributes.
+    #[cfg(test)]
+    pub(crate) fn with_flag_cluster_id(
+        mut self,
+        cluster_id: Option<&pplx_space_cluster_id::ClusterId>,
+    ) -> Self {
+        self.flag_attributes = crate::limiter_flags::attributes(cluster_id);
+        self
     }
 
     /// Whether the limiter should shape this activation, under the
@@ -325,10 +335,11 @@ impl ClusterSandboxAdmission {
     /// its environment asked for; one whose provider is installed and cannot
     /// answer falls back to the flag's declaration, which is on.
     fn admission_enabled(&self) -> bool {
-        self.feature_flags.gate_enabled(
+        self.feature_flags.gate_enabled_with_attributes(
             self.config.enabled,
             SPACE_CLUSTER_RATE_LIMITER_FLAG,
-            CLUSTER_ADMISSION_FLAG_SUBJECT,
+            crate::limiter_flags::SUBJECT,
+            self.flag_attributes.clone(),
         )
     }
 

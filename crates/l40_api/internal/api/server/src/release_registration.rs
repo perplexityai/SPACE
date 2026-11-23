@@ -8,6 +8,8 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::digest_original;
+use std::sync::LazyLock;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -337,44 +339,36 @@ pub(super) async fn accept_existing_release(
 /// republication of one of those must attach its tags to that row rather than
 /// create a second, artifact-less release beside it.
 ///
-/// Where both spellings already exist, the row that owns a recorded storage
-/// location wins regardless of age: tags attached to an artifact-less
-/// duplicate would resolve to a release nothing can pull. Age breaks ties.
-/// Each spelling's candidate is its original (no older release of the same
-/// template and hash), so a twin, registered after its original, never wins,
-/// even with a storage location its original lacks.
+/// The choice is `pplx_space_template_release_original::digest_original`, the
+/// rule the API and the warm pool resolve the digest with too: where both
+/// spellings exist, the original that owns a recorded storage location wins,
+/// then the older. A twin never wins.
 async fn find_original_release_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
+                    r.execution_metadata->>'environment' AS environment
+             FROM template_releases r
+             WHERE r.template_name = $1
+               AND r.hash IN ($2, $3)
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
     let bare_hash = hash.trim_prefix("sha256:");
     let canonical_hash = format!("sha256:{bare_hash}");
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
-                r.execution_metadata->>'environment' AS environment
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash IN ($2, $3)
-           AND NOT EXISTS (
-                SELECT 1 FROM template_releases o
-                WHERE o.template_name = r.template_name
-                  AND o.hash = r.hash
-                  AND (o.created_at, o.id) < (r.created_at, r.id))
-         ORDER BY EXISTS (
-                      SELECT 1
-                      FROM template_release_storage_locations l
-                      WHERE l.template_release_id = r.id) DESC,
-                  r.created_at ASC,
-                  r.id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(&canonical_hash)
-    .bind(bare_hash)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
+    sqlx::query_as::<_, TemplateReleaseRow>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name)
+        .bind(&canonical_hash)
+        .bind(bare_hash)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
 /// The release of `template_name` stored under exactly `hash` in `partition`

@@ -41,7 +41,9 @@ use uuid::Uuid;
 /// build owns a storage location; those in the environment of the build's
 /// preferred original — its earliest release, preferring one that owns a
 /// storage location — are originals; and between candidates of the same
-/// rank and catalog version `hash`'s own spelling wins), and
+/// rank and catalog version the spelling of the build's digest original
+/// (`pplx_space_template_release_original::digest_original`, which tags and
+/// the warm pool resolve the digest to) wins, whichever spelling `hash` is), and
 /// `initial_environment` the initial environment's reference as text, which
 /// unbound releases count as.
 /// The fragment's own aliases start with `resolve_`, and its tables have
@@ -56,6 +58,7 @@ use uuid::Uuid;
 pub fn resolved_release_sql(template_name: &str, hash: &str, initial_environment: &str) -> String {
     let candidate_spellings = sha256_spellings("resolve_r.hash");
     let query_spellings = sha256_spellings(hash);
+    let digest_original = pplx_space_template_release_original::digest_original("resolve_d_r");
     format!(
         "(SELECT resolve_r.id
           FROM template_releases resolve_r
@@ -66,6 +69,18 @@ pub fn resolved_release_sql(template_name: &str, hash: &str, initial_environment
           LEFT JOIN runtime_environments resolve_c
             ON resolve_c.environment_ref =
                COALESCE(resolve_r.execution_metadata->>'environment', ({initial_environment}))
+          -- The spelling of the build's digest original
+          -- (`pplx_space_template_release_original::digest_original`), the
+          -- release a lookup without an environment, a tag and the warm pool
+          -- resolve the digest to: it breaks ties between spellings.
+          LEFT JOIN LATERAL (
+              SELECT resolve_d_r.hash
+              FROM template_releases resolve_d_r
+              WHERE resolve_d_r.template_name = resolve_r.template_name
+                AND resolve_d_r.hash IN {candidate_spellings}
+                AND {digest_original}
+              LIMIT 1
+          ) resolve_d ON TRUE
           CROSS JOIN LATERAL (
               SELECT
                   COALESCE(resolve_r.execution_metadata->>'environment', ({initial_environment}))
@@ -112,7 +127,7 @@ pub fn resolved_release_sql(template_name: &str, hash: &str, initial_environment
                   ELSE 2
               END,
               resolve_c.version_sort_key DESC NULLS LAST,
-              (resolve_r.hash = ({hash})) DESC,
+              (resolve_r.hash = resolve_d.hash) DESC,
               resolve_r.created_at,
               resolve_r.id
           LIMIT 1)"

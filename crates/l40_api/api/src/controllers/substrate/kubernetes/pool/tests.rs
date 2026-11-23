@@ -1322,9 +1322,10 @@ async fn another_spellings_release_elsewhere_leaves_the_originals_pool() -> Test
         );
     }
 
-    // An upsert naming the other release, where creates boot twins, changes
-    // only its config, as its disable does, though creates of its spelling
-    // resolve to the original.
+    // An edit naming the other release, where creates boot twins, changes
+    // only its config, as its disable does, though creates of either spelling
+    // resolve to the original. An upsert naming only the hash would land on
+    // the digest's original instead.
     let upserted = upsert_pool_config(
         &store,
         ClusterPoolConfigRequest {
@@ -1340,7 +1341,7 @@ async fn another_spellings_release_elsewhere_leaves_the_originals_pool() -> Test
             namespace: None,
             enabled: true,
             encryptable: false,
-            template_release_id: None,
+            template_release_id: Some(elsewhere),
         },
         true,
     )
@@ -1465,6 +1466,304 @@ async fn disabling_an_original_disables_every_twins_config_for_the_shape() -> Te
         (true, 2),
         "another shape's config stays"
     );
+    Ok(())
+}
+
+/// A campaign's twin insert copies the original's manual configs in the
+/// transaction that makes the twin, holding the template row lock. An
+/// operator's disable of the original that races it waits for that lock, so
+/// it sees the committed twin and disables the twin's copy too, rather than
+/// each missing the other's uncommitted write.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disable_racing_a_twin_insert_reaches_the_twins_copy() -> TestResult {
+    // The campaign's transaction, the disable's and the lock poll's.
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let original: Uuid = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE hash = 'sha256:newer-untagged'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    crate::test_support::set_default_environment(&db.pool, &e1).await?;
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+    let config = upsert_pool_config(
+        &store,
+        ClusterPoolConfigRequest {
+            template_name: "seed".to_string(),
+            content_hash: Some("sha256:newer-untagged".to_string()),
+            template_release_id: None,
+            vcpu: 4,
+            memory_mib: 2048,
+            disk_mib: None,
+            reset_disk_to_template_default: false,
+            target_ready_slots: 1,
+            refill_per_tick: 1,
+            max_warming_slots: 1,
+            namespace: None,
+            enabled: true,
+            encryptable: false,
+        },
+        true,
+    )
+    .await?;
+
+    // The campaign's transaction, as the twin insert makes it: the template
+    // row lock, then the twin.
+    let mut campaign = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM templates WHERE name = 'seed' FOR NO KEY UPDATE"
+    ))
+    .execute(&mut *campaign)
+    .await?;
+    let twin: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, created_at, execution_metadata)
+         VALUES ('seed', 'fc', 'sha256:newer-untagged', NOW() + INTERVAL '1 minute',
+                 jsonb_build_object('environment', $1::TEXT))
+         RETURNING id"
+    ))
+    .bind(&e1)
+    .fetch_one(&mut *campaign)
+    .await?;
+
+    let holder: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *campaign)
+        .await?;
+    // The copy runs only once the disable waits on the template lock, so it
+    // reads the original's config as it was before the disable.
+    let (disabled, copied) = tokio::join!(disable_pool_config(&store, config.id), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // Something waits on the campaign's backend: the operator's
+            // write, on the template row.
+            let waiting: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE $1 = ANY(pg_blocking_pids(pid))
+                 )"
+            ))
+            .bind(holder)
+            .fetch_one(&db.pool)
+            .await?;
+            if waiting {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err("the disable never waited on the template lock".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let copied =
+            WarmPoolStore::copy_manual_configs_to_release(&mut campaign, original, twin).await?;
+        campaign.commit().await?;
+        TestResult::Ok(copied)
+    });
+    assert_eq!(copied?, 1);
+    assert_eq!(disabled?.id, config.id);
+    let enabled: Vec<(Uuid, bool)> = sqlx::query_as(sql!(
+        "SELECT template_release_id, enabled
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = ANY($1)
+         ORDER BY created_at, id"
+    ))
+    .bind(vec![original, twin])
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(enabled, vec![(original, false), (twin, false)]);
+    Ok(())
+}
+
+/// A template being deleted gets no twin, so an operator's pool-config write
+/// has no twin insert to serialize with. Once the template is marked
+/// `deleting`, the write takes no row lock and doesn't queue behind the
+/// delete's cleanup: here the cleanup holds the template row, and the
+/// disable still goes through.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pool_write_on_a_template_being_deleted_takes_no_template_lock() -> TestResult {
+    // The delete's transaction and the disable's.
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+    let config = upsert_pool_config(
+        &store,
+        ClusterPoolConfigRequest {
+            template_name: "seed".to_string(),
+            content_hash: Some("sha256:newer-untagged".to_string()),
+            template_release_id: None,
+            vcpu: 4,
+            memory_mib: 2048,
+            disk_mib: None,
+            reset_disk_to_template_default: false,
+            target_ready_slots: 1,
+            refill_per_tick: 1,
+            max_warming_slots: 1,
+            namespace: None,
+            enabled: true,
+            encryptable: false,
+        },
+        true,
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = 'deleting' WHERE name = 'seed'"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let mut delete = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM templates WHERE name = 'seed' FOR UPDATE"
+    ))
+    .execute(&mut *delete)
+    .await?;
+
+    let disabled = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        disable_pool_config(&store, config.id),
+    )
+    .await
+    .map_err(|_| "the disable waited on the deleting template's row")??;
+    assert_eq!(disabled.id, config.id);
+    assert!(
+        !disabled.enabled,
+        "the disable applied while the delete held the row"
+    );
+    assert_eq!(disabled.target_ready_slots, 0);
+    delete.rollback().await?;
+    Ok(())
+}
+
+/// As for a disable: an operator's upsert of the original's config that races
+/// a twin insert waits for the template lock, so it sees the committed twin
+/// and gives the twin's copy the new settings too.
+#[tokio::test(flavor = "current_thread")]
+async fn an_upsert_racing_a_twin_insert_reaches_the_twins_copy() -> TestResult {
+    // The campaign's transaction, the upsert's and the lock poll's.
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    insert_ready_pool_slot(&db.pool).await?;
+    let original: Uuid = sqlx::query_scalar(sql!(
+        "SELECT id FROM template_releases WHERE hash = 'sha256:newer-untagged'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let e1 = format!("sha256:{}", "7".repeat(64));
+    sqlx::query(sql!(
+        "DROP INDEX IF EXISTS idx_template_releases_template_name_hash_unique"
+    ))
+    .execute(&db.pool)
+    .await?;
+    crate::test_support::set_default_environment(&db.pool, &e1).await?;
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
+    let request = |target_ready_slots| ClusterPoolConfigRequest {
+        template_name: "seed".to_string(),
+        content_hash: Some("sha256:newer-untagged".to_string()),
+        template_release_id: None,
+        vcpu: 4,
+        memory_mib: 2048,
+        disk_mib: None,
+        reset_disk_to_template_default: false,
+        target_ready_slots,
+        refill_per_tick: 1,
+        max_warming_slots: 1,
+        namespace: None,
+        enabled: true,
+        encryptable: false,
+    };
+    upsert_pool_config(&store, request(1), true).await?;
+
+    // The campaign's transaction, as the twin insert makes it: the template
+    // row lock, then the twin.
+    let mut campaign = db.pool.begin().await?;
+    // A twin shares its original's storage locations; give it one.
+    let location = "s3://templates/seed/newer-untagged?region=us-east-1".to_owned();
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(original)
+    .bind(&location)
+    .execute(&db.pool)
+    .await?;
+    // The production insert, so the lock it takes and holds through the copy
+    // is the one under test.
+    let target = pplx_space_template_release_store::PartitionSelector {
+        environment: e1.parse::<pplx_space_execution_spec::EnvironmentReference>()?,
+        includes_unbound: false,
+    };
+    let twin = match pplx_space_template_release_store::insert_twin(
+        &mut campaign,
+        original,
+        target,
+        &serde_json::json!({ "environment": e1 }),
+        std::slice::from_ref(&location),
+    )
+    .await?
+    {
+        pplx_space_template_release_store::InsertTwin::Inserted(twin) => twin,
+        other => return Err(format!("the twin wasn't inserted: {other:?}").into()),
+    };
+
+    let holder: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *campaign)
+        .await?;
+    // The copy runs only once the upsert waits on the template lock, so it
+    // reads the original's config as it was before the upsert.
+    let (upserted, copied) = tokio::join!(upsert_pool_config(&store, request(5), true), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // Something waits on the campaign's backend: the operator's
+            // write, on the template row.
+            let waiting: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE $1 = ANY(pg_blocking_pids(pid))
+                 )"
+            ))
+            .bind(holder)
+            .fetch_one(&db.pool)
+            .await?;
+            if waiting {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err("the upsert never waited on the template lock".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let copied =
+            WarmPoolStore::copy_manual_configs_to_release(&mut campaign, original, twin).await?;
+        campaign.commit().await?;
+        TestResult::Ok(copied)
+    });
+    assert_eq!(copied?, 1);
+    assert_eq!(upserted?.template_release_id, original);
+    let targets: Vec<(Uuid, i32)> = sqlx::query_as(sql!(
+        "SELECT template_release_id, target_ready_slots
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = ANY($1)
+         ORDER BY created_at, id"
+    ))
+    .bind(vec![original, twin])
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(targets, vec![(original, 5), (twin, 5)]);
     Ok(())
 }
 
@@ -2435,9 +2734,9 @@ async fn postgres_label_adopted_execution_with_attribution_off_sends_nothing() -
 }
 
 /// Characterization of the release choice of the Kubernetes pool config upsert
-/// (`resolve_pool_template_release`): the release whose stored hash equals the
-/// requested string when a hash is given; otherwise the `latest` holder, else
-/// the newest by `created_at`. It takes no runtime and no caller org, and never
+/// (`resolve_pool_template_release`): the digest's original under either
+/// spelling when a hash is given, answered in its stored spelling; otherwise
+/// the `latest` holder, else the newest by `created_at`. It takes no runtime and no caller org, and never
 /// reads `templates`. The create path's pool claim passes the release sandbox
 /// create resolved and skips it.
 #[tokio::test(flavor = "current_thread")]
@@ -2455,17 +2754,19 @@ async fn pool_template_release_resolution_characterization() -> TestResult {
         // The `latest` holder, not the most recently tagged `bare`.
         (RESOLVER_TEMPLATE, None, Some((w.latest_holder, sha('d')))),
         (RESOLVER_TEMPLATE, Some(hex('a')), Some((w.bare, hex('a')))),
-        // Exact string match only; sandbox create, ClusterApi by-hash and
-        // observed-demand matching find the bare row here.
-        (RESOLVER_TEMPLATE, Some(sha('a')), None),
+        // Either spelling names the digest, as sandbox create, ClusterApi
+        // by-hash and observed-demand matching read it.
+        (RESOLVER_TEMPLATE, Some(sha('a')), Some((w.bare, hex('a')))),
         (
             RESOLVER_TEMPLATE,
             Some(sha('b')),
             Some((w.prefixed, sha('b'))),
         ),
-        // ClusterApi by-hash and observed-demand matching find the prefixed row
-        // for this bare request.
-        (RESOLVER_TEMPLATE, Some(hex('b')), None),
+        (
+            RESOLVER_TEMPLATE,
+            Some(hex('b')),
+            Some((w.prefixed, sha('b'))),
+        ),
         (
             RESOLVER_TEMPLATE,
             Some(blake('c')),
@@ -2473,15 +2774,28 @@ async fn pool_template_release_resolution_characterization() -> TestResult {
         ),
         // A missed hash does not fall back to `latest`.
         (RESOLVER_TEMPLATE, Some(sha('c')), None),
+        // Both spellings stored, neither with a storage location: the older
+        // row, whichever spelling the request names, as sandbox create and
+        // observed-demand matching pick it.
         (
             RESOLVER_TEMPLATE,
             Some(hex('9')),
-            Some((w.dual_bare, hex('9'))),
+            Some((w.dual_prefixed, sha('9'))),
         ),
         (
             RESOLVER_TEMPLATE,
             Some(sha('9')),
             Some((w.dual_prefixed, sha('9'))),
+        ),
+        (
+            RESOLVER_TEMPLATE,
+            Some(hex('8')),
+            Some((w.early_bare, hex('8'))),
+        ),
+        (
+            RESOLVER_TEMPLATE,
+            Some(sha('8')),
+            Some((w.early_bare, hex('8'))),
         ),
         // No `latest`: the newest by created_at, which is neither first nor
         // last by insertion, id or hash. Sandbox create, build base and
@@ -2515,6 +2829,60 @@ async fn pool_template_release_resolution_characterization() -> TestResult {
             resolved.map(|row| (row.id, row.content_hash)),
             expected,
             "{template} hash={hash:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A pool config pinned to a digest stored under both spellings targets the
+/// digest's original under either spelling, the release creates resolve and
+/// the warm-pool store counts demand for, with twins and without. An unpinned
+/// config targets the original of the digest tagged `latest`, even when the
+/// tag sits on the other spelling's original, as one written before the
+/// shared rule can.
+#[rstest::rstest]
+#[case::without_twins(false)]
+#[case::with_twins(true)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_pool_targets_the_digest_original(#[case] twins: bool) -> TestResult {
+    use pplx_space_template_release_store::spelling_pairs::{
+        OLD_INDEX, seed_spelling_pairs, tag_release,
+    };
+    const TEMPLATE: &str = "spelling-pairs";
+    let db = pg_test_db().await?;
+    sqlx::query(sql!("INSERT INTO templates (id, name) VALUES ($1, $2)"))
+        .bind(Uuid::now_v7())
+        .bind(TEMPLATE)
+        .execute(&db.pool)
+        .await?;
+    if twins {
+        sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
+            "DROP INDEX IF EXISTS {OLD_INDEX}"
+        ))))
+        .execute(&db.pool)
+        .await?;
+    }
+    let twin_metadata = twins.then_some(r#"{"environment": "fixture-twin"}"#);
+    for pair in seed_spelling_pairs(&db.pool, TEMPLATE, twin_metadata).await? {
+        for hash in [&pair.canonical_hash, &pair.bare_hash] {
+            let mut tx = db.pool.begin().await?;
+            let resolved = resolve_pool_template_release(&mut tx, TEMPLATE, Some(hash)).await?;
+            tx.rollback().await?;
+            assert_eq!(
+                resolved.map(|row| (row.id, row.content_hash)),
+                Some((pair.original, pair.original_hash().to_owned())),
+                "{hash}"
+            );
+        }
+        tag_release(&db.pool, TEMPLATE, pair.other(), "latest").await?;
+        let mut tx = db.pool.begin().await?;
+        let resolved = resolve_pool_template_release(&mut tx, TEMPLATE, None).await?;
+        tx.rollback().await?;
+        assert_eq!(
+            resolved.map(|row| (row.id, row.content_hash)),
+            Some((pair.original, pair.original_hash().to_owned())),
+            "latest on {}",
+            pair.other()
         );
     }
     Ok(())

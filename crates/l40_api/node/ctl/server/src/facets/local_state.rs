@@ -523,6 +523,25 @@ pub(super) fn published_template_builds(
     by_name
 }
 
+/// The partition a legacy-partition build's binding maps to, when that isn't
+/// the legacy one: an adopted legacy-layout build. `None` for an unbound or
+/// initial-environment build, and for a binding that doesn't parse. Only the
+/// Kubernetes controller reads it.
+#[cfg(feature = "kubernetes")]
+pub(crate) fn adopted_partition(
+    template: &pplx_space_template_mgr_client::proto::TemplateFullInfo,
+) -> Option<pplx_space_template_model::TemplateCachePartition> {
+    let environment = template
+        .execution
+        .as_ref()?
+        .environment
+        .as_deref()?
+        .parse()
+        .ok()?;
+    Some(pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment)))
+        .filter(|partition| *partition != pplx_space_template_model::TemplateCachePartition::Legacy)
+}
+
 fn is_legacy_template_build(
     template: &pplx_space_template_mgr_client::proto::TemplateFullInfo,
 ) -> bool {

@@ -1,6 +1,8 @@
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::digest_original;
 use std::{
     collections::{HashMap, HashSet},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -414,6 +416,89 @@ impl WarmPoolStore {
         Ok(id)
     }
 
+    /// Give `twin` a copy of each operator-managed plaintext pool config of
+    /// `original`: same shape, namespace, targets, disk settings and
+    /// `enabled`. A create that resolves to a twin claims only the twin's
+    /// slots, so a twin without these would have no pool. The original's
+    /// configs are left as they are.
+    ///
+    /// Autoscaler-owned configs aren't copied: the autoscaler re-derives them
+    /// for the twin from demand ([`Self::autoscale_configs`]). A manual config
+    /// the twin already has for a shape is kept, so a retry copies nothing
+    /// twice; an autoscaler-owned one for the shape takes the original's
+    /// manual settings. Returns how many configs were copied or taken over.
+    /// Runs on the caller's connection, so the copy commits with the twin's
+    /// insert and a twin never wins resolution without its manual pools.
+    pub async fn copy_manual_configs_to_release(
+        conn: &mut PgConnection,
+        original: Uuid,
+        twin: Uuid,
+    ) -> std::result::Result<u64, sqlx::Error> {
+        Self::copy_manual_configs_from_releases(conn, &[original], twin).await
+    }
+
+    /// [`Self::copy_manual_configs_to_release`] from several originals at
+    /// once, such as one build's releases under both hash spellings, which
+    /// all resolve to the one twin. `originals` is in precedence order: a
+    /// shape more than one of them configures gets the first one's settings.
+    /// Everything else is as for the single-original copy.
+    pub async fn copy_manual_configs_from_releases(
+        conn: &mut PgConnection,
+        originals: &[Uuid],
+        twin: Uuid,
+    ) -> std::result::Result<u64, sqlx::Error> {
+        let copied = sqlx::query(sql!(
+            "INSERT INTO kubernetes_pool_configs (
+                 template_release_id, vcpu, memory_mib, disk_mib, encryptable,
+                 target_ready_slots, refill_per_tick, max_warming_slots,
+                 namespace, enabled, managed_by,
+                 disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
+             )
+             SELECT $2, c.vcpu, c.memory_mib, c.disk_mib, c.encryptable,
+                    c.target_ready_slots, c.refill_per_tick, c.max_warming_slots,
+                    c.namespace, c.enabled, c.managed_by,
+                    c.disk_io_max_operations_per_sec, c.disk_io_max_bandwidth_mib_per_sec
+             FROM (
+                 -- One config per shape: the first original's in `$1`'s
+                 -- order, so the insert's conflict clause never sees a shape
+                 -- twice.
+                 SELECT DISTINCT ON (pc.vcpu, pc.memory_mib, pc.encryptable) pc.*
+                 FROM kubernetes_pool_configs pc
+                 WHERE pc.template_release_id = ANY($1)
+                   AND pc.managed_by = $3
+                   AND NOT pc.encryptable
+                 ORDER BY pc.vcpu, pc.memory_mib, pc.encryptable,
+                          array_position($1, pc.template_release_id), pc.created_at, pc.id
+             ) c
+             ORDER BY c.created_at, c.id
+             -- idx_kubernetes_pool_configs_release_shape_kind. A manual config
+             -- the twin already has for the shape is kept. One the autoscaler
+             -- made, which it can for a release that's already committed
+             -- (one another inserter made in the target's partition), takes
+             -- the original's manual settings: the autoscaler never
+             -- overwrites a manual config, so the operator's override would
+             -- otherwise be lost.
+             ON CONFLICT (template_release_id, vcpu, memory_mib, encryptable) DO UPDATE
+             SET disk_mib = EXCLUDED.disk_mib,
+                 target_ready_slots = EXCLUDED.target_ready_slots,
+                 refill_per_tick = EXCLUDED.refill_per_tick,
+                 max_warming_slots = EXCLUDED.max_warming_slots,
+                 namespace = EXCLUDED.namespace,
+                 enabled = EXCLUDED.enabled,
+                 managed_by = EXCLUDED.managed_by,
+                 disk_io_max_operations_per_sec = EXCLUDED.disk_io_max_operations_per_sec,
+                 disk_io_max_bandwidth_mib_per_sec = EXCLUDED.disk_io_max_bandwidth_mib_per_sec,
+                 updated_at = NOW()
+             WHERE kubernetes_pool_configs.managed_by <> $3"
+        ))
+        .bind(originals)
+        .bind(twin)
+        .bind(PoolConfigOwner::Manual.as_str())
+        .execute(conn)
+        .await?;
+        Ok(copied.rows_affected())
+    }
+
     /// Disable a pool config and zero its target so the reconciler drains
     /// its open slots. `managed_by` is deliberately untouched: a disabled
     /// autoscaler-owned config stays autoscaler-owned. Returns `None` when
@@ -734,7 +819,7 @@ impl WarmPoolStore {
         &self,
         initial_environment: Option<&str>,
     ) -> Result<Vec<PoolPolicyReleaseRow>> {
-        static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        static STATEMENT: LazyLock<String> = LazyLock::new(|| {
             sql!(format!(
                 "SELECT
                  COALESCE(twin.id, retained.id) AS template_release_id,
@@ -761,21 +846,24 @@ impl WarmPoolStore {
                           (
                               SELECT MAX(published.modified_at)
                               FROM template_release_tags published
-                              WHERE published.template_release_id = release.id
+                              JOIN template_releases tagged
+                                ON tagged.id = published.template_release_id
+                              -- Tags on either spelling of the digest: one written
+                              -- before the shared rule can sit on the other spelling.
+                              WHERE tagged.template_name = release.template_name
+                                AND replace(tagged.hash, 'sha256:', '')
+                                  = replace(release.hash, 'sha256:', '')
                           ),
                           release.created_at
                       ) AS published_at
                   FROM template_releases release
                   WHERE release.template_name = p.template_name
                     AND release.type = p.runtime
-                    -- Originals only: a twin of a retained release, bound to
-                    -- another environment, would use up a retain slot.
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM template_releases o
-                        WHERE o.template_name = release.template_name
-                          AND o.hash = release.hash
-                          AND (o.created_at, o.id) < (release.created_at, release.id))
+                    -- Digest originals only: a twin of a retained release,
+                    -- bound to another environment, or the other spelling's
+                    -- original of its digest would use up a retain slot and
+                    -- warm slots no create claims.
+                    AND {digest_original}
                   ORDER BY published_at DESC, release.id DESC
                   LIMIT p.retain_releases
              ) retained ON TRUE
@@ -787,6 +875,7 @@ impl WarmPoolStore {
              WHERE p.enabled
              ORDER BY p.template_name, p.vcpu, p.memory_mib,
                       retained.published_at DESC, retained.id DESC",
+                digest_original = digest_original("release"),
                 resolved = pplx_space_template_release_store::resolved_release_sql(
                     "p.template_name",
                     "retained.hash",
@@ -840,7 +929,13 @@ impl WarmPoolStore {
                             (
                                 SELECT MAX(published.modified_at)
                                 FROM template_release_tags published
-                                WHERE published.template_release_id = release.id
+                                JOIN template_releases tagged
+                                  ON tagged.id = published.template_release_id
+                                -- Tags on either spelling of the digest: one written
+                                -- before the shared rule can sit on the other spelling.
+                                WHERE tagged.template_name = release.template_name
+                                  AND replace(tagged.hash, 'sha256:', '')
+                                    = replace(release.hash, 'sha256:', '')
                             ),
                             release.created_at
                         ) AS published_at
@@ -876,7 +971,7 @@ impl WarmPoolStore {
     ) -> Result<Vec<PoolObservedDemand>> {
         let lookback_secs =
             i64::try_from(AUTOSCALE_LOOKBACK.as_secs()).expect("autoscale lookback fits i64");
-        static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        static STATEMENT: LazyLock<String> = LazyLock::new(|| {
             sql!(format!(
                 // Aggregate BEFORE the release lateral. The lateral's inputs
                 // (template_id, content_hash and its bare form) are constant
@@ -921,21 +1016,17 @@ impl WarmPoolStore {
                        OR r.hash = s.bare_content_hash
                        OR r.hash = 'sha256:' || s.bare_content_hash
                    )
-                   -- Originals only: a twin registered after its original
-                   -- would otherwise take the original's demand.
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM template_releases o
-                       WHERE o.template_name = r.template_name
-                         AND o.hash = r.hash
-                         AND (o.created_at, o.id) < (r.created_at, r.id))
-                 ORDER BY (r.hash = s.content_hash) DESC, r.created_at DESC, r.id DESC
-                 LIMIT 1
+                   -- The digest's original, whichever spelling the create
+                   -- named: the release creates claim slots of. A twin
+                   -- registered after its original, or the other spelling's
+                   -- original, would otherwise take the original's demand.
+                   AND {digest_original}
              ) release_by_hash ON TRUE
              LEFT JOIN LATERAL (
                  SELECT CASE WHEN $4::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
              ) twin ON TRUE
              GROUP BY 1, 2, 3",
+                digest_original = digest_original("r"),
                 resolved = pplx_space_template_release_store::resolved_release_sql(
                     "release_by_hash.template_name",
                     "release_by_hash.hash",

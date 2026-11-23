@@ -50,6 +50,7 @@ mod execution_rows;
 mod node_inventory;
 mod pod_placement;
 mod pod_tracking;
+mod pool_template_lock;
 mod restore_lease;
 mod restore_source;
 mod runtime_attribution;

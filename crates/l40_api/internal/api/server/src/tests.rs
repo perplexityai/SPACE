@@ -1,3 +1,4 @@
+mod digest_original;
 mod prefetch_catalog;
 pub(crate) mod queued_ref;
 mod reconcile_claim_origins;

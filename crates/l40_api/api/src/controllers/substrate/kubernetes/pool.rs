@@ -8,7 +8,9 @@ use pplx_space_execution_spec::VcpuCount;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::digest_original;
 use sqlx::{PgPool, Postgres, Transaction};
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 use crate::controllers::{
@@ -122,6 +124,14 @@ pub(super) async fn upsert_pool_config(
         )),
         None => ControllerError::not_found("template release not found"),
     })?;
+    // After the release lookup, which reads no config row, and before the
+    // config write: a template whose first release registered after a lock
+    // taken earlier found no row would otherwise go unlocked.
+    if boots_template_twins {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &request.template_name)
+            .await?;
+    }
     let upsert_error = |err: pplx_space_cluster_pool::PoolError| match err {
         pplx_space_cluster_pool::PoolError::EncryptableConfigFenced => {
             ControllerError::bad_request(err.to_string())
@@ -206,6 +216,15 @@ pub(super) async fn disable_pool_config(
         .begin()
         .await
         .map_err(|err| db_contention_error("failed to start transaction", &err))?;
+    // Before the config's row, as the upsert takes it: a twin insert holds
+    // the template's row and then locks the twin's config rows, and a twin
+    // it hasn't committed yet is one this disable's read of the twins below
+    // can't see.
+    if let Some(template_name) = store.pool_config_template(&mut tx, id).await? {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &template_name)
+            .await?;
+    }
     let disabled = WarmPoolStore::disable_config(&mut tx, id)
         .await
         .map_err(disable_error)?
@@ -508,9 +527,12 @@ fn admitted_slot_matches_request(
         && request
             .template_release_id
             .is_none_or(|release_id| release_id == reserved.template_release_id)
-        && request
-            .content_hash
-            .is_none_or(|content_hash| content_hash == reserved.content_hash)
+        // Either spelling of the digest: a create resolves a digest stored
+        // bare to its canonical `sha256:` form, and the slot records the
+        // release's stored spelling.
+        && request.content_hash.is_none_or(|content_hash| {
+            content_hash.trim_prefix("sha256:") == reserved.content_hash.trim_prefix("sha256:")
+        })
         && shape_matches
 }
 
@@ -763,40 +785,52 @@ struct PoolTemplateReleaseRow {
 }
 
 /// Resolve the template release a pool claim or config upsert targets: the
-/// release matching the requested content hash when one is pinned, otherwise
-/// the tagged-`latest` release, otherwise the newest release of the template.
-/// Only original releases are candidates (no older release of the same
-/// template and hash): a twin bound to another environment is registered
-/// after its original and would otherwise be the newest.
+/// release matching the requested content hash, under either spelling, when
+/// one is pinned, otherwise the release of the digest tagged `latest` (the tag
+/// may sit on the other spelling's original when it predates the shared rule),
+/// otherwise the newest release of the template. Only digest originals are candidates
+/// (`pplx_space_template_release_original::digest_original`, the release the
+/// create path and the warm-pool store resolve the digest to): a twin bound to
+/// another environment is registered after its original and would otherwise
+/// be the newest, and the other spelling's original of a digest would hold
+/// slots no create claims.
 /// Template-domain logic; deliberately not part of the warm-pool store.
 async fn resolve_pool_template_release(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
-    sqlx::query_as::<_, PoolTemplateReleaseRow>(sql!(
-        "SELECT r.id, r.hash AS content_hash
-         FROM template_releases r
-         LEFT JOIN template_release_tags t
-           ON t.template_release_id = r.id
-          AND t.template_name = r.template_name
-          AND t.tag = 'latest'
-         WHERE r.template_name = $1
-           AND ($2::TEXT IS NULL OR r.hash = $2)
-           AND NOT EXISTS (
-               SELECT 1
-               FROM template_releases o
-               WHERE o.template_name = r.template_name
-                 AND o.hash = r.hash
-                 AND (o.created_at, o.id) < (r.created_at, r.id))
-         ORDER BY (t.tag IS NOT NULL) DESC, r.created_at DESC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(content_hash)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id, r.hash AS content_hash
+             FROM template_releases r
+             WHERE r.template_name = $1
+               AND ($2::TEXT IS NULL
+                    OR r.hash IN (replace($2, 'sha256:', ''),
+                                  'sha256:' || replace($2, 'sha256:', '')))
+               AND {digest_original}
+             ORDER BY EXISTS (
+                          SELECT 1
+                          FROM template_release_tags t
+                          JOIN template_releases tagged
+                            ON tagged.id = t.template_release_id
+                           AND tagged.template_name = t.template_name
+                          WHERE t.template_name = r.template_name
+                            AND t.tag = 'latest'
+                            AND replace(tagged.hash, 'sha256:', '')
+                              = replace(r.hash, 'sha256:', '')) DESC,
+                      r.created_at DESC
+             LIMIT 1",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_as::<_, PoolTemplateReleaseRow>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name)
+        .bind(content_hash)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
 }
 
 /// The release `release_id` names, when it's a release of `template_name`

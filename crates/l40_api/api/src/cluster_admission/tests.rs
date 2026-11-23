@@ -49,6 +49,7 @@ fn admission_with_flags(
         bucket,
         config: sanitize_config(config),
         feature_flags,
+        flag_attributes: crate::limiter_flags::attributes(None),
         live_cap,
     }
 }
@@ -858,4 +859,50 @@ async fn with_config_builds_bucket_from_config_redis_url() -> TestResult {
         "{error:?}"
     );
     Ok(())
+}
+
+/// A `cluster_id` rule on the rate-limiter flag turns the limiter off in the
+/// cluster it names and nowhere else, and a process with no cluster id is
+/// never matched. With no rule, every cluster reads what it read before the
+/// attribute existed.
+#[tokio::test]
+async fn a_cluster_id_rule_switches_off_only_the_cluster_it_names() {
+    use crate::limiter_flags::tests::{cluster, targeting_one_cluster, without_a_rule};
+
+    // Lazy pool: admission_enabled() never reaches the substrate.
+    let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool");
+    let enabled_in = |flags: &FeatureFlagClient, cluster_id: Option<&str>| {
+        admission_with_flags(
+            direct_substrate(&pool),
+            enabled_config(),
+            None,
+            flags.clone(),
+        )
+        .with_flag_cluster_id(cluster_id.map(cluster).as_ref())
+        .admission_enabled()
+    };
+    let key = SPACE_CLUSTER_RATE_LIMITER_FLAG.key();
+
+    let off_in_a = targeting_one_cluster(key, "cluster-a", serde_json::json!(false), None);
+    assert!(!enabled_in(&off_in_a, Some("cluster-a")));
+    assert!(enabled_in(&off_in_a, Some("cluster-b")));
+    assert!(enabled_in(&off_in_a, None));
+
+    // No rule: each cluster gets the answer the attribute-free read gives,
+    // for an assigned default either way and for no assignment at all.
+    for default in [Some(true), Some(false), None] {
+        let today = match default {
+            Some(value) => FeatureFlagClient::fixed_bools([(key, value)]),
+            None => FeatureFlagClient::fixed_bools([("other", true)]),
+        };
+        let expected = enabled_in(&today, None);
+        let untargeted = without_a_rule(key, default.map(serde_json::Value::Bool));
+        for cluster_id in [Some("cluster-a"), Some("cluster-b"), None] {
+            assert_eq!(
+                enabled_in(&untargeted, cluster_id),
+                expected,
+                "default {default:?} in {cluster_id:?}"
+            );
+        }
+    }
 }

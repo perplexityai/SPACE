@@ -257,12 +257,38 @@ pub(super) mod service_tests {
             .authorize_identity(node_ctl.clone(), "GetVmState", ALLOW_NODE_STATUS)
             .expect("node-ctl may inspect runtime state without gaining mutation access");
         authorizer
-            .authorize_identity(node_ctl.clone(), "GetExecutionInventory", ALLOW_NODE_STATUS)
+            .authorize_identity(
+                node_ctl.clone(),
+                "GetExecutionInventory",
+                ALLOW_EXECUTION_INVENTORY,
+            )
             .expect("node-ctl needs runtime compatibility evidence");
 
         let error = authorizer
             .authorize_identity(node_ctl, "SetNetworkPoolDrain", ALLOW_NODE_ADMIN)
             .expect_err("node-ctl must not get broad node-manager admin access");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn template_manager_can_read_execution_inventory_only() {
+        let authorizer = node_peer_authorizer();
+        let template_manager = PeerIdentity::new(
+            users::SPACE_TMPLMGR.uid,
+            users::SPACE_TMPLMGR.primary_group.gid,
+            None,
+        );
+
+        authorizer
+            .authorize_identity(
+                template_manager.clone(),
+                "GetExecutionInventory",
+                ALLOW_EXECUTION_INVENTORY,
+            )
+            .expect("template-manager warms and pools builds per usable environment");
+        let error = authorizer
+            .authorize_identity(template_manager, "InspectSandbox", ALLOW_NODE_STATUS)
+            .expect_err("reading environments grants no other node status");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
@@ -936,10 +962,12 @@ pub(super) mod service_tests {
                     .is_empty()
             );
         }
+        // Template-manager may read the inventory; volume-manager reads no
+        // node status at all.
         let mut denied = Request::new(GetExecutionInventoryRequest {});
         denied.extensions_mut().insert(PeerIdentity::new(
-            users::SPACE_TMPLMGR.uid,
-            users::SPACE_TMPLMGR.primary_group.gid,
+            users::SPACE_VOLMGR.uid,
+            users::SPACE_VOLMGR.primary_group.gid,
             None,
         ));
         assert_eq!(
@@ -950,6 +978,16 @@ pub(super) mod service_tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+        let mut allowed = Request::new(GetExecutionInventoryRequest {});
+        allowed.extensions_mut().insert(PeerIdentity::new(
+            users::SPACE_TMPLMGR.uid,
+            users::SPACE_TMPLMGR.primary_group.gid,
+            None,
+        ));
+        service
+            .get_execution_inventory(allowed)
+            .await
+            .expect("template-manager reads the environments it warms and pools builds for");
     }
 
     #[tokio::test(flavor = "current_thread")]

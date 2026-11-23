@@ -5,7 +5,7 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::test_support::{SnapshotSeed, upsert_snapshot};
-use super::{EnvironmentRefusal, environment_evidence, environment_refusal};
+use super::{EnvironmentRefusal, environment_evidence, environment_refusal, reads_twin_metadata};
 
 async fn evidence(pool: &PgPool, node: NodeId) -> TestResult<bool> {
     let statement = sql!(format!(
@@ -342,5 +342,43 @@ async fn a_null_in_the_usable_list_doesnt_admit_an_unlisted_environment() -> Tes
         refusal_and_evidence(&db.pool, node, LISTED).await?,
         (None, true)
     );
+    Ok(())
+}
+
+/// Only a `node_ctl` document whose `reads_twin_metadata` is JSON `true` says
+/// the node reads a twin's metadata: no document, a document from a node
+/// that predates the key, `null`, `false`, and a string don't, and none of
+/// them is NULL.
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_true_flag_reads_twin_metadata() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node = NodeId::new();
+    insert_ready_worker_node(&db.pool, node).await?;
+    upsert_snapshot(&db.pool, node, SnapshotSeed::default()).await?;
+    let statement = sql!(format!(
+        "SELECT {} FROM node_status_snapshots nss WHERE nss.node_id = $1",
+        reads_twin_metadata("nss")
+    ));
+    for (document, expected) in [
+        (None, false),
+        (Some(r#"{"reachable": true, "reconciliations": []}"#), false),
+        (Some(r#"{"reads_twin_metadata": null}"#), false),
+        (Some(r#"{"reads_twin_metadata": false}"#), false),
+        (Some(r#"{"reads_twin_metadata": "true"}"#), false),
+        (Some(r#"{"reads_twin_metadata": true}"#), true),
+    ] {
+        sqlx::query("UPDATE node_status_snapshots SET node_ctl = $2::jsonb WHERE node_id = $1")
+            .bind(node)
+            .bind(document)
+            .execute(&db.pool)
+            .await?;
+        let reads = sqlx::query_scalar::<_, Option<bool>>(sqlx::AssertSqlSafe(statement.as_str()))
+            .bind(node)
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(reads, Some(expected), "{document:?}");
+    }
     Ok(())
 }

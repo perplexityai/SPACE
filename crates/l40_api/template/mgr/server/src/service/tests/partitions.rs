@@ -219,6 +219,7 @@ async fn an_uncached_digest_pulls_without_a_partition_selector() {
                     hash: hash(),
                     storage_uris: vec![],
                     visibility: pplx_space_node_api_client::proto::TemplateVisibility::Generic,
+                    environment: None,
                 })
             },
             async |_, _, _| {
@@ -904,6 +905,7 @@ fn generic_release() -> crate::volume::ResolvedRelease {
         hash: hash(),
         storage_uris: vec![],
         visibility: pplx_space_node_api_client::proto::TemplateVisibility::Generic,
+        environment: None,
     }
 }
 
@@ -962,6 +964,11 @@ async fn a_required_lookup_pulls_the_environment_s_build_of_a_digest_held_under_
             async |_, _, _, _| Ok(generic_release()),
             async |spec, _, _| {
                 assert_eq!(spec.required, Some(twin()), "the pull knows the partition");
+                assert_eq!(
+                    spec.environment,
+                    Some(twin_environment()),
+                    "the pull resolves the release bound to the required environment"
+                );
                 insert_bound_build(&service.db.lock().unwrap(), twin_environment());
                 materialized.set(true);
                 crate::volume::PullOutcome::Materialized
@@ -1011,6 +1018,11 @@ async fn a_required_lookup_on_the_default_path_pulls_rather_than_answer_with_the
             async |_, _, _| panic!("the default path pulls through the puller"),
             async |spec, _| {
                 assert_eq!(spec.required, Some(twin()), "the pull knows the partition");
+                assert_eq!(
+                    spec.environment,
+                    Some(twin_environment()),
+                    "the pull resolves the release bound to the required environment"
+                );
                 insert_bound_build(&service.db.lock().unwrap(), twin_environment());
                 pulled.set(true);
                 crate::volume::PullOutcome::Materialized
@@ -1151,4 +1163,33 @@ async fn a_required_lookup_touches_no_other_environment_s_build() {
         .await
         .unwrap();
     assert_eq!(legacy_last_used(), "0");
+}
+
+/// An authorized lookup that requires its environment's build resolves the
+/// release bound to it, so its resolution names the environment; one that
+/// only prefers it, or names none, resolves as before twins.
+#[test]
+fn a_required_lookup_resolves_with_its_environment() {
+    use super::lookup::required_lookup_environment;
+    let request =
+        |environment: Option<String>, environment_required| crate::proto::GetTemplateRequest {
+            template: Some(crate::proto::TemplateRef {
+                name: "base".into(),
+                content_hash: Some(hash()),
+                tag: None,
+                environment,
+            }),
+            environment_required,
+            ..Default::default()
+        };
+    let twin = twin_environment();
+    assert_eq!(
+        required_lookup_environment(&request(Some(twin.to_string()), true)),
+        Some(twin)
+    );
+    assert_eq!(
+        required_lookup_environment(&request(Some(twin.to_string()), false)),
+        None
+    );
+    assert_eq!(required_lookup_environment(&request(None, true)), None);
 }

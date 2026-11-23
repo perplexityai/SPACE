@@ -400,6 +400,7 @@ pplx-space-runtime-environment-catalog-store = [
 ]
 pplx-space-runtime-environment-policy-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
 pplx-space-runtime-upgrade-campaign-store = [
@@ -451,10 +452,22 @@ pplx-space-snapshot-store = [
   "pplx-space-snapshot-retention",
 ]
 pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
+pplx-space-template-release-original = [
+  "pplx-space-api",
+  "pplx-space-cluster-pool",
+  "pplx-space-internal-api-server",
+  "pplx-space-template-release-store",
+]
 # The API resolves creates, placement and pool claims to a release's twin
-# through the store, and the cluster pool's autoscaler embeds its resolution
-# SQL so demand follows the release creates run.
-pplx-space-template-release-store = ["pplx-space-api", "pplx-space-cluster-pool"]
+# through the store, the cluster pool's autoscaler embeds its resolution SQL
+# so demand follows the release creates run, and the cluster controller's
+# template campaign driver pages a campaign's source releases, writes twins'
+# metadata.json through its objects, and inserts the twins.
+pplx-space-template-release-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-cluster-pool",
+]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]

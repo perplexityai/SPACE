@@ -2073,24 +2073,222 @@ def run_old_sandboxes(args: argparse.Namespace, *, node_cache_only: bool = False
     return 0
 
 
-def template_candidate_rows(args: argparse.Namespace, cutoff: str) -> list[dict[str, str]]:
-    query = f"""
-WITH ranked AS (
+def superseded_template_ranked_sql() -> str:
+    """The template releases a superseded-template prune ranks: one per digest.
+
+    Each digest of a template, in either spelling (bare or `sha256:`), ranks
+    once, by the first row registered under it. A later row of the same
+    template and digest is a twin, bound to another execution environment, or
+    the digest's other spelling: it isn't a newer version of the template, so it
+    neither counts toward `--keep-latest-per-template` nor gets a rank, and a
+    query that selects candidates from these rows never selects one.
+
+    This orders versions; it isn't the rule that picks which row lookups
+    resolve as the digest's original. That choice doesn't matter here, because
+    a digest with more than one row is never selected.
+    """
+    return """
     SELECT r.id,
            r.template_name,
            r.type AS runtime,
-           r.hash AS content_hash,
+           r.hash,
            r.created_at,
            ROW_NUMBER() OVER (
                PARTITION BY r.template_name
                ORDER BY r.created_at DESC, r.id DESC
            ) AS newest_rank
     FROM template_releases r
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM template_releases earlier
+        WHERE earlier.template_name = r.template_name
+          AND replace(earlier.hash, 'sha256:', '') = replace(r.hash, 'sha256:', '')
+          AND (earlier.created_at, earlier.id) < (r.created_at, r.id)
+    )"""
+
+
+def canonical_storage_locations_sql() -> str:
+    """SQL for every storage location in the form `canonical_s3_prefix_uri` deletes.
+
+    It yields `location_id`, `release_id` and `uri`. Like `urllib.parse.urlsplit` with the
+    CVE-2023-24329 fix, it strips leading C0 controls and spaces, removes tabs and line breaks, lowercases the
+    scheme, and drops the fragment and the query. Like `parse_s3_uri`, it strips
+    the slashes that lead the key. For an `s3://` URI the result is
+    `s3://<bucket>/<key>`, the deletion target.
+    """
+    c0_and_space = "".join(f"\\x{code:02x}" for code in range(1, 0x20)) + " "
+    return f"""
+              SELECT storage.id AS location_id,
+                     storage.template_release_id AS release_id,
+                     regexp_replace(
+                         split_part(split_part(
+                             lower(COALESCE(parsed.scheme, ''))
+                                 || substring(cleaned.uri FROM COALESCE(length(parsed.scheme), 0) + 1),
+                             '#', 1), '?', 1),
+                         '^([^:/?#]+://[^/]*)/*', '\\1/'
+                     ) AS uri
+              FROM template_release_storage_locations storage
+              CROSS JOIN LATERAL (
+                  SELECT translate(
+                      ltrim(storage.storage_connection_string, E'{c0_and_space}'),
+                      E'\\t\\r\\n', ''
+                  ) AS uri
+              ) cleaned
+              CROSS JOIN LATERAL (
+                  SELECT substring(cleaned.uri FROM '^[A-Za-z][A-Za-z0-9+.-]*:') AS scheme
+              ) parsed"""
+
+
+def shared_storage_release_ids_sql(scope: str | None = None) -> str:
+    """SQL for the ids of releases whose storage overlaps another release's.
+
+    Two releases overlap when one's storage location, in the form
+    `canonical_storage_locations_sql` gives, equals the other's or is a string
+    prefix of it. Each location is expanded into its prefixes at the lengths
+    some location has, so finding the overlaps is one hash join of locations
+    against prefixes rather than a comparison of every pair of locations. It
+    has no CTE and isn't correlated with any candidate, so a `NOT EXISTS` over
+    it plans as one anti-join per statement. It may list a release more than
+    once. A location whose canonical form is empty, such as `?region=x`,
+    overlaps nothing in either form: it's no deletion target, and as a prefix
+    it would match every location.
+
+    With `scope`, a relation with an `id` column, it returns only the scoped
+    releases that overlap another, comparing each scoped location with every
+    other location in one pass. The delete passes the releases it was asked
+    for, so under the template lock it compares only those releases' locations
+    against the others rather than every pair, though it still canonicalizes
+    every location.
+    """
+    if scope is not None:
+        return f"""
+          WITH canonical AS MATERIALIZED (
+              SELECT locations.release_id, locations.uri
+              FROM ({canonical_storage_locations_sql()}
+              ) locations
+              WHERE locations.uri <> ''
+          ),
+          scoped AS MATERIALIZED (
+              SELECT canonical.release_id, canonical.uri
+              FROM canonical
+              WHERE canonical.release_id IN (SELECT id FROM {scope})
+          )
+          SELECT scoped.release_id
+          FROM scoped
+          JOIN canonical other
+            ON other.release_id <> scoped.release_id
+           AND (starts_with(other.uri, scoped.uri) OR starts_with(scoped.uri, other.uri))"""
+    # OFFSET 0 keeps Postgres from folding the canonical form into the joins
+    # below, which would recompute it for every prefix of every location.
+    canonical = f"""(
+              SELECT locations.release_id, locations.uri
+              FROM ({canonical_storage_locations_sql()}
+              ) locations
+              WHERE locations.uri <> ''
+              OFFSET 0
+          )"""
+    return f"""
+          SELECT unnest(ARRAY[shorter.release_id, longer.release_id]) AS release_id
+          FROM {canonical} shorter
+          JOIN (
+              SELECT location.release_id, left(location.uri, lengths.n) AS uri
+              FROM {canonical} location
+              JOIN (
+                  SELECT DISTINCT length(any_location.uri) AS n
+                  FROM {canonical} any_location
+              ) lengths ON lengths.n <= length(location.uri)
+          ) longer
+            ON longer.uri = shorter.uri
+           AND longer.release_id <> shorter.release_id"""
+
+
+def template_storage_locations_sql() -> str:
+    """SQL for every template storage location as `template_release_id` and `storage_uri`."""
+    return """
+SELECT template_release_id::text AS template_release_id,
+       storage_connection_string AS storage_uri
+FROM template_release_storage_locations
+ORDER BY 1, 2"""
+
+
+def refuse_unparseable_storage_locations(args: argparse.Namespace, action: str) -> None:
+    """Refuse to go on while a storage location isn't an `s3://<bucket>/<key>` URI.
+
+    The storage check compares locations as string prefixes. A location
+    `parse_s3_uri` rejects can be a prefix of every location in its bucket,
+    such as a bucket root (`s3://bucket/`), or of every location, such as
+    `s3:`, so the check would spare every release there in silence. Deletion
+    refuses such a location anyway, since it has no `s3://<bucket>/<key>` target.
+    """
+    rejected: list[str] = []
+    for row in psql_csv_query(args, template_storage_locations_sql()):
+        try:
+            parse_s3_uri(row["storage_uri"])
+        except ValueError as err:
+            rejected.append(f"{row['template_release_id']} {row['storage_uri']!r} ({err})")
+    if not rejected:
+        return
+    listed = "; ".join(rejected[:10])
+    more = f" and {len(rejected) - 10} more" if len(rejected) > 10 else ""
+    raise SystemExit(
+        f"refusing to {action}: {len(rejected)} template storage location(s) aren't "
+        "s3://<bucket>/<key> URIs. One that names a bucket root, no bucket or another scheme "
+        "can count as a prefix of every location in its bucket, or of every location, and "
+        f"would keep every release there from being pruned: {listed}{more}"
+    )
+
+
+def superseded_template_shared_artifact_guard_sql(release: str, scope: str | None = None) -> str:
+    """Refuse a release whose artifacts another release may still use.
+
+    `release` names a row with `id`, `template_name` and `hash`. The release is
+    kept while any other release of its template has the same digest, under
+    either spelling (bare or `sha256:`): that covers an original with twins,
+    which a lookup without an environment would resolve to a twin once it was
+    gone, and a twin, whose storage location can name its original's prefix.
+    It's also kept while another release has a storage location that equals
+    one of its own or is a string prefix of it, either way round. Deletion runs
+    `aws s3 rm --recursive` on `canonical_s3_prefix_uri`, so both sides are
+    compared in that form (see `canonical_storage_locations_sql`), and as plain
+    string prefixes rather than whole path segments, so the guard holds however
+    the recursive delete matches keys. `scope` restricts the storage check to
+    the named releases (see `shared_storage_release_ids_sql`). That result
+    lists only scoped releases, once per overlapping pair of locations, and
+    `NOT IN` checks the release against it. Postgres hashes a
+    `NOT IN` subplan only when its estimate fits in memory, so the unscoped
+    check uses `NOT EXISTS`, which it plans as an anti-join.
+    """
+    if scope is not None:
+        storage_guard = f"""
+  AND {release}.id NOT IN ({shared_storage_release_ids_sql(scope)}
+  )"""
+    else:
+        storage_guard = f"""
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ({shared_storage_release_ids_sql()}
+      ) shared
+      WHERE shared.release_id = {release}.id
+  )"""
+    return f"""
+  AND NOT EXISTS (
+      SELECT 1
+      FROM template_releases same_digest
+      WHERE same_digest.template_name = {release}.template_name
+        AND same_digest.id <> {release}.id
+        AND replace(same_digest.hash, 'sha256:', '') = replace({release}.hash, 'sha256:', '')
+  ){storage_guard}"""
+
+
+def template_candidate_rows(args: argparse.Namespace, cutoff: str) -> list[dict[str, str]]:
+    refuse_unparseable_storage_locations(args, "list superseded templates")
+    query = f"""
+WITH ranked AS ({superseded_template_ranked_sql()}
 )
 SELECT r.id::text AS template_release_id,
        r.template_name,
        r.runtime,
-       r.content_hash,
+       r.hash AS content_hash,
        r.created_at::text AS created_at,
        r.newest_rank::text AS newest_rank,
        (
@@ -2113,10 +2311,17 @@ SELECT r.id::text AS template_release_id,
 FROM ranked r
 WHERE r.created_at < TIMESTAMPTZ {sql_literal(cutoff)}
   AND r.newest_rank > {args.keep_latest_per_template}
+  -- A tag on any release of the digest, under either spelling: lookups
+  -- resolve a tag to the digest's original release, which may not be the
+  -- release a tag written before that rule names.
   AND NOT EXISTS (
       SELECT 1
       FROM template_release_tags tags
-      WHERE tags.template_release_id = r.id
+      JOIN template_releases tagged
+        ON tagged.id = tags.template_release_id
+      WHERE tagged.template_name = r.template_name
+        AND replace(tagged.hash, 'sha256:', '')
+          = replace(r.hash, 'sha256:', '')
   )
   AND NOT EXISTS (
       SELECT 1
@@ -2127,7 +2332,7 @@ WHERE r.created_at < TIMESTAMPTZ {sql_literal(cutoff)}
       SELECT 1
       FROM kubernetes_pool_slots slots
       WHERE slots.template_release_id = r.id
-  )
+  ){superseded_template_shared_artifact_guard_sql("r")}
 ORDER BY r.created_at, r.template_name, r.id
 {oldest_limit_clause(args)}
 """
@@ -2273,18 +2478,36 @@ CREATE TEMP TABLE requested_template_releases (id uuid PRIMARY KEY) ON COMMIT DR
 INSERT INTO requested_template_releases (id)
 VALUES
 {values};
+-- Registration and the admin tag and delete lock the parent template first,
+-- so taking it first too orders this delete behind them and behind another
+-- prune of the same template instead of deadlocking on the release rows.
+CREATE TEMP TABLE locked_templates (name text NOT NULL) ON COMMIT DROP;
+INSERT INTO locked_templates (name)
+SELECT t.name
+FROM templates t
+JOIN template_releases r ON r.template_name = t.name
+JOIN requested_template_releases requested ON requested.id = r.id
+FOR NO KEY UPDATE OF t;
+-- The tag guard below reads tags on every release of the candidate's digest,
+-- but a tag writer's foreign-key check locks only the release it tags, and
+-- not every tag writer locks the template. Lock them all first, so a tag
+-- written on either spelling either commits before the guard reads it or
+-- waits for this delete.
+CREATE TEMP TABLE locked_digest_releases (id uuid NOT NULL) ON COMMIT DROP;
+INSERT INTO locked_digest_releases (id)
+SELECT digest.id
+FROM template_releases r
+JOIN requested_template_releases requested ON requested.id = r.id
+JOIN template_releases digest
+  ON digest.template_name = r.template_name
+ AND replace(digest.hash, 'sha256:', '') = replace(r.hash, 'sha256:', '')
+FOR UPDATE OF digest;
 CREATE TEMP TABLE locked_template_releases (
     id uuid PRIMARY KEY,
     template_name text NOT NULL,
     content_hash text NOT NULL
 ) ON COMMIT DROP;
-WITH ranked AS (
-    SELECT r.id,
-           ROW_NUMBER() OVER (
-               PARTITION BY r.template_name
-               ORDER BY r.created_at DESC, r.id DESC
-           ) AS newest_rank
-    FROM template_releases r
+WITH ranked AS ({superseded_template_ranked_sql()}
 )
 INSERT INTO locked_template_releases (id, template_name, content_hash)
 SELECT r.id, r.template_name, r.hash
@@ -2293,10 +2516,17 @@ JOIN requested_template_releases requested ON requested.id = r.id
 JOIN ranked ON ranked.id = r.id
 WHERE r.created_at < TIMESTAMPTZ {sql_literal(cutoff)}
   AND ranked.newest_rank > {args.keep_latest_per_template}
+  -- A tag on any release of the digest, under either spelling: lookups
+  -- resolve a tag to the digest's original release, which may not be the
+  -- release a tag written before that rule names.
   AND NOT EXISTS (
       SELECT 1
       FROM template_release_tags tags
-      WHERE tags.template_release_id = r.id
+      JOIN template_releases tagged
+        ON tagged.id = tags.template_release_id
+      WHERE tagged.template_name = r.template_name
+        AND replace(tagged.hash, 'sha256:', '')
+          = replace(r.hash, 'sha256:', '')
   )
   AND NOT EXISTS (
       SELECT 1
@@ -2307,7 +2537,7 @@ WHERE r.created_at < TIMESTAMPTZ {sql_literal(cutoff)}
       SELECT 1
       FROM kubernetes_pool_slots slots
       WHERE slots.template_release_id = r.id
-  )
+  ){superseded_template_shared_artifact_guard_sql("r", "requested_template_releases")}
 FOR UPDATE OF r;
 CREATE TEMP TABLE locked_template_storage (
     template_release_id uuid PRIMARY KEY,
@@ -3159,6 +3389,7 @@ def run_scan(args: argparse.Namespace) -> int:
 
 def run_verify(args: argparse.Namespace) -> int:
     out = output_dir(args)
+    refuse_unparseable_storage_locations(args, "count superseded templates")
     cutoff_row = db_cutoff(args)
     cutoff = cutoff_row["cutoff"]
     keep_predicate = snapshot_generation_keep_predicate_sql()
@@ -3248,15 +3479,7 @@ old_snapshot_generations AS (
       AND storage_uri_snapshot_scoped
       AND NOT has_creating_snapshot
 ),
-ranked_template_releases AS (
-    SELECT r.id,
-           r.template_name,
-           r.created_at,
-           ROW_NUMBER() OVER (
-               PARTITION BY r.template_name
-               ORDER BY r.created_at DESC, r.id DESC
-           ) AS newest_rank
-    FROM template_releases r
+ranked_template_releases AS ({superseded_template_ranked_sql()}
 ),
 superseded_template_candidates AS (
     SELECT r.id
@@ -3277,7 +3500,7 @@ superseded_template_candidates AS (
           SELECT 1
           FROM kubernetes_pool_slots slots
           WHERE slots.template_release_id = r.id
-      )
+      ){superseded_template_shared_artifact_guard_sql("r")}
 )
 SELECT (SELECT COUNT(*) FROM sandboxes)::text AS total_sandboxes,
        (SELECT COUNT(*) FROM sandbox_k8s_executions)::text AS total_execution_rows,

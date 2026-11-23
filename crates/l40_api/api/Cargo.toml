@@ -91,6 +91,7 @@ pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-bearer-token = { workspace = true }
 pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
+pplx-space-cluster-id = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
@@ -156,9 +157,11 @@ pplx-space-service-lifecycle = { workspace = true }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
+pplx-space-template-release-original = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 
 [dev-dependencies]
+pplx-space-template-release-store = { workspace = true, features = ["test-support"] }
 pplx-space-api-route = { workspace = true, features = ["test-support"] }
 pplx-space-ecw-credential = { workspace = true, features = ["test-support"] }
 pplx-space-internal-api-server = { workspace = true }

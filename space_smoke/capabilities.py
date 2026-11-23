@@ -1135,6 +1135,9 @@ class SandboxPodRender:
     phase: str | None
     node_name: str | None
     pool_role: str | None
+    annotations: Mapping[str, str] = field(default_factory=dict)
+    required_node_terms: tuple[tuple[Mapping[str, Any], ...], ...] = ()
+    """The required node affinity's terms (ORed), each its `matchExpressions` (ANDed)."""
 
 
 class NodeSelectorExtrasControl(Protocol):
@@ -1411,6 +1414,7 @@ class EcwScenarioSandboxes(Protocol):
         *,
         network: NetworkConfig | None = None,
         allow_internet_access: bool | None = None,
+        template: str | None = None,
     ) -> EcwSandbox: ...
 
     def fork(
@@ -1426,6 +1430,8 @@ class EcwScenarioSandboxes(Protocol):
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        template: str | None = None,
+        refused_statuses: Collection[int] = (),
     ) -> EcwCreateAttempt: ...
 
     def delete(self, sandbox: CommandSandbox) -> int: ...
@@ -3053,13 +3059,15 @@ class ConsoleControl(Protocol):
         body: Mapping[str, object] | None = None,
         *,
         idempotency_key: str | None = None,
+        if_match: int | None = None,
     ) -> ConsoleApiResponse:
         """One request to `/admin/api/v1/...` or `/auth/v1/...` as the operator.
 
         An HTTP error status is returned, not raised, so a scenario judges a
         404 itself; a transport failure raises without the credential. The
         admin sandbox writes require an `Idempotency-Key`; replaying one
-        answers the operation it first created.
+        answers the operation it first created. `if_match` sends a generation
+        as `If-Match`, for the generation-checked admin writes.
         """
         ...
 

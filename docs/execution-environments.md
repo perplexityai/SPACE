@@ -1191,8 +1191,11 @@ build it gets is bound to that environment's partition: a node holding a
 digest under E0 and E1 boots the E1 build for an E1 pod, and an E0 pod boots
 the legacy-partition build, which unbound builds share. A node holding the
 digest only under another environment pulls the release, which its manifest
-places; a release that lands in another partition leaves the lookup
-`NOT_FOUND`, and the create fails rather than boot the build that's there. An
+places. A release that lands in another partition leaves the lookup
+`NOT_FOUND`. One that lands in the legacy partition while it holds an adopted
+build bound to another environment leaves it `FAILED_PRECONDITION` ("Template
+caches per environment" below). Either way the create fails rather than boot
+the build that's there. An
 older template-manager answers with its preferred build, which the
 partition check refuses. The
 sandbox runs the build's own binding, which the node admits first when it
@@ -1202,9 +1205,9 @@ another environment. A restore, fork or stopped start
 pod boots through Start, not Create, and doesn't send it. In `shadow` the
 annotation is absent and the create names no environment.
 
-On Kubernetes, `on` fails startup for now (see "Not covered"), so what
-follows describes what it does once it's supported. It has no fleet-wide
-fallback and no E0 exemption. If every node lacks the
+On Kubernetes, `on` runs while resume-time runtime upgrades are off; with
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` on it fails startup (see "Not
+covered"). It has no fleet-wide fallback and no E0 exemption. If every node lacks the
 labels at once, as on a new cluster or after node-managers roll out an
 observation this node-ctl can't decode, kube-scheduler can place no new bound
 pod, E0 included, and every restore pinned to its source node is refused: by
@@ -1217,11 +1220,19 @@ running keep running and count as `no_evidence` in
 placement shadow" in [observability.md](observability.md)). Switching the
 gate to `shadow` stops new pods from requiring the label.
 
+The Kind smoke `local.environment_placement_gate_on_places_bound_pods` turns
+the gate `on` on a bench and checks this against kube-scheduler. A create bound
+to an environment no worker publishes is refused as unschedulable, an E0-bound
+create runs E0, and the first create runs once the workers publish its
+environment.
+
 #### Not covered
 
-On Kubernetes, `on` fails startup with `SubstrateError::Unsupported`: a
-runtime-upgrade activation's pod requires the recorded environment rather than
-the upgrade's target. Lifting it also needs every worker on a shim that reads
+On Kubernetes, `on` fails startup with `SubstrateError::Unsupported` while
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` is on: a runtime-upgrade
+activation's pod requires the recorded environment rather than the upgrade's
+target. With resume-time upgrades off no activation upgrades, so `on` runs.
+It also needs every worker on a shim that reads
 `space.pplx.net/environment-required`, since an older shim ignores it.
 `shadow` runs: it records, labels and counts without changing placement.
 
@@ -1289,7 +1300,19 @@ pool config pins it, which keeps creating slots. Where creates boot the twin
 they resolve to ([Resolving creates to template
 twins](#resolving-creates-to-template-twins)), a tag keeps in use the release
 its build resolves to, which may be a twin, not the tagged release; anywhere
-else, the tagged release. An
+else, or when no release of the build qualifies, the tagged digest's original
+release, whichever spelling the tag sits on. Until no API image that predates
+that rule can serve or be rolled back to, the tagged release counts there too,
+since such an image creates from it. The reverse doesn't hold while API
+images are mixed, in a rollout or a partial rollback: an older image's guard
+counts only the tagged release, so a block or default change it serves can stop
+the environment of a digest original that newer images create from by tag.
+Make those writes only while every API replica runs the same image. That's
+not enough for a block an older image already allowed: before this rule
+serves, check that no environment that's blocked, or stopped by the default,
+holds the digest original of a tagged digest whose tag sits on the other
+spelling's release, and allow that environment or retag the digest original
+first, since creates by that tag will run it. An
 in-use release counts when it's bound to an environment that stops, or when its
 environment can't be told, since new creates from it may run there. A superseded
 release doesn't count: it strands work only through the sandboxes made from it,
@@ -1304,9 +1327,17 @@ A block also needs `strand: true` while an unfinished template runtime upgrade
 campaign moves releases off the environment, since it would stop the releases
 the campaign hasn't given a twin on its target yet; that refusal carries the
 same `at_risk` report when work is bound to the environment too. It skips an
-environment that already doesn't execute in the same way. The first default
-doesn't check campaigns yet, and a block checks a campaign's source, not its
-target.
+environment that already doesn't execute in the same way. A block checks a
+campaign's source, not its target. The first default needs `strand: true` the
+same way while such a campaign moves an environment it stops. A campaign waits
+for its target to be the default, so the way through is recording a state for
+the source first: `allowed` or `deprecated` keeps it executing. It reads each
+environment it stops that has template releases or an unfinished template
+campaign under the lock a campaign start for it takes, so no campaign can
+start on one before the default commits. A campaign on any other environment
+had no release to move when the default read them; one started there after
+that read, on a release registered after it, isn't caught. Both refusals name
+the campaign.
 Both writes take an optional `If-Match: <generation>` (`--if-generation` in the
 CLI) and answer 412 without changing anything unless the policy is still at
 that generation, so an operator writing from a stale read can't undo another's
@@ -1528,16 +1559,162 @@ config becomes operator-managed, so the autoscaler stops adjusting it, and it
 takes the original's disk size and disk I/O limits. The response reports the
 original's. The upsert reaches only the twin resolution picks when it runs: a
 twin picked later, after the default moves, gets no copy. An upsert that names
-a release (`template_release_id`, which the admin console sends when it edits or
-detaches an existing pool) changes exactly that release's config, so an edit of
-an earlier twin's pool stays on that twin after the default moves; named or
-resolved, only an original's upsert reaches a twin. Disabling an
+a twin's release (`template_release_id`, which the admin console sends when it
+edits or detaches an existing pool) changes exactly that twin's config, so an
+edit of an earlier twin's pool stays on that twin after the default moves. An
+upsert of an original, named or resolved, also reaches the twin creates pick;
+only an original's upsert reaches a twin. Disabling an
 original's config by its id disables the config for the same shape on every one
 of its twins, whether or not creates boot twins, so an earlier twin's
 operator-managed config doesn't keep warming slots; disabling a twin's config
 changes only that config, though without a policy the twin's cold creates then
 take the original's shape. An autoscaler-owned config that's disabled is
 enabled again on the autoscaler's next pass, as an original's is.
+
+### Template runtime upgrade campaigns
+
+A template campaign gives each release on its source a *twin*: a second
+`template_releases` row with the same template name and hash, bound to the
+campaign's target in `execution_metadata`. A release recorded without an
+environment counts as the initial environment's, since nodes cache unbound and
+initial-bound builds in the same legacy partition. The twin shares its
+original's artifacts and storage locations and has no tags. Its own
+`metadata.json` is the original's with the target's execution metadata, under
+`<build>/environments/<target>/metadata.json` beside the build's shared one,
+which isn't rewritten. Template-manager reads it when it pulls a twin's
+build, binding the build's shared `manifest.json` to the twin's document: the
+shared manifest keeps the source's execution metadata, and template-manager
+refuses a build whose manifest and metadata disagree. Template-manager's
+`GetCapabilities` answers `reads_twin_metadata: true`, and node-ctl reports
+that answer in its status (`reads_twin_metadata`); a template-manager that
+predates the RPC reports `false`, and one that doesn't answer reports
+nothing. A template campaign holds until every worker reports `true`, as
+below. The cluster controller reads the shared
+document and writes the twin's with its own object-storage credentials; the
+EKS module
+grants its role read access to builds' `metadata.json` and `manifest.json`,
+and write access only to `environments/*/metadata.json` keys
+(`infra/space/aws/eks/modules/space/cluster_controller_pod_identity.tf`). Each
+operator-managed (`manual`), plaintext Kubernetes warm pool
+config of the original is copied to the twin. The autoscaler moves
+autoscaler-owned pools itself ([Resolving creates to template
+twins](#resolving-creates-to-template-twins)).
+
+The driver holds every template campaign unless the cluster's pods boot the
+environment a twin is bound to (`twins_not_booted`): only a Kubernetes pod
+with the environment placement gate `on` requires its work's environment, and
+otherwise a create resolved to a twin still boots its build's legacy
+partition. A campaign that completed there would have moved nothing, and the
+environment block check would pass on it. The campaign read reports this hold
+(`held: {reason: "twins_not_booted", detail}`). It also holds a campaign until its target
+is the cluster default (`target_not_default`), the target is a compiled environment
+(`target_not_compiled`), for a compiled source, the catalog certifies the
+edge from it (`edge_not_certified`), and every worker reads a twin's own
+metadata (`nodes_dont_read_twins`). That last hold counts each of the
+substrate's workers, draining or not and whatever environments it lists,
+whose node status isn't current evidence of its environments (no snapshot, or
+an incomplete or stale one) or whose node-ctl `reads_twin_metadata` isn't
+`true`: node-ctl's labels decide where a create lands, and a draining node can
+still admit pods. A substrate with no worker registered holds too, since a
+node that joins later takes creates whatever it supports; a node that runs
+pods before its `nodes` row exists isn't seen at all. A node from before that
+report never sends it, so a fleet mid-rollout holds until its last old worker
+is replaced or removed. The campaign read reports this hold too
+(`held: {reason: "nodes_dont_read_twins", detail}`), and the cluster
+controller logs it with up to five of the holding workers' ids. A twin's
+commit checks the workers again and releases its item if one doesn't report
+it. That narrows the window between the plan and the commit but doesn't close
+it: the check takes no lock on node registration or status, so a change that
+commits after it isn't seen. Neither check reaches twins already made: if a worker's
+template-manager is rolled back after twins exist, creates resolved to a twin
+can still land there. Moving the default back makes the release bound to the
+new default win resolution, and that's the original only when the original is
+bound to it: where an earlier campaign made twins, the previous default's
+release may itself be a twin, so moving the default doesn't recover from a
+reader rollback. Twins made earlier would sit unresolved: a release
+bound to the default comes first, and until the default moves, that's each
+build's original when the original is on the default. Once the default moves,
+a template's creates move as its twin appears, at the campaign's pace.
+
+For each item, the driver:
+
+1. skips a release that's gone or whose template is being deleted;
+2. ends done when the release is already in the target's partition, or the
+   build already has a release there under either spelling of its hash;
+3. skips a release that's no longer on the source, and fails one whose
+   storage locations carry an owner-scoped encryption sidecar, which a twin
+   can't share yet. That release is still the campaign's to move, so it
+   counts against the failure budget rather than letting the campaign
+   complete without it;
+4. reads the build's `metadata.json` from the first of its storage locations
+   that serves it;
+5. checks that the build cold boots under the target and that the target
+   runs its guest image. A build recording no execution metadata in its
+   release or its `metadata.json` is checked against its `manifest.json`'s,
+   which template-manager reads first; a manifest the schema refuses fails.
+   Only a build recording none in any of the three is taken as the initial
+   environment's, and only when its image is x86_64, its architecture
+   resolved as template-manager resolves it; any other fails. Its
+   `manifest.json` comes from the location that served `metadata.json`, else
+   the first other location that has it;
+6. then makes its base's twin first, for a derived template, however deep
+   its lineage. The base is `base_resolved` in that `metadata.json`
+   (`<template>@<hash>`). The lease takes pending items in id order, so a
+   derived item that waited for its base's item could hold the base back.
+   Instead it makes the base's twin, and the base's own item then ends done.
+   A base that is its own ancestor fails the item. One item can therefore
+   commit several twins, and a canary's single item moves its lineage up to
+   the first base that already has a twin: the canary limits items, not
+   twins. The checks come first so
+   that a derived build the target can't run fails without moving its base,
+   whose twin would take the base's creates as soon as it committed;
+7. writes the twin's `metadata.json` beside the build in each storage
+   location that still serves the build's own `metadata.json` and
+   `manifest.json`, which every pull reads, and takes the write, then inserts
+   the twin with only those locations,
+   after rechecking under the policy row's share lock that the target is
+   still the cluster default (a default that moved while the item was in
+   flight returns it to pending without spending an attempt, and the plan
+   then holds the campaign),
+   in one transaction holding the template's row lock, which release
+   registration's lock conflicts with. Once nodes read the twin's document, a
+   pull from a location the write missed would find the source's, so the
+   twin keeps only the locations it reached;
+8. copies the manual, plaintext pool configs of every original of the build
+   on the campaign's source, under either hash spelling, to the twin in that
+   same transaction: a twin bound to the default wins resolution as soon as
+   it commits, so it never commits without them. Creates of both spellings
+   resolve to the one twin, and the other spelling's item finds it and ends
+   done, so the copy takes both originals' configs at the insert; for a shape
+   both configure, the newer original's settings win. A manual config the twin
+   already has for a shape is kept; one the autoscaler made for it first
+   takes the original's manual settings. An operator's pool-config disable
+   for the template, and an upsert where creates boot twins (the only case
+   it changes a twin), take the template's row lock before they look up the
+   twins they change too (the one creates resolve to, for an upsert; every
+   twin of the original, for a disable), so each either lands before the copy
+   reads the original's configs or sees the committed twin and changes its
+   config too. That holds for an edit or disable named by an original's
+   release ID. One named by a twin's release ID changes only that twin's
+   config, so after a later campaign, name the newest twin's release ID to
+   change its pool.
+   The original's configs stay enabled, so a rollback that moves the default
+   back finds its pools warm; until an operator disables them, each copied
+   pool warms slots for both releases, and only the twin's are claimed.
+
+A pass reads the releases on the source as it pages through them. A release
+registered on the source behind the cursor, by a builder that hasn't adopted
+the new default, is found by the next pass, as long as the current one leased
+work. Only a pass that leased nothing completes the campaign, so a release
+registered behind that final pass's cursor isn't moved. If a completed
+campaign leaves source releases that have no twin on the target, start
+another once builders have converged.
+
+While `idx_template_releases_template_name_hash_unique` still stands, no
+release can have a twin: the insert does nothing, and the item fails saying
+so, which counts against the failure budget. A release without storage
+locations that already holds the build's slot in the target's partition keeps
+the twin out the same way, and the item fails naming that release.
 
 ### Selecting a restore consumer
 
@@ -1994,8 +2171,9 @@ as such a build may be rolled back to.
 The loop is off unless `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on
 ([configuration.md](configuration.md)). Off, it reads and writes no campaign
 table. What a kind's subjects are, and how one is upgraded, belong to that
-kind's driver. No kind has a driver yet, so the admin API refuses to start a
-valid campaign (409), and the loop only reports a campaign it finds. Each tick the
+kind's driver. Only template campaigns have one ([Template runtime upgrade
+campaigns](#template-runtime-upgrade-campaigns)), so the admin API refuses to
+start a valid sandbox campaign (409), and the loop only reports one it finds. Each tick the
 loop also returns a finished campaign's in-flight items whose leases lapsed to
 pending (see abort below), and for every unfinished campaign whose kind has a
 driver, it:
@@ -2400,8 +2578,12 @@ template-cache eviction disabled.
 the selected environment's partition, else the legacy build, else any other
 build of the digest. Absent, it prefers the legacy build, so
 environment-unaware callers keep their behavior; E0 selects the legacy
-partition. A lookup of a template's latest build returns the newest build of
-any partition, as before partitions existed. New tie-breaks send same-date
+partition. A lookup of a template's latest build that names an environment
+returns the newest ready build bound to that environment's partition, however
+old: for the legacy partition an unbound or initial-environment build, for
+another partition a build in it or an adopted legacy-layout build bound to it.
+With no such build on the node, or with no environment named, it returns the
+newest build of any partition, as before partitions existed. New tie-breaks send same-date
 builds to the larger content hash, and builds of one digest to the preferred
 partition, then the legacy one. The caller checks the build it gets as a
 compatible cold-boot source for the environment it runs under, which keeps
@@ -2420,8 +2602,18 @@ to it. It needs an exact digest and excludes `cached_only`. A node holding no
 such build pulls the release even when another partition holds the digest,
 since the pull's fast path then counts only a build bound to the required
 partition. If the release's manifest places it in a partition that already
-holds the digest, the pull writes nothing, and the lookup is `NOT_FOUND`.
-Pulls of one digest share a flight whatever they require. A required pull
+holds the digest's build bound to that partition, the pull writes nothing, and
+the lookup is `NOT_FOUND`. If that partition is the legacy one and its build
+is an adopted one bound to another environment, or one whose stored metadata
+doesn't parse, which reads as unbound, the pull fails instead, and the lookup
+is `FAILED_PRECONDITION` (fetch-error reason
+`partition_held_by_another_environment`). The build stays.
+A pull of a release bound to an environment has a flight per cache partition
+and shares only a pull of the same partition. It waits out a claim, or any
+pull of the digest whose partition its manifest decides, and then pulls again.
+Pulls whose partition their manifest decides share one flight per digest and
+wait out every partition's pull, so an environment-less pull waits for each
+twin's. A required pull
 that joins a flight whose owner found the digest cached in another partition
 goes round again, and pulls as the owner when nobody else has started one.
 `ListTemplates` reports each build's partition key in
@@ -2616,8 +2808,24 @@ Known limits until the cluster side carries partitions:
   original release, so a client that sends `environment` to
   `FindTemplateRelease`, `FindTemplateReleaseByHash` or
   `ListLatestTemplateReleases` must require `environment_applied` in the
-  response before it uses the release or any storage location in it. No client sends a selector yet. No dedicated writer
-  creates twins yet, but once the old index is gone the build publisher can:
+  response before it uses the release or any storage location in it.
+  Template-manager is the one client that sends it. An on-demand pull that
+  requires an environment (`environment_required`, which takes an exact
+  digest) names it on `FindTemplateReleaseByHash`; when a server ignores
+  it, the pull drops that answer and asks again without a selector. It takes
+  the second answer when its release is unbound, and the partition check
+  decides, as before twins, or bound to the environment; one bound elsewhere
+  isn't found. Environment prefetch
+  (`SPACE_TEMPLATE_ENVIRONMENT_PREFETCH_ENABLED`) names it on tag lookups,
+  `ListLatestTemplateReleases` and the digest lookups of the pulls it starts.
+  To prefetch, an ignored selector makes the answer unknown, so it warms
+  nothing. On a tag lookup or `ListLatestTemplateReleases`, it also holds that
+  lookup's pins for up to 10 minutes after the lookup's last acknowledged
+  answer (or after the prefetch loop started), then prunes them as before
+  environments; an answer that says the template is org-specific drops its
+  pins at once. The template campaign driver creates twins (see "Template
+  runtime upgrade campaigns"), and once the old index is gone the build
+  publisher can too:
   while a release has no storage location, a build of the same hash bound to
   another environment registers its execution metadata, and the registration
   inserts a twin when every tag it names is already on the hash (a twin
@@ -2628,12 +2836,14 @@ Known limits until the cluster side carries partitions:
   tag it names that isn't on the hash yet refuses it.
   After that, recreating the old index fails, so an image rollback past the
   drop isn't possible. A twin's own `metadata.json`
-  (`<build>/environments/<environment>/metadata.json`) has no writer. Node
+  (`<build>/environments/<environment>/metadata.json`) is written only by the
+  template campaign driver. Node
   inventory is still keyed by template and hash: node-ctl publishes a
   template's legacy-partition build, and another partition's only when it has
   none, so central inventory can't yet tell which nodes hold a twin's build.
   Node presence labels already carry a separate label for each partition's
-  build, but readers still use the partition-less one.
+  build. The warm pool reads that label when its pods require an environment;
+  other readers still use the partition-less one.
 - A twin's build shares its original's `manifest.json` and `metadata.json`
   keys, since object keys carry only template and hash, and template-manager's
   pull derives a build's cache partition and execution from those two
@@ -2659,52 +2869,101 @@ Known limits until the cluster side carries partitions:
   without removing anything. Two publishes of one hash in the same
   environment can still interleave, as before, so one's manifest can end up
   beside the other's rootfs: the publisher doesn't serialize them.
-- Don't drop the old `(template_name, hash)` unique index until the internal
-  API, the API and the cluster controller all run this code, and no rollback
-  target predates it. `scripts/bootstrap-templates.sh` also has to be updated
-  or retired first: its release insert's `ON CONFLICT (template_name, hash)`
-  needs a unique index on exactly those columns, so it fails once the index
-  is gone, even with no twins. It runs with `ON_ERROR_STOP=1` and no
-  transaction, so it stops there, after its template upsert has committed.
-  Its tag and storage-location inserts also pick releases by template and
-  hash alone: with only the release insert fixed, the tag insert fails once
-  a twin exists, which stops the script again, and the storage-location
-  insert, if reached, would add the location to every release of the hash. Recreating the index isn't a
-  rollback once a twin exists: the twin and its original share a template and
-  hash, so the index build fails.
-- Don't drop the old index until the internal API, the API and the cluster
-  pool share one original-release rule, deployed, and no rollback target
-  predates it. Today each spells the rule in its own SQL: the internal API's
-  registration and tag writer prefers, across both spellings of a digest, the
-  original that owns a storage location, the API's statements prefer the
-  canonical `sha256:` spelling and pick its earliest release, and the
-  warm-pool store's count each spelling's earliest release as an original. So
-  a digest stored under both spellings can already resolve to different
-  releases under the old index, as before this change, when the bare one owns
-  the storage location. Once twins exist, each spelling can also hold
-  several releases, and every path has to keep resolving the same original
-  over its twins.
-- Don't run `scripts/admin/prune_cluster_artifacts.py superseded-templates`
-  on a deployment with twins until the script applies the original-release
-  rule. It deletes an old release that no tag, pool config or pool slot names,
-  then the storage that release's locations name. Tags attach to the
-  original, so a twin is never tagged. A twin shares its original's whole
-  build prefix (rootfs, manifest and the shared `metadata.json`); only its
-  own `metadata.json` lives under `<build>/environments/<environment>/`. So
-  deleting either one's storage deletes a build the other still serves, and
-  the script has to protect the shared build prefix, not just the
-  environment directory. Twins can exist
-  only once the old `(template_name, hash)` unique index is dropped, and a
-  run already under way can delete an original whose first twin is
-  registered meanwhile, so let any live run finish before dropping the index,
-  and keep live runs off until the script protects storage a twin shares.
+- One rule picks a digest's original release, owned by
+  `crates/l30_storage/template/release/original`: among the releases of a
+  template whose hash spells the digest either way (`sha256:<hex>` or bare
+  `<hex>`), each spelling's original is its earliest release by
+  `(created_at, id)`, and the digest's original is the spelling original that
+  owns a storage location, or the earlier one when both or neither do. The
+  internal API's registration, tag writer, hash and tag lookups and listing,
+  the API's create-by-digest, create-by-tag and placement lookups, the admin
+  tag refusal and delete guard, the runtime environment in-use count, the
+  warm-pool store's retention and demand reads, and
+  `scripts/bootstrap-templates.sh` all interpolate that one predicate. Twin
+  resolution (`resolved_release_sql`, above) breaks a tie between a build's
+  releases under the two spellings with it too, so a create naming either
+  spelling runs the release the warm pool warms. It still ranks the original
+  tier by the build's earliest storage-owning release, twins included, so the
+  two can differ when a twin owns a storage location its spelling's original
+  lacks. A tag
+  written before the rule can sit on the other spelling's original; tag
+  lookups, the pool's `latest` preference and retention's publish time read
+  it as a tag on the digest, so it resolves to the digest original. A manual
+  pool config upserted before the rule can still name the other spelling's
+  original and keeps warming it until it's disabled with
+  `DELETE /admin/api/v1/warm-pools/{id}`. Upserting the same config again
+  doesn't retire it: the upsert adds a config on the digest original and
+  leaves the old one enabled. A rollback to an image that predates the rule
+  half-strands a config the new API upserted on a bare digest original:
+  old creates by digest resolve to its `sha256:` spelling and miss it, while
+  old creates by a tag on the bare release still hit it. Disabling it and
+  upserting again with the `sha256:` hash, which the old API matches
+  exactly, swaps which of the two goes cold, so keep the one that carries
+  the traffic. Mixed versions can
+  still disagree: an image that predates the rule resolves a digest stored
+  under both spellings as it did before (the API preferring the canonical
+  spelling, the warm pool counting each spelling's original), so don't
+  deploy the migration that drops the old index (below) until the internal
+  API, the API and the cluster controller all run the shared rule and no
+  rollback target predates it. Until the API
+  and the cluster controller have both rolled, creates for such a digest can
+  miss the warm pool in either order: an old controller ranks each spelling's
+  original separately for retention and maps demand to the spelling a
+  sandbox records.
+- Migration `20261119015950` drops the old `(template_name, hash)` unique
+  index. The migration job applies it on deploy, so don't deploy a release
+  that contains it until every SPACE service image that's deployed on a
+  cluster, or kept as a rollback target, registers twins without that index
+  and runs the shared original-release rule above: api, worker,
+  cluster-controller, data-plane and builder-bundle.
+  `scripts/bootstrap-templates.sh` doesn't depend on the index: under the
+  `templates` row lock it inserts a release only when the digest has none
+  under either spelling, and puts the `latest` tag and the storage location
+  on the digest's original. A
+  checkout of the script from before that change still uses `ON CONFLICT
+  (template_name, hash)`, which fails once the index is gone, after its
+  template upsert has committed. Recreating the index isn't a rollback once a
+  twin exists: the twin and its original share a template and hash, so the
+  index build fails.
+- `scripts/admin/prune_cluster_artifacts.py superseded-templates` ranks
+  each digest once, by its first release under either spelling, and
+  never selects a release that shares its template and digest, under either
+  spelling, with another release, or whose storage location equals another
+  release's or is a string prefix of it, either way round. While any storage
+  location isn't an `s3://<bucket>/<key>` URI, it refuses to list anything,
+  and `scan` and `verify` stop without a report: a bucket root such as
+  `s3://bucket/`, or a malformed location such as `s3:`, would count as a
+  prefix of every location in its bucket, or of every location. The internal
+  API accepts a bucket-root location, so such a row has to be corrected in the
+  database before any of the three runs. A twin shares its original's whole build prefix
+  (rootfs, manifest and the shared `metadata.json`), so deleting either
+  one's storage would delete a build the other still serves. The delete
+  transaction locks the candidate's `templates` row in a mode that conflicts
+  with the lock registration under that template takes, but not with
+  foreign-key checks, and re-checks these rules under it, so no
+  twin or other release of that template can appear before its row deletes
+  commit. A registration under another template doesn't take that lock: one
+  whose storage location falls under the candidate's prefix can commit while
+  the check runs, and the check doesn't see it. The transaction also commits
+  the row deletes before it deletes the storage, and nothing fences a prefix
+  in between, so a registration of any template in that window that attaches
+  a storage location under the pruned prefix loses its artifacts. These rules
+  never prune an original that has a twin, the twin itself, or releases that
+  share a storage prefix, however superseded they are, so their storage stays
+  until a twin-aware rule exists. A run of the script from before these rules
+  can delete an original whose first twin is registered meanwhile, so let any
+  such run finish before dropping the index. Once twins exist, don't run a
+  checkout from before these rules at all: it ranks twins as the newest
+  releases, so it can select a superseded original and delete the build
+  prefix its twin still serves.
 - A restore of a btrfs-send stream needs the build its stream descends from.
   Its lookup prefers the snapshot's binding but falls back to another
   partition of the digest without pulling, so a node holding only another
   partition's build of that digest can't restore a stream whose parent it
   lacks, and nothing pulls that build for it: the restore keeps failing. Twins
   exist only where a node admits an environment besides the initial one.
-- Prefetch names no environment: it pulls without a selector, counts a build
+- With `SPACE_TEMPLATE_ENVIRONMENT_PREFETCH_ENABLED` off, prefetch names no
+  environment: it pulls without a selector, counts a build
   in any partition of a digest as cached, and its tag pins use the legacy
   partition key.
 
