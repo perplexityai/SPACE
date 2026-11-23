@@ -387,6 +387,7 @@ pplx-space-firewall-rules-store = [
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
+pplx-space-node-ctl-store = ["pplx-space-node-ctl-server"]
 pplx-space-node-execution-inventory-store = [
   "pplx-space-api",
   "pplx-space-internal-api-server",

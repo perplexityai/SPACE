@@ -31,6 +31,7 @@ use pplx_space_node_api_client::proto::{
     SetFacetSyncDisabledResponse, TriggerStateReconciliationRequest,
     TriggerStateReconciliationResponse,
 };
+use pplx_space_node_ctl_store::reconciliation_status;
 use pplx_space_node_mgr_client::{
     CacheDiskSchedulingEffect, NetworkPoolStatusReader, NodeManagerGrpcClient,
     NodeResourceStatusReader,
@@ -39,7 +40,7 @@ use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 use pplx_space_state_reconciliation::ReconcileReason;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -854,21 +855,7 @@ fn init_reconciliation_status(conn: &Connection, poll_interval_secs: u64) -> rus
         TEMPLATE_INVENTORY_OUTBOUND_RECONCILER,
         NODE_STATUS_OUTBOUND_RECONCILER,
     ] {
-        conn.execute(
-            "INSERT INTO reconciliation_status
-                 (name, poll_interval_secs, next_due_at, running, updated_at)
-             VALUES (?1, ?2, ?3, 0, ?3)
-             ON CONFLICT(name) DO UPDATE
-             SET poll_interval_secs = excluded.poll_interval_secs,
-                 next_due_at = CASE
-                     WHEN reconciliation_status.running != 0
-                     THEN ?3
-                     ELSE reconciliation_status.next_due_at
-                 END,
-                 running = 0,
-                 updated_at = ?3",
-            params![name, poll_interval_secs.cast_signed(), now],
-        )?;
+        reconciliation_status::register(conn, name, poll_interval_secs.cast_signed(), now)?;
     }
     Ok(())
 }
@@ -1718,13 +1705,7 @@ impl NodeCtlWorker {
             TEMPLATE_INVENTORY_OUTBOUND_RECONCILER,
             NODE_STATUS_OUTBOUND_RECONCILER,
         ] {
-            tx.execute(
-                "UPDATE reconciliation_status
-                 SET next_due_at = ?1,
-                     updated_at = ?2
-                 WHERE name = ?3",
-                params![next_due_at, now_secs(), name],
-            )?;
+            reconciliation_status::set_next_due(&tx, name, next_due_at, now_secs())?;
         }
         tx.commit()
     }
@@ -1957,15 +1938,7 @@ impl NodeCtlWorker {
             .db
             .lock()
             .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-        db.execute(
-            "UPDATE reconciliation_status
-             SET last_started_at = ?1,
-                 running = 1,
-                 updated_at = ?1
-             WHERE name = ?2",
-            params![now, name],
-        )?;
-        Ok(())
+        reconciliation_status::mark_started(&db, name, now)
     }
 
     async fn claim_cluster_reconcile_refs(&self) -> Option<ClusterReconcileClaim> {
@@ -2126,30 +2099,19 @@ impl NodeCtlWorker {
             .db
             .lock()
             .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-        db.execute(
-            "UPDATE reconciliation_status
-             SET last_completed_at = ?1,
-                 last_success_at = CASE WHEN ?2 != 0 THEN ?1 ELSE last_success_at END,
-                 running = 0,
-                 templates_seen = ?3,
-                 sandboxes_seen = ?4,
-                 templates_applied = ?5,
-                 sandboxes_applied = ?6,
-                 last_error = ?7,
-                 updated_at = ?1
-             WHERE name = ?8",
-            params![
-                now,
-                i64::from(success),
-                stats.templates_seen.cast_signed(),
-                stats.sandboxes_seen.cast_signed(),
-                stats.templates_applied.cast_signed(),
-                stats.sandboxes_applied.cast_signed(),
-                error.unwrap_or(""),
-                name,
-            ],
-        )?;
-        Ok(())
+        reconciliation_status::mark_finished(
+            &db,
+            name,
+            &reconciliation_status::FinishedRun {
+                completed_at: now,
+                success,
+                templates_seen: stats.templates_seen.cast_signed(),
+                sandboxes_seen: stats.sandboxes_seen.cast_signed(),
+                templates_applied: stats.templates_applied.cast_signed(),
+                sandboxes_applied: stats.sandboxes_applied.cast_signed(),
+                last_error: error.unwrap_or(""),
+            },
+        )
     }
 }
 
@@ -2159,39 +2121,24 @@ fn read_reconciliation_statuses(
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    let mut stmt = db.prepare(
-        "SELECT name,
-                poll_interval_secs,
-                last_started_at,
-                last_completed_at,
-                last_success_at,
-                next_due_at,
-                running,
-                templates_seen,
-                sandboxes_seen,
-                templates_applied,
-                sandboxes_applied,
-                last_error
-         FROM reconciliation_status
-         ORDER BY name ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(ReconciliationStatus {
-            name: row.get(0)?,
-            poll_interval_secs: i64_to_u64(row.get(1)?),
-            last_started_at_unix_secs: i64_to_u64(row.get(2)?),
-            last_completed_at_unix_secs: i64_to_u64(row.get(3)?),
-            last_success_at_unix_secs: i64_to_u64(row.get(4)?),
-            next_due_at_unix_secs: i64_to_u64(row.get(5)?),
-            running: row.get::<_, i64>(6)? != 0,
-            templates_seen: i64_to_u64(row.get(7)?),
-            sandboxes_seen: i64_to_u64(row.get(8)?),
-            templates_applied: i64_to_u64(row.get(9)?),
-            sandboxes_applied: i64_to_u64(row.get(10)?),
-            last_error: row.get(11)?,
+    let rows = reconciliation_status::list(&db)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ReconciliationStatus {
+            name: row.name,
+            poll_interval_secs: i64_to_u64(row.poll_interval_secs),
+            last_started_at_unix_secs: i64_to_u64(row.last_started_at),
+            last_completed_at_unix_secs: i64_to_u64(row.last_completed_at),
+            last_success_at_unix_secs: i64_to_u64(row.last_success_at),
+            next_due_at_unix_secs: i64_to_u64(row.next_due_at),
+            running: row.running,
+            templates_seen: i64_to_u64(row.templates_seen),
+            sandboxes_seen: i64_to_u64(row.sandboxes_seen),
+            templates_applied: i64_to_u64(row.templates_applied),
+            sandboxes_applied: i64_to_u64(row.sandboxes_applied),
+            last_error: row.last_error,
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
 fn group_refs(refs: Vec<dirty_state::FacetRef>) -> BTreeMap<facets::FacetKind, facets::FacetScope> {

@@ -66,6 +66,7 @@ pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-reconcile-metrics = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
+pplx-space-node-ctl-store = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-node-runtime-manager-client = { workspace = true }

@@ -156,12 +156,6 @@ postgres = [
   "build_job_results",
   "jobs",
 ]
-"sqlite.node-ctl" = [
-  "dirty_facets",
-  "dirty_node_state",
-  "facet_sync_overrides",
-  "reconciliation_status",
-]
 "sqlite.node-manager" = [
   "network_pool_meta",
   "network_slots",

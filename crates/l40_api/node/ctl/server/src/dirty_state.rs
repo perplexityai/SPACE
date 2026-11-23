@@ -7,12 +7,13 @@ use pplx_space_node_api_client::proto::{
     NetworkPolicyTargetRef, ReconcileFacet as ProtoReconcileFacet, facet_ref,
     network_policy_target_ref,
 };
+use pplx_space_node_ctl_store::{dirty_facets, facet_sync_overrides};
 pub use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_RUNTIME_PROVISIONING,
     FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
     FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NetworkPolicyTarget, ReconcileFacet,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 pub const ELEMENT_ALL: &str = "";
 pub const DIRECTION_INBOUND: &str = "inbound";
@@ -292,40 +293,14 @@ pub fn mark_refs(conn: &mut Connection, refs: &[FacetRef]) -> rusqlite::Result<(
     for reference in refs {
         let element = reference.element.as_deref().unwrap_or(ELEMENT_ALL);
         if element == ELEMENT_ALL {
-            tx.execute(
-                "DELETE FROM dirty_facets WHERE facet = ?1 AND element != ''",
-                params![reference.facet],
-            )?;
+            dirty_facets::delete_element_rows(&tx, &reference.facet)?;
         } else {
-            let whole_facet_dirty: Option<i64> = tx
-                .query_row(
-                    "SELECT dirty FROM dirty_facets WHERE facet = ?1 AND element = ''",
-                    params![reference.facet],
-                    |row| row.get(0),
-                )
-                .optional()?;
+            let whole_facet_dirty = dirty_facets::whole_facet_dirty(&tx, &reference.facet)?;
             if whole_facet_dirty.is_some_and(|dirty| dirty != 0) {
                 continue;
             }
         }
-        tx.execute(
-            "INSERT INTO dirty_facets
-                 (facet, element, dirty, dirty_generation, attempts, last_error,
-                  updated_at, last_attempt_at, next_attempt_at, claim_token, claimed_at)
-             VALUES (?1, ?2, 1, 1, 0, '', ?3, 0, ?3, '', 0)
-             ON CONFLICT(facet, element) DO UPDATE
-             SET dirty = 1,
-                 dirty_generation = dirty_generation + 1,
-                 attempts = 0,
-                 last_error = '',
-                 dead_at = 0,
-                 dead_reason = '',
-                 updated_at = ?3,
-                 next_attempt_at = ?3,
-                 claim_token = '',
-                 claimed_at = 0",
-            params![reference.facet, element, now],
-        )?;
+        dirty_facets::mark_dirty(&tx, &reference.facet, element, now)?;
     }
     tx.commit()
 }
@@ -350,23 +325,14 @@ pub fn read(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<DirtyFacetBatch> {
            )",
         params![claim_token, now, now.saturating_sub(CLAIM_STALE_AFTER_SECS)],
     )?;
-    let mut stmt = db.prepare(
-        "SELECT facet, element, dirty_generation
-         FROM dirty_facets
-         WHERE dirty != 0
-           AND claim_token = ?1
-         ORDER BY facet ASC, element ASC",
-    )?;
-    let rows = stmt.query_map(params![claim_token], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
+    let rows = dirty_facets::claimed(&db, &claim_token)?;
     let mut batch = DirtyFacetBatch::claimed(claim_token);
     for row in rows {
-        let (facet, element, generation) = row?;
+        let dirty_facets::ClaimedDirtyFacetRow {
+            facet,
+            element,
+            dirty_generation: generation,
+        } = row;
         batch.insert_generation(
             facet,
             if element.is_empty() {
@@ -536,17 +502,7 @@ pub fn set_disabled(
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    db.execute(
-        "INSERT INTO facet_sync_overrides
-             (facet, direction, disabled_until, reason, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(facet, direction) DO UPDATE
-         SET disabled_until = excluded.disabled_until,
-             reason = excluded.reason,
-             updated_at = excluded.updated_at",
-        params![facet, direction.as_db(), disabled_until, reason, now],
-    )?;
-    Ok(())
+    facet_sync_overrides::upsert(&db, facet, direction.as_db(), disabled_until, reason, now)
 }
 
 pub fn clear_disabled(
@@ -557,11 +513,7 @@ pub fn clear_disabled(
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    db.execute(
-        "DELETE FROM facet_sync_overrides WHERE facet = ?1 AND direction = ?2",
-        params![facet, direction.as_db()],
-    )?;
-    Ok(())
+    facet_sync_overrides::delete(&db, facet, direction.as_db())
 }
 
 pub fn is_disabled(
@@ -573,15 +525,7 @@ pub fn is_disabled(
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    let row: Option<Option<i64>> = db
-        .query_row(
-            "SELECT disabled_until
-             FROM facet_sync_overrides
-             WHERE facet = ?1 AND direction = ?2",
-            params![facet, direction.as_db()],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let row = facet_sync_overrides::disabled_until(&db, facet, direction.as_db())?;
     Ok(match row {
         Some(Some(disabled_until)) => disabled_until > now,
         Some(None) => true,
@@ -594,30 +538,27 @@ pub fn list_overrides(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<Vec<Facet
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    let mut stmt = db.prepare(
-        "SELECT facet, direction, disabled_until, reason, updated_at
-         FROM facet_sync_overrides
-         WHERE disabled_until IS NULL OR disabled_until > ?1
-         ORDER BY facet ASC, direction ASC",
-    )?;
-    let rows = stmt.query_map(params![now], |row| {
-        let direction = match row.get::<_, String>(1)?.as_str() {
-            DIRECTION_INBOUND => FacetDirection::Inbound,
-            DIRECTION_OUTBOUND => FacetDirection::Outbound,
-            _ => FacetDirection::Unspecified,
-        };
-        let disabled_until = row.get::<_, Option<i64>>(2)?;
-        Ok(FacetSyncOverride {
-            facet: row.get(0)?,
-            direction: direction.into(),
-            disabled_until_unix_secs: disabled_until
-                .filter(|value| *value > now)
-                .and_then(|value| u64::try_from(value).ok()),
-            reason: row.get(3)?,
-            updated_at_unix_secs: i64_to_u64(row.get(4)?),
+    let rows = facet_sync_overrides::active(&db, now)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let direction = match row.direction.as_str() {
+                DIRECTION_INBOUND => FacetDirection::Inbound,
+                DIRECTION_OUTBOUND => FacetDirection::Outbound,
+                _ => FacetDirection::Unspecified,
+            };
+            FacetSyncOverride {
+                facet: row.facet,
+                direction: direction.into(),
+                disabled_until_unix_secs: row
+                    .disabled_until
+                    .filter(|value| *value > now)
+                    .and_then(|value| u64::try_from(value).ok()),
+                reason: row.reason,
+                updated_at_unix_secs: i64_to_u64(row.updated_at),
+            }
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
 pub fn list_queue(
@@ -627,47 +568,27 @@ pub fn list_queue(
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    let mut rows = Vec::new();
-    if let Some(facet) = facet_filter {
-        let mut stmt = db.prepare(
-            "SELECT facet, element, attempts, last_error, updated_at, last_attempt_at
-             FROM dirty_facets
-             WHERE dirty != 0 AND facet = ?1
-             ORDER BY facet ASC, element ASC",
-        )?;
-        let mapped = stmt.query_map(params![facet], queue_item_from_row)?;
-        for row in mapped {
-            rows.push(row?);
-        }
+    let rows = if let Some(facet) = facet_filter {
+        dirty_facets::facet_queue(&db, facet)?
     } else {
-        let mut stmt = db.prepare(
-            "SELECT facet, element, attempts, last_error, updated_at, last_attempt_at
-             FROM dirty_facets
-             WHERE dirty != 0
-             ORDER BY facet ASC, element ASC",
-        )?;
-        let mapped = stmt.query_map([], queue_item_from_row)?;
-        for row in mapped {
-            rows.push(row?);
-        }
-    }
-    Ok(rows)
+        dirty_facets::queue(&db)?
+    };
+    Ok(rows.into_iter().map(queue_item_from_row).collect())
 }
 
-fn queue_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FacetQueueItem> {
-    let element = row.get::<_, String>(1)?;
-    Ok(FacetQueueItem {
-        facet: row.get(0)?,
-        element: if element.is_empty() {
+fn queue_item_from_row(row: dirty_facets::DirtyFacetQueueRow) -> FacetQueueItem {
+    FacetQueueItem {
+        facet: row.facet,
+        element: if row.element.is_empty() {
             None
         } else {
-            Some(element)
+            Some(row.element)
         },
-        attempts: i64_to_u64(row.get(2)?),
-        last_error: row.get(3)?,
-        updated_at_unix_secs: i64_to_u64(row.get(4)?),
-        last_attempt_at_unix_secs: i64_to_u64(row.get(5)?),
-    })
+        attempts: i64_to_u64(row.attempts),
+        last_error: row.last_error,
+        updated_at_unix_secs: i64_to_u64(row.updated_at),
+        last_attempt_at_unix_secs: i64_to_u64(row.last_attempt_at),
+    }
 }
 
 fn next_claim_token(now: i64) -> String {
@@ -676,13 +597,7 @@ fn next_claim_token(now: i64) -> String {
 }
 
 fn current_attempts(db: &Connection, facet: &str, element: &str) -> rusqlite::Result<i64> {
-    db.query_row(
-        "SELECT attempts FROM dirty_facets WHERE facet = ?1 AND element = ?2",
-        params![facet, element],
-        |row| row.get(0),
-    )
-    .optional()
-    .map(|value| value.unwrap_or(0))
+    dirty_facets::attempts(db, facet, element).map(|value| value.unwrap_or(0))
 }
 
 fn next_attempt_at(now: i64, attempts_before_failure: i64) -> i64 {
