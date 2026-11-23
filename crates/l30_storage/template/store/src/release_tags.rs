@@ -1,9 +1,9 @@
 //! The tags that name a template's releases (`template_release_tags`).
 //!
 //! The tag move (the admin route that points a tag at another release)
-//! locks the tag row and compares it at its call site. It keeps its insert
-//! of a tag that is still absent, whose `DO NOTHING` re-checks the absence;
-//! the retarget of a tag it holds locked is [`retarget`].
+//! locks the tag row and compares it at its call site, in its transaction;
+//! the retarget of a tag it holds locked is [`retarget`], and the insert of
+//! a tag it found absent is [`insert_if_absent`].
 
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateName, TemplateTag};
@@ -47,6 +47,28 @@ pub async fn retarget(
                      SET template_release_id = $1,
                          modified_at = NOW()
                      WHERE template_name = $2 AND tag = $3"
+    ))
+    .bind(release_id)
+    .bind(template_name)
+    .bind(tag.as_str())
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Create `tag` of `template_name`, pointing at `release_id`. `false` when
+/// the template already has a tag of that name, which may have committed
+/// after the caller found it absent.
+pub async fn insert_if_absent(
+    executor: impl PgExecutor<'_>,
+    release_id: Uuid,
+    template_name: &str,
+    tag: &TemplateTag,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (template_name, tag) DO NOTHING"
     ))
     .bind(release_id)
     .bind(template_name)

@@ -190,3 +190,46 @@ pub async fn insert_storage_location(
     .fetch_optional(executor)
     .await
 }
+
+/// Record `execution` as release `release_id`'s execution metadata when it
+/// records none. `false` when it already records some, or there is no
+/// release `release_id`. A binding another release of the build already
+/// holds fails with the partition index's unique violation. The caller holds
+/// the release's row lock while it compares or fills the metadata.
+pub async fn fill_execution_metadata(
+    executor: impl PgExecutor<'_>,
+    release_id: Uuid,
+    execution: &serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "UPDATE template_releases SET execution_metadata = $2
+         WHERE id = $1 AND execution_metadata IS NULL"
+    ))
+    .bind(release_id)
+    .bind(execution)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Give the storage location `location_id` its release's owner when it has
+/// none. `true` whenever the location had no owner, including when its
+/// release has none either, which leaves the location ownerless. `false`
+/// when it already has an owner, or there is no such location.
+pub async fn adopt_storage_location_owner(
+    executor: impl PgExecutor<'_>,
+    location_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "UPDATE template_release_storage_locations location
+         SET org_id = release.org_id
+         FROM template_releases release
+         WHERE location.id = $1
+           AND release.id = location.template_release_id
+           AND location.org_id IS NULL"
+    ))
+    .bind(location_id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}

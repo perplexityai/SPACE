@@ -30,6 +30,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+serde = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 time = { workspace = true }
 uuid = { workspace = true }
@@ -39,6 +40,7 @@ pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-model = { workspace = true, features = ["sqlx"] }
 
 [dev-dependencies]

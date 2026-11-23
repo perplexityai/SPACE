@@ -370,8 +370,12 @@ async fn build_binding(
 ) -> Result<Option<String>, sqlx::Error> {
     let release = match release {
         BuildRelease::Original => {
-            crate::template_releases_store::release_environment(pool, template, content_hash)
-                .await?
+            pplx_space_template_release_store::lookup::original_release_environment(
+                pool,
+                template,
+                content_hash,
+            )
+            .await?
         }
         #[cfg(feature = "kubernetes")]
         BuildRelease::Resolved => {
@@ -385,7 +389,7 @@ async fn build_binding(
             {
                 Some((_, environment)) => environment,
                 None => {
-                    crate::template_releases_store::release_environment(
+                    pplx_space_template_release_store::lookup::original_release_environment(
                         pool,
                         template,
                         content_hash,

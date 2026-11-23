@@ -360,7 +360,7 @@ async fn resolve_original_release(
         None => template.artifact_digest(),
     };
     if let Some(digest) = digest {
-        let resolved = crate::template_releases_store::resolve_template_release_by_digest(
+        let resolved = pplx_space_template_release_store::lookup::resolve_by_digest(
             pool,
             template.name(),
             digest,
@@ -447,7 +447,7 @@ pub(crate) async fn resolve_template_release_by_tag(
     runtime: RuntimeKind,
     caller_org: OrgId,
 ) -> Result<Option<(Uuid, String)>, ControllerError> {
-    crate::template_releases_store::resolve_template_release_by_tag(
+    pplx_space_template_release_store::lookup::resolve_by_tag(
         pool,
         template_name,
         tag,
@@ -472,34 +472,12 @@ async fn load_create_template_defaults(
             .unwrap_or_else(|| (sqlx::types::Json(NetworkPolicyV1::deny_all()), 0));
 
     let default_auto_lifecycle =
-        sqlx::query_scalar::<_, sqlx::types::Json<AutoLifecyclePolicy>>(sql!(
-            "WITH desired AS (
-             SELECT default_auto_lifecycle_json
-             FROM template_default_auto_lifecycle_policies
-             WHERE template = $1
-         ),
-         observed AS (
-             SELECT nti.default_auto_lifecycle_json
-             FROM node_template_inventory nti
-             JOIN nodes n ON n.id = nti.node_id
-             WHERE nti.template_name = $1
-               AND nti.content_hash = $2
-               AND (nti.runtime IS NULL OR nti.runtime = '' OR nti.runtime = $3)
-               AND nti.default_auto_lifecycle_json IS NOT NULL
-               AND n.role = 'builder'
-             ORDER BY nti.observed_at DESC
-             LIMIT 1
-         )
-         SELECT default_auto_lifecycle_json FROM desired
-         UNION ALL
-         SELECT default_auto_lifecycle_json FROM observed
-         WHERE NOT EXISTS (SELECT 1 FROM desired)
-         LIMIT 1"
-        ))
-        .bind(template_name)
-        .bind(content_hash)
-        .bind(runtime)
-        .fetch_optional(pool)
+        pplx_space_template_store::default_auto_lifecycle_policies::for_create(
+            pool,
+            template_name,
+            content_hash,
+            runtime,
+        )
         .await
         .map_err(|err| db_contention_error("failed to load template auto lifecycle", &err))?;
 

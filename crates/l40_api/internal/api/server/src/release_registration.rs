@@ -449,14 +449,14 @@ async fn fill_release_execution_metadata(
     let mut savepoint = sqlx::Acquire::begin(&mut **tx)
         .await
         .map_err(|error| storage(&error))?;
-    match super::template_releases_store::fill_execution_metadata(
+    match pplx_space_template_release_store::registration::fill_execution_metadata(
         &mut *savepoint,
         release_id,
         execution,
     )
     .await
     {
-        Ok(()) => {
+        Ok(_) => {
             savepoint.commit().await.map_err(|error| storage(&error))?;
             Ok(MetadataCheck::Accepted)
         }

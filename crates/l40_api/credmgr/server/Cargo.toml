@@ -115,6 +115,7 @@ pplx-space-snapshot-store = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-storage-vend-store = { workspace = true }
 pplx-space-template-release-store = { workspace = true }
+pplx-space-template-store = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }

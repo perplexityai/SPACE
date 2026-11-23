@@ -1089,7 +1089,7 @@ mod template_release_resolution_postgres_tests {
                 Some((release_id, content_hash.to_string())),
             ),
         ] {
-            let resolved = crate::template_releases_store::resolve_template_release_by_digest(
+            let resolved = pplx_space_template_release_store::lookup::resolve_by_digest(
                 &db.pool,
                 &TemplateName::parse("tenant-secret")?,
                 content_hash.parse()?,
@@ -1148,7 +1148,7 @@ mod template_release_resolution_postgres_tests {
         .execute(&db.pool)
         .await?;
 
-        let resolved = crate::template_releases_store::resolve_template_release_by_digest(
+        let resolved = pplx_space_template_release_store::lookup::resolve_by_digest(
             &db.pool,
             &TemplateName::parse("tenant-twin")?,
             content_hash.parse()?,

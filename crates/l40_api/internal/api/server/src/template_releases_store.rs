@@ -741,20 +741,3 @@ impl TemplateReleasesStore {
             .collect())
     }
 }
-
-/// The caller holds the release row lock while comparing or filling evidence.
-pub(super) async fn fill_execution_metadata(
-    executor: impl sqlx::PgExecutor<'_>,
-    release_id: Uuid,
-    execution: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE template_releases SET execution_metadata = $2
-         WHERE id = $1 AND execution_metadata IS NULL"
-    ))
-    .bind(release_id)
-    .bind(execution)
-    .execute(executor)
-    .await?;
-    Ok(())
-}

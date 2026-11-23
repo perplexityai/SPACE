@@ -19,16 +19,18 @@
 //! against these tables still run in api and internal-api:
 //!
 //! * the locking reads (`FOR UPDATE`, `FOR NO KEY UPDATE`) of registration
-//!   and the admin routes, and registration's guarded fills (`... IS NULL`)
-//!   of a release's execution metadata and of a found storage location's
-//!   owner, stay with their callers, whose locks and re-checks keep them
-//!   correct;
+//!   and the admin routes stay with their callers, whose locks and re-checks
+//!   keep them correct; registration's fills of a release's execution
+//!   metadata and of a found storage location's owner are
+//!   [`registration`]'s, run under those locks;
 //! * statements that interpolate `digest_original` or `spelling_original`
-//!   (in the api's resolvers, pool configs and admin routes, and in
-//!   internal-api's original lookup and `TemplateReleasesStore`) haven't
-//!   moved yet;
-//! * reads of other tables that join a release, and test fixtures, stay
-//!   where they are.
+//!   in the api's pool configs and admin release routes, and in
+//!   internal-api's original lookup and `TemplateReleasesStore`, haven't
+//!   moved yet; the api's create, base and placement resolvers and the
+//!   admin release population are [`lookup`]'s;
+//! * other reads of other tables that join a release, and test fixtures,
+//!   stay where they are; the create's tag lookup, which reads the tags,
+//!   is [`lookup::resolve_by_tag`].
 //!
 //! Tag writes never move here (see "No tags on twins" below).
 //!

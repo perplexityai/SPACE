@@ -10,7 +10,7 @@ use pplx_space_accounts::OrgId;
 
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use pplx_space_sql_locator::sql;
-use pplx_space_template_model::{TemplateDesiredState, TemplateName, TemplateVisibility};
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use sqlx::{FromRow, Postgres, Transaction};
 use time::OffsetDateTime;
 
@@ -49,29 +49,16 @@ pub(super) async fn org_template_rows(
     executor: impl sqlx::PgExecutor<'_>,
     org_id: OrgId,
 ) -> Result<OrgTemplateRows, sqlx::Error> {
-    let (live, held, retained_until) =
-        sqlx::query_as::<_, (Option<bool>, Option<bool>, Option<OffsetDateTime>)>(sql!(
-            "SELECT bool_or(t.desired_state <> $2),
-                    bool_or(
-                        EXISTS (
-                            SELECT 1 FROM template_releases r WHERE r.template_name = t.name
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                              FROM node_template_inventory i
-                             WHERE i.template_name = t.name
-                        )
-                    ),
-                    MAX(COALESCE(t.delete_requested_at, t.updated_at, t.created_at))
-                        + make_interval(secs => $3)
-               FROM templates t
-              WHERE t.org_id = $1"
-        ))
-        .bind(org_id)
-        .bind(TemplateDesiredState::Deleted.as_str())
-        .bind(pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION.as_secs_f64())
-        .fetch_one(executor)
-        .await?;
+    let pplx_space_template_store::templates::OrgTemplates {
+        any_live: live,
+        any_held: held,
+        retained_until,
+    } = pplx_space_template_store::templates::org_templates(
+        executor,
+        org_id,
+        pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION,
+    )
+    .await?;
     Ok(match (live, held, retained_until) {
         (Some(true), _, _) => OrgTemplateRows::Live,
         (Some(false), Some(true), _) => OrgTemplateRows::DeletedOnly {

@@ -13,7 +13,6 @@ use crate::template_visibility_cache::TemplateVisibilityCache;
 
 use super::status::*;
 use super::*;
-use pplx_space_sql_locator::sql;
 
 // ── Template metadata: row types and helpers ──────────────────────────────
 
@@ -1484,16 +1483,10 @@ async fn adopt_template_release_storage_location_org_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     location_id: Uuid,
 ) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "UPDATE template_release_storage_locations location
-         SET org_id = release.org_id
-         FROM template_releases release
-         WHERE location.id = $1
-           AND release.id = location.template_release_id
-           AND location.org_id IS NULL"
-    ))
-    .bind(location_id)
-    .execute(&mut **tx)
+    pplx_space_template_release_store::registration::adopt_storage_location_owner(
+        &mut **tx,
+        location_id,
+    )
     .await
     .map_err(|err| {
         crate::template_publication::storage_status(

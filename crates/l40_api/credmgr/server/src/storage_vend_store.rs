@@ -207,12 +207,7 @@ impl StorageVendStore for PgStorageVendStore {
         &self,
         template: &TemplateName,
     ) -> Result<Option<Option<OrgId>>, StorageVendStoreError> {
-        let owner: Option<Option<uuid::Uuid>> =
-            sqlx::query_scalar(sql!("SELECT org_id FROM templates WHERE name = $1"))
-                .bind(template.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(owner.map(|organization_id| organization_id.map(OrgId::from_uuid)))
+        Ok(pplx_space_template_store::templates::owner(&self.pool, template).await?)
     }
 
     async fn template_release_published(
