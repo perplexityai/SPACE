@@ -1,6 +1,6 @@
 //! The `node_reconcile_queue` enqueue: the refs a node's reconciler applies
 //! after the trigger for that node fires, each with the trace context of the
-//! writer that asked for it.
+//! writer that asked for it, and the claimant's read of a ref it holds.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sql_locator::sql;
@@ -33,6 +33,32 @@ pub struct QueuedReconcileRefs {
     pub node_id: NodeId,
     pub facet: String,
     pub queued: u64,
+}
+
+/// The attempts of `node_id`'s queued `(facet, element)` ref (`None`, the
+/// whole-facet ref) while `claim_token` holds its claim. `None` when the ref
+/// isn't queued or another claim holds it. Takes no lock.
+pub async fn claimed_ref_attempts(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    facet: &str,
+    element: Option<&str>,
+    claim_token: &str,
+) -> Result<Option<i32>, sqlx::Error> {
+    sqlx::query_scalar::<_, i32>(sql!(
+        "SELECT attempts
+         FROM node_reconcile_queue
+         WHERE node_id = $1
+           AND facet = $2
+           AND element = COALESCE($3, '')
+           AND claim_token = $4"
+    ))
+    .bind(node_id)
+    .bind(facet)
+    .bind(element)
+    .bind(claim_token)
+    .fetch_optional(executor)
+    .await
 }
 
 /// Intent: queue each `(facet, element)` ref on each node, as stored (an

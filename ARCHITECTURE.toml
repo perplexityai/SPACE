@@ -404,6 +404,7 @@ pplx-space-node-registration-store = [
 pplx-space-node-runtime-manager-store = ["pplx-space-node-runtime-manager"]
 pplx-space-node-status-store = [
   "pplx-space-api",
+  "pplx-space-internal-api-server",
   "pplx-space-runtime-upgrade-campaign-store",
 ]
 pplx-space-node-template-inventory-store = [
@@ -462,6 +463,7 @@ pplx-space-sandbox-store = [
 pplx-space-sandbox-teardown = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sbx-mgr-migrations = ["pplx-space-sbx-mgr-store"]

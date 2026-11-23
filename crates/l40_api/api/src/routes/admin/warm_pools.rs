@@ -4,10 +4,9 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use pplx_space_cluster_pool::WarmPoolPolicyRecord;
 use pplx_space_execution_spec::DiskIoLimits;
-use pplx_space_sql_locator::sql;
 use serde::Serialize;
-use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::controllers::ControllerError;
@@ -66,25 +65,6 @@ pub async fn disable_warm_pool(
         Ok(config) => Json(config).into_response(),
         Err(error) => controller_error(error).into_response(),
     }
-}
-
-#[derive(Debug, FromRow)]
-struct WarmPoolPolicyRow {
-    template_name: String,
-    runtime: String,
-    vcpu: i32,
-    memory_mib: i32,
-    disk_mib: Option<i32>,
-    min_ready_slots: i32,
-    max_ready_slots: i32,
-    refill_per_tick: i32,
-    max_warming_slots: i32,
-    retain_releases: i32,
-    disk_io_max_operations_per_sec: Option<i64>,
-    disk_io_max_bandwidth_mib_per_sec: Option<i64>,
-    enabled: bool,
-    created_at: time::OffsetDateTime,
-    updated_at: time::OffsetDateTime,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,73 +173,35 @@ fn api_error(
     (status, Json(serde_json::json!({"error": message.into()})))
 }
 
-async fn fetch_policies(pool: &sqlx::PgPool) -> Result<Vec<WarmPoolPolicyRow>, sqlx::Error> {
-    sqlx::query_as::<_, WarmPoolPolicyRow>(sql!(
-        "SELECT template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
-                max_ready_slots, refill_per_tick, max_warming_slots,
-                retain_releases, disk_io_max_operations_per_sec,
-                disk_io_max_bandwidth_mib_per_sec, enabled, created_at, updated_at
-         FROM warm_pool_policies
-         WHERE runtime = 'fc'
-         ORDER BY template_name, runtime, vcpu, memory_mib"
-    ))
-    .fetch_all(pool)
-    .await
+async fn fetch_policies(pool: &sqlx::PgPool) -> Result<Vec<WarmPoolPolicyRecord>, sqlx::Error> {
+    pplx_space_cluster_pool::fc_warm_pool_policies(pool).await
 }
 
 async fn store_policy(
     pool: &sqlx::PgPool,
     request: &WarmPoolPolicyRequest,
-) -> Result<WarmPoolPolicyRow, sqlx::Error> {
-    sqlx::query_as::<_, WarmPoolPolicyRow>(sql!(
-        "INSERT INTO warm_pool_policies (
-             template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
-             max_ready_slots, refill_per_tick, max_warming_slots,
-             retain_releases, disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec, enabled
-         )
-         VALUES ($1, 'fc', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         ON CONFLICT (template_name, runtime, vcpu, memory_mib) DO UPDATE
-         SET disk_mib = CASE WHEN $13 THEN NULL
-                             ELSE COALESCE(EXCLUDED.disk_mib, warm_pool_policies.disk_mib)
-                        END,
-             min_ready_slots = EXCLUDED.min_ready_slots,
-             max_ready_slots = EXCLUDED.max_ready_slots,
-             refill_per_tick = EXCLUDED.refill_per_tick,
-             max_warming_slots = EXCLUDED.max_warming_slots,
-             retain_releases = EXCLUDED.retain_releases,
-             disk_io_max_operations_per_sec =
-                 CASE WHEN $14 THEN NULL
-                      ELSE COALESCE(EXCLUDED.disk_io_max_operations_per_sec,
-                                    warm_pool_policies.disk_io_max_operations_per_sec)
-                 END,
-             disk_io_max_bandwidth_mib_per_sec =
-                 CASE WHEN $14 THEN NULL
-                      ELSE COALESCE(EXCLUDED.disk_io_max_bandwidth_mib_per_sec,
-                                    warm_pool_policies.disk_io_max_bandwidth_mib_per_sec)
-                 END,
-             enabled = EXCLUDED.enabled,
-             updated_at = NOW()
-         RETURNING template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
-                   max_ready_slots, refill_per_tick, max_warming_slots,
-                   retain_releases, disk_io_max_operations_per_sec,
-                   disk_io_max_bandwidth_mib_per_sec, enabled, created_at, updated_at"
-    ))
-    .bind(request.template_name.trim())
-    .bind(request.vcpu as i32)
-    .bind(request.memory_mib as i32)
-    .bind(request.disk_mib.map(|value| value as i32))
-    .bind(request.min_ready_slots as i32)
-    .bind(request.max_ready_slots as i32)
-    .bind(request.refill_per_tick as i32)
-    .bind(request.max_warming_slots as i32)
-    .bind(request.retain_releases as i32)
-    .bind(request.disk_io_max_operations_per_sec.map(u64_to_i64))
-    .bind(request.disk_io_max_bandwidth_mib_per_sec.map(u64_to_i64))
-    .bind(request.enabled)
-    .bind(request.reset_disk_to_template_default)
-    .bind(request.reset_disk_io_to_default)
-    .fetch_one(pool)
+) -> Result<WarmPoolPolicyRecord, sqlx::Error> {
+    pplx_space_cluster_pool::upsert_fc_warm_pool_policy(
+        pool,
+        &pplx_space_cluster_pool::WarmPoolPolicyUpsert {
+            template_name: request.template_name.trim(),
+            vcpu: request.vcpu as i32,
+            memory_mib: request.memory_mib as i32,
+            disk_mib: request.disk_mib.map(|value| value as i32),
+            min_ready_slots: request.min_ready_slots as i32,
+            max_ready_slots: request.max_ready_slots as i32,
+            refill_per_tick: request.refill_per_tick as i32,
+            max_warming_slots: request.max_warming_slots as i32,
+            retain_releases: request.retain_releases as i32,
+            disk_io_max_operations_per_sec: request.disk_io_max_operations_per_sec.map(u64_to_i64),
+            disk_io_max_bandwidth_mib_per_sec: request
+                .disk_io_max_bandwidth_mib_per_sec
+                .map(u64_to_i64),
+            enabled: request.enabled,
+            reset_disk_to_template_default: request.reset_disk_to_template_default,
+            reset_disk_io_to_default: request.reset_disk_io_to_default,
+        },
+    )
     .await
 }
 
@@ -458,8 +400,8 @@ fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).expect("disk I/O request was range validated")
 }
 
-impl From<WarmPoolPolicyRow> for WarmPoolPolicyResponse {
-    fn from(row: WarmPoolPolicyRow) -> Self {
+impl From<WarmPoolPolicyRecord> for WarmPoolPolicyResponse {
+    fn from(row: WarmPoolPolicyRecord) -> Self {
         let disk_io_limits = row
             .disk_io_max_operations_per_sec
             .zip(row.disk_io_max_bandwidth_mib_per_sec)

@@ -1685,19 +1685,13 @@ impl ClusterApi for ClusterApiService {
                 "node-ctl reconciliation failed without an error message".to_string()
             });
             let facet_for_metrics = reference.facet.clone();
-            let attempts = sqlx::query_scalar::<_, i32>(sql!(
-                "SELECT attempts
-                 FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .fetch_optional(&mut *tx)
+            let attempts = pplx_space_cluster_trigger_queue::claimed_ref_attempts(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("read reconcile retry count: {err}")))?
             .unwrap_or(0);

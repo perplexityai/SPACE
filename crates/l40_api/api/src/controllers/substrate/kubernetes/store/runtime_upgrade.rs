@@ -68,18 +68,6 @@ impl From<RecordedExecutionRow> for RecordedActivation {
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct CatalogRow {
-    environment_ref: String,
-    runtime: String,
-    runtime_version: String,
-    kernel_version: String,
-    state_format_name: String,
-    state_format_version: String,
-    upgrade_edges: Vec<String>,
-    memory_edges: Vec<String>,
-}
-
 fn catalog_reference(value: &str) -> Result<EnvironmentReference, SubstrateError> {
     value.parse().map_err(|error| SubstrateError::Failed {
         message: format!("runtime_environments holds an invalid reference {value:?}: {error}"),
@@ -159,16 +147,9 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn unretired_runtime_environments(
         &self,
     ) -> Result<Vec<CatalogEnvironment>, SubstrateError> {
-        let rows: Vec<CatalogRow> = sqlx::query_as(sql!(
-            "SELECT environment_ref, runtime, runtime_version, kernel_version,
-                    state_format_name, state_format_version, upgrade_edges, memory_edges
-               FROM runtime_environments
-              WHERE retired_at IS NULL
-              ORDER BY environment_ref"
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to read the runtime environment catalog")?;
+        let rows = pplx_space_runtime_environment_catalog_store::unretired_environments(&self.pool)
+            .await
+            .db_context("failed to read the runtime environment catalog")?;
         rows.into_iter()
             .map(|row| {
                 Ok(CatalogEnvironment {

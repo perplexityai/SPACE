@@ -6388,6 +6388,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-model",
  "pplx-space-node-registration-store",
+ "pplx-space-node-status-store",
  "pplx-space-node-template-inventory-store",
  "pplx-space-observability",
  "pplx-space-policy-authority",
@@ -6405,6 +6406,7 @@ dependencies = [
  "pplx-space-sandbox-quarantine-store",
  "pplx-space-sandbox-residency",
  "pplx-space-sandbox-store",
+ "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
  "pplx-space-semver",
  "pplx-space-snapshot-model",
@@ -7475,10 +7477,13 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-spec",
  "pplx-space-sql-locator",
  "pplx-space-test-env",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.20",
+ "time",
  "tokio",
 ]
 
@@ -7895,6 +7900,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
  "pplx-space-sandbox-model",
+ "pplx-space-snapshot-model",
  "pplx-space-sql-locator",
  "pplx-space-test-env",
  "sqlx",
@@ -7948,9 +7954,11 @@ dependencies = [
 name = "pplx-space-sandbox-teardown"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-accounts",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
+ "serde_json",
  "sqlx",
 ]
 

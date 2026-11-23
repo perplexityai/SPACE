@@ -6,11 +6,18 @@
 //! `pplx_space_sandbox_store::delete::delete_with_dependents` or a create
 //! rollback, a template delete) and when no node owns it any more (a sandbox
 //! recovered to suspended, quarantined, or recovered from quarantine).
+//!
+//! The same rows' other verbs live alongside: [`observed_status`] for
+//! `node_facet_observed_status` and [`conditions`] for
+//! `node_facet_conditions`.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileElementRef};
+
+pub mod conditions;
+pub mod observed_status;
 
 pub fn sandbox_reconcile_cleanup_refs(sandbox_id: SandboxId) -> Vec<ReconcileElementRef> {
     vec![

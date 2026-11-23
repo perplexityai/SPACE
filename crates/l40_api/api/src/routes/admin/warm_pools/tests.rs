@@ -24,8 +24,8 @@ fn request(disk_io_limits: Option<DiskIoLimits>) -> WarmPoolPolicyRequest {
     }
 }
 
-fn row(disk_io_limits: Option<DiskIoLimits>) -> WarmPoolPolicyRow {
-    WarmPoolPolicyRow {
+fn row(disk_io_limits: Option<DiskIoLimits>) -> WarmPoolPolicyRecord {
+    WarmPoolPolicyRecord {
         template_name: "custom-runtime".to_string(),
         runtime: "fc".to_string(),
         vcpu: 4,

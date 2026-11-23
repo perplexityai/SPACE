@@ -131,16 +131,12 @@ pub(super) async fn delete_cached_node_template_inventory(
     .await?;
 
     if remaining == 0 {
-        sqlx::query(sql!(
-            "DELETE FROM node_facet_observed_status
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = $3"
-        ))
-        .bind(node_id)
-        .bind(FACET_NETWORK_POLICY)
-        .bind(format!("template:{template}"))
-        .execute(pool)
+        pplx_space_sandbox_teardown::observed_status::delete_for_element(
+            pool,
+            node_id,
+            FACET_NETWORK_POLICY,
+            &format!("template:{template}"),
+        )
         .await?;
     }
 
