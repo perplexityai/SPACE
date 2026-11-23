@@ -244,7 +244,11 @@ async fn refuses_endpoints_before_sending() {
         let client = client_with_endpoint(endpoint.to_string(), transport.clone());
 
         let result = client
-            .send_action("DescribeInstances", "2016-11-15", Vec::new())
+            .send_action(
+                "DescribeInstances",
+                "2016-11-15",
+                Vec::<(&str, String)>::new(),
+            )
             .await;
 
         assert_eq!(transport.requests(), Vec::new(), "{endpoint:?} was sent");
