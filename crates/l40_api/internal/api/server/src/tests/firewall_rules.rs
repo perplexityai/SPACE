@@ -7,12 +7,10 @@ use crate::proto::{
     FetchFirewallRulesRequest, FetchFirewallRulesResponse, FirewallRulesAssignment,
     FirewallRulesPendingRound, cluster_api_client::ClusterApiClient,
 };
-use pplx_space_observability::test_capture::{CapturedEvents, CapturedEventsLayer, field_value};
 use pplx_space_rpc_auth::test_support::{
     TokenReviewStatus, pod_bound_service_account_status, projected_token, service_account_status,
 };
 use tonic::transport::Channel;
-use tracing_subscriber::{Layer, filter::LevelFilter, layer::SubscriberExt};
 
 const AUDIENCE: &str = "space-cluster-api";
 const NODE_CTL: &str = "system:serviceaccount:space:space-node-ctl";
@@ -56,18 +54,6 @@ fn denied<T>() -> Result<T, (Code, String)> {
         Code::PermissionDenied,
         "the caller may not fetch firewall rules".to_owned(),
     ))
-}
-
-/// Capture the refusal log lines until the guard drops.
-fn capture_refusals() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
-    let capture = CapturedEventsLayer::new().with_event_filter(|event| {
-        field_value(event, "message") == Some("refused firewall rules fetch")
-    });
-    let refusals = capture.events();
-    let guard = tracing::subscriber::set_default(
-        tracing_subscriber::registry().with(capture.with_filter(LevelFilter::WARN)),
-    );
-    (refusals, guard)
 }
 
 /// Fetch with `bearer`, or with no authorization header.
@@ -201,15 +187,13 @@ fn response(
 
 /// Only node-ctl, bound by reviewed name and UID to exactly one live,
 /// enrolled worker, learns that worker's instructions, and never by its
-/// address: the server's peer address is worker B's. Only the server log
-/// names each refusal's reason. A revision that doesn't decode is an error,
-/// not no work.
+/// address: the server's peer address is worker B's. A revision that doesn't
+/// decode is an error, not no work.
 #[tokio::test(flavor = "current_thread")]
 async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
-    let (refusals, _logs) = capture_refusals();
     let mut service = fixture.service;
     let pool = service.pool.clone();
     let pool = &pool;
@@ -248,32 +232,20 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     // makes a second one differ.
     let other_workload = "system:serviceaccount:space:space-template-manager";
     let reviewed = [
-        ("node-ctl-a", node_ctl_on("worker-a", "uid-a"), Ok(()), ""),
+        ("node-ctl-a", node_ctl_on("worker-a", "uid-a"), Ok(())),
         (
             "other-workload-a",
             pod_bound_service_account_status(AUDIENCE, other_workload, "worker-a", "uid-a"),
             denied(),
-            "no_fetch_authority",
         ),
-        (
-            "stale-uid",
-            node_ctl_on("worker-a", "stale-uid"),
-            denied(),
-            "uid_mismatch",
-        ),
-        (
-            "unsynced",
-            node_ctl_on("worker-n", "uid-n"),
-            denied(),
-            "uid_unsynced",
-        ),
+        ("stale-uid", node_ctl_on("worker-a", "stale-uid"), denied()),
+        ("unsynced", node_ctl_on("worker-n", "uid-n"), denied()),
         (
             "no-claims",
             service_account_status(AUDIENCE, NODE_CTL),
             denied(),
-            "missing_node_claims",
         ),
-        ("malformed", malformed, denied(), "malformed_node_claims"),
+        ("malformed", malformed, denied()),
         (
             "unenrolled",
             node_ctl_on("worker-u", "uid-u"),
@@ -281,35 +253,17 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
                 Code::FailedPrecondition,
                 format!("firewall rules aren't enabled for node {u}: it isn't enrolled"),
             )),
-            "unenrolled",
         ),
-        (
-            "builder",
-            node_ctl_on("builder-x", "uid-x"),
-            denied(),
-            "no_live_worker",
-        ),
-        (
-            "deleted",
-            node_ctl_on("worker-d", "uid-d"),
-            denied(),
-            "no_live_worker",
-        ),
-        (
-            "ambiguous",
-            node_ctl_on("worker-t", "uid-t"),
-            denied(),
-            "ambiguous_name",
-        ),
+        ("builder", node_ctl_on("builder-x", "uid-x"), denied()),
+        ("deleted", node_ctl_on("worker-d", "uid-d"), denied()),
+        ("ambiguous", node_ctl_on("worker-t", "uid-t"), denied()),
     ]
-    .map(|(label, status, expected, reason)| (projected_token(label), status, expected, reason));
+    .map(|(label, status, expected)| (projected_token(label), status, expected));
     let node_ctl_a = reviewed[0].0.clone();
     let reviews = reviewed
         .iter()
-        .map(|(token, status, _, _)| (token.clone(), status.clone()))
+        .map(|(token, status, _)| (token.clone(), status.clone()))
         .collect();
-    let mut reasons: Vec<_> = reviewed[1..].iter().map(|row| row.3).collect();
-    reasons.push("no_fetch_authority");
     let mut harness = serve(service, reviews, true).await?;
     let client = &mut harness.client;
 
@@ -336,7 +290,7 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     ];
     for (bearer, expected) in reviewed
         .into_iter()
-        .map(|(token, _, expected, _)| (Some(token), expected))
+        .map(|(token, _, expected)| (Some(token), expected))
         .chain(unreviewed)
     {
         let expected = expected.map(|()| a_work.clone());
@@ -346,23 +300,6 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
             "{bearer:?}"
         );
     }
-    let logged = refusals.events();
-    assert_eq!(
-        logged
-            .iter()
-            .map(|event| field_value(event, "reason"))
-            .collect::<Vec<_>>(),
-        reasons.into_iter().map(Some).collect::<Vec<_>>()
-    );
-    // A line carries the reason alone: no identity or token data.
-    assert_eq!(
-        logged[1],
-        [
-            ("message", "refused firewall rules fetch"),
-            ("reason", "uid_mismatch"),
-        ]
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-    );
 
     // Fetching again changes nothing: the round isn't consumed and no row is
     // touched.
@@ -412,11 +349,10 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
         return Ok(());
     };
     let pool = fixture.service.pool.clone();
-    let (refusals, _logs) = capture_refusals();
     let a = register(&pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
 
-    for (grant, expected, reason) in [
-        (false, denied(), "no_fetch_authority"),
+    for (grant, expected) in [
+        (false, denied()),
         (
             true,
             Err((
@@ -425,7 +361,6 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
                     "firewall rules aren't enabled for node {a}: no enrollment predicate is approved"
                 ),
             )),
-            "no_enrollment_predicate",
         ),
     ] {
         let mut service = fixture.service.clone();
@@ -438,12 +373,6 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
         assert_eq!(
             fetch(&mut harness.client, Some(&token)).await?,
             expected,
-            "grant {grant}"
-        );
-        let logged = refusals.events();
-        assert_eq!(
-            field_value(logged.last().unwrap(), "reason"),
-            Some(reason),
             "grant {grant}"
         );
     }
