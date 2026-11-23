@@ -94,7 +94,11 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   `get(..).is_some_and(..)`, a hand-rolled probe onto a shared fragment) pins
   the equivalence with a Postgres-backed test before it merges.
 
-Not store verbs — leave these where they are:
+Not plain store verbs. Leave these where they are unless an item below says
+how one may move. A statement that fits several items moves only if each
+item it fits allows it: the guarded-transition item decides whether and
+where a guarded statement moves, and the lock and clock items say what any
+move must keep.
 
 - **Guarded state transitions**, where the `WHERE` re-checks a precondition
   (a lifecycle CAS, a lease-token or generation guard). The guard is the
@@ -114,11 +118,43 @@ Not store verbs — leave these where they are:
   unguarded writes of the row, such as its desired-configuration columns,
   belong in ordinary verbs like `update_desired_state`. The caller keeps its
   locks and transaction (see the crate docs).
-- **`SELECT ... FOR UPDATE`**: a lock acquisition inside the caller's
-  transaction. Converting it to a store read silently drops the lock.
-- **Predicates evaluated against the database clock** (`NOW()`-relative
-  freshness checks). Moving the comparison client-side changes clock
-  authority.
+- **Locks the caller relies on after the statement.** A lock taken by a
+  standalone `SELECT ... FOR UPDATE` (or `FOR NO KEY UPDATE`, `FOR SHARE`,
+  `FOR KEY SHARE`), a `LOCK TABLE`, or a transaction-level advisory lock
+  (`pg_advisory_xact_lock` and its `try_` and `_shared` forms) lasts until
+  the caller's transaction ends, or until a rollback to a savepoint taken
+  before it. A store read that drops the clause takes no lock; on a pool the
+  lock ends with the statement, and `LOCK TABLE` fails. Such a statement may
+  still move as a store verb, under these conditions:
+  - the statement moves verbatim, lock clause included (`OF …`, `NOWAIT`,
+    `SKIP LOCKED`), along with any setting written in the same statement;
+  - the verb takes the caller's `&mut sqlx::Transaction<'_, Postgres>`, or
+    `&mut sqlx::PgConnection` when every caller passes its open transaction
+    (`&mut *tx`). It never takes `impl PgExecutor`, which also accepts a
+    pool;
+  - its name says it locks (`lock_…`, `share_lock_…`, `…_locked`), and its
+    doc says the lock lasts until the caller's transaction ends, as
+    `pplx-space-runtime-environment-policy-store`'s `lock_generation` and
+    `pplx-space-runtime-upgrade-campaign-store`'s `unfinished_from_locked`
+    do.
+
+  Settings that only serve the lock, such as
+  `set_config('lock_timeout', …, true)` or `SET LOCAL lock_timeout`, stay
+  with the caller that owns the transaction. A lock that serves only its own
+  statement, such as a `FOR UPDATE` CTE or subquery that feeds the same
+  statement's `UPDATE` or `DELETE`, needs no caller transaction, and its
+  verb may be executor-generic, as `pplx-space-sandbox-store`'s
+  `ingest::mark_published_failed` is. A session-level advisory lock
+  (`pg_advisory_lock`) outlives the transaction; leave it with the code that
+  unlocks it.
+- **Database-clock predicates.** A `NOW()`-relative freshness check decides
+  on the database clock, and computing it client-side changes clock
+  authority. The statement may still move, verbatim, with the comparison
+  left in its SQL, and each caller keeps the executor it used: `NOW()` and
+  `CURRENT_TIMESTAMP` are the transaction's start time, so the same
+  statement run on a pool or in a later transaction compares against a later
+  instant. The verb binds the same values the caller bound (an interval, a
+  grace period), never a client timestamp in place of `NOW()`.
 
 When a store change adds a workspace crate or dependency edge, run a lib-only
 `cargo check -p <crate>` — `--all-targets` pulls dev-dependencies into feature
