@@ -96,13 +96,15 @@ struct ReviewedClusterApi {
 }
 
 /// Serve `service` with TokenReview answered by `review`, admitting the
-/// `allowed` service accounts (comma-separated). With `firewall_rules_fetch`,
-/// that account holds the fetch authority production withholds.
+/// `allowed` service accounts (comma-separated). With `firewall_rules_fetch`
+/// or `firewall_rules_report`, that account holds the fetch or report
+/// authority production withholds.
 #[cfg(feature = "kubernetes")]
 async fn serve_reviewed(
     service: ClusterApiService,
     allowed: &str,
     firewall_rules_fetch: Option<&str>,
+    firewall_rules_report: Option<&str>,
     review: impl Fn(
         k8s_openapi::api::authentication::v1::TokenReviewSpec,
     ) -> pplx_space_rpc_auth::test_support::TokenReviewStatus
@@ -141,6 +143,9 @@ async fn serve_reviewed(
     )?;
     if let Some(service_account) = firewall_rules_fetch {
         config = config.grant_firewall_rules_fetch_for_test(service_account);
+    }
+    if let Some(service_account) = firewall_rules_report {
+        config = config.grant_firewall_rules_report_for_test(service_account);
     }
     let auth =
         NodeApiAuthLayer::with_k8s_client_for_test(config, kube::Client::try_from(kube_config)?);

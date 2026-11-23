@@ -20,6 +20,8 @@ use pplx_space_rpc_auth::test_support::{
 use pplx_space_state_reconciliation::ReconcileReason;
 use tonic::transport::Channel;
 
+mod report;
+
 const AUDIENCE: &str = "space-cluster-api";
 const NODE_CTL: &str = "system:serviceaccount:space:space-node-ctl";
 
@@ -41,10 +43,21 @@ async fn serve(
     reviews: Vec<(String, TokenReviewStatus)>,
     grant: bool,
 ) -> TestResult<ReviewedClusterApi> {
+    serve_granting(service, reviews, grant, false).await
+}
+
+/// [`serve`], with node-ctl holding the fetch and report authorities as asked.
+async fn serve_granting(
+    service: ClusterApiService,
+    reviews: Vec<(String, TokenReviewStatus)>,
+    fetch: bool,
+    report: bool,
+) -> TestResult<ReviewedClusterApi> {
     serve_reviewed(
         service,
         "space-node-ctl,space-template-manager",
-        grant.then_some("space-node-ctl"),
+        fetch.then_some("space-node-ctl"),
+        report.then_some("space-node-ctl"),
         move |spec| {
             reviews
                 .iter()

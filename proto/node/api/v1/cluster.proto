@@ -237,6 +237,19 @@ service ClusterApi {
   // can't be read.
   rpc FetchFirewallRules(FetchFirewallRulesRequest) returns (FetchFirewallRulesResponse);
 
+  // Records the calling worker's observation as its answer to the round it
+  // names. The server resolves the worker as FetchFirewallRules does, under a
+  // separate report authority; `node_id` must name that worker and never
+  // selects one. Accepting stores the evidence as reported, favorable or not,
+  // and proves nothing about rollout progress. After the auth layer's
+  // UNAUTHENTICATED and UNAVAILABLE: PERMISSION_DENIED unless the caller holds
+  // the report authority, resolves as for a fetch, and names its own worker;
+  // INVALID_ARGUMENT for a malformed report, before any database work;
+  // FAILED_PRECONDITION when the worker isn't enrolled or no enrollment
+  // predicate or report freshness limit is approved. Every other answer is OK
+  // with its outcome.
+  rpc ReportFirewallRules(ReportFirewallRulesRequest) returns (ReportFirewallRulesResponse);
+
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
   // storage) is owned end to end by the credential manager
   // (credmgr GetOrIssueSandboxVolumeDek), so
@@ -1541,4 +1554,118 @@ message FirewallRulesPendingRound {
   // response's assignment; 0 is a generation. Absent from older servers and
   // for a round that names none: such a round can't be answered.
   optional uint64 assignment_generation = 3;
+}
+
+// A worker's observation, answering one round. Every field is required: an
+// unset field is malformed, never 0. Integers above 2^63-1 are malformed.
+message ReportFirewallRulesRequest {
+  // The canonical node ID FetchFirewallRules returned.
+  string node_id = 1;
+  // The round and the assignment generation it asks about, as fetched.
+  optional uint64 round = 2;
+  optional uint64 assignment_generation = 3;
+  // The revision the worker checked against.
+  string revision_id = 4;
+  // The worker's node-manager incarnation.
+  optional uint64 manager_epoch = 5;
+  FirewallRulesCensus census = 6;
+  // At most 32768, in any order; empty exactly when `census` is COMPLETE. A
+  // worker with more gaps, which only stray namespaces can cause, can't
+  // report.
+  repeated FirewallRulesCensusGap census_gaps = 7;
+  // At most 16384, each slot ID once, in any order.
+  repeated FirewallRulesSlotEvidence slots = 8;
+}
+
+// Whether the worker accounted for every managed namespace. INCOMPLETE with
+// every slot VERIFIED differs from COMPLETE with one slot FAILED.
+enum FirewallRulesCensus {
+  FIREWALL_RULES_CENSUS_UNSPECIFIED = 0;
+  FIREWALL_RULES_CENSUS_COMPLETE = 1;
+  FIREWALL_RULES_CENSUS_INCOMPLETE = 2;
+}
+
+message FirewallRulesCensusGap {
+  FirewallRulesCensusGapKind kind = 1;
+  // Set exactly for MISSING and UNREAD.
+  optional uint32 slot_id = 2;
+}
+
+enum FirewallRulesCensusGapKind {
+  FIREWALL_RULES_CENSUS_GAP_KIND_UNSPECIFIED = 0;
+  // The slot inventory couldn't be read.
+  FIREWALL_RULES_CENSUS_GAP_KIND_INVENTORY_FAILED = 1;
+  // The host names no directory that only managed namespaces occupy.
+  FIREWALL_RULES_CENSUS_GAP_KIND_UNOWNED = 2;
+  // The managed-namespace directory couldn't be listed.
+  FIREWALL_RULES_CENSUS_GAP_KIND_LISTING_FAILED = 3;
+  // An eligible slot has no namespace.
+  FIREWALL_RULES_CENSUS_GAP_KIND_MISSING = 4;
+  // An eligible slot wasn't read at its final lifecycle.
+  FIREWALL_RULES_CENSUS_GAP_KIND_UNREAD = 5;
+  // A managed namespace no slot accounts for; one gap per namespace.
+  FIREWALL_RULES_CENSUS_GAP_KIND_EXTRA = 6;
+}
+
+message FirewallRulesSlotEvidence {
+  optional uint32 slot_id = 1;
+  // The slot's lifecycle generation when observed.
+  optional uint64 slot_generation = 2;
+  FirewallRulesSlotOutcome outcome = 3;
+  // Set exactly for FAILED and UNKNOWN, from that outcome's reasons.
+  FirewallRulesSlotReason reason = 4;
+}
+
+enum FirewallRulesSlotOutcome {
+  FIREWALL_RULES_SLOT_OUTCOME_UNSPECIFIED = 0;
+  // The slot enforces the revision.
+  FIREWALL_RULES_SLOT_OUTCOME_VERIFIED = 1;
+  // Mismatched while apply work for the slot was pending.
+  FIREWALL_RULES_SLOT_OUTCOME_APPLYING = 2;
+  // The slot enforces something else.
+  FIREWALL_RULES_SLOT_OUTCOME_FAILED = 3;
+  // What the slot enforces couldn't be determined.
+  FIREWALL_RULES_SLOT_OUTCOME_UNKNOWN = 4;
+}
+
+enum FirewallRulesSlotReason {
+  FIREWALL_RULES_SLOT_REASON_UNSPECIFIED = 0;
+  // FAILED: the table lists other rules.
+  FIREWALL_RULES_SLOT_REASON_RULES_MISMATCH = 1;
+  // UNKNOWN: not a slot the apply takes.
+  FIREWALL_RULES_SLOT_REASON_INELIGIBLE = 2;
+  // UNKNOWN: the slot's namespace is gone.
+  FIREWALL_RULES_SLOT_REASON_NAMESPACE_MISSING = 3;
+  // UNKNOWN: the namespace couldn't be opened.
+  FIREWALL_RULES_SLOT_REASON_NAMESPACE_UNREADABLE = 4;
+  // UNKNOWN: the firewall table couldn't be read.
+  FIREWALL_RULES_SLOT_REASON_TABLE_UNREADABLE = 5;
+  // UNKNOWN: read, but not shown unchanged at the end.
+  FIREWALL_RULES_SLOT_REASON_UNCONFIRMED = 6;
+}
+
+message ReportFirewallRulesResponse {
+  FirewallRulesReportOutcome outcome = 1;
+}
+
+// Every outcome but ACCEPTED changed nothing.
+enum FirewallRulesReportOutcome {
+  FIREWALL_RULES_REPORT_OUTCOME_UNSPECIFIED = 0;
+  // Stored as the round's accepted evidence; the round is no longer pending.
+  FIREWALL_RULES_REPORT_OUTCOME_ACCEPTED = 1;
+  // The accepted evidence is exactly this report, stored earlier. It needn't
+  // be current.
+  FIREWALL_RULES_REPORT_OUTCOME_DUPLICATE = 2;
+  // A different report for this round was accepted.
+  FIREWALL_RULES_REPORT_OUTCOME_CONFLICT = 3;
+  // The round isn't the worker's pending round.
+  FIREWALL_RULES_REPORT_OUTCOME_NOT_PENDING = 4;
+  // The worker's observations belong to another manager epoch.
+  FIREWALL_RULES_REPORT_OUTCOME_EPOCH_MISMATCH = 5;
+  // The pending round asks about another assignment generation.
+  FIREWALL_RULES_REPORT_OUTCOME_GENERATION_MISMATCH = 6;
+  // The worker's assignment is no longer the reported generation and revision.
+  FIREWALL_RULES_REPORT_OUTCOME_SUPERSEDED = 7;
+  // The round was issued too long ago to answer.
+  FIREWALL_RULES_REPORT_OUTCOME_EXPIRED = 8;
 }

@@ -23,7 +23,7 @@
 //!
 //! [`open_round`] asks an issued target's node to verify that assignment,
 //! with its wakeup. [`fetch_instructions`] reads one node's assignment and
-//! pending round.
+//! pending round. [`accept_report`] records the node's answer to that round.
 
 use std::fmt;
 
@@ -34,6 +34,7 @@ mod issue;
 mod lease;
 mod leased_item;
 mod read;
+mod report;
 mod round;
 mod start;
 
@@ -47,6 +48,10 @@ pub use lease::{
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
 pub use read::{StoredStateError, read_adopted};
+pub use report::{
+    Acceptance, Census, CensusGap, Failure, InvalidReport, Report, ReportRefusal, SlotEvidence,
+    SlotOutcome, UnknownReason, accept_report,
+};
 pub use round::{OpenRefusal, Opening, open_round};
 pub use start::{
     AdoptedRevision, REASON_MAX_CHARS, Review, StartError, StartRollout, StartedRollout,

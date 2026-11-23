@@ -6246,6 +6246,7 @@ dependencies = [
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
  "pplx-space-test-env",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.20",
  "time",

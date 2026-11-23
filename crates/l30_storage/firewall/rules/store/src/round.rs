@@ -5,10 +5,11 @@
 //! Locks, in order: the rollout row (shared, so a pause or abort waits), the
 //! lease handoff lock (shared), the item row, the node's assignment row
 //! (shared), its observation row, and the wakeup's rows; a writer that takes
-//! any of them takes them in this order. The first three are issuance's.
-//! Rounds are numbered one past the node's larger pending or accepted round,
-//! so none is reused while only acceptance or a larger round replaces a
-//! pending one.
+//! any of them takes them in this order, as
+//! [`accept_report`](crate::accept_report) does with the assignment and
+//! observation rows. The first three are issuance's. Rounds are numbered one
+//! past the node's larger pending or accepted round, so none is reused while
+//! only acceptance or a larger round replaces a pending one.
 //!
 //! `open_round` is not the authority for the node-manager epoch: it stamps
 //! whatever epoch its first caller passes, and a later mismatch is refused with
