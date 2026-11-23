@@ -220,14 +220,11 @@ pub(crate) async fn gate_template_access(
     caller_org: OrgId,
 ) -> Result<TemplateAccess, ControllerError> {
     let template_name = template_name.as_str();
-    let Some((visibility, owner_org, desired_state)) =
-        sqlx::query_as::<_, (String, Option<Uuid>, String)>(sql!(
-            "SELECT visibility, org_id, desired_state
-         FROM templates
-         WHERE name = $1"
-        ))
-        .bind(template_name)
-        .fetch_optional(pool)
+    let Some(pplx_space_template_store::templates::TemplateAccess {
+        visibility,
+        org_id: owner_org,
+        desired_state,
+    }) = pplx_space_template_store::templates::access(pool, template_name)
         .await
         .map_err(|err| db_contention_error("failed to load template for authorization", &err))?
     else {
@@ -468,18 +465,11 @@ async fn load_create_template_defaults(
     runtime: &str,
 ) -> Result<CreateTemplateDefaults, ControllerError> {
     let (network_policy, network_policy_generation) =
-        sqlx::query_as::<_, (sqlx::types::Json<NetworkPolicy>, i64)>(sql!(
-            "SELECT network_policy_json, network_policy_generation
-         FROM templates
-         WHERE name = $1
-           AND desired_state = $2"
-        ))
-        .bind(template_name)
-        .bind(TemplateDesiredState::Present.as_str())
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| db_contention_error("failed to load template network policy", &err))?
-        .unwrap_or_else(|| (sqlx::types::Json(NetworkPolicyV1::deny_all()), 0));
+        pplx_space_template_store::templates::present_network_policy(pool, template_name)
+            .await
+            .map_err(|err| db_contention_error("failed to load template network policy", &err))?
+            .map(|row| (row.network_policy_json, row.network_policy_generation))
+            .unwrap_or_else(|| (sqlx::types::Json(NetworkPolicyV1::deny_all()), 0));
 
     let default_auto_lifecycle =
         sqlx::query_scalar::<_, sqlx::types::Json<AutoLifecyclePolicy>>(sql!(

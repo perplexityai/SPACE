@@ -1,5 +1,6 @@
 use super::*;
 use pplx_space_db_test_fixtures::{TestDbResult, pg_test_db};
+use pplx_space_sql_locator::sql;
 use rstest::rstest;
 
 #[rstest]

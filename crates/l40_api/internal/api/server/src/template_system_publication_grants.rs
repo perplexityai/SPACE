@@ -66,13 +66,6 @@ pub(super) async fn issue(
     .execute(&mut *tx)
     .await?;
     let grant = SystemPublicationGrantId::new();
-    sqlx::query(sql!(
-        "INSERT INTO template_system_publication_grants (id, template_name)
-        VALUES ($1, $2)"
-    ))
-    .bind(grant)
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
+    pplx_space_template_store::publication_grants::insert_system(&mut *tx, grant, template).await?;
     Ok(grant)
 }

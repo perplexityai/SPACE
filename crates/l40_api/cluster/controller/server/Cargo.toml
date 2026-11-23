@@ -109,6 +109,7 @@ pplx-space-runtime-upgrade-campaign-store = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }
 pplx-space-template-manifest = { workspace = true }
 pplx-space-template-release-store = { workspace = true }
+pplx-space-template-store = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }

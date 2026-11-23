@@ -2845,9 +2845,8 @@ async fn pool_template_release_resolution_characterization() -> TestResult {
 #[case::with_twins(true)]
 #[tokio::test(flavor = "current_thread")]
 async fn a_pinned_pool_targets_the_digest_original(#[case] twins: bool) -> TestResult {
-    use pplx_space_template_release_store::spelling_pairs::{
-        OLD_INDEX, seed_spelling_pairs, tag_release,
-    };
+    use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
+    use pplx_space_template_store::test_support::tag_release;
     const TEMPLATE: &str = "spelling-pairs";
     let db = pg_test_db().await?;
     sqlx::query(sql!("INSERT INTO templates (id, name) VALUES ($1, $2)"))

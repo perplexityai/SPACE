@@ -190,13 +190,8 @@ impl RetentionSink for TombstoneRetentionStore {
         .fetch_one(&mut *tx)
         .await?;
         let direct_node_tombstones = count_to_u64(direct_node_tombstones_count);
-        let template_tombstones_count = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT COUNT(*)
-               FROM templates
-              WHERE desired_state = 'deleted'"
-        ))
-        .fetch_one(&mut *tx)
-        .await?;
+        let template_tombstones_count =
+            pplx_space_template_store::templates::count_deleted(&mut *tx).await?;
         let template_tombstones = count_to_u64(template_tombstones_count);
         let deleted_sandbox_rows_count =
             pplx_space_sandbox_store::deleted_rows::count(&mut *tx).await?;

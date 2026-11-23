@@ -822,16 +822,9 @@ impl K8sStore {
         &self,
         template: &str,
     ) -> Result<Option<NetworkPolicyV1>, SubstrateError> {
-        let policy = sqlx::query_scalar::<_, Option<sqlx::types::Json<NetworkPolicyV1>>>(sql!(
-            "SELECT network_policy_json
-             FROM templates
-             WHERE name = $1"
-        ))
-        .bind(template)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context("failed to load template network policy")?;
-        Ok(policy.flatten().map(|policy| policy.0))
+        pplx_space_template_store::templates::network_policy(&self.pool, template)
+            .await
+            .db_context("failed to load template network policy")
     }
 
     pub(super) fn sandbox_owner_for_user(&self, user_id: UserId) -> SandboxOwner {

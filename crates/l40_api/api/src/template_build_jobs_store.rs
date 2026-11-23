@@ -3,6 +3,7 @@ use std::str::FromStr;
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{BuildRunId, BuildRunIdParseError, TemplateName};
+use pplx_space_template_store::{build_base_grants, build_jobs, publication_grants, templates};
 use sqlx::{PgExecutor, PgPool};
 use time::OffsetDateTime;
 
@@ -118,29 +119,19 @@ impl TemplateBuildJobsStore {
         let build_id = client_build_id.unwrap_or(&daemon_job_id_text);
 
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(sql!(
-            "INSERT INTO template_build_jobs (
-                 template_id,
-                 build_id,
-                 daemon_job_id,
-                 builder_node_id,
-                 org_id
-             )
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (template_id, build_id) DO UPDATE
-             SET daemon_job_id = EXCLUDED.daemon_job_id,
-                 builder_node_id = EXCLUDED.builder_node_id
-             WHERE template_build_jobs.org_id IS NULL OR template_build_jobs.org_id = EXCLUDED.org_id"
-        ))
-        .bind(template_name.as_str())
-        .bind(build_id)
-        .bind(&daemon_job_id_text)
-        .bind(builder_node_id.map(NodeId::as_uuid))
-        .bind(org_id.as_uuid())
-        .execute(&mut *tx)
+        let recorded = build_jobs::record_accepted(
+            &mut *tx,
+            build_jobs::AcceptedBuild {
+                template: template_name,
+                build_id,
+                daemon_job_id,
+                builder_node_id,
+                org_id,
+            },
+        )
         .await?;
 
-        if result.rows_affected() == 0 {
+        if !recorded {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
         if let Some(builder_node_id) = builder_node_id {
@@ -180,16 +171,7 @@ impl TemplateBuildJobsStore {
         .execute(&self.pool)
         .await?;
         let grant = BuildBaseGrantId(uuid::Uuid::now_v7());
-        sqlx::query(sql!(
-            "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
-             VALUES ($1, $2, $3, $4)"
-        ))
-        .bind(grant.as_uuid())
-        .bind(template_name.as_str())
-        .bind(base.as_str())
-        .bind(org_id.as_uuid())
-        .execute(&self.pool)
-        .await?;
+        build_base_grants::insert(&self.pool, grant.as_uuid(), template_name, base, org_id).await?;
         Ok(grant)
     }
 
@@ -213,14 +195,7 @@ impl TemplateBuildJobsStore {
         .execute(&self.pool)
         .await?;
         let grant = SystemPublicationGrantId::new();
-        sqlx::query(sql!(
-            "INSERT INTO template_system_publication_grants (id, template_name)
-             VALUES ($1, $2)"
-        ))
-        .bind(grant.as_uuid())
-        .bind(template_name.as_str())
-        .execute(&self.pool)
-        .await?;
+        publication_grants::insert_system(&self.pool, grant, template_name).await?;
         Ok(grant)
     }
 
@@ -230,12 +205,7 @@ impl TemplateBuildJobsStore {
         &self,
         grant: SystemPublicationGrantId,
     ) -> Result<(), TemplateBuildJobsStoreError> {
-        sqlx::query(sql!(
-            "DELETE FROM template_system_publication_grants WHERE id = $1"
-        ))
-        .bind(grant.as_uuid())
-        .execute(&self.pool)
-        .await?;
+        publication_grants::delete_system(&self.pool, grant).await?;
         Ok(())
     }
 
@@ -262,15 +232,7 @@ impl TemplateBuildJobsStore {
         .execute(&self.pool)
         .await?;
         let grant = TenantPublicationGrantId::new();
-        sqlx::query(sql!(
-            "INSERT INTO template_tenant_publication_grants (id, template_name, org_id)
-             VALUES ($1, $2, $3)"
-        ))
-        .bind(grant.as_uuid())
-        .bind(template_name.as_str())
-        .bind(org_id.as_uuid())
-        .execute(&self.pool)
-        .await?;
+        publication_grants::insert_tenant(&self.pool, grant, template_name, org_id).await?;
         Ok(grant)
     }
 
@@ -280,12 +242,7 @@ impl TemplateBuildJobsStore {
         &self,
         grant: TenantPublicationGrantId,
     ) -> Result<(), TemplateBuildJobsStoreError> {
-        sqlx::query(sql!(
-            "DELETE FROM template_tenant_publication_grants WHERE id = $1"
-        ))
-        .bind(grant.as_uuid())
-        .execute(&self.pool)
-        .await?;
+        publication_grants::delete_tenant(&self.pool, grant).await?;
         Ok(())
     }
 
@@ -297,16 +254,7 @@ impl TemplateBuildJobsStore {
         grant: TenantPublicationGrantId,
         builder_node_id: NodeId,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(sql!(
-            "UPDATE template_tenant_publication_grants
-             SET builder_node_id = $2
-             WHERE id = $1"
-        ))
-        .bind(grant.as_uuid())
-        .bind(builder_node_id.as_uuid())
-        .execute(executor)
-        .await?;
-        Ok(())
+        publication_grants::pin_tenant_to_builder(executor, grant, builder_node_id).await
     }
 
     /// Pin one submission's base grant to the builder that accepted it. From
@@ -318,16 +266,7 @@ impl TemplateBuildJobsStore {
         base_grant: BuildBaseGrantId,
         builder_node_id: NodeId,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(sql!(
-            "UPDATE template_build_base_grants
-             SET builder_node_id = $2
-             WHERE id = $1"
-        ))
-        .bind(base_grant.as_uuid())
-        .bind(builder_node_id.as_uuid())
-        .execute(executor)
-        .await?;
-        Ok(())
+        build_base_grants::pin_to_builder(executor, base_grant.as_uuid(), builder_node_id).await
     }
 
     pub(crate) async fn lookup_build(
@@ -339,19 +278,8 @@ impl TemplateBuildJobsStore {
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Ok(None);
         }
-        let daemon_job_id = sqlx::query_scalar::<_, String>(sql!(
-            "SELECT daemon_job_id
-             FROM template_build_jobs
-             WHERE template_id = $1
-               AND build_id = $2
-               AND (org_id = $3 OR org_id IS NULL)
-               AND daemon_job_id IS NOT NULL"
-        ))
-        .bind(template_name.as_str())
-        .bind(build_id)
-        .bind(org_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+        let daemon_job_id =
+            build_jobs::daemon_job_id(&self.pool, template_name, build_id, org_id).await?;
 
         daemon_job_id
             .map(|job_id| {
@@ -365,16 +293,9 @@ impl TemplateBuildJobsStore {
         &self,
         daemon_job_id: BuildRunId,
     ) -> Result<Option<NodeId>, TemplateBuildJobsStoreError> {
-        sqlx::query_as::<_, (Option<uuid::Uuid>,)>(sql!(
-            "SELECT builder_node_id
-             FROM template_build_jobs
-             WHERE daemon_job_id = $1"
-        ))
-        .bind(daemon_job_id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| row.and_then(|(builder_node_id,)| builder_node_id.map(NodeId::from_uuid)))
-        .map_err(Into::into)
+        build_jobs::builder_node(&self.pool, daemon_job_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// The newest `limit` builds of `template_name` that a builder accepted,
@@ -385,24 +306,13 @@ impl TemplateBuildJobsStore {
         template_name: &TemplateName,
         limit: u32,
     ) -> Result<Vec<RecordedBuild>, TemplateBuildJobsStoreError> {
-        let rows = sqlx::query_as::<_, (String, Option<uuid::Uuid>, OffsetDateTime)>(sql!(
-            "SELECT daemon_job_id, builder_node_id, created_at
-             FROM template_build_jobs
-             WHERE template_id = $1
-               AND daemon_job_id IS NOT NULL
-             ORDER BY created_at DESC, build_id DESC
-             LIMIT $2"
-        ))
-        .bind(template_name.as_str())
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = build_jobs::recent_accepted(&self.pool, template_name, limit).await?;
         rows.into_iter()
-            .map(|(daemon_job_id, builder_node_id, created_at)| {
+            .map(|row| {
                 Ok(RecordedBuild {
-                    daemon_job_id: BuildRunId::from_str(&daemon_job_id)?,
-                    builder_node_id: builder_node_id.map(NodeId::from_uuid),
-                    created_at,
+                    daemon_job_id: BuildRunId::from_str(&row.daemon_job_id)?,
+                    builder_node_id: row.builder_node_id.map(NodeId::from_uuid),
+                    created_at: row.created_at,
                 })
             })
             .collect()
@@ -418,25 +328,20 @@ impl TemplateBuildJobsStore {
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
-        let result = sqlx::query(sql!(
-            "INSERT INTO template_build_jobs (template_id, build_id, cpu_count, memory_mb, tags, org_id)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (template_id, build_id) DO UPDATE
-             SET cpu_count = EXCLUDED.cpu_count,
-                 memory_mb = EXCLUDED.memory_mb,
-                 tags = EXCLUDED.tags
-             WHERE template_build_jobs.org_id IS NULL OR template_build_jobs.org_id = EXCLUDED.org_id"
-        ))
-        .bind(template_name.as_str())
-        .bind(build_id)
-        .bind(spec.cpu_count.map(|value| value as i32))
-        .bind(spec.memory_mb.map(|value| value as i32))
-        .bind(spec.tags)
-        .bind(org_id.as_uuid())
-        .execute(&self.pool)
+        let recorded = build_jobs::record_spec(
+            &self.pool,
+            template_name,
+            build_id,
+            org_id,
+            build_jobs::BuildSpec {
+                tags: &spec.tags,
+                cpu_count: spec.cpu_count.map(|value| value as i32),
+                memory_mb: spec.memory_mb.map(|value| value as i32),
+            },
+        )
         .await?;
 
-        if result.rows_affected() == 0 {
+        if !recorded {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
         Ok(())
@@ -451,24 +356,13 @@ impl TemplateBuildJobsStore {
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Ok(None);
         }
-        let row = sqlx::query_as::<_, (Vec<String>, Option<i32>, Option<i32>)>(sql!(
-            "SELECT tags, cpu_count, memory_mb
-             FROM template_build_jobs
-             WHERE template_id = $1
-               AND build_id = $2
-               AND (org_id = $3 OR org_id IS NULL)"
-        ))
-        .bind(template_name.as_str())
-        .bind(build_id)
-        .bind(org_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = build_jobs::spec(&self.pool, template_name, build_id, org_id).await?;
 
-        row.map(|(tags, cpu_count, memory_mb)| {
+        row.map(|row| {
             Ok(BuildSpec {
-                tags,
-                cpu_count: optional_i32_to_u32(cpu_count)?,
-                memory_mb: optional_i32_to_u32(memory_mb)?,
+                tags: row.tags,
+                cpu_count: optional_i32_to_u32(row.cpu_count)?,
+                memory_mb: optional_i32_to_u32(row.memory_mb)?,
             })
         })
         .transpose()
@@ -480,13 +374,7 @@ pub(crate) async fn template_build_owner_matches(
     template_name: &TemplateName,
     org_id: OrgId,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
-        "SELECT NOT EXISTS (SELECT 1 FROM templates WHERE name = $1 AND org_id <> $2)"
-    ))
-    .bind(template_name.as_str())
-    .bind(org_id.as_uuid())
-    .fetch_one(pool)
-    .await
+    templates::not_owned_by_another_org(pool, template_name, org_id).await
 }
 
 fn optional_i32_to_u32(value: Option<i32>) -> Result<Option<u32>, TemplateBuildJobsStoreError> {
