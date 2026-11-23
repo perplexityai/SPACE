@@ -207,6 +207,8 @@ pub use crate::drained_node_terminator::{
 
 #[cfg(feature = "kubernetes")]
 pub mod aws;
+#[cfg(test)]
+pub(crate) mod guarded_delete;
 #[cfg(feature = "kubernetes")]
 pub mod kube_delete;
 pub mod noop;
