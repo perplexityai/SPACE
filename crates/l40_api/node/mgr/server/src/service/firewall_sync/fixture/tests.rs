@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use tonic::{Code, Request, Response};
 
 use super::*;
+use crate::firewall::assignment::Unavailable;
 use crate::firewall::rules::install::InstallOutcome;
 use crate::proto::FirewallRulesAssignment;
 use crate::service::tests::service_tests::service_for_unit_tests;
@@ -431,6 +432,7 @@ async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
             vec![
                 stale(Stale::Slot),
                 stale(Stale::SlotStore(poisoned())),
+                stale(Stale::Assignment(NotRunnable::Unavailable(Unavailable))),
                 stale(Stale::Namespace(Err(gone()))),
                 attempt(mismatch(), Err(Stale::Slot)),
             ],

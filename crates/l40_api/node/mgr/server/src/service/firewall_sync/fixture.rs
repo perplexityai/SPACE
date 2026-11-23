@@ -37,7 +37,9 @@ use crate::proto::{
     SyncFirewallRulesRequest, SyncFirewallRulesResponse,
 };
 use crate::slot_pool::firewall_rules::SlotHost;
-use crate::slot_pool::{NetworkPool, NotRun, SlotFirewallReport, SlotFirewallRequest, Stale};
+use crate::slot_pool::{
+    NetworkPool, NotRun, NotRunnable, SlotFirewallReport, SlotFirewallRequest, Stale,
+};
 
 #[cfg(test)]
 mod tests;
@@ -278,12 +280,18 @@ fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDisp
         }
         Ok(SlotFirewallReport::Attempted(attempt)) => match (&attempt.readback, &attempt.current) {
             (Verification::Inconclusive(why), _) => (Outcome::Inconclusive, why.clone(), true),
-            // Only an assignment change, or an unreadable assignment store, leaves the target
-            // trusted.
+            // Only a changed assignment leaves the target trusted.
             (_, Err(stale)) => (
                 Outcome::Stale,
                 format!("{stale:?}"),
-                !matches!(stale, Stale::Assignment(_)),
+                !matches!(
+                    stale,
+                    Stale::Assignment(
+                        NotRunnable::NoAssignment
+                            | NotRunnable::WrongNode { .. }
+                            | NotRunnable::NotCurrent { .. }
+                    )
+                ),
             ),
             (Verification::Match, Ok(())) => (Outcome::Matched, String::new(), false),
             (Verification::Mismatch(why), Ok(())) => (Outcome::Mismatched, why.clone(), false),
