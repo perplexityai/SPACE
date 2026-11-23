@@ -419,6 +419,7 @@ pub struct SandboxManagerService {
     /// for a sandbox. The durable operation itself lives in SQLite; this map
     /// only bounds concurrent reattachment attempts from shim polling.
     teardown_suspend_drivers: TeardownSuspendDrivers,
+    pod_addresses: Arc<pod_addresses::PodAddresses>,
     /// Node-wide admission for background durable-suspend drivers. A full
     /// semaphore returns `Pending` to the shim, whose next poll retries
     /// admission without leaving an unbounded queue of tasks on this node.
@@ -1877,6 +1878,7 @@ impl SandboxManagerService {
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
+            pod_addresses: Arc::default(),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
             )),
@@ -2159,6 +2161,7 @@ mod grpc_spaced_process_snapshots;
 mod grpc_state_snapshot;
 mod host_control;
 mod network_runtime;
+mod pod_addresses;
 pub(crate) use network_runtime::{
     log_known_egress_configuration, net_gateway_launch_config, netgtw_launch_args,
 };

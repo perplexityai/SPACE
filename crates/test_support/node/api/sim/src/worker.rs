@@ -320,6 +320,7 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         state_changed_at: None,
         execution_generation: rec.execution_generation,
         pod_uid: None,
+        pod_ip: None,
         activation_attempt_id: None,
         spaced_version: None,
         netgtw_git_sha: None,

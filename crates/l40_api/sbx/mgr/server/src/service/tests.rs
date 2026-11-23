@@ -2992,6 +2992,65 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn sandbox_info_reports_the_started_pods_address_only_for_that_pod() {
+        use pplx_space_net_gateway_client::proto as gateway_proto;
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Started);
+        let service = SandboxManagerService::for_test(conn);
+        let set_pod = |pod_uid: &str| {
+            crate::db::update_space_api_route_identity(
+                &service.db.lock().unwrap(),
+                sandbox_id,
+                &pplx_space_sandbox_model::SpaceApiRouteIdentity {
+                    pod_uid: Some(pplx_space_k8s_ids::PodUid::parse(pod_uid).unwrap()),
+                    ..Default::default()
+                },
+                crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
+            )
+            .unwrap();
+        };
+        let reported = |pod_uid: &str, netns_path: Option<&str>| {
+            super::pod_addresses::ReportedPodAddress::parse(
+                "Start",
+                &sandbox_id.to_string(),
+                netns_path,
+                Some("10.1.2.3"),
+                Some(&gateway_proto::SpaceApiRouteIdentity {
+                    pod_uid: Some(pod_uid.to_string()),
+                    ..Default::default()
+                }),
+            )
+        };
+        let reported_ip = async || {
+            let sandbox = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+            service
+                .build_sandbox_info(sandbox, None, None, None, None)
+                .await
+                .unwrap()
+                .pod_ip
+        };
+
+        assert_eq!(
+            reported("pod-a", None).err().map(|status| status.code()),
+            Some(tonic::Code::InvalidArgument),
+            "a pod address names the address of the Start's network namespace"
+        );
+        set_pod("pod-a");
+        assert_eq!(reported_ip().await, None);
+        service
+            .pod_addresses
+            .record(reported("pod-a", Some("/run/netns/a")).unwrap().unwrap());
+        assert_eq!(reported_ip().await.as_deref(), Some("10.1.2.3"));
+        set_pod("pod-b");
+        assert_eq!(
+            reported_ip().await,
+            None,
+            "a replacement pod must not inherit its predecessor's address"
+        );
+    }
+
+    #[tokio::test]
     async fn authoritative_wake_requires_and_retries_gateway_identity_acknowledgement() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
@@ -9689,6 +9748,7 @@ pub(crate) mod service_tests {
             from_warm: false,
             blocking: false,
             netns_path: None,
+            pod_ip: None,
             ready_timeout_secs: None,
             target_state: 0,
             suspend_restore_storage_uri: None,
@@ -22849,6 +22909,7 @@ pub(crate) mod service_tests {
             from_warm: false,
             blocking: false,
             netns_path: None,
+            pod_ip: None,
             ready_timeout_secs: None,
             target_state: 0,
             suspend_restore_storage_uri: None,

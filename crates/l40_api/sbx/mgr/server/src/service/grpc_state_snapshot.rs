@@ -1157,6 +1157,13 @@ impl SandboxManagerService {
                 .pod_uid
                 .as_ref()
                 .map(ToString::to_string),
+            pod_ip: sandbox
+                .space_api_route_identity
+                .pod_uid
+                .as_ref()
+                .zip(id.parse::<SandboxId>().ok())
+                .and_then(|(pod_uid, sandbox_id)| self.pod_addresses.get(&sandbox_id, pod_uid))
+                .map(|pod_ip| pod_ip.to_string()),
             activation_attempt_id: sandbox
                 .space_api_route_identity
                 .activation_attempt_id

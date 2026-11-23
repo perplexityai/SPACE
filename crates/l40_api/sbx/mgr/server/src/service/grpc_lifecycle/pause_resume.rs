@@ -500,6 +500,20 @@ impl SandboxManagerService {
                         .is_some(),
                 ),
         );
+        let pod_address = req
+            .start_context
+            .as_ref()
+            .map(|start_context| {
+                super::super::pod_addresses::ReportedPodAddress::parse(
+                    "Wake.start_context",
+                    &req.sandbox_id,
+                    start_context.netns_path.as_deref(),
+                    start_context.pod_ip.as_deref(),
+                    start_context.route_identity.as_ref(),
+                )
+            })
+            .transpose()?
+            .flatten();
         let mut start = if let Some(start_context) = &req.start_context {
             self.authorize_peer(&request, "Wake.start_context", ALLOW_SANDBOX_START_CONTEXT)?;
             let space_api_route_identity =
@@ -785,6 +799,9 @@ impl SandboxManagerService {
             SandboxEventSource::SbxManager,
             SandboxEventDetails::default().target_state(target_state.to_string()),
         );
+        if let Some(pod_address) = pod_address {
+            self.pod_addresses.record(pod_address);
+        }
         if publish_node_state {
             mark_sandbox_dirty(&self.db, &sandbox_id);
         }

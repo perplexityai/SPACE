@@ -528,7 +528,8 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		}
 		restoreMode := sandboxRestoreModeForLog(sandboxCheckpoint, artifactRestore)
 		redirectCh := make(chan dataPlaneRedirectResult, 1)
-		go prepareDataPlaneRedirect(ctx, sbxID, netnsPath, sandboxTemplate, redirectCh)
+		podIP := podIPForDataPlane(ctx, netnsPath)
+		go prepareDataPlaneRedirect(ctx, sbxID, netnsPath, podIP, sandboxTemplate, redirectCh)
 		startRPCStartedAt := time.Now()
 		startSpanSbxmgr, startCtx := startSpan(ctx, "shim.sbxmgr.start",
 			attribute.String("template", sandboxTemplate),
@@ -542,6 +543,7 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			Checkpoint:               sandboxCheckpoint,
 			Blocking:                 false,
 			NetnsPath:                ptr(netnsPath),
+			PodIp:                    reportedPodIP(podIP, sandboxPodUID),
 			SuspendRestoreStorageUri: spec.sandboxSuspendRestoreStorageURI(),
 			SuspendRestoreSourceNode: spec.sandboxSuspendRestoreSourceNode(),
 			RestoreArtifactAsNew:     artifactRestore,
@@ -747,16 +749,17 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	}
 
 	// Wake the sandbox. For newly-created sandboxes this starts it; for existing
-	// sandboxes it reattaches and resumes/restores as needed. The dataplane
-	// redirect can be installed as soon as CNI assigns the pod IP, so do that in
-	// parallel with sbx-manager Wake to avoid API readiness probes racing the nft
-	// rule.
+	// sandboxes it reattaches and resumes/restores as needed. The pod IP CNI
+	// assigned goes with the Wake, and the dataplane redirect for it is
+	// installed in parallel with sbx-manager Wake to avoid API readiness probes
+	// racing the nft rule.
 	netnsPath := spec.networkNamespace()
 	if netnsPath != "" {
 		logShim("Create: using CNI network namespace %s", netnsPath)
 	}
 	redirectCh := make(chan dataPlaneRedirectResult, 1)
-	go prepareDataPlaneRedirect(ctx, sbxID, netnsPath, sandboxTemplate, redirectCh)
+	podIP := podIPForDataPlane(ctx, netnsPath)
+	go prepareDataPlaneRedirect(ctx, sbxID, netnsPath, podIP, sandboxTemplate, redirectCh)
 
 	wakeRPCStartedAt := time.Now()
 	wakeSpanSbxmgr, wakeCtx := startSpan(ctx, "shim.sbxmgr.wake",
@@ -770,6 +773,7 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			Vcpu:      sandboxVCPU,
 			MemoryMib: sandboxMemoryMiB,
 			NetnsPath: ptr(netnsPath),
+			PodIp:     reportedPodIP(podIP, sandboxPodUID),
 			RouteIdentity: routeIdentity(
 				sandboxRouteGeneration,
 				sandboxCurrentNodeID,

@@ -85,7 +85,37 @@ func waitForPodIP(netnsPath string, timeout time.Duration) string {
 	}
 }
 
-func prepareDataPlaneRedirect(ctx context.Context, sandboxID string, netnsPath string, template string, resultCh chan<- dataPlaneRedirectResult) {
+// podIPForDataPlane waits for CNI to assign the pod's address in netnsPath.
+// It returns "" when the pod has no network namespace or the wait times out.
+func podIPForDataPlane(ctx context.Context, netnsPath string) string {
+	if netnsPath == "" {
+		return ""
+	}
+	podIPSpan, _ := startSpan(ctx, "shim.pod_ip_wait")
+	podIPStartedAt := time.Now()
+	podIP := waitForPodIP(netnsPath, 5*time.Second)
+	podIPSpan.SetAttributes(attribute.String("pod_ip", podIP))
+	var err error
+	podIPResult := "success"
+	if podIP == "" {
+		podIPResult = shimMetricResultTimeout
+		err = fmt.Errorf("pod IP was not assigned in netns %s before data-plane redirect timeout", netnsPath)
+	}
+	podIPSpan.End(err)
+	emitShimStepLatency("create", "pod_ip_wait", podIPStartedAt, podIPResult)
+	return podIP
+}
+
+// reportedPodIP is the pod address sbx-manager reports for the activation of
+// podUID, so the control plane need not wait for kubelet to publish it.
+func reportedPodIP(podIP string, podUID *string) *string {
+	if podIP == "" || podUID == nil {
+		return nil
+	}
+	return ptr(podIP)
+}
+
+func prepareDataPlaneRedirect(ctx context.Context, sandboxID string, netnsPath string, podIP string, template string, resultCh chan<- dataPlaneRedirectResult) {
 	span, ctx := startSpan(ctx, "shim.dataplane.prepare",
 		attribute.String("sandbox_id", sandboxID),
 		attribute.String("template", template),
@@ -97,19 +127,8 @@ func prepareDataPlaneRedirect(ctx context.Context, sandboxID string, netnsPath s
 		resultCh <- dataPlaneRedirectResult{}
 		return
 	}
-
-	podIPSpan, _ := startSpan(ctx, "shim.pod_ip_wait")
-	podIPStartedAt := time.Now()
-	podIP := waitForPodIP(netnsPath, 5*time.Second)
-	podIPSpan.SetAttributes(attribute.String("pod_ip", podIP))
-	podIPResult := "success"
 	if podIP == "" {
-		podIPResult = shimMetricResultTimeout
 		resultErr = fmt.Errorf("pod IP was not assigned in netns %s before data-plane redirect timeout", netnsPath)
-	}
-	podIPSpan.End(resultErr)
-	emitShimStepLatency("create", "pod_ip_wait", podIPStartedAt, podIPResult)
-	if podIP == "" {
 		resultCh <- dataPlaneRedirectResult{
 			err: resultErr,
 		}
