@@ -26,6 +26,11 @@
 //! A check lease spends an attempt, so repeated lapses can redrive an issued
 //! canary to failed. The pin then holds the rollout in canary, and with no
 //! failure budget it never pauses on its own.
+//!
+//! Rolling has no failure budget and no bound on nodes issued but not yet
+//! proven: once the canary proves, only lease turnover limits how fast an
+//! unproven revision spreads. The rolling driver must add a proof or failure
+//! gate before it calls [`lease_targets`].
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -44,6 +49,7 @@ use crate::{ItemPhase, RolloutId, Scope, end_transaction, rollout_phase};
 
 /// Firewall rollouts don't pause on failures, and the shared claim refuses
 /// once `failed >= failure_budget`, so the budget is one no count reaches.
+/// Nothing else bounds unproven nodes in rolling; see the module docs.
 const NO_FAILURE_BUDGET: u64 = u64::MAX;
 
 /// Key of the advisory lock that hands a node between rollouts. Frozen:
@@ -206,6 +212,11 @@ impl ClaimStore for Claiming<'_> {
         }))
     }
 
+    /// Counts every `in_flight` row, lapsed included, unlike `candidates`'
+    /// live count. That's intended: the canary limit is 1, a first claim
+    /// redrives its lapsed unissued rows before this runs, and a lapsed issued
+    /// row leaves no first assignment to lease. Counting it only withholds a
+    /// claim until its redrive.
     async fn canary_progress(&mut self) -> Result<(bool, u64), sqlx::Error> {
         let (done, in_flight) = sqlx::query_as::<_, (bool, i64)>(sql!(
             "SELECT coalesce(bool_or(phase = $2), false), count(*) FILTER (WHERE phase = $3)

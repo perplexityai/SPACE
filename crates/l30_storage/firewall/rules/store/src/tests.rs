@@ -193,6 +193,7 @@ async fn racing_controllers_share_one_node_and_one_slot() -> TestResult {
         1,
         "two leases committed into one slot: {leased:?}"
     );
+    // The returned vectors can't show a lease committed but not returned.
     let live = sqlx::query_scalar::<_, i64>(sql!(
         "SELECT count(*) FROM firewall_rules_rollout_items
          WHERE rollout_id = $1 AND phase = 'in_flight'
