@@ -2494,6 +2494,7 @@ func stoppedMaterializationRequest(request *pb.StartRequest, artifactID string) 
 	request.TargetState = pb.WakeTargetState_WAKE_TARGET_STATE_STOPPED
 	request.ExpectedLocalArtifactId = ptr(artifactID)
 	request.NetnsPath = nil
+	request.PodIp = nil
 	request.SuspendRestoreSourceNode = nil
 	return nil
 }

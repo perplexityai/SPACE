@@ -70,6 +70,7 @@ struct PodAddress {
     recorded_at: Instant,
 }
 
+/// At most one entry per sandbox on this node; `record` prunes expired ones.
 #[derive(Default)]
 pub(super) struct PodAddresses(DashMap<SandboxId, PodAddress>);
 
@@ -96,9 +97,17 @@ impl PodAddresses {
 
     /// The address reported with the activation of `pod_uid`'s pod, if it is the
     /// latest one recorded for `sandbox_id` and has not expired.
+    /// An expired entry is removed unless a newer activation replaced it.
     pub(super) fn get(&self, sandbox_id: &SandboxId, pod_uid: &PodUid) -> Option<IpAddr> {
-        let address = self.0.get(sandbox_id)?;
-        (address.pod_uid == *pod_uid && address.recorded_at.elapsed() < POD_ADDRESS_TTL)
-            .then_some(address.pod_ip)
+        let expired_at = {
+            let address = self.0.get(sandbox_id)?;
+            if address.recorded_at.elapsed() < POD_ADDRESS_TTL {
+                return (address.pod_uid == *pod_uid).then_some(address.pod_ip);
+            }
+            address.recorded_at
+        };
+        self.0
+            .remove_if(sandbox_id, |_, address| address.recorded_at == expired_at);
+        None
     }
 }

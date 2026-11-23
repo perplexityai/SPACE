@@ -3482,6 +3482,7 @@ func TestStoppedMaterializationRequest(t *testing.T) {
 			SandboxId:                "sbx",
 			Checkpoint:               ptr(stoppedMaterializationCheckpoint),
 			NetnsPath:                ptr("/var/run/netns/cni-1"),
+			PodIp:                    ptr("10.0.0.7"),
 			SuspendRestoreStorageUri: ptr("s3://example/disk"),
 			SuspendRestoreSourceNode: ptr("drained-node"),
 		}
@@ -3500,8 +3501,8 @@ func TestStoppedMaterializationRequest(t *testing.T) {
 	if request.GetExpectedLocalArtifactId() != "019f8000-0000-7000-8000-000000000001" {
 		t.Fatalf("expected artifact = %q", request.GetExpectedLocalArtifactId())
 	}
-	if request.NetnsPath != nil || request.SuspendRestoreSourceNode != nil {
-		t.Fatal("a materialization launches nothing and has no source node")
+	if request.NetnsPath != nil || request.PodIp != nil || request.SuspendRestoreSourceNode != nil {
+		t.Fatal("a materialization launches nothing, has no pod address and has no source node")
 	}
 	if request.GetSuspendRestoreStorageUri() != "s3://example/disk" {
 		t.Fatal("the exact artifact URI must reach sbx-manager")
