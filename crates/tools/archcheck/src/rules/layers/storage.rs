@@ -10,13 +10,11 @@
 //! required (normal or build, not optional) dependency on a driver that
 //! `helpers` doesn't list is a `storage_access` finding until it is added. A
 //! listed helper need not depend on a driver, such as a connector for a
-//! driver's client that does not depend on the driver itself. A Foundation
-//! crate `[rules.layers] legacy` lists is never a helper, so it is checked
-//! like any other; test support and tools are left out. The codec facades
-//! are the Foundation crates `codec_facades` lists, other than helpers and
-//! legacy crates: each re-exports only a driver's codec items, behind
-//! features, those its `exports` list, so that list is what a codec may
-//! use.
+//! driver's client that does not depend on the driver itself. Test support
+//! and tools are left out. The codec facades are the Foundation crates
+//! `codec_facades` lists, other than helpers: each re-exports only a
+//! driver's codec items, behind features, those its `exports` list, so that
+//! list is what a codec may use.
 //!
 //! - `storage_access`: only stores and helpers may have a normal or build
 //!   dependency on a driver, helper or codec facade, optional or not, with
@@ -94,7 +92,7 @@ struct Enabling<'b> {
 pub(super) struct Storage<'a> {
     pub helpers: BTreeMap<&'a str, Helper>,
     /// The codec facades: the Foundation crates `codec_facades` lists that
-    /// are neither helpers nor legacy.
+    /// are not helpers.
     facades: BTreeSet<&'a str>,
     /// The Foundation crates derivation finds that `helpers` doesn't list,
     /// each with the drivers it requires: no helper until listed.
@@ -136,7 +134,7 @@ impl<'a> Storage<'a> {
         let mut helpers = BTreeMap::new();
         let mut unlisted = BTreeMap::new();
         for member in graph.members.values() {
-            if member.layer != Some(Layer::Foundation) || config.legacy.contains(member.name()) {
+            if member.layer != Some(Layer::Foundation) {
                 continue;
             }
             // In manifest order, the first named in messages.
@@ -170,7 +168,6 @@ impl<'a> Storage<'a> {
                 member.layer == Some(Layer::Foundation)
                     && config.storage.codec_facades.contains_key(member.name())
                     && !config.storage.helpers.contains(member.name())
-                    && !config.legacy.contains(member.name())
             })
             .map(|member| member.name())
             .collect();
@@ -468,15 +465,6 @@ impl<'a> Storage<'a> {
                          move the code that uses it{items} into a store or a storage helper."
                     )
                 }
-                (Layer::Foundation, _) if config.legacy.contains(from) => format!(
-                    "Fix: {}move the code that uses it{items} into a store or a storage helper, \
-                     as splitting {from} up would: [rules.{RULE}] legacy lists it, so it is no \
-                     storage helper itself.",
-                    codec
-                        .as_ref()
-                        .map(|codec| format!("{codec}; for anything else, "))
-                        .unwrap_or_default()
-                ),
                 (Layer::Foundation, _) => format!(
                     "Fix one of: {}if {from} names nothing SPACE-specific, list it in \
                      [rules.{RULE}.storage] helpers in {CONFIG_FILE}, which \
@@ -982,9 +970,9 @@ pub(super) fn features_of(member: &Member<'_>) -> BTreeMap<String, Vec<String>> 
 }
 
 /// `layers.stale_entries` for `[rules.layers.storage]`: a `helpers` entry
-/// that is no Foundation crate or is legacy, and a `codec_facades` entry
-/// that is no Foundation crate, is legacy or is a helper. An entry for a crate without a
-/// layer is left to `layers.placement`.
+/// that is no Foundation crate, and a `codec_facades` entry that is no
+/// Foundation crate or is a helper. An entry for a crate without a layer is
+/// left to `layers.placement`.
 pub(super) fn stale_entries(
     ctx: &Context,
     config: &LayersConfig,
@@ -1001,10 +989,6 @@ pub(super) fn stale_entries(
             Some(Some(layer)) if layer != Layer::Foundation => {
                 format!("a storage helper is an l10_foundation crate, and its layer is {layer}")
             }
-            Some(_) if config.legacy.contains(helper) => format!(
-                "[rules.{RULE}] legacy lists it too, which keeps a crate from being a storage \
-                 helper"
-            ),
             Some(_) => continue,
         };
         findings.push(config_finding(
@@ -1022,9 +1006,6 @@ pub(super) fn stale_entries(
             Some(Some(layer)) if layer != Layer::Foundation => {
                 format!("a codec facade is an l10_foundation crate, and its layer is {layer}")
             }
-            Some(_) if config.legacy.contains(facade) => format!(
-                "[rules.{RULE}] legacy lists it too, which keeps a crate from being a codec facade"
-            ),
             Some(_) if config.storage.helpers.contains(facade) => {
                 "helpers lists it too, and a storage helper may reach storage already".to_owned()
             }

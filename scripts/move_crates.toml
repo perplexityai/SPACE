@@ -3,8 +3,7 @@
 # reviewed. A crate's target is crates/<layer>/ and its package name without
 # `pplx-space-`, split on `-`, with a leaf where another crate's path would
 # nest inside it; `rename` changes the package name only, never a binary's.
-# A legacy crate stays until it is dissolved; another stays only for a
-# reviewed reason.
+# A crate stays only for a reviewed reason.
 
 [crates]
 # l10_foundation (49)

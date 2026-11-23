@@ -600,9 +600,9 @@ protocols = [
 # l20_domain dependency on a database driver, aws-sdk-s3 or a storage helper
 # is storage_access's ([rules.layers.storage]), so no family lists them.
 # aws-lc-rs and aws-lc-sys are cryptography, not cloud SDKs. The workspace's
-# own I/O crates need no entry: an l10_foundation crate, legacy or not, with
-# a required dependency on a fenced package is fenced under that package's
-# family, such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
+# own I/O crates need no entry: an l10_foundation crate with a required
+# dependency on a fenced package is fenced under that package's family,
+# such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
 # declared dependencies are seen: tonic's transport brings tokio and hyper
 # into every tonic user's build regardless. Features are not followed, so observability, which brings
 # tokio in only behind its otel feature, is listed; feature-flags, whose
