@@ -34,6 +34,10 @@ reviews:
 
   auto_approvals:
     enabled: true
+    # Only major and critical findings withhold approval. Minor ones stay
+    # advisory, though main's ruleset still needs every review thread
+    # resolved before merging. Pre-merge checks and risk limits still apply.
+    min_blocking_severity: major
     # Authors cannot run `@coderabbitai approve` or `@coderabbitai resolve` on
     # their own pull requests. Any other organization member can, and those
     # commands approve without passing pre-merge checks. Risk limits and the
