@@ -66,6 +66,7 @@ pplx-space-firewall-rules-store = { workspace = true }
 pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }
 pplx-space-node-registration-store = { workspace = true }
+pplx-space-node-template-inventory-store = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-env-vars = { workspace = true }

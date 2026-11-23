@@ -1,5 +1,6 @@
-//! The node-group mirror's Postgres operations: the `node_groups` read and the
-//! bulk UPDATE of `nodes.node_group_id`, with the transaction it runs in.
+//! The node-group mirror's Postgres operations: the `node_groups` read, through
+//! `pplx-space-node-group-store`, and the bulk UPDATE of `nodes.node_group_id`,
+//! with the transaction it runs in.
 //!
 //! The read takes any executor. The write is a pair on one connection,
 //! [`begin_mirror_write`] then [`mirror_worker_groups`], because the statement
@@ -18,10 +19,8 @@ use sqlx::{Connection, Executor, PgConnection, PgExecutor, Postgres, SqlSafeStr,
 pub(super) async fn group_ids_by_name<'e>(
     executor: impl PgExecutor<'e>,
 ) -> Result<HashMap<String, NodeGroupId>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, NodeGroupId)>(sql!("SELECT name, id FROM node_groups"))
-        .fetch_all(executor)
-        .await?;
-    Ok(rows.into_iter().collect())
+    let rows = pplx_space_node_group_store::node_group_names(executor).await?;
+    Ok(rows.into_iter().map(|row| (row.name, row.id)).collect())
 }
 
 /// Open a mirror write's transaction on `conn`, with `statement_timeout` and

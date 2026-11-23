@@ -161,12 +161,8 @@ pub(super) async fn template_cached_rootfs_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
 ) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT COUNT(*)::BIGINT FROM node_template_inventory WHERE template_name = $1"
-    ))
-    .bind(template_name)
-    .fetch_one(&mut **tx)
-    .await
+    pplx_space_node_template_inventory_store::template_inventory_rows(&mut **tx, template_name)
+        .await
 }
 
 /// `true` when the template carries an owner-scoped encryption sidecar —
@@ -243,18 +239,12 @@ pub(super) async fn prune_cross_org_compat_in_tx(
     template_name: &str,
     owner_org_id: OrgId,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(sql!(
-        "DELETE FROM node_group_template_compat c
-          USING node_groups g
-          WHERE c.node_group_id = g.id
-            AND c.template_name = $1
-            AND g.org_id IS DISTINCT FROM $2"
-    ))
-    .bind(template_name)
-    .bind(owner_org_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(result.rows_affected())
+    pplx_space_node_group_store::prune_cross_org_template_compat(
+        &mut **tx,
+        template_name,
+        owner_org_id,
+    )
+    .await
 }
 
 /// Postgres-backed regression tests for the visibility-flip guards and the

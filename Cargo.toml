@@ -86,6 +86,8 @@ members = [
     "crates/l20_domain/sandbox/model",
     "crates/l40_api/node/mgr/server",
     "crates/l30_storage/node/registration/store",
+    "crates/l30_storage/node/group/store",
+    "crates/l30_storage/node/template/inventory/store",
     "crates/l40_api/node/runtime/core",
     "crates/l40_api/node/runtime/manager/client",
     "crates/l40_api/node/runtime/manager/server",
@@ -451,11 +453,13 @@ pplx-space-node-mgr = { path = "crates/l40_api/node/mgr/server" }
 pplx-space-node-mgr-client = { path = "crates/l40_api/node/mgr/client" }
 pplx-space-node-mgr-protocol = { path = "crates/l20_domain/node/mgr/protocol" }
 pplx-space-node-model = { path = "crates/l20_domain/node/model" }
+pplx-space-node-group-store = { path = "crates/l30_storage/node/group/store" }
 pplx-space-node-registration-store = { path = "crates/l30_storage/node/registration/store" }
 pplx-space-node-runtime-core = { path = "crates/l40_api/node/runtime/core" }
 pplx-space-node-runtime-manager = { path = "crates/l40_api/node/runtime/manager/server" }
 pplx-space-node-runtime-manager-client = { path = "crates/l40_api/node/runtime/manager/client" }
 pplx-space-node-runtime-supervisor = { path = "crates/l40_api/node/runtime/supervisor" }
+pplx-space-node-template-inventory-store = { path = "crates/l30_storage/node/template/inventory/store" }
 pplx-space-net-common = { path = "crates/l20_domain/net/common" }
 pplx-space-transparent-proxy-socket = { path = "crates/l10_foundation/transparent/proxy/socket" }
 pplx-space-object-store = { path = "crates/l10_foundation/object/store" }

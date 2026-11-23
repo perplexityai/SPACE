@@ -124,14 +124,6 @@ struct TemplateReleaseTagRow {
 }
 
 #[derive(Debug, FromRow)]
-struct TemplatePoolObservedRow {
-    pool_target: Option<i32>,
-    pool_current: i32,
-    pool_pending: i32,
-    pool_sandbox_ids: SqlxJson<Vec<String>>,
-}
-
-#[derive(Debug, FromRow)]
 struct TemplatePoolPolicyRow {
     target_count: i32,
     boot_mode: String,
@@ -144,12 +136,6 @@ struct BaseSnapshotPolicyRow {
     snapshot_vcpu: i32,
     snapshot_memory_mib: i32,
     updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, FromRow)]
-struct TemplateSnapshotDefaultRow {
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2982,24 +2968,9 @@ async fn fetch_template_snapshot_defaults(
     pool: &sqlx::PgPool,
     template_name: &TemplateName,
 ) -> Result<(u32, u32), sqlx::Error> {
-    let row = sqlx::query_as::<_, TemplateSnapshotDefaultRow>(sql!(
-        "SELECT nti.vcpu, nti.memory_mib
-         FROM node_template_inventory nti
-         JOIN nodes n ON n.id = nti.node_id
-         JOIN templates t ON t.name = nti.template_name
-         WHERE nti.template_name = $1
-           AND t.desired_state = $2
-           AND (nti.vcpu IS NOT NULL OR nti.memory_mib IS NOT NULL)
-         ORDER BY CASE n.role WHEN 'worker' THEN 0 WHEN 'builder' THEN 1 ELSE 2 END,
-                  nti.observed_at DESC,
-                  nti.built_at DESC NULLS LAST,
-                  nti.content_hash ASC
-         LIMIT 1"
-    ))
-    .bind(template_name.as_str())
-    .bind(TemplateDesiredState::Present.as_str())
-    .fetch_optional(pool)
-    .await?;
+    let row =
+        pplx_space_node_template_inventory_store::template_snapshot_shape(pool, template_name)
+            .await?;
     Ok((
         row.as_ref()
             .and_then(|row| row.vcpu)
@@ -3404,53 +3375,6 @@ pub async fn delete_template_pool(
     }
 }
 
-async fn fetch_template_pool_observed(
-    pool: &sqlx::PgPool,
-    template_name: &TemplateName,
-) -> Result<Option<TemplatePoolObservedRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplatePoolObservedRow>(
-        sql!("WITH builder_metadata AS (
-             SELECT nti.content_hash
-             FROM node_template_inventory nti
-             JOIN nodes n ON n.id = nti.node_id
-             WHERE nti.template_name = $1
-               AND n.role = 'builder'
-             ORDER BY nti.observed_at DESC, nti.built_at DESC NULLS LAST, nti.content_hash ASC
-             LIMIT 1
-         ),
-         observed AS (
-             SELECT SUM(nti.pool_target)::INTEGER AS pool_target,
-                    COALESCE(SUM(nti.pool_current), 0)::INTEGER AS pool_current,
-                    COALESCE(SUM(nti.pool_pending), 0)::INTEGER AS pool_pending
-             FROM node_template_inventory nti
-             LEFT JOIN builder_metadata bm ON TRUE
-             WHERE nti.template_name = $1
-               AND nti.pool_target IS NOT NULL
-               AND (NULLIF(bm.content_hash, '') IS NULL OR nti.content_hash = bm.content_hash)
-         )
-         SELECT observed.pool_target,
-                observed.pool_current,
-                observed.pool_pending,
-                COALESCE(
-                    (
-                        SELECT JSONB_AGG(DISTINCT sandbox_id)
-                        FROM node_template_inventory nti2
-                        LEFT JOIN builder_metadata bm ON TRUE
-                        LEFT JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(nti2.pool_sandbox_ids) AS sandbox_id ON TRUE
-                        WHERE nti2.template_name = $1
-                          AND (NULLIF(bm.content_hash, '') IS NULL OR nti2.content_hash = bm.content_hash)
-                          AND sandbox_id IS NOT NULL
-                    ),
-                    '[]'::JSONB
-                ) AS pool_sandbox_ids
-         FROM observed
-         WHERE observed.pool_target IS NOT NULL"),
-    )
-    .bind(template_name.as_str())
-    .fetch_optional(pool)
-    .await
-}
-
 pub async fn template_pool_status(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -3481,7 +3405,12 @@ pub async fn template_pool_status(
             .into_response();
         }
     };
-    let observed = match fetch_template_pool_observed(&state.pool, &template_name).await {
+    let observed = match pplx_space_node_template_inventory_store::template_pool_observed(
+        &state.pool,
+        &template_name,
+    )
+    .await
+    {
         Ok(observed) => observed,
         Err(error) => {
             if let Some(response) = contention_response(ContentionScope::ReadOnly, &error) {
