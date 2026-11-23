@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
+use pplx_space_template_mgr_store::{builds, snapshots};
 use rusqlite::{Connection, params};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -343,16 +344,11 @@ fn execute_precheck(
         return Ok(PrecheckOutcome::SkipWarmPool);
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let pinned: i64 = tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM template_pinned_tags WHERE name = ?1 AND content_hash = ?2
-             UNION ALL
-             SELECT 1 FROM template_pinned_releases WHERE name = ?1 AND content_hash = ?2
-         )",
-        params![candidate.name, candidate.content_hash],
-        |row| row.get(0),
-    )?;
-    if pinned != 0 {
+    if pplx_space_template_mgr_store::eviction::digest_is_pinned(
+        &tx,
+        &candidate.name,
+        &candidate.content_hash,
+    )? {
         return Ok(PrecheckOutcome::SkipPinned);
     }
 
@@ -380,30 +376,18 @@ fn execute_precheck(
     Ok(PrecheckOutcome::Proceed)
 }
 
-/// Finalize phase: delete the snapshot rows and the build row in a
-/// short IMMEDIATE txn. The disk delete has already completed; if a
-/// pin landed between phases the disk is gone and the next pull
-/// will re-materialize (pin's job is to keep the digest available,
-/// not to keep this exact row). Mirror the existing `delete_build`
-/// ordering: child rows first (FK-bound) then the build row. The runtime
-/// connection doesn't enforce foreign keys, so nothing cascades.
+/// Finalize phase: delete the build's components, snapshots and row with
+/// `builds::delete_build` in one short IMMEDIATE txn. The disk delete has
+/// already completed; if a pin landed between phases the disk is gone and
+/// the next pull will re-materialize (pin's job is to keep the digest
+/// available, not to keep this exact row).
 fn execute_finalize(conn: &Connection, candidate: &EvictionCandidate) -> rusqlite::Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let partition = candidate.cache_partition.key();
-    tx.execute(
-        "DELETE FROM template_build_components
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![candidate.name, candidate.content_hash, partition],
-    )?;
-    tx.execute(
-        "DELETE FROM template_snapshots
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![candidate.name, candidate.content_hash, partition],
-    )?;
-    tx.execute(
-        "DELETE FROM template_builds
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![candidate.name, candidate.content_hash, partition],
+    builds::delete_build(
+        &tx,
+        &candidate.name,
+        &candidate.content_hash,
+        candidate.cache_partition,
     )?;
     tx.commit()
 }
@@ -918,11 +902,7 @@ pub(crate) async fn reap_stuck_deleting(
                         &conn,
                         rusqlite::TransactionBehavior::Immediate,
                     )?;
-                    tx.execute(
-                        "DELETE FROM template_snapshots
-                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-                        params![n, h, partition_key],
-                    )?;
+                    snapshots::delete_snapshots_for_build(&tx, &n, &h, partition)?;
                     tx.execute(
                         "DELETE FROM template_builds
                          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
