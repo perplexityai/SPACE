@@ -14,7 +14,8 @@ use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
 use pplx_space_snapshot_model::SnapshotId;
-use pplx_space_snapshot_store::delete_snapshot_catalog;
+use pplx_space_snapshot_store::claimed::{self, ClaimedSnapshot};
+use pplx_space_snapshot_store::{delete_snapshot_catalog, snapshot_ids_after};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -31,6 +32,17 @@ type PruneCandidateRow = (
     bool,
     i64,
 );
+
+fn claimed_row(row: ClaimedSnapshot) -> PruneCandidateRow {
+    (
+        row.snapshot_id,
+        row.sandbox_id,
+        row.storage_location_id,
+        row.storage_connection_string,
+        row.has_encrypted_fields,
+        row.age_secs,
+    )
+}
 
 fn prune_candidate_from_row(row: PruneCandidateRow) -> Result<PruneCandidate, sqlx::Error> {
     let (snapshot_id, sandbox_id, location_id, route, encrypted, age_secs) = row;
@@ -50,57 +62,6 @@ fn prune_candidate_from_row(row: PruneCandidateRow) -> Result<PruneCandidate, sq
         age_secs,
     })
 }
-
-/// Upper bound of the durable claims present when a recovery epoch starts.
-///
-/// The `OFFSET 0` fence keeps the claim filter on the `(state, type)` index.
-/// Without it, `ORDER BY id DESC LIMIT 1` lets the planner walk the primary
-/// key backward and filter every row, expecting a claim near the newest IDs.
-/// A `deleting` estimate larger than the live claim set, such as statistics
-/// sampled while a tick holds its claims, makes that plan look cheap. Claims
-/// are old snapshots with low UUIDv7 IDs, so the walk reads nearly the whole
-/// table and can exceed the statement timeout while fresh discovery keeps
-/// working. With the fence, the cost scales with the claims, not the table.
-pub(crate) const CLAIMED_SCAN_EPOCH_SQL: &str = sql!(
-    "SELECT claimed.id
-       FROM (
-             SELECT id
-               FROM snapshots
-              WHERE state = 'deleting'
-             OFFSET 0
-            ) claimed
-      ORDER BY claimed.id DESC
-      LIMIT 1"
-);
-
-/// One recovery page of durable claims in `($2, $3]`, oldest first.
-///
-/// Same `OFFSET 0` fence as [`CLAIMED_SCAN_EPOCH_SQL`]: the `LIMIT` must not
-/// turn the ID range into a primary-key walk that filters unclaimed rows.
-pub(crate) const LIST_CLAIMED_SQL: &str = sql!(
-    "SELECT
-         s.id AS snapshot_id,
-         s.sandbox_id,
-         ssl.id AS storage_location_id,
-         ssl.storage_connection_string,
-         EXISTS (
-             SELECT 1
-               FROM snapshot_storage_location_encrypted_fields ef
-              WHERE ef.snapshot_storage_location_id = ssl.id
-         ) AS has_encrypted_fields,
-         EXTRACT(EPOCH FROM (NOW() - s.timestamp))::BIGINT AS age_secs
-     FROM (
-           SELECT id, sandbox_id, timestamp
-             FROM snapshots
-            WHERE state = 'deleting'
-              AND id > COALESCE($2::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
-              AND id <= $3
-           OFFSET 0
-          ) s
-     LEFT JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
-     ORDER BY s.id ASC
-     LIMIT $1"
-);
 
 /// SQL fragment for the one usable storage location a snapshot may own.
 ///
@@ -199,19 +160,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         after: Option<SnapshotId>,
         min_age: Option<Duration>,
     ) -> Result<CandidatePage, sqlx::Error> {
-        // One array avoids per-row wire/decoder overhead for the raw ID page.
-        let ids: Vec<SnapshotId> = sqlx::query_scalar(sql!(
-            "SELECT ARRAY(
-                 SELECT id FROM snapshots
-                  WHERE id > COALESCE($1::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
-                  ORDER BY id
-                  LIMIT $2
-             )"
-        ))
-        .bind(after)
-        .bind(self.raw_page_size as i64)
-        .fetch_one(&self.pool)
-        .await?;
+        let ids = snapshot_ids_after(&self.pool, after, self.raw_page_size as i64).await?;
         let mut page = CandidatePage {
             scanned_through: ids.last().copied(),
             exhausted: ids.len() < self.raw_page_size,
@@ -348,9 +297,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
     }
 
     async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, sqlx::Error> {
-        let through: Option<SnapshotId> = sqlx::query_scalar(CLAIMED_SCAN_EPOCH_SQL)
-            .fetch_optional(&self.pool)
-            .await?;
+        let through = claimed::scan_epoch(&self.pool).await?;
         Ok(through.map(|through| ClaimedScanEpoch { through }))
     }
 
@@ -361,13 +308,10 @@ impl RetentionSink for SnapshotRetentionDbStore {
         through: SnapshotId,
     ) -> Result<Vec<PruneCandidate>, sqlx::Error> {
         // Claims are already de-advertised; page them separately to finish forward.
-        let rows: Vec<PruneCandidateRow> = sqlx::query_as(LIST_CLAIMED_SQL)
-            .bind(limit)
-            .bind(after)
-            .bind(through)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(prune_candidate_from_row).collect()
+        let rows = claimed::list(&self.pool, limit, after, through).await?;
+        rows.into_iter()
+            .map(|row| prune_candidate_from_row(claimed_row(row)))
+            .collect()
     }
 
     async fn claim_prune(
