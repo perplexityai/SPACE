@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sandbox_portability::{
-    snapshot_is_current_local_artifact, snapshot_is_live_restore_source,
+    snapshot_is_current_local_artifact, snapshot_is_current_stop_disk,
+    snapshot_is_live_restore_source,
 };
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
@@ -227,7 +228,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         let min_age_secs = min_age.map(|d| d.as_secs() as i64);
         // Only a `disk` row of origin `stop` (a stopped sandbox's evacuation
         // or retire backup) is swept, and it has no keep-set: past the age
-        // gate, only the restore source guard keeps it. Named (`snapshot`)
+        // gate, only the two guards below keep it. Named (`snapshot`)
         // and `fork` disk rows are never candidates. A `full` candidate is
         // outside the keep-set exactly when the indexed sibling probe can
         // skip `keep_n - 1` newer ready/full rows with a usable attached
@@ -250,6 +251,10 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // needs can sit outside the keep-set while newer rows (including a
         // failed restore branch's later artifacts) push it down.
         //
+        // `NOT (current_stop_disk)` keeps a stopped sandbox's newest stored
+        // stop disk taken since its stop, pinned or not. Its node still holds
+        // the rootfs, and the stored disk is the only other copy.
+        //
         // Rows in `deleting` are deliberately absent: outstanding claims
         // page through [`Self::list_claimed`] on their own cursor, so this
         // scan is purely fresh `ready` work and its keyset cursor can
@@ -260,6 +265,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // the PostgreSQL unusable-location tests pin discovery/claim agreement
         // for missing, orphaned, and newly usable candidate/sibling locations.
         let restore_source = snapshot_is_live_restore_source("sb", "s");
+        let current_stop_disk = snapshot_is_current_stop_disk("sb", "s");
         let query = format!(
             "SELECT
                  s.id AS snapshot_id,
@@ -297,6 +303,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
                AND ($4::BIGINT IS NULL
                     OR s.timestamp < NOW() - make_interval(secs => $4::BIGINT))
                AND NOT {restore_source}
+               AND NOT {current_stop_disk}
                AND ((s.type = 'disk' AND s.artifact_origin = 'stop')
                     OR (s.type = 'full'
                         AND EXISTS (
@@ -473,12 +480,15 @@ impl RetentionSink for SnapshotRetentionDbStore {
         }
 
         let restore_source = snapshot_is_live_restore_source("sb", "cur");
+        let current_stop_disk = snapshot_is_current_stop_disk("sb", "cur");
         let newer_location = usable_snapshot_location_exists("newer", "newer_ssl");
         let min_age_secs = min_age.map(|duration| duration.as_secs() as i64);
         // `floor_ok` is also what keeps unswept rows unclaimed: a `disk` row of
         // any origin but `stop` fails it and is refused as `KeepNFloor`.
         // `IS NOT DISTINCT FROM` keeps a markerless row's NULL origin a FALSE
         // here rather than a NULL the boolean decode rejects.
+        // A stopped sandbox's current stop disk is refused with the restore
+        // sources, as `ProtectedRestoreSource`.
         let query = format!(
             "SELECT ((cur.type = 'disk' AND cur.artifact_origin IS NOT DISTINCT FROM 'stop')
                      OR (cur.type = 'full'
@@ -493,7 +503,7 @@ impl RetentionSink for SnapshotRetentionDbStore {
                               OFFSET ($2 - 1)
                               LIMIT 1
                          ))) AS floor_ok,
-             NOT {restore_source} AS restore_source_ok,
+             NOT ({restore_source} OR {current_stop_disk}) AS restore_source_ok,
              ($3::BIGINT IS NULL
                 OR cur.timestamp < NOW() - make_interval(secs => $3::BIGINT)) AS age_ok
              FROM snapshots cur

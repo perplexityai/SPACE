@@ -1,7 +1,8 @@
 //! Disk artifacts against real Postgres: the sweep reaches `stop` disk rows
 //! past the age gate, the restore-source guard shields the ones restore can
-//! load, named and fork disk rows stay unswept, and disk rows have no keep-N
-//! floor and don't count toward a `full` row's.
+//! load, a stopped sandbox keeps its current stop disk, named and fork disk
+//! rows stay unswept, and disk rows have no keep-N floor and don't count
+//! toward a `full` row's.
 
 use super::super::{FakeBackend, Reconciler, config, registry_with};
 use super::*;
@@ -45,6 +46,41 @@ async fn pin_stop_disk(
 
 /// The `(kind, origin)` a stopped sandbox's disk artifact carries.
 const STOP_DISK: (&str, &str) = ("disk", "stop");
+
+/// Move the sandbox to `lifecycle`, entered `secs_ago` seconds in the past.
+/// Two writes, because the row's trigger stamps `lifecycle_changed_at` with
+/// `NOW()` whenever the lifecycle changes.
+async fn enter_lifecycle(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+    secs_ago: i64,
+) -> TestResult {
+    sqlx::query("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1")
+        .bind(sandbox_id)
+        .bind(lifecycle)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE sandboxes
+            SET lifecycle_changed_at = NOW() - make_interval(secs => $2::BIGINT)
+          WHERE id = $1",
+    )
+    .bind(sandbox_id)
+    .bind(secs_ago)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn set_snapshot_state(pool: &PgPool, id: SnapshotId, state: &str) -> TestResult {
+    sqlx::query("UPDATE snapshots SET state = $2 WHERE id = $1")
+        .bind(id)
+        .bind(state)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
 async fn candidate_ids(
     store: &SnapshotRetentionDbStore,
@@ -163,6 +199,80 @@ async fn restoring_stopped_evacuation_keeps_its_pinned_disk_source() -> TestResu
             ClaimOutcome::Refused(ClaimRefusalReason::ProtectedRestoreSource)
         );
         assert_eq!(snapshot_state(pool, id).await?.as_deref(), Some("ready"));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_sandbox_keeps_its_current_stop_disk_unpinned() -> TestResult {
+    // A stopped row with no pin, as a stopped Kubernetes row usually is. Its
+    // newest durable stop disk taken since the stop is the only copy off the
+    // node, so the sweep keeps it. Everything else follows today's rules: the
+    // disk from before the stop, an older disk taken since, and the full row
+    // outside keep-N are all prunable.
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let sandbox = insert_sandbox(pool).await?;
+    enter_lifecycle(pool, sandbox, "stopped", 5000).await?;
+    // Oldest-first, so ids increase with recency.
+    let before_stop = insert_unpinned_stop_disk(pool, sandbox, 6000).await?;
+    let older_full = insert_snapshot(pool, sandbox, "full", "ready", 4900).await?;
+    let superseded = insert_unpinned_stop_disk(pool, sandbox, 4800).await?;
+    insert_snapshot(pool, sandbox, "full", "ready", 4700).await?;
+    let current = insert_unpinned_stop_disk(pool, sandbox, 4600).await?;
+    // A newer upload still in flight doesn't take over yet.
+    let uploading = insert_unpinned_stop_disk(pool, sandbox, 4000).await?;
+    set_snapshot_state(pool, uploading, "creating").await?;
+
+    let store = SnapshotRetentionDbStore::new(pool.clone());
+    assert_eq!(
+        candidate_ids(&store, 1).await?,
+        vec![before_stop, older_full, superseded],
+        "only the current stop disk and the full keep-set survive"
+    );
+    assert_eq!(
+        store.claim_prune(current, 1).await?,
+        ClaimOutcome::Refused(ClaimRefusalReason::ProtectedRestoreSource),
+        "the claim must refuse the current stop disk too"
+    );
+
+    // Once the newer upload is durable, it is the current stop disk, and the
+    // one it replaced is prunable.
+    set_snapshot_state(pool, uploading, "ready").await?;
+    assert_eq!(
+        candidate_ids(&store, 1).await?,
+        vec![before_stop, older_full, superseded, current]
+    );
+    expect_claimed(store.claim_prune(current, 1).await?);
+    assert_eq!(
+        store.claim_prune(uploading, 1).await?,
+        ClaimOutcome::Refused(ClaimRefusalReason::ProtectedRestoreSource)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_sandbox_that_left_stopped_keeps_no_stop_disk() -> TestResult {
+    // A stop disk registered after the row entered each of these lifecycles,
+    // so only the `stopped` condition separates it from a current stop disk.
+    // Each one is prunable, as before.
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let mut disks = Vec::new();
+    for lifecycle in ["started", "suspended", "deleted"] {
+        let sandbox = insert_sandbox(pool).await?;
+        enter_lifecycle(pool, sandbox, lifecycle, 5000).await?;
+        disks.push(insert_unpinned_stop_disk(pool, sandbox, 4000).await?);
+    }
+
+    let store = SnapshotRetentionDbStore::new(pool.clone());
+    assert_eq!(candidate_ids(&store, 1).await?, disks);
+    for id in disks {
+        expect_claimed(store.claim_prune(id, 1).await?);
     }
     Ok(())
 }

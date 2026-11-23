@@ -75,6 +75,11 @@
 //! If you change portability semantics in this file, a deletion path depends
 //! on you.
 //!
+//! The retention sweep has a second "never delete this" guard here, and it
+//! ignores the pin: [`snapshot_is_current_stop_disk`] keeps a stopped
+//! sandbox's newest stored stop disk, which is often the only copy of its
+//! rootfs off the node.
+//!
 //! ## NULL-safety of the freshness clause
 //!
 //! `sn.timestamp >= s.placement_changed_at` is wrapped in
@@ -694,6 +699,70 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
         "(\n\
              {marked}\n\
              OR ({sandbox_alias}.lifecycle = '{restoring}' AND {retry_window})\n\
+         )"
+    )
+}
+
+/// Returns a boolean SQL fragment evaluating to TRUE iff the snapshot aliased
+/// as `snapshot_alias` is the **current stop disk** of the sandbox aliased as
+/// `sandbox_alias`: the sandbox is `stopped`, and the snapshot is its newest
+/// durable `stop` disk taken since it stopped.
+///
+/// The conditions:
+///
+/// * `lifecycle = 'stopped'`. A sandbox that has started, been suspended or
+///   been deleted has no current stop disk.
+/// * The snapshot is a `disk` of origin `stop`, and it has a durable copy
+///   ([`snapshot_has_durable_copy`]: `ready`, with a storage location that
+///   isn't orphaned).
+/// * `timestamp >= lifecycle_changed_at`: registered since the row entered
+///   `stopped`. A disk from an earlier stop predates a later stop's
+///   `lifecycle_changed_at`, so it no longer counts.
+/// * No newer durable `stop` disk of the sandbox exists, by `(timestamp, id)`.
+///   A newer one still uploading, failed, or without a usable location
+///   doesn't take over, so the older durable copy stays current until a
+///   newer one is durable.
+///
+/// It deliberately ignores the row's pin. On Kubernetes, a stopped row usually
+/// carries no `current_local_artifact_id`, while its node still holds the
+/// rootfs, so the stored disk is the only other copy. A pinned disk is
+/// already covered by [`snapshot_is_live_restore_source`]; this covers the
+/// newest stored disk either way.
+///
+/// The snapshot retention sweep uses it as a deletion guard next to
+/// [`snapshot_is_live_restore_source`]: retention never deletes a stopped
+/// sandbox's current stop disk. Like that guard, it errs wide. It shields one
+/// disk per stopped sandbox, and that disk is released when the sandbox leaves
+/// `stopped` or a newer stop disk becomes durable.
+///
+/// ## NULL-safety
+///
+/// Callers negate this, so it must never be NULL. `lifecycle`, `type`,
+/// `timestamp` and `lifecycle_changed_at` are all `NOT NULL`;
+/// `artifact_origin` is compared with `IS NOT DISTINCT FROM`; the rest are
+/// `EXISTS` probes, which are never NULL.
+pub fn snapshot_is_current_stop_disk(sandbox_alias: &str, snapshot_alias: &str) -> String {
+    let stopped = SandboxLifecycle::Stopped.as_str();
+    let stop = ArtifactOrigin::Stop.as_str();
+    let durable = snapshot_has_durable_copy(snapshot_alias);
+    let newer_durable = snapshot_has_durable_copy("newer_stop_disk");
+    format!(
+        "(\n\
+             {sandbox_alias}.lifecycle = '{stopped}'\n\
+             AND {snapshot_alias}.type = 'disk'\n\
+             AND {snapshot_alias}.artifact_origin IS NOT DISTINCT FROM '{stop}'\n\
+             AND {snapshot_alias}.timestamp >= {sandbox_alias}.lifecycle_changed_at\n\
+             AND {durable}\n\
+             AND NOT EXISTS (\n\
+                 SELECT 1\n\
+                   FROM snapshots newer_stop_disk\n\
+                  WHERE newer_stop_disk.sandbox_id = {sandbox_alias}.id\n\
+                    AND newer_stop_disk.type = 'disk'\n\
+                    AND newer_stop_disk.artifact_origin = '{stop}'\n\
+                    AND {newer_durable}\n\
+                    AND (newer_stop_disk.timestamp, newer_stop_disk.id)\n\
+                        > ({snapshot_alias}.timestamp, {snapshot_alias}.id)\n\
+             )\n\
          )"
     )
 }

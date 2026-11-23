@@ -16,9 +16,10 @@
 //! This reconciler keeps, per sandbox, the newest `keep_n` `ready`
 //! `full` snapshots and prunes the rest (S3 prefix + the `snapshots` and
 //! `snapshot_storage_locations` rows). It prunes `ready` `disk` snapshots
-//! of origin `stop` once they are past the age gate, keeping only the ones
-//! the restore-source guard below shields. With no `min_age` there is no
-//! gate; the cluster controller always sets one outside `test-hooks` builds.
+//! of origin `stop` once they are past the age gate, keeping the ones the
+//! restore-source guard below shields and each stopped sandbox's current stop
+//! disk. With no `min_age` there is no gate; the cluster controller always
+//! sets one outside `test-hooks` builds.
 //!
 //! ## Disk snapshots
 //!
@@ -32,15 +33,27 @@
 //! purpose: nothing pins a named one, and once its backup is in, the node's
 //! snapshot GC may drop the local copy, so the S3 copy can be the only one.
 //!
-//! Nothing selects a `stop` row by recency. The stopped restore selectors
-//! load one only through the sandbox's pin, which the restore-source guard
-//! shields. So `stop` rows have no keep-N floor; they neither count toward a
-//! `full` row's floor nor have one of their own.
+//! The stopped restore selectors load a `stop` row only through the
+//! sandbox's pin, which the restore-source guard shields. So `stop` rows have
+//! no keep-N floor; they neither count toward a `full` row's floor nor have
+//! one of their own.
 //!
-//! Node drain can still reuse an unpinned `stop` row: when sbx-mgr finds a
-//! `ready` backup of the node's current artifact, drain pins that artifact
-//! instead of uploading it again. A row pruned before the pin lands costs an
-//! upload, not the data. The stopped evacuation's teardown waits for a
+//! The pin isn't the only protection, though. A stopped sandbox's **current
+//! stop disk** is never swept, pinned or not
+//! (`sandbox_portability::snapshot_is_current_stop_disk`): the newest `stop`
+//! row with a durable copy, registered since the sandbox entered `stopped`.
+//! A stopped Kubernetes row usually carries no pin while its node still
+//! holds the rootfs, so that stored disk is the only other copy, and a node
+//! drain that hands the sandbox off restores from it. The guard keeps at
+//! most one row per stopped sandbox. The row becomes prunable again once the
+//! sandbox leaves `stopped` or a newer stop disk is durable.
+//!
+//! Node drain can reuse an unpinned `stop` row: when sbx-mgr finds a `ready`
+//! backup of the node's current artifact, drain pins that artifact instead of
+//! uploading it again. The current-stop-disk guard keeps such a row if it was
+//! registered since the recorded stop. One registered earlier can still be
+//! pruned before the pin lands, which costs an upload, not the data. The
+//! stopped evacuation's teardown waits for a
 //! `ready` disk row matching the pin before it releases the source node,
 //! whose termination takes the rootfs, and the next drain tick finds no
 //! backup and uploads again. If the sweep claims the row between sbx-mgr's
