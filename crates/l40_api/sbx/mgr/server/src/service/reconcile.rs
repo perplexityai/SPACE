@@ -520,25 +520,44 @@ impl SandboxManagerService {
             return Ok(());
         }
         // A v2 drain doesn't move a stopped sandbox, so a node known sealed
-        // doesn't stop a suspended one on its idle policy: held like the
-        // stages above, the row stays suspended, and the first pass after the
-        // node is unsealed stops it. A sandbox with a VM is stopped through
-        // Stop, which the node doesn't refuse.
-        if action == AutoLifecycleIdleAction::Stop
-            && sandbox.state.is_unowned(SandboxState::Suspended)
-            && let Err(sealed) = self
-                .activation_seal
-                .check_without_vm("idle auto-stop", &sandbox.id)
-        {
-            tracing::debug!(
-                sandbox_id = %sandbox.id,
-                reason = sealed.message(),
-                "holding a due auto-stop of a suspended sandbox while the node is sealed; \
-                 nothing recorded"
-            );
-            self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
-            return Ok(());
-        }
+        // doesn't stop a sandbox on its idle policy, whether suspended,
+        // started or paused: held like the stages above, the row keeps its
+        // state, and the first pass after the node is unsealed stops it. An
+        // admitted stop holds a producer token until its state write commits:
+        // it takes only the wake lock, which a drain's artifact-lock confirm
+        // doesn't exclude, so a drain that seals the node meanwhile reports
+        // the sandbox pending instead of finding it where it was. An idle
+        // suspend isn't held, since the drain wants it. The node's Stop RPC
+        // isn't refused: the Kubernetes teardown calls it first in every
+        // delete.
+        let idle_stop = if action == AutoLifecycleIdleAction::Stop {
+            let admitted = match sandbox.state.unowned() {
+                Some(SandboxState::Suspended) => self
+                    .activation_seal
+                    .admit_producer("idle auto-stop", &sandbox.id, false)
+                    .map(Some),
+                Some(SandboxState::Started | SandboxState::Paused) => self
+                    .activation_seal
+                    .admit_stop_of_vm("idle auto-stop", &sandbox.id)
+                    .map(Some),
+                _ => Ok(None),
+            };
+            match admitted {
+                Ok(token) => token,
+                Err(sealed) => {
+                    tracing::debug!(
+                        sandbox_id = %sandbox.id,
+                        state = %sandbox.state,
+                        reason = sealed.message(),
+                        "holding a due auto-stop while the node is sealed; nothing recorded"
+                    );
+                    self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         // Join the writer set only after wake arbitration and due-policy
         // revalidation; keep the supervisor pinned through the transition.
         let _state_writer = self.state_writer_lease("AutoLifecycle")?;
@@ -612,6 +631,9 @@ impl SandboxManagerService {
                     }
                     _ => {}
                 }
+                // The stop's state write has committed: a drain's next read
+                // finds the row where the stop left it.
+                drop(idle_stop);
                 AutoLifecycleTransition::Stop
             }
             AutoLifecycleIdleAction::Delete => {
@@ -1193,4 +1215,4 @@ fn network_policy_reconcile_entry_decision(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

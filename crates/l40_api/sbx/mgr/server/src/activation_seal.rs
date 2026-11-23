@@ -47,9 +47,13 @@
 //! until it ends, which a drain reports as pending. A rollback that doesn't
 //! restart publishes no artifact, but rewrites the disk a drain may already
 //! have made durable, so it is admitted the same way and holds a token until
-//! it returns. A v2 drain doesn't move a stopped sandbox, so the idle
-//! auto-stop of a suspended sandbox asks [`ActivationSeal::check_without_vm`],
-//! which refuses it on a node known sealed, counting nothing in flight.
+//! it returns. A v2 drain doesn't move a stopped sandbox, so an idle
+//! auto-stop is admitted the same way and holds its token until its state
+//! write commits: the stop of a suspended sandbox through
+//! [`ActivationSeal::admit_producer`], and the stop of a started or paused one
+//! through [`ActivationSeal::admit_stop_of_vm`], which a node known sealed
+//! refuses though the sandbox has a VM. A drain that seals the node while one
+//! runs reports the sandbox pending until it ends.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -377,13 +381,32 @@ impl ActivationSeal {
         })
     }
 
-    /// The refusal [`Self::admit_producer`] gives a sandbox without a VM, for
-    /// work that would leave it stopped on the node, which a v2 drain doesn't
-    /// move: the idle auto-stop of a suspended sandbox. `work` names it in the
-    /// refusal. A node known sealed refuses it; an unknown seal admits.
-    /// Nothing is counted in flight.
-    pub(crate) fn check_without_vm(&self, work: &str, sandbox_id: &str) -> Result<(), Status> {
-        refuse_without_vm(&self.lock_state(), work, sandbox_id, false)
+    /// Admit work that would stop a sandbox that has a VM and leave it
+    /// stopped on the node, which a v2 drain doesn't move: the idle auto-stop
+    /// of a started or paused sandbox. `work` names it in the refusal. A node
+    /// known sealed refuses it, though the sandbox has a VM; an unknown seal
+    /// admits, as [`Self::admit_producer`] does. The token counts the work in
+    /// flight as a producer until it is dropped, so a drain that seals the
+    /// node meanwhile reports the sandbox pending. The node's Stop RPC doesn't
+    /// ask: the Kubernetes teardown calls it first in every delete and
+    /// retirement.
+    pub(crate) fn admit_stop_of_vm(
+        &self,
+        work: &str,
+        sandbox_id: &str,
+    ) -> Result<ArtifactProducerToken, Status> {
+        let state = self.lock_state();
+        if let Some(generation) = state.sealed_generation() {
+            return Err(Status::failed_precondition(format!(
+                "{ACTIVATIONS_SEALED_MARKER} (generation {generation}); refusing the {work} of \
+                 sandbox {sandbox_id}, which would leave it stopped on the node"
+            )));
+        }
+        // Registered before the state lock is released, so a seal that
+        // lands next finds it in flight.
+        Ok(ArtifactProducerToken {
+            _in_flight: self.producers.register(sandbox_id),
+        })
     }
 
     /// Seal under `generation`, persisted before the seal takes effect. The
