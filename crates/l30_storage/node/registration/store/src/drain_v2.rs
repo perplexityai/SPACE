@@ -7,9 +7,10 @@
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_drain::NodeDrainEngine;
+use pplx_space_node_model::SubstrateKind;
 use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 /// A v2 drain's `drain_status`, as the admin API starts it and the cluster
 /// controller writes it, and as every reader reads it. Its keys are frozen:
@@ -349,6 +350,523 @@ pub async fn admit_v2_start(
         heartbeat_fresh,
         evacuating,
     })
+}
+
+/// SQL expression over a `nodes` row, unqualified: the generation of the
+/// row's v2 drain, `drain_status.generation`.
+const GENERATION: &str = "(drain_status->>'generation')::BIGINT";
+
+/// SQL expression over the `nodes` row aliased `n`: the instance its v2
+/// drain fenced, `drain_status.terminate_instance`.
+pub const FENCE: &str = "n.drain_status->>'terminate_instance'";
+
+/// One v2 node as [`list_v2_node_rows`] reads it.
+#[derive(sqlx::FromRow)]
+pub struct V2NodeRow {
+    pub id: NodeId,
+    pub drain_phase: Option<String>,
+    /// `drain_status.generation`.
+    pub generation: Option<i64>,
+    /// `drain_status.deadline_at`.
+    pub deadline_at: Option<i64>,
+    /// The database clock had reached the deadline when the listing read the
+    /// row, so the drain evacuates: a drain without a deadline holds
+    /// nothing.
+    pub evacuate: bool,
+    /// `drain_status.report`, as stored; read it with [`Self::report`].
+    pub report: Option<serde_json::Value>,
+    pub k8s_node_name: Option<String>,
+    pub k8s_node_uid: Option<String>,
+    pub instance_id: Option<String>,
+    pub heartbeat_fresh: bool,
+    /// `drain_status.terminate_instance`.
+    pub fence: Option<String>,
+    /// `drain_status.dispatched_at`.
+    pub dispatched_at: Option<i64>,
+    /// `drain_status.terminated_observed_at`.
+    pub terminated_observed_at: Option<i64>,
+    pub decrement_capacity: bool,
+    /// The database clock when the listing read the row, in Unix seconds:
+    /// the clock the drain's deadline, and the loop's stall rules, are kept
+    /// in.
+    pub db_now: i64,
+}
+
+impl V2NodeRow {
+    /// The stored report, typed; `None` without one, and for one that
+    /// doesn't read, which the loop then treats as never stored.
+    pub fn report(&self) -> Option<StoredV2Report> {
+        self.report
+            .as_ref()
+            .and_then(|report| StoredV2Report::deserialize(report).ok())
+    }
+}
+
+/// Every v2 drain's node of the Kubernetes substrate, with its Kubernetes
+/// identity, recorded instance and heartbeat. Whether the drain evacuates
+/// is read by the database clock, the one its deadline was set by.
+static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let fresh = pplx_space_sandbox_residency::node_heartbeat_fresh("n.id");
+    sql!(format!(
+        "SELECT n.id, n.drain_phase,
+                (n.drain_status->>'generation')::BIGINT AS generation,
+                (n.drain_status->>'deadline_at')::BIGINT AS deadline_at,
+                COALESCE(
+                    EXTRACT(EPOCH FROM NOW()) >= (n.drain_status->>'deadline_at')::NUMERIC,
+                    TRUE
+                ) AS evacuate,
+                n.drain_status->'report' AS report,
+                k.k8s_node_name, k.k8s_node_uid, k.instance_id,
+                {fresh} AS heartbeat_fresh,
+                {FENCE} AS fence,
+                (n.drain_status->>'dispatched_at')::BIGINT AS dispatched_at,
+                (n.drain_status->>'terminated_observed_at')::BIGINT AS terminated_observed_at,
+                n.terminate_decrement_capacity AS decrement_capacity,
+                FLOOR(EXTRACT(EPOCH FROM NOW()))::BIGINT AS db_now
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.drain_engine = 'v2' AND n.managed_by = $1
+          ORDER BY n.id"
+    ))
+});
+
+/// Every v2 drain's node of the Kubernetes substrate, as [`LIST_V2_NODES`]
+/// reads it.
+pub async fn list_v2_node_rows(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<V2NodeRow>, sqlx::Error> {
+    sqlx::query_as(sqlx::AssertSqlSafe(LIST_V2_NODES.as_str()))
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_all(executor)
+        .await
+}
+
+/// For each v2 drain's node of the Kubernetes substrate, how many of the
+/// sandboxes its drain has seen running (`drain_status.observed_running`)
+/// are `suspended`, their lifecycle unchanged for longer than `after_secs`
+/// seconds by the database clock: a drain restores nothing, so each waits
+/// for a call. A node with none is absent.
+pub async fn evacuated_still_suspended(
+    executor: impl sqlx::PgExecutor<'_>,
+    after_secs: f64,
+) -> Result<Vec<(NodeId, i64)>, sqlx::Error> {
+    // An id in the set that isn't a UUID names no sandbox.
+    sqlx::query_as(sql!(
+        "SELECT n.id, COUNT(*)
+           FROM nodes n
+          CROSS JOIN LATERAL jsonb_array_elements_text(
+                    COALESCE(n.drain_status->'observed_running', '[]'::JSONB)
+                ) AS running(sandbox_id)
+           JOIN sandboxes s
+             ON s.id = CASE
+                    WHEN running.sandbox_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                    THEN running.sandbox_id::UUID
+                END
+          WHERE n.drain_engine = 'v2'
+            AND n.managed_by = $1
+            AND s.lifecycle = 'suspended'
+            AND s.lifecycle_changed_at < NOW() - make_interval(secs => $2)
+          GROUP BY n.id"
+    ))
+    .bind(SubstrateKind::Kubernetes)
+    .bind(after_secs)
+    .fetch_all(executor)
+    .await
+}
+
+/// The locked node's v2 state, as the terminate transaction and the
+/// delete read it under the row lock.
+#[derive(sqlx::FromRow)]
+pub struct LockedV2Node {
+    pub drain_engine: Option<String>,
+    pub drain_phase: Option<String>,
+    pub generation: Option<i64>,
+    pub fence: Option<String>,
+    pub dispatched: bool,
+    pub terminated_observed: bool,
+    pub k8s_node_name: Option<String>,
+    pub k8s_node_uid: Option<String>,
+    pub instance_id: Option<String>,
+}
+
+/// The locked node's v2 state, by its id `$1`.
+static LOCKED_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "SELECT n.drain_engine, n.drain_phase,
+                (n.drain_status->>'generation')::BIGINT AS generation,
+                {FENCE} AS fence,
+                COALESCE(n.drain_status ? 'dispatched_at', FALSE) AS dispatched,
+                COALESCE(n.drain_status ? 'terminated_observed_at', FALSE) AS terminated_observed,
+                k.k8s_node_name, k.k8s_node_uid, k.instance_id
+           FROM nodes n
+           LEFT JOIN node_k8s k ON k.node_id = n.id
+          WHERE n.id = $1"
+    ))
+});
+
+/// Read the v2 state of `node_id`'s row, which the caller has locked
+/// `FOR UPDATE`; `None` when the row is gone.
+pub async fn read_locked_v2_node(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+) -> Result<Option<LockedV2Node>, sqlx::Error> {
+    sqlx::query_as(sqlx::AssertSqlSafe(LOCKED_V2_NODE.as_str()))
+        .bind(node_id)
+        .fetch_optional(conn)
+        .await
+}
+
+impl LockedV2Node {
+    pub fn is_v2(&self, phase: &str, generation: i64) -> bool {
+        self.drain_engine.as_deref() == NodeDrainEngine::V2.column()
+            && self.drain_phase.as_deref() == Some(phase)
+            && self.generation == Some(generation)
+    }
+
+    /// The undrained v2 row of `generation`'s drain, its cancel not yet
+    /// finished: a v2 engine with no phase, under that generation.
+    pub fn is_v2_cancel(&self, generation: i64) -> bool {
+        self.drain_engine.as_deref() == NodeDrainEngine::V2.column()
+            && self.drain_phase.is_none()
+            && self.generation == Some(generation)
+    }
+}
+
+/// Record what holds the locked node from its terminate transaction's fence
+/// in `drain_last_error`.
+pub async fn record_terminate_held(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    held: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!("UPDATE nodes SET drain_last_error = $2 WHERE id = $1"))
+        .bind(node_id)
+        .bind(held)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Write the locked node's fence, `drain_status.terminate_instance`, the
+/// instance its v2 drain terminates, and clear its last error.
+pub async fn write_fence(
+    conn: &mut PgConnection,
+    node_id: NodeId,
+    instance_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_status = drain_status || jsonb_build_object('terminate_instance', $2::TEXT),
+                drain_last_error = NULL
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .bind(instance_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Record that Auto Scaling accepted the termination of the fenced
+/// `instance_id`, by the database clock in Unix seconds, so the loop never
+/// dispatches it again. False for a row that is no longer that generation's
+/// `terminating` node fenced on that instance with no dispatch recorded.
+pub async fn record_v2_dispatched(
+    pool: &PgPool,
+    node_id: NodeId,
+    generation: i64,
+    instance_id: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE nodes
+            SET drain_status = drain_status
+                    || jsonb_build_object('dispatched_at', EXTRACT(EPOCH FROM NOW())::BIGINT),
+                drain_last_error = NULL
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase = 'terminating'
+            AND (drain_status->>'generation')::BIGINT = $2
+            AND drain_status->>'terminate_instance' = $3
+            AND NOT drain_status ? 'dispatched_at'"
+    ))
+    .bind(node_id)
+    .bind(generation)
+    .bind(instance_id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+/// `$1` = node id, `$2` = generation, `$3` = the instance EC2 was asked
+/// about. Records, by the database clock in Unix seconds, that EC2 listed it
+/// `terminated`, keeping the first time, on a row whose drain asks about
+/// that instance: its fence once written, else the instance its
+/// registration recorded.
+static RECORD_TERMINATED_OBSERVED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "UPDATE nodes n
+                SET drain_status = n.drain_status || jsonb_build_object(
+                        'terminated_observed_at',
+                        COALESCE(
+                            n.drain_status->'terminated_observed_at',
+                            to_jsonb(EXTRACT(EPOCH FROM NOW())::BIGINT)
+                        )
+                    )
+              WHERE n.id = $1
+                AND n.drain_engine = 'v2'
+                AND (n.drain_status->>'generation')::BIGINT = $2
+                AND COALESCE(
+                        {FENCE},
+                        (SELECT k.instance_id FROM node_k8s k WHERE k.node_id = n.id)
+                    ) = $3"
+    ))
+});
+
+/// Record that EC2 listed `instance_id`, the instance the v2 drain under
+/// `generation` asks about (its fence, else its recorded instance),
+/// `terminated`: EC2 stops listing a terminated instance after a while, and
+/// the let-go and the delete of the row need this record when it no longer
+/// does. Keeps the first time. False for a row that is no longer that
+/// generation's v2 drain asking about that instance.
+pub async fn record_v2_terminated_observed(
+    pool: &PgPool,
+    node_id: NodeId,
+    generation: i64,
+    instance_id: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(RECORD_TERMINATED_OBSERVED.as_str()))
+            .bind(node_id)
+            .bind(generation)
+            .bind(instance_id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+/// `$1` = node id, `$2` = generation, `$3` = phase, `$4` = fence, `$5` =
+/// trace. The let-go statement.
+static LET_GO_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "UPDATE nodes n
+            SET drain_phase = NULL,
+                drain_mode = NULL,
+                drain_started_at = NULL,
+                drain_engine = NULL,
+                drain_status = NULL,
+                drain_last_error = $5
+          WHERE n.id = $1
+            AND n.drain_engine = 'v2'
+            AND (n.drain_status->>'generation')::BIGINT = $2
+            AND n.drain_phase IS NOT DISTINCT FROM $3::TEXT
+            AND {FENCE} IS NOT DISTINCT FROM $4::TEXT"
+    ))
+});
+
+/// The let-go statement: clear the phase and the v2 columns of the v2 node
+/// under `generation` in `phase` with fence `fence`, as the caller read
+/// them, and record `trace`. Writes no sandbox row. Returns whether it
+/// matched.
+pub async fn let_go_v2_node(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    generation: i64,
+    phase: Option<&str>,
+    fence: Option<&str>,
+    trace: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sqlx::AssertSqlSafe(LET_GO_V2_NODE.as_str()))
+        .bind(node_id)
+        .bind(generation)
+        .bind(phase)
+        .bind(fence)
+        .bind(trace)
+        .execute(executor)
+        .await?
+        .rows_affected()
+        == 1)
+}
+
+/// `$1` = node id, `$2` = generation, `$3` = report, `$4` = the sandboxes it
+/// lists running, `$5` = the evacuations recorded. Stores the report and
+/// adds to the two id sets, each kept sorted and without repeats.
+static RECORD_V2_REPORT_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let union = |key: &str, param: &str| {
+        format!(
+            "(SELECT COALESCE(jsonb_agg(ids.sandbox_id ORDER BY ids.sandbox_id), '[]'::JSONB)
+                FROM (
+                      SELECT jsonb_array_elements_text(
+                                 COALESCE(drain_status->'{key}', '[]'::JSONB)
+                             ) AS sandbox_id
+                      UNION
+                      SELECT unnest({param}::TEXT[])
+                     ) AS ids)"
+        )
+    };
+    let observed_running = union("observed_running", "$4");
+    let evacuated_total = union("evacuated_total", "$5");
+    sql!(format!(
+        "UPDATE nodes
+            SET drain_status = drain_status || jsonb_build_object(
+                    'report', $3::JSONB,
+                    'observed_running', {observed_running},
+                    'evacuated_total', {evacuated_total}
+                ),
+                drain_last_error = NULL
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND {GENERATION} = $2"
+    ))
+});
+
+/// Store the node's `report` under `generation`, add `running`, the
+/// sandboxes it lists running, to the drain's observed set
+/// (`drain_status.observed_running`), and `evacuated`, the evacuations the
+/// controller recorded, to `drain_status.evacuated_total`; both sets only
+/// grow. Clears the last error. Returns false when the row is no longer
+/// that generation's v2 drain.
+pub async fn record_v2_report(
+    pool: &PgPool,
+    node_id: NodeId,
+    generation: i64,
+    report: &StoredV2Report,
+    running: &[String],
+    evacuated: &[String],
+) -> Result<bool, sqlx::Error> {
+    let report = serde_json::to_value(report).map_err(|error| sqlx::Error::Encode(error.into()))?;
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(RECORD_V2_REPORT_STATEMENT.as_str()))
+            .bind(node_id)
+            .bind(generation)
+            .bind(report)
+            .bind(running)
+            .bind(evacuated)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+/// SQL predicate over a `nodes` row, unqualified: its stored report lists
+/// nothing pending, blocked or unrecorded ([`StoredV2Report::finished`]).
+const REPORT_FINISHED: &str = "(drain_status ? 'report'
+     AND jsonb_array_length(COALESCE(drain_status->'report'->'pending', '[]'::JSONB)) = 0
+     AND jsonb_array_length(COALESCE(drain_status->'report'->'blocked', '[]'::JSONB)) = 0
+     AND jsonb_array_length(COALESCE(drain_status->'report'->'unrecorded', '[]'::JSONB)) = 0)";
+
+static ADVANCE_V2_DRAINED_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "UPDATE nodes
+            SET drain_phase = 'drained'
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase = 'draining'
+            AND {GENERATION} = $2
+            AND {REPORT_FINISHED}"
+    ))
+});
+
+/// `draining -> drained` for the v2 drain under `generation`, only with a
+/// stored report that is finished: nothing pending, blocked or unrecorded.
+pub async fn advance_v2_drained(
+    pool: &PgPool,
+    node_id: NodeId,
+    generation: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(ADVANCE_V2_DRAINED_STATEMENT.as_str()))
+            .bind(node_id)
+            .bind(generation)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+static RETURN_V2_DRAINED_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "UPDATE nodes
+            SET drain_phase = 'drained',
+                drain_last_error = $3
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase = 'terminating'
+            AND {GENERATION} = $2
+            AND NOT drain_status ? 'terminate_instance'"
+    ))
+});
+
+/// `terminating -> drained` for the v2 drain under `generation` whose
+/// terminating tick's fresh check refused the fence, recording `refused`
+/// as its last error: the operator retries `:terminate`. False for a row
+/// that is no longer that generation's unfenced `terminating` node.
+pub async fn return_v2_drained(
+    pool: &PgPool,
+    node_id: NodeId,
+    generation: i64,
+    refused: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(RETURN_V2_DRAINED_STATEMENT.as_str()))
+            .bind(node_id)
+            .bind(generation)
+            .bind(refused)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+static FINISH_V2_CANCEL_STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    sql!(format!(
+        "UPDATE nodes
+            SET drain_engine = NULL,
+                drain_status = NULL
+          WHERE id = $1
+            AND drain_engine = 'v2'
+            AND drain_phase IS NULL
+            AND {GENERATION} = $2"
+    ))
+});
+
+/// Clear an undrained v2 row's columns once its generation `generation` is
+/// cancelled on the node; false for a row that is no longer that
+/// generation's cancel (a v2 engine with no phase).
+pub async fn finish_v2_cancel(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    generation: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(FINISH_V2_CANCEL_STATEMENT.as_str()))
+            .bind(node_id)
+            .bind(generation)
+            .execute(executor)
+            .await?
+            .rows_affected()
+            == 1,
+    )
+}
+
+pub async fn record_v2_error(
+    pool: &PgPool,
+    node_id: NodeId,
+    message: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_last_error = $2 WHERE id = $1 AND drain_engine = 'v2'"
+    ))
+    .bind(node_id)
+    .bind(message)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
