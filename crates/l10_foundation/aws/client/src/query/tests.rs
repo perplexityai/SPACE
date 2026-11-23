@@ -8,28 +8,29 @@ use super::test_support::{RecordingTransport, credentials_provider};
 use super::*;
 
 #[tokio::test(flavor = "current_thread")]
-async fn transport_times_out_hung_response() {
+async fn reqwest_transport_times_out_hung_response() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (_socket, _) = listener.accept().await.unwrap();
         std::future::pending::<()>().await;
     });
-    let transport = HttpTransport::with_timeouts(Duration::from_secs(1), Duration::from_millis(50));
+    let transport =
+        ReqwestTransport::with_timeouts(Duration::from_secs(1), Duration::from_millis(50));
     let request = Request::builder()
         .method("POST")
         .uri(format!("http://{addr}/"))
         .body(Vec::new())
         .unwrap();
 
-    let result = tokio::time::timeout(Duration::from_secs(5), transport.send(request)).await;
+    let err = transport.send(request).await.unwrap_err();
     server.abort();
 
-    match result.expect("the request timeout fired") {
-        Err(AwsClientError::Http(err)) => {
-            assert!(err.is_timeout(), "expected a timeout, got {err}");
+    match err {
+        AwsClientError::Http(err) => {
+            assert!(err.is_timeout(), "expected reqwest timeout, got {err}");
         }
-        result => panic!("expected a timeout, got {result:?}"),
+        err => panic!("expected reqwest timeout, got {err}"),
     }
 }
 
@@ -173,20 +174,24 @@ async fn receive_and_verify(listener: TcpListener) -> (String, bool) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn sends_and_signs_the_url_2_5_8_target() {
+async fn signs_the_target_that_reqwest_sends() {
     for (endpoint, sent) in [
-        // Catches sending through url 2.5.9 or reqwest, or restoring left to right.
-        ("http://127.0.0.1:{port}/a^b^c", "/a^b^c/"),
-        // Catches restoring every `%5E` rather than those url encoded.
+        // Catches signing the written path: url sends `^` encoded.
+        ("http://127.0.0.1:{port}/a^b", "/a%5Eb/"),
+        // The contract: `/a^b` and `/a%5Eb` reach one target, and both verify.
         ("http://127.0.0.1:{port}/a%5Eb", "/a%5Eb/"),
         // Catches a signer that decodes before it signs.
         ("http://127.0.0.1:{port}/a%255Eb", "/a%255Eb/"),
-        // Catches sending the written URI: url 2.5.8 encoded non-ASCII.
+        // Catches a signer that predicts url's encoding of `^` alone.
         ("http://127.0.0.1:{port}/café", "/caf%C3%A9/"),
-        // Catches restoring by position in the written path rather than url's.
-        ("http://127.0.0.1:{port}/x/../a^b%5E", "/a^b%5E/"),
         // Catches signing the written host: url lowercases it.
-        ("http://LOCALHOST:{port}", "/"),
+        ("http://LOCALHOST:{port}/", "/"),
+        // Catches refusing the dot segments url and SigV4 both resolve.
+        ("http://127.0.0.1:{port}/a/./../b", "/b/"),
+        // Catches checking the written path rather than SigV4's resolution of it.
+        ("http://127.0.0.1:{port}/a\\b/%2e/../../c", "/c/"),
+        // Catches refusing escapes url keeps: it resolves only whole `%2e` segments and `\`.
+        ("http://127.0.0.1:{port}/a%2E%5Cb", "/a%2E%5Cb/"),
     ] {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let endpoint =
@@ -194,7 +199,7 @@ async fn sends_and_signs_the_url_2_5_8_target() {
         let server = tokio::spawn(receive_and_verify(listener));
         let client = client_with_endpoint(
             endpoint.clone(),
-            HttpTransport::with_timeouts(Duration::from_secs(1), Duration::from_secs(5)),
+            ReqwestTransport::with_timeouts(Duration::from_secs(1), Duration::from_secs(5)),
         );
 
         client
@@ -223,8 +228,15 @@ async fn refuses_endpoints_before_sending() {
         (" http://127.0.0.1:9/x", true),
         ("http://127.0.0.1:9/a\tb", true),
         ("http:127.0.0.1:9/normal", true),
-        // Catches sending userinfo, which reqwest sent as a Basic Authorization header.
-        ("http://user:pw@127.0.0.1:9/", false),
+        // Catches signing where url resolves `..` unlike SigV4.
+        ("http://127.0.0.1:9/x/E|/../y", false),
+        ("http://127.0.0.1:9/a//../b", false),
+        // Catches each case of the `%2e` and backslash guard.
+        ("http://127.0.0.1:9/one/%2e%2e/two", false),
+        ("http://127.0.0.1:9/one/.%2e/two", false),
+        ("http://127.0.0.1:9/one/%2e./two", false),
+        ("http://127.0.0.1:9/one/%2E/two", false),
+        ("http://127.0.0.1:9/a\\b", false),
         // Catches signing an endpoint with no authority, which panics in aws-sigv4.
         ("/relative", false),
     ] {

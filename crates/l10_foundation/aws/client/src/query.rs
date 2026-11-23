@@ -7,18 +7,7 @@ use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SigningSettings, sign as sign_http_request,
 };
 use aws_sigv4::sign::v4;
-use aws_smithy_async::rt::sleep::TokioSleep;
-use aws_smithy_http_client::proxy::ProxyConfig;
-use aws_smithy_http_client::{Connector, tls};
-use aws_smithy_runtime_api::client::http::{
-    HttpConnector, HttpConnectorSettings, SharedHttpConnector,
-};
 use aws_smithy_runtime_api::client::identity::Identity;
-use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
-use aws_smithy_runtime_api::client::result::ConnectorError;
-use aws_smithy_types::body::SdkBody;
-use aws_smithy_types::byte_stream::ByteStream;
-use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_xml::decode::{Document, ScopedDecoder, XmlDecodeError, try_data};
 use aws_types::SdkConfig;
 use aws_types::service_config::ServiceConfigKey;
@@ -38,8 +27,8 @@ pub enum AwsClientError {
     HttpBuild(#[from] http::Error),
     #[error("invalid AWS endpoint: {0}")]
     InvalidEndpoint(String),
-    #[error("AWS HTTP request failed: {}", DisplayErrorContext(.0))]
-    Http(#[from] ConnectorError),
+    #[error("AWS HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
     #[error("failed to convert AWS HTTP header to UTF-8: {0}")]
     Header(String),
     #[error("AWS {service} returned {code}: {message} (HTTP {status})")]
@@ -81,68 +70,49 @@ pub trait QueryTransport: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<QueryResponse, AwsClientError>> + Send + '_>>;
 }
 
-/// Sends the request's URI as given; reqwest would reparse it with url, which
-/// percent-encodes `^` in paths since url 2.5.9.
 #[derive(Debug, Clone)]
-pub struct HttpTransport {
-    connector: SharedHttpConnector,
-    request_timeout: Duration,
+pub struct ReqwestTransport {
+    client: reqwest::Client,
 }
 
 const AWS_CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
 const AWS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-impl HttpTransport {
+impl ReqwestTransport {
     fn with_timeouts(connect_timeout: Duration, request_timeout: Duration) -> Self {
-        let connector = Connector::builder()
-            .connector_settings(
-                HttpConnectorSettings::builder()
-                    .connect_timeout(connect_timeout)
-                    .build(),
-            )
-            .sleep_impl(TokioSleep::new())
-            // Honours HTTP(S)_PROXY and NO_PROXY, as the SDK's clients do.
-            .proxy_config(ProxyConfig::from_env())
-            .tls_provider(tls::Provider::Rustls(
-                tls::rustls_provider::CryptoMode::AwsLc,
-            ))
-            .build();
-        Self {
-            connector: SharedHttpConnector::new(connector),
-            request_timeout,
-        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()
+            .expect("AWS reqwest client timeout configuration is valid");
+        Self { client }
     }
 }
 
-impl Default for HttpTransport {
+impl Default for ReqwestTransport {
     fn default() -> Self {
         Self::with_timeouts(AWS_CONNECT_TIMEOUT, AWS_REQUEST_TIMEOUT)
     }
 }
 
-impl QueryTransport for HttpTransport {
+impl QueryTransport for ReqwestTransport {
     fn send(
         &self,
         request: Request<Vec<u8>>,
     ) -> Pin<Box<dyn Future<Output = Result<QueryResponse, AwsClientError>> + Send + '_>> {
         Box::pin(async move {
-            let request = HttpRequest::try_from(request.map(SdkBody::from))
-                .map_err(|err| ConnectorError::user(err.into()))?;
-            let exchange = async {
-                let response = self.connector.call(request).await?;
-                let status = response.status().as_u16();
-                let body = ByteStream::new(response.into_body())
-                    .collect()
-                    .await
-                    .map_err(|err| ConnectorError::io(err.into()))?
-                    .into_bytes();
-                Ok::<_, ConnectorError>((status, body))
-            };
-            let (status, body) = tokio::time::timeout(self.request_timeout, exchange)
-                .await
-                .map_err(|elapsed| ConnectorError::timeout(elapsed.into()))??;
-            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            Ok(QueryResponse::new(status, String::from_utf8_lossy(&body)))
+            let (parts, body) = request.into_parts();
+            let mut builder = self
+                .client
+                .request(reqwest::Method::POST, parts.uri.to_string());
+            for (name, value) in &parts.headers {
+                builder = builder.header(name.as_str(), value.as_bytes());
+            }
+            let response = builder.body(body).send().await?;
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let body = response.text().await?;
+            Ok(QueryResponse::new(status, body))
         })
     }
 }
@@ -176,7 +146,7 @@ impl AwsQueryService {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AwsQueryClient<T = HttpTransport> {
+pub(crate) struct AwsQueryClient<T = ReqwestTransport> {
     service: AwsQueryService,
     region: Option<String>,
     endpoint_url: Option<String>,
@@ -184,14 +154,14 @@ pub(crate) struct AwsQueryClient<T = HttpTransport> {
     transport: T,
 }
 
-impl AwsQueryClient<HttpTransport> {
+impl AwsQueryClient<ReqwestTransport> {
     pub(crate) fn from_config(service: AwsQueryService, config: &SdkConfig) -> Self {
         Self {
             service,
             region: config.region().map(|region| region.as_ref().to_string()),
             endpoint_url: configured_endpoint_url(service, config),
             credentials_provider: config.credentials_provider(),
-            transport: HttpTransport::default(),
+            transport: ReqwestTransport::default(),
         }
     }
 }
@@ -264,7 +234,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         let bytes = body.into_bytes();
         let mut request = Request::builder()
             .method("POST")
-            .uri(target.clone())
+            .uri(target.as_str())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(bytes)?;
 
@@ -305,7 +275,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             .collect::<Result<Vec<_>, _>>()?;
         let signable_request = SignableRequest::new(
             "POST",
-            target.to_string(),
+            target.as_str(),
             header_pairs.into_iter(),
             SignableBody::Bytes(request.body()),
         )?;
@@ -315,35 +285,28 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         Ok(request)
     }
 
-    /// The endpoint as url 2.5.8 serialized it, which reqwest sent until url 2.5.9.
-    fn target(&self) -> Result<http::Uri, AwsClientError> {
+    /// The endpoint as url serializes it, which is the target reqwest sends.
+    fn target(&self) -> Result<reqwest::Url, AwsClientError> {
+        let endpoint = self.endpoint()?;
         // http's parser keeps rejecting what it rejected before url could repair it.
-        let written = self
-            .endpoint()?
-            .parse::<http::Uri>()
-            .map_err(http::Error::from)?
-            .to_string();
-        let parse = |endpoint: &str| {
-            url::Url::parse(endpoint)
-                .map_err(|err| AwsClientError::InvalidEndpoint(err.to_string()))
-        };
-        let url = parse(&written)?;
-        // SigV4 endpoints carry no userinfo; url 2.5.8 sent it as a second Authorization header.
-        if !url.username().is_empty() || url.password().is_some() {
+        let uri: http::Uri = endpoint.parse().map_err(http::Error::from)?;
+        let target = reqwest::Url::parse(&endpoint)
+            .map_err(|err| AwsClientError::InvalidEndpoint(err.to_string()))?;
+        // Send only if url and SigV4 resolve the written path alike, up to url's percent-encoding.
+        let written = signed_segments(uri.path());
+        let mut expected = target.clone();
+        expected.set_path(&written.join("/"));
+        // set_path would resolve a `%2e` or `\` segment SigV4 keeps, so refuse those outright.
+        if written
+            .iter()
+            .any(|segment| segment.contains('\\') || is_encoded_dot_segment(segment))
+            || signed_segments(expected.path()) != signed_segments(target.path())
+        {
             return Err(AwsClientError::InvalidEndpoint(
-                "endpoint carries userinfo".to_string(),
+                "url resolves its path differently from SigV4".to_string(),
             ));
         }
-        // url 2.5.9 percent-encodes `^` in paths, which 2.5.8 kept.
-        // A backtick parsed in its place marks the `%5E`s url wrote.
-        let marked = parse(&written.replace('^', "`"))?;
-        let mut target = url.to_string();
-        for (index, _) in url.as_str().rmatch_indices("%5E") {
-            if marked.as_str().get(index..index + 3) == Some("%60") {
-                target.replace_range(index..index + 3, "^");
-            }
-        }
-        Ok(target.parse().map_err(http::Error::from)?)
+        Ok(target)
     }
 
     fn endpoint(&self) -> Result<String, AwsClientError> {
@@ -361,6 +324,28 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             region
         ))
     }
+}
+
+/// The path segments SigV4's default normalization signs.
+fn signed_segments(path: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    segments
+}
+
+fn is_encoded_dot_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "%2e" | ".%2e" | "%2e." | "%2e%2e"
+    )
 }
 
 fn encode_form(params: &[(&str, String)]) -> String {

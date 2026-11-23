@@ -13,17 +13,14 @@ workspace = true
 [dependencies]
 aws-credential-types = { workspace = true }
 aws-sigv4 = { workspace = true, features = ["http1", "sign-http"] }
-aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
-aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
-aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x"] }
-aws-smithy-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true, features = ["client"] }
 aws-smithy-xml = { workspace = true }
 aws-types = { workspace = true }
 form_urlencoded = { workspace = true }
 http = { workspace = true }
+reqwest = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
-url = { workspace = true }
 
 [dev-dependencies]
+aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
