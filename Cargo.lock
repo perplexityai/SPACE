@@ -4942,6 +4942,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-execution-inventory-store",
  "pplx-space-node-group-store",
  "pplx-space-node-mgr-client",
  "pplx-space-node-model",
@@ -6341,6 +6342,7 @@ dependencies = [
  "pplx-space-network-roles",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-execution-inventory-store",
  "pplx-space-node-mgr-client",
  "pplx-space-node-model",
  "pplx-space-node-registration-store",
@@ -7007,6 +7009,20 @@ dependencies = [
  "pplx-space-host-linux",
  "pplx-space-test-hooks",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-node-execution-inventory-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde",
+ "sqlx",
+ "time",
+ "tokio",
 ]
 
 [[package]]
