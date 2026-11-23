@@ -308,8 +308,6 @@ struct NodeApiAuthenticator {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeApiAuthenticatedCaller {
     node_identity: AuthenticatedNodeIdentity,
-    /// The reviewed Kubernetes username; static-token callers have none.
-    service_account: Option<String>,
     wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority,
     network_policy_authority: NetworkPolicyMutationAuthority,
     data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
@@ -423,7 +421,6 @@ impl NodeApiAuthenticatedCaller {
         };
         Self {
             node_identity: AuthenticatedNodeIdentity::RemoteAddress,
-            service_account: None,
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
@@ -449,7 +446,6 @@ impl NodeApiAuthenticatedCaller {
     ) -> Self {
         Self {
             node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
-            service_account: None,
             wait_ready_lifecycle_authority,
             network_policy_authority,
             data_plane_session_refresh_authority,
@@ -465,7 +461,6 @@ impl NodeApiAuthenticatedCaller {
     pub const fn data_plane_edge_for_test() -> Self {
         Self {
             node_identity: AuthenticatedNodeIdentity::RemoteAddress,
-            service_account: None,
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Granted,
@@ -480,7 +475,6 @@ impl NodeApiAuthenticatedCaller {
     pub const fn unprivileged_workload_for_test() -> Self {
         Self {
             node_identity: AuthenticatedNodeIdentity::RemoteAddress,
-            service_account: None,
             wait_ready_lifecycle_authority: WaitReadyLifecycleAuthority::Denied,
             network_policy_authority: NetworkPolicyMutationAuthority::Denied,
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Denied,
@@ -492,10 +486,6 @@ impl NodeApiAuthenticatedCaller {
 
     pub const fn node_identity(&self) -> &AuthenticatedNodeIdentity {
         &self.node_identity
-    }
-
-    pub fn service_account(&self) -> Option<&str> {
-        self.service_account.as_deref()
     }
 
     pub const fn wait_ready_lifecycle_authority(&self) -> WaitReadyLifecycleAuthority {

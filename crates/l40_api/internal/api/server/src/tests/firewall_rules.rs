@@ -7,7 +7,7 @@ use crate::proto::{
     FetchFirewallRulesRequest, FetchFirewallRulesResponse, FirewallRulesAssignment,
     FirewallRulesPendingRound, cluster_api_client::ClusterApiClient,
 };
-use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
+use pplx_space_observability::test_capture::{CapturedEvents, CapturedEventsLayer, field_value};
 use pplx_space_rpc_auth::test_support::{
     TokenReviewStatus, pod_bound_service_account_status, projected_token, service_account_status,
 };
@@ -56,6 +56,18 @@ fn denied<T>() -> Result<T, (Code, String)> {
         Code::PermissionDenied,
         "the caller may not fetch firewall rules".to_owned(),
     ))
+}
+
+/// Capture the refusal log lines until the guard drops.
+fn capture_refusals() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
+    let capture = CapturedEventsLayer::new().with_event_filter(|event| {
+        field_value(event, "message") == Some("refused firewall rules fetch")
+    });
+    let refusals = capture.events();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(capture.with_filter(LevelFilter::WARN)),
+    );
+    (refusals, guard)
 }
 
 /// Fetch with `bearer`, or with no authorization header.
@@ -197,13 +209,7 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
-    let capture = CapturedEventsLayer::new().with_event_filter(|event| {
-        field_value(event, "message") == Some("refused firewall rules fetch")
-    });
-    let refusals = capture.events();
-    let _logs = tracing::subscriber::set_default(
-        tracing_subscriber::registry().with(capture.with_filter(LevelFilter::WARN)),
-    );
+    let (refusals, _logs) = capture_refusals();
     let mut service = fixture.service;
     let pool = service.pool.clone();
     let pool = &pool;
@@ -348,15 +354,12 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
             .collect::<Vec<_>>(),
         reasons.into_iter().map(Some).collect::<Vec<_>>()
     );
-    // The stale UID's line names whom to look at, with no token data.
+    // A line carries the reason alone: no identity or token data.
     assert_eq!(
         logged[1],
         [
             ("message", "refused firewall rules fetch"),
             ("reason", "uid_mismatch"),
-            ("service_account", NODE_CTL),
-            ("node_name", "worker-a"),
-            ("node_uid", "stale-uid"),
         ]
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
     );
@@ -409,10 +412,11 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
         return Ok(());
     };
     let pool = fixture.service.pool.clone();
+    let (refusals, _logs) = capture_refusals();
     let a = register(&pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
 
-    for (grant, expected) in [
-        (false, denied()),
+    for (grant, expected, reason) in [
+        (false, denied(), "no_fetch_authority"),
         (
             true,
             Err((
@@ -421,6 +425,7 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
                     "firewall rules aren't enabled for node {a}: no enrollment predicate is approved"
                 ),
             )),
+            "no_enrollment_predicate",
         ),
     ] {
         let mut service = fixture.service.clone();
@@ -433,6 +438,12 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
         assert_eq!(
             fetch(&mut harness.client, Some(&token)).await?,
             expected,
+            "grant {grant}"
+        );
+        let logged = refusals.events();
+        assert_eq!(
+            field_value(logged.last().unwrap(), "reason"),
+            Some(reason),
             "grant {grant}"
         );
     }
