@@ -437,18 +437,11 @@ impl KubernetesSubstrate {
                 .await;
                 match state {
                     Ok(Ok(response)) => {
-                        let reported =
-                            response
-                                .into_inner()
-                                .sandboxes
-                                .into_iter()
-                                .find_map(|info| {
-                                    (info.sandbox_id == sandbox_id.to_string()
-                                        && info.pod_uid.as_deref() == Some(pod_uid))
-                                    .then_some(info.pod_ip)
-                                    .flatten()
-                                });
-                        if let Some(pod_ip) = reported.and_then(|ip| PodIp::parse(&ip).ok()) {
+                        if let Some(pod_ip) = node_reported_address(
+                            response.into_inner().sandboxes,
+                            sandbox_id,
+                            pod_uid,
+                        ) {
                             let persisted = self
                                 .store
                                 .persist_pod_metadata(
@@ -539,9 +532,54 @@ impl KubernetesSubstrate {
                     sandbox_id = %sandbox_id,
                 )),
         );
+        // Kubernetes' answer: the watch, then polling if the watch ends or fails.
+        let kubernetes = Box::pin(async {
+            match watched.await {
+                Ok(Some(pod_ip)) => Ok(Some((pod_ip, "watch"))),
+                Ok(None) => {
+                    let pod_ip = self
+                        .poll_until_pod_ip_assigned(sandbox_id, deadline)
+                        .instrument(tracing::info_span!(
+                            "substrate.k8s.poll_pod_ip",
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            namespace = %self.k8s.sandbox_namespace,
+                        ))
+                        .await?;
+                    Ok(pod_ip.map(|pod_ip| (pod_ip, "poll")))
+                }
+                Err(err) => {
+                    crate::metrics::sandbox::api::create_step_error(
+                        sandbox_id,
+                        metric_identity,
+                        "fc",
+                        None,
+                        "execution_watch",
+                        "watch_error",
+                        Some(phase),
+                    );
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "pod IP watch failed; falling back to polling"
+                    );
+                    let pod_ip = self
+                        .poll_until_pod_ip_assigned(sandbox_id, deadline)
+                        .instrument(tracing::info_span!(
+                            "substrate.k8s.poll_pod_ip",
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            namespace = %self.k8s.sandbox_namespace,
+                            fallback_reason = "watch_error",
+                        ))
+                        .await?;
+                    Ok(pod_ip.map(|pod_ip| (pod_ip, "poll_after_watch_error")))
+                }
+            }
+        });
         let raced = async {
             tokio::select! {
-                watched = watched => watched.map(|pod_ip| pod_ip.map(|pod_ip| (pod_ip, "watch"))),
+                kubernetes = kubernetes => kubernetes,
                 Some(pod_ip) = node_reported => Ok(Some((pod_ip, "node"))),
             }
         };
@@ -550,57 +588,8 @@ impl KubernetesSubstrate {
                 record_pod_ip_ready(metric_identity, sandbox_id, started_at, source);
                 Ok(Some(pod_ip))
             }
-            Ok(Ok(None)) => {
-                let pod_ip = self
-                    .poll_until_pod_ip_assigned(sandbox_id, deadline)
-                    .instrument(tracing::info_span!(
-                        "substrate.k8s.poll_pod_ip",
-                        sandbox_id = %sandbox_id,
-                        pod_name = %pod_name,
-                        namespace = %self.k8s.sandbox_namespace,
-                    ))
-                    .await?;
-                if pod_ip.is_some() {
-                    record_pod_ip_ready(metric_identity, sandbox_id, started_at, "poll");
-                }
-                Ok(pod_ip)
-            }
-            Ok(Err(err)) => {
-                crate::metrics::sandbox::api::create_step_error(
-                    sandbox_id,
-                    metric_identity,
-                    "fc",
-                    None,
-                    "execution_watch",
-                    "watch_error",
-                    Some(phase),
-                );
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "pod IP watch failed; falling back to polling"
-                );
-                let pod_ip = self
-                    .poll_until_pod_ip_assigned(sandbox_id, deadline)
-                    .instrument(tracing::info_span!(
-                        "substrate.k8s.poll_pod_ip",
-                        sandbox_id = %sandbox_id,
-                        pod_name = %pod_name,
-                        namespace = %self.k8s.sandbox_namespace,
-                        fallback_reason = "watch_error",
-                    ))
-                    .await?;
-                if pod_ip.is_some() {
-                    record_pod_ip_ready(
-                        metric_identity,
-                        sandbox_id,
-                        started_at,
-                        "poll_after_watch_error",
-                    );
-                }
-                Ok(pod_ip)
-            }
-            Err(_) => Ok(None),
+            Ok(Ok(None)) | Err(_) => Ok(None),
+            Ok(Err(err)) => Err(err),
         }
     }
 
@@ -1298,4 +1287,57 @@ pub(super) struct PodProxyWaitTarget<'a> {
     /// path passes `None` (the binding it produces is discarded).
     pub pod_uid: Option<&'a str>,
     pub generation: i64,
+}
+
+/// The address `sandboxes` report for `sandbox_id` while its pod is `pod_uid`.
+fn node_reported_address(
+    sandboxes: Vec<pplx_space_sbx_mgr_client::proto::SandboxInfo>,
+    sandbox_id: SandboxId,
+    pod_uid: &str,
+) -> Option<PodIp> {
+    let sandbox_id = sandbox_id.to_string();
+    sandboxes
+        .into_iter()
+        .find(|info| info.sandbox_id == sandbox_id && info.pod_uid.as_deref() == Some(pod_uid))
+        .and_then(|info| PodIp::parse(info.pod_ip.as_deref()?).ok())
+}
+
+#[cfg(test)]
+mod node_reported_address_tests {
+    use super::*;
+    use pplx_space_sbx_mgr_client::proto::SandboxInfo;
+
+    fn info(sandbox_id: SandboxId, pod_uid: &str, pod_ip: &str) -> SandboxInfo {
+        SandboxInfo {
+            sandbox_id: sandbox_id.to_string(),
+            pod_uid: Some(pod_uid.to_owned()),
+            pod_ip: Some(pod_ip.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_the_observed_pods_address_is_taken() {
+        let sandbox_id = SandboxId::new();
+        let other_sandbox = SandboxId::new();
+        let reported = vec![
+            info(other_sandbox, "pod-a", "10.0.0.1"),
+            info(sandbox_id, "pod-old", "10.0.0.2"),
+            info(sandbox_id, "pod-a", "10.0.0.3"),
+        ];
+
+        assert_eq!(
+            node_reported_address(reported.clone(), sandbox_id, "pod-a"),
+            Some(PodIp::parse("10.0.0.3").unwrap())
+        );
+        assert_eq!(node_reported_address(reported, sandbox_id, "pod-new"), None);
+        assert_eq!(
+            node_reported_address(
+                vec![info(sandbox_id, "pod-a", "not-an-ip")],
+                sandbox_id,
+                "pod-a"
+            ),
+            None
+        );
+    }
 }
