@@ -1,4 +1,4 @@
-//! The UUID identifiers that `pplx_space_job_id::postgres_uuid!` gives a
+//! The UUID identifiers that `pplx_space_uuid_id::postgres_uuid!` gives a
 //! Postgres codec, in accounts, node-model, sandbox-model and snapshot-model,
 //! whose `sqlx` features this store enables, reach Postgres as `UUID`s, and
 //! lists of them as `UUID[]`s, and decode back to the same values.

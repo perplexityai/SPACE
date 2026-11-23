@@ -10,7 +10,7 @@ pub use restore_retirement::*;
 pub use sandbox::*;
 
 #[cfg(feature = "sqlx")]
-pplx_space_job_id::postgres_uuid!(
+pplx_space_uuid_id::postgres_uuid!(
     SandboxActivationAttemptId,
     SandboxCleanupEpisodeId,
     SandboxId
