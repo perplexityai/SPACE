@@ -444,16 +444,16 @@ impl KubernetesSubstrate {
                         ) {
                             let persisted = self
                                 .store
-                                .persist_pod_metadata(
+                                .persist_node_reported_pod_ip(
                                     sandbox_id,
                                     generation,
-                                    Some(pod_uid),
-                                    Some(&pod_ip.to_string()),
+                                    pod_uid,
+                                    &pod_ip.to_string(),
                                     pod.client_id().as_ref(),
                                 )
                                 .await;
                             match persisted {
-                                Ok(Some(_)) => return Some(pod_ip),
+                                Ok(Some(recorded)) => return PodIp::parse(&recorded).ok(),
                                 Ok(None) => return None,
                                 Err(error) => tracing::warn!(
                                     sandbox_id = %sandbox_id,

@@ -8437,6 +8437,19 @@ mod kubernetes_tests {
             .fetch_one(&pool)
             .await?;
             assert_eq!(row, ("running".to_owned(), Some(expected_ip.to_owned())));
+            // A node write committing late does not replace the recorded IP.
+            assert_eq!(
+                substrate
+                    .store
+                    .persist_node_reported_pod_ip(sandbox_id, 1, "node-bound-uid", "10.0.0.8", None)
+                    .await?
+                    .as_deref(),
+                Some(expected_ip)
+            );
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                expected
+            );
         }
         Ok(())
     }
@@ -15257,12 +15270,14 @@ mod kubernetes_tests {
     }
 
     /// Before kubelet publishes `status.podIP`, the row's node-reported IP for
-    /// the same pod UID is the fenced pod's runtime, so the retire must stop
-    /// and back it up before deleting the pod. Nothing answers at 127.0.0.1
-    /// here: the stop fails, the retire aborts and the pod is kept.
+    /// the same pod UID is the fenced pod's runtime, so the retire stops it
+    /// before deleting the pod.
     #[tokio::test(flavor = "current_thread")]
     async fn fenced_retire_stops_the_runtime_recorded_for_an_unpublished_pod()
     -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
@@ -15288,6 +15303,17 @@ mod kubernetes_tests {
             },
             ..Default::default()
         };
+        let sim_worker = start_sim_worker().await?;
+        let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+            sandbox_id.to_string(),
+            "seed".into(),
+            "fc".into(),
+            "test".into(),
+            None,
+            false,
+        );
+        record.status = "running".into();
+        sim_worker.state().insert_new(record).await?;
         let captured_deletes = Arc::new(Mutex::new(Vec::new()));
         let substrate = substrate_with_store_client_proxy_port_and_pod(
             pool.clone(),
@@ -15295,32 +15321,34 @@ mod kubernetes_tests {
                 Arc::clone(&captured_deletes),
                 Some(fenced_pod.clone()),
             ),
-            DEFAULT_SANDBOX_PROXY_PORT,
+            sim_worker.port(),
             Some(fenced_pod),
         );
 
-        let result = substrate
+        let outcome = substrate
             .retire_execution(RetireExecutionRequest::fenced(
                 sandbox_id,
                 PodIdentityFence::new(PodName::parse(&pod_name)?)
                     .with_pod_uid(PodUid::parse("uid-observed")?),
             ))
-            .await;
+            .await?;
 
-        assert!(
-            result.is_err(),
-            "the in-VM stop must be attempted: {result:?}"
+        assert_eq!(outcome, RetireExecutionOutcome::Retired);
+        assert_eq!(
+            sim_worker
+                .state()
+                .get(&sandbox_id.to_string())
+                .await?
+                .status,
+            "stopped",
+            "the runtime is stopped before the pod is deleted"
         );
-        assert!(
+        assert_eq!(
             captured_deletes
                 .lock()
                 .expect("capture mutex poisoned")
-                .is_empty(),
-            "the pod is kept until its runtime is stopped"
-        );
-        assert_eq!(
-            active_execution_generations(&pool, sandbox_id).await,
-            vec![1]
+                .len(),
+            1
         );
         Ok(())
     }
