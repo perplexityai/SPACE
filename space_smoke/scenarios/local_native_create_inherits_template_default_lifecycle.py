@@ -36,3 +36,6 @@ def native_create_inherits_template_default_lifecycle(test: smoke.KindAdmin) -> 
     with test.phase("an explicit empty policy stays disabled despite the default"):
         sandbox_id = lifecycle.create(DISABLED_POLICY)
         lifecycle.expect_idle(sandbox_id, DISABLED_IDLE, "an explicit empty policy must win over the template's default")
+
+    with test.phase("remove the template's default auto-lifecycle policy"):
+        lifecycle.remove_default()

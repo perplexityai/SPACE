@@ -7,7 +7,8 @@ both. The public sandbox read reports the outcome as `idle_timeout` and
 `idle_action`.
 
 The scenario sets the default on the bench's seed template through the admin
-API. That API can set a default but not remove one, so the restore first sets
+API. That API can set a default but not remove one, so removing it, in the
+scenario's last phase and again as cleanup if the scenario fails first, sets
 the disabled policy, waits until every node that published a copy of the
 default publishes the disabled one (a node never drops a copy it holds, and a
 disabled default is what a template without one already means to every
@@ -23,7 +24,7 @@ from collections.abc import Callable, Mapping
 from typing import Protocol
 
 from space_smoke.execution_environment import Judge
-from space_smoke.runtime import ResourceScope, SmokeConfigurationError
+from space_smoke.runtime import Compensation, ResourceScope, SmokeConfigurationError
 
 TEMPLATE_DEFAULT_IDLE = "4321s"
 # Wakes on access and suspends after `TEMPLATE_DEFAULT_IDLE`: distinct from the
@@ -100,6 +101,7 @@ class TemplateDefaultLifecycle:
         self._template = template
         self._kill_sandbox = kill_sandbox
         self._kill_matching = kill_matching
+        self._compensation: Compensation | None = None
 
     def require_no_default(self) -> None:
         standing = self._control.template_default_auto_lifecycle(self._template)
@@ -126,10 +128,21 @@ class TemplateDefaultLifecycle:
             if self._control.template_default_auto_lifecycle(self._template) is not None:
                 raise RuntimeError(f"template {self._template} still has a default")
 
-        self._scope.defer(
+        self._compensation = self._scope.defer(
             f"remove the default auto-lifecycle policy of {self._template}", restore, critical=True
         )
         self._control.set_template_default_auto_lifecycle(self._template, TEMPLATE_DEFAULT_POLICY)
+
+    def remove_default(self) -> None:
+        """Remove the default `set_default` set, in a scenario phase rather than cleanup.
+
+        The publication wait can outlast cleanup's shared budget, so the deferred
+        restore only recovers from a scenario that failed before this ran.
+        """
+
+        if self._compensation is None:
+            raise RuntimeError("remove_default called before set_default")
+        self._compensation.release()
 
     def create(self, auto_lifecycle: Mapping[str, object] | None = None) -> str:
         """A native create of the template; the bare sandbox id. Cleanup kills it."""
