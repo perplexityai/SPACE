@@ -4919,6 +4919,7 @@ dependencies = [
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
  "pplx-space-byok-model",
+ "pplx-space-byok-store",
  "pplx-space-byte-size",
  "pplx-space-cluster-id",
  "pplx-space-cluster-pool",
@@ -5346,6 +5347,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-byok-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-byok-model",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-byte-size"
 version = "0.8.2"
 dependencies = [
@@ -5735,6 +5751,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-artifact-model",
  "pplx-space-byok-model",
+ "pplx-space-byok-store",
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
  "pplx-space-credential-injection",
@@ -5760,12 +5777,16 @@ dependencies = [
  "pplx-space-postgres-pool",
  "pplx-space-rpc-auth",
  "pplx-space-sandbox-model",
+ "pplx-space-sandbox-store",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
+ "pplx-space-snapshot-store",
  "pplx-space-sql-locator",
+ "pplx-space-storage-vend-store",
  "pplx-space-subject-model",
  "pplx-space-template-model",
+ "pplx-space-template-release-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-uds-peer-auth",
@@ -8746,6 +8767,15 @@ dependencies = [
 [[package]]
 name = "pplx-space-stopwatch"
 version = "0.8.2"
+
+[[package]]
+name = "pplx-space-storage-vend-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-sql-locator",
+ "sqlx",
+]
 
 [[package]]
 name = "pplx-space-subject-model"

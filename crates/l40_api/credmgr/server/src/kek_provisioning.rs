@@ -10,7 +10,6 @@
 //! inventory, including the broker-wrapped blob when applicable, race-safe via
 //! the partial unique active-KEK index.
 
-use pplx_space_sql_locator::sql;
 use std::sync::Arc;
 
 use pplx_space_accounts::OrgId;
@@ -83,28 +82,22 @@ impl KekProvisioner for IntermediateKeyProvisioner {
             .await?;
 
         let mut tx = self.pool.begin().await?;
-        let inserted: Option<Uuid> = sqlx::query_scalar(sql!(
-            "INSERT INTO org_master_keys (org_id, provider, key_identifier) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (org_id) WHERE retired_at IS NULL DO NOTHING \
-             RETURNING id"
-        ))
-        .bind(org.as_uuid())
-        .bind(KekProvider::IntermediateKeyBroker.as_str())
-        .bind(issued.key_id.as_str())
-        .fetch_optional(&mut *tx)
+        let inserted: Option<Uuid> = pplx_space_byok_store::insert_active_master_key(
+            &mut *tx,
+            org,
+            KekProvider::IntermediateKeyBroker,
+            &issued.key_id,
+        )
         .await?;
 
         match inserted {
             Some(cmk_id) => {
-                sqlx::query(sql!(
-                    "INSERT INTO org_branching_keys (cmk_id, org_id, wrapped_key) \
-                     VALUES ($1, $2, $3)"
-                ))
-                .bind(cmk_id)
-                .bind(org.as_uuid())
-                .bind(&issued.wrapped_key)
-                .execute(&mut *tx)
+                pplx_space_byok_store::insert_branching_key(
+                    &mut *tx,
+                    cmk_id,
+                    org,
+                    &issued.wrapped_key,
+                )
                 .await?;
                 tx.commit().await?;
                 tracing::info!(
@@ -167,16 +160,12 @@ impl KekProvisioner for InMemoryKekProvisioner {
             return Ok(existing);
         }
 
-        let inserted: Option<Uuid> = sqlx::query_scalar(sql!(
-            "INSERT INTO org_master_keys (org_id, provider, key_identifier) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (org_id) WHERE retired_at IS NULL DO NOTHING \
-             RETURNING id"
-        ))
-        .bind(org.as_uuid())
-        .bind(KekProvider::InMemory.as_str())
-        .bind(self.key_identifier.as_str())
-        .fetch_optional(&self.pool)
+        let inserted: Option<Uuid> = pplx_space_byok_store::insert_active_master_key(
+            &self.pool,
+            org,
+            KekProvider::InMemory,
+            &self.key_identifier,
+        )
         .await?;
 
         match inserted {

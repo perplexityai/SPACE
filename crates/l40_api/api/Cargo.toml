@@ -94,6 +94,7 @@ pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-byok-store = { workspace = true }
 pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }

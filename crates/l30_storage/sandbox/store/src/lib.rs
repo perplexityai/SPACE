@@ -78,7 +78,9 @@
 //!   count against one node, each with the gate terms that count it, composed
 //!   from the residency and portability fragments those gates read.
 //!   [`node_placements`] pages one node's placement history, every lifecycle
-//!   included.
+//!   included. [`k8s_node_attribution`] lists the registered nodes the
+//!   sandbox's placement, latest execution and a named snapshot attribute to
+//!   it, for scoping the storage credentials a node may receive.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
 //!   crate declares, mostly inside a larger transaction, move into modules
@@ -143,6 +145,7 @@ pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
 pub mod k8s_executions;
+pub mod k8s_node_attribution;
 mod lifecycle;
 pub mod lost;
 pub mod node_holds;
