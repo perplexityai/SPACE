@@ -246,8 +246,8 @@ service ClusterApi {
   // the report authority, resolves as for a fetch, and names its own worker;
   // INVALID_ARGUMENT for a malformed report, before any database work;
   // FAILED_PRECONDITION when the worker isn't enrolled or no enrollment
-  // predicate or report freshness limit is approved. Every other answer is OK
-  // with its outcome.
+  // predicate is approved. Every other answer is OK with its outcome, which
+  // is EXPIRED for a round issued too long ago.
   rpc ReportFirewallRules(ReportFirewallRulesRequest) returns (ReportFirewallRulesResponse);
 
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
