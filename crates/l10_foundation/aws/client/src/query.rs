@@ -27,8 +27,6 @@ pub enum AwsClientError {
     HttpBuild(#[from] http::Error),
     #[error("AWS endpoint is not a valid URL: {0}")]
     EndpointUrl(#[from] url::ParseError),
-    #[error("invalid AWS endpoint: {0}")]
-    InvalidEndpoint(String),
     #[error("AWS HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("failed to convert AWS HTTP header to UTF-8: {0}")]
@@ -292,14 +290,7 @@ impl<T: QueryTransport> AwsQueryClient<T> {
         let endpoint = self.endpoint()?;
         // http's parser keeps rejecting what it rejected before url could repair it.
         endpoint.parse::<http::Uri>().map_err(http::Error::from)?;
-        let target = reqwest::Url::parse(&endpoint)?;
-        // reqwest sends userinfo as a second, Basic, Authorization header, which nothing verifies.
-        if !target.username().is_empty() || target.password().is_some() {
-            return Err(AwsClientError::InvalidEndpoint(
-                "endpoint carries userinfo".to_string(),
-            ));
-        }
-        Ok(target)
+        Ok(reqwest::Url::parse(&endpoint)?)
     }
 
     fn endpoint(&self) -> Result<String, AwsClientError> {

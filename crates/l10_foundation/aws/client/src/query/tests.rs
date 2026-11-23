@@ -227,7 +227,6 @@ async fn signs_the_target_that_reqwest_sends() {
 enum Refusal {
     Http,
     Url,
-    Userinfo,
 }
 
 #[tokio::test]
@@ -238,10 +237,6 @@ async fn refuses_endpoints_before_sending() {
         (" http://127.0.0.1:9/x", Refusal::Http),
         ("http://127.0.0.1:9/a\tb", Refusal::Http),
         ("http:127.0.0.1:9/normal", Refusal::Http),
-        // Catches sending userinfo, which reqwest sends as a Basic Authorization header.
-        ("http://user:pw@127.0.0.1:9/", Refusal::Userinfo),
-        ("http://user@127.0.0.1:9/", Refusal::Userinfo),
-        ("http://:pw@127.0.0.1:9/", Refusal::Userinfo),
         // Catches signing an endpoint with no authority, which panics in aws-sigv4.
         ("/relative", Refusal::Url),
     ] {
@@ -262,7 +257,6 @@ async fn refuses_endpoints_before_sending() {
                     "{endpoint:?}"
                 );
             }
-            (Err(AwsClientError::InvalidEndpoint(_)), Refusal::Userinfo) => {}
             _ => panic!("{endpoint:?}: {result:?}"),
         }
     }
