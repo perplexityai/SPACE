@@ -20,6 +20,7 @@ use crate::firewall::rules::verify::{Verification, verify_with};
 use crate::firewall::rules::{Nft, nft, render};
 use crate::net::SlotInfo;
 
+pub mod observe;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -33,7 +34,7 @@ pub struct SlotFirewallRequest {
 }
 
 /// The occupant of a slot, as discovered or as an attempt reached it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotTarget {
     pub slot_generation: u64,
     pub sandbox_id: Option<String>,
@@ -150,8 +151,15 @@ pub(crate) trait SlotHost: Send + Sync + 'static {
     fn namespace_path(&self, slot: &SlotInfo) -> PathBuf;
     /// Test seam between the lookup and taking ownership.
     fn looked_up(&self) {}
+    /// A directory only managed namespaces occupy, if the host has one.
+    fn namespace_dir(&self) -> Option<&Path> {
+        None
+    }
+    /// Test seam between an observation's last read and its final checks.
+    fn observed(&self) {}
 }
 
+/// Declares no namespace directory: `/run/netns` also holds CNI-named ones.
 struct Live;
 
 impl SlotHost for Live {

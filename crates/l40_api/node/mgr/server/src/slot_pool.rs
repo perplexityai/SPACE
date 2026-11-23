@@ -19,6 +19,10 @@ use crate::memory_admission::ActiveLeaseMemoryReservation;
 use crate::net::{self, NetId, SlotInfo};
 pub use crate::node_state_sync::{NodeCtlNodeStatusDirtySink, NodeStatusDirtySink};
 #[cfg(target_os = "linux")]
+pub use firewall_rules::observe::{
+    Census, CensusGap, Failure, FirewallObservation, Refusal, SlotEvidence, SlotOutcome, Unknown,
+};
+#[cfg(target_os = "linux")]
 pub use firewall_rules::{
     NamespaceIdentity, NotRun, NotRunnable, SlotFirewallAttempt, SlotFirewallReport,
     SlotFirewallRequest, SlotTarget, Stale,
