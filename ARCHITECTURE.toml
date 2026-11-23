@@ -480,6 +480,11 @@ pplx-space-template-release-store = [
   "pplx-space-cluster-controller-server",
   "pplx-space-cluster-pool",
 ]
+pplx-space-template-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]

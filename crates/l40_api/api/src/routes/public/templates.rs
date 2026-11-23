@@ -1,7 +1,6 @@
 use crate::routes::public::error::database_error;
 use pplx_space_accounts::OrgId;
 
-use pplx_space_sql_locator::sql;
 use std::collections::BTreeMap;
 
 use axum::{
@@ -13,10 +12,10 @@ use pplx_space_public_api::{
     PageCursor, PublicPage, PublicTemplate, PublicTemplateSnapshot, PublicTemplateVariant,
     SandboxResources,
 };
-use pplx_space_template_model::{TemplateName, TemplateVisibility};
+use pplx_space_template_model::TemplateName;
+use pplx_space_template_store::templates::VisibleTemplate as TemplateRow;
 use serde::Deserialize;
-use sqlx::{FromRow, PgPool};
-use time::OffsetDateTime;
+use sqlx::PgPool;
 
 use crate::{middleware::auth::AuthOrg, routes::AppState};
 
@@ -94,14 +93,6 @@ impl ListTemplatesQuery {
     }
 }
 
-#[derive(Debug, FromRow)]
-struct TemplateRow {
-    name: String,
-    description: Option<String>,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-}
-
 type TemplateVariantRow =
     pplx_space_node_template_inventory_store::TemplateVariant<Vec<PublicTemplateSnapshot>>;
 
@@ -111,21 +102,8 @@ async fn fetch_template_rows(
     cursor: Option<&str>,
     limit: u16,
 ) -> Result<Vec<TemplateRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateRow>(sql!(
-        "SELECT name, description, created_at, updated_at
-         FROM templates
-         WHERE (visibility = $1 OR org_id = $2)
-           AND desired_state = 'present'
-           AND ($3::TEXT IS NULL OR name > $3)
-         ORDER BY name ASC
-         LIMIT $4"
-    ))
-    .bind(TemplateVisibility::Generic.as_str())
-    .bind(org_id)
-    .bind(cursor)
-    .bind(i64::from(limit) + 1)
-    .fetch_all(pool)
-    .await
+    pplx_space_template_store::templates::list_visible(pool, org_id, cursor, i64::from(limit) + 1)
+        .await
 }
 
 async fn fetch_template_row(
@@ -133,18 +111,7 @@ async fn fetch_template_row(
     org_id: OrgId,
     template_name: &str,
 ) -> Result<Option<TemplateRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateRow>(sql!(
-        "SELECT name, description, created_at, updated_at
-         FROM templates
-         WHERE name = $1
-           AND desired_state = 'present'
-           AND (visibility = $2 OR org_id = $3)"
-    ))
-    .bind(template_name)
-    .bind(TemplateVisibility::Generic.as_str())
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await
+    pplx_space_template_store::templates::get_visible(pool, org_id, template_name).await
 }
 
 async fn fetch_template_variants(

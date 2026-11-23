@@ -20,13 +20,7 @@ pub(super) async fn template_exists(
     executor: impl sqlx::PgExecutor<'_>,
     template_name: &TemplateName,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
-        "SELECT EXISTS (SELECT 1 FROM templates WHERE name = $1 AND desired_state <> $2)"
-    ))
-    .bind(template_name.as_str())
-    .bind(TemplateDesiredState::Deleted.as_str())
-    .fetch_one(executor)
-    .await
+    pplx_space_template_store::templates::exists_not_deleted(executor, template_name).await
 }
 
 /// What an organization's `templates` rows are, as far as deleting the
@@ -214,18 +208,13 @@ pub(super) async fn update_template_visibility_in_tx(
     visibility: TemplateVisibility,
     new_org_id: Option<OrgId>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE templates
-            SET visibility = $2,
-                org_id = COALESCE($3, org_id)
-          WHERE name = $1"
-    ))
-    .bind(template_name)
-    .bind(visibility)
-    .bind(new_org_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_template_store::templates::update_visibility(
+        &mut **tx,
+        template_name,
+        visibility,
+        new_org_id,
+    )
+    .await
 }
 
 /// After a narrowing flip to owner `owner_org_id`, allowlist rows naming

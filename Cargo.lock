@@ -4980,6 +4980,7 @@ dependencies = [
  "pplx-space-template-release-original",
  "pplx-space-template-release-store",
  "pplx-space-template-runtime",
+ "pplx-space-template-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-work-coalescer",
@@ -5411,6 +5412,7 @@ dependencies = [
  "pplx-space-template-manifest",
  "pplx-space-template-model",
  "pplx-space-template-release-store",
+ "pplx-space-template-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "prost-types",
@@ -5469,6 +5471,7 @@ dependencies = [
  "pplx-space-template-model",
  "pplx-space-template-release-original",
  "pplx-space-template-release-store",
+ "pplx-space-template-store",
  "rstest",
  "serde",
  "sqlx",
@@ -6371,6 +6374,7 @@ dependencies = [
  "pplx-space-template-model",
  "pplx-space-template-release-original",
  "pplx-space-template-release-store",
+ "pplx-space-template-store",
  "pplx-space-test-env",
  "prost",
  "prost-types",
@@ -8960,6 +8964,24 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "toml",
+]
+
+[[package]]
+name = "pplx-space-template-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-auto-lifecycle",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-net-common",
+ "pplx-space-sql-locator",
+ "pplx-space-template-model",
+ "pplx-space-test-env",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

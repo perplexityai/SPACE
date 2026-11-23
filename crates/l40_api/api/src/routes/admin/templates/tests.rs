@@ -1912,9 +1912,8 @@ async fn admin_tags_and_deletes_keep_the_original_release() -> TestResult {
 #[case::with_twins(true)]
 #[tokio::test]
 async fn admin_tags_only_the_digest_original(#[case] twins: bool) -> TestResult {
-    use pplx_space_template_release_store::spelling_pairs::{
-        OLD_INDEX, seed_spelling_pairs, tag_release,
-    };
+    use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
+    use pplx_space_template_store::test_support::tag_release;
     let db = pg_test_db().await?;
     let state = AppState::from_pool(db.pool.clone()).await?;
     let actor = sqlx::query_as::<_, User>(sql!(

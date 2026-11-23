@@ -18,7 +18,6 @@
 //!   sizing).
 //!
 use pplx_space_accounts::OrgId;
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateName;
 use std::sync::Arc;
 
@@ -71,26 +70,15 @@ impl TemplateBuildState {
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Err(RecordBlobError::Conflict);
         }
-        // The SDK's file hash excludes archive metadata, so same-owner reuploads can
-        // have different blob digests even when the file contents are unchanged.
-        // Mappings recorded before uploads carried an owner have a NULL org_id;
-        // the first owned upload claims them so later writers meet the owner check.
-        let result = sqlx::query(sql!(
-            "INSERT INTO template_build_blobs (template_id, files_hash, blob_sha256, org_id)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (template_id, files_hash) DO UPDATE
-             SET blob_sha256 = EXCLUDED.blob_sha256,
-                 org_id = EXCLUDED.org_id
-             WHERE template_build_blobs.org_id IS NULL
-                OR template_build_blobs.org_id = EXCLUDED.org_id"
-        ))
-        .bind(template_name.as_str())
-        .bind(files_hash)
-        .bind(blob_sha256)
-        .bind(org_id.as_uuid())
-        .execute(&self.pool)
+        let recorded = pplx_space_template_store::build_blobs::record(
+            &self.pool,
+            template_name,
+            files_hash,
+            blob_sha256,
+            org_id,
+        )
         .await?;
-        if result.rows_affected() == 0 {
+        if !recorded {
             return Err(RecordBlobError::Conflict);
         }
         Ok(())
@@ -105,19 +93,12 @@ impl TemplateBuildState {
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Ok(None);
         }
-        sqlx::query_scalar::<_, String>(sql!(
-            r#"
-            SELECT blob_sha256
-            FROM template_build_blobs
-            WHERE template_id = $1
-              AND files_hash = $2
-              AND (org_id = $3 OR org_id IS NULL)
-            "#
-        ))
-        .bind(template_name.as_str())
-        .bind(files_hash)
-        .bind(org_id.as_uuid())
-        .fetch_optional(&self.pool)
+        pplx_space_template_store::build_blobs::blob_sha256(
+            &self.pool,
+            template_name,
+            files_hash,
+            org_id,
+        )
         .await
     }
 

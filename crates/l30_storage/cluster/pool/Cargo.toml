@@ -52,6 +52,7 @@ uuid = { workspace = true, features = ["v7"], optional = true }
 
 [dev-dependencies]
 pplx-space-template-release-store = { workspace = true, features = ["test-support"] }
+pplx-space-template-store = { workspace = true, features = ["test-support"] }
 pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-db-test-fixtures = { workspace = true }
 rstest = { workspace = true }

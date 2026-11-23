@@ -9,8 +9,9 @@ use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_template_release_store::spelling_pairs::{
-    OLD_INDEX, SpellingPair, seed_spelling_pairs, tag_release,
+    OLD_INDEX, SpellingPair, seed_spelling_pairs,
 };
+use pplx_space_template_store::test_support::tag_release;
 
 const TEMPLATE: &str = "spelling-pairs";
 

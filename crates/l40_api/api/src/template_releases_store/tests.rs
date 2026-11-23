@@ -6,9 +6,8 @@
 
 use super::*;
 use pplx_space_db_test_fixtures::pg_test_db;
-use pplx_space_template_release_store::spelling_pairs::{
-    OLD_INDEX, seed_spelling_pairs, tag_release,
-};
+use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
+use pplx_space_template_store::test_support::tag_release;
 use pplx_space_test_env::TestResult;
 
 const TEMPLATE: &str = "spelling-pairs";

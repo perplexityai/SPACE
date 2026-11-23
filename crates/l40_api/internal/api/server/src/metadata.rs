@@ -935,25 +935,12 @@ pub(super) async fn template_visibility(
         visibility_lookup_cache(VisibilityLookupCacheOutcome::Fresh);
         return proto_visibility(visibility);
     }
-    // Shaped as a scalar subselect rather than `SELECT visibility ... WHERE
-    // name = $1` so it returns exactly one row whether or not the template
-    // exists, which is what lets one query carry both the value and the
-    // server-side instant the cache orders writes on. `visibility` is `NOT
-    // NULL`, so a NULL here unambiguously means "no such row" rather than "a row
-    // with no value" — and `templates.name` is the primary key, so the subselect
-    // cannot return more than one row.
-    //
-    // The no-row arm discards the instant: it invalidates, and a removal needs
-    // no ordering. An earlier revision retained a dated marker there and did
-    // need it; that is gone, so only the value/NULL disambiguation still
-    // justifies this shape.
-    let observed: Result<(OffsetDateTime, Option<String>), sqlx::Error> = sqlx::query_as(sql!(
-        "SELECT clock_timestamp() AS observed_at,
-                (SELECT visibility FROM templates WHERE name = $1) AS visibility"
-    ))
-    .bind(template_name)
-    .fetch_one(pool)
-    .await;
+    // One read carries both the value and the server-side instant the cache
+    // orders writes on; see `observed_visibility`. The no-row arm discards the
+    // instant: it invalidates, and a removal needs no ordering.
+    let observed = pplx_space_template_store::templates::observed_visibility(pool, template_name)
+        .await
+        .map(|row| (row.observed_at, row.visibility));
     match observed {
         Ok((observed_at, Some(value))) => match CoreTemplateVisibility::parse(&value) {
             Ok(parsed) => {
@@ -1423,19 +1410,18 @@ pub(super) async fn ensure_template_release_tag(
     release: &TemplateReleaseRow,
     tag: &str,
 ) -> Result<TemplateReleaseTagRow, Status> {
-    sqlx::query_as::<_, TemplateReleaseTagRow>(sql!(
-        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (template_name, tag) DO UPDATE
-             SET template_release_id = EXCLUDED.template_release_id,
-                 modified_at = NOW()
-         RETURNING id, tag, created_at"
-    ))
-    .bind(release.id)
-    .bind(&release.template_name)
-    .bind(tag)
-    .fetch_one(&mut **tx)
+    pplx_space_template_store::release_tags::upsert(
+        &mut **tx,
+        release.id,
+        &release.template_name,
+        tag,
+    )
     .await
+    .map(|row| TemplateReleaseTagRow {
+        id: row.id,
+        tag: row.tag,
+        created_at: row.created_at,
+    })
     .map_err(|err| crate::template_publication::storage_status("insert tag", &err))
 }
 
