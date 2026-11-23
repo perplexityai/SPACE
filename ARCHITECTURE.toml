@@ -372,6 +372,10 @@ pplx-space-cluster-trigger-queue = [
   "pplx-space-internal-api-server",
 ]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-data-plane-session-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
+]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-firewall-rules-store = [
   "pplx-space-api",

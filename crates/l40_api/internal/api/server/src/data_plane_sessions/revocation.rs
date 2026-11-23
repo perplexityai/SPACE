@@ -1,6 +1,7 @@
 //! Session and org revocation state.
 
 use super::*;
+use pplx_space_data_plane_session_store as data_plane_session_store;
 
 #[derive(Debug, Clone, FromRow)]
 pub(super) struct RevocationRow {
@@ -12,12 +13,6 @@ pub(super) struct RevocationRow {
     pub(super) revocation_reason: Option<String>,
     pub(super) revocation_updated_at: OffsetDateTime,
     pub(super) org_revocation_epoch: i64,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct OrgRevocationEpochRow {
-    pub(super) epoch: i64,
-    pub(super) updated_at: Option<OffsetDateTime>,
 }
 
 pub(crate) async fn revocation_state_for_session(
@@ -69,24 +64,18 @@ pub(crate) async fn org_revocation_epoch(
     let org_id = required(&request.org_id, "org_id")?
         .parse::<Uuid>()
         .map_err(|_| Status::invalid_argument("org_id must be a UUID"))?;
-    let row = sqlx::query_as::<_, OrgRevocationEpochRow>(sql!(
-        "SELECT epoch, updated_at
-         FROM data_plane_org_revocation_epochs
-         WHERE org_id = $1"
-    ))
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| Status::internal(format!("get data-plane org revocation epoch: {error}")))?
-    .unwrap_or(OrgRevocationEpochRow {
-        epoch: 0,
-        updated_at: None,
-    });
+    let (epoch, updated_at) =
+        data_plane_session_store::org_revocation_epoch(pool, OrgId::from_uuid(org_id))
+            .await
+            .map_err(|error| {
+                Status::internal(format!("get data-plane org revocation epoch: {error}"))
+            })?
+            .map_or((0, None), |row| (row.epoch, Some(row.updated_at)));
 
     Ok(GetDataPlaneOrgRevocationEpochResponse {
         org_id: org_id.to_string(),
-        epoch: i64_to_u64(row.epoch, "org_revocation_epoch")?,
-        updated_at: row.updated_at.map(timestamp),
+        epoch: i64_to_u64(epoch, "org_revocation_epoch")?,
+        updated_at: updated_at.map(timestamp),
     })
 }
 
