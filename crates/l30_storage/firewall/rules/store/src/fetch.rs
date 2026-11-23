@@ -3,6 +3,7 @@
 //! transaction so they come from one snapshot. It writes nothing and decides
 //! no authorization.
 
+use jiff::Timestamp;
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_model::FirewallRuleRevision;
 use pplx_space_sql_locator::sql;
@@ -33,7 +34,7 @@ pub struct Assignment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingRound {
     pub round: u64,
-    pub issued_at: OffsetDateTime,
+    pub issued_at: Timestamp,
 }
 
 /// Read `node`'s assignment and pending round.
@@ -74,7 +75,8 @@ pub async fn fetch_instructions(
     let pending_round = match (round, issued_at) {
         (Some(round), Some(issued_at)) => Some(PendingRound {
             round: non_negative(round)?,
-            issued_at,
+            issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
         }),
         _ => None,
     };

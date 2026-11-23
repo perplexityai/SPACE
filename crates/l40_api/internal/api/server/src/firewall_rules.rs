@@ -1,8 +1,11 @@
 //! `FetchFirewallRules`: node-ctl reads its own worker's firewall assignment
-//! and pending round. The worker is the one live registration matching the
-//! caller's reviewed Kubernetes node name and UID, never its address, and it
-//! must be enrolled. Neither the node-ctl principal nor an enrollment
-//! predicate is approved yet, so production refuses every caller.
+//! and pending round. The caller's reviewed Kubernetes node name must match
+//! exactly one live worker registration, whose UID must match too; the
+//! address is never used, and the worker must be enrolled. Neither the
+//! node-ctl principal nor an enrollment predicate is approved yet, so
+//! production refuses every caller. Direct workers can't fetch: static-token
+//! callers are denied and the lookup requires `managed_by = k8s`, so an
+//! enrollment predicate must exclude them until a Direct binding exists.
 
 use std::time::SystemTime;
 
@@ -41,7 +44,9 @@ impl Enrollment {
             #[cfg(all(test, feature = "kubernetes"))]
             Self::Fixture(enrolled) if enrolled.contains(&node) => Ok(()),
             #[cfg(all(test, feature = "kubernetes"))]
-            Self::Fixture(_) => Err(Status::permission_denied(DENIED)),
+            Self::Fixture(_) => Err(Status::failed_precondition(format!(
+                "firewall rules aren't enabled for node {node}: it isn't enrolled"
+            ))),
         }
     }
 }

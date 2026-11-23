@@ -217,13 +217,14 @@ impl NodeApiAuthConfig {
     }
 
     /// Grant `service_account` the firewall-rules fetch authority that
-    /// production grants no one.
+    /// production grants no one; panics without Kubernetes auth.
     #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
     #[must_use]
     pub fn grant_firewall_rules_fetch_for_test(mut self, service_account: &str) -> Self {
-        if let Some(k8s) = &mut self.k8s {
-            k8s.grant_firewall_rules_fetch(service_account);
-        }
+        self.k8s
+            .as_mut()
+            .expect("firewall-rules fetch grant needs Kubernetes auth")
+            .grant_firewall_rules_fetch(service_account);
         self
     }
 

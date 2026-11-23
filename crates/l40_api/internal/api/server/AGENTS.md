@@ -16,7 +16,8 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 - A new RPC that acts for a node identifies it as the registered node whose
   address equals the caller's remote IP (except publication above and template
   catalog reads, which use reviewed node name/UID when supplied and retain
-  address matching for missing claims), never by a
+  address matching for missing claims, and `FetchFirewallRules`, which uses
+  only reviewed node name/UID and never the address), never by a
   request field alone; one that names a node uses `authenticated_origin_node_id`. Existing exception:
   `TouchArtifactBackup` binds no node.
 - ClusterApi never creates a node registration. `nodes` and `node_k8s` rows
@@ -47,8 +48,8 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 
 Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
 
-- Node-bound RPCs deny a request with no remote address. Give the test request
-  a peer address equal to the node's registered one.
+- Address-bound RPCs deny a request with no remote address. Give the test
+  request a peer address equal to the node's registered one.
 
 Module moves change log targets and `sql!` locators: see "Log targets" in
 `docs/rust/space-conventions.md`.

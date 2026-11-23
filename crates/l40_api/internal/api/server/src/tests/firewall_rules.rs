@@ -231,7 +231,11 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
             denied,
         ),
         ("malformed", malformed, denied),
-        ("unenrolled", node_ctl_on("worker-u", "uid-u"), denied),
+        (
+            "unenrolled",
+            node_ctl_on("worker-u", "uid-u"),
+            Err(Code::FailedPrecondition),
+        ),
         ("builder", node_ctl_on("builder-x", "uid-x"), denied),
         ("deleted", node_ctl_on("worker-d", "uid-d"), denied),
         ("ambiguous", node_ctl_on("worker-t", "uid-t"), denied),

@@ -109,7 +109,7 @@ async fn fetch_returns_exactly_the_nodes_own_parts() -> TestResult {
             assignment,
             pending_round: pending.map(|round| PendingRound {
                 round: round.try_into().unwrap(),
-                issued_at: issued_at(),
+                issued_at: Timestamp::from_nanosecond(issued_at().unix_timestamp_nanos()).unwrap(),
             }),
         };
         let fetched = fetch_instructions(&mut *pool.acquire().await?, node).await?;
