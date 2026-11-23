@@ -458,8 +458,8 @@ enum FirewallSlotDispatchOutcome {
   FIREWALL_SLOT_DISPATCH_OUTCOME_MISMATCHED = 5;
   // Submitted once; the readback could not tell.
   FIREWALL_SLOT_DISPATCH_OUTCOME_INCONCLUSIVE = 6;
-  // Submitted once, but the assignment, slot or namespace changed before the
-  // final check.
+  // Submitted once, but the assignment, slot or namespace changed, or could no
+  // longer be confirmed, before the final check.
   FIREWALL_SLOT_DISPATCH_OUTCOME_STALE = 7;
   // The apply failed, and nft may have run.
   FIREWALL_SLOT_DISPATCH_OUTCOME_UNKNOWN = 8;

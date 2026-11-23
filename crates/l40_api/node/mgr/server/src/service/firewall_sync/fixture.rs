@@ -101,6 +101,8 @@ impl FirewallSync {
         service: &NodeManagerService,
         request: SyncFirewallRulesRequest,
     ) -> Result<SyncFirewallRulesResponse, Status> {
+        // A delivery that races the end can still commit and arm, then replies NOT_RUN
+        // "the binding ended"; nothing reaches nft.
         if self.ended.is_cancelled() {
             return Err(Status::failed_precondition(
                 "the firewall rule sync binding ended",
@@ -276,7 +278,8 @@ fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDisp
         }
         Ok(SlotFirewallReport::Attempted(attempt)) => match (&attempt.readback, &attempt.current) {
             (Verification::Inconclusive(why), _) => (Outcome::Inconclusive, why.clone(), true),
-            // Only an assignment change leaves the target trusted.
+            // Only an assignment change, or an unreadable assignment store, leaves the target
+            // trusted.
             (_, Err(stale)) => (
                 Outcome::Stale,
                 format!("{stale:?}"),

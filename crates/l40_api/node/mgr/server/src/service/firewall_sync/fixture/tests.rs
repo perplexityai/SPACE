@@ -446,7 +446,7 @@ async fn each_report_is_one_outcome_and_only_drift_or_unknown_ends() {
 
 // Catches a mismatched generation submitted again, work run against a
 // namespace replaced between attempts, a binding-ending result not reaching the
-// reply, or a later delivery admitted, written or applied.
+// reply, or a later sequential delivery admitted, written or applied.
 #[tokio::test]
 async fn a_target_replaced_between_attempts_ends_the_binding() {
     let bound = bind(Some(Fault::Drops), None, WAIT).await;
