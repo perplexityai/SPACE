@@ -33,6 +33,7 @@ sandbox-pod phase does.
 from __future__ import annotations
 
 import secrets
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,9 @@ if TYPE_CHECKING:
 # A policy drop is a SYN that never returns, so a refusal is a timeout; a
 # completed connect inside the cluster takes milliseconds.
 PROBE_TIMEOUT_SECONDS = 3.0
+# A sandbox reaches running on the pod IP its node reports, which can precede
+# kubelet publishing `status.podIP` by several seconds under load.
+POD_IP_PUBLISH_TIMEOUT_SECONDS = 60.0
 # Whether this host reaches the internet at all, asked from the control-plane
 # namespace: a public anycast resolver's HTTPS port, by address, so no DNS is
 # involved.
@@ -82,8 +86,13 @@ class SandboxNetworkIsolationAssertions:
         ids = self._fixture.sandboxes.ids
         if len(ids) < 2:
             raise SmokeConfigurationError("the isolation probes need two sandboxes")
-        sandbox = self._control.sandbox_pod_network(ids[0])
-        peer = self._control.sandbox_pod_network(ids[1])
+        deadline = time.monotonic() + POD_IP_PUBLISH_TIMEOUT_SECONDS
+        while True:
+            sandbox = self._control.sandbox_pod_network(ids[0])
+            peer = self._control.sandbox_pod_network(ids[1])
+            if (sandbox is not None and peer is not None) or time.monotonic() >= deadline:
+                break
+            time.sleep(1)
         self._fixture.verify(
             sandbox is not None and peer is not None,
             "a sandbox has no running execution pod with a pod IP in the sandbox namespace",
