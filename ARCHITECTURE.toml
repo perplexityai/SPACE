@@ -375,6 +375,7 @@ pplx-space-cluster-trigger-queue = [
   "pplx-space-cluster-reconciler",
   "pplx-space-internal-api-server",
 ]
+pplx-space-build-mgr-store = ["pplx-space-build-mgr-server"]
 pplx-space-byok-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-data-plane-session-store = [
@@ -509,6 +510,7 @@ pplx-space-template-store = [
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
+pplx-space-volmgr-store = ["pplx-space-volmgr"]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]

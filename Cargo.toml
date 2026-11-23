@@ -155,6 +155,8 @@ members = [
     "crates/l30_storage/firewall/rules/store",
     "crates/l30_storage/public/operation/store",
     "crates/l30_storage/node/runtime/manager/store",
+    "crates/l30_storage/build/mgr/store",
+    "crates/l30_storage/volmgr/store",
     "crates/l40_api/ingress/admission",
     "crates/l10_foundation/metrics/emit",
     "crates/l10_foundation/grpc/metrics",
@@ -408,6 +410,7 @@ pplx-space-bearer-token = { path = "crates/l10_foundation/bearer/token" }
 pplx-space-build-mgr = { path = "crates/l40_api/build/mgr/engine" }
 pplx-space-build-mgr-client = { path = "crates/l40_api/build/mgr/client" }
 pplx-space-build-mgr-server = { path = "crates/l40_api/build/mgr/server" }
+pplx-space-build-mgr-store = { path = "crates/l30_storage/build/mgr/store" }
 pplx-space-byte-size = { path = "crates/l10_foundation/byte/size" }
 pplx-space-durations = { path = "crates/l10_foundation/durations" }
 pplx-space-stopwatch = { path = "crates/l10_foundation/stopwatch" }
@@ -457,6 +460,7 @@ pplx-space-credential-provider-client = { path = "crates/l40_api/credential/prov
 pplx-space-credential-provider-proto = { path = "crates/l20_domain/credential/provider/proto" }
 pplx-space-volmgr = { path = "crates/l40_api/volmgr/server" }
 pplx-space-volmgr-client = { path = "crates/l40_api/volmgr/client" }
+pplx-space-volmgr-store = { path = "crates/l30_storage/volmgr/store" }
 pplx-space-net-gateway = { path = "crates/l40_api/net/gateway/server" }
 pplx-space-net-gateway-client = { path = "crates/l40_api/net/gateway/client" }
 pplx-space-net-gateway-protocol = { path = "crates/l20_domain/net/gateway/protocol" }

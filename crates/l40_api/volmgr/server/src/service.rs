@@ -22,6 +22,9 @@ use pplx_space_subject_model::SubjectId;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use pplx_space_volmgr_store::{
+    JobPayloadRow, JobPayloadsError, pending_or_running_job_payloads, transfer_scope_job_ids,
+};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
@@ -64,22 +67,6 @@ const TRANSFER_MANAGER_PEERS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
 ];
-
-fn transfer_scope_job_ids(
-    conn: &rusqlite::Connection,
-    scope: TransferScopeId,
-) -> rusqlite::Result<Vec<pplx_space_common_jobs::JobId>> {
-    let mut stmt = conn.prepare(
-        "SELECT job_id
-           FROM jobs
-          WHERE kind = 'pull'
-            AND status IN ('pending', 'running', 'cancelling')
-            AND json_extract(payload, '$.transfer_scope_id') = ?1
-          ORDER BY created_at DESC, job_id DESC",
-    )?;
-    stmt.query_map([scope.to_string()], |row| row.get(0))?
-        .collect()
-}
 
 #[derive(Clone)]
 pub struct VolumeManagerService {
@@ -460,22 +447,19 @@ impl VolumeManagerService {
     /// exact "entity not found" failure this module exists to prevent.
     fn collect_active_staged_paths(&self) -> Result<HashSet<PathBuf>, Status> {
         let conn = self.lock_db()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT kind, payload FROM jobs
-                 WHERE kind IN (?1, ?2) AND status IN ('pending', 'running')",
-            )
-            .map_err(|e| Status::internal(format!("prepare staged-paths query: {e}")))?;
-        let rows = stmt
-            .query_map([PUSH_KIND, PUSH_ARTIFACT_KIND], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| Status::internal(format!("execute staged-paths query: {e}")))?;
+        let rows = pending_or_running_job_payloads(&conn, [PUSH_KIND, PUSH_ARTIFACT_KIND])
+            .map_err(|error| match error {
+                JobPayloadsError::Prepare(e) => {
+                    Status::internal(format!("prepare staged-paths query: {e}"))
+                }
+                JobPayloadsError::Execute(e) => {
+                    Status::internal(format!("execute staged-paths query: {e}"))
+                }
+                JobPayloadsError::Row(e) => Status::internal(format!("read staged-paths row: {e}")),
+            })?;
 
         let mut out = HashSet::new();
-        for row in rows {
-            let (kind, payload) =
-                row.map_err(|e| Status::internal(format!("read staged-paths row: {e}")))?;
+        for JobPayloadRow { kind, payload } in rows {
             if kind == PUSH_ARTIFACT_KIND {
                 if let Ok(artifact) = serde_json::from_str::<ArtifactPayload>(&payload) {
                     out.extend(

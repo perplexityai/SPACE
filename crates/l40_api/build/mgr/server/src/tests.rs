@@ -5,6 +5,7 @@ use futures_util::stream::iter;
 use pplx_space_build_mgr_client::proto::{
     BuildOptions, ClientContext, Recipe as ProtoRecipe, UploadBlobChunk, UploadBlobPhase, recipe,
 };
+use rusqlite::params;
 use tonic::Code;
 
 use super::*;

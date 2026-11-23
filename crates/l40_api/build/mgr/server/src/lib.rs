@@ -22,11 +22,14 @@ use pplx_space_build_mgr_client::proto::{
     BuildState, GetBuildStatusRequest, GetBuildStatusResponse, StartBuildRequest,
     StartBuildResponse, UploadBlobChunk, UploadBlobPhase, UploadBlobResponse,
 };
+use pplx_space_build_mgr_store::{
+    count_active_build_jobs, count_running_build_jobs_by_lease_owner,
+};
 use pplx_space_common_jobs::metrics::JobCompletedResult;
 use pplx_space_common_jobs::{
     BackgroundWorker, Job, JobError, JobExecutor, LeaseConfig, WorkerConfig,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::Instrument as _;
@@ -600,7 +603,7 @@ impl JobExecutor for BuildExecutor {
                 }
             };
 
-            let result = build_result.state.as_metric_result();
+            let result = jobs::metric_result(build_result.state);
             pplx_space_build_mgr::metrics::build_completed(
                 &template_id,
                 result,
@@ -754,31 +757,6 @@ fn open_db(path: &str) -> rusqlite::Result<Connection> {
          PRAGMA foreign_keys=ON;",
     )?;
     Ok(conn)
-}
-
-fn count_active_build_jobs(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM jobs
-         WHERE kind = ?1 AND status IN ('pending', 'running')",
-        params![jobs::BUILD_JOB_KIND],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(jobs::sqlite_count_to_usize)
-}
-
-fn count_running_build_jobs_by_lease_owner(
-    conn: &Connection,
-    lease_owner: &str,
-) -> rusqlite::Result<usize> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM jobs
-         WHERE kind = ?1
-           AND status = 'running'
-           AND lease_owner = ?2",
-        params![jobs::BUILD_JOB_KIND, lease_owner],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(jobs::sqlite_count_to_usize)
 }
 
 fn build_job_lease_config() -> LeaseConfig {
@@ -969,7 +947,7 @@ impl BuildManager for BuildManagerDaemonService {
         let (state, content_hash, error) = match (job.status.as_str(), result) {
             ("pending" | "running", _) => (BuildState::Running, String::new(), String::new()),
             ("completed", Some(result)) => (
-                result.state.as_build_state(),
+                jobs::proto_build_state(result.state),
                 result.content_hash.unwrap_or_default(),
                 result.error.unwrap_or_default(),
             ),
@@ -986,7 +964,7 @@ impl BuildManager for BuildManagerDaemonService {
                     error: job.error.clone(),
                 });
                 (
-                    result.state.as_build_state(),
+                    jobs::proto_build_state(result.state),
                     result.content_hash.unwrap_or_default(),
                     result
                         .error
