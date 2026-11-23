@@ -48,11 +48,19 @@ async fn serve(
     .await
 }
 
+/// Every PERMISSION_DENIED reason looks the same to the caller.
+fn denied<T>() -> Result<T, (Code, String)> {
+    Err((
+        Code::PermissionDenied,
+        "the caller may not fetch firewall rules".to_owned(),
+    ))
+}
+
 /// Fetch with `bearer`, or with no authorization header.
 async fn fetch(
     client: &mut ClusterApiClient<Channel>,
     bearer: Option<&str>,
-) -> TestResult<Result<FetchFirewallRulesResponse, Code>> {
+) -> TestResult<Result<FetchFirewallRulesResponse, (Code, String)>> {
     let mut request = Request::new(FetchFirewallRulesRequest {});
     if let Some(bearer) = bearer {
         request
@@ -63,7 +71,7 @@ async fn fetch(
         .fetch_firewall_rules(request)
         .await
         .map(tonic::Response::into_inner)
-        .map_err(|status| status.code()))
+        .map_err(|status| (status.code(), status.message().to_owned())))
 }
 
 /// node-ctl's token, pod-bound to `name` and `uid`.
@@ -194,11 +202,18 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
 
     let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
     let b = register(pool, "worker", "ready", "127.0.0.1", "worker-b", "uid-b").await?;
-    register(pool, "worker", "ready", "192.0.2.11", "worker-u", "uid-u").await?;
+    let u = register(pool, "worker", "ready", "192.0.2.11", "worker-u", "uid-u").await?;
     let builder = register(pool, "builder", "ready", "192.0.2.12", "builder-x", "uid-x").await?;
     let deleted = register(pool, "worker", "deleted", "192.0.2.13", "worker-d", "uid-d").await?;
     let twin = register(pool, "worker", "ready", "192.0.2.14", "worker-t", "uid-t").await?;
     let twin_peer = register(pool, "worker", "ready", "192.0.2.15", "worker-t", "uid-t2").await?;
+    let unsynced = register(pool, "worker", "ready", "192.0.2.16", "worker-n", "uid-n").await?;
+    sqlx::query(sql!(
+        "UPDATE node_k8s SET k8s_node_uid = NULL WHERE node_id = $1"
+    ))
+    .bind(unsynced)
+    .execute(pool)
+    .await?;
     give_work(pool, b, 9, (ssh, SSH), 70).await?;
     service.firewall_enrollment =
         Enrollment::Fixture(vec![a, b, builder, deleted, twin, twin_peer]);
@@ -215,30 +230,33 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
         );
     // `Ok` is A's own instructions. Each token is minted once: its expiry
     // makes a second one differ.
-    let denied = Err(Code::PermissionDenied);
     let other_workload = "system:serviceaccount:space:space-template-manager";
     let reviewed = [
         ("node-ctl-a", node_ctl_on("worker-a", "uid-a"), Ok(())),
         (
             "other-workload-a",
             pod_bound_service_account_status(AUDIENCE, other_workload, "worker-a", "uid-a"),
-            denied,
+            denied(),
         ),
-        ("stale-uid", node_ctl_on("worker-a", "stale-uid"), denied),
+        ("stale-uid", node_ctl_on("worker-a", "stale-uid"), denied()),
+        ("unsynced", node_ctl_on("worker-n", "uid-n"), denied()),
         (
             "no-claims",
             service_account_status(AUDIENCE, NODE_CTL),
-            denied,
+            denied(),
         ),
-        ("malformed", malformed, denied),
+        ("malformed", malformed, denied()),
         (
             "unenrolled",
             node_ctl_on("worker-u", "uid-u"),
-            Err(Code::FailedPrecondition),
+            Err((
+                Code::FailedPrecondition,
+                format!("firewall rules aren't enabled for node {u}: it isn't enrolled"),
+            )),
         ),
-        ("builder", node_ctl_on("builder-x", "uid-x"), denied),
-        ("deleted", node_ctl_on("worker-d", "uid-d"), denied),
-        ("ambiguous", node_ctl_on("worker-t", "uid-t"), denied),
+        ("builder", node_ctl_on("builder-x", "uid-x"), denied()),
+        ("deleted", node_ctl_on("worker-d", "uid-d"), denied()),
+        ("ambiguous", node_ctl_on("worker-t", "uid-t"), denied()),
     ]
     .map(|(label, status, expected)| (projected_token(label), status, expected));
     let node_ctl_a = reviewed[0].0.clone();
@@ -261,8 +279,14 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     let a_work = give_work(pool, a, 4, (ordered, ORDERED), 7).await?;
 
     let unreviewed = [
-        (Some(REVIEWED_STATIC_TOKEN.to_owned()), denied),
-        (None, Err(Code::Unauthenticated)),
+        (Some(REVIEWED_STATIC_TOKEN.to_owned()), denied()),
+        (
+            None,
+            Err((
+                Code::Unauthenticated,
+                "missing authorization header".to_owned(),
+            )),
+        ),
     ];
     for (bearer, expected) in reviewed
         .into_iter()
@@ -308,7 +332,12 @@ async fn fetch_serves_only_node_ctl_on_its_own_enrolled_worker() -> TestResult {
     .bind(bad)
     .execute(pool)
     .await?;
-    assert_eq!(fetch(client, Some(&node_ctl_a)).await?, Err(Code::Internal));
+    assert_eq!(
+        fetch(client, Some(&node_ctl_a))
+            .await?
+            .map_err(|(code, _)| code),
+        Err(Code::Internal)
+    );
     Ok(())
 }
 
@@ -323,8 +352,16 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
     let a = register(&pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
 
     for (grant, expected) in [
-        (false, Code::PermissionDenied),
-        (true, Code::FailedPrecondition),
+        (false, denied()),
+        (
+            true,
+            Err((
+                Code::FailedPrecondition,
+                format!(
+                    "firewall rules aren't enabled for node {a}: no enrollment predicate is approved"
+                ),
+            )),
+        ),
     ] {
         let mut service = fixture.service.clone();
         if !grant {
@@ -335,7 +372,7 @@ async fn fetch_is_closed_while_authority_or_enrollment_is_unapproved() -> TestRe
         let mut harness = serve(service, reviews, grant).await?;
         assert_eq!(
             fetch(&mut harness.client, Some(&token)).await?,
-            Err(expected),
+            expected,
             "grant {grant}"
         );
     }
@@ -434,11 +471,7 @@ async fn fetch_returns_assignment_and_round_from_one_snapshot() -> TestResult {
         writer.commit().await?;
 
         assert_eq!(overlapping.await?, Ok(old.clone()), "step {step}");
-        let after = if delete {
-            Err(Code::PermissionDenied)
-        } else {
-            Ok(new.clone())
-        };
+        let after = if delete { denied() } else { Ok(new.clone()) };
         assert_eq!(fetch(&mut harness.client, Some(&token)).await?, after);
         old = new;
     }

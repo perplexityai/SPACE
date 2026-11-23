@@ -26,6 +26,19 @@ use crate::proto::{
 
 const DENIED: &str = "the caller may not fetch firewall rules";
 
+/// PERMISSION_DENIED for every caller; only the log has the reason.
+fn denied(reason: &'static str) -> Status {
+    tracing::warn!(reason, "refused firewall rules fetch");
+    Status::permission_denied(DENIED)
+}
+
+fn not_enabled(reason: &'static str, node: NodeId, why: &str) -> Status {
+    tracing::warn!(reason, "refused firewall rules fetch");
+    Status::failed_precondition(format!(
+        "firewall rules aren't enabled for node {node}: {why}"
+    ))
+}
+
 /// The workers that may fetch. Production enrolls none until an enrollment
 /// predicate is approved; tests name their fixture workers.
 #[derive(Clone, Debug)]
@@ -38,15 +51,15 @@ pub(crate) enum Enrollment {
 impl Enrollment {
     fn admit(&self, node: NodeId) -> Result<(), Status> {
         match self {
-            Self::Unapproved => Err(Status::failed_precondition(format!(
-                "firewall rules aren't enabled for node {node}: no enrollment predicate is approved"
-            ))),
+            Self::Unapproved => Err(not_enabled(
+                "no_enrollment_predicate",
+                node,
+                "no enrollment predicate is approved",
+            )),
             #[cfg(all(test, feature = "kubernetes"))]
             Self::Fixture(enrolled) if enrolled.contains(&node) => Ok(()),
             #[cfg(all(test, feature = "kubernetes"))]
-            Self::Fixture(_) => Err(Status::failed_precondition(format!(
-                "firewall rules aren't enabled for node {node}: it isn't enrolled"
-            ))),
+            Self::Fixture(_) => Err(not_enabled("unenrolled", node, "it isn't enrolled")),
         }
     }
 }
@@ -56,17 +69,23 @@ impl ClusterApiService {
         &self,
         request: Request<FetchFirewallRulesRequest>,
     ) -> Result<Response<FetchFirewallRulesResponse>, Status> {
-        let denied = || Status::permission_denied(DENIED);
         let caller = request
             .extensions()
             .get::<NodeApiAuthenticatedCaller>()
-            .ok_or_else(denied)?;
+            .ok_or_else(|| denied("no_fetch_authority"))?;
         if caller.firewall_rules_fetch_authority() != FirewallRulesFetchAuthority::Granted {
-            return Err(denied());
+            return Err(denied("no_fetch_authority"));
         }
         // Missing or malformed claims never fall back to the address.
-        let AuthenticatedNodeIdentity::Kubernetes(identity) = caller.node_identity() else {
-            return Err(denied());
+        let identity = match caller.node_identity() {
+            AuthenticatedNodeIdentity::Kubernetes(identity) => identity,
+            AuthenticatedNodeIdentity::MalformedKubernetesClaims => {
+                return Err(denied("malformed_node_claims"));
+            }
+            AuthenticatedNodeIdentity::RemoteAddress
+            | AuthenticatedNodeIdentity::MissingKubernetesClaims => {
+                return Err(denied("missing_node_claims"));
+            }
         };
         // The binding and the instructions come from one snapshot.
         let mut tx = self
@@ -85,7 +104,10 @@ impl ClusterApiService {
         .as_slice()
         {
             [(node, Some(true))] => *node,
-            _ => return Err(denied()),
+            [] => return Err(denied("no_live_worker")),
+            [(_, Some(false))] => return Err(denied("uid_mismatch")),
+            [(_, None)] => return Err(denied("uid_unsynced")),
+            _ => return Err(denied("ambiguous_name")),
         };
         self.firewall_enrollment.admit(node)?;
         let instructions = pplx_space_firewall_rules_store::fetch_instructions(&mut tx, node)
