@@ -7,8 +7,10 @@
 //!
 //! Claims and renewals run [`pplx_space_rollout_queue::claim`] and
 //! [`pplx_space_rollout_queue::renew`] on these tables, in their lock order:
-//! the rollout row, then the lease handoff lock, then item rows. Requeues and
-//! redrives are single fenced updates under the shared outcome contract
+//! the rollout row, then the lease handoff lock, then item rows. A canary's
+//! first claim takes back its lapsed unissued claims in the same transaction,
+//! right after the rollout row. Requeues and redrives are single fenced
+//! updates under the shared outcome contract
 //! ([`pplx_space_rollout_queue::LEASE_EXPIRED`]).
 //!
 //! A lease isn't permission to assign: the assignment step must still recheck
@@ -40,7 +42,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
-use crate::{ItemPhase, RolloutId, end_transaction, rollout_phase};
+use crate::{ItemPhase, RolloutId, Scope, end_transaction, rollout_phase};
 
 /// Firewall rollouts don't pause on failures, and the shared claim refuses
 /// once `failed >= failure_budget`, so the budget is one no count reaches.
@@ -103,9 +105,52 @@ pub async fn lease_targets(
         active_limit,
         held: Vec::new(),
         unverified: 0,
+        scope: Scope::Any,
     };
     let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
     end_transaction(tx, leased).await
+}
+
+/// Lease one first assignment of the database's unfinished rollout for
+/// `lease` (clamped as for [`lease_targets`]), from the first `scan_limit`
+/// eligible targets, while it's in canary and none of its saved targets is
+/// issued. No check is leased. Commits before it returns.
+///
+/// First, in the same transaction once the header lock finds it in canary,
+/// its unissued targets whose leases lapsed go back to pending, keeping their
+/// attempts: their claimants died before issuing. An issued one may be a
+/// check's, so it's left alone.
+pub async fn lease_first_canary(
+    conn: &mut PgConnection,
+    lease: Duration,
+    scan_limit: u32,
+) -> Result<Option<LeasedTarget>, sqlx::Error> {
+    let Some(rollout_id) = sqlx::query_scalar::<_, RolloutId>(sql!(
+        "SELECT id
+         FROM firewall_rules_rollouts
+         WHERE unfinished_slot IS NOT NULL
+           AND phase = $1"
+    ))
+    .bind(rollout_phase(HeaderPhase::Canary))
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let mut tx = conn
+        .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
+        .await?;
+    let mut claiming = Claiming {
+        tx: &mut tx,
+        rollout_id,
+        active_limit: 1,
+        held: Vec::new(),
+        unverified: 0,
+        scope: Scope::FirstCanary,
+    };
+    let leased = pplx_space_rollout_queue::claim(&mut claiming, lease, scan_limit).await;
+    // A canary leases one target at a time.
+    Ok(end_transaction(tx, leased).await?.pop())
 }
 
 struct Claiming<'c> {
@@ -117,6 +162,8 @@ struct Claiming<'c> {
     /// Nodes leased or holding an unverified assignment, as `candidates`
     /// counted them, plus the first assignments `claim` has leased since.
     unverified: u64,
+    /// [`Scope::FirstCanary`] leases only a canary's first assignments.
+    scope: Scope,
 }
 
 impl FailedItems for Claiming<'_> {
@@ -149,6 +196,13 @@ impl ClaimStore for Claiming<'_> {
         .bind(rollout_phase(HeaderPhase::Rolling))
         .fetch_optional(&mut *self.tx)
         .await?;
+        // A canary's first claim found its rollout without a lock: this is
+        // its only canary check.
+        let canary = canary.filter(|&canary| canary || self.scope == Scope::Any);
+        if canary == Some(true) && self.scope == Scope::FirstCanary {
+            // Never failed, which is the later driver's call; the attempts stay.
+            redrive(&mut *self.tx, self.rollout_id, u64::MAX, Scope::FirstCanary).await?;
+        }
         Ok(canary.map(|canary| {
             (
                 canary,
@@ -291,6 +345,9 @@ impl ClaimStore for Claiming<'_> {
                 .into_iter()
                 .map(|node| (node, false))
                 .chain(first.into_iter().map(|node| (node, true)))
+                // In canary a due check means one is issued, so there are no
+                // first assignments for it to crowd out.
+                .filter(|&(_, first)| first || self.scope == Scope::Any)
                 .take(scan_limit as usize)
                 .map(|(node, first)| (NodeId::from_uuid(node), first))
                 .collect(),
@@ -583,6 +640,16 @@ pub async fn redrive_expired(
     rollout_id: RolloutId,
     max_attempts: u64,
 ) -> Result<RedriveReport, sqlx::Error> {
+    redrive(executor, rollout_id, max_attempts, Scope::Any).await
+}
+
+/// [`redrive_expired`]; [`Scope::FirstCanary`] redrives only unissued items.
+async fn redrive(
+    executor: impl sqlx::PgExecutor<'_>,
+    rollout_id: RolloutId,
+    max_attempts: u64,
+    scope: Scope,
+) -> Result<RedriveReport, sqlx::Error> {
     let phases = sqlx::query_scalar::<_, String>(sql!(
         "UPDATE firewall_rules_rollout_items
          SET phase = CASE WHEN attempts >= $2 THEN $3 ELSE $4 END,
@@ -592,6 +659,7 @@ pub async fn redrive_expired(
          WHERE rollout_id = $1
            AND phase = $6
            AND lease_expires_at <= clock_timestamp()
+           AND (NOT $7 OR issued_at IS NULL)
          RETURNING phase"
     ))
     .bind(rollout_id)
@@ -600,6 +668,7 @@ pub async fn redrive_expired(
     .bind(ItemPhase::Pending.as_str())
     .bind(LEASE_EXPIRED)
     .bind(ItemPhase::InFlight.as_str())
+    .bind(scope == Scope::FirstCanary)
     .fetch_all(executor)
     .await?;
     let failed = phases
