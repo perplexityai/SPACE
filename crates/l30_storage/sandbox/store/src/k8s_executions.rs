@@ -56,6 +56,31 @@ pub async fn active_execution(
     .await
 }
 
+/// Whether the sandbox's execution `generation` is its active one, when
+/// that execution's pod was placed on one of `node_ids` (its Kubernetes node
+/// is registered as one of them). `None` when there is no such execution, or
+/// it ran elsewhere.
+pub async fn generation_active_on_nodes(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    generation: ExecutionGeneration,
+    node_ids: &[NodeId],
+) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT e.active
+           FROM sandbox_k8s_executions e
+           JOIN node_k8s nk ON nk.k8s_node_name = e.k8s_node_name
+          WHERE e.sandbox_id = $1
+            AND e.generation = $2
+            AND nk.node_id = ANY($3)"
+    ))
+    .bind(sandbox_id)
+    .bind(generation.get())
+    .bind(node_ids)
+    .fetch_optional(executor)
+    .await
+}
+
 /// Milliseconds left, by the database clock and never negative, until the
 /// newest active execution at or past `generation` is `lease_ttl_secs` past
 /// its last update. `None` when there is no such execution.

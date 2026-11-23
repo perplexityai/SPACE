@@ -28,7 +28,6 @@ use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sandbox_store::ObservedSpacedVersion;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_semver::SemVer;
 use pplx_space_sql_locator::sql;
@@ -44,8 +43,6 @@ use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_
 use crate::controllers::substrate::direct::reported_node::{reported_on_a_node, reported_on_node};
 use crate::controllers::{ControllerError, db_contention_error, pool_store_error};
 use crate::models::{Sandbox, SandboxResourceType};
-
-const DELETED_LIFECYCLE: &str = "deleted";
 
 /// What the admin sandbox list narrows to. Every field that is set must
 /// match; an unset field matches every row.
@@ -454,17 +451,6 @@ pub struct SpacedVersionCount {
     pub count: i64,
 }
 
-#[derive(sqlx::FromRow)]
-struct SpacedVersionCountRow {
-    template: Option<String>,
-    #[sqlx(flatten)]
-    version: ObservedSpacedVersion,
-    status: Option<String>,
-    has_row: bool,
-    pool_slot: bool,
-    count: i64,
-}
-
 /// The values of the filters every admin list statement binds as $1-$11.
 struct FilterBinds<'a> {
     org_id: Option<OrgId>,
@@ -664,43 +650,11 @@ impl SandboxController {
         } else {
             Vec::new()
         };
-        let rows = sqlx::query_as::<_, SpacedVersionCountRow>(sql!(
-            "SELECT counted.template,
-                    counted.spaced_version,
-                    counted.status,
-                    counted.has_row,
-                    counted.pool_slot,
-                    COUNT(*)::BIGINT AS count
-             FROM (
-                 SELECT COALESCE(s.template_id, sos.template, observed_template.template_name,
-                                 sos.pool_template) AS template,
-                        sos.spaced_version,
-                        COALESCE(sos.status, s.lifecycle) AS status,
-                        s.id IS NOT NULL AS has_row,
-                        s.id IS NULL
-                            AND (sos.pool_template IS NOT NULL
-                                 OR sos.sandbox_id IN (SELECT unnest($3::UUID[]))) AS pool_slot
-                 FROM sandboxes s
-                 FULL JOIN sandbox_observed_states sos ON sos.sandbox_id = s.id
-                 LEFT JOIN LATERAL (
-                     SELECT nti.template_name
-                     FROM node_template_inventory nti
-                     WHERE nti.node_id = sos.node_id
-                       AND sos.image_hash IS NOT NULL
-                       AND nti.content_hash = sos.image_hash
-                     ORDER BY nti.observed_at DESC, nti.template_name ASC
-                     LIMIT 1
-                 ) observed_template ON TRUE
-                 WHERE ($1::UUID IS NULL OR s.org_id = $1)
-             ) counted
-             WHERE counted.status IS DISTINCT FROM $2
-             GROUP BY 1, 2, 3, 4, 5
-             ORDER BY 1 NULLS LAST, 2 NULLS LAST, 3 NULLS LAST, 4 DESC, 5"
-        ))
-        .bind(org_id)
-        .bind(DELETED_LIFECYCLE)
-        .bind(pool_reserved)
-        .fetch_all(pool)
+        let rows = pplx_space_sandbox_store::spaced_version_counts::count_by_spaced_version(
+            pool,
+            org_id,
+            &pool_reserved,
+        )
         .await
         .map_err(|err| db_contention_error("count sandboxes by spaced version", &err))?;
         Ok(rows

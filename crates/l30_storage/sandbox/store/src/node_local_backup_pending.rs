@@ -2,11 +2,21 @@
 //! not yet backed up durably, one row per `(node, sandbox)`. The rows go with
 //! their sandbox through the `sandbox_id` foreign key's cascade.
 //!
-//! The census mirrors a node's report here inside its publish transaction;
-//! [`crate::lost::write_off_lost_sandboxes`] removes a gone node's rows.
+//! The census mirrors a node's report here inside its publish transaction
+//! ([`upsert_reported`], [`delete_durable_absent`], [`depth`]), a finalize
+//! clears the row of the artifact it made durable ([`delete_finalized`]),
+//! and [`crate::lost::write_off_lost_sandboxes`] removes a gone node's rows.
+//! Both deletes carry their durability proof from
+//! `pplx-space-sandbox-portability` rather than spelling it here, so the
+//! drain that reads the queue agrees with them on what "durable" means.
+
+use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_portability::{
+    artifact_has_durable_copy, queued_artifact_recoverable_without_node,
+};
 use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
@@ -82,3 +92,95 @@ pub async fn depth(
         retained_absent,
     })
 }
+
+/// Built once: every input is a literal, so the composed text is identical
+/// on every census, and this runs for each node each minute. Same shape as
+/// internal-api-server's `sandbox_quarantine_store` recovery queries, and the
+/// `line!()` the `sql!` locator captures is fixed either way.
+///
+/// At module scope rather than inside [`delete_durable_absent`] so
+/// `tests::the_delete_guard_resolves_through_indexes_not_a_history_scan` can
+/// EXPLAIN the statement this function executes instead of a copy of it: a
+/// copy pins the shared predicate but not the `USING`/`WHERE` scaffolding
+/// around it.
+static DELETE_DURABLE_ABSENT: LazyLock<String> = LazyLock::new(|| {
+    let recoverable = queued_artifact_recoverable_without_node(
+        "sandbox",
+        "queued.artifact_id",
+        "queued.artifact_kind",
+        "queued.node_id",
+    );
+    sql!(
+        format!(
+            "DELETE FROM node_local_backup_pending queued
+              USING sandboxes sandbox
+              WHERE queued.node_id = $1
+                AND sandbox.id = queued.sandbox_id
+                AND NOT (queued.sandbox_id = ANY($2))
+                AND {recoverable}"
+        )
+        .as_str()
+    )
+});
+
+/// Delete `node_id`'s rows for the sandboxes not in `reported_sandbox_ids`
+/// that [`queued_artifact_recoverable_without_node`] proves recoverable
+/// without that node's disk (an observed projection). A row that is absent
+/// and not provably recoverable stays. Returns the rows deleted.
+pub async fn delete_durable_absent(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+    reported_sandbox_ids: &[SandboxId],
+) -> Result<u64, sqlx::Error> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(DELETE_DURABLE_ABSENT.as_str()))
+            .bind(node_id.as_uuid())
+            .bind(reported_sandbox_ids)
+            .execute(executor)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// Delete `node_id`'s row for exactly this artifact of `sandbox_id`, when
+/// [`artifact_has_durable_copy`] finds that artifact durable (an operation
+/// step). All four identity parts are required: keying on `(node, sandbox)`
+/// alone would let finalizing an old artifact remove a newer artifact's row.
+/// Returns whether a row was removed.
+pub async fn delete_finalized(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+    sandbox_id: SandboxId,
+    artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> Result<bool, sqlx::Error> {
+    /// Built once: every input is a bind placeholder, so the composed text is
+    /// identical on every finalize. Same shape as `DELETE_DURABLE_ABSENT`.
+    static DELETE_FINALIZED: LazyLock<String> = LazyLock::new(|| {
+        let durable = artifact_has_durable_copy("$2", "$3", "$4");
+        sql!(
+            format!(
+                "DELETE FROM node_local_backup_pending
+                  WHERE node_id = $1
+                    AND sandbox_id = $2
+                    AND artifact_id = $3
+                    AND artifact_kind = $4
+                    AND {durable}"
+            )
+            .as_str()
+        )
+    });
+    let removed = sqlx::query(sqlx::AssertSqlSafe(DELETE_FINALIZED.as_str()))
+        .bind(node_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .bind(artifact_id.as_uuid())
+        .bind(artifact_kind.as_str())
+        .execute(executor)
+        .await?
+        .rows_affected()
+        > 0;
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests;

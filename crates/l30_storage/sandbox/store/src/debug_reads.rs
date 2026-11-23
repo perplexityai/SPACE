@@ -1,18 +1,121 @@
-//! Reads for the admin debug view of one sandbox: its Kubernetes executions,
+//! Reads for the admin debug view of one sandbox: its row with the
+//! registrations of the nodes it is placed on, its Kubernetes executions,
 //! its node-reported snapshot inventory, and a merged timeline of its row,
 //! executions, observed state, snapshots, snapshot inventory and port
 //! exposures. The debug view's port exposures are
-//! [`crate::port_exposures::list`].
+//! [`crate::port_exposures::list`], and its observed state is
+//! [`crate::observed_states::get_with_node`].
 //!
 //! Plain reads, run on the executor the caller passes (the debug view reads
 //! inside a read-only transaction).
 
+use pplx_space_accounts::{NodeId, OrgId, UserId};
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodeRole};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::types::{Json, JsonValue};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// One `sandboxes` row as [`record`] reads it. Stored vocabularies
+/// (`managed_by`, `lifecycle`, `placement`) and documents stay raw: the
+/// endpoint reports what is stored, garbage included. `active_node_id` and
+/// `target_node_id` are the row's own columns. The other `active_node_*` and
+/// `target_node_*` columns are `None` when that id is unset or names no
+/// `nodes` row; the address is also `None` when the node has no address,
+/// and the Kubernetes node name when the node has no `node_k8s` row.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct SandboxDebugRecord {
+    pub id: SandboxId,
+    pub name: Option<String>,
+    pub user_id: Option<UserId>,
+    pub org_id: Option<OrgId>,
+    pub managed_by: String,
+    pub lifecycle: String,
+    pub placement: String,
+    pub active_node_id: Option<NodeId>,
+    pub active_node_address: Option<NodeAddress>,
+    pub active_node_role: Option<NodeRole>,
+    pub active_node_managed_by: Option<NodeManagedBy>,
+    pub active_k8s_node_name: Option<String>,
+    pub target_node_id: Option<NodeId>,
+    pub target_node_address: Option<NodeAddress>,
+    pub target_node_role: Option<NodeRole>,
+    pub target_node_managed_by: Option<NodeManagedBy>,
+    pub target_k8s_node_name: Option<String>,
+    pub placement_changed_at: Option<OffsetDateTime>,
+    pub template_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub vcpu: Option<i32>,
+    pub memory_mib: Option<i32>,
+    pub disk_mib: Option<i32>,
+    pub env: Json<JsonValue>,
+    pub metadata: Json<JsonValue>,
+    /// `auto_lifecycle_json`.
+    pub auto_lifecycle: Json<JsonValue>,
+    /// `auto_lifecycle_state_json`.
+    pub auto_lifecycle_state: Json<JsonValue>,
+    pub next_auto_event_at: Option<i64>,
+    pub network_policy_override_json: Option<Json<JsonValue>>,
+    pub network_policy_generation: i64,
+    pub snapshots_enabled_desired: bool,
+    pub last_used_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+/// The sandbox's [`SandboxDebugRecord`]. `None` when no such sandbox exists.
+pub async fn record(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Option<SandboxDebugRecord>, sqlx::Error> {
+    sqlx::query_as::<_, SandboxDebugRecord>(sql!(
+        "SELECT s.id,
+                s.name,
+                s.user_id,
+                s.org_id,
+                s.managed_by,
+                s.lifecycle,
+                s.placement,
+                s.active_node_id,
+                host(active_node.address) AS active_node_address,
+                active_node.role AS active_node_role,
+                active_node.managed_by AS active_node_managed_by,
+                active_k8s.k8s_node_name AS active_k8s_node_name,
+                s.target_node_id,
+                host(target_node.address) AS target_node_address,
+                target_node.role AS target_node_role,
+                target_node.managed_by AS target_node_managed_by,
+                target_k8s.k8s_node_name AS target_k8s_node_name,
+                s.placement_changed_at,
+                s.template_id,
+                s.content_hash,
+                s.vcpu,
+                s.memory_mib,
+                s.disk_mib,
+                s.env,
+                s.metadata,
+                s.auto_lifecycle_json AS auto_lifecycle,
+                s.auto_lifecycle_state_json AS auto_lifecycle_state,
+                s.next_auto_event_at,
+                s.network_policy_override_json,
+                s.network_policy_generation,
+                s.snapshots_enabled_desired,
+                s.last_used_at,
+                s.created_at,
+                s.updated_at
+           FROM sandboxes s
+      LEFT JOIN nodes active_node ON active_node.id = s.active_node_id
+      LEFT JOIN node_k8s active_k8s ON active_k8s.node_id = active_node.id
+      LEFT JOIN nodes target_node ON target_node.id = s.target_node_id
+      LEFT JOIN node_k8s target_k8s ON target_k8s.node_id = target_node.id
+          WHERE s.id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(executor)
+    .await
+}
 
 /// One `sandbox_k8s_executions` row as the debug view shows it.
 #[derive(Clone, Debug, sqlx::FromRow)]
