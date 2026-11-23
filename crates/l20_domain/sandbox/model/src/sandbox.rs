@@ -1170,86 +1170,6 @@ pub enum SandboxTransitionReceiptInvariantError {
 }
 
 #[cfg(feature = "sqlx")]
-impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for SandboxCleanupEpisodeId {
-    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
-        <Uuid as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
-    }
-
-    fn compatible(ty: &pplx_space_sql_codec::postgres::PgTypeInfo) -> bool {
-        <Uuid as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::compatible(ty)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>
-    for SandboxCleanupEpisodeId
-{
-    fn encode_by_ref(
-        &self,
-        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
-    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
-    {
-        <Uuid as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode_by_ref(
-            &self.0, buf,
-        )
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres>
-    for SandboxCleanupEpisodeId
-{
-    fn decode(
-        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
-    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
-        Ok(Self(<Uuid as pplx_space_sql_codec::Decode<
-            'r,
-            pplx_space_sql_codec::Postgres,
-        >>::decode(value)?))
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for SandboxActivationAttemptId {
-    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
-        <Uuid as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
-    }
-
-    fn compatible(ty: &pplx_space_sql_codec::postgres::PgTypeInfo) -> bool {
-        <Uuid as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::compatible(ty)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>
-    for SandboxActivationAttemptId
-{
-    fn encode_by_ref(
-        &self,
-        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
-    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
-    {
-        <Uuid as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode_by_ref(
-            &self.0, buf,
-        )
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres>
-    for SandboxActivationAttemptId
-{
-    fn decode(
-        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
-    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
-        Ok(Self(<Uuid as pplx_space_sql_codec::Decode<
-            'r,
-            pplx_space_sql_codec::Postgres,
-        >>::decode(value)?))
-    }
-}
-
-#[cfg(feature = "sqlx")]
 impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for EcwCredentialEpoch {
     fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
         <i64 as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
@@ -1284,42 +1204,6 @@ impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for Ec
                 value,
             )?;
         Ok(Self::try_from(value)?)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres> for SandboxId {
-    fn type_info() -> pplx_space_sql_codec::postgres::PgTypeInfo {
-        <Uuid as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::type_info()
-    }
-
-    fn compatible(ty: &pplx_space_sql_codec::postgres::PgTypeInfo) -> bool {
-        <Uuid as pplx_space_sql_codec::Type<pplx_space_sql_codec::Postgres>>::compatible(ty)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'q> pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres> for SandboxId {
-    fn encode_by_ref(
-        &self,
-        buf: &mut pplx_space_sql_codec::postgres::PgArgumentBuffer,
-    ) -> Result<pplx_space_sql_codec::encode::IsNull, pplx_space_sql_codec::error::BoxDynError>
-    {
-        <Uuid as pplx_space_sql_codec::Encode<'q, pplx_space_sql_codec::Postgres>>::encode_by_ref(
-            &self.0, buf,
-        )
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'r> pplx_space_sql_codec::Decode<'r, pplx_space_sql_codec::Postgres> for SandboxId {
-    fn decode(
-        value: pplx_space_sql_codec::postgres::PgValueRef<'r>,
-    ) -> Result<Self, pplx_space_sql_codec::error::BoxDynError> {
-        Ok(Self(<Uuid as pplx_space_sql_codec::Decode<
-            'r,
-            pplx_space_sql_codec::Postgres,
-        >>::decode(value)?))
     }
 }
 

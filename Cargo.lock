@@ -7201,6 +7201,7 @@ name = "pplx-space-node-model"
 version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
+ "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-sql-codec",
  "pplx-space-template-model",
@@ -7806,6 +7807,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-byte-size",
  "pplx-space-env-vars",
+ "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-linux-ids",
  "pplx-space-node-model",
@@ -8253,6 +8255,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-byte-size",
  "pplx-space-execution-spec",
+ "pplx-space-job-id",
  "pplx-space-sql-codec",
  "pplx-space-template-model",
  "serde",
