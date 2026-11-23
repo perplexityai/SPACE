@@ -5,9 +5,6 @@
 //! condition set. The crate also holds the stage-chain shorthand
 //! (`pause@5m,delete@1d`), the per-sandbox runtime state that tracks activity
 //! and fired stages, and the public status derived from it.
-//!
-//! It is its own crate so that code can name these types without depending on
-//! `pplx-space-common-core`: import them from here.
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 

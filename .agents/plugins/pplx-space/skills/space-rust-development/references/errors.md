@@ -7,7 +7,7 @@ lives in `docs/rust/error-handling.md` and `docs/rust/principles.md` § 3.
 
 ## When to read this reference
 
-- A library function (in `crates/libs/**` or an `l10`–`l40` layer directory) returns `Result<_, _>`.
+- A library function (in an `l10`–`l40` layer directory) returns `Result<_, _>`.
 - A function returns `Result<_, String>`. (Almost always wrong — fix it.)
 - A library crate signature has `anyhow::Result<_>` or `Box<dyn std::error::Error>`. (Always wrong in a public lib signature.)
 - A crate has a single `Error` enum that mixes I/O, network, parse, and business errors. (Kitchen sink — split it.)
@@ -80,7 +80,7 @@ return Err(format!("foo failed: {}", e));
 | Where                                       | Use                       |
 | ------------------------------------------- | ------------------------- |
 | An app's `main.rs`, binary glue             | `anyhow::Result<T>`       |
-| Library public signatures (`crates/libs/**`, `l10`–`l40`) | typed `thiserror` enum |
+| Library public signatures (`l10`–`l40`)     | typed `thiserror` enum    |
 | Throwaway helpers private to one library file | typed if reused, `anyhow` only if truly local |
 | Tests, `examples/`, build scripts           | `anyhow` / `eyre` fine    |
 

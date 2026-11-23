@@ -23,117 +23,25 @@
 # the crates into a count this file does not name.
 ISOLATED_CRATE_SHARDS=5
 
-# The workspace libraries run_isolated_crate_checks lints, one per line: every
-# library, other than common-core, that reaches common-core at most directly.
-# No other workspace member in its normal dependency graph may reach
-# common-core. A crate split out of it is linted once it depends on nothing
-# else that reaches it, and a new library joins
-# without a CI edit, wherever it lives. A crate that reaches common-core
-# through another crate builds that crate's graph too, so linting all of them
-# would take several times as long; the workspace clippy still lints them.
-#
-# The declared dependencies, optional ones included, decide first. They can
-# only overstate a graph, so a crate they select stays selected. A crate they
-# leave out is decided again from the normal graph Cargo resolves for it with
-# all of its features, on every target: an optional dependency that nothing in
-# its build enables is not part of it. The libraries left out are named on
-# stderr, so a crate that drops out shows in the log.
+# Every workspace library, one per line. run_isolated_crate_checks lints each
+# alone in its configurations, so a new library joins without a CI edit.
 isolated_crates() {
     local metadata="$1"
     python3 - "${metadata}" <<'PY'
-import concurrent.futures
 import json
-import subprocess
 import sys
 
-COMMON_CORE = "pplx-space-common-core"
+# Every kind a library target can have: its crate types, or proc-macro.
+LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+
 with open(sys.argv[1]) as metadata_file:
-    packages = {p["name"]: p for p in json.load(metadata_file)["packages"]}
-
-
-def declared_edges(name):
-    return {
-        dependency["name"]
-        for dependency in packages[name]["dependencies"]
-        if dependency["kind"] is None and dependency["name"] in packages
-    }
-
-
-def resolved_edges(name):
-    """The normal dependency edges of the graph Cargo resolves for crate
-    `name` with all of its features, read from `cargo tree --prefix depth`."""
-    result = subprocess.run(
-        ["cargo", "tree", "--locked", "-q", "-p", name, "--all-features",
-         "-e", "normal", "--target", "all", "--prefix", "depth", "-f", "{p}"],
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    if result.returncode != 0:
-        sys.exit(f"isolated_crates: cargo tree failed for {name}")
-    edges, path = {}, []
-    for line in result.stdout.splitlines():
-        digits = len(line) - len(line.lstrip("0123456789"))
-        depth, package = int(line[:digits]), line[digits:].split()[0]
-        del path[depth:]
-        if path:
-            edges.setdefault(path[-1], set()).add(package)
-        path.append(package)
-    if not path or path[0] != name:
-        sys.exit(f"isolated_crates: cargo tree printed no graph for {name}")
-    return lambda member: edges.get(member, set())
-
-
-def reaches(start, edges):
-    seen, pending = set(), [start]
-    while pending:
-        for dependency in edges(pending.pop()) - seen:
-            seen.add(dependency)
-            pending.append(dependency)
-    return seen
-
-
-def classify(name, edges):
-    others = reaches(name, edges) - {COMMON_CORE}
-    if any(COMMON_CORE in reaches(other, edges) for other in others):
-        return "indirect"
-    return "selected"
-
-
-libraries = sorted(
-    name
-    for name, package in packages.items()
-    if any(
-        kind in ("lib", "rlib", "proc-macro")
-        for target in package["targets"]
-        for kind in target["kind"]
-    )
-)
-undecided = [
-    name
-    for name in libraries
-    if name != COMMON_CORE
-    and classify(name, declared_edges) != "selected"
-]
-# Cargo's package-cache lock serializes most of each `cargo tree`; running a
-# few at once still overlaps the rest, which saves about a third.
-with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-    resolved = dict(zip(undecided, pool.map(resolved_edges, undecided)))
-groups = {"selected": [], "indirect": []}
-for name in libraries:
-    if name == COMMON_CORE:
-        continue
-    if name in resolved:
-        group = classify(name, resolved[name])
-    else:
-        group = "selected"
-    groups[group].append(name)
-for name in sorted(groups["selected"]):
+    packages = json.load(metadata_file)["packages"]
+for name in sorted(
+    package["name"]
+    for package in packages
+    if any(LIBRARY_KINDS.intersection(target["kind"]) for target in package["targets"])
+):
     print(name)
-print(
-    f"Not linted alone, reaching common-core through another crate: "
-    f"{len(groups['indirect'])}: {' '.join(groups['indirect'])}",
-    file=sys.stderr,
-)
 PY
 }
 

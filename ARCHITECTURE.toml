@@ -185,8 +185,8 @@ mode = "required"
 # (`pplx-space-sbx-mgr-store` and `pplx-space-sbx-mgr-migrations`;
 # `layers.storage_access` keeps database drivers out of sbx-mgr's other
 # crates), so its crates are allowed whole: `crates/l*/sbx/**` matches every
-# directory named `sbx` directly below `crates/libs` or an `l*` layer
-# directory, and any other glob in the list adds sbx crates that are
+# directory named `sbx` directly below an `l*` layer directory, and any
+# other glob in the list adds sbx crates that are
 # elsewhere. A narrower glob would make this required rule fire on moves
 # within sbx-mgr. Test files are
 # filename-based, so `allow` adds the `#[cfg(test)]` support modules and
@@ -352,22 +352,13 @@ mode = "advisory"
 
 # Every workspace crate belongs to a layer: l10_foundation, l20_domain,
 # l30_storage, l40_api and l50_app, bottom-up, or test_support and tools beside
-# them. A crate in crates/<layer>/ takes its layer from the directory; the
-# crates that predate the layer directories are listed in `unmoved` until they
-# move. A new crate goes in a layer directory. What belongs in each layer, the
-# dependency matrix and how to fix a finding: crates/tools/archcheck/README.md
-# (Layers).
-[rules.layers.unmoved]
-l10_foundation = [
-]
-l20_domain = [
-  "pplx-space-common-core",
-]
-
+# them. A crate in crates/<layer>/ takes its layer from the directory. Every
+# crate is in one now, so there is no `[rules.layers.unmoved]` table; a new
+# crate goes in a layer directory. What belongs in each layer, the dependency
+# matrix and how to fix a finding: crates/tools/archcheck/README.md (Layers).
 
 # Each store's users: the l40_api and l30_storage crates that own its state
-# and use the store today, directly or through a legacy crate's re-exports
-# (see `legacy` below).
+# and use the store today.
 [rules.layers.store_users]
 pplx-space-cluster-pool = [
   "pplx-space-api",
@@ -457,9 +448,7 @@ pplx-space-db-migrator = ["pplx-space-db-migrate"]
 # l10_foundation crate with a required dependency on a driver that the list
 # lacks is a storage_access finding until it is added. The sqlx and SQLite
 # sub-crates are listed so that depending on one instead of the umbrella crate
-# is no way around the checks. A legacy l10_foundation crate (see `legacy`
-# below) is no helper even with a driver dependency: it is checked like every
-# other crate, with today's edges baselined.
+# is no way around the checks.
 [rules.layers.storage]
 drivers = [
   "aws-sdk-s3",
@@ -527,11 +516,6 @@ sqlx = [
 ]
 
 [rules.layers]
-# The crates being dissolved: they predate the layers and mix SPACE-specific
-# code in until they are split up. Every check covers them, with today's edges
-# baselined.
-legacy = ["pplx-space-common-core"]
-
 # An l20_domain crate is a protocol (wire schemas and the conversions between
 # them and the models) if its name ends in -protocol or -proto, or `protocols`
 # lists it; every other one is a model, which never depends on a protocol.

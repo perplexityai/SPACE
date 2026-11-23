@@ -22,7 +22,8 @@ uuid = { workspace = true, features = ["v7"] }
 [features]
 default = []
 serde = ["dep:serde"]
-# Forwards TemplateVisibility's codec, which api's node-group store needs once common-core is gone.
+# Forwards TemplateVisibility's codec, which api's node-group SQL gets through
+# sandbox-store, as Cargo unifies features.
 sqlx = [
     "dep:pplx-space-sql-codec",
     "pplx-space-sql-codec/postgres",

@@ -5,9 +5,6 @@
 //! activation created a sandbox's runtime (`client_id`). They carry only their
 //! own validation rules and storage codecs. `auth` also re-exports the job ID
 //! and the ID parse error from `pplx-space-job-id`.
-//!
-//! They are their own crate so that code can name them without depending on
-//! `pplx-space-common-core`.
 
 pub mod auth;
 pub mod client_id;
