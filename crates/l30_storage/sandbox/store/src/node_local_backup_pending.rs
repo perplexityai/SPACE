@@ -11,6 +11,8 @@ use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 
+use crate::SandboxStoreError;
+
 /// Upsert one row per reported entry on `node_id` (an observed projection),
 /// the three slices being the entries' columns in order, replacing the
 /// tracked artifact of an existing `(node, sandbox)` row. Entries naming a
@@ -47,4 +49,36 @@ pub async fn upsert_reported(
     .execute(executor)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// The size of one node's `node_local_backup_pending` rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingBackupDepth {
+    /// Every row the node has.
+    pub depth: i64,
+    /// The rows whose sandbox is not among the ids the node reported.
+    pub retained_absent: i64,
+}
+
+/// Count `node_id`'s pending-local-backup rows, and those of them for a
+/// sandbox outside `reported_sandbox_ids`.
+pub async fn depth(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    reported_sandbox_ids: &[SandboxId],
+) -> Result<PendingBackupDepth, SandboxStoreError> {
+    let (depth, retained_absent): (i64, i64) = sqlx::query_as(sql!(
+        "SELECT COUNT(*),
+                COUNT(*) FILTER (WHERE NOT (sandbox_id = ANY($2)))
+           FROM node_local_backup_pending
+          WHERE node_id = $1"
+    ))
+    .bind(node_id.as_uuid())
+    .bind(reported_sandbox_ids)
+    .fetch_one(executor)
+    .await?;
+    Ok(PendingBackupDepth {
+        depth,
+        retained_absent,
+    })
 }

@@ -1215,17 +1215,13 @@ impl OrphanActionSink for SubstrateActionSink {
     }
 
     async fn current_max_sandbox_id(&self) -> Result<Option<SandboxId>, sqlx::Error> {
-        // Pre-PG-15 has no `max(uuid)` aggregate, so use ORDER BY DESC
-        // LIMIT 1 instead. The primary key index makes this an index-only
-        // scan that returns immediately. `fetch_optional` correctly returns
-        // `None` for an empty table.
-        let row: Option<(SandboxId,)> = sqlx::query_as(sql!(
-            "SELECT id FROM sandboxes WHERE managed_by = $1 ORDER BY id DESC LIMIT 1"
-        ))
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(id,)| id))
+        Ok(
+            pplx_space_sandbox_store::sandbox_id_bounds::newest_managed_by(
+                &self.pool,
+                SubstrateKind::Kubernetes,
+            )
+            .await?,
+        )
     }
 
     async fn classify_orphan(
@@ -1437,14 +1433,9 @@ impl OrphanActionSink for SubstrateActionSink {
     }
 
     async fn active_quarantine_count(&self) -> Result<u32, OrphanClassifyError> {
-        let count: i64 = sqlx::query_scalar(sql!(
-            "SELECT COUNT(*)::BIGINT
-               FROM sandbox_quarantine_state quarantine
-               JOIN sandboxes sandbox ON sandbox.id = quarantine.sandbox_id
-              WHERE sandbox.lifecycle = 'quarantined'"
-        ))
-        .fetch_one(&self.pool)
-        .await?;
+        let count = pplx_space_sandbox_store::active_quarantines::count(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 }

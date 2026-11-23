@@ -10,9 +10,11 @@
 
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
-use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId};
+use pplx_space_sandbox_model::{ExecutionGeneration, SandboxActivationAttemptId, SandboxId};
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
+
+use crate::SandboxStoreError;
 
 /// The sandbox's active execution, as [`active_execution`] reads it.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -213,4 +215,51 @@ pub async fn first_activation(
     .bind(managed_by)
     .fetch_optional(executor)
     .await
+}
+
+/// Whether `sandbox_id` has an active execution row. A plain read: run it in
+/// the caller's transaction to see that transaction's writes.
+pub async fn exists(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<bool, SandboxStoreError> {
+    Ok(sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+                     SELECT 1
+                       FROM sandbox_k8s_executions
+                      WHERE sandbox_id = $1
+                        AND active
+                 )"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(executor)
+    .await?)
+}
+
+/// One pod name the sandbox has had, with the namespace and generation its
+/// execution row recorded for it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ExecutionPodRef {
+    /// Decoded as [`ExecutionGeneration`], so a stored value that isn't one
+    /// fails the database read rather than reaching the node.
+    pub generation: ExecutionGeneration,
+    pub pod_namespace: String,
+    pub pod_name: String,
+}
+
+/// Every pod name `sandbox_id`'s execution rows recorded, newest generation
+/// first: a live pod is likeliest under the newest name.
+pub async fn newest_first(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Vec<ExecutionPodRef>, SandboxStoreError> {
+    Ok(sqlx::query_as::<_, ExecutionPodRef>(sql!(
+        "SELECT generation, pod_namespace, pod_name
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1
+          ORDER BY generation DESC"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(executor)
+    .await?)
 }

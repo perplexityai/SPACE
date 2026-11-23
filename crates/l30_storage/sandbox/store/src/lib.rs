@@ -81,6 +81,13 @@
 //!   included. [`k8s_node_attribution`] lists the registered nodes the
 //!   sandbox's placement, latest execution and a named snapshot attribute to
 //!   it, for scoping the storage credentials a node may receive.
+//! * **So are single-question reads.** A read of the `sandboxes` row that
+//!   callers made inline moves here whole, as a module named for the question
+//!   it answers, such as [`restore_pod_owners`] or [`stopped_replacements`].
+//!   Two such modules also read a table another store owns:
+//!   [`active_quarantines`] and [`quarantine_recovery_authority`] join
+//!   `sandbox_quarantine_state`, which belongs to
+//!   `pplx-space-sandbox-quarantine-store`.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
 //!   crate declares, mostly inside a larger transaction, move into modules
@@ -133,11 +140,13 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod action_stamp;
+pub mod active_quarantines;
 pub mod admin_occupancy;
 pub mod artifact_marker;
 pub mod attribute_runtime;
 pub mod create;
 pub mod delete;
+pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
 pub mod ecw_credential_epochs;
@@ -148,6 +157,7 @@ pub mod k8s_executions;
 pub mod k8s_node_attribution;
 mod lifecycle;
 pub mod lost;
+pub mod node_desired_state;
 pub mod node_holds;
 pub mod node_local_backup_pending;
 pub mod node_placements;
@@ -155,14 +165,21 @@ pub mod observed_states;
 pub mod orphan;
 pub mod pod_tracking;
 pub mod port_exposures;
+pub mod published_quarantine_candidates;
 pub mod quarantine;
+pub mod quarantine_recovery_authority;
 pub mod repair;
 pub mod restore_dispatch_fence;
 pub mod restore_lease;
+pub mod restore_pod_owners;
 pub mod restore_source;
 pub mod runtime_access;
 pub mod runtime_population;
+pub mod sandbox_id_bounds;
+pub mod snapshot_capture_fields;
 pub mod snapshot_inventory;
+pub mod stopped_replacement_claim;
+pub mod stopped_replacements;
 pub mod stuck;
 pub mod suspend;
 pub mod sweeper;

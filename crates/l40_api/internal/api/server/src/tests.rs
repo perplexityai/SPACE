@@ -5037,17 +5037,16 @@ async fn seed_suspend_snapshot_with_identity(
     let storage_uri = ExactStorageUri::parse(&storage_uri)
         .map_err(|e| tonic::Status::invalid_argument(format!("invalid storage_uri: {e}")))?;
     let execution_metadata = snapshot_execution_metadata(Some(&execution))?;
-    let snapshot = service
-        .lookup_snapshot_sandbox(sandbox_id)
-        .await?
-        .new_snapshot(
-            snapshot_id,
-            sandbox_id,
-            SnapshotKind::Full,
-            SnapshotState::Creating,
-            storage_uri,
-        )?
-        .with_execution_metadata(execution_metadata);
+    let sandbox = service.lookup_snapshot_sandbox(sandbox_id).await?;
+    let snapshot = new_snapshot_from_sandbox(
+        &sandbox,
+        snapshot_id,
+        sandbox_id,
+        SnapshotKind::Full,
+        SnapshotState::Creating,
+        storage_uri,
+    )?
+    .with_execution_metadata(execution_metadata);
     let mut tx = service
         .pool
         .begin()

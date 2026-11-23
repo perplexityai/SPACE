@@ -693,51 +693,10 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
     )
 }
 
-/// Every evacuated `stopped` sandbox that can't serve a `start` yet: released
-/// and on no node, or claimed for re-placement and not yet settled.
-/// Cluster-wide, and **deliberately not** the retry-eligible subset
-/// [`restore_pending_evacuations_query`] returns.
-///
-/// This is the population an on-call alert reads, so it has to answer "how many
-/// sandboxes are currently unstartable", not "how many will the next sweep try".
-/// Those differ by exactly the rows that matter most: a re-placement that keeps
-/// failing carries a `next_restore_attempt_at` up to the 30-minute backoff cap,
-/// which would drop it out of the work list — and therefore out of the gauge —
-/// for the whole window, precisely while it is most stuck. The alert would go
-/// quiet as the incident got worse.
-///
-/// It also omits the durability term the work list applies. A torn-down row
-/// whose backup is *not* resolvable (its only storage location orphaned, say)
-/// is unplaceable rather than un-ready, and dropping it from the count would
-/// silence the one case with no automatic recovery at all.
-///
-/// The two lifecycles are read differently on purpose:
-///
-/// * a `stopped` row counts only with `active_node_id IS NULL`, which is what
-///   makes it "released" rather than "mid evacuation": a claimed row still on
-///   its node is held by the drain, visible as a drain blocker, and startable
-///   again the moment the marker clears;
-/// * a `restoring` row counts whatever its `active_node_id`. The re-placement
-///   pod's placement sets the column as soon as the pod binds, while the row
-///   stays unstartable until the drain settles it, which is exactly where a
-///   re-placement that never converges (a destination whose shim predates
-///   stopped materialization, say) sits indefinitely.
-pub(crate) fn stopped_replacements_pending_query() -> &'static str {
-    sql!(
-        "SELECT COUNT(*)::BIGINT
-           FROM sandboxes s
-          WHERE s.evacuation_restore_target = 'stopped'
-            AND (
-                (s.lifecycle = 'stopped' AND s.active_node_id IS NULL)
-                OR s.lifecycle = 'restoring'
-            )"
-    )
-}
-
 /// How long the longest-stalled stopped evacuation has been waiting for its
 /// bytes, in seconds — `0` when none is waiting, plus the row it measured.
 ///
-/// **The gap this closes.** [`stopped_replacements_pending_query`] counts rows
+/// **The gap this closes.** [`pplx_space_sandbox_store::stopped_replacements::pending`] counts rows
 /// with `active_node_id IS NULL`, i.e. ones already torn down and waiting to be
 /// placed. An evacuation stuck *before* the teardown still has its node, so it
 /// is invisible there — and it is invisible everywhere else too: the only other
@@ -2828,21 +2787,11 @@ impl SubstrateSink {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, EvacuateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT COALESCE(
-                        lifecycle = 'restoring' AND evacuation_restore_target = 'stopped',
-                        FALSE
-                    )
-               FROM sandboxes
-              WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|claimed| claimed.unwrap_or(false))
-        .map_err(|err| {
-            EvacuateError::Lookup(format!("stopped re-placement claim lookup failed: {err}"))
-        })
+        pplx_space_sandbox_store::stopped_replacement_claim::claimed(&self.pool, sandbox_id)
+            .await
+            .map_err(|err| {
+                EvacuateError::Lookup(format!("stopped re-placement claim lookup failed: {err}"))
+            })
     }
 
     /// Restore an evacuated sandbox onto a target-cohort node and finalize
@@ -4766,9 +4715,7 @@ impl NodeDrainSink for SubstrateSink {
     }
 
     async fn count_stopped_replacements_pending(&self) -> Result<u64, sqlx::Error> {
-        let pending: i64 = sqlx::query_scalar(stopped_replacements_pending_query())
-            .fetch_one(&self.pool)
-            .await?;
+        let pending = pplx_space_sandbox_store::stopped_replacements::pending(&self.pool).await?;
         Ok(pending.max(0).cast_unsigned())
     }
 
