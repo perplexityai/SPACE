@@ -84,6 +84,15 @@ The `lost` module holds the guarded write the lost-sandbox give-ups run in
 their flip's transaction: failing the gone node's quiet `creating` full
 uploads for the sandboxes they flipped.
 
+The `claimed` module holds the two reads retention's recovery runs over the
+snapshots a committed claim parked in `deleting`: the highest claimed id
+(`scan_epoch`) and one page of claims with their optional storage location
+(`list`). Both keep their `OFFSET 0` fences so the cost follows the claims, not
+the table, and `list` projects the snapshot's age from the database clock.
+
+`snapshot_ids_after` pages snapshot ids in ascending order, in any state. It
+is the raw id page retention's discovery reads before it checks eligibility.
+
 Add further typed CRUD incrementally with each migrated caller. Add claim/prune
 with its live retention workflow, after the workflow has a complete protection
 matrix for restore, fork, lifecycle, publication, the zero-or-one location invariant,

@@ -23,6 +23,7 @@ use sqlx::types::Json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod claimed;
 pub mod lost;
 mod placement;
 pub use placement::{SnapshotStoragePlacement, storage_placements};
@@ -902,6 +903,29 @@ pub async fn is_latest_ready_suspend(
     .bind(snapshot_id)
     .fetch_one(executor)
     .await?)
+}
+
+/// Up to `limit` snapshot ids greater than `after` (all ids when `None`), in
+/// ascending order, in whatever state each snapshot is.
+///
+/// One array avoids per-row wire/decoder overhead for a large id page.
+pub async fn snapshot_ids_after(
+    executor: impl sqlx::PgExecutor<'_>,
+    after: Option<SnapshotId>,
+    limit: i64,
+) -> Result<Vec<SnapshotId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT ARRAY(
+             SELECT id FROM snapshots
+              WHERE id > COALESCE($1::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
+              ORDER BY id
+              LIMIT $2
+         )"
+    ))
+    .bind(after)
+    .bind(limit)
+    .fetch_one(executor)
+    .await
 }
 
 /// Fetch one snapshot catalog row by id.
