@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use super::*;
-use crate::firewall_rules::ReportMaxAge;
+use crate::firewall_rules::REPORT_MAX_AGE;
 use crate::proto::{
     FirewallRulesCensus as Census, FirewallRulesCensusGap, FirewallRulesCensusGapKind as Gap,
     FirewallRulesReportOutcome as Outcome, FirewallRulesSlotEvidence,
@@ -13,8 +13,7 @@ use crate::proto::{
     ReportFirewallRulesRequest,
 };
 
-/// The fixtures' freshness limit; production has none yet.
-const MAX_AGE: Duration = Duration::from_secs(600);
+const MAX_AGE: Duration = REPORT_MAX_AGE;
 /// Bounds every wait on a lock or the clock.
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -197,7 +196,6 @@ async fn reporter(max_connections: u32) -> TestResult<Option<Reporter>> {
     let node = register(&pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
     let revision = insert_revision(&pool, SSH).await?;
     service.firewall_enrollment = Enrollment::Fixture(vec![node]);
-    service.firewall_report_max_age = ReportMaxAge::Fixture(MAX_AGE);
     let token = projected_token("node-ctl-a");
     let reviews = vec![(token.clone(), node_ctl_on("worker-a", "uid-a"))];
     Ok(Some(Reporter {
@@ -227,7 +225,6 @@ async fn report_answers_the_round_its_opener_opened() -> TestResult {
     let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
     upsert_snapshot(pool, a, SnapshotSeed::default()).await?;
     service.firewall_enrollment = Enrollment::Fixture(vec![a]);
-    service.firewall_report_max_age = ReportMaxAge::Fixture(MAX_AGE);
     let mut conn = pool.acquire().await?;
     let rollout = rollout(pool, "rolling").await?;
     save_targets(pool, rollout, &[a]).await?;
@@ -607,7 +604,6 @@ async fn delayed_answers_leave_a_newer_round_pending() -> TestResult {
     let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
     upsert_snapshot(pool, a, SnapshotSeed::default()).await?;
     service.firewall_enrollment = Enrollment::Fixture(vec![a]);
-    service.firewall_report_max_age = ReportMaxAge::Fixture(MAX_AGE);
     let mut conn = pool.acquire().await?;
     let revision_of = async |rollout: RolloutId| -> TestResult<Uuid> {
         Ok(sqlx::query_scalar::<_, Uuid>(sql!(
@@ -672,12 +668,12 @@ async fn delayed_answers_leave_a_newer_round_pending() -> TestResult {
 }
 
 /// Only a report-authorized node-ctl reporting for its own resolved, enrolled
-/// worker writes, and only with a freshness limit: the fetch authority alone,
+/// worker writes: the fetch authority alone,
 /// another workload, a stale UID, an ambiguous name, missing claims, the static
 /// token and a report naming worker B all write nothing, and the report
 /// authority doesn't permit fetching. Catches report authorized by the fetch
 /// authority, a row chosen by the request's node ID, and acceptance without
-/// enrollment or a limit.
+/// enrollment.
 #[tokio::test(flavor = "current_thread")]
 async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -699,7 +695,6 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
     let enrolled = || {
         let mut service = fixture.service.clone();
         service.firewall_enrollment = Enrollment::Fixture(vec![a, b, twin]);
-        service.firewall_report_max_age = ReportMaxAge::Fixture(MAX_AGE);
         service
     };
     let other_workload = "system:serviceaccount:space:space-template-manager";
@@ -747,30 +742,25 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
     }
     assert_eq!(rows().await?, before);
 
-    // Production's defaults: no enrollment predicate, then no limit. Naming
-    // another worker is denied before either is consulted.
+    // Production's default enrolls no worker. Naming another worker is denied
+    // before enrollment is consulted.
     let mut unenrolled = enrolled();
     unenrolled.firewall_enrollment = Enrollment::Unapproved;
-    let mut no_limit = enrolled();
-    no_limit.firewall_report_max_age = ReportMaxAge::Unapproved;
-    for (service, why) in [
-        (unenrolled, "no enrollment predicate is approved"),
-        (no_limit, "no report freshness limit is approved"),
-    ] {
-        let mut harness = serve_granting(service, reviews.clone(), false, true).await?;
-        let client = &mut harness.client;
-        assert_eq!(
-            report(client, &token(0), for_b.clone()).await?,
-            report_denied
-        );
-        assert_eq!(
-            report(client, &token(0), own.clone()).await?,
-            Err((
-                Code::FailedPrecondition,
-                format!("firewall rules aren't enabled for node {a}: {why}")
-            ))
-        );
-    }
+    let mut harness = serve_granting(unenrolled, reviews.clone(), false, true).await?;
+    let refused = &mut harness.client;
+    assert_eq!(
+        report(refused, &token(0), for_b.clone()).await?,
+        report_denied
+    );
+    assert_eq!(
+        report(refused, &token(0), own.clone()).await?,
+        Err((
+            Code::FailedPrecondition,
+            format!(
+                "firewall rules aren't enabled for node {a}: no enrollment predicate is approved"
+            )
+        ))
+    );
     assert_eq!(rows().await?, before);
 
     // A's acceptance and its replay are A's alone.

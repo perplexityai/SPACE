@@ -20,28 +20,10 @@ use crate::proto::{
     FirewallRulesSlotReason, ReportFirewallRulesRequest, ReportFirewallRulesResponse,
 };
 
-/// How long after its round was issued a report may be accepted. No
-/// production limit is approved; tests name theirs.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ReportMaxAge {
-    Unapproved,
-    #[cfg(all(test, feature = "kubernetes"))]
-    Fixture(Duration),
-}
-
-impl ReportMaxAge {
-    fn limit(self, node: NodeId) -> Result<Duration, Status> {
-        match self {
-            Self::Unapproved => Err(Call::Report.not_enabled(
-                "no_report_max_age",
-                node,
-                "no report freshness limit is approved",
-            )),
-            #[cfg(all(test, feature = "kubernetes"))]
-            Self::Fixture(limit) => Ok(limit),
-        }
-    }
-}
+/// How long after its round was issued a report may be accepted. It covers
+/// wake delivery, fetch, observation and report; the round scheduler must
+/// reopen a round less often than this.
+pub(crate) const REPORT_MAX_AGE: Duration = Duration::from_secs(300);
 
 fn malformed(what: impl std::fmt::Display) -> Status {
     Status::invalid_argument(format!("malformed firewall rules report: {what}"))
@@ -182,8 +164,7 @@ impl ClusterApiService {
             return Err(call.denied("other_node"));
         }
         self.firewall_enrollment.admit(node, call)?;
-        let max_age = self.firewall_report_max_age.limit(node)?;
-        let acceptance = accept_report(&mut conn, node, &report, max_age)
+        let acceptance = accept_report(&mut conn, node, &report, REPORT_MAX_AGE)
             .await
             .map_err(|error| Status::internal(format!("accept firewall rules report: {error}")))?;
         Ok(Response::new(ReportFirewallRulesResponse {

@@ -29,7 +29,8 @@ use crate::proto::{
 
 mod report;
 
-pub(crate) use report::ReportMaxAge;
+#[cfg(all(test, feature = "kubernetes"))]
+pub(crate) use report::REPORT_MAX_AGE;
 
 /// The RPC a refusal answers, which words it.
 #[derive(Clone, Copy, Debug)]
