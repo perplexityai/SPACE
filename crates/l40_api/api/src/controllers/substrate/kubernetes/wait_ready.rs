@@ -292,11 +292,14 @@ impl KubernetesSubstrate {
         Ok(())
     }
 
+    /// Watch the pod until Kubernetes publishes its IP, sending each view of
+    /// it to `observed` once its placement is recorded.
     async fn watch_until_pod_ip_assigned(
         &self,
         sandbox_id: SandboxId,
         generation: i64,
         pod_name: &str,
+        observed: &tokio::sync::watch::Sender<Option<SandboxPodView>>,
     ) -> Result<Option<PodIp>, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let pods: Api<Pod> = Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
@@ -353,6 +356,7 @@ impl KubernetesSubstrate {
                     PlacementRetryDisposition::RetryDuplicatesExecution,
                 )
                 .await?;
+            observed.send_replace(Some(pod.clone()));
             if pod_ip.is_none() {
                 continue;
             }
@@ -385,6 +389,83 @@ impl KubernetesSubstrate {
             }
 
             return Ok(pod_ip);
+        }
+    }
+
+    /// The pod IP the pod's node reports for it, once `observed` places the
+    /// pod. The shim reads it from the pod's network namespace at Start, so
+    /// the node knows it before kubelet's status sync publishes the same
+    /// address. Only an address reported for the observed pod's UID is taken,
+    /// and only once it is persisted; otherwise the wait is left to the watch.
+    async fn node_reported_pod_ip(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        mut observed: tokio::sync::watch::Receiver<Option<SandboxPodView>>,
+    ) -> Option<PodIp> {
+        let pod = observed
+            .wait_for(|pod| {
+                pod.as_ref()
+                    .is_some_and(|pod| pod.uid().is_some() && assigned_pod_node_name(pod).is_some())
+            })
+            .await
+            .ok()?
+            .clone()?;
+        let node_name = assigned_pod_node_name(&pod)?;
+        let pod_uid = pod.uid()?;
+        let target = NodeApiTarget {
+            managed_by: pplx_space_node_model::NodeManagedBy::Kubernetes,
+            role: SpaceNodeRole::Worker,
+            direct_endpoint: None,
+            substrate_node_id: Some(node_name),
+        };
+        let started_at = Instant::now();
+        let mut worker = None;
+        loop {
+            if worker.is_none()
+                && let Ok(endpoint) = self.try_resolve_node_api_endpoint(&target)
+            {
+                worker = Self::worker_client_at(&endpoint, POD_WORKER_CONNECT_TIMEOUT).await;
+            }
+            if let Some(client) = worker.as_mut() {
+                let state = timeout(
+                    POD_WORKER_CONNECT_TIMEOUT,
+                    client.sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
+                        sandbox_ids: vec![sandbox_id.to_string()],
+                    }),
+                )
+                .await;
+                match state {
+                    Ok(Ok(response)) => {
+                        let reported =
+                            response
+                                .into_inner()
+                                .sandboxes
+                                .into_iter()
+                                .find_map(|info| {
+                                    (info.sandbox_id == sandbox_id.to_string()
+                                        && info.pod_uid.as_deref() == Some(pod_uid))
+                                    .then_some(info.pod_ip)
+                                    .flatten()
+                                });
+                        if let Some(pod_ip) = reported.and_then(|ip| PodIp::parse(&ip).ok()) {
+                            let persisted = self
+                                .store
+                                .persist_pod_metadata(
+                                    sandbox_id,
+                                    generation,
+                                    Some(pod_uid),
+                                    Some(&pod_ip.to_string()),
+                                    pod.client_id().as_ref(),
+                                )
+                                .await;
+                            return matches!(persisted, Ok(Some(_))).then_some(pod_ip);
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => worker = None,
+                }
+            }
+            tokio::time::sleep(start_wait_poll_interval(started_at)).await;
         }
     }
 
@@ -430,20 +511,32 @@ impl KubernetesSubstrate {
             return Ok(None);
         }
 
-        match timeout_at(
-            deadline,
-            self.watch_until_pod_ip_assigned(sandbox_id, generation, pod_name)
-                .instrument(tracing::info_span!(
-                    "substrate.k8s.watch_pod_ip",
-                    sandbox_id = %sandbox_id,
-                    pod_name = %pod_name,
-                    namespace = %self.k8s.sandbox_namespace,
-                )),
-        )
-        .await
-        {
-            Ok(Ok(Some(pod_ip))) => {
-                record_pod_ip_ready(metric_identity, sandbox_id, started_at, "watch");
+        // The pod's node usually reports the address before Kubernetes does;
+        // whichever answers first binds the execution.
+        let (observed, observed_by_node) = tokio::sync::watch::channel(None);
+        let watched = self
+            .watch_until_pod_ip_assigned(sandbox_id, generation, pod_name, &observed)
+            .instrument(tracing::info_span!(
+                "substrate.k8s.watch_pod_ip",
+                sandbox_id = %sandbox_id,
+                pod_name = %pod_name,
+                namespace = %self.k8s.sandbox_namespace,
+            ));
+        let node_reported = self
+            .node_reported_pod_ip(sandbox_id, generation, observed_by_node)
+            .instrument(tracing::info_span!(
+                "substrate.k8s.node_pod_ip",
+                sandbox_id = %sandbox_id,
+            ));
+        let raced = async {
+            tokio::select! {
+                watched = watched => watched.map(|pod_ip| pod_ip.map(|pod_ip| (pod_ip, "watch"))),
+                Some(pod_ip) = node_reported => Ok(Some((pod_ip, "node"))),
+            }
+        };
+        match timeout_at(deadline, raced).await {
+            Ok(Ok(Some((pod_ip, source)))) => {
+                record_pod_ip_ready(metric_identity, sandbox_id, started_at, source);
                 Ok(Some(pod_ip))
             }
             Ok(Ok(None)) => {
