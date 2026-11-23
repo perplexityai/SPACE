@@ -201,12 +201,18 @@ async fn a_stopped_sandbox_keeps_its_newest_stored_stop_disk_unpinned() -> TestR
     let older_full = insert_snapshot(pool, sandbox, "full", "ready", 4900).await?;
     insert_snapshot(pool, sandbox, "full", "ready", 4700).await?;
     let current = insert_unpinned_stop_disk(pool, sandbox, 4600).await?;
-    // A newer upload still in flight doesn't take over yet.
+    // Neither a newer upload still in flight nor a newer row whose only
+    // location is orphaned takes over.
     let uploading = insert_unpinned_stop_disk(pool, sandbox, 4000).await?;
     set_snapshot_state(pool, uploading, "creating").await?;
-    // A stopped re-placement: through `restoring` and back, which moves
-    // `lifecycle_changed_at` past every disk's registration while `current`
-    // is still the sandbox's disk.
+    let orphaned = insert_unpinned_stop_disk(pool, sandbox, 3900).await?;
+    sqlx::query("UPDATE snapshot_storage_locations SET orphaned_at = NOW() WHERE snapshot_id = $1")
+        .bind(orphaned)
+        .execute(pool)
+        .await?;
+    // A round trip out of `stopped` and back, as a stopped re-placement or a
+    // rolled-back start makes: it moves `lifecycle_changed_at` past every
+    // disk's registration while `current` is still the sandbox's disk.
     set_lifecycle(pool, sandbox, "restoring").await?;
     set_lifecycle(pool, sandbox, "stopped").await?;
     let moved_past: bool = sqlx::query_scalar(
@@ -220,9 +226,11 @@ async fn a_stopped_sandbox_keeps_its_newest_stored_stop_disk_unpinned() -> TestR
     assert!(moved_past, "the fixture must stop the row after the disk");
 
     let store = SnapshotRetentionDbStore::new(pool.clone());
+    // The orphaned row is listed for repair telemetry, as any route-less
+    // row is, but it never displaces `current`.
     assert_eq!(
         candidate_ids(&store, 1).await?,
-        vec![older, older_full],
+        vec![older, older_full, orphaned],
         "only the newest stored stop disk and the full keep-set survive"
     );
     assert_eq!(
@@ -236,7 +244,7 @@ async fn a_stopped_sandbox_keeps_its_newest_stored_stop_disk_unpinned() -> TestR
     set_snapshot_state(pool, uploading, "ready").await?;
     assert_eq!(
         candidate_ids(&store, 1).await?,
-        vec![older, older_full, current]
+        vec![older, older_full, current, orphaned]
     );
     expect_claimed(store.claim_prune(current, 1).await?);
     assert_eq!(

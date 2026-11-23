@@ -728,19 +728,22 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 ///
 /// It also deliberately has no freshness term, such as `timestamp >=
 /// lifecycle_changed_at`. `snapshots.timestamp` is the catalog registration
-/// time, not when the disk was captured. A stopped re-placement moves the row
-/// through `restoring` back to `stopped`, which moves `lifecycle_changed_at`
-/// past the registration of the disk it was re-placed from, while that disk
-/// is still the sandbox's current one. A freshness term would release exactly
-/// that disk. Without one, the
-/// newest stored disk can be from an earlier stop (when a later stop stored
-/// none), which costs storage but never deletes a disk a restore needs.
+/// time, not when the disk was captured, and `lifecycle_changed_at` moves
+/// without a new disk. An activation the node rolled back to `stopped` stamps
+/// it (`pplx_space_sandbox_store::quarantine::converge_activation_rollback`),
+/// and so does a stopped re-placement, which goes through `restoring` back to
+/// `stopped`. A freshness term would release an unpinned row's stored disk
+/// after either. Without one, the newest stored disk can be from an earlier
+/// stop when a later stop stored none, which costs storage but never deletes
+/// a disk a restore needs.
 ///
 /// The snapshot retention sweep uses it as a deletion guard next to
 /// [`snapshot_is_live_restore_source`]: retention never deletes a stopped
-/// sandbox's current stop disk. Like that guard, it errs wide. It shields one
-/// disk per stopped sandbox, and that disk is released when the sandbox leaves
-/// `stopped` or a newer stop disk becomes durable.
+/// sandbox's current stop disk. It errs toward keeping: the newest stored
+/// disk may predate the rootfs's latest writes, so a restore may not want it,
+/// but nothing needs it deleted. It shields one disk per stopped sandbox, and
+/// that disk is released when the sandbox leaves `stopped` or a newer stop
+/// disk becomes durable.
 ///
 /// ## NULL-safety
 ///
