@@ -459,7 +459,15 @@ impl KubernetesSubstrate {
                                     pod.client_id().as_ref(),
                                 )
                                 .await;
-                            return matches!(persisted, Ok(Some(_))).then_some(pod_ip);
+                            match persisted {
+                                Ok(Some(_)) => return Some(pod_ip),
+                                Ok(None) => return None,
+                                Err(error) => tracing::warn!(
+                                    sandbox_id = %sandbox_id,
+                                    error = %error,
+                                    "failed to persist node-reported pod IP; retrying"
+                                ),
+                            }
                         }
                     }
                     Ok(Err(_)) | Err(_) => worker = None,
@@ -514,20 +522,23 @@ impl KubernetesSubstrate {
         // The pod's node usually reports the address before Kubernetes does;
         // whichever answers first binds the execution.
         let (observed, observed_by_node) = tokio::sync::watch::channel(None);
-        let watched = self
-            .watch_until_pod_ip_assigned(sandbox_id, generation, pod_name, &observed)
-            .instrument(tracing::info_span!(
-                "substrate.k8s.watch_pod_ip",
-                sandbox_id = %sandbox_id,
-                pod_name = %pod_name,
-                namespace = %self.k8s.sandbox_namespace,
-            ));
-        let node_reported = self
-            .node_reported_pod_ip(sandbox_id, generation, observed_by_node)
-            .instrument(tracing::info_span!(
-                "substrate.k8s.node_pod_ip",
-                sandbox_id = %sandbox_id,
-            ));
+        // Both waits are large futures; keep them off the caller's stack.
+        let watched = Box::pin(
+            self.watch_until_pod_ip_assigned(sandbox_id, generation, pod_name, &observed)
+                .instrument(tracing::info_span!(
+                    "substrate.k8s.watch_pod_ip",
+                    sandbox_id = %sandbox_id,
+                    pod_name = %pod_name,
+                    namespace = %self.k8s.sandbox_namespace,
+                )),
+        );
+        let node_reported = Box::pin(
+            self.node_reported_pod_ip(sandbox_id, generation, observed_by_node)
+                .instrument(tracing::info_span!(
+                    "substrate.k8s.node_pod_ip",
+                    sandbox_id = %sandbox_id,
+                )),
+        );
         let raced = async {
             tokio::select! {
                 watched = watched => watched.map(|pod_ip| pod_ip.map(|pod_ip| (pod_ip, "watch"))),
