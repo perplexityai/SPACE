@@ -18,16 +18,20 @@
 //! [`requeue`] and [`redrive_expired`] keep or end the lease.
 //! [`issue_first_assignment`] issues a leased target's first assignment with
 //! its node's wakeup.
+//!
+//! [`fetch_instructions`] reads one node's assignment and pending round.
 
 use std::fmt;
 
 use pplx_space_rollout_queue::HeaderPhase;
 
+mod fetch;
 mod issue;
 mod lease;
 mod read;
 mod start;
 
+pub use fetch::{Assignment, NodeInstructions, PendingRound, fetch_instructions};
 pub use issue::{Issuance, Refusal, Stamp, Wakeup, issue_first_assignment};
 pub use lease::{
     LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
