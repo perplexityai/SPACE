@@ -36,18 +36,80 @@ pub(crate) enum Enrollment {
 }
 
 impl Enrollment {
-    fn admit(&self, node: NodeId) -> Result<(), Status> {
+    fn admit(&self, node: NodeId) -> Result<(), Refusal> {
         match self {
-            Self::Unapproved => Err(Status::failed_precondition(format!(
-                "firewall rules aren't enabled for node {node}: no enrollment predicate is approved"
-            ))),
+            Self::Unapproved => Err(Refusal::NoEnrollmentPredicate(node)),
             #[cfg(all(test, feature = "kubernetes"))]
             Self::Fixture(enrolled) if enrolled.contains(&node) => Ok(()),
             #[cfg(all(test, feature = "kubernetes"))]
-            Self::Fixture(_) => Err(Status::failed_precondition(format!(
-                "firewall rules aren't enabled for node {node}: it isn't enrolled"
-            ))),
+            Self::Fixture(_) => Err(Refusal::Unenrolled(node)),
         }
+    }
+}
+
+/// Why a fetch was refused. Only the server log names it; callers see
+/// [`Refusal::status`].
+#[derive(Clone, Copy, Debug)]
+enum Refusal {
+    NoFetchAuthority,
+    /// A static-token caller or a token without pod/node claims.
+    MissingNodeClaims,
+    MalformedNodeClaims,
+    /// No live Kubernetes worker carries the name: unregistered, deleted, or
+    /// another role.
+    NoLiveWorker,
+    AmbiguousName,
+    UidMismatch,
+    /// The registration has no inventory UID until node sync supplies it.
+    UidUnsynced,
+    #[cfg(all(test, feature = "kubernetes"))]
+    Unenrolled(NodeId),
+    NoEnrollmentPredicate(NodeId),
+}
+
+impl Refusal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoFetchAuthority => "no_fetch_authority",
+            Self::MissingNodeClaims => "missing_node_claims",
+            Self::MalformedNodeClaims => "malformed_node_claims",
+            Self::NoLiveWorker => "no_live_worker",
+            Self::AmbiguousName => "ambiguous_name",
+            Self::UidMismatch => "uid_mismatch",
+            Self::UidUnsynced => "uid_unsynced",
+            #[cfg(all(test, feature = "kubernetes"))]
+            Self::Unenrolled(_) => "unenrolled",
+            Self::NoEnrollmentPredicate(_) => "no_enrollment_predicate",
+        }
+    }
+
+    fn status(self) -> Status {
+        match self {
+            Self::NoEnrollmentPredicate(node) => Status::failed_precondition(format!(
+                "firewall rules aren't enabled for node {node}: no enrollment predicate is approved"
+            )),
+            #[cfg(all(test, feature = "kubernetes"))]
+            Self::Unenrolled(node) => Status::failed_precondition(format!(
+                "firewall rules aren't enabled for node {node}: it isn't enrolled"
+            )),
+            _ => Status::permission_denied(DENIED),
+        }
+    }
+
+    /// Log the reason with the reviewed identity, which carries no token data.
+    fn log(self, caller: Option<&NodeApiAuthenticatedCaller>) -> Status {
+        let node = caller.and_then(|caller| match caller.node_identity() {
+            AuthenticatedNodeIdentity::Kubernetes(node) => Some(node),
+            _ => None,
+        });
+        tracing::warn!(
+            reason = self.as_str(),
+            service_account = caller.and_then(NodeApiAuthenticatedCaller::service_account),
+            node_name = node.map(|node| node.name().as_str()),
+            node_uid = node.map(|node| node.uid().as_str()),
+            "refused firewall rules fetch"
+        );
+        self.status()
     }
 }
 
@@ -56,17 +118,24 @@ impl ClusterApiService {
         &self,
         request: Request<FetchFirewallRulesRequest>,
     ) -> Result<Response<FetchFirewallRulesResponse>, Status> {
-        let denied = || Status::permission_denied(DENIED);
-        let caller = request
-            .extensions()
-            .get::<NodeApiAuthenticatedCaller>()
-            .ok_or_else(denied)?;
+        let caller = request.extensions().get::<NodeApiAuthenticatedCaller>();
+        let refuse = |reason: Refusal| reason.log(caller);
+        let Some(caller) = caller else {
+            return Err(refuse(Refusal::NoFetchAuthority));
+        };
         if caller.firewall_rules_fetch_authority() != FirewallRulesFetchAuthority::Granted {
-            return Err(denied());
+            return Err(refuse(Refusal::NoFetchAuthority));
         }
         // Missing or malformed claims never fall back to the address.
-        let AuthenticatedNodeIdentity::Kubernetes(identity) = caller.node_identity() else {
-            return Err(denied());
+        let identity = match caller.node_identity() {
+            AuthenticatedNodeIdentity::Kubernetes(identity) => identity,
+            AuthenticatedNodeIdentity::MalformedKubernetesClaims => {
+                return Err(refuse(Refusal::MalformedNodeClaims));
+            }
+            AuthenticatedNodeIdentity::RemoteAddress
+            | AuthenticatedNodeIdentity::MissingKubernetesClaims => {
+                return Err(refuse(Refusal::MissingNodeClaims));
+            }
         };
         // The binding and the instructions come from one snapshot.
         let mut tx = self
@@ -85,9 +154,12 @@ impl ClusterApiService {
         .as_slice()
         {
             [(node, Some(true))] => *node,
-            _ => return Err(denied()),
+            [] => return Err(refuse(Refusal::NoLiveWorker)),
+            [(_, Some(false))] => return Err(refuse(Refusal::UidMismatch)),
+            [(_, None)] => return Err(refuse(Refusal::UidUnsynced)),
+            _ => return Err(refuse(Refusal::AmbiguousName)),
         };
-        self.firewall_enrollment.admit(node)?;
+        self.firewall_enrollment.admit(node).map_err(refuse)?;
         let instructions = pplx_space_firewall_rules_store::fetch_instructions(&mut tx, node)
             .await
             .map_err(|error| Status::internal(format!("fetch firewall instructions: {error}")))?;

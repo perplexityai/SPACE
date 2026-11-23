@@ -804,6 +804,7 @@ impl AuthPolicy<'_> {
             self.data_plane_session_refresh_authority(username),
         );
         caller.node_identity = node_identity;
+        caller.service_account = Some(username.to_owned());
         if matches!(self.role, NodeRole::Worker | NodeRole::Builder)
             && self.template_transfer_usernames.contains(username)
             && !self.guest_bridge_usernames.contains(username)
