@@ -16,20 +16,24 @@
 //!   release and its twin share the digest, and so the row: a pin protects
 //!   the digest in every partition, so the partition adds nothing to it.
 //!
-//! Both tables are owned by [`PinnedDigestsStore`]. The store mirrors
+//! `pplx-space-template-mgr-store` owns both tables, and its [`pins`]
+//! module holds their statements. [`PinnedDigestsStore`] mirrors
 //! [`WarmPoolStore`] in `pplx-space-cluster-pool`: per-domain struct
-//! holding a connection handle, methods that delegate to one query
-//! each, no trait abstraction. Methods are synchronous because the
-//! on-node SQLite database is wrapped in `Arc<Mutex<Connection>>` and
-//! must be locked under a `tokio::task::spawn_blocking` boundary
-//! anyway — async wrappers here would add a layer without removing
-//! the boundary.
+//! holding a connection handle, methods that lock it and call the
+//! store, no trait abstraction. The prunes that build a placeholder per
+//! listed template or kept key still issue their statements here. Methods are synchronous
+//! because the on-node SQLite database is wrapped in
+//! `Arc<Mutex<Connection>>` and must be locked under a
+//! `tokio::task::spawn_blocking` boundary anyway — async wrappers here
+//! would add a layer without removing the boundary.
 //!
 //! [`WarmPoolStore`]: pplx_space_cluster_pool::WarmPoolStore
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, Result};
+
+use pplx_space_template_mgr_store::pins;
 
 /// Pinned-digest store backing the template-manager prefetcher.
 ///
@@ -75,12 +79,7 @@ impl PinnedDigestsStore {
     ) -> Result<()> {
         let conn = self.lock_conn()?;
         let ts = crate::db::now();
-        conn.execute(
-            "INSERT INTO template_pinned_tags (name, tag, cache_partition, content_hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(name, tag, cache_partition) DO UPDATE SET content_hash = ?4, updated_at = ?5",
-            params![name, tag, cache_partition.key(), content_hash, ts],
-        )?;
+        pins::upsert_tag_pin(&conn, name, tag, &cache_partition.key(), content_hash, &ts)?;
         Ok(())
     }
 
@@ -92,7 +91,7 @@ impl PinnedDigestsStore {
         let conn = self.lock_conn()?;
         if keep.is_empty() {
             // Empty keep set → no tracked tuples; drop everything.
-            conn.execute("DELETE FROM template_pinned_tags", [])?;
+            pins::delete_all_tag_pins(&conn)?;
             return Ok(());
         }
         // SQLite's parameter binding doesn't expand a `Vec` into a
@@ -130,10 +129,7 @@ impl PinnedDigestsStore {
         cache_partition: crate::db::TemplateCachePartition,
     ) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
-            "DELETE FROM template_pinned_tags WHERE name = ?1 AND tag = ?2 AND cache_partition = ?3",
-            params![name, tag, cache_partition.key()],
-        )?;
+        pins::delete_tag_pin(&conn, name, tag, &cache_partition.key())?;
         Ok(())
     }
 
@@ -148,42 +144,15 @@ impl PinnedDigestsStore {
     ) -> Result<usize> {
         let conn = self.lock_conn()?;
         let keep: Vec<String> = keep.iter().map(|partition| partition.key()).collect();
-        // `json_each` binds the whole list as one value, so the statement
-        // stays whole however many partitions the node has.
-        let keep = serde_json::to_string(&keep)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        conn.execute(
-            "DELETE FROM template_pinned_tags
-              WHERE cache_partition != ''
-                AND cache_partition NOT IN (SELECT value FROM json_each(?1))",
-            params![keep],
-        )
+        pins::delete_tag_pins_of_partitions_outside(&conn, &keep)
     }
 
     pub fn prune_without_local_builds(&self) -> Result<usize> {
         let conn = self.lock_conn()?;
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let tags = tx.execute(
-            "DELETE FROM template_pinned_tags
-              WHERE NOT EXISTS (
-                    SELECT 1
-                      FROM template_builds b
-                     WHERE b.name = template_pinned_tags.name
-                       AND b.content_hash = template_pinned_tags.content_hash
-                )",
-            [],
-        )?;
-        let releases = tx.execute(
-            "DELETE FROM template_pinned_releases
-              WHERE NOT EXISTS (
-                    SELECT 1
-                      FROM template_builds b
-                     WHERE b.name = template_pinned_releases.name
-                       AND b.content_hash = template_pinned_releases.content_hash
-                )",
-            [],
-        )?;
+        let tags = pins::delete_tag_pins_without_local_builds(&tx)?;
+        let releases = pins::delete_release_pins_without_local_builds(&tx)?;
         tx.commit()?;
         Ok(tags.saturating_add(releases))
     }
@@ -202,14 +171,13 @@ impl PinnedDigestsStore {
     ) -> Result<()> {
         let conn = self.lock_conn()?;
         let ts = crate::db::now();
-        conn.execute(
-            "INSERT INTO template_pinned_releases (name, content_hash, release_id, release_created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(name, content_hash) DO UPDATE SET
-                 release_id = ?3,
-                 release_created_at = ?4,
-                 updated_at = ?5",
-            params![name, content_hash, release_id, release_created_at, ts],
+        pins::upsert_release_pin(
+            &conn,
+            name,
+            content_hash,
+            release_id,
+            release_created_at,
+            &ts,
         )?;
         Ok(())
     }
@@ -290,13 +258,7 @@ impl PinnedDigestsStore {
     /// both pin reasons resolve to the same digest.
     pub fn list_pinned_hashes_for_template(&self, name: &str) -> Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT content_hash FROM template_pinned_tags WHERE name = ?1
-             UNION
-             SELECT content_hash FROM template_pinned_releases WHERE name = ?1",
-        )?;
-        let rows = stmt.query_map(params![name], |row| row.get::<_, String>(0))?;
-        rows.collect()
+        pins::list_pinned_hashes_for_template(&conn, name)
     }
 
     /// Hashes currently pinned by `template_pinned_releases` for
@@ -305,13 +267,7 @@ impl PinnedDigestsStore {
     /// [`Self::list_pinned_hashes_for_template`].
     pub fn list_release_hashes(&self, name: &str) -> Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT content_hash FROM template_pinned_releases
-             WHERE name = ?1
-             ORDER BY release_created_at DESC, content_hash ASC",
-        )?;
-        let rows = stmt.query_map(params![name], |row| row.get::<_, String>(0))?;
-        rows.collect()
+        pins::list_release_pin_hashes(&conn, name)
     }
 }
 

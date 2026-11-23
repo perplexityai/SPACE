@@ -1,13 +1,15 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 
-use rusqlite::{Connection, Result, params, types::Type};
+use rusqlite::{Connection, Result, params};
 
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_mgr_store::builds::{self, TemplateBuildRow};
 use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
+use pplx_space_template_mgr_store::template_local_state;
+use pplx_space_template_mgr_store::{network_policy_notifications, pins};
 
 pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;
 
@@ -43,12 +45,7 @@ pub(crate) fn test_conn() -> Connection {
     conn
 }
 
-pub(crate) fn now() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    format!("{now}")
-}
+pub(crate) use pplx_space_template_mgr_store::now;
 
 pub(crate) fn mutex_poison_error(context: &'static str) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
@@ -56,47 +53,8 @@ pub(crate) fn mutex_poison_error(context: &'static str) -> rusqlite::Error {
     ))))
 }
 
-fn nonnegative_i64_to_u64(value: i64, column: usize) -> Result<u64> {
-    u64::try_from(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
-    })
-}
-
 fn saturating_u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-fn limit_to_i64(limit: usize) -> i64 {
-    i64::try_from(limit).unwrap_or(i64::MAX)
-}
-
-fn network_policy_json(policy: &NetworkPolicyV1) -> Result<String> {
-    serde_json::to_string(policy)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-}
-
-fn default_network_policy_json() -> Result<String> {
-    network_policy_json(&NetworkPolicyV1::deny_all())
-}
-
-fn parse_network_policy_json(value: Option<String>, column: usize) -> Result<NetworkPolicyV1> {
-    match value {
-        Some(json) => match serde_json::from_str(&json) {
-            Ok(policy) => Ok(policy),
-            Err(error) => Err(rusqlite::Error::FromSqlConversionFailure(
-                column,
-                Type::Text,
-                Box::new(error),
-            )),
-        },
-        None => Ok(NetworkPolicyV1::deny_all()),
-    }
-}
-
-fn parse_policy_authority(value: &str, column: usize) -> Result<PolicyAuthority> {
-    value.parse().map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
-    })
 }
 
 // ── Template builds ────────────────────────────────────────────────────────
@@ -172,28 +130,23 @@ impl BuildRow {
     }
 }
 
-fn parse_cache_partition(value: &str, column: usize) -> Result<TemplateCachePartition> {
-    TemplateCachePartition::from_key(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
-    })
-}
-
-/// Maps the column list shared by every `template_builds` read below.
-fn build_row(row: &rusqlite::Row<'_>) -> Result<BuildRow> {
-    Ok(BuildRow {
-        name: row.get(0)?,
-        content_hash: row.get(1)?,
-        cache_partition: parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
-        build_date: row.get(3)?,
-        manifest_json: row.get(4)?,
-        runtime: row.get(5)?,
-        arch: row.get(6)?,
-        artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(7)?, 7)?,
-        state: row.get(8)?,
-        owner_type: row.get(9)?,
-        owner_id: row.get(10)?,
-        execution_metadata_json: row.get(11)?,
-    })
+impl From<TemplateBuildRow> for BuildRow {
+    fn from(row: TemplateBuildRow) -> Self {
+        Self {
+            name: row.name,
+            content_hash: row.content_hash,
+            cache_partition: row.cache_partition,
+            build_date: row.build_date,
+            manifest_json: row.manifest_json,
+            runtime: row.runtime,
+            arch: row.arch,
+            artifact_size_bytes: row.artifact_size_bytes,
+            state: row.state,
+            owner_type: row.owner_type,
+            owner_id: row.owner_id,
+            execution_metadata_json: row.execution_metadata_json,
+        }
+    }
 }
 
 pub fn get_build(
@@ -202,15 +155,7 @@ pub fn get_build(
     content_hash: &str,
     cache_partition: TemplateCachePartition,
 ) -> Result<Option<BuildRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-    )?;
-    let mut rows = stmt.query_map(
-        params![name, content_hash, cache_partition.key()],
-        build_row,
-    )?;
-    rows.next().transpose()
+    Ok(builds::get_build(conn, name, content_hash, cache_partition)?.map(BuildRow::from))
 }
 
 /// The ready build of a digest, preferring `preferred`'s partition, then
@@ -221,21 +166,7 @@ pub fn find_ready_build(
     content_hash: &str,
     preferred: Option<TemplateCachePartition>,
 ) -> Result<Option<BuildRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds
-         WHERE name = ?1 AND content_hash = ?2 AND state = 'ready'
-         ORDER BY cache_partition = ?3 DESC, cache_partition ASC LIMIT 1",
-    )?;
-    let mut rows = stmt.query_map(
-        params![
-            name,
-            content_hash,
-            preferred.map(TemplateCachePartition::key)
-        ],
-        build_row,
-    )?;
-    rows.next().transpose()
+    Ok(builds::find_ready_build(conn, name, content_hash, preferred)?.map(BuildRow::from))
 }
 
 /// The ready build of a digest bound to `partition`'s environment
@@ -255,29 +186,14 @@ pub fn find_ready_build_bound_to(
 
 /// Whether a row exists for the digest in any partition, in any state.
 pub fn build_exists(conn: &Connection, name: &str, content_hash: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM template_builds WHERE name = ?1 AND content_hash = ?2)",
-        params![name, content_hash],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|exists| exists != 0)
+    builds::build_exists(conn, name, content_hash)
 }
 
 /// Builds left in `state='deleting'` by an interrupted eviction.
 pub fn list_deleting_builds(
     conn: &Connection,
 ) -> Result<Vec<(String, String, TemplateCachePartition)>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition FROM template_builds WHERE state = 'deleting'",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
-        ))
-    })?;
-    rows.collect()
+    builds::list_deleting_builds(conn)
 }
 
 /// Every cached build of one rootfs digest, legacy partition first.
@@ -286,13 +202,10 @@ pub fn list_builds_for_hash(
     name: &str,
     content_hash: &str,
 ) -> Result<Vec<BuildRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds WHERE name = ?1 AND content_hash = ?2
-         ORDER BY cache_partition ASC",
-    )?;
-    let rows = stmt.query_map(params![name, content_hash], build_row)?;
-    rows.collect()
+    Ok(builds::list_builds_for_hash(conn, name, content_hash)?
+        .into_iter()
+        .map(BuildRow::from)
+        .collect())
 }
 
 /// Normalize an ISO 8601 build_date to UTC so lexicographic sort = chronological sort.
@@ -341,7 +254,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     }
     // A build lives in the partition of the environment it's bound to. A
     // mismatch would let a lookup for one environment return a build bound to
-    // another, so the store refuses it rather than trusting the caller. The
+    // another, so this function refuses it rather than trusting the caller. The
     // legacy partition is the exception: startup recovery adopts a
     // legacy-layout build bound to another environment in place, since a node
     // that ran that environment before partitions existed holds one there.
@@ -370,34 +283,42 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
         .map(|value| value.version.as_str());
     let ts = now();
     let build_date_utc = normalize_build_date(b.build_date);
-    let partition = b.cache_partition.key();
     // Insert seeds `last_used_at` to `created_at` so a build that has
     // never been resolved sits at the correct LRU position. The
     // ON CONFLICT path intentionally leaves `last_used_at` alone: a
     // re-upsert refreshes manifest/size metadata for the same digest,
     // but it is *not* an access — only `touch_build` advances the
     // LRU clock.
-    //
-    // The `WHERE state != 'deleting'` guard on the ON CONFLICT path
-    // is the back-door fix for the GC-vs-pull race: when eviction
-    // Phase 1 has already flipped this row to `state='deleting'`, a
-    // concurrent pull's final upsert must NOT clobber the marker
-    // back to `'ready'`. Without this, the pull would silently
-    // resurrect a doomed row, eviction's Phase 3 would then DELETE
-    // it, and the on-disk artifacts would be in an indeterminate
-    // half-deleted half-written state. With the guard, the upsert
-    // is a no-op when the row is mid-eviction; the pull's caller
-    // sees the build as still NotFound after re-resolution and
-    // surfaces NotFound to its caller cleanly.
+    let row = builds::BuildUpsertRow {
+        name: b.name,
+        content_hash: b.content_hash,
+        cache_partition: b.cache_partition,
+        build_date: &build_date_utc,
+        manifest_json: b.manifest_json,
+        runtime: b.runtime,
+        arch: b.arch,
+        artifact_size_bytes: saturating_u64_to_i64(b.artifact_size_bytes),
+        state: b.state,
+        created_at: &ts,
+        runtime_version,
+        guest_os,
+        state_format_name,
+        state_format_version,
+        execution_metadata_json: execution_json.as_deref(),
+    };
+    let components: Vec<_> = execution
+        .into_iter()
+        .flat_map(|execution| execution.components())
+        .map(|component| builds::BuildComponentRow {
+            kind: component.kind.as_str(),
+            role_key: component.role.as_ref().map_or("", |role| role.as_str()),
+            version: component.version.as_ref().map(|value| value.as_str()),
+            digest: component.digest.as_ref().map(ToString::to_string),
+            format: component.format.as_ref().map(|value| value.as_str()),
+        })
+        .collect();
     let tx = immediate_transaction(conn)?;
-    let rows = tx.execute(
-        "INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, created_at, last_used_at, runtime_version, guest_os, state_format_name, state_format_version, execution_metadata_json)
-         VALUES (?1, ?2, ?15, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)
-         ON CONFLICT(name, content_hash, cache_partition) DO UPDATE SET build_date = ?3, manifest_json = ?4, runtime = ?5, arch = ?6, artifact_size_bytes = ?7, state = ?8, runtime_version = ?10, guest_os = ?11, state_format_name = ?12, state_format_version = ?13, execution_metadata_json = ?14
-         WHERE template_builds.state != 'deleting'",
-        params![b.name, b.content_hash, build_date_utc, b.manifest_json, b.runtime, b.arch, saturating_u64_to_i64(b.artifact_size_bytes), b.state, ts, runtime_version, guest_os, state_format_name, state_format_version, execution_json, partition],
-    )?;
-    if rows == 0 {
+    if !builds::upsert_build(&tx, &row, &components)? {
         tracing::warn!(
             template = b.name,
             content_hash = b.content_hash,
@@ -406,29 +327,6 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
         );
         tx.commit()?;
         return Ok(());
-    }
-    tx.execute(
-        "DELETE FROM template_build_components
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![b.name, b.content_hash, partition],
-    )?;
-    if let Some(execution) = execution {
-        for component in execution.components() {
-            tx.execute(
-                "INSERT INTO template_build_components (name, content_hash, cache_partition, kind, role_key, version, digest, format)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    b.name,
-                    b.content_hash,
-                    partition,
-                    component.kind.as_str(),
-                    component.role.as_ref().map_or("", |role| role.as_str()),
-                    component.version.as_ref().map(|value| value.as_str()),
-                    component.digest.as_ref().map(ToString::to_string),
-                    component.format.as_ref().map(|value| value.as_str()),
-                ],
-            )?;
-        }
     }
     tx.commit()?;
     Ok(())
@@ -442,13 +340,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
 /// learns its partition only from the release manifest, so the check
 /// covers every partition.
 pub fn is_build_marked_deleting(conn: &Connection, name: &str, content_hash: &str) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM template_builds
-         WHERE name = ?1 AND content_hash = ?2 AND state = 'deleting'",
-        params![name, content_hash],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
+    builds::is_build_marked_deleting(conn, name, content_hash)
 }
 
 /// Advance the LRU clock on a build to "now". Called from every
@@ -466,48 +358,16 @@ pub fn touch_build(
     cache_partition: TemplateCachePartition,
 ) -> Result<()> {
     let ts = now();
-    conn.execute(
-        "UPDATE template_builds SET last_used_at = ?4
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![name, content_hash, cache_partition.key(), ts],
-    )?;
-    Ok(())
+    builds::touch_build(conn, name, content_hash, cache_partition, &ts)
 }
 
-/// One row's worth of eviction-planner input. Times are stored in the
-/// DB as Unix-epoch-seconds strings (via [`now`]); this struct hands
-/// them to the planner as `u64` so the planner does not need to
-/// know about the on-disk encoding.
-pub struct BuildEvictionRow {
-    pub name: String,
-    pub content_hash: String,
-    pub cache_partition: TemplateCachePartition,
-    pub artifact_size_bytes: u64,
-    pub created_at_secs: u64,
-    pub last_used_at_secs: u64,
-}
+pub use pplx_space_template_mgr_store::builds::BuildEvictionRow;
 
 /// Return every `ready` build with the timestamps the eviction
 /// planner needs. The planner is purely functional, so this is the
 /// only DB read the GC loop performs against `template_builds`.
 pub fn list_eviction_candidates(conn: &Connection) -> Result<Vec<BuildEvictionRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, artifact_size_bytes, created_at, last_used_at
-         FROM template_builds WHERE state = 'ready'",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let created_str: String = row.get(4)?;
-        let last_used_str: String = row.get(5)?;
-        Ok(BuildEvictionRow {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-            cache_partition: parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
-            artifact_size_bytes: nonnegative_i64_to_u64(row.get::<_, i64>(3)?, 3)?,
-            created_at_secs: created_str.parse::<u64>().unwrap_or(0),
-            last_used_at_secs: last_used_str.parse::<u64>().unwrap_or(0),
-        })
-    })?;
-    rows.collect()
+    builds::list_eviction_candidates(conn)
 }
 
 /// Distinct `(name, content_hash)` pairs pinned by *any* prefetch
@@ -515,15 +375,7 @@ pub fn list_eviction_candidates(conn: &Connection) -> Result<Vec<BuildEvictionRo
 /// loop's pinned-set check is one query, not two. A pin names rootfs
 /// bytes, so it protects every cache partition of the digest.
 pub fn list_pinned_build_keys(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash FROM template_pinned_tags
-         UNION
-         SELECT name, content_hash FROM template_pinned_releases",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    rows.collect()
+    pins::list_pinned_build_keys(conn)
 }
 
 /// Test-only helper: forces `last_used_at` on an existing build to
@@ -545,22 +397,17 @@ pub(crate) fn set_last_used_at_for_test(
 }
 
 pub fn list_builds(conn: &Connection) -> Result<Vec<BuildRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds WHERE state = 'ready'
-         ORDER BY name ASC, build_date ASC, content_hash ASC, cache_partition ASC",
-    )?;
-    let rows = stmt.query_map([], build_row)?;
-    rows.collect()
+    Ok(builds::list_builds(conn)?
+        .into_iter()
+        .map(BuildRow::from)
+        .collect())
 }
 
 pub fn list_builds_by_name(conn: &Connection, name: &str) -> Result<Vec<BuildRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds WHERE name = ?1 AND state = 'ready'",
-    )?;
-    let rows = stmt.query_map(params![name], build_row)?;
-    rows.collect()
+    Ok(builds::list_builds_by_name(conn, name)?
+        .into_iter()
+        .map(BuildRow::from)
+        .collect())
 }
 
 pub fn delete_build(
@@ -569,28 +416,12 @@ pub fn delete_build(
     content_hash: &str,
     cache_partition: TemplateCachePartition,
 ) -> Result<()> {
-    let partition = cache_partition.key();
-    conn.execute(
-        "DELETE FROM template_build_components
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![name, content_hash, partition],
-    )?;
-    conn.execute(
-        "DELETE FROM template_snapshots
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![name, content_hash, partition],
-    )?;
-    conn.execute(
-        "DELETE FROM template_builds
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![name, content_hash, partition],
-    )?;
-    Ok(())
+    builds::delete_build(conn, name, content_hash, cache_partition)
 }
 
 pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> {
     let tx = immediate_transaction(conn)?;
-    delete_template_rows(&tx, name)?;
+    template_local_state::delete_template_rows(&tx, name)?;
     tx.commit()?;
     Ok(())
 }
@@ -600,52 +431,16 @@ pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> 
 /// whether it deleted.
 pub fn delete_template_local_state_without_builds(conn: &Connection, name: &str) -> Result<bool> {
     let tx = immediate_transaction(conn)?;
-    let has_builds = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM template_builds WHERE name = ?1)",
-        params![name],
-        |row| row.get::<_, i64>(0),
-    )? != 0;
-    if has_builds {
+    if template_local_state::template_has_builds(&tx, name)? {
         return Ok(false);
     }
-    delete_template_rows(&tx, name)?;
+    template_local_state::delete_template_rows(&tx, name)?;
     tx.commit()?;
     Ok(true)
 }
 
-fn delete_template_rows(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<()> {
-    tx.execute(
-        "DELETE FROM template_snapshots WHERE name = ?1",
-        params![name],
-    )?;
-    tx.execute(
-        "DELETE FROM template_build_components WHERE name = ?1",
-        params![name],
-    )?;
-    tx.execute("DELETE FROM template_builds WHERE name = ?1", params![name])?;
-    tx.execute("DELETE FROM pools WHERE template = ?1", params![name])?;
-    tx.execute(
-        "DELETE FROM template_settings WHERE template = ?1",
-        params![name],
-    )?;
-    Ok(())
-}
-
 pub fn template_local_state_exists(conn: &Connection, name: &str) -> Result<bool> {
-    let exists = conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM template_snapshots WHERE name = ?1
-             UNION ALL
-             SELECT 1 FROM template_builds WHERE name = ?1
-             UNION ALL
-             SELECT 1 FROM pools WHERE template = ?1
-             UNION ALL
-             SELECT 1 FROM template_settings WHERE template = ?1
-         )",
-        params![name],
-        |row| row.get::<_, i64>(0),
-    )?;
-    Ok(exists != 0)
+    template_local_state::template_local_state_exists(conn, name)
 }
 
 // ── Latest build (replaces tag-based resolution) ──────────────────────────
@@ -670,20 +465,7 @@ pub fn get_latest_build(
     {
         return Ok(Some(bound));
     }
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds
-         WHERE name = ?1 AND state = 'ready'
-         ORDER BY build_date DESC, content_hash DESC, cache_partition = ?2 DESC,
-                  cache_partition = '' DESC,
-                  cache_partition ASC
-         LIMIT 1",
-    )?;
-    let mut rows = stmt.query_map(
-        params![name, preferred.map(TemplateCachePartition::key)],
-        build_row,
-    )?;
-    rows.next().transpose()
+    Ok(builds::get_latest_build(conn, name, preferred)?.map(BuildRow::from))
 }
 
 /// Newest ready build of `name` bound to `cache_partition`: one cached in
@@ -699,19 +481,10 @@ fn get_latest_bound_build(
     name: &str,
     cache_partition: TemplateCachePartition,
 ) -> Result<Option<BuildRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds
-         WHERE name = ?1 AND cache_partition IN (?2, '') AND state = 'ready'
-         ORDER BY build_date DESC, content_hash DESC, cache_partition = ?2 DESC",
-    )?;
-    for row in stmt.query_map(params![name, cache_partition.key()], build_row)? {
-        let row = row?;
-        if row.bound_partition() == cache_partition {
-            return Ok(Some(row));
-        }
-    }
-    Ok(None)
+    builds::find_latest_build_in_partition_or_legacy(conn, name, cache_partition, |row| {
+        let row = BuildRow::from(row);
+        (row.bound_partition() == cache_partition).then_some(row)
+    })
 }
 
 /// Newest ready build of `name` in exactly one partition that belongs there:
@@ -723,253 +496,48 @@ pub fn get_latest_build_in_partition(
     name: &str,
     cache_partition: TemplateCachePartition,
 ) -> Result<Option<BuildRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, artifact_size_bytes, state, owner_type, owner_id, execution_metadata_json
-         FROM template_builds
-         WHERE name = ?1 AND cache_partition = ?2 AND state = 'ready'
-         ORDER BY build_date DESC, content_hash DESC",
-    )?;
     // A legacy row can be bound to any environment: the migration files every
     // pre-partition row there, and startup recovery adopts the ones bound to
     // another environment in place. An environment partition's row bound to
     // something else isn't its build, so an older one that is wins.
-    for row in stmt.query_map(params![name, cache_partition.key()], build_row)? {
-        let row = row?;
-        if cache_partition == TemplateCachePartition::Legacy
+    builds::find_latest_build_in_partition(conn, name, cache_partition, |row| {
+        let row = BuildRow::from(row);
+        (cache_partition == TemplateCachePartition::Legacy
             || pplx_space_node_runtime_core::catalog::template_cache_partition(row.environment())
-                == cache_partition
-        {
-            return Ok(Some(row));
-        }
-    }
-    Ok(None)
+                == cache_partition)
+            .then_some(row)
+    })
 }
 
 /// Partitions that hold at least one ready build of `name`, legacy first.
 pub fn list_build_partitions(conn: &Connection, name: &str) -> Result<Vec<TemplateCachePartition>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT cache_partition FROM template_builds
-         WHERE name = ?1 AND state = 'ready'
-         ORDER BY cache_partition ASC",
-    )?;
-    let rows = stmt.query_map(params![name], |row| {
-        parse_cache_partition(&row.get::<_, String>(0)?, 0)
-    })?;
-    rows.collect()
+    builds::list_build_partitions(conn, name)
 }
 
 // ── Snapshots ──────────────────────────────────────────────────────────────
 
-pub struct SnapshotRow {
-    pub name: String,
-    pub content_hash: String,
-    pub cache_partition: TemplateCachePartition,
-    pub vcpu: u32,
-    pub memory_mib: u32,
-    pub snapshot_hash: String,
-    pub built_at: String,
-}
+pub use pplx_space_template_mgr_store::snapshots::{
+    SnapshotKey, SnapshotRow, delete_snapshot, delete_snapshots_for_build, get_snapshot,
+    list_snapshots, upsert_snapshot,
+};
 
-fn snapshot_row(row: &rusqlite::Row<'_>) -> Result<SnapshotRow> {
-    Ok(SnapshotRow {
-        name: row.get(0)?,
-        content_hash: row.get(1)?,
-        cache_partition: parse_cache_partition(&row.get::<_, String>(2)?, 2)?,
-        vcpu: row.get(3)?,
-        memory_mib: row.get(4)?,
-        snapshot_hash: row.get(5)?,
-        built_at: row.get(6)?,
-    })
-}
+// ── Pools ──────────────────────────────────────────────────────────────────
 
-/// One base snapshot: a build and the compute shape it was captured at.
-#[derive(Clone, Copy)]
-pub struct SnapshotKey<'a> {
-    pub name: &'a str,
-    pub content_hash: &'a str,
-    pub cache_partition: TemplateCachePartition,
-    pub vcpu: u32,
-    pub memory_mib: u32,
-}
-
-pub fn get_snapshot(conn: &Connection, key: SnapshotKey<'_>) -> Result<Option<SnapshotRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at
-         FROM template_snapshots
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND vcpu = ?4 AND memory_mib = ?5",
-    )?;
-    let mut rows = stmt.query_map(
-        params![
-            key.name,
-            key.content_hash,
-            key.cache_partition.key(),
-            key.vcpu,
-            key.memory_mib
-        ],
-        snapshot_row,
-    )?;
-    match rows.next() {
-        Some(Ok(row)) => Ok(Some(row)),
-        _ => Ok(None),
-    }
-}
-
-pub fn upsert_snapshot(conn: &Connection, key: SnapshotKey<'_>, snapshot_hash: &str) -> Result<()> {
-    let ts = now();
-    conn.execute(
-        "INSERT INTO template_snapshots (name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(name, content_hash, cache_partition, vcpu, memory_mib) DO UPDATE SET snapshot_hash = ?6, built_at = ?7",
-        params![
-            key.name,
-            key.content_hash,
-            key.cache_partition.key(),
-            key.vcpu,
-            key.memory_mib,
-            snapshot_hash,
-            ts
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn list_snapshots(
-    conn: &Connection,
-    name: &str,
-    content_hash: &str,
-    cache_partition: TemplateCachePartition,
-) -> Result<Vec<SnapshotRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at
-         FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-         ORDER BY vcpu ASC, memory_mib ASC",
-    )?;
-    let rows = stmt.query_map(
-        params![name, content_hash, cache_partition.key()],
-        snapshot_row,
-    )?;
-    rows.collect()
-}
-
-pub fn delete_snapshots_for_build(
-    conn: &Connection,
-    name: &str,
-    content_hash: &str,
-    cache_partition: TemplateCachePartition,
-) -> Result<()> {
-    conn.execute(
-        "DELETE FROM template_snapshots
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![name, content_hash, cache_partition.key()],
-    )?;
-    Ok(())
-}
-
-pub fn delete_snapshot(conn: &Connection, key: SnapshotKey<'_>) -> Result<()> {
-    conn.execute(
-        "DELETE FROM template_snapshots
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND vcpu = ?4 AND memory_mib = ?5",
-        params![
-            key.name,
-            key.content_hash,
-            key.cache_partition.key(),
-            key.vcpu,
-            key.memory_mib
-        ],
-    )?;
-    Ok(())
-}
-
-// ── Pools (unchanged from before) ──────────────────────────────────────────
-
-pub fn insert_pool(
-    conn: &Connection,
-    template: &str,
-    target_count: u32,
-    boot_mode: &str,
-    vcpu: u32,
-    memory_mib: u32,
-) -> Result<()> {
-    let ts = now();
-    conn.execute(
-        "INSERT INTO pools (template, target_count, boot_mode, vcpu, memory_mib, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-         ON CONFLICT(template) DO UPDATE SET target_count = ?2, boot_mode = ?3, vcpu = ?4, memory_mib = ?5, updated_at = ?6",
-        params![template, target_count, boot_mode, vcpu, memory_mib, ts],
-    )?;
-    Ok(())
-}
-
-pub fn delete_pool(conn: &Connection, template: &str) -> Result<()> {
-    conn.execute("DELETE FROM pools WHERE template = ?1", params![template])?;
-    Ok(())
-}
-
-pub struct PoolRow {
-    pub template: String,
-    pub target_count: u32,
-    pub boot_mode: String,
-    pub vcpu: u32,
-    pub memory_mib: u32,
-}
-
-impl PoolRow {
-    pub fn from_snapshot(&self) -> bool {
-        self.boot_mode == "snapshot"
-    }
-}
-
-pub fn get_pool(conn: &Connection, template: &str) -> Result<Option<PoolRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT template, target_count, boot_mode, vcpu, memory_mib FROM pools WHERE template = ?1",
-    )?;
-    let mut rows = stmt.query_map(params![template], |row| {
-        Ok(PoolRow {
-            template: row.get(0)?,
-            target_count: row.get(1)?,
-            boot_mode: row.get(2)?,
-            vcpu: row.get(3)?,
-            memory_mib: row.get(4)?,
-        })
-    })?;
-    match rows.next() {
-        Some(Ok(row)) => Ok(Some(row)),
-        _ => Ok(None),
-    }
-}
-
-pub fn get_all_pools(conn: &Connection) -> Result<Vec<PoolRow>> {
-    let mut stmt =
-        conn.prepare("SELECT template, target_count, boot_mode, vcpu, memory_mib FROM pools")?;
-    let rows = stmt.query_map([], |row| {
-        Ok(PoolRow {
-            template: row.get(0)?,
-            target_count: row.get(1)?,
-            boot_mode: row.get(2)?,
-            vcpu: row.get(3)?,
-            memory_mib: row.get(4)?,
-        })
-    })?;
-    rows.collect()
-}
+pub use pplx_space_template_mgr_store::pools::{
+    PoolRow, delete_pool, get_all_pools, get_pool, insert_pool,
+};
 
 // ── Template settings ──────────────────────────────────────────────────────
 
-pub struct TemplateSettingsRow {
-    pub template: String,
-    pub default_auto_lifecycle: AutoLifecyclePolicy,
-    pub default_auto_lifecycle_authority: PolicyAuthority,
-    pub default_network_policy: NetworkPolicyV1,
-    pub default_network_policy_generation: u64,
-    pub default_network_policy_authority: PolicyAuthority,
-    pub ensure_base_snapshot: bool,
-    pub snapshot_vcpu: u32,
-    pub snapshot_memory_mib: u32,
-    pub base_snapshot_policy_set_at: Option<String>,
-    pub last_snapshot_reconcile_started_at: Option<String>,
-    pub last_snapshot_reconcile_completed_at: Option<String>,
-    pub last_snapshot_reconcile_error: Option<String>,
-}
+pub use pplx_space_template_mgr_store::template_settings::{
+    TemplateNetworkPolicyUpdate, TemplateNetworkPolicyUpsertError, TemplateSettingsPolicies,
+    TemplateSettingsRow, get_template_settings, list_template_settings,
+    list_template_snapshot_policies, record_snapshot_reconcile_completed,
+    record_snapshot_reconcile_started, update_template_snapshot_policy,
+};
+use pplx_space_template_mgr_store::template_settings::{
+    try_update_template_network_policy_tx, upsert_template_settings_tx,
+};
 
 pub fn upsert_template_settings(
     conn: &Connection,
@@ -987,90 +555,12 @@ pub fn upsert_template_settings(
     Ok(())
 }
 
-fn upsert_template_settings_tx(
-    tx: &rusqlite::Transaction<'_>,
-    template: &str,
-    default_auto_lifecycle: &AutoLifecyclePolicy,
-    authority: PolicyAuthority,
-) -> Result<bool> {
-    let ts = now();
-    let json = serde_json::to_string(default_auto_lifecycle)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let default_network_json = default_network_policy_json()?;
-    match tx.query_row(
-        "SELECT default_auto_lifecycle_json, default_auto_lifecycle_authority
-         FROM template_settings
-         WHERE template = ?1",
-        params![template],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                parse_policy_authority(row.get::<_, String>(1)?.as_str(), 1)?,
-            ))
-        },
-    ) {
-        Ok((existing_json, existing_authority)) => {
-            if authority == PolicyAuthority::Cluster && existing_authority == PolicyAuthority::Local
-            {
-                return Ok(false);
-            }
-            if existing_authority == authority && existing_json == json {
-                return Ok(false);
-            }
-            tx.execute(
-                "UPDATE template_settings
-                 SET default_auto_lifecycle_json = ?1,
-                     default_auto_lifecycle_authority = ?2,
-                     updated_at = ?3
-                 WHERE template = ?4",
-                params![json, authority.as_str(), ts, template],
-            )?;
-            Ok(true)
-        }
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            tx.execute(
-                "INSERT INTO template_settings
-                     (template, default_auto_lifecycle_json, default_auto_lifecycle_authority,
-                      default_network_policy_json, default_network_policy_authority, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                params![
-                    template,
-                    json,
-                    authority.as_str(),
-                    default_network_json,
-                    PolicyAuthority::Cluster.as_str(),
-                    ts
-                ],
-            )?;
-            Ok(true)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TemplateNetworkPolicyUpdate {
-    Unspecified,
-    Skip,
-    Apply,
-    Repair,
-    Conflict,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemplateSettingsUpdateOutcome {
     pub auto_lifecycle_applied: bool,
     pub network_policy: TemplateNetworkPolicyUpdate,
     pub queued_dirty_ref: bool,
     pub queued_sandbox_notification: bool,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum TemplateNetworkPolicyUpsertError {
-    #[error("template network policy generation conflicts with existing policy")]
-    GenerationConflict,
-    #[error(transparent)]
-    Db(#[from] rusqlite::Error),
 }
 
 pub fn try_upsert_template_network_policy(
@@ -1090,98 +580,6 @@ pub fn try_upsert_template_network_policy(
     )?;
     tx.commit()?;
     Ok(matches!(decision, TemplateNetworkPolicyUpdate::Apply))
-}
-
-fn try_update_template_network_policy_tx(
-    tx: &rusqlite::Transaction<'_>,
-    template: &str,
-    default_network_policy: &NetworkPolicyV1,
-    default_network_policy_generation: u64,
-    authority: PolicyAuthority,
-) -> std::result::Result<TemplateNetworkPolicyUpdate, TemplateNetworkPolicyUpsertError> {
-    let ts = now();
-    let default_auto_json = serde_json::to_string(&AutoLifecyclePolicy::disabled())
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let network_json = network_policy_json(default_network_policy)?;
-    let generation = saturating_u64_to_i64(default_network_policy_generation);
-
-    match tx.query_row(
-        "SELECT default_network_policy_json, default_network_policy_generation, default_network_policy_authority
-         FROM template_settings
-         WHERE template = ?1",
-        params![template],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                parse_policy_authority(row.get::<_, String>(2)?.as_str(), 2)?,
-            ))
-        },
-    ) {
-        Ok((existing_json, existing_generation, existing_authority)) => {
-            if authority == PolicyAuthority::Cluster && existing_authority == PolicyAuthority::Local
-            {
-                Ok(TemplateNetworkPolicyUpdate::Skip)
-            } else if authority == PolicyAuthority::Local {
-                if existing_authority == PolicyAuthority::Local && existing_json == network_json {
-                    Ok(TemplateNetworkPolicyUpdate::Skip)
-                } else {
-                    // The owning schema derives the committed local generation
-                    // from its retained counter, including this legacy
-                    // write shape when an older binary runs on the new schema.
-                    tx.execute(
-                        "UPDATE template_settings
-                         SET default_network_policy_json = ?1,
-                             default_network_policy_generation = 0,
-                             default_network_policy_authority = ?2,
-                             updated_at = ?3
-                         WHERE template = ?4",
-                        params![network_json, authority.as_str(), ts, template],
-                    )?;
-                    Ok(TemplateNetworkPolicyUpdate::Apply)
-                }
-            } else if generation < existing_generation {
-                Ok(TemplateNetworkPolicyUpdate::Skip)
-            } else if generation == existing_generation {
-                if existing_authority == authority && existing_json == network_json {
-                    Ok(TemplateNetworkPolicyUpdate::Skip)
-                } else {
-                    Err(TemplateNetworkPolicyUpsertError::GenerationConflict)
-                }
-            } else {
-                tx.execute(
-                    "UPDATE template_settings
-                     SET default_network_policy_json = ?1,
-                         default_network_policy_generation = ?2,
-                         default_network_policy_authority = ?3,
-                         updated_at = ?4
-                     WHERE template = ?5",
-                    params![network_json, generation, authority.as_str(), ts, template],
-                )?;
-                Ok(TemplateNetworkPolicyUpdate::Apply)
-            }
-        }
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            tx.execute(
-                "INSERT INTO template_settings
-                     (template, default_auto_lifecycle_json, default_network_policy_json,
-                      default_network_policy_generation, default_network_policy_authority,
-                      default_auto_lifecycle_authority, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                params![
-                    template,
-                    default_auto_json,
-                    network_json,
-                    generation,
-                    authority.as_str(),
-                    PolicyAuthority::Cluster.as_str(),
-                    ts
-                ],
-            )?;
-            Ok(TemplateNetworkPolicyUpdate::Apply)
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 pub struct TemplateSettingsUpdate<'a> {
@@ -1254,23 +652,12 @@ pub fn update_template_settings_with_outbox(
     })
 }
 
-const RECONCILE_FACET_NETWORK_POLICY: i32 = 1;
-const RECONCILE_FACET_TEMPLATE_INVENTORY: i32 = 3;
-
 fn enqueue_node_dirty_network_policy_template_tx(
     tx: &rusqlite::Transaction<'_>,
     template: &str,
 ) -> Result<bool> {
     let ts = now();
-    let changed = tx.execute(
-        "INSERT INTO node_dirty_refs
-             (facet, element_kind, element_value, requested_at, updated_at)
-         VALUES (?1, 'network_policy_template', ?2, ?3, ?3)
-         ON CONFLICT(facet, element_kind, element_value) DO UPDATE SET
-             requested_at = excluded.requested_at,
-             updated_at = excluded.updated_at",
-        params![RECONCILE_FACET_NETWORK_POLICY, template, ts],
-    )?;
+    let changed = node_dirty_refs::enqueue_network_policy_template(tx, template, &ts)?;
     Ok(changed != 0)
 }
 
@@ -1286,15 +673,7 @@ fn enqueue_node_dirty_template_inventory_tx(
     template: &str,
 ) -> Result<bool> {
     let ts = now();
-    let changed = tx.execute(
-        "INSERT INTO node_dirty_refs
-             (facet, element_kind, element_value, requested_at, updated_at)
-         VALUES (?1, 'template_inventory', ?2, ?3, ?3)
-         ON CONFLICT(facet, element_kind, element_value) DO UPDATE SET
-             requested_at = excluded.requested_at,
-             updated_at = excluded.updated_at",
-        params![RECONCILE_FACET_TEMPLATE_INVENTORY, template, ts],
-    )?;
+    let changed = node_dirty_refs::enqueue_template_inventory(tx, template, &ts)?;
     Ok(changed != 0)
 }
 
@@ -1312,24 +691,7 @@ fn enqueue_template_network_policy_notification_tx(
     template: &str,
 ) -> Result<bool> {
     let ts = now();
-    // Local generations are allocated by the owning schema. Publish the actual
-    // committed witness, never the caller's requested (usually zero) generation.
-    let changed = tx.execute(
-        sql!("INSERT INTO template_network_policy_notifications
-             (template, policy_json, generation, authority, requested_at, updated_at)
-         SELECT settings.template, settings.default_network_policy_json,
-                settings.default_network_policy_generation, settings.default_network_policy_authority,
-                ?2, ?2
-         FROM template_settings AS settings
-         WHERE settings.template = ?1
-         ON CONFLICT(template) DO UPDATE SET
-             policy_json = excluded.policy_json,
-             generation = excluded.generation,
-             authority = excluded.authority,
-             requested_at = excluded.requested_at,
-             updated_at = excluded.updated_at"),
-        params![template, ts],
-    )?;
+    let changed = network_policy_notifications::enqueue(tx, template, &ts)?;
     Ok(changed != 0)
 }
 
@@ -1348,29 +710,16 @@ pub fn list_template_network_policy_notifications(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<TemplateNetworkPolicyNotificationRow>> {
-    let mut stmt = conn.prepare(sql!(
-        "SELECT template, policy_json, generation, authority
-         FROM template_network_policy_notifications
-         ORDER BY requested_at ASC
-         LIMIT ?1"
-    ))?;
-    let rows = stmt.query_map(params![limit_to_i64(limit)], |row| {
-        let policy_json: String = row.get(1)?;
-        let policy = serde_json::from_str(&policy_json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-        })?;
-        let generation = row
-            .get::<_, i64>(2)
-            .and_then(|value| nonnegative_i64_to_u64(value, 2))?;
-        Ok(TemplateNetworkPolicyNotificationRow {
-            template: row.get(0)?,
-            policy,
-            generation,
-            authority: parse_policy_authority(row.get::<_, String>(3)?.as_str(), 3)?,
-            policy_json,
+    Ok(network_policy_notifications::list(conn, limit)?
+        .into_iter()
+        .map(|record| TemplateNetworkPolicyNotificationRow {
+            template: record.template,
+            policy: record.policy,
+            generation: record.generation,
+            authority: record.authority,
+            policy_json: record.policy_json,
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
 pub fn delete_template_network_policy_notifications(
@@ -1398,228 +747,6 @@ pub fn delete_template_network_policy_notifications(
     }
     tx.commit()?;
     Ok(deleted)
-}
-
-pub fn get_template_settings(
-    conn: &Connection,
-    template: &str,
-) -> Result<Option<TemplateSettingsRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT template, default_auto_lifecycle_json, default_network_policy_json,
-                default_network_policy_generation, default_network_policy_authority,
-                default_auto_lifecycle_authority, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib,
-                base_snapshot_policy_set_at, last_snapshot_reconcile_started_at,
-                last_snapshot_reconcile_completed_at, last_snapshot_reconcile_error
-         FROM template_settings WHERE template = ?1",
-    )?;
-    let mut rows = stmt.query_map(params![template], |row| {
-        let json: String = row.get(1)?;
-        let default_auto_lifecycle = serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        let default_network_policy = parse_network_policy_json(row.get(2)?, 2)?;
-        Ok(TemplateSettingsRow {
-            template: row.get(0)?,
-            default_auto_lifecycle,
-            default_auto_lifecycle_authority: parse_policy_authority(
-                row.get::<_, String>(5)?.as_str(),
-                5,
-            )?,
-            default_network_policy,
-            default_network_policy_generation: nonnegative_i64_to_u64(row.get::<_, i64>(3)?, 3)?,
-            default_network_policy_authority: parse_policy_authority(
-                row.get::<_, String>(4)?.as_str(),
-                4,
-            )?,
-            ensure_base_snapshot: row.get::<_, bool>(6)?,
-            snapshot_vcpu: row.get(7)?,
-            snapshot_memory_mib: row.get(8)?,
-            base_snapshot_policy_set_at: row.get(9)?,
-            last_snapshot_reconcile_started_at: row.get(10)?,
-            last_snapshot_reconcile_completed_at: row.get(11)?,
-            last_snapshot_reconcile_error: row.get(12)?,
-        })
-    })?;
-    match rows.next() {
-        Some(Ok(row)) => Ok(Some(row)),
-        Some(Err(error)) => Err(error),
-        None => Ok(None),
-    }
-}
-
-pub fn update_template_snapshot_policy(
-    conn: &Connection,
-    template: &str,
-    ensure_base_snapshot: bool,
-    snapshot_vcpu: u32,
-    snapshot_memory_mib: u32,
-) -> Result<()> {
-    let ts = now();
-    // Snapshot policy may be pushed before any other settings exist for this
-    // template. Seed the required lifecycle column with the disabled default.
-    let default_json = serde_json::to_string(&AutoLifecyclePolicy::disabled())
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let default_network_json = default_network_policy_json()?;
-    conn.execute(
-        "INSERT INTO template_settings
-             (template, default_auto_lifecycle_json, default_network_policy_json,
-              ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib,
-              base_snapshot_policy_set_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7)
-         ON CONFLICT(template) DO UPDATE SET
-             ensure_base_snapshot = ?4,
-             snapshot_vcpu = ?5,
-             snapshot_memory_mib = ?6,
-             base_snapshot_policy_set_at = ?7,
-             updated_at = ?7",
-        params![
-            template,
-            default_json,
-            default_network_json,
-            ensure_base_snapshot,
-            snapshot_vcpu,
-            snapshot_memory_mib,
-            ts
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn list_template_snapshot_policies(conn: &Connection) -> Result<Vec<TemplateSettingsRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT template, default_auto_lifecycle_json, default_network_policy_json,
-                default_network_policy_generation, default_network_policy_authority,
-                default_auto_lifecycle_authority, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib,
-                base_snapshot_policy_set_at, last_snapshot_reconcile_started_at,
-                last_snapshot_reconcile_completed_at, last_snapshot_reconcile_error
-         FROM template_settings
-         WHERE base_snapshot_policy_set_at IS NOT NULL
-         ORDER BY template",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let json: String = row.get(1)?;
-        let default_auto_lifecycle = serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        let default_network_policy = parse_network_policy_json(row.get(2)?, 2)?;
-        Ok(TemplateSettingsRow {
-            template: row.get(0)?,
-            default_auto_lifecycle,
-            default_auto_lifecycle_authority: parse_policy_authority(
-                row.get::<_, String>(5)?.as_str(),
-                5,
-            )?,
-            default_network_policy,
-            default_network_policy_generation: nonnegative_i64_to_u64(row.get::<_, i64>(3)?, 3)?,
-            default_network_policy_authority: parse_policy_authority(
-                row.get::<_, String>(4)?.as_str(),
-                4,
-            )?,
-            ensure_base_snapshot: row.get::<_, bool>(6)?,
-            snapshot_vcpu: row.get(7)?,
-            snapshot_memory_mib: row.get(8)?,
-            base_snapshot_policy_set_at: row.get(9)?,
-            last_snapshot_reconcile_started_at: row.get(10)?,
-            last_snapshot_reconcile_completed_at: row.get(11)?,
-            last_snapshot_reconcile_error: row.get(12)?,
-        })
-    })?;
-    rows.collect()
-}
-
-pub fn record_snapshot_reconcile_started(conn: &Connection, template: &str) -> Result<()> {
-    let ts = now();
-    conn.execute(
-        "UPDATE template_settings
-         SET last_snapshot_reconcile_started_at = ?1,
-             last_snapshot_reconcile_error = NULL,
-             updated_at = ?1
-         WHERE template = ?2",
-        params![ts, template],
-    )?;
-    Ok(())
-}
-
-pub fn record_snapshot_reconcile_completed(
-    conn: &Connection,
-    template: &str,
-    error: Option<&str>,
-) -> Result<()> {
-    let ts = now();
-    conn.execute(
-        "UPDATE template_settings
-         SET last_snapshot_reconcile_completed_at = ?1,
-             last_snapshot_reconcile_error = ?2,
-             updated_at = ?1
-         WHERE template = ?3",
-        params![ts, error, template],
-    )?;
-    Ok(())
-}
-
-pub struct TemplateSettingsPolicies {
-    pub default_auto_lifecycle: AutoLifecyclePolicy,
-    pub default_auto_lifecycle_authority: PolicyAuthority,
-    pub default_network_policy: NetworkPolicyV1,
-    pub default_network_policy_generation: u64,
-    pub default_network_policy_authority: PolicyAuthority,
-    pub ensure_base_snapshot: bool,
-    pub snapshot_vcpu: u32,
-    pub snapshot_memory_mib: u32,
-}
-
-pub fn list_template_settings(
-    conn: &Connection,
-) -> Result<BTreeMap<String, TemplateSettingsPolicies>> {
-    let mut stmt = conn.prepare(
-        "SELECT template, default_auto_lifecycle_json, default_network_policy_json,
-                default_network_policy_generation, default_network_policy_authority,
-                default_auto_lifecycle_authority, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib
-         FROM template_settings ORDER BY template",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let template: String = row.get(0)?;
-        let json: String = row.get(1)?;
-        let default_auto_lifecycle = serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        let default_network_policy = parse_network_policy_json(row.get(2)?, 2)?;
-        Ok((
-            template,
-            TemplateSettingsPolicies {
-                default_auto_lifecycle,
-                default_auto_lifecycle_authority: parse_policy_authority(
-                    row.get::<_, String>(5)?.as_str(),
-                    5,
-                )?,
-                default_network_policy,
-                default_network_policy_generation: nonnegative_i64_to_u64(
-                    row.get::<_, i64>(3)?,
-                    3,
-                )?,
-                default_network_policy_authority: parse_policy_authority(
-                    row.get::<_, String>(4)?.as_str(),
-                    4,
-                )?,
-                ensure_base_snapshot: row.get(6)?,
-                snapshot_vcpu: row.get(7)?,
-                snapshot_memory_mib: row.get(8)?,
-            },
-        ))
-    })?;
-    rows.collect()
 }
 
 pub fn ensure_template_settings(conn: &Connection, template: &str) -> Result<AutoLifecyclePolicy> {

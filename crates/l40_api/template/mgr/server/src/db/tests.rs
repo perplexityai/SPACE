@@ -159,7 +159,7 @@ fn local_generation_triggers_cover_old_writers_without_recursion_or_cluster_rewr
         conn.execute(
             "UPDATE template_settings SET default_network_policy_json = ?1,
                 default_network_policy_generation = 0 WHERE template = 'base'",
-            [network_policy_json(&NetworkPolicyV1::deny_all()).unwrap()],
+            [serde_json::to_string(&NetworkPolicyV1::deny_all()).unwrap()],
         )
         .unwrap();
         assert_eq!(generation(), first + 1);
@@ -167,7 +167,7 @@ fn local_generation_triggers_cover_old_writers_without_recursion_or_cluster_rewr
         assert_ne!(current.policy, previous.policy);
         conn.execute(
             "UPDATE template_network_policy_notifications SET policy_json = ?1, generation = 0",
-            [network_policy_json(&previous.policy).unwrap()],
+            [serde_json::to_string(&previous.policy).unwrap()],
         )
         .unwrap();
         let repaired = list_template_network_policy_notifications(&conn, 10).unwrap();
