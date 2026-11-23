@@ -6989,6 +6989,7 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
+ "pplx-space-node-ctl-store",
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
@@ -7023,6 +7024,18 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-node-ctl-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-locator",
+ "pplx-space-sqlite",
+ "rusqlite",
+ "sqlx",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
