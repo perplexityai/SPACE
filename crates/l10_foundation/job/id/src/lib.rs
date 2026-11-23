@@ -5,6 +5,11 @@
 //! name a job without depending on `pplx-space-accounts`. The account
 //! identifiers in `pplx-space-accounts` are made with the same [`uuid_id!`]
 //! macro and share [`AuthIdParseError`].
+//!
+//! The codec macros for UUID identifiers are here too: [`postgres_uuid!`],
+//! which [`uuid_id!`] expands to and model crates invoke for identifiers they
+//! define themselves, and [`sqlite_uuid!`]. They can't live in the codec
+//! facade, `pplx-space-sql-codec`, which archcheck holds to re-exports.
 
 /// Error returned when an auth/account UUID cannot be parsed.
 ///
@@ -27,8 +32,8 @@ pub enum AuthIdParseError {
     InvalidUuid(#[from] uuid::Error),
 }
 
-/// What [`uuid_id!`] expands to, so a caller needs no `uuid` dependency of its
-/// own to use it.
+/// What [`uuid_id!`] and [`postgres_uuid!`] expand to, so a caller needs no
+/// `uuid` dependency of its own to use them.
 #[doc(hidden)]
 pub mod __private {
     pub use uuid::Uuid;
@@ -41,9 +46,10 @@ pub mod __private {
 /// The `serde` and `sqlx` impls are compiled when the calling crate's own
 /// `serde` and `sqlx` features are on, and use its `serde` and
 /// `pplx-space-sql-codec` dependencies: serde as the UUID's string form,
-/// sqlx as a Postgres `UUID`. A caller declares both features, even if it
-/// enables neither, and its `serde` dependency needs serde's `derive`
-/// feature and its `sqlx` feature `pplx-space-sql-codec/postgres`.
+/// sqlx as a Postgres `UUID`, through [`postgres_uuid!`]. A caller declares
+/// both features, even if it enables neither, and its `serde` dependency
+/// needs serde's `derive` feature and its `sqlx` feature
+/// `pplx-space-sql-codec/postgres`.
 /// Attributes before the name, doc comments included, are put on the
 /// struct.
 ///
@@ -190,13 +196,50 @@ macro_rules! uuid_id {
         }
 
         #[cfg(feature = "sqlx")]
-        impl ::pplx_space_sql_codec::postgres::PgHasArrayType for $name {
-            fn array_type_info() -> ::pplx_space_sql_codec::postgres::PgTypeInfo {
-                <$crate::__private::Uuid as ::pplx_space_sql_codec::postgres::PgHasArrayType>::array_type_info()
-            }
-        }
+        $crate::postgres_uuid!($name);
+    };
+}
 
-        #[cfg(feature = "sqlx")]
+/// Stores each listed type in Postgres as a `UUID`, and a list of them as a
+/// `UUID[]`: the `Type`, `Encode`, `Decode` and `PgHasArrayType` impls
+/// delegate to `uuid::Uuid`'s, through the type's `as_uuid(self)` and
+/// `from_uuid`, so the type must be `Copy`. The impls use the calling crate's
+/// `pplx-space-sql-codec` dependency, with its `postgres` feature; a caller
+/// gates the invocation on its own feature. [`uuid_id!`] invokes it for the
+/// identifiers it defines.
+///
+/// ```rust
+/// use pplx_space_sql_codec::postgres::PgHasArrayType;
+/// use pplx_space_sql_codec::{Postgres, Type};
+/// use uuid::Uuid;
+///
+/// #[derive(Clone, Copy)]
+/// struct WidgetId(Uuid);
+///
+/// impl WidgetId {
+///     const fn from_uuid(value: Uuid) -> Self {
+///         Self(value)
+///     }
+///
+///     const fn as_uuid(self) -> Uuid {
+///         self.0
+///     }
+/// }
+///
+/// pplx_space_job_id::postgres_uuid!(WidgetId);
+///
+/// assert_eq!(
+///     <WidgetId as Type<Postgres>>::type_info(),
+///     <Uuid as Type<Postgres>>::type_info(),
+/// );
+/// assert_eq!(
+///     <WidgetId as PgHasArrayType>::array_type_info(),
+///     <Uuid as PgHasArrayType>::array_type_info(),
+/// );
+/// ```
+#[macro_export]
+macro_rules! postgres_uuid {
+    ($($name:ty),+ $(,)?) => {$(
         impl ::pplx_space_sql_codec::Type<::pplx_space_sql_codec::Postgres> for $name {
             fn type_info() -> ::pplx_space_sql_codec::postgres::PgTypeInfo {
                 <$crate::__private::Uuid as ::pplx_space_sql_codec::Type<::pplx_space_sql_codec::Postgres>>::type_info()
@@ -207,29 +250,33 @@ macro_rules! uuid_id {
             }
         }
 
-        #[cfg(feature = "sqlx")]
+        impl ::pplx_space_sql_codec::postgres::PgHasArrayType for $name {
+            fn array_type_info() -> ::pplx_space_sql_codec::postgres::PgTypeInfo {
+                <$crate::__private::Uuid as ::pplx_space_sql_codec::postgres::PgHasArrayType>::array_type_info()
+            }
+        }
+
         impl<'q> ::pplx_space_sql_codec::Encode<'q, ::pplx_space_sql_codec::Postgres> for $name {
             fn encode_by_ref(
                 &self,
                 buf: &mut ::pplx_space_sql_codec::postgres::PgArgumentBuffer,
             ) -> ::core::result::Result<::pplx_space_sql_codec::encode::IsNull, ::pplx_space_sql_codec::error::BoxDynError> {
                 <$crate::__private::Uuid as ::pplx_space_sql_codec::Encode<'q, ::pplx_space_sql_codec::Postgres>>::encode_by_ref(
-                    &self.0, buf,
+                    &self.as_uuid(), buf,
                 )
             }
         }
 
-        #[cfg(feature = "sqlx")]
         impl<'r> ::pplx_space_sql_codec::Decode<'r, ::pplx_space_sql_codec::Postgres> for $name {
             fn decode(
                 value: ::pplx_space_sql_codec::postgres::PgValueRef<'r>,
             ) -> ::core::result::Result<Self, ::pplx_space_sql_codec::error::BoxDynError> {
-                ::core::result::Result::Ok(Self(
+                ::core::result::Result::Ok(Self::from_uuid(
                     <$crate::__private::Uuid as ::pplx_space_sql_codec::Decode<'r, ::pplx_space_sql_codec::Postgres>>::decode(value)?,
                 ))
             }
         }
-    };
+    )+};
 }
 
 /// Stores each listed type in SQLite as its `Display` text and reads it back

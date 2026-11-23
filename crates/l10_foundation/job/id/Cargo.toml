@@ -17,8 +17,9 @@ thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
-# The unit tests compile sqlite_uuid!(JobId) without the feature.
-pplx-space-sql-codec = { workspace = true, features = ["sqlite"] }
+# The unit tests compile sqlite_uuid!(JobId) without the feature, and
+# postgres_uuid!'s doc example its impls.
+pplx-space-sql-codec = { workspace = true, features = ["postgres", "sqlite"] }
 rusqlite = { workspace = true }
 
 [features]

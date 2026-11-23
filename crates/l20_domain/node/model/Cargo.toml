@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 pplx-space-accounts = { workspace = true }
+pplx-space-job-id = { workspace = true, optional = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true }
@@ -25,6 +26,7 @@ serde = ["dep:serde"]
 # Forwards TemplateVisibility's codec, which api's node-group SQL gets through
 # sandbox-store, as Cargo unifies features.
 sqlx = [
+    "dep:pplx-space-job-id",
     "dep:pplx-space-sql-codec",
     "pplx-space-sql-codec/postgres",
     "pplx-space-template-model/sqlx",

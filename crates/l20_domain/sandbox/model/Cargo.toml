@@ -14,6 +14,7 @@ workspace = true
 pplx-space-accounts = { workspace = true }
 pplx-space-byte-size = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-job-id = { workspace = true, optional = true }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-node-model = { workspace = true }
@@ -34,6 +35,7 @@ serde = [
     "pplx-space-node-model/serde",
 ]
 sqlx = [
+    "dep:pplx-space-job-id",
     "dep:pplx-space-sql-codec",
     "pplx-space-sql-codec/postgres",
 ]
