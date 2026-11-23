@@ -192,6 +192,9 @@ async fn signs_the_target_that_reqwest_sends() {
         ("http://127.0.0.1:{port}/a\\b/%2e/../../c", "/c/"),
         // Catches refusing escapes url keeps: it resolves only whole `%2e` segments and `\`.
         ("http://127.0.0.1:{port}/a%2E%5Cb", "/a%2E%5Cb/"),
+        // Catches refusing a path url resolves differently from the written one: it is signed and sent as resolved.
+        ("http://127.0.0.1:{port}/one/%2e%2e/two", "/two/"),
+        ("http://127.0.0.1:{port}/a\\b", "/a/b/"),
     ] {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let endpoint =
@@ -220,29 +223,27 @@ async fn signs_the_target_that_reqwest_sends() {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    Http,
+    Url,
+    Userinfo,
+}
+
 #[tokio::test]
 async fn refuses_endpoints_before_sending() {
-    for (endpoint, http_rejects) in [
+    for (endpoint, refusal) in [
         // Catches url parsing first: it would repair these.
-        ("http://127.0.0.1:9/a b", true),
-        (" http://127.0.0.1:9/x", true),
-        ("http://127.0.0.1:9/a\tb", true),
-        ("http:127.0.0.1:9/normal", true),
-        // Catches signing where url resolves `..` unlike SigV4.
-        ("http://127.0.0.1:9/x/E|/../y", false),
-        ("http://127.0.0.1:9/a//../b", false),
-        // Catches each case of the `%2e` and backslash guard.
-        ("http://127.0.0.1:9/one/%2e%2e/two", false),
-        ("http://127.0.0.1:9/one/.%2e/two", false),
-        ("http://127.0.0.1:9/one/%2e./two", false),
-        ("http://127.0.0.1:9/one/%2E/two", false),
-        ("http://127.0.0.1:9/a\\b", false),
+        ("http://127.0.0.1:9/a b", Refusal::Http),
+        (" http://127.0.0.1:9/x", Refusal::Http),
+        ("http://127.0.0.1:9/a\tb", Refusal::Http),
+        ("http:127.0.0.1:9/normal", Refusal::Http),
         // Catches sending userinfo, which reqwest sends as a Basic Authorization header.
-        ("http://user:pw@127.0.0.1:9/", false),
-        ("http://user@127.0.0.1:9/", false),
-        ("http://:pw@127.0.0.1:9/", false),
+        ("http://user:pw@127.0.0.1:9/", Refusal::Userinfo),
+        ("http://user@127.0.0.1:9/", Refusal::Userinfo),
+        ("http://:pw@127.0.0.1:9/", Refusal::Userinfo),
         // Catches signing an endpoint with no authority, which panics in aws-sigv4.
-        ("/relative", false),
+        ("/relative", Refusal::Url),
     ] {
         let transport = RecordingTransport::new(vec![QueryResponse::new(StatusCode::OK, "")]);
         let client = client_with_endpoint(endpoint.to_string(), transport.clone());
@@ -252,10 +253,17 @@ async fn refuses_endpoints_before_sending() {
             .await;
 
         assert_eq!(transport.requests(), Vec::new(), "{endpoint:?} was sent");
-        match result {
-            Err(AwsClientError::HttpBuild(_)) if http_rejects => {}
-            Err(AwsClientError::InvalidEndpoint(_)) if !http_rejects => {}
-            result => panic!("{endpoint:?}: {result:?}"),
+        match (&result, refusal) {
+            (Err(AwsClientError::HttpBuild(_)), Refusal::Http) => {}
+            (Err(AwsClientError::EndpointUrl(err)), Refusal::Url) => {
+                assert_eq!(
+                    *err,
+                    url::ParseError::RelativeUrlWithoutBase,
+                    "{endpoint:?}"
+                );
+            }
+            (Err(AwsClientError::InvalidEndpoint(_)), Refusal::Userinfo) => {}
+            _ => panic!("{endpoint:?}: {result:?}"),
         }
     }
 }

@@ -25,6 +25,8 @@ pub enum AwsClientError {
     Signing(#[from] aws_sigv4::http_request::SigningError),
     #[error("failed to build AWS HTTP request: {0}")]
     HttpBuild(#[from] http::Error),
+    #[error("AWS endpoint is not a valid URL: {0}")]
+    EndpointUrl(#[from] url::ParseError),
     #[error("invalid AWS endpoint: {0}")]
     InvalidEndpoint(String),
     #[error("AWS HTTP request failed: {0}")]
@@ -289,27 +291,12 @@ impl<T: QueryTransport> AwsQueryClient<T> {
     fn target(&self) -> Result<reqwest::Url, AwsClientError> {
         let endpoint = self.endpoint()?;
         // http's parser keeps rejecting what it rejected before url could repair it.
-        let uri: http::Uri = endpoint.parse().map_err(http::Error::from)?;
-        let target = reqwest::Url::parse(&endpoint)
-            .map_err(|err| AwsClientError::InvalidEndpoint(err.to_string()))?;
+        endpoint.parse::<http::Uri>().map_err(http::Error::from)?;
+        let target = reqwest::Url::parse(&endpoint)?;
         // reqwest sends userinfo as a second, Basic, Authorization header, which nothing verifies.
         if !target.username().is_empty() || target.password().is_some() {
             return Err(AwsClientError::InvalidEndpoint(
                 "endpoint carries userinfo".to_string(),
-            ));
-        }
-        // Send only if url and SigV4 resolve the written path alike, up to url's percent-encoding.
-        let written = signed_segments(uri.path());
-        let mut expected = target.clone();
-        expected.set_path(&written.join("/"));
-        // set_path would resolve a `%2e` or `\` segment SigV4 keeps, so refuse those outright.
-        if written
-            .iter()
-            .any(|segment| segment.contains('\\') || is_encoded_dot_segment(segment))
-            || signed_segments(expected.path()) != signed_segments(target.path())
-        {
-            return Err(AwsClientError::InvalidEndpoint(
-                "url resolves its path differently from SigV4".to_string(),
             ));
         }
         Ok(target)
@@ -330,28 +317,6 @@ impl<T: QueryTransport> AwsQueryClient<T> {
             region
         ))
     }
-}
-
-/// The path segments SigV4's default normalization signs.
-fn signed_segments(path: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            segment => segments.push(segment),
-        }
-    }
-    segments
-}
-
-fn is_encoded_dot_segment(segment: &str) -> bool {
-    matches!(
-        segment.to_ascii_lowercase().as_str(),
-        "%2e" | ".%2e" | "%2e." | "%2e%2e"
-    )
 }
 
 fn encode_form(params: &[(&str, String)]) -> String {

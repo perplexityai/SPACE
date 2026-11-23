@@ -5129,6 +5129,7 @@ dependencies = [
  "reqwest 0.13.5",
  "thiserror 2.0.20",
  "tokio",
+ "url",
 ]
 
 [[package]]

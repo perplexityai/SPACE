@@ -20,6 +20,7 @@ form_urlencoded = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 aws-smithy-types = { workspace = true }
