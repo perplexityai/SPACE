@@ -1,12 +1,12 @@
 //! A digest stored under both spellings, `sha256:<hex>` and bare `<hex>`:
-//! the API's create-by-digest and placement lookups answer the release
+//! the create-by-digest, create-by-tag and placement lookups answer the release
 //! `pplx_space_template_release_original::digest_original` picks, which the
 //! shared spelling-pair fixture names. The internal API and warm-pool tests
 //! assert against the same fixture.
 
 use super::*;
+use crate::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
 use pplx_space_db_test_fixtures::pg_test_db;
-use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
 use pplx_space_template_store::test_support::tag_release;
 use pplx_space_test_env::TestResult;
 
@@ -54,7 +54,7 @@ async fn create_and_placement_resolve_the_digest_original(#[case] twins: bool) -
     for pair in &pairs {
         // A create names the canonical spelling; a bare `<hex>` reference
         // doesn't parse.
-        let resolved = resolve_template_release_by_digest(
+        let resolved = resolve_by_digest(
             pool,
             &template,
             pair.canonical_hash.parse()?,
@@ -72,7 +72,7 @@ async fn create_and_placement_resolve_the_digest_original(#[case] twins: bool) -
         } else {
             &pair.bare_hash
         };
-        let tagged = resolve_template_release_by_tag(
+        let tagged = resolve_by_tag(
             pool,
             &template,
             &TemplateTag::parse("legacy")?,
@@ -83,7 +83,7 @@ async fn create_and_placement_resolve_the_digest_original(#[case] twins: bool) -
         assert_eq!(tagged, Some((pair.original, other_hash.clone())));
         for hash in [&pair.canonical_hash, &pair.bare_hash] {
             assert_eq!(
-                release_environment(pool, TEMPLATE, hash).await?,
+                original_release_environment(pool, TEMPLATE, hash).await?,
                 Some(pair.original.to_string()),
                 "{hash}"
             );

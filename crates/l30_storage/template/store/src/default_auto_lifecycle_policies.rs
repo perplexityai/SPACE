@@ -29,6 +29,47 @@ pub async fn upsert(
     Ok(())
 }
 
+/// The auto-lifecycle policy a create of `template` at `content_hash` on
+/// `runtime` defaults to: `template`'s own default, else the one the
+/// builder last reported for that build (a report without a runtime
+/// matches any), or `None` when neither is recorded.
+pub async fn for_create(
+    executor: impl PgExecutor<'_>,
+    template: &str,
+    content_hash: &str,
+    runtime: &str,
+) -> Result<Option<Json<AutoLifecyclePolicy>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Json<AutoLifecyclePolicy>>(sql!(
+        "WITH desired AS (
+             SELECT default_auto_lifecycle_json
+             FROM template_default_auto_lifecycle_policies
+             WHERE template = $1
+         ),
+         observed AS (
+             SELECT nti.default_auto_lifecycle_json
+             FROM node_template_inventory nti
+             JOIN nodes n ON n.id = nti.node_id
+             WHERE nti.template_name = $1
+               AND nti.content_hash = $2
+               AND (nti.runtime IS NULL OR nti.runtime = '' OR nti.runtime = $3)
+               AND nti.default_auto_lifecycle_json IS NOT NULL
+               AND n.role = 'builder'
+             ORDER BY nti.observed_at DESC
+             LIMIT 1
+         )
+         SELECT default_auto_lifecycle_json FROM desired
+         UNION ALL
+         SELECT default_auto_lifecycle_json FROM observed
+         WHERE NOT EXISTS (SELECT 1 FROM desired)
+         LIMIT 1"
+    ))
+    .bind(template)
+    .bind(content_hash)
+    .bind(runtime)
+    .fetch_optional(executor)
+    .await
+}
+
 /// Delete `template`'s default auto-lifecycle policy, if it has one.
 pub async fn delete(
     executor: impl PgExecutor<'_>,

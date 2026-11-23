@@ -1867,3 +1867,52 @@ async fn widen_guard_detects_owner_encryption() -> TestResult {
     );
     Ok(())
 }
+
+/// Registration's fills write only an empty field and say whether it was empty.
+#[tokio::test(flavor = "current_thread")]
+async fn registration_fills_only_a_missing_binding_or_owner() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    insert_template(&db.pool, TEMPLATE).await?;
+    let release = insert_release(&db.pool, TEMPLATE, HASH, None).await?;
+    let first = metadata(environment(1));
+    assert!(registration::fill_execution_metadata(&db.pool, release, &first).await?);
+    assert!(
+        !registration::fill_execution_metadata(&db.pool, release, &metadata(environment(2)))
+            .await?
+    );
+    let stored: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT execution_metadata FROM template_releases WHERE id = $1")
+            .bind(release)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(stored, Some(first));
+
+    sqlx::query("UPDATE templates SET org_id = $2, visibility = 'org_specific' WHERE name = $1")
+        .bind(TEMPLATE)
+        .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("UPDATE template_releases SET org_id = $2 WHERE id = $1")
+        .bind(release)
+        .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+        .execute(&db.pool)
+        .await?;
+    insert_location(&db.pool, release, LOCATION).await?;
+    let location: Uuid = sqlx::query_scalar(
+        "SELECT id FROM template_release_storage_locations WHERE template_release_id = $1",
+    )
+    .bind(release)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(registration::adopt_storage_location_owner(&db.pool, location).await?);
+    assert!(!registration::adopt_storage_location_owner(&db.pool, location).await?);
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT org_id FROM template_release_storage_locations WHERE id = $1")
+            .bind(location)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(owner, Some(pplx_space_db_test_fixtures::SEED_ORG_ID));
+    Ok(())
+}

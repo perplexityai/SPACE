@@ -508,6 +508,33 @@ async fn a_delete_keeps_the_first_requests_actor_and_operation() -> TestResult {
             true
         )
     );
+    let state = templates::delete_state(&db.pool, &template)
+        .await?
+        .expect("the row");
+    assert_eq!(
+        (
+            state.desired_state.as_str(),
+            state.delete_operation_id,
+            state.delete_operation_live
+        ),
+        ("deleting", Some(first), true)
+    );
+    sqlx::query("UPDATE public_operations SET state = 'succeeded' WHERE operation_id = $1")
+        .bind(first)
+        .execute(&db.pool)
+        .await?;
+    assert!(
+        !templates::delete_state(&db.pool, &template)
+            .await?
+            .expect("the row")
+            .delete_operation_live,
+        "a finished delete operation is not live"
+    );
+    assert!(
+        templates::delete_state(&db.pool, &name("missing"))
+            .await?
+            .is_none()
+    );
     templates::mark_deleted(&db.pool, &template, operations[2]).await?;
     assert_eq!(
         read(db.pool.clone()).await?,
@@ -541,6 +568,19 @@ async fn the_default_auto_lifecycle_upsert_replaces_the_policy() -> TestResult {
     .fetch_all(&db.pool)
     .await?;
     assert_eq!(stored, [serde_json::to_value(&second)?]);
+    let for_create = super::default_auto_lifecycle_policies::for_create(
+        &db.pool,
+        "lifecycled",
+        "sha256:any",
+        "fc",
+    )
+    .await?;
+    assert_eq!(for_create.map(|policy| policy.0), Some(second));
+    assert!(
+        super::default_auto_lifecycle_policies::for_create(&db.pool, "other", "sha256:any", "fc")
+            .await?
+            .is_none()
+    );
     Ok(())
 }
 
@@ -721,5 +761,59 @@ async fn a_tag_upsert_creates_then_retargets_and_retarget_needs_the_tag() -> Tes
 
     assert!(release_tags::retarget(&db.pool, first, "tagged", &latest).await?);
     assert_eq!(tagged(db.pool.clone()).await?, Some(first));
+
+    assert!(
+        !release_tags::insert_if_absent(&db.pool, second, "tagged", &latest).await?,
+        "an existing tag is an outcome"
+    );
+    assert_eq!(tagged(db.pool.clone()).await?, Some(first));
+    let stable = TemplateTag::parse("stable")?;
+    assert!(release_tags::insert_if_absent(&db.pool, second, "tagged", &stable).await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owner_and_org_summary_read_the_rows_an_org_owns() -> TestResult {
+    let db = pg_test_db().await?;
+    let org = insert_org(&db.pool).await?;
+    assert!(
+        templates::owner(&db.pool, &name("missing"))
+            .await?
+            .is_none()
+    );
+    let retention = std::time::Duration::from_secs(60);
+    let none = templates::org_templates(&db.pool, org, retention).await?;
+    assert_eq!(
+        (none.any_live, none.any_held, none.retained_until),
+        (None, None, None)
+    );
+
+    register(&db.pool, "ownerless", None).await?;
+    assert_eq!(
+        templates::owner(&db.pool, &name("ownerless")).await?,
+        Some(None)
+    );
+    register(&db.pool, "owned", Some(org)).await?;
+    assert_eq!(
+        templates::owner(&db.pool, &name("owned")).await?,
+        Some(Some(org))
+    );
+    let live = templates::org_templates(&db.pool, org, retention).await?;
+    assert_eq!((live.any_live, live.any_held), (Some(true), Some(false)));
+
+    set_desired_state(&db.pool, "owned", "deleted").await?;
+    let deleted = templates::org_templates(&db.pool, org, retention).await?;
+    assert_eq!(
+        (deleted.any_live, deleted.any_held),
+        (Some(false), Some(false))
+    );
+    let updated_at: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT updated_at FROM templates WHERE name = 'owned'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(deleted.retained_until, Some(updated_at + retention));
+    insert_release(&db.pool, "owned").await?;
+    let held = templates::org_templates(&db.pool, org, retention).await?;
+    assert_eq!(held.any_held, Some(true));
     Ok(())
 }

@@ -1,11 +1,16 @@
 //! The `templates` catalog row.
 
 use pplx_space_accounts::{OrgId, UserId};
+use std::time::Duration;
+
+use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sql_locator::sql;
+use pplx_space_state_reconciliation::ReconcileFacet;
 use pplx_space_template_model::{
     TemplateDesiredState, TemplateId, TemplateName, TemplateVisibility,
 };
+use serde::de::DeserializeOwned;
 use sqlx::{FromRow, PgExecutor, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -133,6 +138,250 @@ pub async fn not_owned_by_another_org(
     .bind(template.as_str())
     .bind(org_id.as_uuid())
     .fetch_one(executor)
+    .await
+}
+
+/// The owner of `template`: `None` when no row names it, `Some(None)` for an
+/// ownerless template.
+pub async fn owner(
+    executor: impl PgExecutor<'_>,
+    template: &TemplateName,
+) -> Result<Option<Option<OrgId>>, sqlx::Error> {
+    let owner: Option<Option<Uuid>> =
+        sqlx::query_scalar(sql!("SELECT org_id FROM templates WHERE name = $1"))
+            .bind(template.as_str())
+            .fetch_optional(executor)
+            .await?;
+    Ok(owner.map(|organization_id| organization_id.map(OrgId::from_uuid)))
+}
+
+/// A template's desired state and the delete operation it records.
+#[derive(Debug)]
+pub struct DeleteState {
+    /// The stored desired state, unparsed.
+    pub desired_state: String,
+    pub delete_operation_id: Option<Uuid>,
+    /// Whether the recorded delete operation is still queued or running:
+    /// `false` when it reached a terminal state or was garbage-collected, or
+    /// none is recorded.
+    pub delete_operation_live: bool,
+}
+
+/// `template`'s delete state, or `None` when no row names it.
+pub async fn delete_state(
+    executor: impl PgExecutor<'_>,
+    template: &TemplateName,
+) -> Result<Option<DeleteState>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, Option<Uuid>, bool)>(sql!(
+        "SELECT t.desired_state,
+                t.delete_operation_id,
+                COALESCE(po.state IN ('queued', 'running'), FALSE)
+         FROM templates t
+         LEFT JOIN public_operations po ON po.operation_id = t.delete_operation_id
+         WHERE t.name = $1"
+    ))
+    .bind(template.as_str())
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(
+        |(desired_state, delete_operation_id, delete_operation_live)| DeleteState {
+            desired_state,
+            delete_operation_id,
+            delete_operation_live,
+        },
+    ))
+}
+
+/// What an organization's template rows are, for deleting the organization.
+#[derive(Debug)]
+pub struct OrgTemplates {
+    /// Whether any of them is not deleted; `None` when it owns none.
+    pub any_live: Option<bool>,
+    /// Whether a template release or a node's inventory row names any of
+    /// them; `None` when it owns none.
+    pub any_held: Option<bool>,
+    /// `retention` after the latest of their delete requests (or, without
+    /// one, their last update or creation); `None` when it owns none.
+    pub retained_until: Option<OffsetDateTime>,
+}
+
+/// Summarize `org_id`'s template rows; see [`OrgTemplates`].
+pub async fn org_templates(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+    retention: Duration,
+) -> Result<OrgTemplates, sqlx::Error> {
+    let (any_live, any_held, retained_until) =
+        sqlx::query_as::<_, (Option<bool>, Option<bool>, Option<OffsetDateTime>)>(sql!(
+            "SELECT bool_or(t.desired_state <> $2),
+                    bool_or(
+                        EXISTS (
+                            SELECT 1 FROM template_releases r WHERE r.template_name = t.name
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                              FROM node_template_inventory i
+                             WHERE i.template_name = t.name
+                        )
+                    ),
+                    MAX(COALESCE(t.delete_requested_at, t.updated_at, t.created_at))
+                        + make_interval(secs => $3)
+               FROM templates t
+              WHERE t.org_id = $1"
+        ))
+        .bind(org_id)
+        .bind(TemplateDesiredState::Deleted.as_str())
+        .bind(retention.as_secs_f64())
+        .fetch_one(executor)
+        .await?;
+    Ok(OrgTemplates {
+        any_live,
+        any_held,
+        retained_until,
+    })
+}
+
+/// A template as the admin template routes list it: its row, its policies,
+/// what the builder and the other nodes report of its build, and the
+/// network policy generation nodes observe. `Snapshots` decodes the
+/// inventory's `snapshots` JSON.
+///
+/// The api's admin template create also decodes its upsert's `RETURNING`
+/// row into this type, so a field added here needs a column in that
+/// `RETURNING` list too.
+#[derive(Debug, FromRow)]
+pub struct AdminTemplate<Snapshots> {
+    pub name: String,
+    pub description: Option<String>,
+    pub org_id: Option<OrgId>,
+    pub desired_state: String,
+    pub network_policy_generation: i64,
+    pub created_at: OffsetDateTime,
+    pub built_at: Option<String>,
+    pub content_hash: Option<String>,
+    pub runtime: Option<String>,
+    pub runtime_version: Option<String>,
+    pub arch: Option<String>,
+    pub has_base_snapshot: Option<bool>,
+    pub pool_target: Option<i32>,
+    pub pool_current: Option<i32>,
+    pub artifact_size_bytes: Option<i64>,
+    pub cache_size_bytes: Option<i64>,
+    pub base_snapshot_size_bytes: Option<i64>,
+    pub snapshots: Option<Json<Snapshots>>,
+    pub vcpu: Option<i32>,
+    pub memory_mib: Option<i32>,
+    pub disk_size_mb: Option<i32>,
+    pub default_auto_lifecycle: Option<Json<AutoLifecyclePolicy>>,
+    pub network_policy: Json<NetworkPolicyV1>,
+    pub observed_network_policy_generation: Option<i64>,
+    pub observed_network_policy_authority: Option<String>,
+}
+
+/// Every template that is not deleted, or only `template` when given, by
+/// name. A template without a stored network policy lists deny-all.
+pub async fn list_admin<Snapshots>(
+    executor: impl PgExecutor<'_>,
+    template: Option<&TemplateName>,
+) -> Result<Vec<AdminTemplate<Snapshots>>, sqlx::Error>
+where
+    Snapshots: DeserializeOwned + Send + Unpin + 'static,
+{
+    sqlx::query_as::<_, AdminTemplate<Snapshots>>(
+         sql!("WITH template_names AS (
+             SELECT name
+             FROM templates
+             WHERE desired_state <> $4
+               AND ($3::TEXT IS NULL OR name = $3)
+         ),
+         builder_metadata AS (
+             SELECT DISTINCT ON (nti.template_name)
+                    nti.*
+             FROM node_template_inventory nti
+             JOIN nodes n ON n.id = nti.node_id
+             WHERE n.role = 'builder'
+             ORDER BY nti.template_name, nti.observed_at DESC, nti.built_at DESC NULLS LAST, nti.content_hash ASC
+         ),
+         availability AS (
+             SELECT DISTINCT ON (nti.template_name)
+                    nti.*
+             FROM node_template_inventory nti
+             LEFT JOIN builder_metadata bm ON bm.template_name = nti.template_name
+             WHERE NULLIF(bm.content_hash, '') IS NULL
+                OR nti.content_hash = bm.content_hash
+             ORDER BY nti.template_name,
+                      nti.has_base_snapshot DESC,
+                      nti.observed_at DESC,
+                      nti.content_hash ASC
+         ),
+         pools AS (
+             SELECT nti.template_name,
+                    SUM(nti.pool_target) FILTER (WHERE nti.pool_target IS NOT NULL)::INTEGER AS pool_target,
+                    SUM(nti.pool_current)::INTEGER AS pool_current
+             FROM node_template_inventory nti
+             LEFT JOIN builder_metadata bm ON bm.template_name = nti.template_name
+             WHERE NULLIF(bm.content_hash, '') IS NULL
+                OR nti.content_hash = bm.content_hash
+             GROUP BY nti.template_name
+         ),
+         network_policy_status AS (
+             SELECT substring(element from 10) AS template_name,
+                    MAX(observed_generation) AS observed_network_policy_generation,
+                    CASE
+                        WHEN BOOL_OR(applied_authority = 'local') THEN 'local'
+                        WHEN BOOL_OR(applied_authority = 'cluster') THEN 'cluster'
+                        ELSE NULL
+                    END AS observed_network_policy_authority
+             FROM node_facet_observed_status
+             WHERE facet = $2
+               AND element LIKE 'template:%'
+             GROUP BY substring(element from 10)
+         )
+         SELECT names.name,
+                t.description,
+                t.org_id,
+                t.desired_state,
+                t.network_policy_generation,
+                COALESCE(t.created_at, builder_metadata.observed_at, availability.observed_at) AS created_at,
+                builder_metadata.built_at,
+                NULLIF(builder_metadata.content_hash, '') AS content_hash,
+                builder_metadata.runtime,
+                builder_metadata.runtime_version,
+                builder_metadata.arch,
+                availability.has_base_snapshot,
+                COALESCE(pool_policy.target_count, pools.pool_target) AS pool_target,
+                pools.pool_current,
+                builder_metadata.artifact_size_bytes,
+                availability.cache_size_bytes,
+                availability.base_snapshot_size_bytes,
+                availability.snapshots,
+                builder_metadata.vcpu,
+                builder_metadata.memory_mib,
+                builder_metadata.disk_size_mb,
+                COALESCE(
+                    auto_lifecycle_policy.default_auto_lifecycle_json,
+                    builder_metadata.default_auto_lifecycle_json
+                ) AS default_auto_lifecycle,
+                COALESCE(t.network_policy_json, $1) AS network_policy,
+                network_policy_status.observed_network_policy_generation,
+                network_policy_status.observed_network_policy_authority
+         FROM template_names names
+         JOIN templates t ON t.name = names.name
+         LEFT JOIN builder_metadata ON builder_metadata.template_name = names.name
+         LEFT JOIN availability ON availability.template_name = names.name
+         LEFT JOIN pools ON pools.template_name = names.name
+         LEFT JOIN template_default_auto_lifecycle_policies auto_lifecycle_policy
+                ON auto_lifecycle_policy.template = names.name
+         LEFT JOIN template_pool_policies pool_policy
+                ON pool_policy.template = names.name
+         LEFT JOIN network_policy_status ON network_policy_status.template_name = names.name
+         ORDER BY names.name"),
+    )
+    .bind(Json(NetworkPolicyV1::deny_all()))
+    .bind(ReconcileFacet::NetworkPolicy.as_str())
+    .bind(template.map(TemplateName::as_str))
+    .bind(TemplateDesiredState::Deleted.as_str())
+    .fetch_all(executor)
     .await
 }
 

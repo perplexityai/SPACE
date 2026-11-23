@@ -17,7 +17,6 @@ use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_guest_process::IdempotencyKey;
-use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope,
@@ -62,7 +61,7 @@ use crate::{
     },
     public_template_operations::{DeleteTemplateOperationPayload, TemplateInUse},
     reconcile_queue::{
-        ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx,
+        ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx,
         requeue_node_reconcile_refs_for_nodes_tx,
     },
     reconcile_trigger::enqueue_triggers_tx,
@@ -79,34 +78,8 @@ use crate::{
 
 type ApiErrorResponse = (StatusCode, Json<PublicErrorEnvelope>);
 
-#[derive(Debug, FromRow)]
-struct TemplateRow {
-    name: String,
-    description: Option<String>,
-    org_id: Option<OrgId>,
-    desired_state: String,
-    network_policy_generation: i64,
-    created_at: OffsetDateTime,
-    built_at: Option<String>,
-    content_hash: Option<String>,
-    runtime: Option<String>,
-    runtime_version: Option<String>,
-    arch: Option<String>,
-    has_base_snapshot: Option<bool>,
-    pool_target: Option<i32>,
-    pool_current: Option<i32>,
-    artifact_size_bytes: Option<i64>,
-    cache_size_bytes: Option<i64>,
-    base_snapshot_size_bytes: Option<i64>,
-    snapshots: Option<SqlxJson<Vec<crate::models::SnapshotInfoResponse>>>,
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
-    disk_size_mb: Option<i32>,
-    default_auto_lifecycle: Option<SqlxJson<pplx_space_auto_lifecycle::AutoLifecyclePolicy>>,
-    network_policy: SqlxJson<NetworkPolicyV1>,
-    observed_network_policy_generation: Option<i64>,
-    observed_network_policy_authority: Option<String>,
-}
+type TemplateRow =
+    pplx_space_template_store::templates::AdminTemplate<Vec<crate::models::SnapshotInfoResponse>>;
 
 #[derive(Debug, FromRow)]
 struct TemplateReleaseRow {
@@ -413,102 +386,7 @@ async fn fetch_template_rows(
     pool: &sqlx::PgPool,
     template_name: Option<&TemplateName>,
 ) -> Result<Vec<TemplateRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateRow>(
-         sql!("WITH template_names AS (
-             SELECT name
-             FROM templates
-             WHERE desired_state <> $4
-               AND ($3::TEXT IS NULL OR name = $3)
-         ),
-         builder_metadata AS (
-             SELECT DISTINCT ON (nti.template_name)
-                    nti.*
-             FROM node_template_inventory nti
-             JOIN nodes n ON n.id = nti.node_id
-             WHERE n.role = 'builder'
-             ORDER BY nti.template_name, nti.observed_at DESC, nti.built_at DESC NULLS LAST, nti.content_hash ASC
-         ),
-         availability AS (
-             SELECT DISTINCT ON (nti.template_name)
-                    nti.*
-             FROM node_template_inventory nti
-             LEFT JOIN builder_metadata bm ON bm.template_name = nti.template_name
-             WHERE NULLIF(bm.content_hash, '') IS NULL
-                OR nti.content_hash = bm.content_hash
-             ORDER BY nti.template_name,
-                      nti.has_base_snapshot DESC,
-                      nti.observed_at DESC,
-                      nti.content_hash ASC
-         ),
-         pools AS (
-             SELECT nti.template_name,
-                    SUM(nti.pool_target) FILTER (WHERE nti.pool_target IS NOT NULL)::INTEGER AS pool_target,
-                    SUM(nti.pool_current)::INTEGER AS pool_current
-             FROM node_template_inventory nti
-             LEFT JOIN builder_metadata bm ON bm.template_name = nti.template_name
-             WHERE NULLIF(bm.content_hash, '') IS NULL
-                OR nti.content_hash = bm.content_hash
-             GROUP BY nti.template_name
-         ),
-         network_policy_status AS (
-             SELECT substring(element from 10) AS template_name,
-                    MAX(observed_generation) AS observed_network_policy_generation,
-                    CASE
-                        WHEN BOOL_OR(applied_authority = 'local') THEN 'local'
-                        WHEN BOOL_OR(applied_authority = 'cluster') THEN 'cluster'
-                        ELSE NULL
-                    END AS observed_network_policy_authority
-             FROM node_facet_observed_status
-             WHERE facet = $2
-               AND element LIKE 'template:%'
-             GROUP BY substring(element from 10)
-         )
-         SELECT names.name,
-                t.description,
-                t.org_id,
-                t.desired_state,
-                t.network_policy_generation,
-                COALESCE(t.created_at, builder_metadata.observed_at, availability.observed_at) AS created_at,
-                builder_metadata.built_at,
-                NULLIF(builder_metadata.content_hash, '') AS content_hash,
-                builder_metadata.runtime,
-                builder_metadata.runtime_version,
-                builder_metadata.arch,
-                availability.has_base_snapshot,
-                COALESCE(pool_policy.target_count, pools.pool_target) AS pool_target,
-                pools.pool_current,
-                builder_metadata.artifact_size_bytes,
-                availability.cache_size_bytes,
-                availability.base_snapshot_size_bytes,
-                availability.snapshots,
-                builder_metadata.vcpu,
-                builder_metadata.memory_mib,
-                builder_metadata.disk_size_mb,
-                COALESCE(
-                    auto_lifecycle_policy.default_auto_lifecycle_json,
-                    builder_metadata.default_auto_lifecycle_json
-                ) AS default_auto_lifecycle,
-                COALESCE(t.network_policy_json, $1) AS network_policy,
-                network_policy_status.observed_network_policy_generation,
-                network_policy_status.observed_network_policy_authority
-         FROM template_names names
-         JOIN templates t ON t.name = names.name
-         LEFT JOIN builder_metadata ON builder_metadata.template_name = names.name
-         LEFT JOIN availability ON availability.template_name = names.name
-         LEFT JOIN pools ON pools.template_name = names.name
-         LEFT JOIN template_default_auto_lifecycle_policies auto_lifecycle_policy
-                ON auto_lifecycle_policy.template = names.name
-         LEFT JOIN template_pool_policies pool_policy
-                ON pool_policy.template = names.name
-         LEFT JOIN network_policy_status ON network_policy_status.template_name = names.name
-         ORDER BY names.name"),
-    )
-    .bind(SqlxJson(NetworkPolicyV1::deny_all()))
-    .bind(ReconcileFacet::NetworkPolicy.as_str())
-    .bind(template_name.map(TemplateName::as_str))
-    .bind(TemplateDesiredState::Deleted.as_str())
-    .fetch_all(pool)
-    .await
+    pplx_space_template_store::templates::list_admin(pool, template_name).await
 }
 
 /// The node-discovery read this module's reconcile enqueues begin with.
@@ -1044,22 +922,22 @@ pub async fn delete_template(
         Err(response) => return response.into_response(),
     };
 
-    // The third column is false when the recorded delete operation reached a
+    // The third field is false when the recorded delete operation reached a
     // terminal state or was garbage-collected. Such a delete can never finish
     // on its own, so a new request replaces it instead of returning it.
-    let existing_state = match sqlx::query_as::<_, (String, Option<Uuid>, bool)>(sql!(
-        "SELECT t.desired_state,
-                t.delete_operation_id,
-                COALESCE(po.state IN ('queued', 'running'), FALSE)
-         FROM templates t
-         LEFT JOIN public_operations po ON po.operation_id = t.delete_operation_id
-         WHERE t.name = $1"
-    ))
-    .bind(template_name.as_str())
-    .fetch_optional(&state.pool)
+    let existing_state = match pplx_space_template_store::templates::delete_state(
+        &state.pool,
+        &template_name,
+    )
     .await
     {
-        Ok(value) => value,
+        Ok(value) => value.map(|row| {
+            (
+                row.desired_state,
+                row.delete_operation_id,
+                row.delete_operation_live,
+            )
+        }),
         Err(error) => {
             if let Some(response) = contention_response(ContentionScope::ReadOnly, &error) {
                 return response.into_response();
@@ -2551,18 +2429,13 @@ pub async fn tag_template_release(
                     .await?
                 }
                 None => {
-                    sqlx::query(sql!(
-                        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (template_name, tag) DO NOTHING"
-                    ))
-                    .bind(row.id)
-                    .bind(&row.template_name)
-                    .bind(tag.as_str())
-                    .execute(&mut *tx)
+                    pplx_space_template_store::release_tags::insert_if_absent(
+                        &mut *tx,
+                        row.id,
+                        &row.template_name,
+                        &tag,
+                    )
                     .await?
-                    .rows_affected()
-                        == 1
                 }
             };
             if moved {

@@ -21,14 +21,16 @@
 //! `pplx-space-template-release-store`'s.
 //!
 //! Every verb is a free function over an executor, so it runs in the
-//! caller's transaction. Some statements on these tables still run at
-//! their call sites, among them: the tag move's compare-and-set; reads
-//! that lock rows (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`); writes
-//! guarded by the template's desired state, owner or network policy
-//! generation; statements compared against the database clock, such as
-//! the grant checks, consumption and sweeps, and tombstone retention's
-//! delete; and statements that also read or write another store's
-//! tables.
+//! caller's transaction. Some reads join other stores' tables, such as the
+//! admin template list's node inventory and the create's builder-reported
+//! auto-lifecycle default; none writes them. Some statements on these
+//! tables still run at their call sites, among them: the tag move's lock of
+//! the tag row; reads that lock rows (`FOR UPDATE`, `FOR NO KEY UPDATE`,
+//! `FOR SHARE`); writes guarded by the template's desired state, owner or
+//! network policy generation; statements compared against the database
+//! clock, such as the grant checks, consumption and sweeps, and tombstone
+//! retention's delete; and other statements that also read or write
+//! another store's tables.
 
 pub mod base_snapshot_policies;
 pub mod build_base_grants;
