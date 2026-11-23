@@ -95,6 +95,10 @@ uuid = { workspace = true, features = ["serde"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }
 
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+kvm-bindings = "0.14"
+kvm-ioctls = "0.24"
+
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
 rstest = { workspace = true }

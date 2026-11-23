@@ -943,8 +943,16 @@ impl NodeManagerService {
         );
 
         let client = crate::fc_api::FcApiClient::new(api_socket);
+        // Firecracker only accepts `clock_realtime` when the snapshot's KVM
+        // clock state carries KVM_CLOCK_REALTIME, which the host kernel
+        // decides at snapshot time; probe the host once per node instead of
+        // failing the load (a failed load kills the Firecracker process).
         client
-            .load_snapshot(fc_snapshot_path, fc_mem_file_path)
+            .load_snapshot_with_clock_realtime(
+                fc_snapshot_path,
+                fc_mem_file_path,
+                crate::kvm_clock::host_supports_clock_realtime(),
+            )
             .await
             .map_err(|e| Status::internal(format!("load snapshot failed: {e}")))?;
         // The loaded drive limiter is the one of the VM the snapshot was taken

@@ -10,6 +10,7 @@ pub mod disk_io_reservation;
 mod encrypted_volume;
 pub mod firewall;
 mod host_command;
+mod kvm_clock;
 pub mod lifecycle_limiter;
 #[cfg(target_os = "linux")]
 pub mod loop_devices;
