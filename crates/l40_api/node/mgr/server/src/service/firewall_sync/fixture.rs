@@ -61,6 +61,16 @@ pub(crate) enum BoundSlots {
     All,
 }
 
+/// What a generation's pass has left to run.
+enum Left {
+    /// Not listed yet, or the inventory failed.
+    Unlisted,
+    /// Each slot without a result: its index, ID and listed target.
+    Slots(Vec<(usize, u32, Option<SlotTarget>)>),
+    /// A newer generation replaced it.
+    Superseded,
+}
+
 /// What a slot's result ends besides its own attempt.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Ends {
@@ -104,13 +114,14 @@ impl Wanted {
         }
     }
 
-    /// Clears what never reached nft so it runs again, if anything didn't.
+    /// Clears what never reached nft so it runs again, if anything didn't. The
+    /// listed targets stay, so a slot taken since reads not run again.
     fn retry(&mut self) -> bool {
         let retry = match &mut self.pass {
             Some(Ok(items)) => {
+                let not_run = |done: &FirewallSlotDispatch| done.outcome() == Outcome::NotRun;
                 let mut retry = false;
                 for item in items {
-                    let not_run = |done: &FirewallSlotDispatch| done.outcome() == Outcome::NotRun;
                     if item.dispatch.as_ref().is_some_and(not_run) {
                         item.dispatch = None;
                         retry = true;
@@ -246,12 +257,16 @@ impl FirewallSync {
                     _ = changed.changed() => continue,
                 }
             };
-            let work = match self.unsettled(generation) {
-                Some(work) => work,
-                None => {
+            let work = match self.left(generation) {
+                Left::Slots(work) => work,
+                Left::Superseded => continue,
+                Left::Unlisted => {
                     let pass = self.list(&pool, &target).await;
                     self.update(generation, |wanted| wanted.pass = Some(pass));
-                    self.unsettled(generation).unwrap_or_default()
+                    match self.left(generation) {
+                        Left::Slots(work) => work,
+                        Left::Unlisted | Left::Superseded => continue,
+                    }
                 }
             };
             // Once superseded, the slot apply refuses the rest before nft, and their
@@ -345,24 +360,22 @@ impl FirewallSync {
         Ok(found.into_iter().map(item).collect())
     }
 
-    /// `generation`'s slots still to run, or None until it is listed. Empty
-    /// once a newer generation replaced it.
-    fn unsettled(&self, generation: u64) -> Option<Vec<(usize, u32, Option<SlotTarget>)>> {
+    fn left(&self, generation: u64) -> Left {
         match self.wanted.borrow().as_ref() {
             Some(wanted) if wanted.generation == generation => {
                 let Some(Ok(items)) = &wanted.pass else {
-                    return None;
+                    return Left::Unlisted;
                 };
                 let left = items
                     .iter()
                     .enumerate()
                     .filter(|(_, item)| item.dispatch.is_none());
-                Some(
+                Left::Slots(
                     left.map(|(index, item)| (index, item.slot_id, item.expected.clone()))
                         .collect(),
                 )
             }
-            _ => Some(Vec::new()),
+            _ => Left::Superseded,
         }
     }
 

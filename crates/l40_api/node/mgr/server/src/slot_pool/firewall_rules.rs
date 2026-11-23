@@ -300,6 +300,13 @@ fn apply_blocking(
         Ok(owned) => owned,
         Err(not_run) => return SlotFirewallReport::NotRun(not_run),
     };
+    // Taken under ownership, so an invocation queued behind a newer one
+    // cannot reinstall an older revision. Before the target checks, so
+    // superseded work reads not current rather than changed.
+    let desired = match runnable(assignments.current(), request.node_id, request.generation) {
+        Ok(desired) => desired,
+        Err(not_runnable) => return SlotFirewallReport::NotRun(not_runnable.into()),
+    };
     let info = &owned.record.info;
     let SlotTarget {
         slot_generation,
@@ -322,12 +329,6 @@ fn apply_blocking(
     if expected.is_some_and(|target| target.namespace.is_some_and(|pinned| pinned != namespace)) {
         return SlotFirewallReport::NotRun(NotRun::Changed);
     }
-    // Taken under ownership, so an invocation queued behind a newer one
-    // cannot reinstall an older revision.
-    let desired = match runnable(assignments.current(), request.node_id, request.generation) {
-        Ok(desired) => desired,
-        Err(not_runnable) => return SlotFirewallReport::NotRun(not_runnable.into()),
-    };
     let submitted = install_with(&render(&desired.revision), &netns, nft);
     let readback = verify_with(&desired.revision, &netns, nft);
     let current = still_current(pool, assignments, &desired, &owned.record, &path, namespace);

@@ -349,8 +349,8 @@ fn only_healthy_ready_or_leased_slots_are_eligible() {
     assert_eq!(passed, expected);
 }
 
-// Catches nft run, ownership skipped or kept, the assignment read early, or
-// work started during shutdown.
+// Catches nft run, ownership skipped or kept, the assignment read early or
+// after the target checks, or work started during shutdown.
 #[tokio::test]
 async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
@@ -399,6 +399,15 @@ async fn refusals_never_run_nft() {
         sandbox_id: Some("sandbox-0".into()),
         namespace: Some(host.name(0, "uts")),
     };
+    // Superseded work reads not current, even for a target that changed since.
+    let replaced = SlotTarget {
+        slot_generation: 1,
+        ..current.clone()
+    };
+    assert!(matches!(
+        apply_expecting(&pool, &store, &host, 11, 0, Some(replaced)).await,
+        SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NotCurrent { accepted: 12 }))
+    ));
     for expected in [
         SlotTarget {
             slot_generation: 1,
