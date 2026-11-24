@@ -51,6 +51,7 @@ fn memory_cli_config(memory_mib: Option<u64>) -> NodeMgrRunConfig {
 
 #[rstest::rstest]
 #[case(Some("8192"), Some(4096), Some(2048), Some(4096))]
+#[case(Some("invalid"), Some(4096), Some(2048), Some(4096))]
 #[case(Some(" 8192 "), None, Some(2048), Some(8192))]
 #[case(Some("8192"), None, None, Some(8192))]
 #[case(None, None, Some(2048), Some(2048))]
@@ -85,8 +86,6 @@ fn parent_memory_reserve_precedence(
 #[case("invalid")]
 #[case("-1")]
 #[case("18446744073709551616")]
-#[case("0")]
-#[case("1023")]
 fn parent_memory_reserve_environment_rejects_invalid_values(#[case] value: &str) {
     if !pplx_space_test_env::enter_test_process(&[(
         ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB,
@@ -96,8 +95,7 @@ fn parent_memory_reserve_environment_rejects_invalid_values(#[case] value: &str)
     }
     assert!(matches!(
         resolve_parent_memory_reserve_mib(&memory_cli_config(None), &Default::default()),
-        Err(RunNodeMgrError::EnvNotU64 { .. }
-            | RunNodeMgrError::SandboxCgroupParentMemoryReserveBelowMinimum { .. })
+        Err(RunNodeMgrError::EnvNotU64 { .. })
     ));
 }
 

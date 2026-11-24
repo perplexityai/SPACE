@@ -188,10 +188,6 @@ pub enum RunNodeMgrError {
          ({headroom_mib} MiB), got {memory_mib}"
     )]
     SandboxCgroupMemoryBelowHeadroom { memory_mib: u64, headroom_mib: u64 },
-    #[error(
-        "sandbox_cgroup.parent_memory_reserve_mib must be at least {min_mib} MiB, got {reserve_mib}"
-    )]
-    SandboxCgroupParentMemoryReserveBelowMinimum { reserve_mib: u64, min_mib: u64 },
     #[error("failed to look up a required node-manager runtime group: {0}")]
     RuntimeGroupLookup(#[source] pplx_space_unix_socket_bind::UnixGroupLookupError),
     #[error("missing required node-manager runtime groups: {}", groups.join(", "))]
@@ -497,25 +493,18 @@ fn resolve_parent_memory_reserve_mib(
     cli: &NodeMgrRunConfig,
     file: &SandboxCgroupFileConfig,
 ) -> Result<Option<u64>, RunNodeMgrError> {
-    let reserve_mib = setting(
+    let env = if cli.sandbox_cgroup_parent_memory_reserve_mib.is_some() {
+        None
+    } else {
+        env_u64(ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB)?.map(Some)
+    };
+    Ok(setting(
         "sandbox_cgroup.parent_memory_reserve_mib",
         cli.sandbox_cgroup_parent_memory_reserve_mib.map(Some),
-        env_u64(ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB)?.map(Some),
+        env,
         file.parent_memory_reserve_mib.map(Some),
         None,
-    );
-    if let Some(reserve_mib) = reserve_mib {
-        let min_mib = crate::cgroup::MIN_PARENT_MEMORY_RESERVE_MIB;
-        if reserve_mib < min_mib {
-            return Err(
-                RunNodeMgrError::SandboxCgroupParentMemoryReserveBelowMinimum {
-                    reserve_mib,
-                    min_mib,
-                },
-            );
-        }
-    }
-    Ok(reserve_mib)
+    ))
 }
 
 fn resolve_memory_admission_config(
