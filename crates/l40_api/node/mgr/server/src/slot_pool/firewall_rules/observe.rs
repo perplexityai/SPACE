@@ -45,7 +45,8 @@ pub struct FirewallObservation {
     pub generation: u64,
     pub revision_id: Uuid,
     pub census: Census,
-    /// One per inventory record, in slot order.
+    /// One per first-inventory record, in slot order, then one for each slot
+    /// gap whose slot that inventory missed.
     pub slots: Vec<SlotEvidence>,
 }
 
@@ -65,7 +66,9 @@ pub(crate) const SWEEP_BUDGET: Duration = Duration::from_secs(60);
 /// listed entry is some record's. Gaps come in this order: each eligible
 /// record's, by slot; the listing's failure; each extra entry, sorted by path.
 /// Past [`MAX_CENSUS_GAPS`], the rest are omitted and counted by a final
-/// `Truncated`, so the census is never complete then.
+/// `Truncated`, so the census is never complete then. A `Missing` gap's slot
+/// reads `NamespaceMissing`, and an `Unread` one's `Unconfirmed` or
+/// `NamespaceUnreadable`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Census {
     pub gaps: Vec<CensusGap>,
@@ -345,7 +348,7 @@ fn finalize(
     pool: &NetworkPool,
     host: &dyn SlotHost,
     reached: &[Reached],
-    slots: &mut [SlotEvidence],
+    slots: &mut Vec<SlotEvidence>,
 ) -> Census {
     let now = pool.all_records().ok();
     let listed = listing(host);
@@ -382,6 +385,10 @@ fn finalize(
         };
     };
     let mut gaps = Gaps::new(MAX_CENSUS_GAPS);
+    let mut entries: HashMap<_, _> = (0..)
+        .zip(slots.iter())
+        .map(|(i, s)| (s.slot_id, i))
+        .collect();
     let paths: Vec<_> = now
         .iter()
         .map(|record| host.namespace_path(&record.info))
@@ -395,6 +402,7 @@ fn finalize(
         let slot_id = record.info.slot;
         let Some(&(index, stands)) = readings.get(&slot_id) else {
             gaps.push(CensusGap::Unread { slot_id });
+            account(slots, &mut entries, record, Unknown::Unconfirmed);
             continue;
         };
         // Gone from the final listing, or outside the declared directory.
@@ -404,8 +412,10 @@ fn finalize(
         let outcome = slots.get(index).map(|slot| slot.outcome);
         if unlisted || outcome == Some(SlotOutcome::Unknown(Unknown::NamespaceMissing)) {
             gaps.push(CensusGap::Missing { slot_id });
+            account(slots, &mut entries, record, Unknown::NamespaceMissing);
         } else if !stands {
             gaps.push(CensusGap::Unread { slot_id });
+            account(slots, &mut entries, record, Unknown::Unconfirmed);
         }
     }
     match listed {
@@ -420,6 +430,45 @@ fn finalize(
     }
     Census {
         gaps: gaps.finish(),
+    }
+}
+
+/// Makes `record`'s slot say why its gap is unknown, at its final lifecycle.
+/// An unreadable namespace at that lifecycle already says why it is unread.
+fn account(
+    slots: &mut Vec<SlotEvidence>,
+    entries: &mut HashMap<u32, usize>,
+    record: &SlotRecord,
+    why: Unknown,
+) {
+    let (outcome, target) = (SlotOutcome::Unknown(why), SlotTarget::of(&record.info));
+    let unreadable = SlotOutcome::Unknown(Unknown::NamespaceUnreadable);
+    let lifecycle = |target: &SlotTarget| (target.slot_generation, target.sandbox_id.clone());
+    let slot_id = record.info.slot;
+    match entries
+        .get(&slot_id)
+        .and_then(|&index| slots.get_mut(index))
+    {
+        Some(slot) if lifecycle(&slot.target) == lifecycle(&target) => {
+            if why != Unknown::Unconfirmed || slot.outcome != unreadable {
+                slot.outcome = outcome;
+            }
+        }
+        Some(slot) => {
+            *slot = SlotEvidence {
+                slot_id,
+                target,
+                outcome,
+            }
+        }
+        None => {
+            entries.insert(slot_id, slots.len());
+            slots.push(SlotEvidence {
+                slot_id,
+                target,
+                outcome,
+            });
+        }
     }
 }
 

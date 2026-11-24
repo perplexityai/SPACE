@@ -4,7 +4,7 @@
 use super::*;
 use crate::slot_pool::firewall_rules::NamespaceIdentity;
 use crate::slot_pool::firewall_rules::tests::{
-    FakeHost, Fault, NODE, accept, bounded, busy, fake_nft, hook, installed, poison, pool,
+    FakeHost, Fault, NODE, accept, bounded, busy, fake_nft, heal, hook, installed, poison, pool,
     set_slot, store,
 };
 use crate::slot_pool::{SlotInfo, SlotState};
@@ -183,8 +183,8 @@ fn gaps_past_the_bound_keep_a_prefix_and_end_in_a_count() {
 }
 
 // Catches a reading kept or counted after its namespace or slot changed, a
-// census judged before the last read, or a superseded generation's readings
-// returned.
+// slot gap whose slot gives another reason, a census judged before the last
+// read, or a superseded generation's readings returned.
 #[tokio::test]
 async fn changes_before_finalizing_leave_no_reading_standing() {
     use SlotState::{Dirty, Leased, Ready};
@@ -214,12 +214,20 @@ async fn changes_before_finalizing_leave_no_reading_standing() {
     let observed = observe(&pool, &store, host.clone(), &nft, SWEEP_BUDGET).await;
     let observed = observed.unwrap();
     let unconfirmed = SlotOutcome::Unknown(Unknown::Unconfirmed);
-    let outcomes: Vec<_> = observed.slots.iter().map(|slot| slot.outcome).collect();
-    let ineligible = SlotOutcome::Unknown(Unknown::Ineligible);
-    assert_eq!(
-        outcomes,
-        [unconfirmed, unconfirmed, ineligible, unconfirmed]
-    );
+    let outcomes: Vec<_> = observed
+        .slots
+        .iter()
+        .map(|slot| (slot.outcome, slot.target.slot_generation))
+        .collect();
+    let missing = SlotOutcome::Unknown(Unknown::NamespaceMissing);
+    // Each slot gap's slot at its final lifecycle.
+    let final_lifecycles = [
+        (unconfirmed, 1),
+        (unconfirmed, 2),
+        (unconfirmed, 1),
+        (missing, 1),
+    ];
+    assert_eq!(outcomes, final_lifecycles);
     let gaps = [
         CensusGap::Unread { slot_id: 0 },
         CensusGap::Unread { slot_id: 1 },
@@ -241,4 +249,44 @@ async fn changes_before_finalizing_leave_no_reading_standing() {
         "{superseded:?}"
     );
     assert_eq!(host.installs(), []);
+}
+
+// Catches an unread slot that names no slot entry, or one at a lifecycle
+// other than its final one or with another reason, when only the final
+// inventory lists it.
+#[tokio::test]
+async fn a_slot_only_the_final_inventory_lists_is_unknown_with_its_gap() {
+    use SlotState::{Dirty, Leased, Ready};
+    let (pool, _jobs) = pool(3);
+    let (_dir, store) = store(Some(12));
+    let host = FakeHost::new(None);
+    for ((slot_id, state), generation) in (0..).zip([Leased, Dirty, Ready]).zip([3, 1, 4]) {
+        set_slot(&pool, slot_id, state, generation);
+        host.name(slot_id, ["net", "uts", "ipc"][slot_id as usize]);
+    }
+    // The first inventory read fails, and the final one succeeds.
+    poison(&pool);
+    let healed = pool.clone();
+    hook(&host.observed, move || heal(&healed));
+    let nft = fake_nft(&host);
+    let observed = observe(&pool, &store, host.clone(), &nft, SWEEP_BUDGET).await;
+    let observed = observed.unwrap();
+    let unread = |slot_id, slot_generation, sandbox_id: Option<&str>| SlotEvidence {
+        slot_id,
+        target: SlotTarget {
+            slot_generation,
+            sandbox_id: sandbox_id.map(str::to_owned),
+            namespace: None,
+        },
+        outcome: SlotOutcome::Unknown(Unknown::Unconfirmed),
+    };
+    let gaps = [
+        CensusGap::Unread { slot_id: 0 },
+        CensusGap::Unread { slot_id: 2 },
+    ];
+    assert_eq!(observed.census.gaps, gaps);
+    assert_eq!(
+        observed.slots,
+        [unread(0, 3, Some("sandbox-0")), unread(2, 4, None)]
+    );
 }
