@@ -21,7 +21,7 @@ const FAMILY: &str = "ip";
 const TABLE: &str = "space_firewall_rules";
 const CHAIN: &str = "guest_drop";
 // After conntrack (-200) and just ahead of the baseline pre-TPROXY guardrails.
-const PRIORITY: i32 = super::PRE_TPROXY_GUARDRAILS_PRIO - 1;
+pub(crate) const PRIORITY: i32 = super::PRE_TPROXY_GUARDRAILS_PRIO - 1;
 
 /// Runs nft with these arguments and stdin, within the budget, in the
 /// namespace the descriptor pins.

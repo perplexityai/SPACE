@@ -19,7 +19,10 @@
 //! it again.
 //!
 //! An `All` binding also gates each runtime launch (`start`). A start waits for
-//! the pass to settle first. A launch whose outcome is unknown ends the binding.
+//! the pass to settle, then applies the accepted assignment to its own slot
+//! and reads that result by the same rule: one that ends the binding ends it,
+//! and a changed target refuses only that start. Only a match launches. A
+//! launch whose outcome is unknown ends the binding.
 //!
 //! A production binding is expected to build on this worker. First it must
 //! revisit the node-wide end rule, re-listing on retry, and per-slot reporting,
@@ -123,7 +126,8 @@ pub(crate) struct FirewallSync {
     fixture: FirewallSyncFixture,
     assignments: Arc<FirewallAssignments>,
     wanted: watch::Sender<Option<Wanted>>,
-    /// Cancelled once the worker ends, which ends the binding.
+    /// Cancelled once the binding ends: the worker ends, or a start's apply or
+    /// launch leaves an uncertain result.
     ended: CancellationToken,
     /// Recent verification rounds, for replay.
     rounds: std::sync::Mutex<rounds::Rounds>,
@@ -272,9 +276,9 @@ impl FirewallSync {
 
     /// Under a node-wide binding, runs `launch` only after the accepted
     /// assignment is applied to the lease's slot and read back in the
-    /// namespace the launcher opens; every refusal comes before dispatch. A
-    /// launch that fails or is dropped may have started its guest, so it ends
-    /// the binding.
+    /// namespace the launcher opens; every refusal comes before dispatch. An
+    /// apply result that ends a pass's binding ends this one too. A launch that
+    /// fails or is dropped may have started its guest, so it ends the binding.
     pub(in crate::service) async fn start<T>(
         &self,
         pool: &Arc<NetworkPool>,
@@ -322,12 +326,22 @@ impl FirewallSync {
             }),
         };
         let (host, nft) = (self.fixture.host.clone(), self.fixture.nft.clone());
-        let attempt = match pool
+        let report = pool
             .apply_firewall_rules_with(&self.assignments, request, host, nft)
-            .await
-        {
+            .await;
+        let (done, ends) = dispatch(&report);
+        if ends.binding(self.fixture.slots) {
+            tracing::warn!(
+                generation = accepted.generation,
+                slot_id = lease.slot,
+                outcome = ?done.outcome(),
+                "fixture firewall sync binding ended"
+            );
+            // Under `_order`, so no acceptance follows.
+            self.ended.cancel();
+        }
+        let attempt = match report {
             Ok(SlotFirewallReport::Attempted(attempt)) if attempt.verified() => attempt,
-            // Even an uncertain result only refuses: no guest runs, and the next start reinstalls.
             report => return Err(refused(format!("{report:?}"))),
         };
         // The launcher opens the namespace by this path.
@@ -337,6 +351,10 @@ impl FirewallSync {
         });
         if entry.ok() != Some(attempt.namespace) {
             return Err(refused("the launch names another namespace".into()));
+        }
+        // Another start ended the binding during this one's apply.
+        if self.ended.is_cancelled() {
+            return Err(refused("the binding ended".into()));
         }
         // Dropped before `_order`, so no acceptance follows an unknown outcome.
         let unknown = self.ended.clone().drop_guard();

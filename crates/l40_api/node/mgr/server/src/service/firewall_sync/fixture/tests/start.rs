@@ -106,11 +106,15 @@ enum Refusal {
     LeasedAgain,
     /// The launch names slot 1's namespace entry.
     OtherNamespace,
+    /// The node-wide pass is held past the start's wait.
+    PassRunning,
 }
 
 // Catches a start launched without a usable assignment, on an idle slot's
 // earlier result, on a readback that mismatched, was inconclusive or never
-// ran, or for an occupant or namespace other than the launch's own.
+// ran, for an occupant or namespace other than the launch's own, or while the
+// pass still runs; or an inconclusive readback that leaves the binding open,
+// or drift that ends it.
 #[tokio::test]
 async fn a_start_that_does_not_verify_never_launches() {
     use Refusal::*;
@@ -122,10 +126,16 @@ async fn a_start_that_does_not_verify_never_launches() {
         UnreadableNamespace,
         LeasedAgain,
         OtherNamespace,
+        PassRunning,
     ] {
         let fault = matches!(case, Inconclusive).then_some(Fault::Unlistable);
         let accepted = (!matches!(case, NoAssignment | MatchedIdleThenMismatched)).then_some(12);
-        let mut bound = bind_all(fault, accepted).await;
+        let wait = match case {
+            PassRunning => Duration::from_millis(100),
+            _ => WAIT,
+        };
+        let ready = [SlotState::Ready; 2];
+        let mut bound = bind_slots(BoundSlots::All, fault, accepted, wait, &ready).await;
         if let MatchedIdleThenMismatched = case {
             sync_all(&bound.service, 12).await;
             let matched = Some(Outcome::Matched);
@@ -135,6 +145,7 @@ async fn a_start_that_does_not_verify_never_launches() {
         let lease = pooled(&bound.service).await;
         let launched = launcher(&mut bound, &lease, || Ok(()));
         let mut link = bound.host.link(0);
+        let mut pass = None;
         match case {
             NoAssignment | Inconclusive => {}
             Unavailable => {
@@ -152,15 +163,32 @@ async fn a_start_that_does_not_verify_never_launches() {
                 set_slot(&bound.service.pool, 0, SlotState::Leased, again);
             }
             OtherNamespace => link = bound.host.link(1),
+            PassRunning => {
+                let (entered, release) = gate(&bound.host.installed);
+                sync_all(&bound.service, 12).await;
+                bounded(entered).await.unwrap();
+                pass = Some(release);
+            }
         }
         let installs = bound.host.installs().len();
         let refused = start(&bound.service, &lease, &link).await.unwrap_err();
+        drop(pass);
         assert_eq!(
             refused.code(),
             Code::FailedPrecondition,
             "{case:?}: {refused}"
         );
         assert_eq!(*launched.lock().unwrap(), [], "{case:?}");
+        let binding = bound.service.firewall_sync.clone().unwrap();
+        assert_eq!(
+            binding.ended.is_cancelled(),
+            matches!(case, Inconclusive),
+            "{case:?}"
+        );
+        if let PassRunning = case {
+            // The held pass owns the slot, so an apply would be refused too.
+            assert!(refused.message().contains("still running"), "{refused}");
+        }
         if let MatchedIdleThenMismatched = case {
             assert_eq!(
                 bound.host.installs().len(),
@@ -257,4 +285,28 @@ async fn an_unknown_launch_outcome_ends_the_binding() {
     assert_eq!(bound.host.installs(), [bound.namespaces[0]]);
     let sync = bound.service.firewall_sync.clone().unwrap();
     assert_eq!(sync.assignments.current().unwrap().unwrap().generation, 12);
+}
+
+// Catches a start that launches after another start's unknown outcome ended
+// the binding during its apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_after_another_s_unknown_outcome_never_launches() {
+    let mut bound = bind_all(None, Some(12)).await;
+    let (first, second) = (pooled(&bound.service).await, pooled(&bound.service).await);
+    let launched = launcher(&mut bound, &first, || {
+        Err(Status::deadline_exceeded("launch timed out"))
+    });
+    // The second start is held after its install while the first one fails.
+    let (entered, release) = gate(&bound.host.installed);
+    let (service, link) = (bound.service.clone(), bound.host.link(second.slot));
+    let held = tokio::spawn(async move { start(&service, &second, &link).await });
+    bounded(entered).await.unwrap();
+    start(&bound.service, &first, &bound.host.link(first.slot))
+        .await
+        .unwrap_err();
+    assert_eq!(launched.lock().unwrap().len(), 1);
+    release.send(()).unwrap();
+    let refused = bounded(held).await.unwrap().unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert_eq!(launched.lock().unwrap().len(), 1);
 }

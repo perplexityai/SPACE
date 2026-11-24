@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use pplx_space_node_runtime_core::proto::LaunchRuntimeResponse;
 
 use super::*;
-use crate::firewall::rules::render;
+use crate::firewall::rules::{PRIORITY, render};
 use crate::netns_tests::{TestNamespace, contained, inside, link_guest};
 use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
 use crate::slot_pool::firewall_rules::tests::linux::{Redirected, list, owned_table};
@@ -149,17 +149,20 @@ fn a_start_s_first_guest_traffic_meets_the_accepted_assignment() {
     let earlier = pplx_space_firewall_rules_protocol::decode_revision(&document(11)).unwrap();
     let outcome = contained(|| crate::firewall::rules::install::install(&render(&earlier), &netns));
     assert!(matches!(outcome, InstallOutcome::Committed), "{outcome:?}");
-    // Counts tap0 packets just before and just after the owned chain (-176).
-    let probe = r#"table ip probe {
-        chain before { type filter hook prerouting priority -177;
+    // Counts tap0 packets just before and just after the owned chain.
+    let (before, after) = (PRIORITY - 1, PRIORITY + 1);
+    let probe = format!(
+        r#"table ip probe {{
+        chain before {{ type filter hook prerouting priority {before};
             iifname "tap0" tcp dport 12 counter comment "before-12"
             iifname "tap0" tcp dport 13 counter comment "before-13"
-        }
-        chain after { type filter hook prerouting priority -175;
+        }}
+        chain after {{ type filter hook prerouting priority {after};
             iifname "tap0" tcp dport 12 counter comment "after-12"
             iifname "tap0" tcp dport 13 counter comment "after-13"
-        }
-    }"#;
+        }}
+    }}"#
+    );
     let added =
         contained(|| crate::firewall::rules::nft(&netns, &["-f", "-"], probe.as_bytes(), budget));
     assert!(added.unwrap().status.success());
