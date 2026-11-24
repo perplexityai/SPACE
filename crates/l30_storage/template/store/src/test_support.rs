@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 /// Point `tag` of `template_name` at `release`, as a tag written before the
 /// shared original-release rule could: nothing here checks that `release` is
-/// the digest original. Tests over
+/// the digest original. Like a binary older than
+/// `template_releases.first_mutable_tag_at`, it leaves that column alone; a
+/// test that needs the mark tags through [`crate::release_tags`]. Tests over
 /// `pplx_space_template_release_store::spelling_pairs` tag the pair's other
 /// release with it.
 pub async fn tag_release(

@@ -7,6 +7,18 @@
 //! [`insert_if_absent`]. Release registration share-locks the tags it
 //! confirms with [`share_lock_tags_of_digest`]. Each locking verb takes the
 //! caller's transaction, and its lock lasts until that transaction ends.
+//!
+//! Every verb that points a tag at a release also records, in the same
+//! statement, when a mutable tag first landed on it:
+//! `template_releases.first_mutable_tag_at`, set when the tag isn't the
+//! release's own digest in either spelling and the release has no time yet.
+//! The tag is compared with both spellings exactly: a bare hash is always
+//! SHA-256, so it and its `sha256:` form are one digest, and a hash with
+//! another algorithm's prefix has only its own spelling. The time is the
+//! transaction's, but never before the release's `created_at`, which
+//! registration stamps with `clock_timestamp()` in the same transaction. A
+//! release's digest tag never sets it, and moving a tag off the release never
+//! clears it.
 
 use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
@@ -46,18 +58,34 @@ pub async fn retarget(
     template_name: &str,
     tag: &TemplateTag,
 ) -> Result<bool, DbError> {
-    let result = sqlx::query(sql!(
-        "UPDATE template_release_tags
-                     SET template_release_id = $1,
-                         modified_at = NOW()
-                     WHERE template_name = $2 AND tag = $3"
+    let moved = sqlx::query_scalar::<_, i64>(sql!(
+        "WITH moved AS (
+             UPDATE template_release_tags
+             SET template_release_id = $1,
+                 modified_at = NOW()
+             WHERE template_name = $2 AND tag = $3
+             RETURNING template_release_id, tag
+         ), marked AS (
+             UPDATE template_releases release
+             SET first_mutable_tag_at = GREATEST(NOW(), release.created_at)
+             FROM moved
+             WHERE release.id = moved.template_release_id
+               AND release.first_mutable_tag_at IS NULL
+               AND moved.tag <> release.hash
+               AND moved.tag <> CASE
+                   WHEN release.hash LIKE 'sha256:%' THEN substr(release.hash, 8)
+                   WHEN release.hash LIKE '%:%' THEN release.hash
+                   ELSE 'sha256:' || release.hash
+               END
+         )
+         SELECT COUNT(*) FROM moved"
     ))
     .bind(release_id)
     .bind(template_name)
     .bind(tag.as_str())
-    .execute(executor.into_sqlx())
+    .fetch_one(executor.into_sqlx())
     .await?;
-    Ok(result.rows_affected() == 1)
+    Ok(moved == 1)
 }
 
 /// Create `tag` of `template_name`, pointing at `release_id`. `false` when
@@ -69,17 +97,33 @@ pub async fn insert_if_absent(
     template_name: &str,
     tag: &TemplateTag,
 ) -> Result<bool, DbError> {
-    let result = sqlx::query(sql!(
-        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (template_name, tag) DO NOTHING"
+    let inserted = sqlx::query_scalar::<_, i64>(sql!(
+        "WITH inserted AS (
+             INSERT INTO template_release_tags (template_release_id, template_name, tag)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (template_name, tag) DO NOTHING
+             RETURNING template_release_id, tag
+         ), marked AS (
+             UPDATE template_releases release
+             SET first_mutable_tag_at = GREATEST(NOW(), release.created_at)
+             FROM inserted
+             WHERE release.id = inserted.template_release_id
+               AND release.first_mutable_tag_at IS NULL
+               AND inserted.tag <> release.hash
+               AND inserted.tag <> CASE
+                   WHEN release.hash LIKE 'sha256:%' THEN substr(release.hash, 8)
+                   WHEN release.hash LIKE '%:%' THEN release.hash
+                   ELSE 'sha256:' || release.hash
+               END
+         )
+         SELECT COUNT(*) FROM inserted"
     ))
     .bind(release_id)
     .bind(template_name)
     .bind(tag.as_str())
-    .execute(executor.into_sqlx())
+    .fetch_one(executor.into_sqlx())
     .await?;
-    Ok(result.rows_affected() == 1)
+    Ok(inserted == 1)
 }
 
 /// A tag as release registration reads it back.
@@ -99,12 +143,27 @@ pub async fn upsert(
     tag: &str,
 ) -> Result<RegisteredTag, DbError> {
     Ok(sqlx::query_as::<_, RegisteredTag>(sql!(
-        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (template_name, tag) DO UPDATE
-             SET template_release_id = EXCLUDED.template_release_id,
-                 modified_at = NOW()
-         RETURNING id, tag, created_at"
+        "WITH upserted AS (
+             INSERT INTO template_release_tags (template_release_id, template_name, tag)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (template_name, tag) DO UPDATE
+                 SET template_release_id = EXCLUDED.template_release_id,
+                     modified_at = NOW()
+             RETURNING id, template_release_id, tag, created_at
+         ), marked AS (
+             UPDATE template_releases release
+             SET first_mutable_tag_at = GREATEST(NOW(), release.created_at)
+             FROM upserted
+             WHERE release.id = upserted.template_release_id
+               AND release.first_mutable_tag_at IS NULL
+               AND upserted.tag <> release.hash
+               AND upserted.tag <> CASE
+                   WHEN release.hash LIKE 'sha256:%' THEN substr(release.hash, 8)
+                   WHEN release.hash LIKE '%:%' THEN release.hash
+                   ELSE 'sha256:' || release.hash
+               END
+         )
+         SELECT id, tag, created_at FROM upserted"
     ))
     .bind(release_id)
     .bind(template_name)

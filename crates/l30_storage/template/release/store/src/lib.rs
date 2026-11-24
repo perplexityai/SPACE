@@ -37,6 +37,9 @@
 //!   and twin checks are [`lookup`]'s, internal-api's catalog lookups are
 //!   [`catalog`]'s, and registration's original lookup is
 //!   [`registration::original_release`];
+//! * `pplx-space-template-store`'s tag verbs set `first_mutable_tag_at` on
+//!   the release a tag lands on, in the statement that writes the tag, under
+//!   a co-writer grant in `ARCHITECTURE.toml`;
 //! * other reads of other tables that join a release, and test fixtures,
 //!   stay where they are; the create's tag lookup, which reads the tags,
 //!   is [`lookup::resolve_by_tag`].

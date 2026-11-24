@@ -191,15 +191,27 @@ WHERE t.name = :'name'
   AND r.org_id IS NULL
   AND :digest_original;
 
-INSERT INTO template_release_tags (template_release_id, template_name, tag)
-SELECT r.id, r.template_name, 'latest'
-FROM template_releases r
-WHERE r.template_name = :'name'
-  AND r.hash IN (replace(:'hash', 'sha256:', ''),
-                 'sha256:' || replace(:'hash', 'sha256:', ''))
-  AND :digest_original
-ON CONFLICT (template_name, tag) DO UPDATE
-SET template_release_id = EXCLUDED.template_release_id;
+-- `latest` is a mutable tag, so the release it lands on records when one
+-- first did, in the same statement, as the template store's tag verbs do.
+-- The release may have been inserted above, stamped with clock_timestamp(),
+-- so the time is never before its created_at.
+WITH tagged AS (
+  INSERT INTO template_release_tags (template_release_id, template_name, tag)
+  SELECT r.id, r.template_name, 'latest'
+  FROM template_releases r
+  WHERE r.template_name = :'name'
+    AND r.hash IN (replace(:'hash', 'sha256:', ''),
+                   'sha256:' || replace(:'hash', 'sha256:', ''))
+    AND :digest_original
+  ON CONFLICT (template_name, tag) DO UPDATE
+  SET template_release_id = EXCLUDED.template_release_id
+  RETURNING template_release_id
+)
+UPDATE template_releases
+SET first_mutable_tag_at = GREATEST(NOW(), template_releases.created_at)
+FROM tagged
+WHERE template_releases.id = tagged.template_release_id
+  AND template_releases.first_mutable_tag_at IS NULL;
 
 INSERT INTO template_release_storage_locations (
   template_release_id,
