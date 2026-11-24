@@ -22,6 +22,7 @@ use pplx_space_sandbox_model::{
 };
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
+use pplx_space_sandbox_store::orphan::try_lock_orphan_observation;
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
 use tonic::Status;
@@ -448,6 +449,22 @@ async fn apply_receipt(
     origin_node_id: NodeId,
     completion: &ParsedCompletion,
 ) -> Result<ReceiptOutcome, Status> {
+    // Publication can hold the observation row while advancing sandbox
+    // clocks. Neither writer can wait on the other while holding the row
+    // it needs, so acquire the shared protocol's exclusive lock before the
+    // sandbox row. Do not wait: this transaction can already hold publication
+    // locks, including a shared lock for this very sandbox.
+    if !try_lock_orphan_observation(tx, completion.sandbox_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("lock auto-lifecycle delete observation: {error}"))
+        })?
+    {
+        return Ok(ReceiptOutcome::Deferred(
+            AutoLifecycleDeleteCompletionReason::LockContended,
+        ));
+    }
+
     let row = sqlx::query_as::<_, CompletionAuthorityRow>(sql!(
         "SELECT s.lifecycle,
                 s.auto_lifecycle_json,

@@ -169,6 +169,126 @@ async fn sandbox_exists(pool: &sqlx::PgPool, sandbox_id: SandboxId) -> TestResul
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn receipt_defers_while_publication_holds_observation_then_retries() -> TestResult {
+    use std::time::Duration;
+
+    use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
+
+    use crate::proto::PublishedSandboxState;
+    use crate::published_state::publish_sandbox_states;
+
+    let db = pg_test_db_with_max_connections(4).await?;
+    let sandbox_id = SandboxId::new();
+    let node_id = NodeId::new();
+    let receipt_id = AutoLifecycleDeleteReceiptId::generate();
+    let route_activation_id = seed_active_sandbox(&db.pool, sandbox_id, node_id, 7).await?;
+    let receipt = completion(
+        receipt_id,
+        sandbox_id,
+        7,
+        route_activation_id,
+        matching_policy_fingerprint(),
+    );
+    let mut state = PublishedSandboxState {
+        sandbox_id: sandbox_id.to_string(),
+        status: Some("started".to_owned()),
+        present: true,
+        ..Default::default()
+    };
+    let mut seed = db.pool.begin().await?;
+    publish_sandbox_states(&mut seed, node_id, std::slice::from_ref(&state)).await?;
+    seed.commit().await?;
+
+    // Pause publication after it writes the observation, before it updates
+    // the sandbox clocks. The old receipt path can then claim the sandbox
+    // row and wait on this same gate while reading snapshot evidence.
+    let mut gate = db.pool.begin().await?;
+    let gate_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *gate)
+        .await?;
+    sqlx::query(sql!("LOCK TABLE snapshots IN ACCESS EXCLUSIVE MODE"))
+        .execute(&mut *gate)
+        .await?;
+    let monitor_pool = &db.pool;
+    let wait_at_gate = |count| async move {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sqlx::query_scalar::<_, i64>(sql!(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND $1 = ANY(pg_blocking_pids(pid))"
+            ))
+            .bind(gate_pid)
+            .fetch_one(monitor_pool)
+            .await?
+                < count
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            TestResult::Ok(())
+        })
+        .await?
+    };
+
+    state.uptime = Some("1m".to_owned());
+    state.last_access_at = Some(prost_types::Timestamp {
+        seconds: 1_900_000_000,
+        nanos: 0,
+    });
+    let pool = db.pool.clone();
+    let concurrent_state = state.clone();
+    let publishing = tokio::spawn(async move {
+        let mut tx = pool.begin().await?;
+        sqlx::query(sql!("SET LOCAL deadlock_timeout = '100ms'"))
+            .execute(&mut *tx)
+            .await?;
+        publish_sandbox_states(&mut tx, node_id, &[concurrent_state]).await?;
+        tx.commit().await?;
+        TestResult::Ok(())
+    });
+    wait_at_gate(1).await?;
+
+    let pool = db.pool.clone();
+    let first_receipt = receipt.clone();
+    let mut deleting = tokio::spawn(async move {
+        let mut tx = pool.begin().await?;
+        sqlx::query(sql!("SET LOCAL deadlock_timeout = '1500ms'"))
+            .execute(&mut *tx)
+            .await?;
+        let consumption =
+            consume_auto_lifecycle_delete_completions(&mut tx, node_id, &[first_receipt]).await?;
+        tx.commit().await?;
+        TestResult::Ok(consumption.acknowledged_receipt_ids)
+    });
+    // Let an older receipt path reach the blocking point before opening the
+    // gate, but a correct receipt must return without waiting for the writer.
+    let deferred = tokio::select! {
+        result = &mut deleting => Some(result),
+        blocked = wait_at_gate(2) => { blocked?; None }
+    };
+    gate.commit().await?;
+
+    let published = tokio::time::timeout(Duration::from_secs(4), publishing).await??;
+    assert!(published.is_ok(), "publication failed: {published:?}");
+    let deferred = deferred.expect("receipt must defer before publication completes")??;
+    assert!(
+        deferred.is_empty(),
+        "contended receipt must not be acknowledged"
+    );
+    assert!(sandbox_exists(&db.pool, sandbox_id).await?);
+
+    let mut retry = db.pool.begin().await?;
+    // A later publication carries the unacknowledged receipt again. Its own
+    // shared lock must not prevent it from acquiring the exclusive lock.
+    publish_sandbox_states(&mut retry, node_id, &[state]).await?;
+    let consumed =
+        consume_auto_lifecycle_delete_completions(&mut retry, node_id, &[receipt]).await?;
+    retry.commit().await?;
+    assert_eq!(consumed.acknowledged_receipt_ids, vec![receipt_id]);
+    assert!(!sandbox_exists(&db.pool, sandbox_id).await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn matching_generation_and_node_deletes_and_acknowledges() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

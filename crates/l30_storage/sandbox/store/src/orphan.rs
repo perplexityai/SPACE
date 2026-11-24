@@ -81,6 +81,22 @@ pub async fn lock_orphan_observation(
     Ok(())
 }
 
+/// Try the same exclusive observation lock as [`lock_orphan_observation`]
+/// without waiting. Take it before locking the sandbox row; a caller using a
+/// savepoint releases the lock on rollback and keeps it on commit.
+pub async fn try_lock_orphan_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, $2))"
+    ))
+    .bind(sandbox_id)
+    .bind(ORPHAN_OBSERVATION_LOCK_SEED)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 /// The classification guard a statement here re-checks, with the values it
 /// binds: the reconciler's own guard, converted at its call site, and the
 /// same lifecycle sets and create age it binds into its plan read.
