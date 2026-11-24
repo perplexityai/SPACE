@@ -84,9 +84,6 @@ pplx-space-credmgr = [
 pplx-space-internal-api-server = [
   "sqlx",
 ]
-pplx-space-node-mgr = [
-  "rusqlite",
-]
 pplx-space-node-runtime-manager = [
   "aws-sdk-s3",
   "pplx-space-s3-http-client",

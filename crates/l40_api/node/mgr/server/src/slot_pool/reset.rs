@@ -290,7 +290,7 @@ pub(super) async fn reset_slot_with(
         let Ok(mut conn) = pool.db.lock() else {
             return ResetAttempt::Done;
         };
-        let Ok(tx) = conn.transaction() else {
+        let Ok(tx) = Transaction::deferred(&mut conn) else {
             return ResetAttempt::Done;
         };
         let record = match query_record_by_slot(&tx, slot_id) {

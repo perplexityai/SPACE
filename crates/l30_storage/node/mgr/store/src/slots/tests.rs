@@ -1,8 +1,6 @@
 //! Each guarded transition wins on the slot it names and, once one guarded
 //! column disagrees, matches no row and changes nothing.
 
-use rusqlite::Connection;
-
 use super::*;
 use crate::tests::migrated_db;
 
@@ -12,7 +10,8 @@ const NOW: u64 = 1_000;
 fn slot(set: &str) -> Connection {
     let conn = migrated_db();
     insert_missing_slot(&conn, 0, "slot-0", 4, 1).unwrap();
-    conn.execute_batch(&format!("UPDATE network_slots SET {set} WHERE slot_id = 0"))
+    conn.0
+        .execute_batch(&format!("UPDATE network_slots SET {set} WHERE slot_id = 0"))
         .unwrap();
     conn
 }
@@ -20,6 +19,7 @@ fn slot(set: &str) -> Connection {
 /// Every column of every slot.
 fn rows(conn: &Connection) -> Vec<String> {
     let mut stmt = conn
+        .0
         .prepare("SELECT * FROM network_slots ORDER BY slot_id")
         .unwrap();
     let columns = stmt.column_count();
@@ -38,11 +38,7 @@ fn rows(conn: &Connection) -> Vec<String> {
 /// matches no row and leaves every column as it was. Returns the winning
 /// case's database.
 #[track_caller]
-fn guarded(
-    won: &str,
-    lost: &str,
-    verb: impl Fn(&Connection) -> rusqlite::Result<usize>,
-) -> Connection {
+fn guarded(won: &str, lost: &str, verb: impl Fn(&Connection) -> Result<usize>) -> Connection {
     let won_conn = slot(won);
     let before = rows(&won_conn);
     assert_eq!(verb(&won_conn).unwrap(), 1, "winning case");
@@ -59,6 +55,7 @@ fn guarded(
 #[track_caller]
 fn assert_wrote(conn: &Connection, written: &str) {
     let count: u32 = conn
+        .0
         .query_row(
             &format!("SELECT COUNT(*) FROM network_slots WHERE slot_id = 0 AND {written}"),
             [],
@@ -393,11 +390,12 @@ fn lease_reads_match_the_sandbox_id_exactly() {
     let conn = slot(LEASED);
     insert_missing_slot(&conn, 1, "slot-1", 4, 1).unwrap();
     insert_missing_slot(&conn, 2, "slot-2", 4, 1).unwrap();
-    conn.execute_batch(
-        "UPDATE network_slots SET state = 'leased', sandbox_id = 'sbx-2' WHERE slot_id = 1;
+    conn.0
+        .execute_batch(
+            "UPDATE network_slots SET state = 'leased', sandbox_id = 'sbx-2' WHERE slot_id = 1;
          UPDATE network_slots SET state = 'dirty', sandbox_id = 'sbx-3' WHERE slot_id = 2;",
-    )
-    .unwrap();
+        )
+        .unwrap();
 
     let ids = |rows: Vec<SlotRow>| rows.iter().map(|row| row.slot_id).collect::<Vec<_>>();
     assert_eq!(ids(exact_leases(&conn, "sbx").unwrap()), [0]);

@@ -5,13 +5,15 @@ use std::sync::LazyLock;
 
 use pplx_space_sql_locator::sql;
 use pplx_space_sqlite::SqliteU64;
-use rusqlite::{Connection, params};
+use rusqlite::params;
+
+use crate::{Connection, Result};
 
 use super::{LeaseKind, SLOT_COLUMNS, SlotHealth, SlotRow, SlotState};
 
 /// Unowned slots below `max_slots` that are ready but not healthy, in slot
 /// order: the idle slots revalidation may adopt.
-pub fn adoptable_ready_slots(conn: &Connection, max_slots: u32) -> rusqlite::Result<Vec<SlotRow>> {
+pub fn adoptable_ready_slots(conn: &Connection, max_slots: u32) -> Result<Vec<SlotRow>> {
     static SQL: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
             "SELECT {SLOT_COLUMNS}
@@ -31,10 +33,7 @@ pub fn adoptable_ready_slots(conn: &Connection, max_slots: u32) -> rusqlite::Res
 
 /// [`adoptable_ready_slots`], then the missing degraded ones: the idle slots
 /// startup revalidates.
-pub fn startup_recoverable_idle_slots(
-    conn: &Connection,
-    max_slots: u32,
-) -> rusqlite::Result<Vec<SlotRow>> {
+pub fn startup_recoverable_idle_slots(conn: &Connection, max_slots: u32) -> Result<Vec<SlotRow>> {
     static SQL: LazyLock<String> = LazyLock::new(|| {
         sql!(format!(
             "SELECT {SLOT_COLUMNS}
@@ -53,10 +52,11 @@ pub fn startup_recoverable_idle_slots(
     idle_slot_rows(conn, &SQL, max_slots)
 }
 
-fn idle_slot_rows(conn: &Connection, sql: &str, max_slots: u32) -> rusqlite::Result<Vec<SlotRow>> {
-    let mut stmt = conn.prepare(sql)?;
-    stmt.query_map(params![max_slots], SlotRow::from_row)?
-        .collect()
+fn idle_slot_rows(conn: &Connection, sql: &str, max_slots: u32) -> Result<Vec<SlotRow>> {
+    let mut stmt = conn.0.prepare(sql)?;
+    Ok(stmt
+        .query_map(params![max_slots], SlotRow::from_row)?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Claim an unowned missing slot with `health` for creation, leaving it
@@ -67,8 +67,8 @@ pub fn claim_missing_for_create(
     generation: u64,
     health: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
              SET state = 'creating', health = 'unknown',
@@ -86,7 +86,7 @@ pub fn claim_missing_for_create(
             SqliteU64(generation),
             health
         ],
-    )
+    )?)
 }
 
 /// Record a creation that set up the slot's network: the slot is a healthy
@@ -97,8 +97,8 @@ pub fn mark_created_ready(
     generation: u64,
     pod_netns_path: Option<&str>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
              SET state = 'ready', health = 'healthy', sandbox_id = NULL,
@@ -115,7 +115,7 @@ pub fn mark_created_ready(
             slot_id,
             SqliteU64(generation)
         ],
-    )
+    )?)
 }
 
 /// Record a creation that failed and may be retried: the slot is missing and
@@ -126,8 +126,8 @@ pub fn degrade_failed_create(
     generation: u64,
     error: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
              SET state = 'missing', health = 'degraded',
@@ -144,7 +144,7 @@ pub fn degrade_failed_create(
             slot_id,
             SqliteU64(generation)
         ],
-    )
+    )?)
 }
 
 /// Record a creation that failed for good: the slot is quarantined as
@@ -155,8 +155,8 @@ pub fn quarantine_failed_create(
     generation: u64,
     error: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
              SET state = 'quarantined', health = 'invalid',
@@ -174,7 +174,7 @@ pub fn quarantine_failed_create(
             slot_id,
             SqliteU64(generation)
         ],
-    )
+    )?)
 }
 
 /// Return a `creating` slot whose setup was abandoned to missing and
@@ -183,21 +183,21 @@ pub fn revalidate_abandoned_setup(
     conn: &Connection,
     slot_id: u32,
     generation: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots SET state = 'missing', health = 'degraded',
              last_error = 'abandoned setup completion; revalidating host resources'
              WHERE slot_id = ?1 AND generation = ?2 AND state = 'creating' AND sandbox_id IS NULL"
         ),
         params![slot_id, SqliteU64(generation)],
-    )
+    )?)
 }
 
 /// Claim an idle ready or missing slot for destruction, leaving it
 /// `destroying`. The guard is ownership and state, not generation.
-pub fn claim_for_destroy(conn: &Connection, slot_id: u32, now: u64) -> rusqlite::Result<usize> {
-    conn.execute(
+pub fn claim_for_destroy(conn: &Connection, slot_id: u32, now: u64) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
          SET state = 'destroying', health = 'unknown', memory_reservation_mib = NULL,
@@ -206,18 +206,13 @@ pub fn claim_for_destroy(conn: &Connection, slot_id: u32, now: u64) -> rusqlite:
            AND sandbox_uid IS NULL AND pid IS NULL"
         ),
         params![SqliteU64(now), slot_id],
-    )
+    )?)
 }
 
 /// Record a destroyed slot: it is missing, with no namespace, as a pooled
 /// slot.
-pub fn finish_destroy(
-    conn: &Connection,
-    slot_id: u32,
-    generation: u64,
-    now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+pub fn finish_destroy(conn: &Connection, slot_id: u32, generation: u64, now: u64) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!("UPDATE network_slots
                      SET state = 'missing', health = 'unknown',
                          sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
@@ -226,7 +221,7 @@ pub fn finish_destroy(
                          last_error = NULL, updated_at = ?2
                      WHERE slot_id = ?3 AND generation = ?4 AND state = 'destroying' AND sandbox_id IS NULL"),
         params![LeaseKind::Pooled.as_str(), SqliteU64(now), slot_id, SqliteU64(generation)],
-    )
+    )?)
 }
 
 /// Record an incomplete teardown on a slot that stays `destroying`.
@@ -236,13 +231,13 @@ pub fn record_destroy_failure(
     generation: u64,
     error: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!("UPDATE network_slots
                  SET state = 'destroying', last_error = ?1, updated_at = ?2
                  WHERE slot_id = ?3 AND generation = ?4 AND state = 'destroying' AND sandbox_id IS NULL"),
         params![error, SqliteU64(now), slot_id, SqliteU64(generation)],
-    )
+    )?)
 }
 
 /// Record an unowned slot that passed validation in `previous_state`: it is a
@@ -254,8 +249,8 @@ pub fn mark_validated_ready(
     previous_state: SlotState,
     pod_netns_path: Option<&str>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
                          SET state = 'ready', health = 'healthy', last_error = NULL,
@@ -274,7 +269,7 @@ pub fn mark_validated_ready(
             SqliteU64(generation),
             previous_state.as_str()
         ],
-    )
+    )?)
 }
 
 /// Record an unowned slot that failed validation in `previous_state`: it is
@@ -286,8 +281,8 @@ pub fn degrade_failed_validation(
     previous_state: SlotState,
     error: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
                          SET state = 'missing', health = 'degraded',
@@ -306,7 +301,7 @@ pub fn degrade_failed_validation(
             SqliteU64(generation),
             previous_state.as_str()
         ],
-    )
+    )?)
 }
 
 /// A startup `leasing` lease whose runtime evidence is unknown: mark it so
@@ -318,8 +313,8 @@ pub fn keep_unknown_startup_leasing(
     sandbox_id: &str,
     pid: Option<u32>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots SET health = 'unknown',
                  last_error = 'startup runtime evidence unknown; retrying', updated_at = ?1
@@ -333,7 +328,7 @@ pub fn keep_unknown_startup_leasing(
             sandbox_id,
             pid
         ],
-    )
+    )?)
 }
 
 /// A startup `leasing` lease whose runtime is live: promote it to `leased`.
@@ -345,12 +340,12 @@ pub fn promote_live_startup_leasing(
     sandbox_id: &str,
     pid: Option<u32>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!("UPDATE network_slots SET state = 'leased', updated_at = ?1
              WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4 AND state = 'leasing' AND pid IS ?5"),
         params![SqliteU64(now), slot_id, SqliteU64(generation), sandbox_id, pid],
-    )
+    )?)
 }
 
 /// A startup `leasing` lease whose runtime is gone: hand it to cleanup.
@@ -362,14 +357,14 @@ pub fn dirty_gone_startup_leasing(
     sandbox_id: &str,
     pid: Option<u32>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!("UPDATE network_slots SET state = 'dirty', health = 'unknown',
                  memory_reservation_mib = NULL,
                  last_error = 'interrupted lease runtime is gone after startup re-probe', updated_at = ?1
              WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4 AND state = 'leasing' AND pid IS ?5"),
         params![SqliteU64(now), slot_id, SqliteU64(generation), sandbox_id, pid],
-    )
+    )?)
 }
 
 /// A startup `leased` lease whose runtime is gone: hand it to cleanup. The
@@ -381,8 +376,8 @@ pub fn dirty_gone_startup_leased(
     sandbox_id: &str,
     pid: Option<u32>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots SET state = 'dirty', health = 'unknown',
                          memory_reservation_mib = NULL,
@@ -397,7 +392,7 @@ pub fn dirty_gone_startup_leased(
             sandbox_id,
             pid
         ],
-    )
+    )?)
 }
 
 /// Record the validated `health` and `last_error` of a `leased` lease.
@@ -409,8 +404,8 @@ pub fn record_lease_health(
     health: SlotHealth,
     last_error: Option<&str>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
                      SET health = ?1, last_error = ?2, updated_at = ?3
@@ -425,5 +420,5 @@ pub fn record_lease_health(
             SqliteU64(generation),
             sandbox_id
         ],
-    )
+    )?)
 }

@@ -7286,6 +7286,7 @@ dependencies = [
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
+ "ref-cast",
  "rusqlite",
  "sqlx",
  "thiserror 2.0.20",

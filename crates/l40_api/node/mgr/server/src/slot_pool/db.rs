@@ -6,8 +6,8 @@ use slots::SlotRow;
 
 #[cfg(test)]
 pub(super) fn configure_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_timeout(Duration::from_secs(5))?;
-    conn.execute_batch(
+    conn.raw().busy_timeout(Duration::from_secs(5))?;
+    conn.raw().execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;",
@@ -18,7 +18,7 @@ pub(super) fn init_db(
     conn: &mut Connection,
     config: &NetworkPoolConfig,
 ) -> Result<(), SlotStoreError> {
-    let tx = conn.transaction()?;
+    let tx = Transaction::deferred(conn)?;
     ensure_slot_rows(&tx, config)?;
     reconcile_startup(&tx, config)?;
     Ok(tx.commit()?)
@@ -29,7 +29,7 @@ pub(super) fn init_in_memory_db(
     conn: &mut Connection,
     config: &NetworkPoolConfig,
 ) -> Result<(), SlotStoreError> {
-    let tx = conn.transaction()?;
+    let tx = Transaction::deferred(conn)?;
     init_schema(&tx)?;
     ensure_slot_rows(&tx, config)?;
     reconcile_startup(&tx, config)?;
@@ -37,12 +37,12 @@ pub(super) fn init_in_memory_db(
 }
 
 #[cfg(test)]
-fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+fn init_schema(conn: &Connection) -> pplx_space_node_mgr_store::Result<()> {
     for migration in pplx_space_node_mgr_store::database::MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
-        conn.execute_batch(migration.sql.as_ref())?;
+        conn.raw().execute_batch(migration.sql.as_ref())?;
     }
     Ok(())
 }
@@ -50,7 +50,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 pub(super) fn ensure_slot_rows(
     conn: &Connection,
     config: &NetworkPoolConfig,
-) -> rusqlite::Result<()> {
+) -> pplx_space_node_mgr_store::Result<()> {
     let now = now_secs();
     for slot_id in 0..config.max_slots {
         slots::insert_missing_slot(
@@ -114,7 +114,7 @@ pub(super) fn reconcile_runtime_state(
     conn: &mut Connection,
     config: &NetworkPoolConfig,
     young_leases: &HashMap<LeaseKey, u64>,
-) -> rusqlite::Result<()> {
+) -> pplx_space_node_mgr_store::Result<()> {
     let records = query_all_records(conn)?;
     let updates = runtime_reconcile_updates(records, lease_liveness, |record| {
         LeaseKey::from_record(record).is_some_and(|key| young_leases.contains_key(&key))
@@ -198,7 +198,7 @@ pub(super) fn runtime_reconcile_updates(
 pub(super) fn record_cleanup_reset_failure(
     conn: &Connection,
     reset_key: &ResetKey,
-) -> rusqlite::Result<u32> {
+) -> pplx_space_node_mgr_store::Result<u32> {
     slots::reset::record_cleanup_reset_failure(
         conn,
         reset_key.slot_id,
@@ -237,11 +237,11 @@ pub(super) fn apply_runtime_reconcile_updates(
     conn: &mut Connection,
     config: &NetworkPoolConfig,
     updates: &[RuntimeReconcileUpdate],
-) -> rusqlite::Result<()> {
+) -> pplx_space_node_mgr_store::Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
-    let tx = conn.transaction()?;
+    let tx = Transaction::deferred(conn)?;
     let now = now_secs();
     for update in updates {
         match update {
@@ -284,7 +284,7 @@ pub(super) fn apply_runtime_reconcile_updates(
 pub(super) fn query_current_lease_by_sandbox(
     conn: &Connection,
     sandbox_id: &str,
-) -> rusqlite::Result<Option<SlotRecord>> {
+) -> pplx_space_node_mgr_store::Result<Option<SlotRecord>> {
     Ok(slots::current_lease_by_sandbox(conn, sandbox_id)?.map(SlotRecord::from))
 }
 
@@ -320,14 +320,14 @@ pub(super) fn record_lease_pid(
 pub(super) fn query_record_by_slot(
     conn: &Connection,
     slot_id: u32,
-) -> rusqlite::Result<Option<SlotRecord>> {
+) -> pplx_space_node_mgr_store::Result<Option<SlotRecord>> {
     Ok(slots::slot_by_id(conn, slot_id)?.map(SlotRecord::from))
 }
 
 pub(super) fn query_adoptable_ready_records(
     conn: &Connection,
     config: &NetworkPoolConfig,
-) -> rusqlite::Result<Vec<SlotRecord>> {
+) -> pplx_space_node_mgr_store::Result<Vec<SlotRecord>> {
     Ok(
         slots::worker::adoptable_ready_slots(conn, config.max_slots)?
             .into_iter()
@@ -339,7 +339,7 @@ pub(super) fn query_adoptable_ready_records(
 pub(super) fn query_startup_recoverable_idle_records(
     conn: &Connection,
     config: &NetworkPoolConfig,
-) -> rusqlite::Result<Vec<SlotRecord>> {
+) -> pplx_space_node_mgr_store::Result<Vec<SlotRecord>> {
     Ok(
         slots::worker::startup_recoverable_idle_slots(conn, config.max_slots)?
             .into_iter()
@@ -348,7 +348,9 @@ pub(super) fn query_startup_recoverable_idle_records(
     )
 }
 
-pub(super) fn query_live_leased_records(conn: &Connection) -> rusqlite::Result<Vec<SlotRecord>> {
+pub(super) fn query_live_leased_records(
+    conn: &Connection,
+) -> pplx_space_node_mgr_store::Result<Vec<SlotRecord>> {
     Ok(slots::live_leased_slots(conn)?
         .into_iter()
         .map(SlotRecord::from)
@@ -427,7 +429,7 @@ pub(super) struct LeaseHealthValidationUpdate {
 pub(super) fn apply_live_lease_validation_updates(
     conn: &Connection,
     updates: &[LeaseHealthValidationUpdate],
-) -> rusqlite::Result<()> {
+) -> pplx_space_node_mgr_store::Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
@@ -455,7 +457,7 @@ pub(super) fn apply_startup_lease_updates(
         .startup_leases
         .lock()
         .map_err(|_| SlotStoreError::LockPoisoned)?;
-    let tx = conn.transaction()?;
+    let tx = Transaction::deferred(&mut conn)?;
     let mut reset = Vec::new();
     let mut claims = Vec::new();
     for update in updates {
@@ -515,7 +517,9 @@ pub(super) fn apply_startup_lease_updates(
     Ok(())
 }
 
-pub(super) fn query_all_records(conn: &Connection) -> rusqlite::Result<Vec<SlotRecord>> {
+pub(super) fn query_all_records(
+    conn: &Connection,
+) -> pplx_space_node_mgr_store::Result<Vec<SlotRecord>> {
     Ok(slots::all_slots(conn)?
         .into_iter()
         .map(SlotRecord::from)

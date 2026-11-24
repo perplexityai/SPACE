@@ -5,18 +5,15 @@
 
 use pplx_space_sql_locator::sql;
 use pplx_space_sqlite::SqliteU64;
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{OptionalExtension as _, params};
+
+use crate::{Connection, Result};
 
 use super::LeaseKind;
 
 /// Claim a dirty or resetting slot for reset, leaving it `resetting`.
-pub fn begin_reset(
-    conn: &Connection,
-    slot_id: u32,
-    generation: u64,
-    now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+pub fn begin_reset(conn: &Connection, slot_id: u32, generation: u64, now: u64) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
                  SET state = 'resetting', updated_at = ?1
@@ -24,7 +21,7 @@ pub fn begin_reset(
                    AND state IN ('dirty', 'resetting')"
         ),
         params![SqliteU64(now), slot_id, SqliteU64(generation)],
-    )
+    )?)
 }
 
 /// Finish a pooled reset: the slot is a healthy ready pooled slot on
@@ -35,8 +32,8 @@ pub fn finish_pooled_reset(
     generation: u64,
     pod_netns_path: Option<&str>,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
                              SET state = 'ready', health = 'healthy',
@@ -55,7 +52,7 @@ pub fn finish_pooled_reset(
             slot_id,
             SqliteU64(generation)
         ],
-    )
+    )?)
 }
 
 /// Finish an ephemeral reset: the slot is torn down to a missing pooled slot.
@@ -64,8 +61,8 @@ pub fn finish_ephemeral_reset(
     slot_id: u32,
     generation: u64,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
                              SET state = 'missing', health = 'unknown',
@@ -83,7 +80,7 @@ pub fn finish_ephemeral_reset(
             slot_id,
             SqliteU64(generation)
         ],
-    )
+    )?)
 }
 
 /// Defer a reset that cannot finish yet: the slot returns to `dirty`,
@@ -94,8 +91,8 @@ pub fn defer_reset(
     generation: u64,
     error: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
                      SET state = 'dirty', health = 'degraded',
@@ -104,7 +101,7 @@ pub fn defer_reset(
                        AND state = 'resetting'"
         ),
         params![error, SqliteU64(now), slot_id, SqliteU64(generation)],
-    )
+    )?)
 }
 
 /// Count a failed cleanup reset of the resetting slot and its previous lease
@@ -116,10 +113,12 @@ pub fn record_cleanup_reset_failure(
     generation: u64,
     sandbox_id: Option<&str>,
     now: u64,
-) -> rusqlite::Result<Option<u32>> {
-    conn.query_row(
-        sql!(
-            "UPDATE network_slots
+) -> Result<Option<u32>> {
+    Ok(conn
+        .0
+        .query_row(
+            sql!(
+                "UPDATE network_slots
          SET cleanup_reset_attempts = cleanup_reset_attempts + 1,
              last_reset_retry_at = ?1,
              updated_at = ?1
@@ -127,11 +126,11 @@ pub fn record_cleanup_reset_failure(
            AND state = 'resetting'
            AND ((?4 IS NULL AND sandbox_id IS NULL) OR sandbox_id = ?4)
          RETURNING cleanup_reset_attempts"
-        ),
-        params![SqliteU64(now), slot_id, SqliteU64(generation), sandbox_id],
-        |row| row.get::<_, u32>(0),
-    )
-    .optional()
+            ),
+            params![SqliteU64(now), slot_id, SqliteU64(generation), sandbox_id],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()?)
 }
 
 /// Quarantine a resetting slot as invalid with `error`, clearing its previous
@@ -142,8 +141,8 @@ pub fn quarantine_reset(
     generation: u64,
     error: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
              SET state = 'quarantined', health = 'invalid',
@@ -162,7 +161,7 @@ pub fn quarantine_reset(
             slot_id,
             SqliteU64(generation)
         ],
-    )
+    )?)
 }
 
 /// [`quarantine_reset`], leaving the previous lease's columns in place.
@@ -172,8 +171,8 @@ pub fn quarantine_reset_preserving_lease(
     generation: u64,
     error: &str,
     now: u64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.0.execute(
         sql!(
             "UPDATE network_slots
              SET state = 'quarantined', health = 'invalid',
@@ -184,5 +183,5 @@ pub fn quarantine_reset_preserving_lease(
                AND state = 'resetting'"
         ),
         params![error, SqliteU64(now), slot_id, SqliteU64(generation)],
-    )
+    )?)
 }
