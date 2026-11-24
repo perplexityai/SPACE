@@ -1,7 +1,6 @@
 use pplx_space_accounts::NodeId;
 
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -338,13 +337,10 @@ pub async fn enqueue_sandbox_reconcile_tx(
 ) -> Result<Option<EnqueuedNodeReconcile>, sqlx::Error> {
     // Keep placement stable through enqueue without blocking foreign-key
     // checks in a node publication that already holds its reconcile trigger.
-    let node_id: Option<NodeId> = sqlx::query_scalar(sql!(
-        "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .flatten();
+    let node_id: Option<NodeId> =
+        pplx_space_sandbox_store::row_locks::lock_active_node_id_no_key_update(tx, sandbox_id)
+            .await?
+            .flatten();
     let Some(node_id) = node_id else {
         return Ok(None);
     };
