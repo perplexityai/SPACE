@@ -18,10 +18,10 @@ use pplx_space_node_registration_store::direct;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::admin_occupancy;
 use pplx_space_sandbox_store::node_placements::{
     self, NodePlacementChangeCursor, NodePlacementChangeRow, NodePlacementFilter,
 };
-use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -2067,17 +2067,20 @@ const FORCE_UPLOAD_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const FORCE_UPLOAD_MAX_PER_INVOCATION: usize = 32;
 
 /// Hard cap on how many pinned-local-only sandbox IDs the
-/// `list_pinned_local_only_sandboxes` query can enumerate per call.
+/// `admin_occupancy::pinned_local_only_sandboxes` query can enumerate per
+/// call.
 ///
 /// The handler processes the first `FORCE_UPLOAD_MAX_PER_INVOCATION`
 /// IDs and reports the remaining `ENUMERATION_CAP - MAX_PER_INVOCATION`
-/// IDs in `deferred[]` for operator visibility. The query passes
-/// `LIMIT cap + 1` so the response can flip `truncated: true` when
-/// the actual pinned-list size exceeds the cap, signalling that
-/// re-invoking will keep finding new work. Bounds the DB transfer
-/// and JSON response size to O(1) regardless of how big the pinned
-/// list is on a backlogged node.
+/// IDs in `deferred[]` for operator visibility. The query's page is
+/// `cap + 1` ([`admin_occupancy::FORCE_UPLOAD_PAGE`], a literal `LIMIT` in
+/// its statement, asserted below) so the response can flip
+/// `truncated: true` when the actual pinned-list size exceeds the cap,
+/// signalling that re-invoking will keep finding new work. Bounds the DB
+/// transfer and JSON response size to O(1) regardless of how big the
+/// pinned list is on a backlogged node.
 pub(super) const FORCE_UPLOAD_ENUMERATION_CAP: usize = 256;
+const _: () = assert!(FORCE_UPLOAD_ENUMERATION_CAP + 1 == admin_occupancy::FORCE_UPLOAD_PAGE.get());
 
 /// Maximum acceptable wall-clock for the handler. The
 /// `:force-upload-local-snapshots` route lives under the admin API,
@@ -2105,7 +2108,7 @@ const _: () = {
 ///
 /// Enumerates every suspended sandbox whose `target_node_id` still pins
 /// it to this node **and** whose snapshot has not yet been registered
-/// to S3 (via [`node_store::list_pinned_local_only_sandboxes`]), then
+/// to S3 (via [`admin_occupancy::pinned_local_only_sandboxes`]), then
 /// calls the controller's `enqueue_suspended_snapshot_backup` per sandbox. That
 /// RPC enqueues a durable-worker upload on the on-node sbx-mgr; the
 /// worker lands a `state='ready'` row in `snapshots` +
@@ -2230,21 +2233,16 @@ async fn apply_force_upload_local_snapshots(
             .into_response();
     }
 
-    // `LIMIT cap + 1` so a returned slice of length `cap + 1` is the
-    // unambiguous "more pinned sandboxes exist beyond what's listed"
+    // The page is `cap + 1` rows so a returned slice of length `cap + 1` is
+    // the unambiguous "more pinned sandboxes exist beyond what's listed"
     // signal — we trim the sentinel row and flip `truncated: true`
     // on the response.
     // `cap + 1` so a full page is distinguishable from a page that merely
     // filled the cap exactly, which is what flips `truncated` below.
-    let enumeration_limit = NonZeroUsize::new(FORCE_UPLOAD_ENUMERATION_CAP + 1)
-        .expect("FORCE_UPLOAD_ENUMERATION_CAP + 1 is a positive constant");
-    let pinned =
-        match node_store::list_pinned_local_only_sandboxes(&state.pool, node_id, enumeration_limit)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(err) => return db_error(err).into_response(),
-        };
+    let pinned = match admin_occupancy::pinned_local_only_sandboxes(&state.pool, node_id).await {
+        Ok(rows) => rows,
+        Err(err) => return db_error(err).into_response(),
+    };
 
     let mut response = ForceUploadLocalSnapshotsResponse {
         node_id,

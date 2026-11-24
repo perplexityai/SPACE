@@ -864,7 +864,8 @@ pub(crate) const PINNED_LOCAL_ONLY_ENUMERATION_CAP: NonZeroUsize = NonZeroUsize:
 /// an index rather than with a plan shape: `idx_sandboxes_target_node_ordered`
 /// carries `(target_node_id, id)`, so the equality fixes the leading column and
 /// the scan emits that node's rows already ordered — no sort, and the scan
-/// reads at most that node's rows (`node_store::pinned_local_only_sandboxes_query`).
+/// reads at most that node's rows
+/// (`pplx_space_sandbox_store::admin_occupancy::pinned_local_only_sandboxes`).
 /// This statement needs no page identity, so it stays unordered. The admin
 /// twin also fences its in-flight check, because its node-ordered scan makes a
 /// merge anti-join against `snapshots` available; this unordered statement

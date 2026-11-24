@@ -1,11 +1,12 @@
-//! Reads of `sandboxes` that resolve what the Kubernetes substrate restores an
-//! unplaced or evacuated sandbox from, by the node-drain
-//! `evacuation_restore_target` marker: the unplaced restore plan of a `stopped`
-//! row, and the disk artifact a stopped evacuation is re-placed from.
+//! Reads of `sandboxes` that resolve what the Kubernetes substrate restores a
+//! sandbox from: the unplaced restore plan of a `stopped` row and the disk
+//! artifact a stopped evacuation is re-placed from, both by the node-drain
+//! `evacuation_restore_target` marker, and the storage URIs the suspend and
+//! stopped restore selectors load.
 //!
-//! The Kubernetes store keeps the rest of restore source selection: the
-//! suspend and stopped storage-URI selectors, the node-name fallback, the
-//! missing-mapping warning and the validation of a selected storage URI. Both
+//! The Kubernetes store keeps the rest of restore source selection: which
+//! suspend snapshot a restore asks for, the node-name fallback, the
+//! missing-mapping warning and the validation of a selected storage URI. The
 //! reads here are plain reads: they take no lock, and run on the executor the
 //! caller passes.
 
@@ -13,7 +14,12 @@ use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::LocalArtifactId;
 
-use pplx_space_sandbox_portability::snapshot_is_current_local_artifact;
+use std::sync::LazyLock;
+
+use pplx_space_sandbox_portability::{
+    fresh_ready_snapshot_exists, no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
+    snapshot_is_current_local_artifact,
+};
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 
@@ -165,4 +171,141 @@ pub async fn stopped_evacuation_restore_source(
             }
         }),
     )
+}
+
+/// Which full snapshot [`suspend_restore_storage_uri`] selects for a
+/// `suspended` or `restoring` row. Each is its own statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuspendRestoreSnapshot {
+    /// A restore retry: the newest full snapshot in the restore's pre-claim
+    /// source window, selected only when it is ready. A newer attempt in that
+    /// window blocks older ready snapshots unless it is a failed retry of the
+    /// same artifact ([`restore_retry_source_snapshot_is_current`]).
+    RestoreRetrySource,
+    /// The snapshot of the row's current local artifact
+    /// ([`snapshot_is_current_local_artifact`]); a row without one restores
+    /// only the newest full snapshot ([`no_newer_full_snapshot`]).
+    NewestRemote,
+    /// The snapshot of the row's current local artifact; a row without one
+    /// restores a snapshot newer than its last placement
+    /// ([`fresh_ready_snapshot_exists`]).
+    PlacementFresh,
+}
+
+/// The storage connection string of the newest ready full snapshot of a
+/// `suspended` or `restoring` `sandbox_id` that has a live storage location
+/// and matches `snapshot`, unvalidated. `None` when nothing matches.
+///
+/// The current-artifact branches use [`snapshot_is_current_local_artifact`],
+/// the fragment the retention sweeper's never-prune-the-current-artifact
+/// guard is built from, so the sweep cannot delete what those branches select.
+pub async fn suspend_restore_storage_uri(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    snapshot: SuspendRestoreSnapshot,
+) -> Result<Option<String>, sqlx::Error> {
+    static RESTORE_RETRY_SOURCE: LazyLock<String> = LazyLock::new(|| {
+        let retry_source = restore_retry_source_snapshot_is_current("s", "sn");
+        sql!(format!(
+            "SELECT ssl.storage_connection_string
+               FROM sandboxes s
+               JOIN snapshots sn ON sn.sandbox_id = s.id
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+              WHERE s.id = $1
+                AND s.lifecycle IN ('suspended', 'restoring')
+                AND ssl.orphaned_at IS NULL
+                AND sn.type = 'full'
+                AND sn.state = 'ready'
+                AND {retry_source}
+              ORDER BY sn.timestamp DESC
+              LIMIT 1"
+        ))
+    });
+    static NEWEST_REMOTE: LazyLock<String> = LazyLock::new(|| {
+        let marked = snapshot_is_current_local_artifact("s", "sn");
+        let newest_full = no_newer_full_snapshot("s", "sn");
+        sql!(format!(
+            "SELECT ssl.storage_connection_string
+               FROM sandboxes s
+               JOIN snapshots sn ON sn.sandbox_id = s.id
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+              WHERE s.id = $1
+                AND s.lifecycle IN ('suspended', 'restoring')
+                AND ssl.orphaned_at IS NULL
+                AND sn.type = 'full'
+                AND sn.state = 'ready'
+                AND (
+                    {marked}
+                    OR (s.current_local_artifact_id IS NULL AND {newest_full})
+                )
+              ORDER BY sn.timestamp DESC
+              LIMIT 1"
+        ))
+    });
+    static PLACEMENT_FRESH: LazyLock<String> = LazyLock::new(|| {
+        let marked = snapshot_is_current_local_artifact("s", "sn");
+        let fresh = fresh_ready_snapshot_exists("s");
+        sql!(format!(
+            "SELECT ssl.storage_connection_string
+               FROM sandboxes s
+               JOIN snapshots sn ON sn.sandbox_id = s.id
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+              WHERE s.id = $1
+                AND s.lifecycle IN ('suspended', 'restoring')
+                AND ssl.orphaned_at IS NULL
+                AND sn.type = 'full'
+                AND sn.state = 'ready'
+                AND (
+                    {marked}
+                    OR (s.current_local_artifact_id IS NULL AND {fresh})
+                )
+              ORDER BY sn.timestamp DESC
+              LIMIT 1"
+        ))
+    });
+    let query = match snapshot {
+        SuspendRestoreSnapshot::RestoreRetrySource => &RESTORE_RETRY_SOURCE,
+        SuspendRestoreSnapshot::NewestRemote => &NEWEST_REMOTE,
+        SuspendRestoreSnapshot::PlacementFresh => &PLACEMENT_FRESH,
+    };
+    sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
+        .bind(sandbox_id)
+        .fetch_optional(executor)
+        .await
+}
+
+/// The storage connection string of the newest ready disk snapshot of a
+/// `stopped` `sandbox_id` that has a live storage location and is the row's
+/// current local artifact, unvalidated. `None` when nothing matches.
+///
+/// The pin ([`snapshot_is_current_local_artifact`]) is the only guard: it is
+/// what ties the URI to these bytes, and the fragment the retention sweeper's
+/// current-artifact guard is built from. Newest first, with an `sn.id`
+/// tiebreak, because a retried backup of one artifact mints a fresh
+/// `snapshots` row per attempt while keeping the same `local_artifact_id`.
+pub async fn stopped_restore_storage_uri(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Option<String>, sqlx::Error> {
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let pinned = snapshot_is_current_local_artifact("s", "sn");
+        sql!(format!(
+            "SELECT ssl.storage_connection_string
+               FROM sandboxes s
+               JOIN snapshots sn ON sn.sandbox_id = s.id
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+              WHERE s.id = $1
+                AND s.lifecycle = 'stopped'
+                AND ssl.orphaned_at IS NULL
+                AND sn.type = 'disk'
+                AND sn.state = 'ready'
+                AND {pinned}
+              ORDER BY sn.timestamp DESC, sn.id DESC
+              LIMIT 1"
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(sandbox_id)
+        .fetch_optional(executor)
+        .await
 }

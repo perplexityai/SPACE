@@ -65,7 +65,7 @@ use std::time::Duration;
 use crate::metrics::operations as metrics;
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_postgres_pool::contention;
-use pplx_space_public_operation_store::quota::SandboxesHeld;
+use pplx_space_public_operation_store::quota::{self, SandboxesHeld};
 use pplx_space_sql_locator::sql;
 use sqlx::{Postgres, Transaction};
 
@@ -357,16 +357,10 @@ async fn lock_tx(
     seed: i64,
     mode: LockMode,
 ) -> Result<(), sqlx::Error> {
-    let statement = match mode {
-        LockMode::Shared => sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, $2))"
-        )),
-        LockMode::Exclusive => sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
-        )),
-    };
-    statement.bind(id).bind(seed).execute(&mut **tx).await?;
-    Ok(())
+    match mode {
+        LockMode::Shared => quota::lock_quota_shared(tx, id, seed).await,
+        LockMode::Exclusive => quota::lock_quota_exclusive(tx, id, seed).await,
+    }
 }
 
 /// Count with [`SANDBOXES_HELD`](pplx_space_public_operation_store::quota::SANDBOXES_HELD);
