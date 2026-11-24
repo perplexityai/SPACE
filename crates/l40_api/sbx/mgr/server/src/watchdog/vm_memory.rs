@@ -31,6 +31,32 @@ fn read_sample(cgroup: &Path) -> Option<CgroupMemoryUsage> {
     read_cgroup_memory_usage(cgroup).ok()
 }
 
+async fn sweep<T: Send, F: Future<Output = ()> + Send>(
+    mut targets: Vec<T>,
+    cursor: &mut usize,
+    visit: impl FnMut(T) -> F + Send,
+) -> bool {
+    let len = targets.len();
+    if len == 0 {
+        return false;
+    }
+    let start = *cursor % len;
+    targets.rotate_left(start);
+    let completed = stream::iter(targets)
+        .map(visit)
+        .buffer_unordered(SAMPLE_CONCURRENCY)
+        .take_until(tokio::time::sleep(SWEEP_DEADLINE))
+        .count()
+        .await;
+    if completed < len {
+        // Don't keep sampling only the same prefix when sweeps hit the deadline.
+        // Advance by completions, not started reads that were dropped on timeout.
+        *cursor = (start + completed.max(1)) % len;
+        return true;
+    }
+    false
+}
+
 pub(super) async fn run(
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
     reads: HostReads,
@@ -39,13 +65,14 @@ pub(super) async fn run(
     let parent = sandbox_cgroup_parent().await;
     let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut cursor = 0;
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             _ = interval.tick() => {}
         }
-        let targets = {
+        let mut targets = {
             let sidecars = sidecars.lock().await;
             sidecars
                 .values()
@@ -54,34 +81,30 @@ pub(super) async fn run(
                 })
                 .collect::<Vec<_>>()
         };
+        targets.sort_unstable_by_key(|(sandbox_id, _)| *sandbox_id);
         let now = Timestamp::now().as_second();
-        let sweep = stream::iter(targets).for_each_concurrent(
-            SAMPLE_CONCURRENCY,
-            |(sandbox_id, created_at)| {
-                let cgroup = jailer_cgroup_path_in(&parent, &sandbox_id.to_string());
-                let reads = &reads;
-                async move {
-                    if let Some(sample) =
-                        reads.blocking(move || read_sample(&cgroup)).await.flatten()
-                    {
-                        let age = AgeBucket::from_age_secs(
-                            created_at.and_then(|created_at| now.checked_sub(created_at.get())),
-                        );
-                        cgroup_memory::emit(
-                            sample.current_bytes,
-                            sample.anon_bytes,
-                            CgroupLimitBucket::from_memory_max(sample.limit),
-                            age,
-                        );
-                    }
+        let sweep = sweep(targets, &mut cursor, |(sandbox_id, created_at)| {
+            let cgroup = jailer_cgroup_path_in(&parent, &sandbox_id.to_string());
+            let reads = &reads;
+            async move {
+                if let Some(sample) = reads.blocking(move || read_sample(&cgroup)).await.flatten() {
+                    let age = AgeBucket::from_age_secs(
+                        created_at.and_then(|created_at| now.checked_sub(created_at.get())),
+                    );
+                    cgroup_memory::emit(
+                        sample.current_bytes,
+                        sample.anon_bytes,
+                        CgroupLimitBucket::from_memory_max(sample.limit),
+                        age,
+                    );
                 }
-            },
-        );
+            }
+        });
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
-            result = tokio::time::timeout(SWEEP_DEADLINE, sweep) => {
-                if result.is_err() {
+            truncated = sweep => {
+                if truncated {
                     cgroup_memory::sweep_truncated();
                     tracing::warn!("VM cgroup memory sweep exceeded its deadline");
                 }

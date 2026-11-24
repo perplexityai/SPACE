@@ -42,3 +42,23 @@ fn samples_only_populated_cgroups_and_never_substitutes_zero_for_unreadable_memo
     write("cgroup.events", "populated 0\nfrozen 0\n");
     assert_eq!(read_sample(root), None);
 }
+
+#[tokio::test(start_paused = true)]
+async fn repeated_truncated_sweeps_sample_the_tail_of_the_inventory() {
+    let completed = std::sync::Mutex::new(Vec::new());
+    let visit = |target| {
+        let completed = &completed;
+        async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            completed.lock().unwrap().push(target);
+        }
+    };
+    let targets = [0, 1, 2, 3, 4, 5];
+    let mut cursor = 0;
+    for _ in 0..3 {
+        assert!(sweep(targets.to_vec(), &mut cursor, visit).await);
+    }
+    let mut sampled = completed.into_inner().unwrap();
+    sampled.sort_unstable();
+    assert_eq!(sampled, targets);
+}
