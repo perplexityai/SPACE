@@ -10,16 +10,20 @@
 //! without writing them, [`drain_write`] writes them checking only the node
 //! id, [`tombstone`] records terminated nodes, [`inventory`] lists the
 //! Kubernetes nodes, and [`node_group`] mirrors their node-group labels.
+//! [`direct`] reads the admin node row, which joins the node's Direct
+//! registration.
 //!
 //! Every verb runs on the caller's executor, so it composes into the
-//! caller's transaction. The drain-phase compare-and-sets, whose `WHERE`
-//! re-checks the current phase, stay with their callers.
+//! caller's transaction; [`direct::lock_admin_node`] takes that transaction,
+//! whose end releases its row lock. The drain-phase compare-and-sets, whose
+//! `WHERE` re-checks the current phase, stay with their callers.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
 use pplx_space_node_model::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 
+pub mod direct;
 pub mod drain_reads;
 pub mod drain_v2;
 pub mod drain_write;

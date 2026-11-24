@@ -2667,11 +2667,8 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
         assert_eq!(observation.policy.is_some(), expected);
         assert_eq!(observation.policy_received_at.is_some(), expected);
         let mut tx = db.pool.begin().await?;
-        assert!(
-            node_store::lock_node_for_update(&mut tx, node_id)
-                .await?
-                .is_some()
-        );
+        let row: Option<AdminNodeRow> = direct::lock_admin_node(&mut tx, node_id).await?;
+        assert!(row.is_some());
         tx.rollback().await?;
     }
     Ok(())
