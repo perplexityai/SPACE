@@ -7067,9 +7067,11 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
+ "ref-cast",
  "rusqlite",
  "sqlx",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
 ]
 

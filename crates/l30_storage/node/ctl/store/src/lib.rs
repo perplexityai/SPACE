@@ -6,11 +6,14 @@
 //! and `dirty_node_state`, which no code reads or writes today.
 //!
 //! [`database`] migrates and opens the database, which node-ctl does at
-//! startup. Every other function takes a `rusqlite::Connection`, so a caller
-//! passes its own connection or open transaction, and returns rusqlite's
-//! error unchanged. node-ctl keeps the transactions whose reads guard its
-//! writes: run each verb whose doc asks for it inside the caller's
-//! transaction.
+//! startup, and holds the handle types callers name. Every other function
+//! takes a [`database::Connection`], so a caller passes the connection its
+//! [`database::SharedConnection`] lock holds or a [`database::Transaction`]
+//! it opened, and fails with [`database::Error`], whose `Display` and
+//! `source` are rusqlite's. node-ctl keeps the transactions whose reads guard
+//! its writes: run each verb whose doc asks for it inside the caller's
+//! transaction. This crate's `AGENTS.md` states the rules for its public
+//! surface.
 //!
 //! [`dirty_facets`]' claim, clear and failure writes are guarded transitions:
 //! each re-checks the row's claim in its `WHERE`. The claim takes only
