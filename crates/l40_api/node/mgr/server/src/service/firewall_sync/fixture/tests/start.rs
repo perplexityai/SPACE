@@ -223,7 +223,8 @@ async fn acceptance_is_ordered_against_a_start() {
     let mut bound = bind_all(None, Some(12)).await;
     let lease = pooled(&bound.service).await;
     let launched = launcher(&mut bound, &lease, || Ok(()));
-    let accepting = queued_behind_a_start(&bound, &lease).await;
+    let (started, accepting) = queued_behind_a_start(&bound, &lease).await;
+    started.unwrap();
     let committed = FirewallAssignmentAcceptance::Committed;
     assert_eq!(
         bounded(accepting).await.unwrap().unwrap().acceptance(),
@@ -232,12 +233,15 @@ async fn acceptance_is_ordered_against_a_start() {
     assert_eq!(*launched.lock().unwrap(), [(Some(12), Some(installed(12)))]);
 }
 
-/// Pauses a start of `lease` after its install, queues a delivery of 13 behind
-/// it, and returns that delivery once the start returned.
-async fn queued_behind_a_start(
+type Starting = tokio::task::JoinHandle<Result<(), Status>>;
+type Accepting = tokio::task::JoinHandle<Result<SyncFirewallRulesResponse, Status>>;
+
+/// Holds a start of `lease` after its install and queues a delivery of 13
+/// behind it. The start runs on once the returned sender is sent or dropped.
+async fn held_start_with_queued_delivery(
     bound: &Bound,
     lease: &SlotInfo,
-) -> tokio::task::JoinHandle<Result<SyncFirewallRulesResponse, Status>> {
+) -> (Starting, Accepting, std::sync::mpsc::Sender<()>) {
     let binding = bound.service.firewall_sync.clone().unwrap();
     let (entered, release) = gate(&bound.host.installed);
     let (service, leased, link) = (bound.service.clone(), lease.clone(), bound.host.link(0));
@@ -258,9 +262,15 @@ async fn queued_behind_a_start(
     })
     .await;
     assert_eq!(accepted(), 12, "13 was accepted during the start");
+    (starting, accepting, release)
+}
+
+/// Pauses a start of `lease` after its install, queues a delivery of 13 behind
+/// it, and returns the start's result and that delivery once the start returned.
+async fn queued_behind_a_start(bound: &Bound, lease: &SlotInfo) -> (Result<(), Status>, Accepting) {
+    let (starting, accepting, release) = held_start_with_queued_delivery(bound, lease).await;
     release.send(()).unwrap();
-    let _ = bounded(starting).await.unwrap();
-    accepting
+    (bounded(starting).await.unwrap(), accepting)
 }
 
 // Catches a launch whose outcome is unknown treated as never started: the
@@ -272,7 +282,8 @@ async fn an_unknown_launch_outcome_ends_the_binding() {
     let launched = launcher(&mut bound, &lease, || {
         Err(Status::deadline_exceeded("launch timed out"))
     });
-    let accepting = queued_behind_a_start(&bound, &lease).await;
+    let (started, accepting) = queued_behind_a_start(&bound, &lease).await;
+    started.unwrap_err();
     let refused = bounded(accepting).await.unwrap().unwrap_err();
     assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
     assert_eq!(launched.lock().unwrap().len(), 1);
@@ -285,6 +296,34 @@ async fn an_unknown_launch_outcome_ends_the_binding() {
     assert_eq!(bound.host.installs(), [bound.namespaces[0]]);
     let sync = bound.service.firewall_sync.clone().unwrap();
     assert_eq!(sync.assignments.current().unwrap().unwrap().generation, 12);
+}
+
+// Catches a start dropped while its nft job is unresolved leaving the binding
+// open, so the acceptance queued behind it commits 13 after an unknown apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_dropped_during_its_apply_ends_the_binding() {
+    let mut bound = bind_all(None, Some(12)).await;
+    let lease = pooled(&bound.service).await;
+    let launched = launcher(&mut bound, &lease, || Ok(()));
+    let (starting, accepting, release) = held_start_with_queued_delivery(&bound, &lease).await;
+    starting.abort();
+    assert!(bounded(starting).await.unwrap_err().is_cancelled());
+    // The install hook still holds the detached job, so the apply is unresolved.
+    let refused = bounded(accepting).await.unwrap().unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    let binding = bound.service.firewall_sync.clone().unwrap();
+    assert!(binding.ended.is_cancelled());
+    assert_eq!(
+        binding.assignments.current().unwrap().unwrap().generation,
+        12
+    );
+    release.send(()).unwrap();
+    applied(&bound.service).await;
+    assert_eq!(*launched.lock().unwrap(), []);
+    let refused = start(&bound.service, &lease, &bound.host.link(0))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
 }
 
 // Catches a start that launches after another start's unknown outcome ended

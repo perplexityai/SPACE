@@ -22,7 +22,8 @@
 //! the pass to settle, then applies the accepted assignment to its own slot
 //! and reads that result by the same rule: one that ends the binding ends it,
 //! and a changed target refuses only that start. Only a match launches. A
-//! launch whose outcome is unknown ends the binding.
+//! start dropped before its apply is read, or a launch whose outcome is
+//! unknown, ends the binding.
 //!
 //! A production binding is expected to build on this worker. First it must
 //! revisit the node-wide end rule, re-listing on retry, and per-slot reporting,
@@ -277,8 +278,9 @@ impl FirewallSync {
     /// Under a node-wide binding, runs `launch` only after the accepted
     /// assignment is applied to the lease's slot and read back in the
     /// namespace the launcher opens; every refusal comes before dispatch. An
-    /// apply result that ends a pass's binding ends this one too. A launch that
-    /// fails or is dropped may have started its guest, so it ends the binding.
+    /// apply result that ends a pass's binding ends this one too, as does a start
+    /// dropped before it has one. A launch that fails or is dropped may have
+    /// started its guest, so it ends the binding.
     pub(in crate::service) async fn start<T>(
         &self,
         pool: &Arc<NetworkPool>,
@@ -326,6 +328,9 @@ impl FirewallSync {
             }),
         };
         let (host, nft) = (self.fixture.host.clone(), self.fixture.nft.clone());
+        // A dropped start detaches its nft job, whose result is lost. Dropped
+        // before `_order`, so no acceptance follows an apply of unknown outcome.
+        let applying = self.ended.clone().drop_guard();
         let report = pool
             .apply_firewall_rules_with(&self.assignments, request, host, nft)
             .await;
@@ -340,6 +345,7 @@ impl FirewallSync {
             // Under `_order`, so no acceptance follows.
             self.ended.cancel();
         }
+        applying.disarm();
         let attempt = match report {
             Ok(SlotFirewallReport::Attempted(attempt)) if attempt.verified() => attempt,
             report => return Err(refused(format!("{report:?}"))),
@@ -357,6 +363,8 @@ impl FirewallSync {
             return Err(refused("the binding ended".into()));
         }
         // Dropped before `_order`, so no acceptance follows an unknown outcome.
+        // Any launch error, even a supervisor refusal before boot, ends the
+        // binding; a production gate should revisit that.
         let unknown = self.ended.clone().drop_guard();
         let launched = launch.await?;
         unknown.disarm();
