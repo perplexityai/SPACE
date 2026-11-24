@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use pplx_space_common_jobs::{JobError, JobStatus};
 use pplx_space_node_mgr_client::proto as node;
+use pplx_space_volmgr_store::jobs::{JobError, JobStatus};
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 use uuid::Uuid;
@@ -137,7 +137,7 @@ impl crate::service::VolumeManagerService {
             &serialized,
             Some(&subject_id),
             Some(&dedup),
-            pplx_space_common_jobs::DuplicatePolicy::ReuseExistingOrCompleted,
+            pplx_space_volmgr_store::jobs::DuplicatePolicy::ReuseExistingOrCompleted,
         );
         match submitted {
             Ok(job_id) => Ok(crate::proto::SubmitTransferResponse {

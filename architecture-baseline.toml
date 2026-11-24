@@ -116,9 +116,7 @@ pplx-space-template-publisher = [
   "pplx-space-object-store",
 ]
 pplx-space-volmgr = [
-  "pplx-space-common-jobs",
   "pplx-space-object-store",
-  "rusqlite",
 ]
 
 [layers.unowned]

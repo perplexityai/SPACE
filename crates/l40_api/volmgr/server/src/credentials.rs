@@ -143,7 +143,7 @@ async fn request_credentials(
 ///
 /// Split from [`tonic::Status`] so the executor can map permanent
 /// credmgr-side rejections (bad provider, AAD mismatch, malformed
-/// wrap) onto [`pplx_space_common_jobs::JobError::Permanent`] and
+/// wrap) onto [`pplx_space_volmgr_store::jobs::JobError::Permanent`] and
 /// transport blips onto `Retriable`. The credmgr's own gRPC code
 /// taxonomy informs this split: `InvalidArgument`, `FailedPrecondition`,
 /// and `PermissionDenied` are caller-visible mistakes that won't resolve

@@ -35,9 +35,6 @@ use dashmap::DashMap;
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{SnapshotArtifact, StorageUri};
 use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
-use pplx_space_common_jobs::{
-    Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
-};
 use pplx_space_file_io::sparse::{SparseDataRange, SparseFileWriter, SparseMaterialization};
 use pplx_space_object_store::{
     ObjectMeta, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
@@ -49,6 +46,9 @@ use pplx_space_subject_model::{SubjectId, SubjectIdParseError};
 use pplx_space_volmgr_client::{
     VERIFIED_REPLICA_PROVENANCE_VERSION, VerifiedReplicaProvenance,
     verified_replica_provenance_path,
+};
+use pplx_space_volmgr_store::jobs::{
+    Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;

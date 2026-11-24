@@ -2,7 +2,7 @@ use pplx_space_accounts::JobId;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::artifact::{ArtifactEntryRole, ArtifactId};
@@ -11,10 +11,6 @@ use crate::materialization::MaterializationMode;
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{SnapshotArtifact, StorageUri, parse_snapshot_object_key};
 use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
-use pplx_space_common_jobs::{
-    BackgroundWorker, JobExecutor, JobFailure, JobFailureReason, JobPriority, PriorityBand,
-    WorkerConfig,
-};
 use pplx_space_host_layout::{identities::user_names, identities::users};
 use pplx_space_sandbox_grpc::record_sandbox_id;
 use pplx_space_snapshot_model::TransferScopeId;
@@ -22,8 +18,13 @@ use pplx_space_subject_model::SubjectId;
 use pplx_space_uds_peer_auth::{
     AuthorizedUdsPeer, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal,
 };
+use pplx_space_volmgr_store::jobs::{
+    DuplicatePolicy, Job, JobExecutor, JobFailure, JobFailureReason, JobPriority, JobWorker,
+    PriorityBand, WorkerConfig,
+};
 use pplx_space_volmgr_store::{
-    JobPayloadRow, JobPayloadsError, pending_or_running_job_payloads, transfer_scope_job_ids,
+    ConnectionGuard, JobPayloadRow, JobPayloadsError, SharedConnection, count_active_jobs,
+    pending_or_running_job_payloads, transfer_scope_job_ids,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -70,8 +71,8 @@ const TRANSFER_MANAGER_PEERS: &[UdsPeerPrincipal] = &[
 
 #[derive(Clone)]
 pub struct VolumeManagerService {
-    db: Arc<Mutex<rusqlite::Connection>>,
-    pub(crate) worker: BackgroundWorker<TransferExecutor>,
+    db: SharedConnection,
+    pub(crate) worker: JobWorker<TransferExecutor>,
     pub(crate) btrfs_submission: Arc<tokio::sync::Mutex<()>>,
     pub(crate) btrfs_push_enabled: bool,
     shadow_comparisons: ShadowComparisonController,
@@ -247,7 +248,7 @@ impl VolumeManagerService {
         config: VolumeManagerServiceConfig,
     ) -> Result<Self, NewServiceError> {
         let conn = db::open(db_path).map_err(NewServiceError::OpenDb)?;
-        let db = Arc::new(Mutex::new(conn));
+        let db = SharedConnection::new(conn);
         let staging = StagingDir::ensure(staging_dir)?;
         let worker_config = WorkerConfig::new(1, config.transfer_timeout, config.max_attempts)
             .with_kind_concurrency(PUSH_KIND, config.push_concurrency)
@@ -260,7 +261,7 @@ impl VolumeManagerService {
             && config.executor.snapshot_upload_mode.buffer_budget_bytes() > 0;
         let executor = TransferExecutor::new(config.executor, staging.root().to_path_buf());
         let shadow_comparisons = executor.shadow_comparison_controller();
-        let worker = BackgroundWorker::new(Arc::clone(&db), executor, worker_config);
+        let worker = db.background_worker(executor, worker_config);
         Ok(Self {
             db,
             worker,
@@ -332,7 +333,7 @@ impl VolumeManagerService {
         &self,
         peer: &AuthorizedUdsPeer,
         requested_subject: &SubjectId,
-        job: &pplx_space_common_jobs::Job,
+        job: &Job,
         operation: &str,
     ) -> Result<(), Status> {
         if artifact_job_matches_subject_class(job, requested_subject) {
@@ -353,7 +354,7 @@ impl VolumeManagerService {
     fn authorize_job(
         &self,
         peer: &AuthorizedUdsPeer,
-        job: &pplx_space_common_jobs::Job,
+        job: &Job,
         operation: &str,
     ) -> Result<(), Status> {
         if matches!(peer.principal(), UdsPeerPrincipal::Root) {
@@ -405,9 +406,10 @@ impl VolumeManagerService {
         )))
     }
 
-    /// Returns a clone of the worker handle for calling `recover()` and
-    /// `drain()` from the service binary.
-    pub fn worker(&self) -> BackgroundWorker<TransferExecutor> {
+    /// Returns a clone of the worker handle for [`run`](fn@crate::run): startup
+    /// recovery, the terminal-job pruner and queue-metrics loops, and the drain
+    /// sequence.
+    pub fn worker(&self) -> JobWorker<TransferExecutor> {
         self.worker.clone()
     }
 
@@ -422,13 +424,13 @@ impl VolumeManagerService {
     /// Count durable transfer rows that have not reached a terminal state.
     pub fn active_transfer_count(&self) -> Result<u64, Status> {
         let conn = self.lock_db()?;
-        pplx_space_common_jobs::db::count_active_jobs(&conn)
+        count_active_jobs(&conn)
             .map_err(|error| Status::internal(format!("count active transfers: {error}")))
     }
 
     /// Sweep the staging dir, removing any file whose owning push job is
     /// no longer in `pending`/`running`. Call once at startup, **before**
-    /// [`BackgroundWorker::recover`], so that:
+    /// [`JobWorker::recover_and_log`], so that:
     ///   * files left by jobs that completed or permanently failed before
     ///     a prior process exit are reclaimed; and
     ///   * files still owned by jobs that the worker is about to re-spawn
@@ -479,7 +481,7 @@ impl VolumeManagerService {
         Ok(out)
     }
 
-    pub(crate) fn lock_db(&self) -> Result<MutexGuard<'_, rusqlite::Connection>, Status> {
+    pub(crate) fn lock_db(&self) -> Result<ConnectionGuard<'_>, Status> {
         self.db
             .lock()
             .map_err(|e| Status::internal(format!("lock vol-mgr db: {e}")))
@@ -552,7 +554,7 @@ fn rootfs_materialization_mode(subject: &SubjectId) -> MaterializationMode {
 #[derive(Debug, thiserror::Error)]
 pub enum NewServiceError {
     #[error("open volume-manager db: {0}")]
-    OpenDb(#[source] rusqlite::Error),
+    OpenDb(#[source] pplx_space_volmgr_store::Error),
     #[error(transparent)]
     Staging(#[from] StagingError),
 }
@@ -579,7 +581,7 @@ fn proto_to_attachment(spec: VolumeSpec) -> VolumeAttachment {
     }
 }
 
-fn db_err(e: rusqlite::Error) -> Status {
+fn db_err(e: pplx_space_volmgr_store::Error) -> Status {
     Status::internal(format!("volume-manager db error: {e}"))
 }
 
@@ -613,10 +615,7 @@ fn parse_request_subject(raw: &str) -> Result<SubjectId, Status> {
     Ok(subject)
 }
 
-fn artifact_job_matches_subject_class(
-    job: &pplx_space_common_jobs::Job,
-    requested_subject: &SubjectId,
-) -> bool {
+fn artifact_job_matches_subject_class(job: &Job, requested_subject: &SubjectId) -> bool {
     job.subject_id
         .as_deref()
         .and_then(|subject_id| parse_subject(subject_id).ok())
@@ -631,7 +630,7 @@ fn job_bytes_to_u64(bytes: i64) -> Result<u64, Status> {
     })
 }
 
-fn pull_job_failure_status(job: &pplx_space_common_jobs::Job) -> Status {
+fn pull_job_failure_status(job: &Job) -> Status {
     let message = format!(
         "pull failed: {}",
         job.error.as_deref().unwrap_or("unknown error")
@@ -671,7 +670,7 @@ fn transfer_job_status_code(status: TransferJobStatus) -> i32 {
     }
 }
 
-fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status> {
+fn job_to_proto(job: Job) -> Result<TransferJob, Status> {
     let payload = serde_json::from_str::<TransferPayload>(&job.payload).ok();
     let local_path = payload
         .as_ref()
@@ -718,7 +717,7 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
 }
 
 async fn wait_for_transfer_job<E: JobExecutor>(
-    worker: &BackgroundWorker<E>,
+    worker: &JobWorker<E>,
     job_id: &JobId,
 ) -> Result<GetTransferJobResponse, Status> {
     let job = worker
@@ -730,10 +729,10 @@ async fn wait_for_transfer_job<E: JobExecutor>(
 }
 
 async fn submit_push(
-    worker: &BackgroundWorker<TransferExecutor>,
+    worker: &JobWorker<TransferExecutor>,
     staging: &StagingDir,
     req: &PushFileRequest,
-) -> Result<pplx_space_common_jobs::JobId, Status> {
+) -> Result<JobId, Status> {
     // Reflink the caller's source into vol-mgr-owned staging first. The
     // upload reads bytes from the staged copy, so an unlink or rewrite of
     // the original between submit time and worker dequeue (e.g. a later
@@ -778,10 +777,10 @@ async fn unstage_push_source(path: &Path) {
 /// pre-staged path explicitly so batched callers can hand in paths from
 /// [`stage_push_source`].
 async fn register_push_job(
-    worker: &BackgroundWorker<TransferExecutor>,
+    worker: &JobWorker<TransferExecutor>,
     req: &PushFileRequest,
     staged: PathBuf,
-) -> Result<pplx_space_common_jobs::JobId, Status> {
+) -> Result<JobId, Status> {
     let staged_str = staged.to_string_lossy().into_owned();
 
     // Single-file pushes are always plaintext: envelope encryption is a
@@ -866,15 +865,15 @@ async fn register_push_job(
     Ok(job_id)
 }
 
-fn push_duplicate_policy(req: &PushFileRequest) -> pplx_space_common_jobs::DuplicatePolicy {
+fn push_duplicate_policy(req: &PushFileRequest) -> DuplicatePolicy {
     if is_immutable_suspend_snapshot_push(req) {
         // Snapshot object keys include an immutable backup-attempt identity.
         // A retry may therefore rejoin a completed transfer across the
         // caller's submit-to-persist gap. Generic PushFile callers can reuse
         // paths and destinations for changed bytes and remain active-only.
-        pplx_space_common_jobs::DuplicatePolicy::ReuseExistingOrCompleted
+        DuplicatePolicy::ReuseExistingOrCompleted
     } else {
-        pplx_space_common_jobs::DuplicatePolicy::ReuseExisting
+        DuplicatePolicy::ReuseExisting
     }
 }
 
@@ -897,10 +896,10 @@ fn is_immutable_suspend_snapshot_push(req: &PushFileRequest) -> bool {
 }
 
 fn submit_pull<E: JobExecutor>(
-    worker: &BackgroundWorker<E>,
+    worker: &JobWorker<E>,
     req: &PullFileRequest,
     assignment: impl Into<MaterializationAssignment>,
-) -> Result<pplx_space_common_jobs::JobId, Status> {
+) -> Result<JobId, Status> {
     let assignment = assignment.into();
     let file_mode = req
         .file_mode
@@ -1019,14 +1018,14 @@ impl<'a> ArtifactRetryIdentity<'a> {
 /// either satisfies a dense rootfs request or blocks an incompatible retry
 /// until it becomes terminal.
 fn classify_pull_artifact_retry<E: JobExecutor>(
-    worker: &BackgroundWorker<E>,
+    worker: &JobWorker<E>,
     identity: ArtifactRetryIdentity<'_>,
     assignment: impl Into<MaterializationAssignment>,
     entries: &[ArtifactEntryPayload],
     kek: Option<(&OrgId, &KekProvider, &MasterKeyIdentifier)>,
     wrapped_dek: Option<&[u8]>,
-    mut is_authorized: impl FnMut(&pplx_space_common_jobs::Job) -> bool,
-) -> Result<Option<pplx_space_common_jobs::Job>, Status> {
+    mut is_authorized: impl FnMut(&Job) -> bool,
+) -> Result<Option<Job>, Status> {
     let ArtifactRetryIdentity { artifact_id, dedup } = identity;
     let assignment = assignment.into();
     let mut reusable = None;
@@ -2037,7 +2036,7 @@ fn effective_entry_snapshot_artifact(entry: &ArtifactEntryPayload) -> Option<Sna
         .or_else(|| snapshot_artifact_from_entry_role(&entry.role))
 }
 
-/// Decide how to handle a [`BackgroundWorker::find_job_by_dedup_key`] hit for an
+/// Decide how to handle a [`JobWorker::find_job_by_dedup_key`] hit for an
 /// artifact retry:
 ///
 /// - `Ok(Some((job, payload)))` — reuse the existing job: an equivalent retry
@@ -2051,12 +2050,12 @@ fn effective_entry_snapshot_artifact(entry: &ArtifactEntryPayload) -> Option<Sna
 ///   persisted state (e.g. an upstream bug that derives the id from too few
 ///   inputs, or a stale id resurrected after a crash).
 fn classify_artifact_retry(
-    existing: pplx_space_common_jobs::Job,
+    existing: Job,
     artifact_id: &str,
     entries: &[ArtifactEntryPayload],
     kek: Option<(&OrgId, &KekProvider, &MasterKeyIdentifier)>,
     wrapped_dek: Option<&[u8]>,
-) -> Result<Option<(pplx_space_common_jobs::Job, ArtifactPayload)>, Status> {
+) -> Result<Option<(Job, ArtifactPayload)>, Status> {
     if existing.status == "failed" {
         return Ok(None);
     }
@@ -2103,7 +2102,7 @@ fn issue_dek_error_to_status(e: crate::credentials::IssueDekError) -> Status {
 #[cfg(test)]
 mod tests;
 
-fn parse_job_id(raw: &str) -> Result<pplx_space_common_jobs::JobId, Status> {
+fn parse_job_id(raw: &str) -> Result<JobId, Status> {
     raw.parse()
         .map_err(|error| Status::invalid_argument(format!("job_id: {error}")))
 }
