@@ -671,13 +671,12 @@ pub async fn converge_published_stopped(
 /// published lifecycle equals its target state, naming the active execution's
 /// generation, activation attempt and target state; a route activation to be
 /// present; and either a `created` lifecycle (for a `created` target) or a
-/// running execution with a pod IP (for `started` and `paused`). It checks
-/// `active_node_id` only through an unlocked join, as of the statement's
-/// snapshot, and the `sandboxes` update does not re-check it, so a change to
-/// `active_node_id` committed after that snapshot is not seen. The lifecycle
-/// projection re-checks only that the row is outside the suspend, hold and
-/// delete lifecycles: if a newer suspend owns the row, the attempt is still
-/// released but its stale target is not projected.
+/// running execution with a pod IP (for `started` and `paused`). Only matching
+/// receipts lock sandboxes still on `node_id`, before updating their executions
+/// to match teardown's lock order. The lifecycle projection also requires
+/// that the row is outside the suspend, hold and delete lifecycles: if a newer
+/// suspend owns the row, the attempt is still released but its stale target
+/// is not projected.
 ///
 /// A projected `started` target also clears `command_ready_pending`. The node
 /// writes an activation-completed receipt only once the guest has passed its
@@ -693,23 +692,23 @@ pub async fn release_completed_activations(
         "WITH input AS (
              SELECT *
                FROM jsonb_to_recordset($2::jsonb) AS published({TRANSITION_RECEIPT_RECORD_COLUMNS})
-         ), released AS (
-             UPDATE sandbox_k8s_executions execution
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = NULL,
-                    activation_attempt_target_state = NULL,
-                    updated_at = NOW()
-               FROM sandboxes sandbox, input
-              WHERE sandbox.id = execution.sandbox_id
-                AND input.sandbox_id = sandbox.id
-                AND sandbox.active_node_id = $1
+         ), locked AS MATERIALIZED (
+             SELECT execution.id AS execution_id,
+                    input.transition_receipt_execution_generation,
+                    input.transition_receipt_activation_attempt_id,
+                    input.transition_receipt_target_state
+               FROM input
+               JOIN sandboxes sandbox ON sandbox.id = input.sandbox_id
+               JOIN sandbox_k8s_executions execution ON execution.sandbox_id = sandbox.id
+              WHERE sandbox.active_node_id = $1
+                AND input.transition_receipt_kind = $3
+                AND input.published_lifecycle = input.transition_receipt_target_state
+                -- Retained receipts that no longer match need no sandbox lock.
                 AND execution.active
                 AND execution.generation = input.transition_receipt_execution_generation
                 AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
                 AND execution.route_activation_id IS NOT NULL
                 AND execution.activation_attempt_target_state = input.transition_receipt_target_state
-                AND input.transition_receipt_kind = $3
-                AND input.published_lifecycle = input.transition_receipt_target_state
                 AND (
                     (
                         input.transition_receipt_target_state = 'created'
@@ -721,7 +720,27 @@ pub async fn release_completed_activations(
                         AND execution.pod_ip IS NOT NULL
                     )
                 )
-              RETURNING execution.sandbox_id, input.transition_receipt_target_state
+              ORDER BY sandbox.id
+              FOR NO KEY UPDATE OF sandbox
+         ), released AS (
+             UPDATE sandbox_k8s_executions execution
+                SET activation_attempt_id = NULL,
+                    activation_attempt_expires_at = NULL,
+                    activation_attempt_target_state = NULL,
+                    updated_at = NOW()
+               FROM locked
+              WHERE execution.id = locked.execution_id
+                -- Execution-only writers can change these without the sandbox lock.
+                AND execution.active
+                AND execution.generation = locked.transition_receipt_execution_generation
+                AND execution.activation_attempt_id = locked.transition_receipt_activation_attempt_id
+                AND execution.route_activation_id IS NOT NULL
+                AND execution.activation_attempt_target_state = locked.transition_receipt_target_state
+                AND (
+                    locked.transition_receipt_target_state = 'created'
+                    OR (execution.state = 'running' AND execution.pod_ip IS NOT NULL)
+                )
+              RETURNING execution.sandbox_id, locked.transition_receipt_target_state
          )
          UPDATE sandboxes sandbox
             SET lifecycle = released.transition_receipt_target_state,
