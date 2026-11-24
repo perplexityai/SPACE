@@ -887,6 +887,10 @@ pub async fn run(
             shutdown_token.child_token(),
             &task_tracker,
         );
+        crate::service::node_cpu_metrics::start_node_cpu_metrics(
+            shutdown_token.child_token(),
+            &task_tracker,
+        );
         service
             .disk_admission()
             .start_refresh_loop(shutdown_token.child_token(), &task_tracker);
