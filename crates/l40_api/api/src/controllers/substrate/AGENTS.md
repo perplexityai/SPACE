@@ -130,7 +130,8 @@ For new work:
   together with `nodes`. Elsewhere, read them only through an existing
   query that joins them (archcheck's `pattern_ratchet.direct_tables`
   fails a new use, or a new mention of the store's crate, outside
-  `direct.rs`, `direct/` and the store; its baseline lists today's).
+  `direct.rs`, `direct/`, the store and a storage crate's `direct`
+  module (`src/direct.rs`, `src/direct/`); its baseline lists today's).
 - Direct-table joins in shared code, `Unsupported` trait defaults
   (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`,
   `select_ready_worker_node_api_target`) and `supports_node_drain`, a

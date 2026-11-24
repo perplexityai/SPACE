@@ -107,45 +107,10 @@ pub(super) async fn fetch_sandbox_service_route_row(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
 ) -> Result<SandboxServiceRouteRow, Status> {
-    sqlx::query_as::<_, SandboxServiceRouteRow>(sql!(
-        "SELECT s.id AS sandbox_id,
-                s.org_id,
-                s.template_id,
-                s.lifecycle,
-                COALESCE(direct_route.current_node_id, s.active_node_id) AS active_node_id,
-                HOST(n.address) AS node_address,
-                COALESCE(direct_route.substrate_kind, n.managed_by) AS node_managed_by,
-                nk.k8s_node_name AS k8s_node_name,
-                nd.node_api_endpoint AS direct_node_api_endpoint,
-                COALESCE(NULLIF(BTRIM(e.pod_uid), ''), direct_route.pod_uid)
-                    AS sandbox_pod_uid,
-                COALESCE(e.generation, direct_route.execution_generation)
-                    AS execution_generation,
-                COALESCE(e.route_activation_id, direct_route.activation_attempt_id)
-                    AS activation_attempt_id,
-                COALESCE(ecw_credential.epoch, 1) AS ecw_credential_epoch,
-                s.command_ready_pending
-         FROM sandboxes s
-         LEFT JOIN sandbox_direct_route_identities direct_route
-           ON direct_route.sandbox_id = s.id
-          AND s.active_node_id IS NOT NULL
-         LEFT JOIN nodes n
-           ON n.id = COALESCE(direct_route.current_node_id, s.active_node_id)
-         LEFT JOIN node_k8s nk ON nk.node_id = n.id
-         LEFT JOIN node_direct nd ON nd.node_id = n.id AND nd.deleted_at IS NULL
-         LEFT JOIN sandbox_k8s_executions e
-           ON e.sandbox_id = s.id
-          AND e.active
-          AND e.terminated_at IS NULL
-         LEFT JOIN sandbox_ecw_credential_epochs ecw_credential
-           ON ecw_credential.sandbox_id = s.id
-         WHERE s.id = $1"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| Status::internal(format!("resolve sandbox service route: {error}")))?
-    .ok_or_else(|| Status::not_found("sandbox not found"))
+    sandbox_store::direct::route_reads::service_route_row(pool, sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("resolve sandbox service route: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
 pub(super) fn resolve_sandbox_service_backend_endpoint(

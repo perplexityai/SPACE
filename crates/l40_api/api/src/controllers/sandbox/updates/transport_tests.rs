@@ -22,6 +22,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
 use super::*;
+use pplx_space_sql_locator::sql;
 
 #[cfg(feature = "kubernetes")]
 mod kubernetes;

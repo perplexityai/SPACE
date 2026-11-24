@@ -300,7 +300,8 @@ pub async fn invalidate_open_tcp_exposure_after_proxy_failure(
 /// described, such as an execution finished or retired, a quarantine
 /// recovered, a failed row repaired or an activation rolled back.
 /// Transitions written as one statement in [`crate::suspend`],
-/// [`crate::orphan`] and [`crate::ingest`] reset the same columns in a CTE
+/// [`crate::orphan`], [`crate::ingest`] and
+/// [`crate::direct::service_route_reset`] reset the same columns in a CTE
 /// of their own, so change them together.
 /// [`crate::lost::write_off_lost_sandboxes`] leaves exposures alone.
 pub async fn invalidate_open_observations(

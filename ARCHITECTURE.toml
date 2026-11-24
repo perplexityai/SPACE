@@ -423,6 +423,7 @@ pplx-space-node-status-store = [
   "pplx-space-api",
   "pplx-space-internal-api-server",
   "pplx-space-runtime-upgrade-campaign-store",
+  "pplx-space-sandbox-store",
 ]
 pplx-space-node-template-inventory-store = [
   "pplx-space-api",
