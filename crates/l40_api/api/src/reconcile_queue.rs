@@ -11,6 +11,7 @@ use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+use pplx_space_sandbox_store::orphan::lock_orphan_observation;
 
 pub use pplx_space_sandbox_teardown::{
     delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
@@ -78,7 +79,13 @@ pub enum FinalizeSandboxDbDeleteError {
 ///
 /// ## Concurrency
 ///
-/// Takes a `FOR UPDATE` lock on the parent `sandboxes` row first.
+/// Serializes with node-state publication before taking any row locks:
+/// publication can write observed state before it updates the sandbox row,
+/// or remove observed state before locking an absent stopped Direct sandbox.
+/// Finalization locks the sandbox row before deleting observed state and does
+/// not require the caller to have marked the sandbox `deleting`.
+///
+/// Takes a `FOR UPDATE` lock on the parent `sandboxes` row before checking uploads.
 /// PostgreSQL's foreign-key enforcement makes a concurrent
 /// `INSERT INTO snapshots (sandbox_id, …)` take an implicit
 /// `FOR KEY SHARE` lock on the same row; `FOR UPDATE` conflicts with
@@ -102,6 +109,7 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     sandbox_id: SandboxId,
 ) -> Result<(), FinalizeSandboxDbDeleteError> {
     let mut tx = pool.begin().await?;
+    lock_orphan_observation(&mut tx, sandbox_id).await?;
     lock_fork_source_lifecycle(&mut tx, sandbox_id).await?;
     // Lock the parent sandbox row to serialize against any
     // concurrent BeginArtifactBackup INSERT (which acquires the

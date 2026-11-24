@@ -5,7 +5,13 @@ use super::*;
 mod postgres_tests {
 
     use pplx_space_db_test_fixtures::{
-        insert_pool_slot_receipt, pg_test_db, pool_slot_receipt_state,
+        insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
+        pg_test_db_with_max_connections, pool_slot_receipt_state,
+    };
+    use pplx_space_internal_api_server::{
+        ClusterApiService,
+        proto::{PublishNodeStateRequest, PublishedSandboxState, cluster_api_server::ClusterApi},
+        publish_sandbox_states,
     };
     use pplx_space_snapshot_model::SnapshotId;
     use uuid::Uuid;
@@ -263,6 +269,151 @@ mod postgres_tests {
             "snapshot_id should be NULL after orphan"
         );
         assert!(orphan.1.is_some(), "orphaned_at should be stamped");
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::present(Some(true))]
+    #[case::absent(Some(false))]
+    #[case::omitted(None)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_delete_finalization_racing_publication_does_not_deadlock(
+        #[case] present: Option<bool>,
+    ) -> TestResult {
+        let db = pg_test_db_with_max_connections(4).await?;
+        let node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        insert_ready_worker_node(&db.pool, node_id).await?;
+        let lifecycle = if present == Some(true) {
+            "started"
+        } else {
+            "stopped"
+        };
+        insert_sandbox(&db.pool, sandbox_id, lifecycle).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+             SET placement = 'on_node', active_node_id = $2, target_node_id = $2, managed_by = $3
+             WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(node_id)
+        .bind(if present == Some(true) {
+            "k8s"
+        } else {
+            "space"
+        })
+        .execute(&db.pool)
+        .await?;
+
+        let mut state = PublishedSandboxState {
+            sandbox_id: sandbox_id.to_string(),
+            status: Some(lifecycle.to_owned()),
+            present: true,
+            ..Default::default()
+        };
+        let mut tx = db.pool.begin().await?;
+        publish_sandbox_states(&mut tx, node_id, std::slice::from_ref(&state)).await?;
+        tx.commit().await?;
+        if present.is_none() {
+            // Give the prune's DELETE a snapshot inventory row to visit.
+            // Otherwise PostgreSQL can drain its two write CTEs in either
+            // order without scanning their results.
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_snapshot_inventory (sandbox_id, snapshot_id, type, state)
+                 VALUES ($1, 'observed-snapshot', 'disk', 'ready')"
+            ))
+            .bind(sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        }
+        if present == Some(true) {
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle = 'deleting' WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        }
+
+        // Pause finalization at the fork-operation check, after it locks the
+        // sandbox row. The publication then either updates observed state and
+        // activity, removes an explicitly absent row, or prunes an omitted
+        // sandbox in a full census. Wait for both writers to
+        // block before releasing the gate so their overlap is deterministic.
+        let mut gate = db.pool.begin().await?;
+        sqlx::query(sql!(
+            "LOCK TABLE public_operations IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *gate)
+        .await?;
+        let wait_for_writers = async |expected| {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while sqlx::query_scalar::<_, i64>(sql!(
+                    "SELECT COUNT(*) FROM pg_stat_activity
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                ))
+                .fetch_one(&db.pool)
+                .await?
+                    < expected
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                TestResult::Ok(())
+            })
+            .await?
+        };
+
+        let pool = db.pool.clone();
+        let delete = tokio::spawn(async move {
+            finalize_sandbox_db_delete_user_initiated(&pool, sandbox_id).await
+        });
+        wait_for_writers(1).await?;
+
+        if present == Some(true) {
+            state.uptime = Some("1m".to_owned());
+            state.last_access_at = Some(prost_types::Timestamp {
+                seconds: 1_900_000_000,
+                nanos: 0,
+            });
+        }
+        let pool = db.pool.clone();
+        let publish = tokio::spawn(async move {
+            if let Some(present) = present {
+                state.present = present;
+                let mut tx = pool.begin().await?;
+                publish_sandbox_states(&mut tx, node_id, &[state]).await?;
+                tx.commit().await?;
+            } else {
+                let mut request = tonic::Request::new(PublishNodeStateRequest {
+                    node_id: node_id.to_string(),
+                    sandbox_inventory_complete: true,
+                    ..Default::default()
+                });
+                request
+                    .extensions_mut()
+                    .insert(tonic::transport::server::TcpConnectInfo {
+                        local_addr: None,
+                        remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
+                    });
+                ClusterApiService::new(pool)
+                    .publish_node_state(request)
+                    .await?;
+            }
+            TestResult::Ok(())
+        });
+        wait_for_writers(2).await?;
+        gate.commit().await?;
+
+        let (deleted, published) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(delete, publish)
+        })
+        .await?;
+        let (deleted, published) = (deleted?, published?);
+        assert!(
+            deleted.is_ok() && published.is_ok(),
+            "delete: {deleted:?}; publication: {published:?}"
+        );
+        assert!(!sandbox_exists(&db.pool, sandbox_id).await?);
         Ok(())
     }
 }
