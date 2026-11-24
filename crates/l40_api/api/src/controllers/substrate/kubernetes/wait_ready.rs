@@ -668,8 +668,8 @@ impl KubernetesSubstrate {
         loop {
             connect_attempts += 1;
             let connect_started_at = Instant::now();
-            let probe = self
-                .probe_pod_proxy(sandbox_id, pod_ip, &target)
+            let serves = self
+                .probe_pod_proxy(sandbox_id, pod_ip, &target, deadline)
                 .instrument(tracing::info_span!(
                     "substrate.k8s.connect_pod_proxy",
                     sandbox_id = %sandbox_id,
@@ -678,7 +678,7 @@ impl KubernetesSubstrate {
                     attempt = connect_attempts,
                 ))
                 .await;
-            if probe == PodProxyProbe::Serves {
+            if serves {
                 record_pod_proxy_wait_ready(
                     metric_identity,
                     sandbox_id,
@@ -716,11 +716,12 @@ impl KubernetesSubstrate {
                 });
             }
 
-            // A stale address is re-resolved. The recorded address for the
-            // target's UID is kept until kubelet publishes another, so after a
-            // runtime sandbox is recreated under the same UID the wait binds
-            // its new address at kubelet's pace, as without a node report.
-            if probe == PodProxyProbe::Stale
+            // An address that does not serve the target is re-resolved. The
+            // recorded address for the target's UID is kept until kubelet
+            // publishes another, so after a runtime sandbox is recreated under
+            // the same UID the wait binds its new address at kubelet's pace,
+            // as without a node report.
+            if !serves
                 && let Some(current) = self
                     .resolve_pod_ip_for_readiness(sandbox_id, &target, deadline)
                     .await?
@@ -731,8 +732,8 @@ impl KubernetesSubstrate {
         }
     }
 
-    /// Ask the node behind `pod_ip` whether it serves `target`'s execution at
-    /// that address. The address forwards to its node's node-api, so a stale
+    /// Whether the node behind `pod_ip` answers that it serves `target`'s
+    /// execution at that address. The address forwards to its node's node-api, so a stale
     /// or reused address reaches a node that does not, or that reports
     /// another address for the execution's current network allocation.
     async fn probe_pod_proxy(
@@ -740,18 +741,19 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         pod_ip: PodIp,
         target: &PodProxyWaitTarget<'_>,
-    ) -> PodProxyProbe {
+        deadline: Instant,
+    ) -> bool {
         let Some(mut client) = Self::pod_worker_client(
             pod_ip,
             self.k8s.sandbox_proxy_port,
-            START_WAIT_CONNECT_TIMEOUT,
+            START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline)),
         )
         .await
         else {
-            return PodProxyProbe::Unreachable;
+            return false;
         };
         let state = timeout(
-            START_WAIT_CONNECT_TIMEOUT,
+            START_WAIT_CONNECT_TIMEOUT.min(remaining_ready_window(deadline)),
             client.sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
                 sandbox_ids: vec![sandbox_id.to_string()],
             }),
@@ -759,13 +761,9 @@ impl KubernetesSubstrate {
         .await;
         match state {
             Ok(Ok(response)) => {
-                if serves_target(response.into_inner().sandboxes, sandbox_id, target, pod_ip) {
-                    PodProxyProbe::Serves
-                } else {
-                    PodProxyProbe::Stale
-                }
+                serves_target(response.into_inner().sandboxes, sandbox_id, target, pod_ip)
             }
-            _ => PodProxyProbe::Unreachable,
+            _ => false,
         }
     }
 
@@ -1346,17 +1344,6 @@ pub(super) struct PodProxyWaitTarget<'a> {
     /// path passes `None` (the binding it produces is discarded).
     pub pod_uid: Option<&'a str>,
     pub generation: i64,
-}
-
-/// What the node behind a pod address answered for a readiness wait.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PodProxyProbe {
-    /// It serves the target execution at that address.
-    Serves,
-    /// It answered, but not for the target execution at that address.
-    Stale,
-    /// It did not answer.
-    Unreachable,
 }
 
 /// Whether `sandboxes` show `target`'s execution served at `pod_ip`. A field

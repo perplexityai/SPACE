@@ -218,16 +218,14 @@ impl SimState {
         // only surface as an error when `ensure_sandbox_root` tries to
         // create the directory, leaving a poisoned record behind.
         validate_state_sandbox_id(&record.sandbox_id)?;
-        {
-            let mut map = self.inner.lock().await;
-            if map.contains_key(&record.sandbox_id) {
-                return Err(SimStateError::AlreadyExists(record.sandbox_id));
-            }
-            map.insert(record.sandbox_id.clone(), record.clone());
+        let mut map = self.inner.lock().await;
+        if map.contains_key(&record.sandbox_id) {
+            return Err(SimStateError::AlreadyExists(record.sandbox_id));
         }
-        // Eagerly materialize the per-sandbox FS root so spaced file ops have
-        // a directory to operate against. Failures bubble up so callers know
-        // a malformed sandbox-fs-dir would silently strand later writes.
+        // The per-sandbox FS root exists before the record is visible, so
+        // spaced file ops always have a directory to operate against. Failures
+        // bubble up so callers know a malformed sandbox-fs-dir would silently
+        // strand later writes.
         self.fs
             .ensure_sandbox_root(&record.sandbox_id)
             .await
@@ -235,6 +233,7 @@ impl SimState {
                 sandbox_id: record.sandbox_id.clone(),
                 source: std::io::Error::other(err.to_string()),
             })?;
+        map.insert(record.sandbox_id.clone(), record);
         Ok(())
     }
 
@@ -357,8 +356,8 @@ impl SimState {
     pub async fn state_of(&self, ids: &[String]) -> (Vec<SandboxRecord>, Vec<String>) {
         if self.sandbox_pod {
             for id in ids {
-                // Recorded as a create records it, with its file root; a root
-                // that cannot be created fails the sandbox's later file ops.
+                // Recorded as a create records it, with its file root; one
+                // whose root cannot be created stays missing below.
                 let _ = self.ensure_default_running(id).await;
             }
         }
