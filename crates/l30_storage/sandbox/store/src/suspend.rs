@@ -2,17 +2,55 @@
 //! suspend, recording its committed artifact, and finalizing the suspended
 //! row, including the missing-pod finalization from the current snapshot.
 //!
-//! The caller keeps everything around them: the sandbox and execution row
-//! locks (`SELECT ... FOR UPDATE`), the transactions, the execution-row
-//! writes beside each step, and the claimed warm-pool slot delete. Every
-//! function runs on the executor its caller passes, so it composes into the
-//! caller's transaction when there is one.
+//! Also the sandbox row lock the pod retirement takes on a row that still
+//! carries the committed suspend artifact
+//! ([`lock_committed_artifact`]); the suspend commit's id-only lock is
+//! [`crate::row_locks::lock_id`].
+//!
+//! The caller keeps everything around them: the execution row locks
+//! (`SELECT ... FOR UPDATE` on `sandbox_k8s_executions`), the transactions
+//! the locks last for, the execution-row writes beside each step, and the
+//! claimed warm-pool slot delete. Every write runs on the executor its
+//! caller passes, so it composes into the caller's transaction when there
+//! is one; the lock runs on the caller's open transaction.
 
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 
 use pplx_space_sql_locator::sql;
+
+/// Lock the sandbox row `FOR UPDATE` until the caller's transaction ends,
+/// while it is `suspending` or `suspended` with `artifact_id` of
+/// `artifact_kind` as its current local `suspend` artifact. Returns the
+/// row's lifecycle as stored, or `None` when the row doesn't match. A row
+/// that already fails the guard when the statement reads it is not locked;
+/// under READ COMMITTED, one that a concurrent writer moves off the guard
+/// while the statement waits for its lock can stay locked until the
+/// transaction ends.
+pub async fn lock_committed_artifact(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(sql!(
+        "SELECT lifecycle
+              FROM sandboxes
+              WHERE id = $1
+                AND lifecycle IN ('suspending', 'suspended')
+                AND current_local_artifact_id = $2
+                AND current_local_artifact_kind = $3
+                AND current_local_artifact_origin = $4
+              FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact_id.as_uuid())
+    .bind(artifact_kind.as_str())
+    .bind(ArtifactOrigin::Suspend.as_str())
+    .fetch_optional(conn)
+    .await
+}
 
 /// **Operation step.** Claim the suspend of the execution at `generation`
 /// tracking `pod_uid`: flip the row from `previous` to `suspending` while

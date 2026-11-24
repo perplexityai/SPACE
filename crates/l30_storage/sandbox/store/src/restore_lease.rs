@@ -1,9 +1,13 @@
 //! Guarded writes of the Kubernetes substrate's restore lease on `sandboxes`:
 //! the user and evacuation restore claims, the markerless re-drive's lease
 //! claim, the owned completion and the lease release, and the reverts of an
-//! abandoned claim. Also the reads of the restore gate behind them: the
-//! ownership snapshot a caller reads when a claim matches nothing, and the
-//! batched observation of user restores in flight.
+//! abandoned claim. Also the row locks of those paths: the revert's lock on a
+//! row still `restoring` under its claim ([`lock_restore_claim`]), and the
+//! lock a create-claim cleanup takes to read the lease token it compares
+//! ([`lock_restore_lease_token`]). And the reads behind them: the evidence
+//! the revert decides on under its lock ([`restore_revert_evidence`]), and,
+//! of the restore gate, the ownership snapshot a caller reads when a claim
+//! matches nothing and the batched observation of user restores in flight.
 //!
 //! The restore lease is the pair `restore_lease_expires_at` /
 //! `restore_lease_token`. A user claim writes both; the evacuation claim is
@@ -12,14 +16,17 @@
 //! `sandboxes_clear_restore_lease` trigger.
 //!
 //! The Kubernetes store keeps everything around these statements: the
-//! revert's row lock (`SELECT ... FOR UPDATE`) and its evidence read, the
-//! transactions, the execution retirement beside the revert, and what it
-//! decides from the gate reads. A claim or completion that matches no row is
-//! an outcome, not an error.
+//! transactions the locks last for, the execution retirement beside the
+//! revert, and what it decides from the locks, the evidence and the gate
+//! reads. A claim, completion or guarded lock that matches no
+//! row is an outcome, not an error.
+
+use std::sync::LazyLock;
 
 use pplx_space_node_model::SubstrateKind;
-use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
 
+use pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists;
 use pplx_space_sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, Postgres, Transaction};
@@ -359,6 +366,135 @@ pub async fn revert_restore_claim_lifecycle(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// Lock the sandbox row `FOR UPDATE` while it is still `restoring` under the
+/// claim being reverted, until the caller's transaction ends. With
+/// `restore_lease_token` the row must still carry that token; `None` skips
+/// the token check. Returns whether the row matched. A row that already
+/// fails the guard when the statement reads it is not locked; under READ
+/// COMMITTED, one that a concurrent writer moves off the guard while the
+/// statement waits for its lock can stay locked until the transaction ends.
+///
+/// The revert takes it in its own statement first, so its later statements
+/// read the snapshots and executions as of after the lock.
+pub async fn lock_restore_claim(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    restore_lease_token: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
+    let locked: Option<bool> = sqlx::query_scalar(sql!(
+        "SELECT TRUE
+               FROM sandboxes
+              WHERE id = $1
+                AND lifecycle = 'restoring'
+                AND ($2::uuid IS NULL OR restore_lease_token = $2)
+                FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .bind(restore_lease_token)
+    .fetch_optional(conn)
+    .await?;
+    Ok(locked.is_some())
+}
+
+/// Lock the sandbox row `FOR UPDATE` until the caller's transaction ends and
+/// read its `restore_lease_token`: `None` when no row exists, `Some(None)`
+/// when the row carries no token.
+///
+/// The caller compares the token under the lock, so a cleanup by a lapsed
+/// lease owner serializes against the lease takeover, which locks the row
+/// before it writes a new token.
+pub async fn lock_restore_lease_token(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+) -> Result<Option<Option<Uuid>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<Uuid>>(sql!(
+        "SELECT restore_lease_token FROM sandboxes WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(conn)
+    .await
+}
+
+/// What [`restore_revert_evidence`] reads of one row: the active execution
+/// the reverted claim created, if one is identifiable (its generation and
+/// pod name), whether any active execution exists, and whether the
+/// pre-restore source is proven restorable once the row is `suspended`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreRevertEvidence {
+    pub claimed_generation: Option<i64>,
+    pub claimed_pod_name: Option<String>,
+    pub any_active_execution: bool,
+    pub source_proven: bool,
+}
+
+/// Read the evidence a restore revert decides on, after
+/// [`lock_restore_claim`] in the caller's transaction. A plain read: it takes
+/// no lock, and a missing row is an error ([`sqlx::Error::RowNotFound`]).
+///
+/// The claimed execution is an active one created at or after the row's
+/// `lifecycle_changed_at` that carries `activation_attempt` (its attempt id
+/// and generation) or, with no attempt, any such execution when the claim
+/// wrote `restore_lease_token`. Under the caller's row lock no other claim
+/// can replace the execution, and `lifecycle_changed_at` still reads this
+/// claim's `restoring` transition, so that execution is the one this claim
+/// created. The source proof is
+/// `pplx_space_sandbox_portability::restore_retry_suspended_revert_snapshot_exists`.
+pub async fn restore_revert_evidence(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    restore_lease_token: Option<Uuid>,
+    activation_attempt: Option<(SandboxActivationAttemptId, i64)>,
+) -> Result<RestoreRevertEvidence, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let proof = restore_retry_suspended_revert_snapshot_exists("s");
+        sql!(format!(
+            "SELECT claimed.generation,
+                    claimed.pod_name,
+                    EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions e
+                         WHERE e.sandbox_id = s.id
+                           AND e.active
+                    ),
+                    {proof}
+               FROM sandboxes s
+               LEFT JOIN LATERAL (
+                   SELECT e.generation, e.pod_name
+                     FROM sandbox_k8s_executions e
+                    WHERE e.sandbox_id = s.id
+                      AND e.active
+                      AND e.created_at >= s.lifecycle_changed_at
+                      AND CASE
+                              WHEN $3::uuid IS NOT NULL
+                                  THEN e.activation_attempt_id = $3
+                                       AND e.generation = $4
+                              ELSE $2::uuid IS NOT NULL
+                          END
+               ) claimed ON TRUE
+              WHERE s.id = $1"
+        ))
+    });
+    let (claimed_generation, claimed_pod_name, any_active_execution, source_proven): (
+        Option<i64>,
+        Option<String>,
+        bool,
+        bool,
+    ) = sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(sandbox_id)
+        .bind(restore_lease_token)
+        .bind(activation_attempt.map(|(attempt, _)| attempt))
+        .bind(activation_attempt.map(|(_, generation)| generation))
+        .fetch_one(conn)
+        .await?;
+    Ok(RestoreRevertEvidence {
+        claimed_generation,
+        claimed_pod_name,
+        any_active_execution,
+        source_proven,
+    })
 }
 
 /// What [`restore_ownership_snapshot`] reads of one row: its lifecycle and
