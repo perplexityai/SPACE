@@ -18,8 +18,8 @@
 //! else is resubmitted, so a stale slot waits for the next generation to list
 //! it again.
 //!
-//! An `All` binding also gates each runtime launch (`start`); a launch whose
-//! outcome is unknown ends the binding, though a pass already running finishes.
+//! An `All` binding also gates each runtime launch (`start`). A start waits for
+//! the pass to settle first. A launch whose outcome is unknown ends the binding.
 //!
 //! A production binding is expected to build on this worker. First it must
 //! revisit the node-wide end rule, re-listing on retry, and per-slot reporting,
