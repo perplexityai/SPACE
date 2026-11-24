@@ -8,6 +8,7 @@ use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_durations::PositiveDuration;
 use pplx_space_sandbox_portability::newest_suspend_snapshot_current;
 use pplx_space_sandbox_store::repair::unplace_suspended_after_execution_retired;
+use pplx_space_sandbox_store::row_locks;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
@@ -149,12 +150,7 @@ impl RetireSink for ExecutionDbStore {
     ) -> Result<RetireOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        let lifecycle: Option<String> = sqlx::query_scalar(sql!(
-            "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(candidate.sandbox_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let lifecycle = row_locks::lock_lifecycle(&mut tx, candidate.sandbox_id).await?;
         if lifecycle.as_deref() != Some("suspended") {
             tx.rollback().await?;
             return Ok(RetireOutcome::SkippedRaced);

@@ -11,6 +11,12 @@
 //! transaction under its locks and rechecks. sbx-mgr's SQLite tables of
 //! the same names belong to `pplx-space-sbx-mgr-store`, not here. The fragments
 //! stay here until store functions for these tables replace them.
+//!
+//! [`locks`] holds episode-only locks callers take on their transaction, and
+//! [`node_recovery_receipt`] the internal API's guarded retirement of an
+//! episode a node recovered. The internal API's pause-failed recovery locks
+//! episodes together with their `sandboxes` rows in one statement, in
+//! `pplx-space-sandbox-store`'s `quarantine_publication` module.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -19,6 +25,9 @@ use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+pub mod locks;
+pub mod node_recovery_receipt;
 
 /// A sandbox's open quarantine episode, from `sandbox_quarantine_state`.
 ///

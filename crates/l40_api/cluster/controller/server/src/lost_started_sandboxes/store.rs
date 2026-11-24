@@ -12,6 +12,7 @@ use pplx_space_sandbox_portability::started_restore_source_absent;
 use pplx_space_sandbox_store::lost::{
     DEAD_UPLOAD_SETTLE, mark_started_lost, write_off_lost_sandboxes,
 };
+use pplx_space_sandbox_store::row_locks;
 use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
@@ -154,12 +155,7 @@ impl LostStartedSink for LostStartedDbStore {
         // the execution, so a wake either commits first (the flip's execution
         // check then refuses) or waits for this transaction, then finds the
         // row `failed` and claims nothing.
-        let locked: Option<String> = sqlx::query_scalar(sql!(
-            "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(candidate.sandbox_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let locked = row_locks::lock_lifecycle(&mut tx, candidate.sandbox_id).await?;
         if locked.as_deref() != Some("started") {
             tx.rollback().await?;
             return Ok(false);

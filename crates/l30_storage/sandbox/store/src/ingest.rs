@@ -19,8 +19,10 @@
 //! tables (`sandbox_k8s_executions`, `sandbox_port_exposures`,
 //! `sandbox_observed_states`, the quarantine and node-facet tables,
 //! `sandbox_snapshot_inventory`, `snapshot_storage_locations`): splitting one
-//! would change what it does. The caller owns the transaction, the locking reads that select candidates,
-//! the other tables' own statements, and the events it emits.
+//! would change what it does. The caller owns the transaction, the other
+//! tables' own statements and the events it emits, and takes the locking
+//! reads that select candidates, some of them through
+//! [`crate::quarantine_publication`].
 //!
 //! A new lifecycle write here from a node report follows the rule for such
 //! writes in `crates/l40_api/internal/api/server/AGENTS.md`, which also lists
@@ -46,10 +48,11 @@ use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
 
 /// The `jsonb_to_recordset` column list of one published sandbox row with
-/// its transition receipt, as the publish path serializes it. Two statements
-/// still in the internal API splice it as well, and its names must match the
-/// fields that path serializes: `jsonb_to_recordset` reads a missing field as
-/// NULL.
+/// its transition receipt, as the publish path serializes it.
+/// [`lock_suspended_projection_candidates`](crate::quarantine_publication::lock_suspended_projection_candidates)
+/// and a statement still in the internal API splice it as well, and its names
+/// must match the fields that path serializes: `jsonb_to_recordset` reads a
+/// missing field as NULL.
 pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
     published_lifecycle TEXT,
