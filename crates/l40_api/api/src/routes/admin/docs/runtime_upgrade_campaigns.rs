@@ -21,7 +21,7 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
         json!({
             "get": {
                 "summary": "List runtime upgrade campaigns",
-                "description": format!("At most 100 campaigns in id order, which is creation order to the millisecond. Each is {campaign} Use next_after as the after cursor; null means the last page."),
+                "description": format!("At most 100 campaigns in id order, which is creation order to the millisecond; campaigns of a kind this build doesn't know are skipped. Each is {campaign} Use next_after as the after cursor; null means the last page."),
                 "parameters": [
                     { "name": "unfinished", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Only canary, rolling and paused campaigns" },
                     { "name": "after", "in": "query", "schema": { "type": "string", "format": "uuid" } }
@@ -78,7 +78,7 @@ pub(super) fn insert_runtime_upgrade_campaign_paths(paths: &mut Map<String, Valu
                     "200": { "description": "The campaign" },
                     "400": { "description": "Invalid campaign id" },
                     "403": { "description": "Managing organization administrator required" },
-                    "404": { "description": "No such campaign" }
+                    "404": { "description": "No such campaign, or one of a kind this build doesn't know" }
                 }
             }
         }),

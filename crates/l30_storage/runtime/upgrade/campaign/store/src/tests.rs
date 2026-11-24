@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use pplx_space_node_status_store::test_support::{SnapshotSeed, upsert_snapshot};
 
-use super::test_support::{CampaignSeed, insert_campaign};
+use super::test_support::{CampaignSeed, insert_campaign, insert_campaign_with_kind};
 use super::*;
 
 mod kinds;

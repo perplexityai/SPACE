@@ -2618,7 +2618,8 @@ The loop is off unless `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on
 table. What a kind's subjects are, and how one is upgraded, belong to that
 kind's driver. Only template campaigns have one ([Template runtime upgrade
 campaigns](#template-runtime-upgrade-campaigns)), so the admin API refuses to
-start a valid sandbox campaign (409), and the loop only reports one it finds. Each tick the
+start a valid sandbox campaign (409), and the loop only reports one it finds;
+a campaign row of a kind from a newer build is logged and skipped. Each tick the
 loop also returns a finished campaign's in-flight items whose leases lapsed to
 pending (see abort below), and for every unfinished campaign whose kind has a
 driver, it:
@@ -2684,7 +2685,8 @@ managing-organization admin. `space-admin-cli runtime campaign` wraps them
   answers 409 even when the generation is stale too.
 * `GET /runtime-upgrade-campaigns` and `GET /runtime-upgrade-campaigns/{id}`
   report each campaign's phase, generation, items by phase and stranded
-  count. For a sandbox campaign, `stranded` is its pending items while the
+  count; a campaign of a kind this build doesn't know is skipped (`GET
+  .../{id}` answers 404). For a sandbox campaign, `stranded` is its pending items while the
   catalog certifies no upgrade edge from its source to its target, and 0
   once the campaign is finished. It's `null` for template campaigns.
 

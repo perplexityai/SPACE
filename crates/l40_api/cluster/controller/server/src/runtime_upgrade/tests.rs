@@ -9,7 +9,9 @@ use std::time::Duration;
 use pplx_space_content_digest::Digest;
 use pplx_space_db_test_fixtures::{TestDb, try_pg_test_db_with_max_connections};
 use pplx_space_execution_spec::EnvironmentReference;
-use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+use pplx_space_runtime_upgrade_campaign_store::test_support::{
+    CampaignSeed, insert_campaign, insert_campaign_with_kind,
+};
 use pplx_space_runtime_upgrade_campaign_store::{ItemCounts, ItemError, SubjectKind};
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::{TestEnv, TestResult};
@@ -510,6 +512,49 @@ async fn a_campaign_whose_kind_has_no_driver_is_left_alone() -> TestResult {
         "the template driver isn't asked"
     );
     assert_eq!(item(&db.pool, sandboxes, subject).await?.0, "in_flight");
+    Ok(())
+}
+
+// Store-level read and page behavior for unknown kinds lives in
+// `pplx-space-runtime-upgrade-campaign-store`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unknown_campaign_kind_does_not_stop_the_reconciler() -> TestResult {
+    let Some(db) = test_db().await? else {
+        return Ok(());
+    };
+    let unknown = insert_campaign_with_kind(&db.pool, seed(), "kind_from_a_newer_build").await?;
+    let untouched = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO runtime_upgrade_items (
+             campaign_id, subject_kind, subject_id, phase, attempts, lease_token,
+             lease_expires_at
+         )
+         VALUES ($1, $2, $3, 'in_flight', 1, $4, now() - interval '1 second')"
+    ))
+    .bind(unknown)
+    .bind(SubjectKind::Sandbox.as_str())
+    .bind(untouched)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let templates = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            from: environment(2),
+            ..seed()
+        },
+    )
+    .await?;
+    let found = subjects(1);
+    let driver = FakeDriver::with_subjects(&found);
+    let reconciler = reconciler(&db.pool, driver);
+
+    let report = tick(&reconciler).await;
+
+    assert_eq!(report.leased, 1);
+    assert_eq!(counts(&db.pool, templates).await?.done, 1);
+    assert_eq!(campaign_phase(&db.pool, unknown).await?, "rolling");
+    assert_eq!(item(&db.pool, unknown, untouched).await?.0, "in_flight");
     Ok(())
 }
 
