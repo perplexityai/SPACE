@@ -649,14 +649,9 @@ impl SandboxController {
         // org-scoped count has no such rows. A row that appears between the
         // two reads counts as observed-local until the next count.
         let pool_reserved = if org_id.is_none() {
-            let rowless = sqlx::query_scalar::<_, SandboxId>(sql!(
-                "SELECT sos.sandbox_id
-                 FROM sandbox_observed_states sos
-                 WHERE NOT EXISTS (SELECT 1 FROM sandboxes s WHERE s.id = sos.sandbox_id)"
-            ))
-            .fetch_all(pool)
-            .await
-            .map_err(|err| db_contention_error("list the rowless observed sandboxes", &err))?;
+            let rowless = pplx_space_sandbox_store::observed_states::rowless_sandbox_ids(pool)
+                .await
+                .map_err(|err| db_contention_error("list the rowless observed sandboxes", &err))?;
             WarmPoolStore::new(pool.clone())
                 .pool_reservations(&rowless)
                 .await

@@ -825,31 +825,10 @@ async fn load_tcp_sandbox_port_exposure(
     sandbox_id: SandboxId,
     port: u16,
 ) -> Result<Option<SandboxPortExposure>, ControllerError> {
-    sqlx::query_as::<_, SandboxPortExposure>(sql!(
-        "SELECT sandbox_id,
-                protocol,
-                guest_port,
-                visibility,
-                source,
-                desired_state,
-                apply_state,
-                last_applied_node_id,
-                last_error,
-                last_bridge_status,
-                last_applied_bridge_generation,
-                last_observed_at,
-                created_at,
-                updated_at
-         FROM sandbox_port_exposures
-         WHERE sandbox_id = $1
-           AND protocol = 'tcp'
-           AND guest_port = $2"
-    ))
-    .bind(sandbox_id)
-    .bind(port as i32)
-    .fetch_optional(pool)
-    .await
-    .map_err(|err| db_contention_error("failed to load sandbox port exposure", &err))
+    pplx_space_sandbox_store::port_exposures::get_tcp(pool, sandbox_id, port as i32)
+        .await
+        .map(|exposure| exposure.map(SandboxPortExposure::from))
+        .map_err(|err| db_contention_error("failed to load sandbox port exposure", &err))
 }
 
 async fn mark_sandbox_port_exposure_applied(

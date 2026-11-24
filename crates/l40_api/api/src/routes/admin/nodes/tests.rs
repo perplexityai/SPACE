@@ -1745,8 +1745,8 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
     sqlx::query(sql!("SET LOCAL lock_timeout = '20ms'"))
         .execute(&mut *guard_tx)
         .await?;
-    let error = node_store::sandbox_occupancy_for_node_in_tx(
-        &mut guard_tx,
+    let error = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+        &mut *guard_tx,
         node_id,
         ResidencyEvidence::LifecycleOnly,
     )

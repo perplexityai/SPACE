@@ -6,6 +6,7 @@
 //! `pplx_space_sandbox_residency` and the durability rules of
 //! `pplx_space_sandbox_portability`. A node's statements come in a fixed set
 //! of shapes: without the drainability counters, and with them under each
+//! [`ResidencyEvidence`], plus the `:terminate` guard's count under each
 //! [`ResidencyEvidence`].
 
 use std::sync::LazyLock;
@@ -13,12 +14,12 @@ use std::sync::LazyLock;
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_sandbox_portability::{
-    inflight_suspend_upload_from_node_exists, snapshot_durable_for_source_release,
-    snapshot_is_current_local_artifact,
+    drain_gate_blockers_for_node, inflight_suspend_upload_from_node_exists,
+    snapshot_durable_for_source_release, snapshot_is_current_local_artifact,
 };
 use pplx_space_sandbox_residency::{
-    ResidencyEvidence, node_heartbeat_fresh, non_resident_lifecycle_exclusion,
-    occupies_node_predicate, resident_lifecycle,
+    ResidencyEvidence, active_resident_predicate, node_heartbeat_fresh,
+    non_resident_lifecycle_exclusion, occupies_node_predicate, resident_lifecycle,
 };
 use pplx_space_sql_locator::sql;
 
@@ -703,6 +704,105 @@ pub async fn group_occupancy(
     Ok(GroupOccupancyCounts {
         active,
         local_snapshots,
+    })
+}
+
+/// What the `:terminate` guard counts, kept separate on purpose from the
+/// node listing's counts ([`NodeOccupancyCounts`], which the api reports
+/// as `SandboxOccupancy`).
+///
+/// The two are produced by different statements for different jobs.
+/// `SandboxOccupancy` is what the node *listing* reports, and its
+/// `local_snapshots` is a diagnostic an operator reads. This one is what the
+/// 409 is *decided* on, and its second term is the shared node-drain gate
+/// (`drain_gate_blockers_for_node`) so the endpoint and the reconciler cannot
+/// disagree about whether a node is safe to terminate.
+///
+/// Sharing one struct would have forced one meaning on both, and the
+/// meanings are genuinely different — see the comment on the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminateOccupancy {
+    pub active: i64,
+    /// Rows the node-drain gate (`drain_gate_blockers_for_node`) counts
+    /// against this node. It is not a count of local snapshots; the listing's
+    /// [`NodeOccupancyCounts::local_snapshots`] is.
+    pub drain_blockers: i64,
+}
+
+/// The statement [`terminate_occupancy`] runs under `residency`.
+fn terminate_occupancy_for(residency: ResidencyEvidence) -> String {
+    // `active` is `active_resident_predicate` for the node, census term
+    // included, so this guard counts exactly the rows node-drain's
+    // `draining → drained` gate and `mark_terminating_query` count. The census
+    // term matters because this endpoint refuses on `active` and
+    // `space-rollout-mng.py` drives it automatically: without it, a worker
+    // whose own census disproves its phantom `active_node_id` rows would clear
+    // the census-aware drain gate, reach `drained`, and then be refused here
+    // forever wherever `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` is on. `$1` is
+    // a bound parameter, which keeps the heartbeat subquery a once-per-execution
+    // InitPlan.
+    //
+    // Quarantined sandboxes remain active placement blockers by design:
+    // quarantine preserves the hot-node association until a quarantine-aware
+    // release or cleanup path decides it is safe to drop.
+    let active = active_resident_predicate("sandboxes", "$1", residency);
+    // `drain_blockers` is exactly `drain_gate_blockers_for_node`, so
+    // `:terminate` and the drain reconciler agree on whether a node is safe to
+    // terminate. The gate holds an evacuation-marked sandbox until its newest
+    // full snapshot is `ready` (`snapshot_durable_for_source_release`), and a
+    // suspend upload still in flight *from* this node even when the sandbox's
+    // `target_node_id` has drifted elsewhere, because its second arm drives
+    // from `snapshots.source_node_id`: terminating mid-upload kills the worker
+    // holding the only durable copy. It also counts rows pinned to the node by
+    // `target_node_id` while `active_node_id` is NULL, such as an in-flight
+    // user restore of a suspended sandbox (`drain_gate_target_pinned_blocks`),
+    // which the `active` count cannot see.
+    //
+    // Each count is its own node-scoped subquery.
+    //
+    // The listing's `local_snapshots` is a different number on purpose. It is
+    // reported, not gated on, and it legitimately differs from
+    // `drain_blockers`: the listing's in-flight branch inlines the legacy
+    // freshness gate while the blocker fragment takes the artifact-exact arm
+    // (see the api's `routes/admin/node_store/live_residents_tests.rs`,
+    // `an_artifact_mismatched_inflight_upload_counts_the_sandbox_once`).
+    let blockers = drain_gate_blockers_for_node("$1");
+    sql!(format!(
+        "SELECT
+     (SELECT COUNT(*)::BIGINT FROM sandboxes WHERE {active}) AS active,
+     (SELECT COUNT(*)::BIGINT FROM (
+{blockers}
+          ) gate_blockers) AS drain_blockers"
+    ))
+}
+
+static TERMINATE_OCCUPANCY: LazyLock<String> =
+    LazyLock::new(|| terminate_occupancy_for(ResidencyEvidence::LifecycleOnly));
+static TERMINATE_OCCUPANCY_CENSUS_AWARE: LazyLock<String> =
+    LazyLock::new(|| terminate_occupancy_for(ResidencyEvidence::NodeCensusAware));
+
+/// The occupancy lookup used by the `:terminate` guard so the
+/// strand-risk count is observed under the same `FOR UPDATE` lock as the
+/// drain-phase write.
+///
+/// Run it on the caller's transaction: that is what keeps the count under
+/// the caller's lock.
+pub async fn terminate_occupancy(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    residency: ResidencyEvidence,
+) -> Result<TerminateOccupancy, sqlx::Error> {
+    let statement: &str = match residency {
+        ResidencyEvidence::LifecycleOnly => &TERMINATE_OCCUPANCY,
+        ResidencyEvidence::NodeCensusAware => &TERMINATE_OCCUPANCY_CENSUS_AWARE,
+    };
+    let row: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(statement))
+        .bind(node_id)
+        .fetch_one(executor)
+        .await?;
+    Ok(TerminateOccupancy {
+        active: row.0,
+        drain_blockers: row.1,
     })
 }
 

@@ -250,7 +250,7 @@ pub(super) struct ObservedResources {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct PodExecution {
     pub id: Uuid,
     pub sandbox_id: SandboxId,
@@ -389,7 +389,7 @@ impl SnapshotStorage {
     }
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct SnapshotInventory {
     pub sandbox_id: SandboxId,
     pub snapshot_id: String,
@@ -456,7 +456,7 @@ pub(super) struct QuarantineHistoryEntry {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct PortExposure {
     pub sandbox_id: SandboxId,
     pub protocol: String,
@@ -477,7 +477,7 @@ pub(super) struct PortExposure {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct TimelineEvent {
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,

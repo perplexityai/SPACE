@@ -8,8 +8,6 @@
 use crate::routes::public::error::database_error;
 use pplx_space_accounts::OrgId;
 
-use pplx_space_sql_locator::sql;
-
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -150,12 +148,11 @@ async fn ensure_sandbox_owner(
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<(), PublicApiError> {
-    let found = sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = $1 AND org_id = $2)"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(org_id)
-    .fetch_one(pool)
+    let found = pplx_space_sandbox_store::row_reads::org_owns(
+        pool,
+        pplx_space_sandbox_model::SandboxId::from(sandbox_id),
+        org_id,
+    )
     .await
     .map_err(database_error)?;
     if !found {

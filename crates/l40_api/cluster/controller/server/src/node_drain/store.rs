@@ -3179,7 +3179,7 @@ impl NodeDrainSink for SubstrateSink {
     /// `fresh_ready_snapshot_exists` predicate so this count agrees
     /// with `drained_node_terminator::count_local_snapshots` and the
     /// admin `:terminate` endpoint's
-    /// `sandbox_occupancy_for_node_in_tx` guard — all three observe
+    /// `admin_occupancy::terminate_occupancy` guard — all three observe
     /// the same "is this snapshot portable?" answer.
     async fn count_drain_blocking_sandboxes_on_node(
         &self,

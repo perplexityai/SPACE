@@ -196,3 +196,158 @@ pub async fn invalidate_open_observations(
     .await?;
     Ok(())
 }
+
+/// Every port exposure of `sandbox_id`, by guest port then protocol.
+pub async fn list(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Vec<PortExposureRecord>, sqlx::Error> {
+    sqlx::query_as::<_, PortExposureRecord>(sql!(
+        "SELECT sandbox_id,
+                    protocol,
+                    guest_port,
+                    visibility,
+                    source,
+                    desired_state,
+                    apply_state,
+                    last_applied_node_id,
+                    last_error,
+                    last_bridge_status,
+                    last_applied_bridge_generation,
+                    last_observed_at,
+                    created_at,
+                    updated_at
+             FROM sandbox_port_exposures
+             WHERE sandbox_id = $1
+             ORDER BY guest_port ASC, protocol ASC"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(executor)
+    .await
+}
+
+/// The exposures of `sandbox_id` whose desired state is `open`, by guest port
+/// then protocol.
+pub async fn list_open(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Vec<PortExposureRecord>, sqlx::Error> {
+    sqlx::query_as::<_, PortExposureRecord>(sql!(
+        "SELECT sandbox_id,
+                    protocol,
+                    guest_port,
+                    visibility,
+                    source,
+                    desired_state,
+                    apply_state,
+                    last_applied_node_id,
+                    last_error,
+                    last_bridge_status,
+                    last_applied_bridge_generation,
+                    last_observed_at,
+                    created_at,
+                    updated_at
+             FROM sandbox_port_exposures
+             WHERE sandbox_id = $1
+               AND desired_state = 'open'
+             ORDER BY guest_port ASC, protocol ASC"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(executor)
+    .await
+}
+
+/// The TCP exposure of `guest_port` on `sandbox_id`, in any desired state;
+/// `None` when there is none.
+pub async fn get_tcp(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    guest_port: i32,
+) -> Result<Option<PortExposureRecord>, sqlx::Error> {
+    sqlx::query_as::<_, PortExposureRecord>(sql!(
+        "SELECT sandbox_id,
+                    protocol,
+                    guest_port,
+                    visibility,
+                    source,
+                    desired_state,
+                    apply_state,
+                    last_applied_node_id,
+                    last_error,
+                    last_bridge_status,
+                    last_applied_bridge_generation,
+                    last_observed_at,
+                    created_at,
+                    updated_at
+             FROM sandbox_port_exposures
+             WHERE sandbox_id = $1
+               AND protocol = 'tcp'
+               AND guest_port = $2"
+    ))
+    .bind(sandbox_id)
+    .bind(guest_port)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Whether any exposure of `sandbox_id` wants to be open.
+pub async fn any_open(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+             SELECT 1 FROM sandbox_port_exposures
+             WHERE sandbox_id = $1 AND desired_state = 'open'
+         )"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// Whether `sandbox_id` already wants `protocol`/`guest_port` open.
+pub async fn open_exists(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    protocol: &str,
+    guest_port: i32,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+                 SELECT 1 FROM sandbox_port_exposures
+                 WHERE sandbox_id = $1
+                   AND protocol = $2
+                   AND guest_port = $3
+                   AND desired_state = 'open'
+             )"
+    ))
+    .bind(sandbox_id)
+    .bind(protocol)
+    .bind(guest_port)
+    .fetch_one(executor)
+    .await
+}
+
+/// How many exposures of `sandbox_id` other than `protocol`/`guest_port` want
+/// to be open: the slots the capacity check counts against an open of that
+/// port.
+pub async fn count_other_open(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    protocol: &str,
+    guest_port: i32,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT COUNT(*)
+             FROM sandbox_port_exposures
+             WHERE sandbox_id = $1
+               AND desired_state = 'open'
+               AND NOT (protocol = $2 AND guest_port = $3)"
+    ))
+    .bind(sandbox_id)
+    .bind(protocol)
+    .bind(guest_port)
+    .fetch_one(executor)
+    .await
+}

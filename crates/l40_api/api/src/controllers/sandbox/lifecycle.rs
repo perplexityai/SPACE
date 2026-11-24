@@ -1222,18 +1222,8 @@ pub(super) async fn fetch_active_node_drain_state(
     // Fallback: the latest `sandbox_k8s_executions.k8s_node_name`. The
     // unique index on (sandbox_id, generation) makes the LIMIT 1
     // deterministic per sandbox.
-    let latest_k8s_name: Option<String> = sqlx::query_scalar(sql!(
-        "SELECT ske.k8s_node_name
-           FROM sandbox_k8s_executions ske
-          WHERE ske.sandbox_id = $1
-            AND ske.k8s_node_name IS NOT NULL
-          ORDER BY ske.generation DESC
-          LIMIT 1"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+    let latest_k8s_name =
+        pplx_space_sandbox_store::k8s_executions::latest_k8s_node_name(pool, sandbox_id).await?;
     let Some(k8s_node_name) = latest_k8s_name else {
         return Ok(primary_state);
     };
