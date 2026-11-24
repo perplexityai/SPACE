@@ -73,11 +73,7 @@ pub async fn fetch_instructions(
     };
     // The schema sets the round and its issue time together.
     let pending_round = match (round, issued_at) {
-        (Some(round), Some(issued_at)) => Some(PendingRound {
-            round: non_negative(round)?,
-            issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
-                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
-        }),
+        (Some(round), Some(issued_at)) => Some(pending_round(round, issued_at)?),
         _ => None,
     };
     Ok(NodeInstructions {
@@ -86,8 +82,21 @@ pub async fn fetch_instructions(
     })
 }
 
-/// The schema keeps both counters non-negative; report a violation rather
+/// A pending round's number and issue time as stored, decoded alike for Fetch
+/// and the round opener.
+pub(crate) fn pending_round(
+    round: i64,
+    issued_at: OffsetDateTime,
+) -> Result<PendingRound, sqlx::Error> {
+    Ok(PendingRound {
+        round: non_negative(round)?,
+        issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+    })
+}
+
+/// The schema keeps every counter non-negative; report a violation rather
 /// than guess.
-fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
+pub(crate) fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
     u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
 }

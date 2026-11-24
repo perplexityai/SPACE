@@ -45,7 +45,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
-use crate::{ItemPhase, RolloutId, Scope, end_transaction, rollout_phase};
+use crate::{ItemPhase, RolloutId, Scope, end_transaction, leased_item, rollout_phase};
 
 /// Firewall rollouts don't pause on failures, and the shared claim refuses
 /// once `failed >= failure_budget`, so the budget is one no count reaches.
@@ -504,28 +504,11 @@ impl RenewStore for Renewing<'_, '_> {
     }
 
     async fn lock_handoff(&mut self) -> Result<(), sqlx::Error> {
-        sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
-        ))
-        .bind(HANDOFF_LOCK)
-        .execute(&mut *self.tx)
-        .await?;
-        Ok(())
+        leased_item::share_handoff(self.tx).await
     }
 
     async fn lock_item(&mut self) -> Result<(), sqlx::Error> {
-        sqlx::query(sql!(
-            "SELECT 1
-             FROM firewall_rules_rollout_items
-             WHERE rollout_id = $1
-               AND node_id = $2
-             FOR UPDATE"
-        ))
-        .bind(self.target.rollout_id)
-        .bind(self.target.node_id)
-        .fetch_optional(&mut *self.tx)
-        .await?;
-        Ok(())
+        leased_item::lock_item(self.tx, self.target.rollout_id, self.target.node_id).await
     }
 
     async fn extend(&mut self, lease: Duration) -> Result<bool, sqlx::Error> {
