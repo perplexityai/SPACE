@@ -2,6 +2,9 @@
 //! the recovered execution, and observing or completing the recovery.
 
 use super::*;
+use pplx_space_sandbox_store::started_recovery_source::{
+    StartedRecoveryRestoreCandidate, started_recovery_restore_candidate,
+};
 
 impl K8sStore {
     async fn started_recovery_lease_remaining(
@@ -159,54 +162,15 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
     ) -> Result<StartedRecoveryRestoreContext, SubstrateError> {
-        let no_newer = no_newer_full_snapshot("s", "sn");
-        let query = format!(
-            "SELECT sn.state,
-                    nk.k8s_node_name,
-                    (
-                        SELECT ssl.storage_connection_string
-                          FROM snapshot_storage_locations ssl
-                         WHERE ssl.snapshot_id = sn.id
-                           AND ssl.orphaned_at IS NULL
-                         ORDER BY ssl.created_at DESC
-                         LIMIT 1
-                    ) AS storage_uri
-               FROM sandboxes s
-               JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id
-                AND e.generation = $2
-                AND e.active
-                AND e.state = 'recovering'
-               JOIN snapshots sn
-                 ON sn.sandbox_id = s.id
-                AND sn.local_artifact_id = s.current_local_artifact_id
-                AND sn.artifact_kind = s.current_local_artifact_kind
-                AND sn.type = 'full'
-                AND (sn.artifact_origin IS NULL OR sn.artifact_origin = 'suspend')
-               LEFT JOIN nodes n
-                 ON n.id = sn.source_node_id
-                AND n.role = 'worker'
-                AND n.state = 'ready'
-                AND n.drain_phase IS NULL
-               LEFT JOIN node_k8s nk ON nk.node_id = n.id
-              WHERE s.id = $1
-                AND s.lifecycle = 'started'
-                AND s.current_local_artifact_origin = 'suspend'
-                AND (s.last_command_at IS NULL OR sn.timestamp >= s.last_command_at)
-                AND (s.last_access_at IS NULL OR sn.timestamp >= s.last_access_at)
-                AND {no_newer}
-              ORDER BY sn.timestamp DESC, sn.id DESC
-              LIMIT 1"
-        );
-        let candidate = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            sqlx::AssertSqlSafe(sql!(query.as_str())),
-        )
-        .bind(sandbox_id.as_uuid())
-        .bind(generation.get())
-        .fetch_optional(&mut *conn)
-        .await
-        .db_context("failed to select started recovery restore context")?;
-        let Some((state, source_node_name, storage_uri)) = candidate else {
+        let candidate = started_recovery_restore_candidate(&mut *conn, sandbox_id, generation)
+            .await
+            .db_context("failed to select started recovery restore context")?;
+        let Some(StartedRecoveryRestoreCandidate {
+            state,
+            source_node_name,
+            storage_uri,
+        }) = candidate
+        else {
             return Ok(StartedRecoveryRestoreContext::Unavailable);
         };
         match state

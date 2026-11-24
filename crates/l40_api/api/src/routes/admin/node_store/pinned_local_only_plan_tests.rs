@@ -1,12 +1,11 @@
 //! Plan-structure and page-shape regression for
-//! [`pinned_local_only_sandboxes_query`].
+//! [`admin_occupancy::pinned_local_only_sandboxes`]'s statement.
 //!
 //! The behavioural tests in `inflight_upload_occupancy_tests` cover *which*
 //! rows the `:force-upload-local-snapshots` enumeration returns, over fixtures
 //! of two or three sandboxes. They cannot see the defect this module guards,
-//! because that defect is not about which rows come back — for the node whose
-//! forced drain this query family stalled the answer was correctly zero — but
-//! about how many rows Postgres reads to decide that.
+//! because that defect is not about which rows come back — the correct answer
+//! can be zero — but about how many rows Postgres reads to decide that.
 //!
 //! `target_node_id` is a placement diagnostic that suspend never clears, so a
 //! long-lived node accumulates every sandbox ever suspended from it. The
@@ -74,16 +73,37 @@ use sqlx::PgPool;
 use std::num::NonZeroUsize;
 use uuid::Uuid;
 
-use super::super::nodes::FORCE_UPLOAD_ENUMERATION_CAP;
-use super::{list_pinned_local_only_sandboxes, pinned_local_only_sandboxes_query};
+use pplx_space_sandbox_store::admin_occupancy;
 
 use pplx_space_test_env::TestResult;
 
-/// The production entry point, with the typed ids unwrapped so its answer
-/// compares directly against the fixture's raw ones.
-async fn list_page(pool: &PgPool, node: Uuid, limit: NonZeroUsize) -> TestResult<Vec<Uuid>> {
-    let page = list_pinned_local_only_sandboxes(pool, NodeId::from_uuid(node), limit).await?;
+/// The production entry point, at [`PRODUCTION_PAGE`], with the typed ids
+/// unwrapped so its answer compares directly against the fixture's raw ones.
+async fn list_production_page(pool: &PgPool, node: Uuid) -> TestResult<Vec<Uuid>> {
+    let page = admin_occupancy::pinned_local_only_sandboxes(pool, NodeId::from_uuid(node)).await?;
     Ok(page.into_iter().map(SandboxId::as_uuid).collect())
+}
+
+/// The same statement at `page` rows, for the pages production never asks
+/// for, with the ids unwrapped as [`list_production_page`] does.
+async fn list_page(pool: &PgPool, node: Uuid, page: NonZeroUsize) -> TestResult<Vec<Uuid>> {
+    let query = pinned_local_only_sandboxes_query(page);
+    let page: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+        .bind(NodeId::from_uuid(node))
+        .fetch_all(pool)
+        .await?;
+    Ok(page.into_iter().map(SandboxId::as_uuid).collect())
+}
+
+/// The statement the enumeration runs, at `page` rows: production's own at
+/// [`PRODUCTION_PAGE`], otherwise the same statement with `page` as its
+/// literal `LIMIT`.
+fn pinned_local_only_sandboxes_query(page: NonZeroUsize) -> String {
+    if page == PRODUCTION_PAGE {
+        admin_occupancy::pinned_local_only_sandboxes_statement().to_owned()
+    } else {
+        admin_occupancy::pinned_local_only_sandboxes_statement_with_limit(page)
+    }
 }
 
 /// Suspended rows pinned to the node that already have a durable backup. This
@@ -131,11 +151,12 @@ const FOREIGN_INFLIGHT_UPLOADS: usize = 120;
 /// page is a strict prefix of the eligible set.
 const SHORT_PAGE: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 
-/// The limit the `:force-upload-local-snapshots` handler actually sends: its
-/// cap plus the one sentinel row that signals truncation. The plan tests run
+/// The page the `:force-upload-local-snapshots` enumeration runs at in
+/// production, [`admin_occupancy::FORCE_UPLOAD_PAGE`]: the handler's cap
+/// plus the one sentinel row that signals truncation. The plan tests run
 /// at this size as well as [`SHORT_PAGE`], because the literal `LIMIT` is an
 /// input to the planner's choice.
-const PRODUCTION_PAGE: NonZeroUsize = NonZeroUsize::new(FORCE_UPLOAD_ENUMERATION_CAP + 1).unwrap();
+const PRODUCTION_PAGE: NonZeroUsize = admin_occupancy::FORCE_UPLOAD_PAGE;
 
 /// Every page size and plan-cache mode the plan tests assert over.
 const PLAN_CASES: [(NonZeroUsize, &str); 4] = [
@@ -145,9 +166,9 @@ const PLAN_CASES: [(NonZeroUsize, &str); 4] = [
     (PRODUCTION_PAGE, "force_generic_plan"),
 ];
 
-/// A page comfortably above the backlog, so it returns the whole eligible set
-/// and a shorter page is provably a prefix of the same answer.
-const FULL_PAGE: NonZeroUsize = NonZeroUsize::new(GENUINE_WORK * 4).unwrap();
+// Production's page is comfortably above the backlog, so it returns the whole
+// eligible set and a shorter page is provably a prefix of the same answer.
+const _: () = assert!(GENUINE_WORK < PRODUCTION_PAGE.get());
 
 /// Insert sandboxes with the supplied ids and matching lifecycles, pinned to
 /// `node`, in the order given.
@@ -808,7 +829,7 @@ async fn snapshot_scans_stay_within_the_nodes_snapshots() -> TestResult {
 /// exclude, whatever plan the planner gives it.
 ///
 /// The statement guarantees that by evaluation order rather than by plan; see
-/// [`pinned_local_only_sandboxes_query`]. Left as two `AND`ed conjuncts, the
+/// [`admin_occupancy::pinned_local_only_sandboxes`]. Left as two `AND`ed conjuncts, the
 /// planner puts the in-flight check first on this fixture, and the check runs
 /// for every suspended row the scan reaches, durable history included.
 ///
@@ -907,10 +928,10 @@ async fn page_is_the_lowest_ids_and_excludes_non_suspended_rows() -> TestResult 
     let other_lifecycles = fleet.other_lifecycles;
 
     // Through the production entry point rather than a re-implementation of it:
-    // these are the only assertions here that describe what an operator
-    // receives, so they have to exercise the bind and the `sql!` site the
-    // handler actually uses.
-    let full_page = list_page(pool, node, FULL_PAGE).await?;
+    // this is the page an operator receives, so it has to exercise the bind
+    // and the statement the handler actually uses. The shorter pages below
+    // run the same statement with a smaller literal `LIMIT`.
+    let full_page = list_production_page(pool, node).await?;
     assert_eq!(
         full_page,
         work_ascending,

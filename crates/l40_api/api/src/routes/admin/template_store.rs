@@ -7,9 +7,6 @@
 //! template row so two operators cannot race the in-use guards.
 
 use pplx_space_accounts::OrgId;
-
-use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateName, TemplateVisibility};
 use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
@@ -106,19 +103,7 @@ pub(super) async fn template_sandboxes_in_use_in_tx(
     // lifecycle/placement stamps a failed transition leaves behind, which the
     // placement-freshness snapshot predicates are not. A `failed` row with no
     // restorable snapshot stays excluded: it is genuinely gone.
-    let eligible = failed_repair_revert_eligibility("s").eligible;
-    let query = format!(
-        "SELECT COUNT(*)::BIGINT
-           FROM sandboxes s
-          WHERE s.template_id = $1
-            AND (
-                 s.lifecycle NOT IN ('failed', 'deleted')
-                 OR (s.lifecycle = 'failed' AND {eligible})
-            )"
-    );
-    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(template_name)
-        .fetch_one(&mut **tx)
+    pplx_space_sandbox_store::template_usage::template_sandboxes_in_use(&mut **tx, template_name)
         .await
 }
 

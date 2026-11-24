@@ -429,37 +429,10 @@ impl K8sStore {
             return Ok(false);
         }
 
-        let eligibility = missing_suspending_pod_revert_eligibility("s");
-        let clear_marker = eligibility.clear_marker;
-        let eligible = eligibility.eligible;
-        let query = format!(
-            "SELECT {clear_marker}
-               FROM sandboxes s
-              WHERE s.id = $1
-                AND LOWER(TRIM(s.lifecycle)) = 'suspending'
-                AND s.active_node_id IS NOT NULL
-                AND EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                       AND e.generation = $2
-                       AND e.pod_uid = $3
-                       AND e.active
-                       AND e.state IN ('running', 'suspended')
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions successor
-                     WHERE successor.sandbox_id = s.id
-                       AND successor.generation > $2
-                )
-                AND {eligible}",
-        );
-        let clear_marker = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id)
-            .bind(generation)
-            .bind(pod_uid)
-            .fetch_optional(&mut *tx)
+        let clear_marker =
+            pplx_space_sandbox_store::suspend_reads::missing_suspending_pod_clear_marker(
+                &mut *tx, sandbox_id, generation, pod_uid,
+            )
             .await
             .db_context("failed to select missing suspended pod finalization")?;
         let Some(clear_marker) = clear_marker else {

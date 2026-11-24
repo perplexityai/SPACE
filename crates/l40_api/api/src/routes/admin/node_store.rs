@@ -4,9 +4,9 @@
 //! state-machine, and audit logging; the SQL strings, row structs, and
 //! transaction-bound helpers live here.
 
+#[cfg(test)]
 use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_admin_protocol::{
@@ -20,9 +20,8 @@ use pplx_space_node_registration_store::drain_write::{self, DrainColumnsUpdate};
 use pplx_space_sandbox_model::SandboxId;
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
-use pplx_space_sandbox_portability::{
-    inflight_suspend_upload_exists, snapshot_durable_for_source_release,
-};
+#[cfg(test)]
+use pplx_space_sandbox_portability::snapshot_durable_for_source_release;
 use pplx_space_sandbox_residency::ResidencyEvidence;
 #[cfg(test)]
 use pplx_space_sandbox_residency::{
@@ -727,206 +726,6 @@ impl AdminNodeStore {
             );
         }
     }
-}
-
-/// `$1` = node id. Suspended sandboxes whose `target_node_id` points at this
-/// node and whose snapshot has not yet been registered to S3, as the lowest
-/// `limit` sandbox ids. Used by the `:force-upload-local-snapshots` admin
-/// handler to enumerate the sandboxes that still need a durable upload before
-/// the source node can terminate.
-///
-/// Built as a `String` rather than issued here so the plan-structure regression
-/// in `pinned_local_only_plan_tests` can `EXPLAIN` the statement body the
-/// handler runs — `sql!` prepends a locator comment to it, which changes no
-/// plan. `sql!` stays at the query site in
-/// [`list_pinned_local_only_sandboxes`], so this statement keeps its own
-/// call-site locator instead of collapsing onto a shared one.
-///
-/// The caller passes `limit = enumeration_cap + 1` so a returned slice
-/// of length `enumeration_cap + 1` is the unambiguous "more pinned
-/// sandboxes exist beyond what's listed" signal — the handler trims
-/// the sentinel row and surfaces `truncated: true` to the operator.
-/// This bounds DB transfer and JSON response size to O(1) regardless
-/// of how big the node's pinned-list actually is.
-///
-/// ## The page is the ascending-id prefix, and that is a contract
-///
-/// `ORDER BY s.id` makes the page stable across re-invocations: the handler
-/// slices `to_process` from the head and the `deferred` tail in Rust, so a
-/// non-deterministic row order would publish a `deferred[]` array that is a
-/// sample rather than the work the next call picks up.
-///
-/// A head that keeps failing therefore keeps being retried while the rows
-/// behind it wait. That residual is deliberate and it is loud rather than
-/// silent — the same ids come back in `failed[]` and the same `deferred[]` on
-/// every call. Reshuffling the page so a stuck sandbox is eventually skipped
-/// would hide it instead.
-///
-/// ## What makes the ordering cheap
-///
-/// `idx_sandboxes_target_node_ordered` covers `(target_node_id, id)`. The equality
-/// on `$1` fixes the leading column, so the scan emits the node's rows already
-/// ordered by `id`: the ordering needs no `Sort`, and the `LIMIT` stops at the
-/// page size. Work is bounded by the node's own pinned history — which is the
-/// question being asked — rather than by the table.
-///
-/// The index makes that plan available; the predicate's shape keeps the
-/// planner on it. Written as two bare conjuncts, the probes can be pulled up
-/// into a join-driven plan that reads the whole table even with this index
-/// present, and on the test fixture a generic plan does exactly that. The
-/// `CASE` and the scalar-subquery fences below each rule that plan out.
-///
-/// The planner may still pick the narrow `idx_sandboxes_target_node` plus a
-/// sort when the table is small enough that the two cost the same. That plan
-/// is node-bounded too, which is the property that matters, so the sort's
-/// absence is the common case rather than an invariant.
-///
-/// Without that index the planner takes the ordering from the primary key's
-/// own index instead, expecting the `LIMIT` to stop early. For a node whose
-/// non-durable set is empty there is nothing to stop early on, so that plan
-/// filters the whole table and runs past the 10 s admin-handler budget. Empty
-/// is the ordinary answer here: it is what an operator gets once the backlog
-/// has cleared, and it was the true answer on the node whose forced drain this
-/// query family stalled.
-///
-/// ## Why both probes are wrapped in scalar subqueries
-///
-/// The `CASE` described below already keeps both checks out of reach of
-/// sublink pull-up, which Postgres applies only to a top-level `WHERE` or
-/// `JOIN … ON` conjunct, including a top-level `NOT` directly over an
-/// `EXISTS`. The fences are a second guard for the conjunct form: if the
-/// predicate is ever written as conjuncts, they keep the plan this
-/// section describes. The rest of the section is about that form.
-///
-/// `(SELECT {snapshot_exists})` rather than a bare `{snapshot_exists}`, and
-/// the same for the in-flight check. The two forms are identical in truth —
-/// `EXISTS` yields a non-NULL boolean and the scalar subquery returns exactly
-/// one row — but as a top-level conjunct the bare sublink is *pullable*:
-/// Postgres may realise it as a nested loop, a hash anti-join, or a merge
-/// anti-join over the whole `snapshots` ⋈
-/// `snapshot_storage_locations` product. A nested loop keeps the work bounded
-/// to the requested sandboxes. Inside a scalar subquery it cannot be pulled up
-/// at all, so it is always a per-row `SubPlan` whose own `sn.sandbox_id = s.id`
-/// makes each execution a `sandbox_id`-keyed index probe.
-///
-/// The node-drain twin fences the same predicate for the same reason. Updated
-/// statistics can otherwise make a merge anti-join cheaper in the planner's
-/// estimate without any query change. The fence removes that alternative.
-///
-/// The in-flight check is fenced for the same reason, and here this statement
-/// departs from its node-drain twin, which leaves that check bare. Bare, it is
-/// the planner's cost choice. It can read the cluster's `state='creating'` full
-/// snapshots once and anti-join against them, which is cheap, but the
-/// node-ordered scan beneath it also makes a merge anti-join
-/// along `idx_snapshots_sandbox_id` available, and that one walks every
-/// snapshot whose sandbox id sorts below the page, whichever node owns it.
-/// Fenced, each execution is correlated on the one sandbox being asked about.
-/// That doesn't make each execution cheap. Which index serves it is still a
-/// cost choice: the test fixtures' plans use a scan keyed on
-/// `idx_snapshots_sandbox_id`, but a planner that overestimates how many
-/// snapshots a sandbox has can instead `BitmapAnd` that index with
-/// `idx_snapshots_state_type`, whose side reads the cluster's whole in-flight
-/// set on every execution. The test fixture doesn't reproduce that plan, and
-/// the plan tests' read counts don't include a bitmap index scan's reads,
-/// which is why they also bound how often the check runs. The fence bounds which
-/// sandboxes the check is about; the evaluation order below bounds how often
-/// it runs.
-///
-/// ## Why the in-flight check sits in a `CASE` branch
-///
-/// `CASE WHEN (SELECT {snapshot_exists}) THEN false ELSE NOT (SELECT
-/// {inflight_upload}) END` rather than two `AND NOT` conjuncts. The two forms
-/// are identical in truth, since neither scalar subquery can yield NULL. But
-/// Postgres orders the conjuncts of a filter by its own cost estimate, so it's
-/// free to evaluate the in-flight check first, on every suspended row the node
-/// ever pinned. A long-lived node's pinned history is almost entirely durable,
-/// so that order runs the check once per row of history. Under the bitmap plan
-/// above, each of those executions also passes over the in-flight set, and the
-/// statement's cost becomes history × in-flight set.
-///
-/// Postgres documents that a `CASE` evaluates only the subexpressions needed
-/// to determine its result, in order, so the in-flight check runs only for
-/// rows the durability check didn't exclude. That's the node's backlog, which
-/// is what an operator came to drain, and it holds whichever plan the planner
-/// picks for the check itself. Postgres calls the rule not ironclad and names
-/// constant subexpressions folded at planning time and aggregates as the
-/// cases that break it. Neither applies: both conditions read the row.
-///
-/// The fixed order has a cost of its own: the durability check runs on
-/// every suspended row, including those the in-flight check alone would have
-/// excluded. That cost is bounded by the node's rows, and each execution has
-/// an index that fits it exactly: `idx_snapshots_sandbox_ready_latest_covering`
-/// is keyed on `sandbox_id` with the probe's own `state = 'ready' AND type =
-/// 'full'` as its predicate, and it serves the probe in every plan the tests
-/// measure. `snapshot_scans_stay_within_the_nodes_snapshots` and
-/// `inflight_check_runs_only_for_non_durable_rows` both bound its reads per
-/// scan; only the first bounds the in-flight check's the same way.
-///
-/// ## Why `limit` is a literal
-///
-/// `limit` is interpolated as a literal rather than bound. `LIMIT $2` is not
-/// a constant when Postgres builds a *generic* plan, so there is no
-/// `tuple_fraction` to apply and the planner loses the low-startup bias the
-/// cap exists to buy — and sqlx prepares every statement, so the plan cache
-/// decides which kind of plan this gets. The value is an in-process
-/// constant, never operator-supplied, and `NonZeroUsize` renders as digits.
-///
-/// ## What the predicates mean
-///
-/// Routes through the shared marker-aware
-/// [`snapshot_durable_for_source_release`] fragment so the "still needs a
-/// durable upload" predicate here matches the admin occupancy counters and the
-/// node-drain drain-blocker / terminator source-release guards exactly —
-/// drifting them produces a node the counter says is stuck while the handler
-/// enumerates nothing (or vice versa). An evacuation-marked sandbox whose
-/// newest snapshot is already `ready` is **not** enumerated (it needs no
-/// further upload), even if a failed-restore placement bump made it
-/// non-placement-fresh. (The API drain-gate bypass and restore-affinity hint
-/// answer a different question — user-op admission and placement — and keep the
-/// freshness predicate; they are intentionally not source-release guards.)
-///
-/// This is deliberately the authoritative predicate rather than the per-node
-/// backup-pending queue the drain reconciler consumes. The endpoint exists to
-/// rescue what the automated path missed, so reading the derived state it
-/// exists to rescue would make exactly the situation an operator reaches for it
-/// in the situation it cannot fix. Keeping the two definitions separate also
-/// makes this a drift oracle against that queue.
-///
-/// Excludes sandboxes whose durable upload is already in flight from any node
-/// (`NOT inflight_suspend_upload_exists`), mirroring the node-drain reupload
-/// queue (`node_drain::store::pinned_local_only_sandboxes_query`):
-/// force-reuploading a sandbox
-/// whose original upload is still `creating` is redundant and racy, and a
-/// resulting newer `failed` snapshot would make `latest_full_snapshot_ready`
-/// stop seeing the in-flight upload and could strand an evacuation restore.
-fn pinned_local_only_sandboxes_query(limit: NonZeroUsize) -> String {
-    let snapshot_exists = snapshot_durable_for_source_release("s");
-    let inflight_upload = inflight_suspend_upload_exists("s");
-    format!(
-        "SELECT s.id
-           FROM sandboxes s
-          WHERE s.target_node_id = $1
-            AND s.lifecycle = 'suspended'
-            AND CASE WHEN (SELECT {snapshot_exists}) THEN false
-                     ELSE NOT (SELECT {inflight_upload}) END
-          ORDER BY s.id
-          LIMIT {limit}"
-    )
-}
-
-/// List up to `limit` suspended sandboxes on this node that still need a
-/// durable upload, lowest sandbox id first. See
-/// [`pinned_local_only_sandboxes_query`] for the statement and its contract.
-pub(super) async fn list_pinned_local_only_sandboxes(
-    pool: &PgPool,
-    node_id: NodeId,
-    limit: NonZeroUsize,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    let query = sql!(pinned_local_only_sandboxes_query(limit));
-    sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(query))
-        .bind(node_id)
-        .fetch_all(pool)
-        .await
 }
 
 /// `true` if the user-API drain gate is currently refusing

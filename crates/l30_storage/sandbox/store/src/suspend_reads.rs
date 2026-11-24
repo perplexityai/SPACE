@@ -1,15 +1,19 @@
 //! Reads the Kubernetes suspend flow makes of `sandboxes` and its executions:
 //! whether a suspend is claimed, committed or projected, which artifact it
-//! committed, the durable snapshot a node can no longer publish, and whether a
-//! node-reported local suspend's upload is still `creating`.
+//! committed, the durable snapshot a node can no longer publish, whether a
+//! node-reported local suspend's upload is still `creating`, and whether a
+//! suspend whose pod went missing can finish from the row's current snapshot.
 //!
 //! Plain reads: none takes a lock. Each runs on the executor its caller
 //! passes, so the ones the suspend flow makes after its row locks run in
 //! that transaction. The suspend's `sandboxes` writes are
 //! [`crate::suspend`]'s; its execution writes stay with the Kubernetes store.
 
+use std::sync::LazyLock;
+
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
+use pplx_space_sandbox_portability::missing_suspending_pod_revert_eligibility;
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
 use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
@@ -274,4 +278,55 @@ pub async fn local_backup_pending(
     .bind(SANDBOX_LOCAL_SUSPEND_KEY)
     .fetch_one(executor)
     .await
+}
+
+/// Whether the `suspending` `sandbox_id`, still placed, whose active execution
+/// at `generation` tracking `pod_uid` is `running` or `suspended` with no
+/// successor, may finish its suspend from its current snapshot
+/// ([`missing_suspending_pod_revert_eligibility`]'s `eligible`). `Some` with
+/// that fragment's `clear_marker` when it may, `None` when it may not.
+///
+/// The Kubernetes store reads it after its per-sandbox row lock, in that
+/// transaction, and feeds the answer to
+/// [`crate::suspend::finalize_missing_pod_from_current_snapshot`].
+pub async fn missing_suspending_pod_clear_marker(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    generation: i64,
+    pod_uid: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let eligibility = missing_suspending_pod_revert_eligibility("s");
+        let clear_marker = eligibility.clear_marker;
+        let eligible = eligibility.eligible;
+        sql!(format!(
+            "SELECT {clear_marker}
+               FROM sandboxes s
+              WHERE s.id = $1
+                AND LOWER(TRIM(s.lifecycle)) = 'suspending'
+                AND s.active_node_id IS NOT NULL
+                AND EXISTS (
+                    SELECT 1
+                      FROM sandbox_k8s_executions e
+                     WHERE e.sandbox_id = s.id
+                       AND e.generation = $2
+                       AND e.pod_uid = $3
+                       AND e.active
+                       AND e.state IN ('running', 'suspended')
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM sandbox_k8s_executions successor
+                     WHERE successor.sandbox_id = s.id
+                       AND successor.generation > $2
+                )
+                AND {eligible}",
+        ))
+    });
+    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(pod_uid)
+        .fetch_optional(executor)
+        .await
 }

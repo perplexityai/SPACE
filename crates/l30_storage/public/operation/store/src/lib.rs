@@ -19,9 +19,10 @@
 //!   key's writers, a fork source's capture leader, or the dispatcher's keyed
 //!   claims, all of which take the caller's connection rather than any
 //!   executor. The caller derives each advisory key and takes the lock where
-//!   its transaction needs it. The dispatcher's claim ([`claim_queue`]) takes
-//!   the caller's connection too, since its rows stay locked for the rest of
-//!   the caller's transaction. A `FOR UPDATE` that serves only its own
+//!   its transaction needs it; [`quota`]'s lock verbs take the native
+//!   create's quota locks on the caller's transaction the same way. The
+//!   dispatcher's claim ([`claim_queue`]) takes the caller's connection too,
+//!   since its rows stay locked for the rest of the caller's transaction. A `FOR UPDATE` that serves only its own
 //!   statement, as in the finished-payload scrub, stays executor-generic;
 //! - the statements that compare with the database clock, verbatim, so the
 //!   decision stays on the database's `NOW()` in the executor the caller

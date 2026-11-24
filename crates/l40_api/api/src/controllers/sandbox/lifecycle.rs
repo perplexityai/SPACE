@@ -13,12 +13,12 @@ use pplx_space_events::{
 use pplx_space_node_model::{NodeDrain, NodeDrainPhase, NodeManagedBy, NodeRole};
 use pplx_space_node_registration_store::drain_reads;
 use pplx_space_postgres_pool::contention;
-use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_deleting};
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+#[cfg(test)]
 use pplx_space_sql_locator::sql;
 use user_admission::{UserLifecycleRequest, admit_user_lifecycle};
 
@@ -1086,18 +1086,6 @@ async fn run_stop_or_kill(
     }
 }
 
-/// The drain gate's single read of the sandbox row and its primary node.
-#[derive(sqlx::FromRow)]
-struct DrainGateRow {
-    portable: bool,
-    drain_phase: Option<NodeDrainPhase>,
-    drain_mode: Option<String>,
-    /// Whether `COALESCE(target_node_id, active_node_id)` names a node row.
-    primary_found: bool,
-    /// Whether that node has a `node_k8s` row.
-    mapped: bool,
-}
-
 /// Fetch the `drain_phase` of the node that the next placement-affecting
 /// call would land on. This must mirror `preferred_restore_node_name`'s
 /// resolution priority, otherwise a guard placed in front of the substrate
@@ -1147,8 +1135,9 @@ pub(super) async fn fetch_active_node_drain_state(
     // portable — restore can land them on any healthy node, so a drain phase
     // on their historical placement is no longer a reason to block
     // placement-affecting calls. Skip the rest of the gate in that case via
-    // the shared portability predicate. The `lifecycle IN ('suspended',
-    // 'restoring')` scope is load-bearing: for `started` / `paused` the
+    // the shared portability predicate `portable_for_restore_affinity`, which
+    // `placement_gate` reads. The `lifecycle IN ('suspended', 'restoring')`
+    // scope is load-bearing: for `started` / `paused` the
     // canonical state lives in the VM's live memory on the source node, not
     // in the snapshot, so a ready prior-cycle snapshot is stale relative to
     // the live VM and must not release the gate. `restoring` is included
@@ -1160,21 +1149,7 @@ pub(super) async fn fetch_active_node_drain_state(
     // sandbox row, so they are one statement: a snapshot at least as
     // consistent as the two reads it replaces. `portable` is only consulted
     // first; the primary columns are ignored when it is true.
-    let portable_predicate = portable_for_restore_affinity("s");
-    let gate_query = format!(
-        "SELECT COALESCE(({portable_predicate}), FALSE) AS portable,
-                n.drain_phase,
-                n.drain_mode,
-                n.id IS NOT NULL AS primary_found,
-                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
-           FROM sandboxes s
-           LEFT JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
-          WHERE s.id = $1"
-    );
-    let gate: Option<DrainGateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(gate_query.as_str())))
-        .bind(sandbox_id)
-        .fetch_optional(pool)
-        .await?;
+    let gate = sandbox_store::placement_gate::placement_gate(pool, sandbox_id).await?;
     if gate.as_ref().is_some_and(|row| row.portable) {
         return Ok(None);
     }

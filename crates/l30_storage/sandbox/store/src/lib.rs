@@ -100,10 +100,11 @@
 //!   shows.
 //! * **So are single-question reads.** A read of the `sandboxes` row that
 //!   callers made inline moves here whole, as a module named for the question
-//!   it answers, such as [`restore_pod_owners`], [`stale_suspended_executions`]
-//!   or [`stopped_replacements`], and so does one that joins the row to what
-//!   it references, as [`row_reads::owner`] (its organization) and
-//!   [`debug_reads::record`] (its nodes) do.
+//!   it answers, such as [`restore_pod_owners`], [`stale_suspended_executions`],
+//!   [`stopped_replacements`], [`placement_gate`] or [`template_usage`], and so
+//!   does one that joins the row to what it references, as
+//!   [`row_reads::owner`] (its organization) and [`debug_reads::record`]
+//!   (its nodes) do.
 //!   The two restore-lease reads the Direct restore takes before and after
 //!   its claim stay beside that claim in [`direct`].
 //!   Some such modules also read tables another store owns. For example,
@@ -202,6 +203,7 @@ pub mod node_placements;
 pub mod observed_states;
 pub mod org_storage;
 pub mod orphan;
+pub mod placement_gate;
 pub mod pod_tracking;
 pub mod port_exposures;
 pub mod published_quarantine_candidates;
@@ -226,12 +228,14 @@ pub mod snapshot_retention_claim;
 pub mod snapshot_retention_finalize;
 pub mod spaced_version_counts;
 pub mod stale_suspended_executions;
+pub mod started_recovery_source;
 pub mod stopped_replacement_claim;
 pub mod stopped_replacements;
 pub mod stuck;
 pub mod suspend;
 pub mod suspend_reads;
 pub mod sweeper;
+pub mod template_usage;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod tombstone;
