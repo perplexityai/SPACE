@@ -1,6 +1,9 @@
 //! Recording a node's EC2 instance through registration, against Postgres:
 //! which reports write it, which leave it alone, and that an instance alone
-//! neither dates the row's Kubernetes metadata nor clears drain state.
+//! neither dates the row's Kubernetes metadata nor clears drain state. The
+//! `direct_*` submodules test the Direct-node reads in [`crate::direct`]'s
+//! `endpoints` and `placement_candidates`; `direct_seed` seeds them and the
+//! registry-row reads' tests in `direct::registry`.
 
 use pplx_space_node_model::NodeRole;
 
@@ -11,6 +14,10 @@ use pplx_space_sql_locator::sql;
 use sqlx::{PgConnection, PgPool};
 
 use super::*;
+
+mod direct_endpoints;
+mod direct_placement_candidates;
+pub(crate) mod direct_seed;
 
 const NAME: &str = "space-test-instance-node";
 const INSTANCE_A: &str = "i-0000000a";

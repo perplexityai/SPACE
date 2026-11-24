@@ -16,7 +16,7 @@ workspace = true
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["derive", "json", "postgres", "time"] }
+sqlx = { workspace = true, features = ["derive", "json", "postgres", "time", "uuid"] }
 thiserror = { workspace = true }
 time = { workspace = true }
 
@@ -26,6 +26,7 @@ pplx-space-node-model = { workspace = true, features = ["sqlx"] }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-node-drain = { workspace = true }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
@@ -34,3 +35,4 @@ pplx-space-sql-locator = { workspace = true }
 [dev-dependencies]
 pplx-space-db-test-fixtures = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+uuid = { workspace = true, features = ["v7"] }

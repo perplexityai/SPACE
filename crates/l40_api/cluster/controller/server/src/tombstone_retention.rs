@@ -1,6 +1,6 @@
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_node_registration_store::direct::registry as direct_registry;
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sql_locator::sql;
 use std::time::{Duration, Instant};
 
 use pplx_space_node_registration_store::direct;
@@ -123,17 +123,8 @@ impl RetentionSink for TombstoneRetentionStore {
         let deleted_sandboxes_deleted = pruned_sandboxes.sandbox_ids.len() as u64;
         let storage_locations_detached = pruned_sandboxes.storage_locations_detached;
 
-        let direct_node_tombstones_count = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT COUNT(*)
-               FROM nodes n
-               JOIN node_direct nd ON nd.node_id = n.id
-              WHERE n.managed_by = $1
-                AND COALESCE(n.state, 'registered') = 'deleted'
-                AND nd.deleted_at IS NOT NULL"
-        ))
-        .bind(SubstrateKind::Space)
-        .fetch_one(&mut *tx)
-        .await?;
+        let direct_node_tombstones_count =
+            direct_registry::count_tombstones(&mut *tx, SubstrateKind::Space).await?;
         let direct_node_tombstones = count_to_u64(direct_node_tombstones_count);
         let template_tombstones_count =
             pplx_space_template_store::templates::count_deleted(&mut *tx).await?;

@@ -1,4 +1,3 @@
-use pplx_space_sql_locator::sql;
 use std::{collections::HashSet, time::Duration};
 
 use axum::{
@@ -17,6 +16,7 @@ use pplx_space_node_api_client::proto::{
 };
 use pplx_space_node_api_client::{BuilderApiClient, NodeApiClient, WorkerApiClient};
 use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
+use pplx_space_node_registration_store::direct::registry as direct_registry;
 use pplx_space_postgres_pool::Db;
 use pplx_space_state_reconciliation::{FACET_NETWORK_POLICY, ReconcileFacet, ReconcileReason};
 use pplx_space_template_mgr_client::proto::{
@@ -61,6 +61,26 @@ struct NodeRow {
     updated_at: Option<OffsetDateTime>,
     deleted_at: Option<OffsetDateTime>,
     node_name: Option<String>,
+}
+
+impl From<direct_registry::RegistryNodeRow> for NodeRow {
+    fn from(row: direct_registry::RegistryNodeRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            address: row.address,
+            node_api_endpoint: row.node_api_endpoint,
+            role: row.role,
+            managed_by: row.managed_by,
+            state: row.state,
+            metadata: row.metadata,
+            last_heartbeat: row.last_heartbeat,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deleted_at: row.deleted_at,
+            node_name: row.node_name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -255,28 +275,9 @@ fn inventory_entry_to_row(
 }
 
 async fn fetch_node(pool: &sqlx::PgPool, id: NodeId) -> Result<Option<NodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeRow>(sql!(
-        "SELECT n.id,
-                nd.name,
-                host(n.address) AS address,
-                nd.node_api_endpoint,
-                n.role,
-                n.managed_by,
-                n.state,
-                nd.metadata,
-                n.last_heartbeat,
-                n.created_at,
-                nd.updated_at,
-                nd.deleted_at,
-                nk.k8s_node_name AS node_name
-         FROM nodes n
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         LEFT JOIN node_k8s nk ON nk.node_id = n.id
-         WHERE n.id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await
+    Ok(direct_registry::registry_node(pool, id)
+        .await?
+        .map(NodeRow::from))
 }
 
 async fn fetch_nodes(
@@ -284,33 +285,11 @@ async fn fetch_nodes(
     role: Option<NodeRole>,
     include_deleted: bool,
 ) -> Result<Vec<NodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeRow>(sql!(
-        "SELECT n.id,
-                nd.name,
-                host(n.address) AS address,
-                nd.node_api_endpoint,
-                n.role,
-                n.managed_by,
-                n.state,
-                nd.metadata,
-                n.last_heartbeat,
-                n.created_at,
-                nd.updated_at,
-                nd.deleted_at,
-                nk.k8s_node_name AS node_name
-         FROM nodes n
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         LEFT JOIN node_k8s nk ON nk.node_id = n.id
-         WHERE ($1::TEXT IS NULL OR n.role = $1)
-           AND ($2::BOOL OR nd.deleted_at IS NULL)
-         ORDER BY n.role ASC,
-                  COALESCE(nd.name, nk.k8s_node_name) ASC NULLS LAST,
-                  nd.node_api_endpoint ASC NULLS LAST"
-    ))
-    .bind(role.map(NodeRole::as_str))
-    .bind(include_deleted)
-    .fetch_all(pool)
-    .await
+    Ok(direct_registry::registry_nodes(pool, role, include_deleted)
+        .await?
+        .into_iter()
+        .map(NodeRow::from)
+        .collect())
 }
 
 async fn fetch_inventory_nodes(

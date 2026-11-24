@@ -9,6 +9,7 @@ use pplx_space_db_test_fixtures::{
     publish_ready_disk_artifact, try_pg_test_db,
 };
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 use super::*;

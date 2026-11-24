@@ -9,7 +9,8 @@
 //! rows of the templates it removes. The admin node-template routes delete one
 //! node's cached copies and list them; template admin and public routes, and
 //! the release lookups, read what nodes hold. Each verb takes any executor, so
-//! a caller's guard keeps its transaction and locks.
+//! a caller's guard keeps its transaction and locks. The reads that also ask
+//! whether a Direct node's registry row is live are in [`direct`].
 //!
 //! Rows whose `snapshots` JSON a caller decodes are generic over that payload
 //! type: the shape belongs to the caller's response, and decoding it in the
@@ -22,6 +23,7 @@ use serde::de::DeserializeOwned;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgExecutor};
 
+pub mod direct;
 mod publish;
 mod template;
 

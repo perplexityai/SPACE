@@ -57,6 +57,7 @@ use pplx_space_events::{
 };
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
+use pplx_space_node_registration_store::direct::registry as direct_registry;
 use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::snapshot_capture_fields::{self, SnapshotSandboxRow};
@@ -357,7 +358,7 @@ pub struct ClusterApiService {
     firewall_enrollment: firewall_rules::Enrollment,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 struct NodeRow {
     id: String,
     name: Option<String>,
@@ -371,6 +372,25 @@ struct NodeRow {
     updated_at: OffsetDateTime,
     deleted_at: Option<OffsetDateTime>,
     metadata_json: String,
+}
+
+impl From<direct_registry::ListedNodeRow> for NodeRow {
+    fn from(row: direct_registry::ListedNodeRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            address: row.address,
+            node_api_endpoint: row.node_api_endpoint,
+            role: row.role,
+            managed_by: row.managed_by,
+            state: row.state,
+            last_heartbeat: row.last_heartbeat,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deleted_at: row.deleted_at,
+            metadata_json: row.metadata_json,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1390,32 +1410,10 @@ impl ClusterApiService {
         role: Option<SpaceNodeRole>,
         include_deleted: bool,
     ) -> Result<Vec<NodeRow>, Status> {
-        sqlx::query_as::<_, NodeRow>(sql!(
-            "SELECT n.id::TEXT AS id,
-                    nd.name,
-                    host(n.address) AS address,
-                    nd.node_api_endpoint,
-                    n.role,
-                    n.managed_by,
-                    n.state,
-                    n.last_heartbeat,
-                    n.created_at,
-                    nd.updated_at,
-                    nd.deleted_at,
-                    nd.metadata::TEXT AS metadata_json
-             FROM nodes n
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE ($1::TEXT IS NULL OR n.role = $1)
-               AND ($2::BOOL OR nd.deleted_at IS NULL)
-               AND n.managed_by = $3
-             ORDER BY n.role ASC, nd.name ASC NULLS LAST, nd.node_api_endpoint ASC"
-        ))
-        .bind(role.map(SpaceNodeRole::as_str))
-        .bind(include_deleted)
-        .bind(SubstrateKind::Space)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| Status::internal(format!("query nodes: {err}")))
+        direct_registry::listed_nodes(&self.pool, role, include_deleted, SubstrateKind::Space)
+            .await
+            .map(|rows| rows.into_iter().map(NodeRow::from).collect())
+            .map_err(|err| Status::internal(format!("query nodes: {err}")))
     }
 
     /// Resolve a caller-named node to its existing registration. Rows are
