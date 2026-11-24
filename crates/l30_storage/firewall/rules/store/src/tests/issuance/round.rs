@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod check;
+
 /// The stable worker's manager epoch the fixtures use; there is no
 /// production source yet.
 const EPOCH: u64 = 1;

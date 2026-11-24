@@ -24,11 +24,14 @@
 //! [`open_round`] asks an issued target's node to verify that assignment,
 //! with its wakeup. [`fetch_instructions`] reads one node's assignment and
 //! pending round. [`accept_report`] records the node's answer to that round.
+//! [`check_target`] decides, for a leased due check, whether to ask, wait or
+//! leave the answer for the outcome path.
 
 use std::fmt;
 
 use pplx_space_rollout_queue::HeaderPhase;
 
+mod check;
 mod fetch;
 mod issue;
 mod lease;
@@ -38,6 +41,7 @@ mod report;
 mod round;
 mod start;
 
+pub use check::{Check, CheckPolicy, Evidence, RecheckWakeup, Verdict, Wait, check_target};
 pub use fetch::{Assignment, NodeInstructions, PendingRound, fetch_instructions};
 pub use issue::{
     Issuance, Refusal, Stamp, Wakeup, issue_canary_and_release, issue_first_assignment,
