@@ -81,7 +81,9 @@ pub enum FinalizeSandboxDbDeleteError {
 ///
 /// Serializes with node-state publication before taking any row locks:
 /// publication can write observed state before it updates the sandbox row,
-/// while finalization locks the sandbox row before deleting observed state.
+/// or remove observed state before locking an absent stopped Direct sandbox.
+/// Finalization locks the sandbox row before deleting observed state and does
+/// not require the caller to have marked the sandbox `deleting`.
 ///
 /// Takes a `FOR UPDATE` lock on the parent `sandboxes` row before checking uploads.
 /// PostgreSQL's foreign-key enforcement makes a concurrent

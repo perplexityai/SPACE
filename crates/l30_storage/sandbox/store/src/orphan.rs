@@ -23,12 +23,12 @@ use pplx_space_sql_locator::sql;
 use sqlx::{PgConnection, Postgres, Transaction};
 
 /// Stable namespace for the per-sandbox advisory transaction lock that
-/// coordinates node-state publication (`SHARED`) with orphan classification
-/// and revert (`EXCLUSIVE`).
+/// coordinates node-state publication (`SHARED`) with orphan classification,
+/// revert, and delete finalization (`EXCLUSIVE`).
 pub const ORPHAN_OBSERVATION_LOCK_SEED: i64 = 847_291_653;
 
-/// Acquire shared per-sandbox advisory transaction locks for published
-/// `present: true` sandboxes in ascending [`SandboxId`] order.
+/// Acquire shared per-sandbox advisory transaction locks for explicitly
+/// reported sandboxes, present or absent, in ascending [`SandboxId`] order.
 ///
 /// Node-state publication runs this in its own statement inside an open
 /// transaction before reading `sandboxes` or writing `sandbox_observed_states`
@@ -37,7 +37,7 @@ pub const ORPHAN_OBSERVATION_LOCK_SEED: i64 = 847_291_653;
 /// non-blocking and doesn't lock `sandboxes` rows against ordinary lifecycle
 /// mutations, while blocking [`lock_orphan_observation`] until the publication
 /// transaction finishes and making a concurrent publication wait for an
-/// in-flight orphan revert to finish.
+/// in-flight orphan revert or delete to finish.
 pub async fn lock_published_sandbox_observations(
     conn: &mut PgConnection,
     sandbox_ids: &[SandboxId],
@@ -66,7 +66,7 @@ pub async fn lock_published_sandbox_observations(
 /// Callers must run this in its own statement before locking `sandboxes`
 /// (`FOR UPDATE OF`), both to keep lock ordering acyclic and so the following
 /// `READ COMMITTED` statement snapshots `sandbox_observed_states` after any
-/// concurrent `present: true` publication holding the shared lock has finished.
+/// concurrent publication holding the shared lock has finished.
 pub async fn lock_orphan_observation(
     tx: &mut Transaction<'_, Postgres>,
     sandbox_id: SandboxId,

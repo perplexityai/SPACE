@@ -268,42 +268,52 @@ mod postgres_tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::present(true)]
+    #[case::absent(false)]
     #[tokio::test(flavor = "current_thread")]
-    async fn user_delete_finalization_racing_publication_does_not_deadlock() -> TestResult {
+    async fn user_delete_finalization_racing_publication_does_not_deadlock(
+        #[case] present: bool,
+    ) -> TestResult {
         let db = pg_test_db_with_max_connections(4).await?;
         let node_id = NodeId::new();
         let sandbox_id = SandboxId::new();
         insert_ready_worker_node(&db.pool, node_id).await?;
-        insert_sandbox(&db.pool, sandbox_id, "started").await?;
+        let lifecycle = if present { "started" } else { "stopped" };
+        insert_sandbox(&db.pool, sandbox_id, lifecycle).await?;
         sqlx::query(sql!(
-            "UPDATE sandboxes SET placement = 'on_node', active_node_id = $2, target_node_id = $2
+            "UPDATE sandboxes
+             SET placement = 'on_node', active_node_id = $2, target_node_id = $2, managed_by = $3
              WHERE id = $1"
         ))
         .bind(sandbox_id)
         .bind(node_id)
+        .bind(if present { "k8s" } else { "space" })
         .execute(&db.pool)
         .await?;
 
         let mut state = PublishedSandboxState {
             sandbox_id: sandbox_id.to_string(),
-            status: Some("started".to_owned()),
+            status: Some(lifecycle.to_owned()),
             present: true,
             ..Default::default()
         };
         let mut tx = db.pool.begin().await?;
         publish_sandbox_states(&mut tx, node_id, std::slice::from_ref(&state)).await?;
         tx.commit().await?;
-        sqlx::query(sql!(
-            "UPDATE sandboxes SET lifecycle = 'deleting' WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .execute(&db.pool)
-        .await?;
+        if present {
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle = 'deleting' WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        }
 
         // Pause finalization at the snapshot-upload check, after it locks the
-        // sandbox row. The next publication changes both an observed field and
-        // an activity clock. Let each writer reach its wait before unblocking
-        // finalization, so their overlap does not depend on scheduling.
+        // sandbox row. The publication then either updates observed state and
+        // activity or removes an absent stopped row. Wait for both writers to
+        // block before releasing the gate so their overlap is deterministic.
         let mut gate = db.pool.begin().await?;
         sqlx::query(sql!("LOCK TABLE snapshots IN ACCESS EXCLUSIVE MODE"))
             .execute(&mut *gate)
@@ -331,11 +341,14 @@ mod postgres_tests {
         });
         wait_for_writers(1).await?;
 
-        state.uptime = Some("1m".to_owned());
-        state.last_access_at = Some(prost_types::Timestamp {
-            seconds: 1_900_000_000,
-            nanos: 0,
-        });
+        state.present = present;
+        if present {
+            state.uptime = Some("1m".to_owned());
+            state.last_access_at = Some(prost_types::Timestamp {
+                seconds: 1_900_000_000,
+                nanos: 0,
+            });
+        }
         let pool = db.pool.clone();
         let publish = tokio::spawn(async move {
             let mut tx = pool.begin().await?;
