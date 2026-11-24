@@ -72,9 +72,9 @@ struct DirBatch {
     exhausted: bool,
 }
 
-/// Read up to `limit` entries strictly after `after` in ascending name order,
-/// keeping at most `limit` entries in memory and closing the directory handle
-/// before returning.
+/// Stream one fresh `read_dir` pass over `dir` and return up to `limit` entries
+/// strictly after `after` in ascending name order, keeping at most `limit`
+/// entries in memory and closing the directory handle before returning.
 fn read_next_batch(dir: &Path, after: Option<&OsStr>, limit: usize) -> std::io::Result<DirBatch> {
     let entries = std::fs::read_dir(dir)?;
     let mut heap: BinaryHeap<QueuedEntry> = BinaryHeap::with_capacity(limit);

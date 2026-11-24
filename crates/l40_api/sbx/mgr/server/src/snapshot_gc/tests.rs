@@ -1152,20 +1152,27 @@ fn orphan_scan_reopens_listings_across_pages_without_stale_enoent_warnings() {
         let added_fork = fork_root.join("op-150");
         fs::create_dir_all(&added_fork).unwrap();
 
-        for _ in 0..4 {
-            gc_found.extend(
-                gc_scan
-                    .next_page(tmp.path(), OrphanKind::GcPending, &active, stale_now)
-                    .unwrap(),
-            );
-            fork_found.extend(
-                fork_scan
-                    .next_page(&fork_root, OrphanKind::ForkCopy, &active, stale_now)
-                    .unwrap(),
-            );
-        }
-        assert!(gc_found.contains(&added_orphan));
-        assert!(fork_found.contains(&added_fork));
+        let next_gc_page: std::collections::HashSet<_> = gc_scan
+            .next_page(tmp.path(), OrphanKind::GcPending, &active, stale_now)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let next_fork_page: std::collections::HashSet<_> = fork_scan
+            .next_page(&fork_root, OrphanKind::ForkCopy, &active, stale_now)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            next_gc_page,
+            std::collections::HashSet::from([surviving_orphan.clone(), added_orphan])
+        );
+        assert_eq!(
+            next_fork_page,
+            std::collections::HashSet::from([fork_root.join("op-149"), added_fork])
+        );
+        gc_found.extend(next_gc_page);
+        fork_found.extend(next_fork_page);
         (gc_found, fork_found)
     });
 
