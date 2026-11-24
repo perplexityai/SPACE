@@ -59,6 +59,9 @@ fn gap(kind: Gap, slot_id: Option<u32>) -> FirewallRulesCensusGap {
 fn incomplete(mut request: ReportFirewallRulesRequest) -> ReportFirewallRulesRequest {
     request.census = Census::Incomplete.into();
     request.census_gaps = vec![gap(Gap::Missing, Some(4)), gap(Gap::Unowned, None)];
+    request
+        .slots
+        .push(slot(4, 1, Slot::Unknown, Reason::NamespaceMissing));
     request.extra_namespaces = Some(2);
     request
 }
@@ -303,6 +306,7 @@ async fn report_answers_the_round_its_opener_opened() -> TestResult {
             "extra_namespaces": 2,
             "slots": [
                 {"slot_id": 3, "slot_generation": 5, "outcome": "verified"},
+                {"slot_id": 4, "slot_generation": 1, "outcome": "unknown", "reason": "namespace_missing"},
                 {"slot_id": 9, "slot_generation": 2, "outcome": "failed", "reason": "rules_mismatch"},
             ],
         })
@@ -777,12 +781,13 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
 }
 
 /// Each malformation of an otherwise acceptable report, whose integers are
-/// all 0 and whose census lists as many gaps as its slots allow, is
-/// INVALID_ARGUMENT and writes nothing, and the report itself is accepted: 0
-/// is a value, and an unset field never reads as 0. Catches a decoder that
-/// defaults an unset field or enum, accepts an unknown or removed enum value,
-/// a duplicate slot, a slot with two gaps, a repeated gap, a reason or gap
-/// slot that doesn't fit, an incomplete census with neither gaps nor extra
+/// all 0 and whose census lists every gap kind, is INVALID_ARGUMENT and
+/// writes nothing, and the report itself is accepted: 0 is a value, and an
+/// unset field never reads as 0. Catches a decoder that defaults an unset
+/// field or enum, accepts an unknown or removed enum value, a duplicate slot,
+/// a slot with two gaps, a repeated gap, a gap for a slot the report doesn't
+/// list or whose outcome contradicts it, a reason or gap slot that doesn't
+/// fit, an incomplete census with neither gaps nor extra
 /// namespaces or a complete one with either, an out-of-range integer, too
 /// many extra namespaces, an oversized report, or a bare census standing in
 /// for evidence.
@@ -795,7 +800,6 @@ async fn malformed_reports_write_nothing() -> TestResult {
     ask(pool, r.node, (0, r.revision), 0, 0, Duration::ZERO).await?;
     let mut base = answer(r.node, 0, (0, r.revision), 0);
     base.census = Census::Incomplete.into();
-    // Three past the two slots.
     base.census_gaps = vec![
         gap(Gap::Missing, Some(0)),
         gap(Gap::Unowned, None),
@@ -804,13 +808,15 @@ async fn malformed_reports_write_nothing() -> TestResult {
         gap(Gap::ListingFailed, None),
     ];
     base.slots = vec![
-        slot(0, 0, Slot::Verified, Reason::Unspecified),
-        slot(1, 0, Slot::Failed, Reason::RulesMismatch),
+        slot(0, 0, Slot::Unknown, Reason::NamespaceMissing),
+        slot(1, 0, Slot::Unknown, Reason::Unconfirmed),
+        slot(2, 0, Slot::Verified, Reason::Unspecified),
+        slot(3, 0, Slot::Failed, Reason::RulesMismatch),
     ];
     let before = row(pool, r.node).await?;
     let too_large = u64::try_from(i64::MAX)? + 1;
     type Malform = fn(&mut ReportFirewallRulesRequest, u64);
-    let malformations: [(&str, Malform); 30] = [
+    let malformations: [(&str, Malform); 31] = [
         ("node_id unset", |q, _| q.node_id.clear()),
         ("round unset", |q, _| q.round = None),
         ("generation unset", |q, _| q.assignment_generation = None),
@@ -847,8 +853,11 @@ async fn malformed_reports_write_nothing() -> TestResult {
         ("repeated gap", |q, _| {
             q.census_gaps[3] = gap(Gap::Unowned, None);
         }),
-        ("too many gaps", |q, _| {
+        ("gap for an unlisted slot", |q, _| {
             q.census_gaps.push(gap(Gap::Missing, Some(7)));
+        }),
+        ("gap contradicting its slot", |q, _| {
+            q.census_gaps[2] = gap(Gap::Unread, Some(2));
         }),
         ("slot_id unset", |q, _| q.slots[0].slot_id = None),
         ("slot generation unset", |q, _| {
@@ -856,11 +865,11 @@ async fn malformed_reports_write_nothing() -> TestResult {
         }),
         ("slot outcome unset", |q, _| q.slots[0].outcome = 0),
         ("verified with a reason", |q, _| {
-            q.slots[0].reason = Reason::RulesMismatch.into();
+            q.slots[2].reason = Reason::RulesMismatch.into();
         }),
-        ("failed without one", |q, _| q.slots[1].reason = 0),
+        ("failed without one", |q, _| q.slots[3].reason = 0),
         ("failed with an unknown's reason", |q, _| {
-            q.slots[1].reason = Reason::TableUnreadable.into();
+            q.slots[3].reason = Reason::TableUnreadable.into();
         }),
         ("duplicate slot", |q, _| q.slots[1].slot_id = Some(0)),
         ("round out of range", |q, n| q.round = Some(n)),

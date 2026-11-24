@@ -27,9 +27,9 @@ fn incomplete(gaps: Vec<CensusGap>, extra_namespaces: u64) -> Result<Report, Inv
 fn every_document_variant_is_written_as_frozen_and_reads_back() {
     let census = Census::Incomplete {
         gaps: vec![
-            CensusGap::Unread { slot_id: 1 },
+            CensusGap::Unread { slot_id: 5 },
             CensusGap::ListingFailed,
-            CensusGap::Missing { slot_id: 0 },
+            CensusGap::Missing { slot_id: 4 },
             CensusGap::Unowned,
             CensusGap::InventoryFailed,
         ],
@@ -86,8 +86,8 @@ fn every_document_variant_is_written_as_frozen_and_reads_back() {
                 {"gap": "inventory_failed"},
                 {"gap": "unowned"},
                 {"gap": "listing_failed"},
-                {"gap": "missing", "slot_id": 0},
-                {"gap": "unread", "slot_id": 1},
+                {"gap": "missing", "slot_id": 4},
+                {"gap": "unread", "slot_id": 5},
             ],
             "extra_namespaces": 3,
             "slots": slots_json,

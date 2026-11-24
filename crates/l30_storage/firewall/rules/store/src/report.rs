@@ -25,9 +25,6 @@ pub const REPORT_MAX_AGE: Duration = Duration::from_secs(300);
 /// Most slots one report may describe: one past node-mgr's largest pool,
 /// `MAX_IPV4_NETWORK_SLOTS`.
 const MAX_REPORT_SLOTS: usize = 16_384;
-/// Census gaps one report may list beyond one per slot: each host-wide gap,
-/// `InventoryFailed`, `Unowned` and `ListingFailed`, once.
-const HOST_GAPS: usize = 3;
 /// Most managed namespaces no slot accounts for one report may count, 64
 /// times `MAX_REPORT_SLOTS`. A larger count is malformed, not stored.
 const MAX_EXTRA_NAMESPACES: u64 = 64 * MAX_REPORT_SLOTS as u64;
@@ -44,16 +41,16 @@ pub enum InvalidReport {
     OutOfRange { field: &'static str, value: u64 },
     #[error("{0} slots is more than {MAX_REPORT_SLOTS}")]
     TooManySlots(usize),
-    #[error("{gaps} census gaps is more than {HOST_GAPS} past the {slots} slots")]
-    TooManyGaps { gaps: usize, slots: usize },
     #[error("{0} extra namespaces is more than {MAX_EXTRA_NAMESPACES}")]
     TooManyExtraNamespaces(u64),
     #[error("slot {0} is reported more than once")]
     DuplicateSlot(u32),
-    #[error("slot {0} has more than one census gap")]
-    RepeatedSlotGap(u32),
     #[error("census gap {0:?} is listed more than once")]
     RepeatedGap(CensusGap),
+    #[error("a census gap names slot {0}, which the report doesn't list")]
+    GapForUnlistedSlot(u32),
+    #[error("slot {0}'s outcome contradicts its census gap")]
+    GapContradictsSlot(u32),
     #[error("an incomplete census lists no gap and counts no extra namespace")]
     NoGaps,
 }
@@ -72,8 +69,9 @@ pub enum Census {
     },
 }
 
-/// Why a census is incomplete. Each slot has at most one gap, and each other
-/// gap appears at most once. Its serde form is the document's.
+/// Why a census is incomplete. A slot gap names a slot the report lists, at
+/// most one per slot, and each host-wide gap appears at most once. Its serde
+/// form is the document's.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "gap", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CensusGap {
@@ -81,11 +79,13 @@ pub enum CensusGap {
     /// The host names no directory only managed namespaces occupy.
     Unowned,
     ListingFailed,
-    /// An eligible slot has no namespace.
+    /// An eligible slot has no namespace. Its slot is
+    /// `Unknown(NamespaceMissing)`.
     Missing {
         slot_id: u32,
     },
-    /// An eligible slot wasn't read at its final lifecycle.
+    /// An eligible slot wasn't read at its final lifecycle. Its slot is
+    /// `Unknown(Unconfirmed)` or `Unknown(NamespaceUnreadable)`.
     Unread {
         slot_id: u32,
     },
@@ -96,6 +96,19 @@ impl CensusGap {
         match self {
             Self::Missing { slot_id } | Self::Unread { slot_id } => Some(slot_id),
             Self::InventoryFailed | Self::Unowned | Self::ListingFailed => None,
+        }
+    }
+
+    /// Whether the outcome of the slot this gap names agrees with it.
+    fn fits(self, outcome: SlotOutcome) -> bool {
+        use UnknownReason as R;
+        match self {
+            Self::Missing { .. } => outcome == SlotOutcome::Unknown(R::NamespaceMissing),
+            Self::Unread { .. } => matches!(
+                outcome,
+                SlotOutcome::Unknown(R::Unconfirmed | R::NamespaceUnreadable)
+            ),
+            Self::InventoryFailed | Self::Unowned | Self::ListingFailed => true,
         }
     }
 }
@@ -266,28 +279,32 @@ impl Report {
                 if extra_namespaces > MAX_EXTRA_NAMESPACES {
                     return Err(InvalidReport::TooManyExtraNamespaces(extra_namespaces));
                 }
-                if gaps.len() > slots.len() + HOST_GAPS {
-                    return Err(InvalidReport::TooManyGaps {
-                        gaps: gaps.len(),
-                        slots: slots.len(),
-                    });
-                }
-                // A slot's gaps sort together, so a second one is adjacent.
                 gaps.sort_unstable_by_key(|&gap| (gap.slot_id(), gap));
-                if let Some(first) = gaps.windows(2).find_map(|pair| match pair {
-                    [first, second]
-                        if first == second
-                            || (first.slot_id().is_some()
-                                && first.slot_id() == second.slot_id()) =>
-                    {
-                        Some(*first)
-                    }
+                if let Some(repeated) = gaps.windows(2).find_map(|pair| match pair {
+                    [first, second] if first == second => Some(*first),
                     _ => None,
                 }) {
-                    return Err(match first.slot_id() {
-                        Some(slot) => InvalidReport::RepeatedSlotGap(slot),
-                        None => InvalidReport::RepeatedGap(first),
-                    });
+                    return Err(InvalidReport::RepeatedGap(repeated));
+                }
+                // Each slot gap names a listed slot whose outcome agrees with
+                // it, which no slot does for both kinds. With no repeats, that
+                // leaves at most one gap per listed slot and the three
+                // host-wide ones, so MAX_REPORT_SLOTS bounds the gaps too.
+                for gap in &gaps {
+                    let Some(slot_id) = gap.slot_id() else {
+                        continue;
+                    };
+                    let slot = slots
+                        .binary_search_by_key(&slot_id, |slot| slot.slot_id)
+                        .ok()
+                        .and_then(|index| slots.get(index));
+                    match slot {
+                        None => return Err(InvalidReport::GapForUnlistedSlot(slot_id)),
+                        Some(slot) if !gap.fits(slot.outcome) => {
+                            return Err(InvalidReport::GapContradictsSlot(slot_id));
+                        }
+                        Some(_) => {}
+                    }
                 }
                 (CensusV1::Incomplete, gaps, extra_namespaces)
             }

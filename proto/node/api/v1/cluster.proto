@@ -1570,8 +1570,10 @@ message ReportFirewallRulesRequest {
   optional uint64 manager_epoch = 5;
   // COMPLETE exactly when `census_gaps` is empty and `extra_namespaces` is 0.
   FirewallRulesCensus census = 6;
-  // In any order, each at most once, and at most one per slot ID: no more
-  // than 3 past the number of `slots`.
+  // In any order, each at most once. A MISSING or UNREAD gap names a slot
+  // listed in `slots`, at most one gap per slot, so there are at most 3 more
+  // gaps than slots. A MISSING slot is UNKNOWN with NAMESPACE_MISSING, an
+  // UNREAD one UNKNOWN with UNCONFIRMED or NAMESPACE_UNREADABLE.
   repeated FirewallRulesCensusGap census_gaps = 7;
   // At most 16384, each slot ID once, in any order.
   repeated FirewallRulesSlotEvidence slots = 8;
@@ -1593,7 +1595,7 @@ message FirewallRulesCensusGap {
   reserved "omitted";
 
   FirewallRulesCensusGapKind kind = 1;
-  // Set exactly for MISSING and UNREAD.
+  // Set exactly for MISSING and UNREAD, to a slot the report lists.
   optional uint32 slot_id = 2;
 }
 
