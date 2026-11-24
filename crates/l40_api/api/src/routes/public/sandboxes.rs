@@ -1,9 +1,8 @@
 use crate::routes::public::error::database_error;
-use pplx_space_accounts::{NodeId, OrgId, UserId};
+use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_public_api_http::PublicJson;
 use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_sql_locator::sql;
 use std::{convert::Infallible, str::FromStr, time::Duration};
 
 use crate::metrics::operations::InlineAdmissionPath;
@@ -19,9 +18,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_guest_process::IdempotencyKey;
-use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
     OperationTargetType, PageCursor, PublicErrorCode, PublicOperationRecord, PublicPage,
@@ -32,14 +29,10 @@ use pplx_space_public_api::{
     routes as native_routes,
 };
 use pplx_space_sandbox_model::SandboxLifecycle;
-use pplx_space_state_reconciliation::{
-    FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
-    SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
-    SANDBOX_FAILURE_POD_UID_KEY,
-};
+use pplx_space_sandbox_store::direct::sandbox_listing::{self, PageWalk, public::PublicSandboxRow};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, types::Json as SqlJson};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use crate::{
@@ -48,7 +41,7 @@ use crate::{
         sandbox::{
             AdmissionPoolPlan, SandboxController, fetch_sandbox,
             lifecycle::user_admission::{UserLifecycleRequest, admit_user_lifecycle},
-            list_page::{ListPage, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte},
+            list_page::{ListPage, SANDBOX_LIST_ROW_OVERHEAD_BYTES},
         },
         substrate::AdmissionPoolClaim,
     },
@@ -1193,163 +1186,12 @@ async fn ensure_sandbox_owner(
     Ok(())
 }
 
-#[derive(Debug, Clone, FromRow)]
-struct PublicSandboxRow {
-    id: SandboxId,
-    name: Option<String>,
-    lifecycle: String,
-    has_current_failure: bool,
-    placement: String,
-    active_node_id: Option<NodeId>,
-    template_id: Option<String>,
-    content_hash: Option<String>,
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
-    disk_mib: Option<i32>,
-    metadata: SqlJson<ControllerSandboxMetadata>,
-    next_auto_event_at: Option<i64>,
-    auto_lifecycle: SqlJson<AutoLifecyclePolicy>,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-    /// A page row is followed by another sandbox in list order, whether or
-    /// not the page's byte budget let it in.
-    has_next: bool,
-}
-
-const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
-            s.name,
-            s.lifecycle,
-            COALESCE(
-                s.lifecycle = 'failed'
-                AND LOWER(TRIM(sos.status)) = 'failed'
-                AND (
-                    (
-                        s.managed_by = $6
-                        AND EXISTS (
-                            SELECT 1
-                            FROM sandbox_k8s_executions execution
-                            WHERE execution.sandbox_id = s.id
-                              AND execution.active
-                              AND failure_observation.observed_payload
-                                  -> $2::TEXT
-                                  @> jsonb_build_object(
-                                      $3::TEXT, execution.generation,
-                                      $4::TEXT, execution.pod_uid,
-                                      $5::TEXT, execution.route_activation_id::TEXT
-                                  )
-                              AND execution.pod_uid IS NOT NULL
-                              AND execution.route_activation_id IS NOT NULL
-                        )
-                    )
-                    OR (
-                        s.managed_by = $7
-                        AND direct_route.sandbox_id IS NOT NULL
-                        AND failure_observation.observed_payload
-                            -> $2::TEXT
-                            @> jsonb_build_object(
-                                $3::TEXT, direct_route.execution_generation,
-                                $5::TEXT, direct_route.activation_attempt_id::TEXT
-                            )
-                    )
-                ),
-                FALSE
-            ) AS has_current_failure,
-            s.placement,
-            s.active_node_id,
-            s.template_id,
-            s.content_hash,
-            s.vcpu,
-            s.memory_mib,
-            s.disk_mib,
-            s.metadata,
-            s.next_auto_event_at,
-            s.auto_lifecycle_json AS auto_lifecycle,
-            s.created_at,
-            s.updated_at";
-
-/// The joins of a public sandbox row onto `s`.
-const PUBLIC_SANDBOX_JOINS: &str = "LEFT JOIN sandbox_direct_route_identities direct_route
-       ON direct_route.sandbox_id = s.id
-     LEFT JOIN sandbox_observed_states sos
-       ON sos.sandbox_id = s.id
-      AND sos.node_id = COALESCE(direct_route.current_node_id, s.active_node_id)
-     LEFT JOIN node_facet_observed_status failure_observation
-       ON failure_observation.node_id = COALESCE(direct_route.current_node_id, s.active_node_id)
-      AND failure_observation.facet = $1
-      AND failure_observation.element = s.id::TEXT";
-
-/// The sandboxes the list shows after the cursor: the org's live sandboxes,
-/// owned by subject $12 or, without one, by a local user.
-const PAGE_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
-    FROM sandboxes s
-    WHERE s.org_id = $8
-      AND s.lifecycle NOT IN ('deleted')
-      AND (($12::UUID IS NOT NULL AND s.user_id = $12)
-        OR ($12::UUID IS NULL AND EXISTS (
-            SELECT 1 FROM users owner WHERE owner.id = s.user_id
-              AND owner.owner_source = 'local'
-        )))
-      AND {after_cursor}
-    ORDER BY s.created_at DESC, s.id DESC
-    LIMIT {max_rows}";
-
-const PAGE_WALK_PARAMS: PageWalkParams = PageWalkParams {
-    cursor_created_at: "$9",
-    cursor_id: "$10",
-    max_rows: "$11",
-    max_bytes: "$13",
-    row_overhead_bytes: "$14",
-    // The public sandbox has no env.
-    lists_env: false,
-};
-
-#[derive(Clone, Copy)]
-enum PublicSandboxQuery {
-    ById,
-    Page,
-}
-
-fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String> {
-    // Control-plane retention keeps deleted tombstones, but deleted public
-    // resources are NotFound and must not consume a list page's lookahead.
-    let sql = match query {
-        PublicSandboxQuery::ById => format!(
-            "{PUBLIC_SANDBOX_SELECT}, FALSE AS has_next
-             FROM sandboxes s
-             {PUBLIC_SANDBOX_JOINS}
-             WHERE s.id = $8 AND s.org_id = $9
-               AND s.lifecycle NOT IN ('deleted')"
-        ),
-        PublicSandboxQuery::Page => format!(
-            "{page_rows}
-             {PUBLIC_SANDBOX_SELECT}, page.has_next
-             FROM page_rows page
-             JOIN sandboxes s ON s.id = page.id
-             {PUBLIC_SANDBOX_JOINS}
-             ORDER BY page.position",
-            page_rows = page_rows_cte(PAGE_CANDIDATE_ROWS, &PAGE_WALK_PARAMS),
-        ),
-    };
-    sqlx::AssertSqlSafe(sql!(sql))
-}
-
 async fn fetch_public_sandbox(
     pool: &PgPool,
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<Option<PublicSandboxRow>, sqlx::Error> {
-    sqlx::query_as::<_, PublicSandboxRow>(public_sandbox_query(PublicSandboxQuery::ById))
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .bind(SANDBOX_FAILURE_EPISODE_KEY)
-        .bind(SANDBOX_FAILURE_EXECUTION_GENERATION_KEY)
-        .bind(SANDBOX_FAILURE_POD_UID_KEY)
-        .bind(SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY)
-        .bind(SubstrateKind::Kubernetes)
-        .bind(SubstrateKind::Space)
-        .bind(sandbox_id.as_uuid())
-        .bind(org_id)
-        .fetch_optional(pool)
-        .await
+    sandbox_listing::public::by_id(pool, SandboxId::from(sandbox_id), org_id).await
 }
 
 async fn fetch_sandboxes_page(
@@ -1360,26 +1202,18 @@ async fn fetch_sandboxes_page(
     limit: u16,
     max_bytes: i64,
 ) -> Result<Vec<PublicSandboxRow>, sqlx::Error> {
-    let (cursor_created_at, cursor_id) = cursor
-        .map(|(created_at, id)| (Some(created_at), Some(id)))
-        .unwrap_or((None, None));
-    sqlx::query_as::<_, PublicSandboxRow>(public_sandbox_query(PublicSandboxQuery::Page))
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .bind(SANDBOX_FAILURE_EPISODE_KEY)
-        .bind(SANDBOX_FAILURE_EXECUTION_GENERATION_KEY)
-        .bind(SANDBOX_FAILURE_POD_UID_KEY)
-        .bind(SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY)
-        .bind(SubstrateKind::Kubernetes)
-        .bind(SubstrateKind::Space)
-        .bind(org_id)
-        .bind(cursor_created_at)
-        .bind(cursor_id)
-        .bind(i64::from(limit) + 1)
-        .bind(subject_id)
-        .bind(max_bytes)
-        .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
-        .fetch_all(pool)
-        .await
+    sandbox_listing::public::page(
+        pool,
+        org_id,
+        subject_id,
+        &PageWalk {
+            after: cursor,
+            max_rows: i64::from(limit) + 1,
+            max_bytes,
+            row_overhead_bytes: SANDBOX_LIST_ROW_OVERHEAD_BYTES,
+        },
+    )
+    .await
 }
 
 async fn sandbox_operation_response(

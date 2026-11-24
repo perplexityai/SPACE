@@ -1353,7 +1353,5 @@ pub(crate) use queries::org_byok_enabled;
 #[cfg(all(test, feature = "kubernetes"))]
 pub(crate) use queries::pooled_prepare_error_is_reclaimable;
 pub use queries::{FederatedSandboxCreateContext, RestoreForkDiskAsNewContext};
-pub use responses::{
-    fetch_sandbox, sandbox_query, sandbox_to_response, update_and_fetch_post_wake_sandbox,
-};
+pub use responses::{fetch_sandbox, sandbox_to_response, update_and_fetch_post_wake_sandbox};
 pub(crate) use updates::{AccessIdleTimeoutOutcome, AutoLifecycleTouchOutcome};

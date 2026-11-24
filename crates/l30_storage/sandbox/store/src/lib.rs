@@ -17,9 +17,10 @@
 //!   ([`insert_unplaced`], [`insert_pooled`], [`update_desired_state`],
 //!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
 //!   nothing in their `WHERE` beyond the row's id. A write whose caller
-//!   answers with a row shape this crate does not own, such as the api's
-//!   joined response row, still moves here: the caller reads its shape after
-//!   the verb in the same transaction, as the pooled create does after
+//!   answers with a joined row, such as the api's response row
+//!   ([`direct::sandbox_listing::Sandbox`]), still moves here as its own
+//!   verb: the caller reads that row after the verb in the same transaction,
+//!   as the pooled create does with [`direct::sandbox_listing::by_id`] after
 //!   [`action_stamp::stamp_pooled_post_wake`].
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
@@ -123,6 +124,17 @@
 //!   `pplx-space-snapshot-store`.
 //!   [`org_storage`] joins the owning organization's row in `organizations`,
 //!   which no store owns yet, for its configured snapshot storage.
+//! * **The api's response row and list pages live in
+//!   [`direct::sandbox_listing`].** They read a sandbox's node from its
+//!   Direct route, and the admin list filters on the node the response
+//!   reports, so they moved there whole; the module shares only its
+//!   projection and join constants, private to it and its children, and
+//!   writes everything else, the page walk included, whole in each
+//!   statement. They also read
+//!   tables this crate does not declare: `users`, `organizations`,
+//!   `templates`, `template_releases`, `template_release_tags`, `nodes`,
+//!   `node_k8s`, `node_direct`, `sandbox_direct_route_identities` and
+//!   `node_facet_observed_status`.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
 //!   crate declares, mostly inside a larger transaction, move into modules

@@ -48,6 +48,7 @@ pub mod observed_publication;
 pub mod observed_reads;
 pub mod restore_candidates;
 pub mod route_reads;
+pub mod sandbox_listing;
 pub mod service_route_reset;
 
 /// The restore lease [`claim_restore_lease`] took.
