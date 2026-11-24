@@ -18,6 +18,11 @@ use uuid::Uuid;
 
 use crate::SandboxStoreError;
 
+pub mod claim;
+pub mod materialize;
+pub mod retire;
+pub mod transition;
+
 /// The sandbox's active execution, as [`active_execution`] reads it.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ActiveExecutionRecord {
@@ -427,8 +432,8 @@ pub async fn predates_current_stop(
 /// active execution exists and a claim would reuse it. Taken without a lock,
 /// it is a hint: a concurrent claim can take that generation first.
 ///
-/// Mirrors the claim's generation allocation in `execution_rows.rs`
-/// (`ensure_active_execution_claim_in`); change them together.
+/// Mirrors the claim's generation allocation, [`claim::mint_generation`];
+/// change them together.
 pub async fn unclaimed_generation(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,

@@ -777,7 +777,7 @@ for intervening writes.
 
 ## Implementation references
 
-- [Execution-generation allocation](../crates/l40_api/api/src/controllers/substrate/kubernetes/store/execution_rows.rs).
+- [Execution-generation allocation](../crates/l30_storage/sandbox/store/src/k8s_executions/claim.rs).
 - [Activity clocks and lifecycle timers](../crates/l30_storage/sbx/mgr/store/src/auto_lifecycle.rs).
 - [Guest workload ownership on daemon restart](../crates/l40_api/spaced/guest/server/src/platform/unix/cgroup.rs) and [seed units](../templates/firecracker/seed/rootfs-builder.sh).
 - [Snapshot capture and publication](../crates/l40_api/sbx/mgr/server/src/service/suspend_snapshot_publication.rs).
