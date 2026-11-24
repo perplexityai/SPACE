@@ -741,11 +741,14 @@ async fn the_firewall_rules_reason_enqueues_and_claims() -> TestResult {
 }
 
 /// Every [`ReconcileReason`] has a `state_reconciliation_reason` label, spelled
-/// the same whichever way the reason crosses: the derived sqlx encoding the
-/// enqueue binds, the derived decoding, and the text a claim parses. A Rust
+/// the same whichever way the reason crosses: the sqlx encoding the enqueue
+/// binds, the decoding, and the text a claim parses. A Rust
 /// reason without a label would fail its enqueue with 22P02. A label without a
 /// Rust reason is not checked: a new label ships in a migration of its own
 /// before the build that adds its reason, and a claim skips it until then.
+/// An array of every reason binds as `state_reconciliation_reason[]` and
+/// decodes back; that is the type postgres-pool's per-connection warm-up
+/// decodes.
 #[tokio::test(flavor = "current_thread")]
 async fn every_rust_reason_has_a_postgres_label() -> TestResult {
     let db = pg_test_db().await?;
@@ -779,5 +782,21 @@ async fn every_rust_reason_has_a_postgres_label() -> TestResult {
                 .await?;
         assert_eq!(decoded, reason);
     }
+
+    let reasons = ReconcileReason::ALL.to_vec();
+    let (decoded, labels, pg_type): (Vec<ReconcileReason>, Vec<String>, String) =
+        sqlx::query_as(sql!("SELECT $1, $1::TEXT[], pg_typeof($1)::TEXT"))
+            .bind(&reasons)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(decoded, reasons);
+    assert_eq!(
+        labels,
+        reasons
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(pg_type, "state_reconciliation_reason[]");
     Ok(())
 }

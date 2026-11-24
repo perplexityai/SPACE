@@ -8833,8 +8833,8 @@ name = "pplx-space-state-reconciliation"
 version = "0.8.2"
 dependencies = [
  "pplx-space-sandbox-model",
+ "pplx-space-sql-codec",
  "pplx-space-template-model",
- "sqlx",
  "thiserror 2.0.20",
 ]
 

@@ -24,7 +24,7 @@ pplx-space-node-model = { workspace = true, features = ["sqlx"] }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-sql-locator = { workspace = true }
-pplx-space-state-reconciliation = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true, features = ["sqlx"] }
 
 [dev-dependencies]
 pplx-space-db-test-fixtures = { workspace = true }
