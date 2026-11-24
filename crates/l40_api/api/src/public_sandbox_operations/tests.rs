@@ -168,6 +168,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements(
     // proxy port answers for.
     let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(NodeId::new().to_string())
         .with_internal_api()
+        .as_sandbox_pod()
         .start()
         .await?;
     let substrate = crate::controllers::substrate::Substrate::from_kubernetes(

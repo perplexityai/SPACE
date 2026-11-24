@@ -309,7 +309,12 @@ async fn build_kubernetes_app_state_fixture(
     let db = pg_test_db().await?;
     let pool = db.pool.clone();
     let worker_node_id = NodeId::new();
-    let worker = start_connect_route_sim_worker(worker_node_id).await?;
+    // The worker answers on the sandbox pod's proxy port.
+    let worker = SimWorkerHarness::builder(worker_node_id.to_string())
+        .with_internal_api()
+        .as_sandbox_pod()
+        .start()
+        .await?;
     let pod_creates = Arc::new(Mutex::new(Vec::new()));
     let initial_pod = existing_pod.then(|| Pod {
         metadata: kube::api::ObjectMeta {
