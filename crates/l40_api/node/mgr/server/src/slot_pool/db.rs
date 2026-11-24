@@ -1,7 +1,8 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) use pplx_space_sqlite::SqliteU64;
-use slots::{SLOT_COLUMNS, SlotRow};
+use slots::SlotRow;
 
 #[cfg(test)]
 pub(super) fn configure_db(conn: &Connection) -> rusqlite::Result<()> {
@@ -68,7 +69,7 @@ pub(super) fn validate_startup_ownership(
     config: &NetworkPoolConfig,
 ) -> Result<(), SlotStoreError> {
     // Refuse unknown persisted vocabulary before any repair can erase it.
-    let records = query_records(conn, None)?;
+    let records = query_all_records(conn)?;
     if let Some(record) = records.iter().find(|record| {
         record.info.slot >= config.max_slots
             && (!record.info.sandbox_id.is_empty()
@@ -114,7 +115,7 @@ pub(super) fn reconcile_runtime_state(
     config: &NetworkPoolConfig,
     young_leases: &HashMap<LeaseKey, u64>,
 ) -> rusqlite::Result<()> {
-    let records = query_records(conn, None)?;
+    let records = query_all_records(conn)?;
     let updates = runtime_reconcile_updates(records, lease_liveness, |record| {
         LeaseKey::from_record(record).is_some_and(|key| young_leases.contains_key(&key))
     });
@@ -141,7 +142,7 @@ pub(super) fn runtime_reconcile_updates(
                         slot_id: record.info.slot,
                         generation: record.info.generation,
                         sandbox_id: record.info.sandbox_id,
-                        health: record.health.as_str().to_string(),
+                        health: record.health,
                         last_error: record.last_error,
                     });
                 } else if liveness == LeaseLiveness::Gone {
@@ -198,25 +199,13 @@ pub(super) fn record_cleanup_reset_failure(
     conn: &Connection,
     reset_key: &ResetKey,
 ) -> rusqlite::Result<u32> {
-    let now = now_secs();
-    conn.query_row(
-        "UPDATE network_slots
-         SET cleanup_reset_attempts = cleanup_reset_attempts + 1,
-             last_reset_retry_at = ?1,
-             updated_at = ?1
-         WHERE slot_id = ?2 AND generation = ?3
-           AND state = 'resetting'
-           AND ((?4 IS NULL AND sandbox_id IS NULL) OR sandbox_id = ?4)
-         RETURNING cleanup_reset_attempts",
-        params![
-            SqliteU64(now),
-            reset_key.slot_id,
-            SqliteU64(reset_key.generation),
-            reset_key.sandbox_id.as_deref()
-        ],
-        |row| row.get::<_, u32>(0),
+    slots::reset::record_cleanup_reset_failure(
+        conn,
+        reset_key.slot_id,
+        reset_key.generation,
+        reset_key.sandbox_id.as_deref(),
+        now_secs(),
     )
-    .optional()
     .map(|attempts| attempts.unwrap_or(0))
 }
 
@@ -235,7 +224,7 @@ pub(super) enum RuntimeReconcileUpdate {
         slot_id: u32,
         generation: u64,
         sandbox_id: String,
-        health: String,
+        health: SlotHealth,
         last_error: Option<String>,
     },
     MissingDegraded {
@@ -265,19 +254,7 @@ pub(super) fn apply_runtime_reconcile_updates(
                 sandbox_id,
                 error,
             } => {
-                tx.execute(
-                    "UPDATE network_slots
-                     SET state = 'dirty', health = 'unknown',
-                         memory_reservation_mib = NULL, last_error = ?1, updated_at = ?2
-                     WHERE slot_id = ?3 AND generation = ?4 AND sandbox_id = ?5",
-                    params![
-                        error,
-                        SqliteU64(now),
-                        slot_id,
-                        SqliteU64(*generation),
-                        sandbox_id
-                    ],
-                )?;
+                slots::dirty_reconciled_lease(&tx, *slot_id, *generation, sandbox_id, error, now)?;
             }
             RuntimeReconcileUpdate::PromoteLeasing {
                 slot_id,
@@ -286,18 +263,14 @@ pub(super) fn apply_runtime_reconcile_updates(
                 health,
                 last_error,
             } => {
-                tx.execute(
-                    "UPDATE network_slots
-                     SET state = 'leased', health = ?1, last_error = ?2, updated_at = ?3
-                     WHERE slot_id = ?4 AND generation = ?5 AND sandbox_id = ?6",
-                    params![
-                        health,
-                        last_error,
-                        SqliteU64(now),
-                        slot_id,
-                        SqliteU64(*generation),
-                        sandbox_id
-                    ],
+                slots::promote_reconciled_lease(
+                    &tx,
+                    *slot_id,
+                    *generation,
+                    sandbox_id,
+                    *health,
+                    last_error.as_deref(),
+                    now,
                 )?;
             }
             RuntimeReconcileUpdate::MissingDegraded { slot_id, error } => {
@@ -322,30 +295,20 @@ pub(super) fn record_lease_pid(
     sandbox_id: &str,
     pid: u32,
 ) -> Result<Option<SlotRecord>, SlotStoreError> {
-    let mut records = query_records(
-        conn,
-        Some((
-            "sandbox_id = ?1 AND state IN ('leasing', 'leased')",
-            sandbox_id,
-        )),
-    )?;
+    let mut records = slots::exact_leases(conn, sandbox_id)?;
     if records.len() != 1 {
         return Ok(None);
     }
-    let Some(mut record) = records.pop() else {
+    let Some(mut record) = records.pop().map(SlotRecord::from) else {
         return Ok(None);
     };
-    let changed = conn.execute(
-        "UPDATE network_slots SET pid = ?1, updated_at = ?2
-         WHERE slot_id = ?3 AND generation = ?4 AND sandbox_id = ?5
-           AND state IN ('leasing', 'leased')",
-        params![
-            pid,
-            SqliteU64(now_secs()),
-            record.info.slot,
-            SqliteU64(record.info.generation),
-            sandbox_id
-        ],
+    let changed = slots::record_lease_pid(
+        conn,
+        record.info.slot,
+        record.info.generation,
+        sandbox_id,
+        pid,
+        now_secs(),
     )?;
     if changed != 1 {
         return Ok(None);
@@ -365,18 +328,23 @@ pub(super) fn query_adoptable_ready_records(
     conn: &Connection,
     config: &NetworkPoolConfig,
 ) -> rusqlite::Result<Vec<SlotRecord>> {
-    query_recoverable_idle_records(conn, config, "state = 'ready' AND health != 'healthy'")
+    Ok(
+        slots::worker::adoptable_ready_slots(conn, config.max_slots)?
+            .into_iter()
+            .map(SlotRecord::from)
+            .collect(),
+    )
 }
 
 pub(super) fn query_startup_recoverable_idle_records(
     conn: &Connection,
     config: &NetworkPoolConfig,
 ) -> rusqlite::Result<Vec<SlotRecord>> {
-    query_recoverable_idle_records(
-        conn,
-        config,
-        "(state = 'ready' AND health != 'healthy')
-         OR (state = 'missing' AND health = 'degraded')",
+    Ok(
+        slots::worker::startup_recoverable_idle_slots(conn, config.max_slots)?
+            .into_iter()
+            .map(SlotRecord::from)
+            .collect(),
     )
 }
 
@@ -388,7 +356,7 @@ pub(super) fn query_live_leased_records(conn: &Connection) -> rusqlite::Result<V
 }
 
 pub(super) fn query_startup_leasing(conn: &Connection) -> Result<Vec<LeaseKey>, SlotStoreError> {
-    Ok(query_records(conn, None)?
+    Ok(query_all_records(conn)?
         .iter()
         .filter(|record| record.state == SlotState::Leasing)
         .filter_map(LeaseKey::from_record)
@@ -396,7 +364,7 @@ pub(super) fn query_startup_leasing(conn: &Connection) -> Result<Vec<LeaseKey>, 
 }
 
 pub(super) fn query_startup_leases(conn: &Connection) -> Result<HashSet<LeaseKey>, SlotStoreError> {
-    Ok(query_records(conn, None)?
+    Ok(query_all_records(conn)?
         .iter()
         .filter(|record| matches!(record.state, SlotState::Leasing | SlotState::Leased))
         .filter_map(LeaseKey::from_record)
@@ -432,27 +400,19 @@ pub(super) fn apply_startup_leasing_evidence(
     pid: Option<u32>,
     evidence: LeaseLiveness,
 ) -> Result<bool, SlotStoreError> {
-    let changed = match evidence {
-        LeaseLiveness::Unknown => conn.execute(
-            "UPDATE network_slots SET health = 'unknown',
-                 last_error = 'startup runtime evidence unknown; retrying', updated_at = ?1
-             WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
-               AND state = 'leasing' AND pid IS ?5",
-            params![SqliteU64(now_secs()), key.slot_id, SqliteU64(key.generation), key.sandbox_id, pid],
-        )?,
-        LeaseLiveness::Live => conn.execute(
-            "UPDATE network_slots SET state = 'leased', updated_at = ?1
-             WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4 AND state = 'leasing' AND pid IS ?5",
-            params![SqliteU64(now_secs()), key.slot_id, SqliteU64(key.generation), key.sandbox_id, pid],
-        )?,
-        LeaseLiveness::Gone => conn.execute(
-            "UPDATE network_slots SET state = 'dirty', health = 'unknown',
-                 memory_reservation_mib = NULL,
-                 last_error = 'interrupted lease runtime is gone after startup re-probe', updated_at = ?1
-             WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4 AND state = 'leasing' AND pid IS ?5",
-            params![SqliteU64(now_secs()), key.slot_id, SqliteU64(key.generation), key.sandbox_id, pid],
-        )?,
+    let verb = match evidence {
+        LeaseLiveness::Unknown => slots::worker::keep_unknown_startup_leasing,
+        LeaseLiveness::Live => slots::worker::promote_live_startup_leasing,
+        LeaseLiveness::Gone => slots::worker::dirty_gone_startup_leasing,
     };
+    let changed = verb(
+        conn,
+        key.slot_id,
+        key.generation,
+        &key.sandbox_id,
+        pid,
+        now_secs(),
+    )?;
     Ok(changed != 0)
 }
 
@@ -473,19 +433,14 @@ pub(super) fn apply_live_lease_validation_updates(
     }
     let now = now_secs();
     for update in updates {
-        conn.execute(
-            "UPDATE network_slots
-                     SET health = ?1, last_error = ?2, updated_at = ?3
-                     WHERE slot_id = ?4 AND generation = ?5 AND sandbox_id = ?6
-                       AND state = 'leased'",
-            params![
-                update.health.as_str(),
-                update.last_error.as_deref(),
-                SqliteU64(now),
-                update.slot_id,
-                SqliteU64(update.generation),
-                update.sandbox_id
-            ],
+        slots::worker::record_lease_health(
+            conn,
+            update.slot_id,
+            update.generation,
+            &update.sandbox_id,
+            update.health,
+            update.last_error.as_deref(),
+            now,
         )?;
     }
     Ok(())
@@ -532,19 +487,13 @@ pub(super) fn apply_startup_lease_updates(
                 apply_live_lease_validation_updates(&tx, std::slice::from_ref(update))?;
             }
             StartupLeaseUpdate::Gone(info) => {
-                let changed = tx.execute(
-                    "UPDATE network_slots SET state = 'dirty', health = 'unknown',
-                         memory_reservation_mib = NULL,
-                         last_error = 'startup runtime gone; cleanup queued', updated_at = ?1
-                     WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
-                       AND state = 'leased' AND pid IS ?5",
-                    params![
-                        SqliteU64(now_secs()),
-                        key.slot_id,
-                        SqliteU64(key.generation),
-                        key.sandbox_id,
-                        info.pid
-                    ],
+                let changed = slots::worker::dirty_gone_startup_leased(
+                    &tx,
+                    key.slot_id,
+                    key.generation,
+                    &key.sandbox_id,
+                    info.pid,
+                    now_secs(),
                 )?;
                 if changed != 0 {
                     reset.push(key);
@@ -566,51 +515,11 @@ pub(super) fn apply_startup_lease_updates(
     Ok(())
 }
 
-fn query_recoverable_idle_records(
-    conn: &Connection,
-    config: &NetworkPoolConfig,
-    state_predicate: &str,
-) -> rusqlite::Result<Vec<SlotRecord>> {
-    let sql = format!(
-        "SELECT {SLOT_COLUMNS}
-         FROM network_slots
-         WHERE slot_id < ?1
-           AND sandbox_id IS NULL
-           AND ({state_predicate})
-         ORDER BY CASE state
-                    WHEN 'ready' THEN 0
-                    WHEN 'missing' THEN 1
-                  END,
-                  slot_id"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![config.max_slots], row_to_record)?;
-    rows.collect()
-}
-
-pub(super) fn query_records(
-    conn: &Connection,
-    where_clause: Option<(&str, &str)>,
-) -> rusqlite::Result<Vec<SlotRecord>> {
-    let base = format!("SELECT {SLOT_COLUMNS} FROM network_slots");
-    let sql = if let Some((where_clause, _)) = where_clause {
-        format!("{base} WHERE {where_clause} ORDER BY slot_id")
-    } else {
-        format!("{base} ORDER BY slot_id")
-    };
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = if let Some((_, value)) = where_clause {
-        stmt.query_map(params![value], row_to_record)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        stmt.query_map([], row_to_record)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    Ok(rows)
-}
-
-fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SlotRecord> {
-    SlotRow::from_row(row).map(SlotRecord::from)
+pub(super) fn query_all_records(conn: &Connection) -> rusqlite::Result<Vec<SlotRecord>> {
+    Ok(slots::all_slots(conn)?
+        .into_iter()
+        .map(SlotRecord::from)
+        .collect())
 }
 
 impl From<SlotRow> for SlotRecord {

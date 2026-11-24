@@ -76,8 +76,6 @@ pplx-space-local-health = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
-# SqliteU64, the u64 bind type of the slot pool's guarded SQL.
-pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-execution-common = { workspace = true }
@@ -104,6 +102,8 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+# SqliteU64, the u64 bind type of the slot pool tests' fixture SQL.
+pplx-space-sqlite = { workspace = true }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }

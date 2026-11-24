@@ -96,7 +96,6 @@ pplx-space-node-ctl-server = [
   "rusqlite",
 ]
 pplx-space-node-mgr = [
-  "pplx-space-sqlite",
   "rusqlite",
 ]
 pplx-space-node-runtime-manager = [
