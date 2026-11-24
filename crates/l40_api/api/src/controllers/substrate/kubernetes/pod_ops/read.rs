@@ -2,6 +2,7 @@
 //! and remembering the node a resolved pod landed on.
 
 use super::*;
+use crate::controllers::substrate::kubernetes::wait_ready::PodProxyWaitTarget;
 
 const SUCCEEDED_POD_SUSPEND_PUBLICATION_GRACE: Duration = Duration::from_secs(180);
 
@@ -312,14 +313,22 @@ impl KubernetesSubstrate {
     /// Bound direct pod GETs without putting the store mutations in the
     /// resolver under the shorter GET timeout. A timed-out read leaves the
     /// IP unresolved so readiness can keep observing the reflector or watch.
+    /// Only an address for the execution and pod `target` names is returned.
     pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_ip_for_readiness(
         &self,
         sandbox_id: SandboxId,
+        target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
     ) -> Result<Option<PodIp>, SubstrateError> {
         Ok(self
             .resolve_pod_instance_inner(sandbox_id, Some(deadline))
             .await?
+            .filter(|pod| {
+                pod.generation == target.generation
+                    && target
+                        .pod_uid
+                        .is_none_or(|uid| pod.pod_uid.as_ref().map(PodUid::as_str) == Some(uid))
+            })
             .map(|pod| pod.ip))
     }
 

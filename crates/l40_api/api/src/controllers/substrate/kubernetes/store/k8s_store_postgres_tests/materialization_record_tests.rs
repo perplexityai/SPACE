@@ -400,3 +400,61 @@ async fn writers_from_before_the_record_keep_existing_stamps() -> TestResult {
     );
     Ok(())
 }
+
+/// A node report is written only while the row records the reported pod: a
+/// report for the pod a re-materialization cleared is dropped, and the
+/// replacement's report is accepted once its UID is recorded.
+#[tokio::test]
+async fn node_reports_follow_the_recorded_pod_across_rematerialization() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    let generation = fixture
+        .store
+        .ensure_active_execution_claim(sandbox_id)
+        .await?
+        .row
+        .generation;
+    let materialize = |pod_uid| {
+        fixture.store.persist_materialized_pod_metadata(
+            sandbox_id,
+            generation,
+            SandboxLifecycle::Started,
+            Some(pod_uid),
+            None,
+            None,
+        )
+    };
+    let report = |pod_uid, pod_ip| {
+        fixture
+            .store
+            .persist_node_reported_pod_ip(sandbox_id, generation, pod_uid, pod_ip, None)
+    };
+
+    materialize("first-pod").await?;
+    assert_eq!(
+        report("first-pod", "10.0.0.1").await?.as_deref(),
+        Some("10.0.0.1")
+    );
+
+    assert!(
+        fixture
+            .store
+            .claim_active_execution_pod_materialization(
+                sandbox_id,
+                generation,
+                SandboxLifecycle::Started,
+            )
+            .await?
+    );
+    assert_eq!(report("first-pod", "10.0.0.1").await?, None);
+    assert_eq!(report("second-pod", "10.0.0.2").await?, None);
+
+    materialize("second-pod").await?;
+    assert_eq!(report("first-pod", "10.0.0.1").await?, None);
+    assert_eq!(
+        report("second-pod", "10.0.0.2").await?.as_deref(),
+        Some("10.0.0.2")
+    );
+    Ok(())
+}

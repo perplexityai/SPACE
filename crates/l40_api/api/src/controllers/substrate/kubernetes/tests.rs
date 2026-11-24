@@ -8478,34 +8478,6 @@ mod kubernetes_tests {
                 substrate.resolve_reachable_pod_ip(sandbox_id).await?,
                 expected
             );
-            // A report landing after a materialization cleared the pod is not
-            // written; one for the pod the row records next is.
-            let set_pod = |pod_uid: Option<&'static str>| {
-                sqlx::query(sql!(
-                    "UPDATE sandbox_k8s_executions SET pod_uid = $2, pod_ip = NULL
-                      WHERE sandbox_id = $1 AND active",
-                ))
-                .bind(sandbox_id)
-                .bind(pod_uid)
-                .execute(&pool)
-            };
-            set_pod(None).await?;
-            assert_eq!(
-                substrate
-                    .store
-                    .persist_node_reported_pod_ip(sandbox_id, 1, "node-bound-uid", "10.0.0.8", None)
-                    .await?,
-                None
-            );
-            set_pod(Some("next-uid")).await?;
-            assert_eq!(
-                substrate
-                    .store
-                    .persist_node_reported_pod_ip(sandbox_id, 1, "next-uid", "10.0.0.8", None)
-                    .await?
-                    .as_deref(),
-                Some("10.0.0.8")
-            );
         }
         Ok(())
     }
@@ -8568,6 +8540,72 @@ mod kubernetes_tests {
             Some(PodIp::parse("127.0.0.1")?)
         );
         assert_eq!(*kube_requests.lock().unwrap(), Vec::new());
+        Ok(())
+    }
+
+    /// A readiness wait binds only the pod it targets: a same-name pod with
+    /// another UID never supplies the address, so the returned address and
+    /// the binding name the same pod.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pod_proxy_wait_binds_the_address_of_its_target_pod() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = "space-sbx-replaced-g1";
+        insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                  pod_ip, state, active)
+             VALUES ($1, 1, $2, 'space', 'replacement-uid', '127.0.0.1',
+                     'running', TRUE)",
+        ))
+        .bind(sandbox_id)
+        .bind(pod_name)
+        .execute(&pool)
+        .await?;
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": pod_name, "namespace": "space", "uid": "replacement-uid" },
+            "status": { "phase": "Running", "podIP": "127.0.0.1" }
+        }))?;
+        let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+            pool,
+            replace_existing_pod_kubernetes_client(
+                pod.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            proxy.local_addr()?.port(),
+            Some(pod),
+            Vec::new(),
+        );
+        let wait = |pod_uid| {
+            substrate.wait_for_pod_proxy_reachable(
+                SandboxApiMetricIdentity::ecw("create"),
+                sandbox_id,
+                super::wait_ready::PodProxyWaitTarget {
+                    pod_name,
+                    pod_uid: Some(pod_uid),
+                    generation: 1,
+                },
+                "create",
+                Instant::now() + Duration::from_millis(500),
+            )
+        };
+
+        let (pod_ip, binding) = wait("replacement-uid").await?;
+        assert_eq!(pod_ip, PodIp::parse("127.0.0.1")?);
+        assert_eq!(binding.execution_object_id, "replacement-uid");
+        assert!(matches!(
+            wait("first-uid").await,
+            Err(SubstrateError::Timeout {
+                phase: Some(WaitReadyTimeoutPhase::PodNeverReady),
+                ..
+            })
+        ));
         Ok(())
     }
 

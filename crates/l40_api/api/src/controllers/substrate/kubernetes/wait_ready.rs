@@ -293,14 +293,19 @@ impl KubernetesSubstrate {
     }
 
     /// Watch the pod until Kubernetes publishes its IP, sending each view of
-    /// it to `observed` once its placement is recorded.
+    /// it to `observed` once its placement is recorded. A pod other than the
+    /// one `target` names is ignored.
     async fn watch_until_pod_ip_assigned(
         &self,
         sandbox_id: SandboxId,
-        generation: i64,
-        pod_name: &str,
+        target: &PodProxyWaitTarget<'_>,
         observed: &tokio::sync::watch::Sender<Option<SandboxPodView>>,
     ) -> Result<Option<PodIp>, SubstrateError> {
+        let PodProxyWaitTarget {
+            pod_name,
+            generation,
+            ..
+        } = *target;
         let sandbox_uuid = sandbox_id;
         let pods: Api<Pod> = Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
         let watch_params = WatchParams::default()
@@ -341,6 +346,9 @@ impl KubernetesSubstrate {
                 }
             };
 
+            if !target.names(&pod) {
+                continue;
+            }
             if let Some(message) = pod.unschedulable_message() {
                 return Err(SubstrateError::Unschedulable {
                     message: format!("sandbox pod is unschedulable: {message}"),
@@ -480,12 +488,13 @@ impl KubernetesSubstrate {
     async fn poll_until_pod_ip_assigned(
         &self,
         sandbox_id: SandboxId,
+        target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
     ) -> Result<Option<PodIp>, SubstrateError> {
         let started_at = Instant::now();
         while Instant::now() < deadline {
             if let Some(pod_ip) = self
-                .resolve_pod_ip_for_readiness(sandbox_id, deadline)
+                .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
                 .await?
             {
                 return Ok(Some(pod_ip));
@@ -513,7 +522,7 @@ impl KubernetesSubstrate {
         } = *target;
         let started_at = Instant::now();
         if let Some(pod_ip) = self
-            .resolve_pod_ip_for_readiness(sandbox_id, deadline)
+            .resolve_pod_ip_for_readiness(sandbox_id, target, deadline)
             .await?
         {
             record_pod_ip_ready(metric_identity, sandbox_id, started_at, "cached");
@@ -528,7 +537,7 @@ impl KubernetesSubstrate {
         let (observed, observed_by_node) = tokio::sync::watch::channel(None);
         // Both waits are large futures; keep them off the caller's stack.
         let watched = Box::pin(
-            self.watch_until_pod_ip_assigned(sandbox_id, generation, pod_name, &observed)
+            self.watch_until_pod_ip_assigned(sandbox_id, target, &observed)
                 .instrument(tracing::info_span!(
                     "substrate.k8s.watch_pod_ip",
                     sandbox_id = %sandbox_id,
@@ -549,7 +558,7 @@ impl KubernetesSubstrate {
                 Ok(Some(pod_ip)) => Ok(Some((pod_ip, "watch"))),
                 Ok(None) => {
                     let pod_ip = self
-                        .poll_until_pod_ip_assigned(sandbox_id, deadline)
+                        .poll_until_pod_ip_assigned(sandbox_id, target, deadline)
                         .instrument(tracing::info_span!(
                             "substrate.k8s.poll_pod_ip",
                             sandbox_id = %sandbox_id,
@@ -575,7 +584,7 @@ impl KubernetesSubstrate {
                         "pod IP watch failed; falling back to polling"
                     );
                     let pod_ip = self
-                        .poll_until_pod_ip_assigned(sandbox_id, deadline)
+                        .poll_until_pod_ip_assigned(sandbox_id, target, deadline)
                         .instrument(tracing::info_span!(
                             "substrate.k8s.poll_pod_ip",
                             sandbox_id = %sandbox_id,
@@ -1292,6 +1301,14 @@ pub(super) struct PodProxyWaitTarget<'a> {
     /// path passes `None` (the binding it produces is discarded).
     pub pod_uid: Option<&'a str>,
     pub generation: i64,
+}
+
+impl PodProxyWaitTarget<'_> {
+    /// Whether `pod` is the pod this wait binds: with a target UID, only the
+    /// pod that has it.
+    pub(super) fn names(&self, pod: &SandboxPodView) -> bool {
+        self.pod_uid.is_none_or(|uid| pod.uid() == Some(uid))
+    }
 }
 
 /// The address `sandboxes` report for `sandbox_id` while its pod is `pod_uid`.
