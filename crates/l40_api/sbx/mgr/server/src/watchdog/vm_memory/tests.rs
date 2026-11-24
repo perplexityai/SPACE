@@ -46,7 +46,8 @@ fn samples_only_populated_cgroups_and_never_substitutes_zero_for_unreadable_memo
 #[tokio::test(start_paused = true)]
 async fn repeated_truncated_sweeps_sample_the_tail_of_the_inventory() {
     let targets = [0, 1, 2, 3, 4, 5];
-    for delays in [[3000; 6], [1000, 3500, 4500, 1000, 3500, 4500]] {
+    for (delays, nominal_completions) in [([3000; 6], 2), ([1000, 3500, 4500, 1000, 3500, 4500], 3)]
+    {
         let completed = std::sync::Mutex::new(Vec::new());
         let visit = |target: usize| {
             let completed = &completed;
@@ -56,7 +57,8 @@ async fn repeated_truncated_sweeps_sample_the_tail_of_the_inventory() {
             }
         };
         let mut cursor = 0;
-        for _ in targets {
+        let max_sweeps = targets.len().div_ceil(nominal_completions) + 1;
+        for _ in 0..max_sweeps {
             assert!(sweep(targets.to_vec(), &mut cursor, visit).await);
         }
         let mut sampled = completed.into_inner().unwrap();

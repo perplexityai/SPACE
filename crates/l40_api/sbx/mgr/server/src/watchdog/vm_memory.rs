@@ -34,7 +34,7 @@ fn read_sample(cgroup: &Path) -> Option<CgroupMemoryUsage> {
 async fn sweep<T: Send, F: Future<Output = ()> + Send>(
     mut targets: Vec<T>,
     cursor: &mut usize,
-    visit: impl FnMut(T) -> F + Send,
+    mut visit: impl FnMut(T) -> F + Send,
 ) -> bool {
     let len = targets.len();
     if len == 0 {
@@ -42,15 +42,28 @@ async fn sweep<T: Send, F: Future<Output = ()> + Send>(
     }
     let start = *cursor % len;
     targets.rotate_left(start);
-    let completed = stream::iter(targets)
-        .map(visit)
+    let mut completed = vec![false; len];
+    stream::iter(targets.into_iter().enumerate())
+        .map(|(index, target)| {
+            let visit = visit(target);
+            async move {
+                visit.await;
+                index
+            }
+        })
         .buffer_unordered(SAMPLE_CONCURRENCY)
         .take_until(tokio::time::sleep(SWEEP_DEADLINE))
-        .count()
+        .for_each(|index| {
+            if let Some(finished) = completed.get_mut(index) {
+                *finished = true;
+            }
+            std::future::ready(())
+        })
         .await;
-    if completed < len {
-        // Give every target a turn first, regardless of read completion order.
-        *cursor = (start + 1) % len;
+    if let Some(first_incomplete) = completed.iter().position(|&finished| !finished) {
+        // Resume at the first unfinished target, not a count of out-of-order
+        // completions. If the first target stalled, let another go first.
+        *cursor = (start + first_incomplete.max(1)) % len;
         return true;
     }
     false
