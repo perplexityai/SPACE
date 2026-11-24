@@ -1,12 +1,24 @@
-//! Reads of `sandbox_k8s_executions`, the per-generation execution records of
-//! Kubernetes-managed sandboxes, for callers that read them without locking
-//! them.
+//! `sandbox_k8s_executions`, the per-generation execution records of
+//! Kubernetes-managed sandboxes.
 //!
-//! Writes of the table stay with the execution-ownership paths that issue
-//! them, as do the generation allocation and every `FOR UPDATE` read: they
-//! are correct only under the caller's locks. Each read here runs on the
-//! executor its caller passes, so one issued inside a transaction stays in
-//! it, and keeps its comparisons with the database clock in the SQL.
+//! This module holds the table's unlocked reads. Each runs on the executor
+//! its caller passes, so one issued inside a transaction stays in it, and
+//! keeps its comparisons with the database clock in the SQL.
+//!
+//! Its submodules, each named for the transition or the path that issues
+//! them, hold the execution-ownership transitions and their lock verbs, as
+//! [`activation_fence`] does for the activation attempt's fence and route
+//! publication. Each guarded write there keeps its guard whole, bound to the
+//! caller's values, and returns its outcome; each `FOR UPDATE` read is a
+//! `lock_…` verb on the caller's transaction, its lock clause verbatim (see
+//! "Guarded state transitions" and "Locks the caller relies on after the
+//! statement" in the `space-data-store-development` skill). Some are correct
+//! only under locks their caller holds, as [`activation_fence`]'s claims are
+//! after [`activation_fence::lock_attempt_owner`], so the callers keep their
+//! transactions, their lock order (the sandbox row before its executions),
+//! their re-checks between statements and the decision on each outcome.
+
+pub mod activation_fence;
 
 use pplx_space_accounts::{ClientId, NodeId};
 use pplx_space_k8s_ids::PodUid;
