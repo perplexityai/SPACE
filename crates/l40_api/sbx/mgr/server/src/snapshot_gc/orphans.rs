@@ -69,7 +69,11 @@ impl OrphanScan {
             let entry = match entries.next() {
                 Some(Ok(entry)) => entry,
                 Some(Err(error)) => {
-                    tracing::warn!(%error, "snapshot reaper: unreadable directory entry retained for a later sweep");
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        tracing::debug!(%error, "snapshot reaper: directory entry disappeared during sweep");
+                    } else {
+                        tracing::warn!(%error, "snapshot reaper: unreadable directory entry retained for a later sweep");
+                    }
                     continue;
                 }
                 None => {
@@ -82,7 +86,11 @@ impl OrphanScan {
                 Ok(kind) if kind.is_dir() => {}
                 Ok(_) => continue,
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "snapshot reaper: unreadable path retained");
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        tracing::debug!(%error, path = %path.display(), "snapshot reaper: path disappeared during sweep");
+                    } else {
+                        tracing::warn!(%error, path = %path.display(), "snapshot reaper: unreadable path retained");
+                    }
                     continue;
                 }
             }
@@ -100,7 +108,11 @@ impl OrphanScan {
                             now.saturating_sub(modified) >= FORK_COPY_ORPHAN_MIN_AGE_SECS
                         }),
                         Err(error) => {
-                            tracing::warn!(%error, path = %path.display(), "snapshot reaper: unknown fork-copy age retained");
+                            if error.kind() == std::io::ErrorKind::NotFound {
+                                tracing::debug!(%error, path = %path.display(), "snapshot reaper: fork-copy path disappeared during sweep");
+                            } else {
+                                tracing::warn!(%error, path = %path.display(), "snapshot reaper: unknown fork-copy age retained");
+                            }
                             false
                         }
                     }
@@ -113,6 +125,9 @@ impl OrphanScan {
             {
                 match std::fs::read_dir(&path) {
                     Ok(entries) => self.directories.push(entries),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::debug!(%error, path = %path.display(), "snapshot reaper: subtree disappeared during sweep")
+                    }
                     Err(error) => {
                         tracing::warn!(%error, path = %path.display(), "snapshot reaper: unreadable subtree retained for a later sweep")
                     }

@@ -3,12 +3,17 @@
 //!
 //! Only ERROR lines are re-logged. Firecracker warns on every snapshot restore,
 //! so WARN lines stay in the file, where the watchdog's failure-time tail of it
-//! still reads them. One ERROR is expected and logged at DEBUG instead: the
-//! "Device not found" answer to `GET /balloon` on a VM without a balloon
-//! device, which node-manager probes before every snapshot pause. Firecracker
-//! gives missing drives and network interfaces the same message, so it is
-//! expected only when the API request before it, which Firecracker logs at
-//! INFO, was that read. Reading a regular file never affects the VMM; each poll
+//! still reads them. Two ERRORs are expected and logged at DEBUG instead:
+//! - the "Device not found" answer to `GET /balloon` on a VM without a balloon
+//!   device, which node-manager probes before every snapshot pause (Firecracker
+//!   gives missing drives and network interfaces the same message, so it is
+//!   expected only when the API request before it, which Firecracker logs at
+//!   INFO, was that read);
+//! - "Failed to update balloon stats, missing descriptor.", which Firecracker
+//!   emits on every stats-polling tick whenever the guest has not returned a
+//!   stats descriptor (logged once at DEBUG per log file).
+//!
+//! Reading a regular file never affects the VMM; each poll
 //! reads at most [`MAX_READ_BYTES`]. Polls block: they run on the shared log
 //! poll's blocking job, never on the runtime.
 //!
@@ -36,6 +41,10 @@ const API_REQUEST_PREFIX: &str = "The API server received a ";
 const BALLOON_READ: &str = "Get request on \"/balloon\".";
 /// Firecracker's ERROR for a request on a device the running VM does not have.
 const DEVICE_NOT_FOUND: &str = "Received Error. Status code: 400 Bad Request. Message: Internal VMM error: Failed perform action on device: Device not found";
+/// Firecracker's ERROR on a balloon stats poll tick when the guest has not
+/// returned a stats descriptor.
+const BALLOON_STATS_MISSING_DESCRIPTOR: &str =
+    "Failed to update balloon stats, missing descriptor.";
 
 /// Bytes one poll read from a log, not yet accepted.
 pub(super) struct LogRead {
@@ -53,6 +62,9 @@ pub(super) struct LogTail {
     partial: Vec<u8>,
     /// The last API request the log shows is `GET /balloon`.
     after_balloon_read: bool,
+    /// Whether `BALLOON_STATS_MISSING_DESCRIPTOR` has already been logged for
+    /// the current log file.
+    logged_balloon_stats_missing_descriptor: bool,
 }
 
 impl LogTail {
@@ -63,6 +75,7 @@ impl LogTail {
             offset: None,
             partial: Vec::new(),
             after_balloon_read: false,
+            logged_balloon_stats_missing_descriptor: false,
         }
     }
 
@@ -110,6 +123,7 @@ impl LogTail {
         if read.restarted {
             self.partial.clear();
             self.after_balloon_read = false;
+            self.logged_balloon_stats_missing_descriptor = false;
         }
         self.offset = Some(read.start + read.chunk.len() as u64);
         self.accept(sandbox_id, &read.chunk, budget);
@@ -144,6 +158,16 @@ impl LogTail {
         }
         if self.after_balloon_read && message == DEVICE_NOT_FOUND {
             tracing::debug!(sandbox_id, "firecracker reports no balloon device");
+            return;
+        }
+        if message == BALLOON_STATS_MISSING_DESCRIPTOR {
+            if !self.logged_balloon_stats_missing_descriptor {
+                self.logged_balloon_stats_missing_descriptor = true;
+                tracing::debug!(
+                    sandbox_id,
+                    "firecracker balloon stats update skipped: missing descriptor"
+                );
+            }
             return;
         }
         forward_error(sandbox_id, message, budget);

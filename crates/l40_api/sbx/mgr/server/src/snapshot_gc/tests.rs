@@ -518,6 +518,105 @@ fn sweep_discovers_gc_pending_orphans_and_skips_unrelated() {
 }
 
 #[test]
+fn orphan_scan_logs_missing_subtrees_at_debug_and_keeps_permission_errors_at_warn() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let tmp = TempDir::new().unwrap();
+    let count = crate::db::snapshot_gc::PAGE_SIZE + 2;
+    let dirs: Vec<_> = (0..count)
+        .map(|i| {
+            let dir = tmp.path().join(format!("sbx-{i:04}"));
+            fs::create_dir(&dir).unwrap();
+            dir
+        })
+        .collect();
+
+    let active = crate::service::fork_artifact::CopyOperationReservations::default();
+    let mut scan = OrphanScan::default();
+    // First page opens `tmp` and visits only part of its subdirectories.
+    let _ = scan
+        .next_page(tmp.path(), OrphanKind::GcPending, &active, now_secs())
+        .unwrap();
+
+    // Remove the directories before the next page reads them, simulating
+    // concurrent sandbox deletion.
+    for dir in &dirs {
+        let _ = fs::remove_dir(dir);
+    }
+
+    let all_layer = CapturedEventsLayer::new();
+    let all_events = all_layer.events();
+    let warn_layer = CapturedEventsLayer::new();
+    let warn_events = warn_layer.events();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(all_layer)
+            .with(warn_layer.with_filter(LevelFilter::WARN)),
+    );
+    tracing::dispatcher::with_default(&dispatch, || {
+        for _ in 0..4 {
+            let _ = scan
+                .next_page(tmp.path(), OrphanKind::GcPending, &active, now_secs())
+                .unwrap();
+        }
+    });
+
+    assert!(
+        warn_events.events().is_empty(),
+        "expected no warnings for concurrently removed subtrees: {:?}",
+        warn_events.events()
+    );
+    assert!(
+        all_events.events().iter().any(|event| {
+            field_value(event, "message")
+                .is_some_and(|message| message.contains("disappeared during sweep"))
+        }),
+        "expected debug log for concurrently removed subtrees: {:?}",
+        all_events.events()
+    );
+
+    // Real IO failures such as permission denied must still warn.
+    if !nix::unistd::geteuid().is_root() {
+        let locked_root = TempDir::new().unwrap();
+        let locked_dir = locked_root.path().join("sbx-locked");
+        fs::create_dir(&locked_dir).unwrap();
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let locked_warn_layer = CapturedEventsLayer::new();
+        let locked_warn_events = locked_warn_layer.events();
+        let warn_dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(locked_warn_layer.with_filter(LevelFilter::WARN)),
+        );
+        let mut warn_scan = OrphanScan::default();
+        tracing::dispatcher::with_default(&warn_dispatch, || {
+            let _ = warn_scan
+                .next_page(
+                    locked_root.path(),
+                    OrphanKind::GcPending,
+                    &active,
+                    now_secs(),
+                )
+                .unwrap();
+        });
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            locked_warn_events.events().iter().any(|event| {
+                field_value(event, "message")
+                    .is_some_and(|message| message.contains("unreadable subtree"))
+            }),
+            "expected warning for unreadable subtree: {:?}",
+            locked_warn_events.events()
+        );
+    }
+}
+
+#[test]
 fn gc_pending_reaping_requires_absent_registry_and_pin() {
     let db = crate::db::SharedConnection::new(open_test_db());
     let artifacts = LocalArtifacts::new(db.clone());

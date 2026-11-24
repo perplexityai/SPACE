@@ -164,6 +164,44 @@ fn a_balloon_read_finding_no_device_is_not_an_error() {
     );
 }
 
+/// Firecracker's periodic "Failed to update balloon stats, missing descriptor."
+/// error is demoted to a single DEBUG line per log file while unrelated
+/// Firecracker ERROR lines continue to be forwarded at ERROR.
+#[test]
+fn balloon_stats_missing_descriptor_is_logged_once_at_debug() {
+    const MISSING_DESC: &str = "Failed to update balloon stats, missing descriptor.";
+    const OTHER: &str = "Received Error. Status code: 400 Bad Request. Message: real error";
+    let (runtime, readers) = readers();
+    let jail = tempfile::tempdir().unwrap();
+    attach(&runtime, &readers, "sbx", 1, jail.path());
+
+    append_error(jail.path(), MISSING_DESC);
+    append_error(jail.path(), MISSING_DESC);
+    append_error(jail.path(), OTHER);
+
+    let capture = Capture::new();
+    tracing::dispatcher::with_default(&capture.dispatch, || readers.poll_logs_now());
+
+    assert_eq!(capture.logged(), logged(&[("sbx", OTHER)]));
+    let debug_hits: Vec<_> = capture
+        .events
+        .events()
+        .into_iter()
+        .filter(|event| {
+            field_value(event, "message")
+                .is_some_and(|message| message.contains("missing descriptor"))
+        })
+        .collect();
+    assert_eq!(debug_hits.len(), 1, "expected one coalesced debug event");
+
+    // A subsequent poll with another missing-descriptor line stays silent.
+    append_error(jail.path(), MISSING_DESC);
+    let second = Capture::new();
+    tracing::dispatcher::with_default(&second.dispatch, || readers.poll_logs_now());
+    assert!(second.logged().is_empty());
+    assert!(second.events.events().is_empty());
+}
+
 /// One sandbox's log path holding a FIFO, which a blocking open would wait on
 /// for a writer, or a symlink, neither holds up nor feeds the poll: it returns,
 /// and every other sandbox's line is re-logged, in any iteration order.
