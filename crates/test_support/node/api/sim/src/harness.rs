@@ -60,6 +60,7 @@ impl SimWorkerHarness {
             node_id: node_id.into(),
             with_internal_api: false,
             activation_policy_support: true,
+            sandbox_pod: false,
         }
     }
 
@@ -86,6 +87,7 @@ pub struct SimWorkerHarnessBuilder {
     node_id: String,
     with_internal_api: bool,
     activation_policy_support: bool,
+    sandbox_pod: bool,
 }
 
 impl SimWorkerHarnessBuilder {
@@ -93,6 +95,12 @@ impl SimWorkerHarnessBuilder {
     /// always-mounted `WorkerApi` surface.
     pub fn with_internal_api(mut self) -> Self {
         self.with_internal_api = true;
+        self
+    }
+
+    /// Serve as a Kubernetes sandbox pod's node; see [`SimState::as_sandbox_pod`].
+    pub fn as_sandbox_pod(mut self) -> Self {
+        self.sandbox_pod = true;
         self
     }
 
@@ -110,6 +118,11 @@ impl SimWorkerHarnessBuilder {
             dir.path().join("sandboxes"),
             self.node_id,
         );
+        let state = if self.sandbox_pod {
+            state.as_sandbox_pod()
+        } else {
+            state
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(SimWorkerHarnessError::Bind)?;

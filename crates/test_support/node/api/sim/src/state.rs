@@ -128,6 +128,7 @@ pub struct SimState {
     fs: crate::fs::SandboxFs,
     last_wait_ready_route_token: Arc<Mutex<Option<String>>>,
     processes: crate::processes::SimProcessTable,
+    sandbox_pod: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -173,7 +174,17 @@ impl SimState {
             fs: crate::fs::SandboxFs::new(sandbox_fs_dir),
             last_wait_ready_route_token: Arc::new(Mutex::new(None)),
             processes: crate::processes::SimProcessTable::default(),
+            sandbox_pod: false,
         }
+    }
+
+    /// Serve as a Kubernetes sandbox pod's node, which already runs every
+    /// sandbox it is asked about: `SandboxState` reports an unseen sandbox
+    /// as running, as [`Self::ensure_default_running`] records it, instead of
+    /// missing.
+    pub fn as_sandbox_pod(mut self) -> Self {
+        self.sandbox_pod = true;
+        self
     }
 
     pub(crate) fn node_id(&self) -> &str {
@@ -257,25 +268,7 @@ impl SimState {
                 return Ok(rec.clone());
             }
         }
-        let record = SandboxRecord {
-            sandbox_id: sandbox_id.to_string(),
-            template: "seed".into(),
-            runtime: "fc".into(),
-            user: "root".into(),
-            status: status::RUNNING.to_string(),
-            created_at: chrono_like_now(),
-            content_hash: None,
-            snapshots_enabled: false,
-            pool_template: None,
-            process_env: BTreeMap::new(),
-            route_generation: None,
-            execution_generation: None,
-            access_extended_until: None,
-            access_idle_policy: Vec::new(),
-            auto_lifecycle_authority: Default::default(),
-            route_substrate_kind: None,
-            activation_attempt_id: None,
-        };
+        let record = default_running_record(sandbox_id);
         // insert_new races are tolerable: another concurrent call already
         // created the record, so fall through to a fresh get().
         match self.insert_new(record.clone()).await {
@@ -351,6 +344,11 @@ impl SimState {
         for id in ids {
             match map.get(id) {
                 Some(rec) => found.push(rec.clone()),
+                None if self.sandbox_pod => {
+                    let record = default_running_record(id);
+                    map.insert(id.clone(), record.clone());
+                    found.push(record);
+                }
                 None => missing.push(id.clone()),
             }
         }
@@ -651,6 +649,28 @@ pub(crate) fn chrono_like_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}", now.as_secs())
+}
+
+fn default_running_record(sandbox_id: &str) -> SandboxRecord {
+    SandboxRecord {
+        sandbox_id: sandbox_id.to_string(),
+        template: "seed".into(),
+        runtime: "fc".into(),
+        user: "root".into(),
+        status: status::RUNNING.to_string(),
+        created_at: chrono_like_now(),
+        content_hash: None,
+        snapshots_enabled: false,
+        pool_template: None,
+        process_env: BTreeMap::new(),
+        route_generation: None,
+        execution_generation: None,
+        access_extended_until: None,
+        access_idle_policy: Vec::new(),
+        auto_lifecycle_authority: Default::default(),
+        route_substrate_kind: None,
+        activation_attempt_id: None,
+    }
 }
 
 #[cfg(test)]

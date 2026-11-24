@@ -649,7 +649,7 @@ impl KubernetesSubstrate {
             },
             None => pod_ip_assignment.await?,
         };
-        let Some(pod_ip) = pod_ip else {
+        let Some(mut pod_ip) = pod_ip else {
             record_pod_proxy_wait_timeout(metric_identity, sandbox_id, started_at);
             // Pod never reached scheduled / IP-assigned in the window. No
             // node-mgr probe ran on this path, so the message names only
@@ -668,20 +668,17 @@ impl KubernetesSubstrate {
         loop {
             connect_attempts += 1;
             let connect_started_at = Instant::now();
-            if Self::pod_proxy_accepts_tcp(
-                pod_ip,
-                self.k8s.sandbox_proxy_port,
-                START_WAIT_CONNECT_TIMEOUT,
-            )
-            .instrument(tracing::info_span!(
-                "substrate.k8s.connect_pod_proxy",
-                sandbox_id = %sandbox_id,
-                pod_ip = %pod_ip,
-                port = self.k8s.sandbox_proxy_port,
-                attempt = connect_attempts,
-            ))
-            .await
-            {
+            let probe = self
+                .probe_pod_proxy(sandbox_id, pod_ip, &target)
+                .instrument(tracing::info_span!(
+                    "substrate.k8s.connect_pod_proxy",
+                    sandbox_id = %sandbox_id,
+                    pod_ip = %pod_ip,
+                    port = self.k8s.sandbox_proxy_port,
+                    attempt = connect_attempts,
+                ))
+                .await;
+            if probe == PodProxyProbe::Serves {
                 record_pod_proxy_wait_ready(
                     metric_identity,
                     sandbox_id,
@@ -706,10 +703,9 @@ impl KubernetesSubstrate {
 
             if Instant::now() >= deadline {
                 record_pod_proxy_wait_timeout(metric_identity, sandbox_id, started_at);
-                // Pod IP was assigned but every TCP connect attempt to the
-                // sandbox proxy failed. No node-mgr probe ran here either —
-                // name the phase that stalled and let the `Timeout` variant
-                // drive the defer-cleanup decision.
+                // Pod IP was assigned but no probe through it reached a node
+                // serving this execution. Name the phase that stalled and let
+                // the `Timeout` variant drive the defer-cleanup decision.
                 let phase = WaitReadyTimeoutPhase::ProxyUnreachable;
                 return Err(SubstrateError::Timeout {
                     message: format!(
@@ -720,7 +716,52 @@ impl KubernetesSubstrate {
                 });
             }
 
+            if probe == PodProxyProbe::Stale
+                && let Some(current) = self
+                    .resolve_pod_ip_for_readiness(sandbox_id, &target, deadline)
+                    .await?
+            {
+                pod_ip = current;
+            }
             sleep(start_wait_poll_interval(started_at)).await;
+        }
+    }
+
+    /// Ask the node behind `pod_ip` whether it serves `target`'s execution at
+    /// that address. The address forwards to its node's node-api, so a stale
+    /// or reused address reaches a node that does not, or that reports
+    /// another address for the execution's current network allocation.
+    async fn probe_pod_proxy(
+        &self,
+        sandbox_id: SandboxId,
+        pod_ip: PodIp,
+        target: &PodProxyWaitTarget<'_>,
+    ) -> PodProxyProbe {
+        let Some(mut client) = Self::pod_worker_client(
+            pod_ip,
+            self.k8s.sandbox_proxy_port,
+            START_WAIT_CONNECT_TIMEOUT,
+        )
+        .await
+        else {
+            return PodProxyProbe::Unreachable;
+        };
+        let state = timeout(
+            START_WAIT_CONNECT_TIMEOUT,
+            client.sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
+                sandbox_ids: vec![sandbox_id.to_string()],
+            }),
+        )
+        .await;
+        match state {
+            Ok(Ok(response)) => {
+                if serves_target(response.into_inner().sandboxes, sandbox_id, target, pod_ip) {
+                    PodProxyProbe::Serves
+                } else {
+                    PodProxyProbe::Stale
+                }
+            }
+            _ => PodProxyProbe::Unreachable,
         }
     }
 
@@ -1303,6 +1344,43 @@ pub(super) struct PodProxyWaitTarget<'a> {
     pub generation: i64,
 }
 
+/// What the node behind a pod address answered for a readiness wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PodProxyProbe {
+    /// It serves the target execution at that address.
+    Serves,
+    /// It answered, but not for the target execution at that address.
+    Stale,
+    /// It did not answer.
+    Unreachable,
+}
+
+/// Whether `sandboxes` show `target`'s execution served at `pod_ip`. A field
+/// the node does not report (an older node, or a sandbox manager that has
+/// restarted since the allocation) is not compared.
+fn serves_target(
+    sandboxes: Vec<pplx_space_sbx_mgr_client::proto::SandboxInfo>,
+    sandbox_id: SandboxId,
+    target: &PodProxyWaitTarget<'_>,
+    pod_ip: PodIp,
+) -> bool {
+    let sandbox_id = sandbox_id.to_string();
+    sandboxes.iter().any(|info| {
+        info.sandbox_id == sandbox_id
+            && info
+                .execution_generation
+                .is_none_or(|generation| generation == target.generation)
+            && target
+                .pod_uid
+                .zip(info.pod_uid.as_deref())
+                .is_none_or(|(expected, reported)| expected == reported)
+            && info
+                .pod_ip
+                .as_deref()
+                .is_none_or(|reported| PodIp::parse(reported).ok() == Some(pod_ip))
+    })
+}
+
 impl PodProxyWaitTarget<'_> {
     /// Whether `pod` is the pod this wait binds: with a target UID, only the
     /// pod that has it.
@@ -1367,5 +1445,30 @@ mod node_reported_address_tests {
             taken(vec![info(sandbox_id, 1, "pod-a", "not-an-ip")], 1, "pod-a"),
             None
         );
+    }
+    /// The readiness probe accepts only a node serving the target execution
+    /// at the probed address; fields an older node omits are not compared.
+    #[test]
+    fn a_probe_accepts_only_the_target_served_at_its_address() {
+        let sandbox_id = SandboxId::new();
+        let probed = PodIp::parse("10.0.0.3").unwrap();
+        let target = PodProxyWaitTarget {
+            pod_name: "pod",
+            pod_uid: Some("pod-a"),
+            generation: 1,
+        };
+        let serves = |info: SandboxInfo| serves_target(vec![info], sandbox_id, &target, probed);
+
+        assert!(serves(info(sandbox_id, 1, "pod-a", "10.0.0.3")));
+        // A recreated runtime sandbox's node reports its new allocation.
+        assert!(!serves(info(sandbox_id, 1, "pod-a", "10.0.0.4")));
+        assert!(!serves(info(sandbox_id, 1, "pod-b", "10.0.0.3")));
+        assert!(!serves(info(sandbox_id, 2, "pod-a", "10.0.0.3")));
+        assert!(!serves(info(SandboxId::new(), 1, "pod-a", "10.0.0.3")));
+        assert!(!serves_target(Vec::new(), sandbox_id, &target, probed));
+        assert!(serves(SandboxInfo {
+            sandbox_id: sandbox_id.to_string(),
+            ..Default::default()
+        }));
     }
 }

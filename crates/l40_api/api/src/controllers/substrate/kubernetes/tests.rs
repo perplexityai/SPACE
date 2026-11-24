@@ -2020,6 +2020,7 @@ mod kubernetes_tests {
     async fn start_sim_worker() -> Result<SimWorkerHarness, BoxError> {
         Ok(SimWorkerHarness::builder("node-a")
             .with_internal_api()
+            .as_sandbox_pod()
             .start()
             .await?)
     }
@@ -8548,6 +8549,9 @@ mod kubernetes_tests {
     /// the binding name the same pod.
     #[tokio::test(flavor = "current_thread")]
     async fn pod_proxy_wait_binds_the_address_of_its_target_pod() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
@@ -8564,45 +8568,62 @@ mod kubernetes_tests {
         .bind(pod_name)
         .execute(&pool)
         .await?;
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let worker = start_sim_worker().await?;
         let pod: Pod = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": { "name": pod_name, "namespace": "space", "uid": "replacement-uid" },
             "status": { "phase": "Running", "podIP": "127.0.0.1" }
         }))?;
-        let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+        let mut substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
             pool,
             replace_existing_pod_kubernetes_client(
                 pod.clone(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicUsize::new(0)),
             ),
-            proxy.local_addr()?.port(),
+            worker.port(),
             Some(pod),
             Vec::new(),
         );
-        let wait = |pod_uid| {
-            substrate.wait_for_pod_proxy_reachable(
-                SandboxApiMetricIdentity::ecw("create"),
-                sandbox_id,
-                super::wait_ready::PodProxyWaitTarget {
-                    pod_name,
-                    pod_uid: Some(pod_uid),
-                    generation: 1,
-                },
-                "create",
-                Instant::now() + Duration::from_millis(500),
-            )
-        };
+        async fn wait(
+            substrate: &KubernetesSubstrate,
+            sandbox_id: SandboxId,
+            pod_uid: &str,
+        ) -> Result<(PodIp, ExecutionBinding), SubstrateError> {
+            substrate
+                .wait_for_pod_proxy_reachable(
+                    SandboxApiMetricIdentity::ecw("create"),
+                    sandbox_id,
+                    super::wait_ready::PodProxyWaitTarget {
+                        pod_name: "space-sbx-replaced-g1",
+                        pod_uid: Some(pod_uid),
+                        generation: 1,
+                    },
+                    "create",
+                    Instant::now() + Duration::from_millis(500),
+                )
+                .await
+        }
 
-        let (pod_ip, binding) = wait("replacement-uid").await?;
+        let (pod_ip, binding) = wait(&substrate, sandbox_id, "replacement-uid").await?;
         assert_eq!(pod_ip, PodIp::parse("127.0.0.1")?);
         assert_eq!(binding.execution_object_id, "replacement-uid");
         assert!(matches!(
-            wait("first-uid").await,
+            wait(&substrate, sandbox_id, "first-uid").await,
             Err(SubstrateError::Timeout {
                 phase: Some(WaitReadyTimeoutPhase::PodNeverReady),
+                ..
+            })
+        ));
+
+        // A node that does not run the sandbox at that address is not bound.
+        let other_node = SimWorkerHarness::builder("node-b").start().await?;
+        substrate.k8s.sandbox_proxy_port = other_node.port();
+        assert!(matches!(
+            wait(&substrate, sandbox_id, "replacement-uid").await,
+            Err(SubstrateError::Timeout {
+                phase: Some(WaitReadyTimeoutPhase::ProxyUnreachable),
                 ..
             })
         ));
