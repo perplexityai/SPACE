@@ -10,13 +10,17 @@ fn slot(slot_id: u32, outcome: SlotOutcome) -> SlotEvidence {
     }
 }
 
-fn incomplete(gaps: Vec<CensusGap>, extra_namespaces: u64) -> Result<Report, InvalidReport> {
+fn incomplete(
+    gaps: Vec<CensusGap>,
+    extra_namespaces: u64,
+    slots: Vec<SlotEvidence>,
+) -> Result<Report, InvalidReport> {
     let census = Census::Incomplete {
         gaps,
         extra_namespaces,
     };
     let revision = RevisionId(uuid::Uuid::nil());
-    Report::new(7, 12, revision, 1, census, Vec::new())
+    Report::new(7, 12, revision, 1, census, slots)
 }
 
 /// Every gap and slot outcome as the version 1 document stores it, in its
@@ -108,13 +112,58 @@ fn every_document_variant_is_written_as_frozen_and_reads_back() {
 #[test]
 fn extra_namespaces_alone_are_incomplete_up_to_the_cap() {
     for extra in [1, MAX_EXTRA_NAMESPACES] {
-        assert!(incomplete(Vec::new(), extra).is_ok(), "{extra}");
+        assert!(incomplete(Vec::new(), extra, Vec::new()).is_ok(), "{extra}");
     }
     assert_eq!(
-        incomplete(Vec::new(), MAX_EXTRA_NAMESPACES + 1),
+        incomplete(Vec::new(), MAX_EXTRA_NAMESPACES + 1, Vec::new()),
         Err(InvalidReport::TooManyExtraNamespaces(
             MAX_EXTRA_NAMESPACES + 1
         ))
     );
-    assert_eq!(incomplete(Vec::new(), 0), Err(InvalidReport::NoGaps));
+    assert_eq!(
+        incomplete(Vec::new(), 0, Vec::new()),
+        Err(InvalidReport::NoGaps)
+    );
+}
+
+/// Every slot outcome against each slot gap: only MISSING on
+/// NAMESPACE_MISSING, and UNREAD on UNCONFIRMED or NAMESPACE_UNREADABLE, are
+/// accepted. Catches a gap that refuses a slot a worker reports for it, or
+/// accepts one that contradicts it.
+#[test]
+fn a_slot_gap_fits_only_its_unknown_reasons() {
+    use UnknownReason as R;
+    let outcomes = [
+        SlotOutcome::Verified,
+        SlotOutcome::Applying,
+        SlotOutcome::Failed(Failure::RulesMismatch),
+        SlotOutcome::Unknown(R::Ineligible),
+        SlotOutcome::Unknown(R::NamespaceMissing),
+        SlotOutcome::Unknown(R::NamespaceUnreadable),
+        SlotOutcome::Unknown(R::TableUnreadable),
+        SlotOutcome::Unknown(R::Unconfirmed),
+    ];
+    for outcome in outcomes {
+        for gap in [
+            CensusGap::Missing { slot_id: 0 },
+            CensusGap::Unread { slot_id: 0 },
+        ] {
+            let fits = matches!(
+                (gap, outcome),
+                (
+                    CensusGap::Missing { .. },
+                    SlotOutcome::Unknown(R::NamespaceMissing)
+                ) | (
+                    CensusGap::Unread { .. },
+                    SlotOutcome::Unknown(R::Unconfirmed | R::NamespaceUnreadable)
+                )
+            );
+            let report = incomplete(vec![gap], 0, vec![slot(0, outcome)]);
+            assert_eq!(
+                report.err(),
+                (!fits).then_some(InvalidReport::GapContradictsSlot(0)),
+                "{gap:?} on {outcome:?}"
+            );
+        }
+    }
 }

@@ -787,10 +787,10 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
 /// field or enum, accepts an unknown or removed enum value, a duplicate slot,
 /// a slot with two gaps, a repeated gap, a gap for a slot the report doesn't
 /// list or whose outcome contradicts it, a reason or gap slot that doesn't
-/// fit, an incomplete census with neither gaps nor extra
-/// namespaces or a complete one with either, an out-of-range integer, too
-/// many extra namespaces, an oversized report, or a bare census standing in
-/// for evidence.
+/// fit, an incomplete census with neither gaps nor extra namespaces or a
+/// complete one with either, an out-of-range integer, too many extra
+/// namespaces, an oversized report, or a bare census standing in for
+/// evidence.
 #[tokio::test(flavor = "current_thread")]
 async fn malformed_reports_write_nothing() -> TestResult {
     let Some(mut r) = reporter(2).await? else {

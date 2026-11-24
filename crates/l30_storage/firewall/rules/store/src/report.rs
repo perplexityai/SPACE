@@ -287,9 +287,9 @@ impl Report {
                     return Err(InvalidReport::RepeatedGap(repeated));
                 }
                 // Each slot gap names a listed slot whose outcome agrees with
-                // it, which no slot does for both kinds. With no repeats, that
-                // leaves at most one gap per listed slot and the three
-                // host-wide ones, so MAX_REPORT_SLOTS bounds the gaps too.
+                // it. No outcome fits both kinds, so with no repeats each listed
+                // slot has at most one gap; with the three host-wide gaps,
+                // MAX_REPORT_SLOTS bounds the total.
                 for gap in &gaps {
                     let Some(slot_id) = gap.slot_id() else {
                         continue;
