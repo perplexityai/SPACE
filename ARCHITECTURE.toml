@@ -1,17 +1,25 @@
 # Repository structure rules, checked by `cargo arch` (crates/tools/archcheck).
 
-# Direct-only control-plane Postgres tables belong to the Direct substrate;
-# existing users outside it are baselined until moved behind it. Postgres folds
-# unquoted identifiers, so the names match in any case.
+# Direct-only control-plane Postgres tables belong to the Direct substrate and
+# its store, pplx-space-direct-store; existing users outside them are baselined
+# until moved behind them. Postgres folds unquoted identifiers, so the names
+# match in any case. Naming the store's crate counts as a use, so its verbs
+# stay behind the Direct substrate too. A store's `direct` module may also name
+# these tables: a statement whose main table that store owns, but which joins a
+# Direct table, moves there verbatim.
 [rules.pattern_ratchet.direct_tables]
 patterns = [
   '(?i)\bnode_direct\b',
   '(?i)\bsandbox_direct_route_identities\b',
   '(?i)\bsandbox_direct_route_provenance\b',
+  '\bpplx_space_direct_store\b',
 ]
 allow = [
   "crates/l40_api/api/src/controllers/substrate/direct.rs",
   "crates/l40_api/api/src/controllers/substrate/direct/**",
+  "crates/l30_storage/direct/store/**",
+  "crates/l30_storage/**/src/direct.rs",
+  "crates/l30_storage/**/src/direct/**",
 ]
 
 [rules.pattern_ratchet.direct_tables.no_crossing]       # only allowed and listed files may match
@@ -382,6 +390,7 @@ pplx-space-data-plane-session-store = [
   "pplx-space-api",
   "pplx-space-internal-api-server",
 ]
+pplx-space-direct-store = ["pplx-space-api"]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-firewall-rules-store = [
   "pplx-space-api",

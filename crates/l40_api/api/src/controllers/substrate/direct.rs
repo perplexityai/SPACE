@@ -123,6 +123,7 @@ use std::{fmt, sync::LazyLock, time::Duration};
 
 use pplx_space_accounts::NodeId;
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
+use pplx_space_direct_store::{route_identities, route_provenance};
 use pplx_space_k8s_ids::{PodUid, PodUidParseError};
 use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPolicyProto};
 use pplx_space_node_model::{
@@ -137,7 +138,7 @@ use pplx_space_sandbox_model::{
 use pplx_space_sandbox_portability::{
     no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
 };
-use pplx_space_sandbox_store::direct as direct_store;
+use pplx_space_sandbox_store::direct as sandbox_direct;
 use pplx_space_sbx_mgr_client::proto::{
     BootMode, StartRequest, SuspendRequest, WakeResponse, WakeTransition,
 };
@@ -865,74 +866,14 @@ enum DirectRouteIdentityOperation {
     Wake,
 }
 
-async fn upsert_direct_route_provenance(
-    connection: &mut sqlx::PgConnection,
-    sandbox_id: SandboxId,
-    route_generation: RouteGeneration,
-    execution_generation: ExecutionGeneration,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_direct_route_provenance (
-             sandbox_id,
-             last_route_generation,
-             last_execution_generation,
-             updated_at
-         )
-         VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (sandbox_id) DO UPDATE
-         SET last_route_generation = GREATEST(
-                 sandbox_direct_route_provenance.last_route_generation,
-                 EXCLUDED.last_route_generation
-             ),
-             last_execution_generation = GREATEST(
-                 sandbox_direct_route_provenance.last_execution_generation,
-                 EXCLUDED.last_execution_generation
-             ),
-             updated_at = NOW()"
-    ))
-    .bind(sandbox_id)
-    .bind(route_generation)
-    .bind(execution_generation)
-    .execute(connection)
-    .await?;
-    Ok(())
-}
-
 async fn persist_monotonic_direct_route_identity(
     connection: &mut sqlx::PgConnection,
     identity: &SandboxRouteIdentity,
 ) -> Result<bool, sqlx::Error> {
-    let persisted = sqlx::query_scalar::<_, i64>(sql!(
-        "INSERT INTO sandbox_direct_route_identities (
-             sandbox_id, route_generation, current_node_id, substrate_kind,
-             execution_generation, activation_attempt_id, pod_uid, updated_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-         ON CONFLICT (sandbox_id) DO UPDATE
-         SET route_generation = EXCLUDED.route_generation,
-             current_node_id = EXCLUDED.current_node_id,
-             substrate_kind = EXCLUDED.substrate_kind,
-             execution_generation = EXCLUDED.execution_generation,
-             activation_attempt_id = EXCLUDED.activation_attempt_id,
-             pod_uid = EXCLUDED.pod_uid,
-             updated_at = NOW()
-         WHERE sandbox_direct_route_identities.route_generation <= EXCLUDED.route_generation
-           AND sandbox_direct_route_identities.execution_generation <= EXCLUDED.execution_generation
-         RETURNING execution_generation"
-    ))
-    .bind(identity.sandbox_id().as_uuid())
-    .bind(identity.route_generation())
-    .bind(identity.current_node_id().as_uuid())
-    .bind(identity.substrate_kind().as_str())
-    .bind(identity.execution_generation())
-    .bind(identity.activation_attempt_id().as_uuid())
-    .bind(identity.pod_uid().map(ToString::to_string))
-    .fetch_optional(&mut *connection)
-    .await?;
-    if persisted.is_none() {
+    if !route_identities::store_unless_newer(&mut *connection, identity).await? {
         return Ok(false);
     }
-    upsert_direct_route_provenance(
+    route_provenance::retain_generations(
         connection,
         identity.sandbox_id(),
         identity.route_generation(),
@@ -1281,71 +1222,18 @@ impl DirectSubstrate {
                 sandbox_id,
             )
             .await?;
-        let persisted = sqlx::query_scalar::<_, i64>(sql!(
-            "INSERT INTO sandbox_direct_route_identities (
-                 sandbox_id,
-                 route_generation,
-                 current_node_id,
-                 substrate_kind,
-                 execution_generation,
-                 activation_attempt_id,
-                 pod_uid,
-                 updated_at
-             )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-             ON CONFLICT (sandbox_id) DO UPDATE
-             SET route_generation = EXCLUDED.route_generation,
-                 current_node_id = EXCLUDED.current_node_id,
-                 substrate_kind = EXCLUDED.substrate_kind,
-                 execution_generation = EXCLUDED.execution_generation,
-                 activation_attempt_id = EXCLUDED.activation_attempt_id,
-                 pod_uid = EXCLUDED.pod_uid,
-                 updated_at = NOW()
-             WHERE (
-                 sandbox_direct_route_identities.current_node_id = EXCLUDED.current_node_id
-                 AND sandbox_direct_route_identities.route_generation
-                     <= EXCLUDED.route_generation
-                 AND (
-                     sandbox_direct_route_identities.execution_generation
-                         < EXCLUDED.execution_generation
-                     OR (
-                         sandbox_direct_route_identities.execution_generation
-                             = EXCLUDED.execution_generation
-                         AND sandbox_direct_route_identities.activation_attempt_id
-                             <= EXCLUDED.activation_attempt_id
-                     )
-                 )
-             )
-             OR (
-                 sandbox_direct_route_identities.current_node_id <> EXCLUDED.current_node_id
-                 AND EXISTS (
-                     SELECT 1
-                     FROM sandboxes s
-                     WHERE s.id = EXCLUDED.sandbox_id
-                       AND s.active_node_id = EXCLUDED.current_node_id
-                 )
-             )
-             RETURNING execution_generation"
-        ))
-        .bind(identity.sandbox_id().as_uuid())
-        .bind(identity.route_generation())
-        .bind(identity.current_node_id().as_uuid())
-        .bind(identity.substrate_kind().as_str())
-        .bind(identity.execution_generation())
-        .bind(identity.activation_attempt_id().as_uuid())
-        .bind(identity.pod_uid().map(ToString::to_string))
-        .fetch_optional(&mut *transaction)
-        .await
-        .db_context("failed to persist direct route identity")?;
-        if persisted.is_none() {
+        let persisted = route_identities::accept_receipt(&mut *transaction, &identity)
+            .await
+            .db_context("failed to persist direct route identity")?;
+        if !persisted {
             return Err(SubstrateError::Failed {
                 message: format!(
                     "refused stale direct route identity receipt for sandbox {sandbox_id}"
                 ),
             });
         }
-        upsert_direct_route_provenance(
-            &mut transaction,
+        route_provenance::retain_generations(
+            &mut *transaction,
             identity.sandbox_id(),
             identity.route_generation(),
             identity.execution_generation(),
@@ -1424,7 +1312,7 @@ impl DirectSubstrate {
                 message: format!("refused stale direct restore receipt for sandbox {sandbox_id}"),
             });
         }
-        let placed = direct_store::place_owned_restore_receipt(
+        let placed = sandbox_direct::place_owned_restore_receipt(
             &mut *transaction,
             sandbox_id,
             expected_node_id,
@@ -1474,30 +1362,19 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         expected_node_id: NodeId,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
-        let row: Option<(i64, Uuid, String, i64, Uuid, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT route_generation,
-                        current_node_id,
-                        substrate_kind,
-                        execution_generation,
-                        activation_attempt_id,
-                        pod_uid
-                   FROM sandbox_direct_route_identities
-                  WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| {
-            format!("failed to load current Direct route identity for sandbox {sandbox_id}")
-        })?;
-        let Some((
+        let row = route_identities::get(&self.pool, sandbox_id)
+            .await
+            .db_context_with(|| {
+                format!("failed to load current Direct route identity for sandbox {sandbox_id}")
+            })?;
+        let Some(route_identities::RouteIdentityRow {
             route_generation,
             current_node_id,
             substrate_kind,
             execution_generation,
             activation_attempt_id,
             pod_uid,
-        )) = row
+        }) = row
         else {
             return Ok(None);
         };
@@ -1656,25 +1533,15 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<(i64, i64)>, SubstrateError> {
-        let reserved: Option<(i64, i64)> = sqlx::query_as(sql!(
-            "UPDATE sandbox_direct_route_provenance
-             SET last_route_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_route_generation,
-                     sandbox_direct_route_provenance.last_execution_generation
-                 ) + 1,
-                 last_execution_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_route_generation,
-                     sandbox_direct_route_provenance.last_execution_generation
-                 ) + 1,
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-             RETURNING last_route_generation, last_execution_generation"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(direct_route_generation_reservation_error)?;
-        Ok(reserved)
+        let reserved = route_provenance::advance_generations(&self.pool, sandbox_id)
+            .await
+            .map_err(direct_route_generation_reservation_error)?;
+        Ok(reserved.map(|reserved| {
+            (
+                reserved.last_route_generation,
+                reserved.last_execution_generation,
+            )
+        }))
     }
 
     async fn recover_direct_route_provenance(
@@ -1707,8 +1574,8 @@ impl DirectSubstrate {
                 .acquire()
                 .await
                 .db_context("failed to acquire direct route provenance connection")?;
-            upsert_direct_route_provenance(
-                &mut connection,
+            route_provenance::retain_generations(
+                &mut *connection,
                 sandbox_id,
                 route_generation,
                 execution_generation,
@@ -1724,19 +1591,9 @@ impl DirectSubstrate {
         // generation 1. Initialize only this requested sandbox after active
         // and node-local sources have been exhausted; never scan the hot
         // sandboxes table from a startup migration.
-        sqlx::query(sql!(
-            "INSERT INTO sandbox_direct_route_provenance (
-                 sandbox_id,
-                 last_route_generation,
-                 last_execution_generation
-             )
-             VALUES ($1, 1, 1)
-             ON CONFLICT (sandbox_id) DO NOTHING"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&self.pool)
-        .await
-        .map_err(direct_route_generation_reservation_error)?;
+        route_provenance::initialize(&self.pool, sandbox_id)
+            .await
+            .map_err(direct_route_generation_reservation_error)?;
         Ok(())
     }
 
@@ -1828,20 +1685,10 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         target_node_id: NodeId,
     ) -> Result<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity, SubstrateError> {
-        let inserted = sqlx::query(sql!(
-            "INSERT INTO sandbox_direct_route_provenance (
-                 sandbox_id,
-                 last_route_generation,
-                 last_execution_generation
-             )
-             VALUES ($1, 1, 1)
-             ON CONFLICT (sandbox_id) DO NOTHING"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&self.pool)
-        .await
-        .map_err(direct_route_generation_reservation_error)?;
-        if inserted.rows_affected() != 1 {
+        let inserted = route_provenance::initialize(&self.pool, sandbox_id)
+            .await
+            .map_err(direct_route_generation_reservation_error)?;
+        if !inserted {
             return Err(SubstrateError::Failed {
                 message: format!(
                     "sandbox {sandbox_id} already has direct route provenance before its initial activation"
@@ -1921,37 +1768,11 @@ impl DirectSubstrate {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        let retained = sqlx::query(sql!(
-            "INSERT INTO sandbox_direct_route_provenance (
-                 sandbox_id,
-                 last_route_generation,
-                 last_execution_generation,
-                 updated_at
-             )
-             SELECT sandbox_id,
-                    route_generation,
-                    execution_generation,
-                    NOW()
-             FROM sandbox_direct_route_identities
-             WHERE sandbox_id = $1
-             ON CONFLICT (sandbox_id) DO UPDATE
-             SET last_route_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_route_generation,
-                     EXCLUDED.last_route_generation
-                 ),
-                 last_execution_generation = GREATEST(
-                     sandbox_direct_route_provenance.last_execution_generation,
-                     EXCLUDED.last_execution_generation
-                 ),
-                 updated_at = NOW()"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&mut **transaction)
-        .await
-        .db_context_with(|| {
-            format!("failed to retain active direct route provenance for sandbox {sandbox_id}")
-        })?;
-        Ok(retained.rows_affected() > 0)
+        route_provenance::retain_route_identity_generations(&mut **transaction, sandbox_id)
+            .await
+            .db_context_with(|| {
+                format!("failed to retain active direct route provenance for sandbox {sandbox_id}")
+            })
     }
 
     async fn clear_direct_route_identity(
@@ -1965,14 +1786,9 @@ impl DirectSubstrate {
             .db_context("failed to begin direct route identity clear")?;
         self.retain_active_direct_route_provenance(&mut transaction, sandbox_id)
             .await?;
-        sqlx::query(sql!(
-            "DELETE FROM sandbox_direct_route_identities
-             WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .execute(&mut *transaction)
-        .await
-        .db_context("failed to clear direct route identity")?;
+        route_identities::delete(&mut *transaction, sandbox_id)
+            .await
+            .db_context("failed to clear direct route identity")?;
         transaction
             .commit()
             .await
@@ -3281,7 +3097,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
     ) -> Result<DirectRestoreLease, SubstrateError> {
         let token = Uuid::now_v7();
-        let claimed = direct_store::claim_restore_lease(
+        let claimed = sandbox_direct::claim_restore_lease(
             &self.pool,
             sandbox_id,
             i64::try_from(DIRECT_NODE_RPC_TIMEOUT.as_secs()).expect("node timeout fits i64"),
@@ -3289,7 +3105,7 @@ impl DirectSubstrate {
         )
         .await
         .db_context("failed to claim direct restore lease")?;
-        if let Some(direct_store::ClaimedRestoreLease {
+        if let Some(sandbox_direct::ClaimedRestoreLease {
             token: claimed_token,
             restore_retry,
         }) = claimed
@@ -3344,7 +3160,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let released = direct_store::release_restore_lease(
+        let released = sandbox_direct::release_restore_lease(
             &self.pool,
             sandbox_id,
             lease.token,
@@ -3381,7 +3197,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let renewed = direct_store::renew_restore_lease(
+        let renewed = sandbox_direct::renew_restore_lease(
             &self.pool,
             sandbox_id,
             lease.token,
@@ -3403,7 +3219,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let completed = direct_store::complete_restore_lease(&self.pool, sandbox_id, lease.token)
+        let completed = sandbox_direct::complete_restore_lease(&self.pool, sandbox_id, lease.token)
             .await
             .db_context("failed to complete direct restore lease")?;
         if !completed {
@@ -3933,7 +3749,7 @@ impl DirectSubstrate {
     ///
     /// One transaction selects the candidate with the full guard in one
     /// statement, locks only that `sandboxes` row, and makes the guarded
-    /// write ([`direct_store::adopt_live_execution`]) with the two facts the
+    /// write ([`sandbox_direct::adopt_live_execution`]) with the two facts the
     /// route identity and the last reservation give. The joined `UPDATE ...
     /// FROM` it replaced locked only a row its snapshot matched, and so does
     /// this: a row another restore owns under a live lease returns no row
@@ -3995,7 +3811,7 @@ impl DirectSubstrate {
             )
         });
         let adopted = match adoptable {
-            Some((one_generation, started_now)) => direct_store::adopt_live_execution(
+            Some((one_generation, started_now)) => sandbox_direct::adopt_live_execution(
                 &mut *transaction,
                 sandbox_id,
                 node.id,
