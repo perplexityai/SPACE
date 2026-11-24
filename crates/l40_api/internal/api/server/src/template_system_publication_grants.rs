@@ -2,8 +2,8 @@
 //! build, never selected from other submissions for the same template.
 
 use pplx_space_accounts::SystemPublicationGrantId;
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateName;
+use pplx_space_template_store::publication_grants;
 use sqlx::PgExecutor;
 
 #[derive(Debug, thiserror::Error)]
@@ -22,16 +22,7 @@ pub(super) async fn covers(
     template: &TemplateName,
     grant: SystemPublicationGrantId,
 ) -> Result<bool, GrantStorageError> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT EXISTS (
-             SELECT 1 FROM template_system_publication_grants
-             WHERE id = $1 AND template_name = $2
-               AND granted_at > NOW() - INTERVAL '7 days')"
-    ))
-    .bind(grant)
-    .bind(template.as_str())
-    .fetch_one(executor)
-    .await?)
+    Ok(publication_grants::system_grant_covers(executor, template, grant).await?)
 }
 
 /// Consume only this build's grant in the publication transaction. Rollback
@@ -41,17 +32,7 @@ pub(super) async fn consume(
     template: &TemplateName,
     grant: SystemPublicationGrantId,
 ) -> Result<bool, GrantStorageError> {
-    let consumed = sqlx::query_scalar::<_, uuid::Uuid>(sql!(
-        "DELETE FROM template_system_publication_grants
-         WHERE id = $1 AND template_name = $2
-           AND granted_at > NOW() - INTERVAL '7 days'
-         RETURNING id"
-    ))
-    .bind(grant)
-    .bind(template.as_str())
-    .fetch_optional(executor)
-    .await?;
-    Ok(consumed.is_some())
+    Ok(publication_grants::consume_system(executor, template, grant).await?)
 }
 
 /// Issue a fresh authorization under independently verified operator authority.
@@ -59,13 +40,8 @@ pub(super) async fn issue(
     tx: &mut sqlx::PgConnection,
     template: &TemplateName,
 ) -> Result<SystemPublicationGrantId, GrantStorageError> {
-    sqlx::query(sql!(
-        "DELETE FROM template_system_publication_grants
-        WHERE granted_at < NOW() - INTERVAL '7 days'"
-    ))
-    .execute(&mut *tx)
-    .await?;
+    publication_grants::delete_expired_system_before_issue(&mut *tx).await?;
     let grant = SystemPublicationGrantId::new();
-    pplx_space_template_store::publication_grants::insert_system(&mut *tx, grant, template).await?;
+    publication_grants::insert_system(&mut *tx, grant, template).await?;
     Ok(grant)
 }

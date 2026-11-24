@@ -5,8 +5,9 @@
 //! orchestration, and audit logging; the helpers they call live here.
 //! Multi-step guarded writes (assign-org, set-default, delete) lock the group
 //! row `FOR UPDATE` and run their residue checks inside the same transaction so
-//! two operators cannot race a guard. This module keeps the template
-//! `FOR SHARE` read and the organization check. The node-group and allowlist
+//! two operators cannot race a guard. This module keeps the organization
+//! check; the template `FOR SHARE` read is `pplx-space-template-store`'s
+//! `templates::share_lock_visibilities`. The node-group and allowlist
 //! statements, the group reads and the group-row and default-row locks among
 //! them, are verbs of `pplx-space-node-group-store`, the cached-template count
 //! is `pplx-space-node-template-inventory-store`'s and the occupancy count is
@@ -20,20 +21,14 @@ use std::collections::HashMap;
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
 use pplx_space_sql_locator::sql;
-use pplx_space_template_model::TemplateVisibility;
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 
 use super::node_store::SandboxOccupancy;
 
 pub(super) use pplx_space_node_group_store::groups::NodeGroupRow;
 
 /// Template fields consulted when validating a `restricted` allowlist entry.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct CompatTemplateRow {
-    pub(super) name: String,
-    pub(super) visibility: TemplateVisibility,
-    pub(super) org_id: Option<OrgId>,
-}
+pub(super) type CompatTemplateRow = pplx_space_template_store::templates::VisibilityOwner;
 
 /// Pool-bound repository for node-group reads. Guarded writes that need a
 /// `FOR UPDATE` lock live as free functions below, since a `Transaction`
@@ -287,12 +282,7 @@ pub(super) async fn templates_by_names_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     names: &[String],
 ) -> Result<Vec<CompatTemplateRow>, sqlx::Error> {
-    sqlx::query_as::<_, CompatTemplateRow>(sql!(
-        "SELECT name, visibility, org_id FROM templates WHERE name = ANY($1::TEXT[]) FOR SHARE"
-    ))
-    .bind(names)
-    .fetch_all(&mut **tx)
-    .await
+    pplx_space_template_store::templates::share_lock_visibilities(tx, names).await
 }
 
 /// Replace the group's allowlist with `names` (full-set PUT semantics).

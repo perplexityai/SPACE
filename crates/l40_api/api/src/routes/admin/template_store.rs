@@ -11,7 +11,7 @@ use pplx_space_accounts::OrgId;
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateName, TemplateVisibility};
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
 
 /// Whether a template row named `template_name` exists and is not deleted:
@@ -69,12 +69,7 @@ pub(super) async fn org_template_rows(
     })
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplateVisibilityRow {
-    pub(super) name: String,
-    pub(super) org_id: Option<OrgId>,
-    pub(super) visibility: TemplateVisibility,
-}
+pub(super) type TemplateVisibilityRow = pplx_space_template_store::templates::VisibilityOwner;
 
 /// `SELECT ... FOR UPDATE` — the visibility write and its guards share one
 /// lock window on the template row.
@@ -82,12 +77,7 @@ pub(super) async fn lock_template_for_update(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
 ) -> Result<Option<TemplateVisibilityRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateVisibilityRow>(sql!(
-        "SELECT name, org_id, visibility FROM templates WHERE name = $1 FOR UPDATE"
-    ))
-    .bind(template_name)
-    .fetch_optional(&mut **tx)
-    .await
+    pplx_space_template_store::templates::lock_visibility(tx, template_name).await
 }
 
 /// Sandboxes still referencing the template: anything not terminally gone

@@ -1916,3 +1916,153 @@ async fn registration_fills_only_a_missing_binding_or_owner() -> TestResult {
     assert_eq!(owner, Some(pplx_space_db_test_fixtures::SEED_ORG_ID));
     Ok(())
 }
+
+/// Whether another transaction can take `lock` on release `release` now.
+async fn release_lock_free(pool: &PgPool, release: Uuid, lock: &str) -> TestResult<bool> {
+    let mut other = pool.begin().await?;
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM template_releases WHERE id = $1 FOR {lock} NOWAIT"
+    )))
+    .bind(release)
+    .execute(&mut *other)
+    .await;
+    other.rollback().await?;
+    match result {
+        Ok(_) => Ok(true),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn release_locks_last_until_the_callers_transaction_ends() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let bound = metadata(environment(1));
+    let original = seeded(&db.pool, Some(bound.clone())).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let other_spelling = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+
+    let mut tx = db.pool.begin().await?;
+    assert_eq!(
+        registration::lock_execution_metadata(&mut tx, original).await?,
+        Some(bound)
+    );
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    assert!(release_lock_free(&db.pool, other_spelling, "UPDATE").await?);
+    tx.rollback().await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(matches!(
+        registration::lock_execution_metadata(&mut tx, Uuid::now_v7()).await,
+        Err(sqlx::Error::RowNotFound)
+    ));
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    let release = lookup::lock_release_of_present_template(&mut tx, original)
+        .await?
+        .expect("a present template's release");
+    assert_eq!(
+        (release.id, release.content_hash.as_str()),
+        (original, HASH)
+    );
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    let mut other = db.pool.begin().await?;
+    sqlx::query("SELECT 1 FROM templates WHERE name = $1 FOR UPDATE NOWAIT")
+        .bind(TEMPLATE)
+        .execute(&mut *other)
+        .await?;
+    other.rollback().await?;
+    tx.rollback().await?;
+    sqlx::query("UPDATE templates SET desired_state = 'deleting' WHERE name = $1")
+        .bind(TEMPLATE)
+        .execute(&db.pool)
+        .await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(
+        lookup::lock_release_of_present_template(&mut tx, original)
+            .await?
+            .is_none()
+    );
+    assert!(release_lock_free(&db.pool, original, "UPDATE").await?);
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    removal::lock_releases_of_digest(&mut tx, other_spelling).await?;
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    assert!(!release_lock_free(&db.pool, other_spelling, "KEY SHARE").await?);
+    tx.rollback().await?;
+    assert!(release_lock_free(&db.pool, original, "UPDATE").await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn original_lookups_and_the_twin_check_follow_the_shared_rule() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let original = seeded(&db.pool, None).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let other_spelling = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+    for hash in [HASH, bare] {
+        assert_eq!(
+            lookup::original_release_id(&db.pool, TEMPLATE, hash).await?,
+            Some(original),
+            "the original that owns a location wins under either spelling"
+        );
+    }
+    assert_eq!(
+        lookup::original_release_id(&db.pool, "other", HASH).await?,
+        None
+    );
+    let registered = registration::original_release(&db.pool, TEMPLATE, HASH, bare)
+        .await?
+        .expect("the digest's original");
+    assert_eq!((registered.id, registered.hash.as_str()), (original, HASH));
+    assert!(
+        registration::original_release(&db.pool, "other", HASH, bare)
+            .await?
+            .is_none()
+    );
+
+    assert!(!lookup::release_serves_a_tag(&db.pool, original).await?);
+    pplx_space_template_store::test_support::tag_release(
+        &db.pool,
+        TEMPLATE,
+        other_spelling,
+        "stable",
+    )
+    .await?;
+    assert!(
+        lookup::release_serves_a_tag(&db.pool, original).await?,
+        "a tag on the other spelling resolves to the digest original"
+    );
+    pplx_space_template_store::test_support::tag_release(&db.pool, TEMPLATE, original, "pinned")
+        .await?;
+    assert!(
+        !lookup::release_serves_a_tag(&db.pool, other_spelling).await?,
+        "a non-original serves neither its own non-latest tag nor a tag on another release of the digest"
+    );
+    pplx_space_template_store::test_support::tag_release(
+        &db.pool,
+        TEMPLATE,
+        other_spelling,
+        "latest",
+    )
+    .await?;
+    assert!(lookup::release_serves_a_tag(&db.pool, other_spelling).await?);
+
+    assert!(!lookup::release_has_twins(&db.pool, original).await?);
+    let twin = insert_release(&db.pool, TEMPLATE, HASH, Some(metadata(environment(2)))).await?;
+    assert!(lookup::release_has_twins(&db.pool, original).await?);
+    assert!(
+        !lookup::release_has_twins(&db.pool, twin).await?,
+        "a twin is no original"
+    );
+    assert!(
+        !lookup::release_has_twins(&db.pool, other_spelling).await?,
+        "the other spelling's original has no twin of its own"
+    );
+    Ok(())
+}

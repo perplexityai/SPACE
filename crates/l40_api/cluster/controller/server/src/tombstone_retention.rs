@@ -128,37 +128,12 @@ impl RetentionSink for TombstoneRetentionStore {
         .await?
         .len() as u64;
 
-        let templates_deleted = sqlx::query_scalar::<_, String>(sql!(
-            "WITH candidates AS (
-                 SELECT t.name
-                   FROM templates t
-                  WHERE t.desired_state = 'deleted'
-                    AND COALESCE(t.delete_requested_at, t.updated_at, t.created_at)
-                        < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM template_releases r
-                         WHERE r.template_name = t.name
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM node_template_inventory i
-                         WHERE i.template_name = t.name
-                    )
-                  ORDER BY COALESCE(t.delete_requested_at, t.updated_at, t.created_at) ASC,
-                           t.name ASC
-                  LIMIT $2
-             )
-             DELETE FROM templates t
-              USING candidates c
-              WHERE t.name = c.name
-              RETURNING t.name"
-        ))
-        .bind(retention_secs)
-        .bind(max_records)
-        .fetch_all(&mut *tx)
-        .await?
-        .len() as u64;
+        let templates_deleted = pplx_space_template_store::templates::prune_deleted(
+            &mut *tx,
+            retention_secs,
+            max_records,
+        )
+        .await?;
 
         let pruned_sandboxes =
             tombstone::prune_deleted_sandboxes(&mut *tx, retention_secs, max_records).await?;

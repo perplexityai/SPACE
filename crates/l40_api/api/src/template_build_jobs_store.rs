@@ -1,7 +1,6 @@
 use std::str::FromStr;
 
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{BuildRunId, BuildRunIdParseError, TemplateName};
 use pplx_space_template_store::{build_base_grants, build_jobs, publication_grants, templates};
 use sqlx::{PgExecutor, PgPool};
@@ -164,12 +163,7 @@ impl TemplateBuildJobsStore {
         template_name: &TemplateName,
         base: &TemplateName,
     ) -> Result<BuildBaseGrantId, sqlx::Error> {
-        sqlx::query(sql!(
-            "DELETE FROM template_build_base_grants
-             WHERE granted_at < NOW() - INTERVAL '7 days'"
-        ))
-        .execute(&self.pool)
-        .await?;
+        build_base_grants::delete_expired(&self.pool).await?;
         let grant = BuildBaseGrantId(uuid::Uuid::now_v7());
         build_base_grants::insert(&self.pool, grant.as_uuid(), template_name, base, org_id).await?;
         Ok(grant)
@@ -188,12 +182,7 @@ impl TemplateBuildJobsStore {
         &self,
         template_name: &TemplateName,
     ) -> Result<SystemPublicationGrantId, TemplateBuildJobsStoreError> {
-        sqlx::query(sql!(
-            "DELETE FROM template_system_publication_grants
-             WHERE granted_at < NOW() - INTERVAL '7 days'"
-        ))
-        .execute(&self.pool)
-        .await?;
+        publication_grants::delete_expired_system(&self.pool).await?;
         let grant = SystemPublicationGrantId::new();
         publication_grants::insert_system(&self.pool, grant, template_name).await?;
         Ok(grant)
@@ -225,12 +214,7 @@ impl TemplateBuildJobsStore {
         org_id: OrgId,
         template_name: &TemplateName,
     ) -> Result<TenantPublicationGrantId, TemplateBuildJobsStoreError> {
-        sqlx::query(sql!(
-            "DELETE FROM template_tenant_publication_grants
-             WHERE granted_at < NOW() - INTERVAL '7 days'"
-        ))
-        .execute(&self.pool)
-        .await?;
+        publication_grants::delete_expired_tenant(&self.pool).await?;
         let grant = TenantPublicationGrantId::new();
         publication_grants::insert_tenant(&self.pool, grant, template_name, org_id).await?;
         Ok(grant)
