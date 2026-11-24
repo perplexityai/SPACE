@@ -13,7 +13,7 @@ pub use pplx_space_state_reconciliation::{
     FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
     FACET_TEMPLATE_DESIRED_STATE, FACET_TEMPLATE_INVENTORY, NetworkPolicyTarget, ReconcileFacet,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 pub const ELEMENT_ALL: &str = "";
 pub const DIRECTION_INBOUND: &str = "inbound";
@@ -311,19 +311,11 @@ pub fn read(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<DirtyFacetBatch> {
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    db.execute(
-        "UPDATE dirty_facets
-         SET claim_token = ?1,
-             claimed_at = ?2,
-             last_attempt_at = ?2
-         WHERE dirty != 0
-           AND next_attempt_at <= ?2
-           AND dead_at = 0
-           AND (
-               claim_token = ''
-               OR claimed_at <= ?3
-           )",
-        params![claim_token, now, now.saturating_sub(CLAIM_STALE_AFTER_SECS)],
+    dirty_facets::claim_due(
+        &db,
+        &claim_token,
+        now,
+        now.saturating_sub(CLAIM_STALE_AFTER_SECS),
     )?;
     let rows = dirty_facets::claimed(&db, &claim_token)?;
     let mut batch = DirtyFacetBatch::claimed(claim_token);
@@ -354,23 +346,8 @@ pub fn clear(db: &Arc<Mutex<Connection>>, batch: &DirtyFacetBatch) -> rusqlite::
     for (facet, elements) in &batch.facets {
         if let Some(elements) = elements {
             for (element, generation) in elements {
-                tx.execute(
-                    "DELETE FROM dirty_facets
-                     WHERE facet = ?1
-                       AND element = ?2
-                       AND dirty_generation = ?3
-                       AND claim_token = ?4",
-                    params![facet, element, generation, batch.claim_token],
-                )?;
-                tx.execute(
-                    "UPDATE dirty_facets
-                     SET claim_token = '',
-                         claimed_at = 0
-                     WHERE facet = ?1
-                       AND element = ?2
-                       AND claim_token = ?3",
-                    params![facet, element, batch.claim_token],
-                )?;
+                dirty_facets::delete_synced(&tx, facet, element, *generation, &batch.claim_token)?;
+                dirty_facets::release_claim(&tx, facet, element, &batch.claim_token)?;
             }
         }
     }
@@ -416,55 +393,29 @@ fn mark_error_row(
 ) -> rusqlite::Result<()> {
     let attempts_before_failure = current_attempts(tx, facet, element)?;
     let attempts_after_failure = attempts_before_failure.saturating_add(1);
+    let attempt = dirty_facets::FailedAttempt {
+        facet,
+        element,
+        dirty_generation: generation,
+        claim_token,
+        error,
+        failed_at: now,
+    };
     if attempts_after_failure >= MAX_ATTEMPTS {
-        let changed = tx.execute(
-            "UPDATE dirty_facets
-             SET attempts = attempts + 1,
-                 last_error = ?3,
-                 last_attempt_at = ?4,
-                 dead_at = ?4,
-                 dead_reason = ?3,
-                 claim_token = '',
-                 claimed_at = 0,
-                 updated_at = ?4
-             WHERE facet = ?1
-               AND element = ?2
-               AND dirty_generation = ?5
-               AND claim_token = ?6",
-            params![facet, element, error, now, generation, claim_token],
-        )?;
-        if changed == 0 {
-            release_refreshed_claim(tx, facet, element, claim_token, now)?;
-        } else {
+        if dirty_facets::dead_letter_failed_attempt(tx, &attempt)? {
             pplx_space_reconcile_metrics::queue_dead_letter(facet);
+        } else {
+            release_refreshed_claim(tx, facet, element, claim_token, now)?;
         }
         return Ok(());
     }
 
-    let changed = tx.execute(
-        "UPDATE dirty_facets
-         SET attempts = attempts + 1,
-             last_error = ?3,
-             last_attempt_at = ?4,
-             next_attempt_at = ?5,
-             claim_token = '',
-             claimed_at = 0,
-             updated_at = ?4
-         WHERE facet = ?1
-           AND element = ?2
-           AND dirty_generation = ?6
-           AND claim_token = ?7",
-        params![
-            facet,
-            element,
-            error,
-            now,
-            next_attempt_at(now, attempts_before_failure),
-            generation,
-            claim_token
-        ],
+    let recorded = dirty_facets::back_off_failed_attempt(
+        tx,
+        &attempt,
+        next_attempt_at(now, attempts_before_failure),
     )?;
-    if changed == 0 {
+    if !recorded {
         release_refreshed_claim(tx, facet, element, claim_token, now)?;
     }
     Ok(())
@@ -477,17 +428,7 @@ fn release_refreshed_claim(
     claim_token: &str,
     now: i64,
 ) -> rusqlite::Result<()> {
-    tx.execute(
-        "UPDATE dirty_facets
-         SET claim_token = '',
-             claimed_at = 0,
-             next_attempt_at = ?4,
-             updated_at = ?4
-         WHERE facet = ?1
-           AND element = ?2
-           AND claim_token = ?3",
-        params![facet, element, claim_token, now],
-    )?;
+    dirty_facets::release_claim_due_now(tx, facet, element, claim_token, now)?;
     Ok(())
 }
 

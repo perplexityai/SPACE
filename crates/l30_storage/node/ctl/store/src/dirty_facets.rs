@@ -71,6 +71,189 @@ pub fn mark_dirty(conn: &Connection, facet: &str, element: &str, now: i64) -> Re
     Ok(())
 }
 
+/// Claim every due dirty row for `claim_token` at `now`: rows that are not
+/// dead-lettered, whose retry is due, and that are unclaimed or whose claim
+/// is at or before `stale_before`. Returns how many rows it claimed; another
+/// claim holding every due row, or no row being due, claims none.
+pub fn claim_due(
+    conn: &Connection,
+    claim_token: &str,
+    now: i64,
+    stale_before: i64,
+) -> Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE dirty_facets
+             SET claim_token = ?1,
+                 claimed_at = ?2,
+                 last_attempt_at = ?2
+             WHERE dirty != 0
+               AND next_attempt_at <= ?2
+               AND dead_at = 0
+               AND (
+                   claim_token = ''
+                   OR claimed_at <= ?3
+               )"
+        ),
+        params![claim_token, now, stale_before],
+    )
+}
+
+/// Delete the element's row if `claim_token` still holds it at
+/// `dirty_generation`. Returns `false` when the row is gone, another claim
+/// took it, or it was marked dirty again since the claim.
+pub fn delete_synced(
+    conn: &Connection,
+    facet: &str,
+    element: &str,
+    dirty_generation: i64,
+    claim_token: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        sql!(
+            "DELETE FROM dirty_facets
+             WHERE facet = ?1
+               AND element = ?2
+               AND dirty_generation = ?3
+               AND claim_token = ?4"
+        ),
+        params![facet, element, dirty_generation, claim_token],
+    )?;
+    Ok(changed != 0)
+}
+
+/// Release `claim_token`'s claim on the element's row, leaving the row
+/// otherwise unchanged. Returns `false` when the row is gone or the token no
+/// longer holds it.
+pub fn release_claim(
+    conn: &Connection,
+    facet: &str,
+    element: &str,
+    claim_token: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        sql!(
+            "UPDATE dirty_facets
+             SET claim_token = '',
+                 claimed_at = 0
+             WHERE facet = ?1
+               AND element = ?2
+               AND claim_token = ?3"
+        ),
+        params![facet, element, claim_token],
+    )?;
+    Ok(changed != 0)
+}
+
+/// A failed sync attempt on a claimed row, recorded by
+/// [`dead_letter_failed_attempt`] or [`back_off_failed_attempt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedAttempt<'a> {
+    pub facet: &'a str,
+    pub element: &'a str,
+    /// The generation the claim took.
+    pub dirty_generation: i64,
+    pub claim_token: &'a str,
+    pub error: &'a str,
+    pub failed_at: i64,
+}
+
+/// Count the failed attempt, dead-letter the row with the error as its
+/// reason and release its claim, if `claim_token` still holds it at
+/// `dirty_generation`. Returns `false` when the row is gone, another claim
+/// took it, or it was marked dirty again since the claim.
+pub fn dead_letter_failed_attempt(conn: &Connection, attempt: &FailedAttempt<'_>) -> Result<bool> {
+    let changed = conn.execute(
+        sql!(
+            "UPDATE dirty_facets
+             SET attempts = attempts + 1,
+                 last_error = ?3,
+                 last_attempt_at = ?4,
+                 dead_at = ?4,
+                 dead_reason = ?3,
+                 claim_token = '',
+                 claimed_at = 0,
+                 updated_at = ?4
+             WHERE facet = ?1
+               AND element = ?2
+               AND dirty_generation = ?5
+               AND claim_token = ?6"
+        ),
+        params![
+            attempt.facet,
+            attempt.element,
+            attempt.error,
+            attempt.failed_at,
+            attempt.dirty_generation,
+            attempt.claim_token
+        ],
+    )?;
+    Ok(changed != 0)
+}
+
+/// Count the failed attempt, schedule the row's retry at `next_attempt_at`
+/// and release its claim, if `claim_token` still holds it at
+/// `dirty_generation`. Returns `false` when the row is gone, another claim
+/// took it, or it was marked dirty again since the claim.
+pub fn back_off_failed_attempt(
+    conn: &Connection,
+    attempt: &FailedAttempt<'_>,
+    next_attempt_at: i64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        sql!(
+            "UPDATE dirty_facets
+             SET attempts = attempts + 1,
+                 last_error = ?3,
+                 last_attempt_at = ?4,
+                 next_attempt_at = ?5,
+                 claim_token = '',
+                 claimed_at = 0,
+                 updated_at = ?4
+             WHERE facet = ?1
+               AND element = ?2
+               AND dirty_generation = ?6
+               AND claim_token = ?7"
+        ),
+        params![
+            attempt.facet,
+            attempt.element,
+            attempt.error,
+            attempt.failed_at,
+            next_attempt_at,
+            attempt.dirty_generation,
+            attempt.claim_token
+        ],
+    )?;
+    Ok(changed != 0)
+}
+
+/// Release `claim_token`'s claim on the element's row and make it due at
+/// `now`, whatever its generation. Returns `false` when the row is gone or
+/// the token no longer holds it.
+pub fn release_claim_due_now(
+    conn: &Connection,
+    facet: &str,
+    element: &str,
+    claim_token: &str,
+    now: i64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        sql!(
+            "UPDATE dirty_facets
+             SET claim_token = '',
+                 claimed_at = 0,
+                 next_attempt_at = ?4,
+                 updated_at = ?4
+             WHERE facet = ?1
+               AND element = ?2
+               AND claim_token = ?3"
+        ),
+        params![facet, element, claim_token, now],
+    )?;
+    Ok(changed != 0)
+}
+
 /// The dirty rows that `claim_token` claimed, ordered by facet and element.
 pub fn claimed(conn: &Connection, claim_token: &str) -> Result<Vec<ClaimedDirtyFacetRow>> {
     let mut stmt = conn.prepare(sql!(

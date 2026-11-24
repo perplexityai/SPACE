@@ -10,12 +10,18 @@
 //! passes its own connection or open transaction, and returns rusqlite's
 //! error unchanged. node-ctl keeps the transactions whose reads guard its
 //! writes: run each verb whose doc asks for it inside the caller's
-//! transaction. node-ctl's claim, clear and failure writes to `dirty_facets`
-//! stay at their call sites, because each re-checks the row's claim in its
-//! `WHERE`: the claim takes only unclaimed rows or rows whose claim went
-//! stale, and the other writes match the batch's claim token. The clear's
-//! delete and the two updates that record a failed attempt also match the
-//! claimed generation.
+//! transaction.
+//!
+//! [`dirty_facets`]' claim, clear and failure writes are guarded transitions:
+//! each re-checks the row's claim in its `WHERE`. The claim takes only
+//! unclaimed rows or rows whose claim went stale, and the other writes match
+//! the batch's claim token. The clear's delete and the two updates that record
+//! a failed attempt also match the claimed generation. Each binds the claim
+//! token, generation and times the caller decided on and returns whether it
+//! matched (the claim, how many rows it took); matching nothing is a normal
+//! outcome, another claim or a newer mark having won. node-ctl keeps the
+//! transaction around a batch's clear or failure and decides what each
+//! outcome means.
 
 #![forbid(unsafe_code)]
 
