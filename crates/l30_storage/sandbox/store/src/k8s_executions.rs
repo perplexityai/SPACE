@@ -109,6 +109,49 @@ pub async fn started_recovery_lease_remaining_millis(
     .await
 }
 
+/// A started recovery still inside its lease, as [`fresh_started_recovery`]
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshStartedRecovery {
+    pub generation: i64,
+    /// Milliseconds left on the lease by the database clock, never negative.
+    pub lease_remaining_millis: i64,
+}
+
+/// The sandbox's active execution in `recovering_state` that was last
+/// updated less than `lease_ttl_secs` ago by the database clock, with the
+/// time its lease has left. `None` when there is no such execution.
+pub async fn fresh_started_recovery(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    recovering_state: &str,
+    lease_ttl_secs: i64,
+) -> Result<Option<FreshStartedRecovery>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, i64)>(sql!(
+        "SELECT generation,
+                    GREATEST(
+                        CEIL(EXTRACT(EPOCH FROM (
+                            updated_at + make_interval(secs => $3) - NOW()
+                        )) * 1000)::BIGINT,
+                        0::BIGINT
+                    ) AS lease_remaining_millis
+             FROM sandbox_k8s_executions
+             WHERE sandbox_id = $1 AND active AND state = $2
+               AND updated_at > NOW() - make_interval(secs => $3)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(recovering_state)
+    .bind(lease_ttl_secs)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(
+        |(generation, lease_remaining_millis)| FreshStartedRecovery {
+            generation,
+            lease_remaining_millis,
+        },
+    ))
+}
+
 /// Whether a failed sandbox's active execution still holds a first activation
 /// that never finished, and whether that activation's lease has expired by
 /// the database clock, as [`list_failed_active_executions`] defines them.

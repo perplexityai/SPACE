@@ -6,6 +6,18 @@
 //! begins or commits a transaction. An upsert that inserts a new row also
 //! takes the foreign key's `FOR KEY SHARE` lock on the `sandboxes` row.
 //!
+//! The verbs: the intents [`upsert_open`] and [`upsert_closed`]; the apply
+//! outcomes, [`mark_applied`] and [`mark_failed`] for an apply the api sends
+//! the node and [`record_apply_states`] for the states the node publishes;
+//! the invalidations [`invalidate_open_tcp_exposure_after_proxy_failure`]
+//! and [`invalidate_open_observations`]; and the reads [`list`],
+//! [`list_open`], [`get_tcp`], [`any_open`], [`open_exists`],
+//! [`count_other_open`] and [`to_apply_on_node`].
+//!
+//! [`mark_applied`] and [`mark_failed`] record a node's apply outcome as
+//! guarded transitions: each re-checks in its `WHERE` that the exposure is
+//! still open, and the failure also that no fresh success on the same node
+//! has landed. Matching no row is the losing writer's normal outcome.
 //! [`record_apply_states`] is the node's report of what it applied, fenced
 //! on the sandbox being active on that node; [`to_apply_on_node`] is the read
 //! that tells the node what to apply.
@@ -137,6 +149,118 @@ pub async fn upsert_closed(
     .bind(guest_port)
     .fetch_one(executor)
     .await
+}
+
+/// What a node reported about an exposure's in-guest bridge when it applied
+/// one: the bridge status and, when the guest agent sent one, its service
+/// generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeObservation<'a> {
+    pub bridge_status: &'a str,
+    pub service_generation: Option<&'a str>,
+}
+
+/// Observed projection: records that `node_id` applied the open TCP exposure
+/// of `guest_port`, with the `observation` it reported, observed now by the
+/// database clock. Returns the updated row, or
+/// `None` when the exposure is no longer open (or never existed).
+///
+/// Guarded by `desired_state = 'open'`: a close that landed while the node
+/// was applying the open wins.
+pub async fn mark_applied(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    guest_port: i32,
+    node_id: NodeId,
+    observation: BridgeObservation<'_>,
+) -> Result<Option<PortExposureRecord>, sqlx::Error> {
+    sqlx::query_as::<_, PortExposureRecord>(sql!(
+        "UPDATE sandbox_port_exposures
+         SET apply_state = 'applied',
+             last_applied_node_id = $3,
+             last_error = NULL,
+             last_bridge_status = $4,
+             last_applied_bridge_generation = $5,
+             last_observed_at = NOW(),
+             updated_at = NOW()
+         WHERE sandbox_id = $1
+           AND protocol = 'tcp'
+           AND guest_port = $2
+           AND desired_state = 'open'
+         RETURNING sandbox_id,
+                   protocol,
+                   guest_port,
+                   visibility,
+                   source,
+                   desired_state,
+                   apply_state,
+                   last_applied_node_id,
+                   last_error,
+                   last_bridge_status,
+                   last_applied_bridge_generation,
+                   last_observed_at,
+                   created_at,
+                   updated_at"
+    ))
+    .bind(sandbox_id)
+    .bind(guest_port)
+    .bind(node_id)
+    .bind(observation.bridge_status)
+    .bind(observation.service_generation)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Observed projection: records that applying the open TCP exposure of
+/// `guest_port` on `node_id` failed with `error`. A reported `observation`
+/// replaces the stored bridge status, and its service generation when it has
+/// one, and marks the row observed now by the database clock.
+/// Returns whether a row was marked.
+///
+/// Guarded by `desired_state = 'open'`, and by the row not already being
+/// applied on `node_id` with a working bridge (`direct` or
+/// `loopback_forwarded`) observed at most `freshness_secs` ago: a fresh
+/// success there wins over this failure.
+pub async fn mark_failed(
+    executor: impl PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    guest_port: i32,
+    node_id: NodeId,
+    error: &str,
+    observation: Option<BridgeObservation<'_>>,
+    freshness_secs: i64,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "UPDATE sandbox_port_exposures
+         SET apply_state = 'failed',
+             last_error = $4,
+             last_bridge_status = COALESCE($5::TEXT, last_bridge_status),
+             last_applied_bridge_generation =
+                 COALESCE($6::TEXT, last_applied_bridge_generation),
+             last_observed_at =
+                 CASE WHEN $5::TEXT IS NOT NULL THEN NOW() ELSE last_observed_at END,
+             updated_at = NOW()
+         WHERE sandbox_id = $1
+           AND protocol = 'tcp'
+           AND guest_port = $2
+           AND desired_state = 'open'
+           AND NOT (
+               apply_state = 'applied'
+               AND last_applied_node_id IS NOT DISTINCT FROM $3
+               AND last_bridge_status IN ('direct', 'loopback_forwarded')
+               AND last_observed_at >= NOW() - ($7::BIGINT * INTERVAL '1 second')
+           )"
+    ))
+    .bind(sandbox_id)
+    .bind(guest_port)
+    .bind(node_id)
+    .bind(error)
+    .bind(observation.map(|observation| observation.bridge_status))
+    .bind(observation.and_then(|observation| observation.service_generation))
+    .bind(freshness_secs)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Forget what the node last applied for one open TCP exposure after the

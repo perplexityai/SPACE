@@ -1287,19 +1287,11 @@ impl DirectSubstrate {
             .begin()
             .await
             .db_context("failed to begin owned direct restore transaction")?;
-        let owns_restore = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT TRUE
-               FROM sandboxes
-              WHERE id = $1
-                AND restore_lease_token = $2
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(lease.token)
-        .fetch_optional(&mut *transaction)
-        .await
-        .db_context("failed to validate direct restore ownership")?;
-        if owns_restore.is_none() {
+        let owns_restore =
+            sandbox_direct::lock_restore_lease_owner(&mut transaction, sandbox_id, lease.token)
+                .await
+                .db_context("failed to validate direct restore ownership")?;
+        if !owns_restore {
             return Err(SubstrateError::restore_in_flight(format!(
                 "direct restore ownership changed for sandbox {sandbox_id}"
             )));
@@ -3054,19 +3046,10 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        let (lifecycle, lease_remaining_seconds) =
-            sqlx::query_as::<_, (String, Option<f64>)>(sql!(
-                "SELECT lifecycle,
-                    CASE
-                        WHEN restore_lease_expires_at > NOW() THEN
-                            EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW()))::float8
-                        ELSE NULL
-                    END
-               FROM sandboxes
-              WHERE id = $1"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .fetch_optional(&self.pool)
+        let sandbox_direct::UnexpiredRestoreLease {
+            lifecycle,
+            remaining_seconds: lease_remaining_seconds,
+        } = sandbox_direct::unexpired_restore_lease(&self.pool, sandbox_id)
             .await
             .db_context("failed to inspect direct restore lifecycle")?
             .ok_or_else(|| SubstrateError::NotFound {
@@ -3117,25 +3100,15 @@ impl DirectSubstrate {
             });
         }
 
-        let (lifecycle, remaining_seconds) = sqlx::query_as::<_, (String, Option<f64>)>(sql!(
-            "SELECT lifecycle,
-                    CASE
-                        WHEN restore_lease_expires_at IS NULL THEN NULL
-                        ELSE GREATEST(
-                            EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
-                            0.0
-                        )::float8
-                    END
-               FROM sandboxes
-              WHERE id = $1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .db_context("failed to inspect direct restore lease")?
-        .ok_or_else(|| SubstrateError::NotFound {
-            message: format!("sandbox {sandbox_id} not found"),
-        })?;
+        let sandbox_direct::FlooredRestoreLease {
+            lifecycle,
+            remaining_seconds,
+        } = sandbox_direct::floored_restore_lease(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to inspect direct restore lease")?
+            .ok_or_else(|| SubstrateError::NotFound {
+                message: format!("sandbox {sandbox_id} not found"),
+            })?;
         let lifecycle =
             lifecycle
                 .parse::<SandboxLifecycle>()

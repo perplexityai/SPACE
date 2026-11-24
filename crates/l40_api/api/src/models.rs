@@ -473,7 +473,7 @@ impl SandboxResponse {
     }
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxPortExposure {
     pub sandbox_id: SandboxId,
     pub protocol: String,
