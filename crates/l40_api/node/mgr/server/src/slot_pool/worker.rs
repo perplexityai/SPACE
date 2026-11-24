@@ -545,7 +545,7 @@ pub(super) fn claim_missing_for_create(pool: &NetworkPool, repair: bool) -> Opti
     let Ok(mut conn) = pool.db.lock() else {
         return None;
     };
-    let tx = conn.transaction().ok()?;
+    let tx = Transaction::deferred(&mut conn).ok()?;
     if meta::meta_bool(&tx, "draining").ok()? {
         return None;
     }
@@ -575,7 +575,7 @@ pub(super) fn claim_ready_for_destroy(pool: &NetworkPool) -> Result<Option<u32>,
     }
     let retained = pool.config().retained_ready_slots;
     let mut conn = pool.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-    let tx = conn.transaction()?;
+    let tx = Transaction::deferred(&mut conn)?;
     // Count all ready rows, including those awaiting startup revalidation.
     // A zero-sized pool can retire interrupted, unowned setup directly rather
     // than needing a successful rebuild before teardown. Quarantine still
@@ -603,7 +603,7 @@ pub(super) fn persist_created_slot(
     config: &NetworkPoolConfig,
     slot_id: u32,
     generation: u64,
-) -> rusqlite::Result<usize> {
+) -> pplx_space_node_mgr_store::Result<usize> {
     slots::worker::mark_created_ready(
         conn,
         slot_id,
@@ -618,7 +618,7 @@ pub(super) fn persist_transient_create_failure(
     slot_id: u32,
     generation: u64,
     error: &str,
-) -> rusqlite::Result<usize> {
+) -> pplx_space_node_mgr_store::Result<usize> {
     slots::worker::degrade_failed_create(conn, slot_id, generation, error, now_secs())
 }
 
@@ -627,7 +627,7 @@ pub(super) fn persist_create_quarantine(
     slot_id: u32,
     generation: u64,
     error: &str,
-) -> rusqlite::Result<usize> {
+) -> pplx_space_node_mgr_store::Result<usize> {
     slots::worker::quarantine_failed_create(conn, slot_id, generation, error, now_secs())
 }
 
@@ -1238,8 +1238,8 @@ pub(super) fn apply_ready_validation_updates(
     conn: &mut Connection,
     config: &NetworkPoolConfig,
     updates: &[ReadyValidationUpdate],
-) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
+) -> pplx_space_node_mgr_store::Result<()> {
+    let tx = Transaction::deferred(conn)?;
     let now = now_secs();
     for update in updates {
         match update {
@@ -1315,7 +1315,7 @@ pub(super) fn quarantine_resetting_slot(
     conn: &Connection,
     reset_key: &ResetKey,
     error: &str,
-) -> rusqlite::Result<usize> {
+) -> pplx_space_node_mgr_store::Result<usize> {
     slots::reset::quarantine_reset(
         conn,
         reset_key.slot_id,
@@ -1329,7 +1329,7 @@ pub(super) fn quarantine_resetting_slot_preserving_lease(
     conn: &Connection,
     reset_key: &ResetKey,
     error: &str,
-) -> rusqlite::Result<usize> {
+) -> pplx_space_node_mgr_store::Result<usize> {
     slots::reset::quarantine_reset_preserving_lease(
         conn,
         reset_key.slot_id,

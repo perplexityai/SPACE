@@ -3,15 +3,15 @@
 use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
 use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use pplx_space_sql_locator::sql;
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{OptionalExtension as _, params};
+
+use crate::{Connection, Result};
 
 /// The fence recorded for `sandbox_id`. An unparsable identity is a
 /// conversion failure of column 0.
-pub fn execution_fence(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> rusqlite::Result<Option<ExecutionFence>> {
+pub fn execution_fence(conn: &Connection, sandbox_id: &str) -> Result<Option<ExecutionFence>> {
     let raw: Option<(String, Option<String>)> = conn
+        .0
         .query_row(
             sql!("SELECT execution_id, previous_id FROM sandbox_executions WHERE sandbox_id = ?1"),
             params![sandbox_id],
@@ -37,12 +37,8 @@ pub fn execution_fence(
 }
 
 /// Record `fence` as `sandbox_id`'s execution fence, replacing the one before.
-pub fn bind_execution(
-    conn: &Connection,
-    sandbox_id: &str,
-    fence: ExecutionFence,
-) -> rusqlite::Result<()> {
-    conn.execute(
+pub fn bind_execution(conn: &Connection, sandbox_id: &str, fence: ExecutionFence) -> Result<()> {
+    conn.0.execute(
         sql!(
             "INSERT INTO sandbox_executions (sandbox_id, execution_id, previous_id) VALUES (?1, ?2, ?3)
              ON CONFLICT (sandbox_id) DO UPDATE SET execution_id = excluded.execution_id,
@@ -59,8 +55,8 @@ pub fn retire_execution(
     conn: &Connection,
     sandbox_id: &str,
     expected: SandboxActivationAttemptId,
-) -> rusqlite::Result<bool> {
-    let retired = conn.execute(
+) -> Result<bool> {
+    let retired = conn.0.execute(
         sql!("DELETE FROM sandbox_executions WHERE sandbox_id = ?1 AND execution_id = ?2"),
         params![sandbox_id, expected.to_string()],
     )?;

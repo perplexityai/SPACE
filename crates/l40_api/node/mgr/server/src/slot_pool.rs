@@ -8,12 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use pplx_space_node_mgr_store::{Connection, Transaction, executions, meta, slots};
 pub use pplx_space_node_mgr_store::{LeaseKind, PoolValueParseError, SlotHealth, SlotState};
-use pplx_space_node_mgr_store::{executions, meta, slots};
 use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 #[cfg(test)]
 use rusqlite::params;
-use rusqlite::{Connection, Transaction};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -159,7 +158,7 @@ pub enum SlotStoreError {
     #[error("network lease setup or recovery for {0} is incomplete; retry allocation")]
     LeaseNotReady(String),
     #[error("network slot database: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] pplx_space_node_mgr_store::Error),
     #[error(transparent)]
     InvalidValue(#[from] PoolValueParseError),
     #[error(
@@ -369,7 +368,7 @@ pub(crate) enum ActiveLeaseMemoryReservationError {
     #[error("active lease memory reservation database lock is poisoned")]
     LockPoisoned,
     #[error("failed to query active lease memory reservations: {0}")]
-    Query(#[from] rusqlite::Error),
+    Query(#[from] pplx_space_node_mgr_store::Error),
     #[error("active lease contains invalid sandbox id {sandbox_id}: {source}")]
     InvalidSandboxId {
         sandbox_id: String,
@@ -576,9 +575,7 @@ impl NetworkPool {
         db_path: &Path,
     ) -> Result<(), PoolOpenError> {
         validate_config(config).map_err(PoolOpenError::Configuration)?;
-        let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(SlotStoreError::from)?;
-        conn.busy_timeout(Duration::from_secs(5))
+        let conn = pplx_space_node_mgr_store::database::open_read_only(db_path)
             .map_err(SlotStoreError::from)?;
         validate_startup_ownership(&conn, config)?;
         Ok(())
@@ -679,7 +676,7 @@ impl NetworkPool {
     ) -> std::sync::Arc<Self> {
         config.pod_netns_path = config.pod_netns_path.as_deref().map(normalize_netns_name);
         validate_config(&config).unwrap();
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory();
         configure_db(&conn).unwrap();
         init_in_memory_db(&mut conn, &config).unwrap();
         let (job_tx, _job_rx) = mpsc::channel(1);
@@ -712,6 +709,7 @@ impl NetworkPool {
         self.db
             .lock()
             .unwrap()
+            .raw()
             .execute(
                 "UPDATE network_slots
                  SET state = 'ready', health = 'healthy', pod_netns_path = NULL,
@@ -859,7 +857,7 @@ impl NetworkPool {
         memory_reservation: Option<NewLeaseMemoryReservation>,
     ) -> Result<SlotInfo, AllocateSlotError> {
         let mut conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let tx = conn.transaction().map_err(SlotStoreError::from)?;
+        let tx = Transaction::deferred(&mut conn).map_err(SlotStoreError::from)?;
 
         let stale_slot_to_reset = match query_current_lease_by_sandbox(&tx, sandbox_id)
             .map_err(SlotStoreError::from)?
@@ -1036,7 +1034,7 @@ impl NetworkPool {
     ) -> Result<EphemeralSlotClaimResult, AllocateSlotError> {
         let config = self.config();
         let mut conn = self.db.lock().map_err(|_| SlotStoreError::LockPoisoned)?;
-        let tx = conn.transaction().map_err(SlotStoreError::from)?;
+        let tx = Transaction::deferred(&mut conn).map_err(SlotStoreError::from)?;
 
         let stale_slot_to_reset = match query_current_lease_by_sandbox(&tx, sandbox_id)
             .map_err(SlotStoreError::from)?
@@ -1370,7 +1368,7 @@ impl NetworkPool {
                 .db
                 .lock()
                 .map_err(|error| format!("slot pool db lock poisoned: {error}"))?;
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = Transaction::deferred(&mut conn).map_err(|e| e.to_string())?;
             let Some(current) =
                 slots::lease_to_release(&tx, sandbox_id).map_err(|e| e.to_string())?
             else {

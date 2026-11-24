@@ -58,7 +58,7 @@ fn slot_vocabularies_round_trip_through_text() {
 }
 
 /// A migrated in-memory node-manager database.
-pub(crate) fn migrated_db() -> rusqlite::Connection {
+pub(crate) fn migrated_db() -> Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     for migration in database::MIGRATOR
         .iter()
@@ -66,7 +66,7 @@ pub(crate) fn migrated_db() -> rusqlite::Connection {
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    conn
+    Connection(conn)
 }
 
 #[test]

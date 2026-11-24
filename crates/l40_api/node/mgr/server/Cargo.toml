@@ -37,7 +37,6 @@ pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs", "mount", "process"] }
 nix = { workspace = true, features = ["dir", "fs", "mount", "sched", "process", "resource", "signal", "user"] }
-rusqlite = { workspace = true }
 socket2 = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -102,8 +101,11 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
-# SqliteU64, the u64 bind type of the slot pool tests' fixture SQL.
+# The slot pool tests seed and inspect rows through the store's raw
+# connection with rusqlite, binding u64 values as SqliteU64.
+pplx-space-node-mgr-store = { workspace = true, features = ["test-support"] }
 pplx-space-sqlite = { workspace = true }
+rusqlite = { workspace = true }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }

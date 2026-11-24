@@ -209,6 +209,7 @@ async fn releasing_an_owner_leaves_a_colliding_resets_queued_wakeup() {
         pool.db
             .lock()
             .unwrap()
+            .raw()
             .execute_batch(
                 "UPDATE network_slots
                  SET state = 'dirty', generation = 7, lease_kind = 'ephemeral'",

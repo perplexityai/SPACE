@@ -2,11 +2,16 @@
 //! slot pool (`network_slots`, `network_pool_meta`) and the execution fence of
 //! each sandbox (`sandbox_executions`).
 //!
-//! Every verb runs on the caller's connection or transaction. [`database`]
-//! migrates the database and opens it with its busy timeout and PRAGMAs; the
-//! startup repair sequence stays in `pplx-space-node-mgr`, which holds the one
-//! connection behind its pool lock. Where a slot-keyed write follows its read
-//! inside the caller's transaction, the two come together:
+//! Every verb takes the store's [`Connection`], so it runs on the caller's
+//! connection or inside the [`Transaction`] the caller opened on it, and
+//! fails with the store's [`Error`]; [`slots::lease_to_release`],
+//! [`slots::ready_slot_to_lease`] and [`slots::idle_slot_scan`] take the
+//! [`Transaction`] itself. [`database`] migrates the database, opens it with
+//! its busy timeout and PRAGMAs, and opens it read-only for node-manager's
+//! startup check; the startup repair sequence stays in `pplx-space-node-mgr`,
+//! which holds the one connection behind its pool lock. `AGENTS.md` lists the
+//! rules for this crate's public surface. Where a slot-keyed write follows
+//! its read inside the caller's transaction, the two come together:
 //! [`slots::ready_slot_to_lease`] and [`slots::lease_to_release`] return the
 //! row with the write bound to it, so the caller's checks run in between and
 //! the write cannot reach another row or transaction.
@@ -25,9 +30,11 @@
 
 pub mod database;
 pub mod executions;
+mod handle;
 pub mod meta;
 pub mod slots;
 
+pub use handle::{Connection, Error, Result, Transaction};
 pub use slots::{LeaseKind, PoolValueParseError, SlotHealth, SlotState};
 
 #[cfg(test)]
