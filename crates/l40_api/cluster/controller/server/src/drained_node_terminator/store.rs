@@ -14,7 +14,9 @@ use pplx_space_sandbox_portability::{
 };
 use pplx_space_sandbox_residency::{self as sandbox_residency, ResidencyEvidence};
 use pplx_space_sandbox_store::lost::{self, DEAD_UPLOAD_SETTLE, write_off_lost_sandboxes};
-use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
+use pplx_space_snapshot_store::lost::{
+    fail_quiet_full_uploads_from_node, lock_creating_full_uploads_from_node,
+};
 use sqlx::PgPool;
 
 use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
@@ -512,19 +514,8 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // residual (terminal flip beats a finalize RPC still in flight one
         // tick after the instance was confirmed terminated) is accepted:
         // the bytes are preserved in S3 and the row is operator-revivable.
-        let _locked_dead_uploads: Vec<SnapshotId> = sqlx::query_scalar(sql!(
-            "SELECT id FROM snapshots
-              WHERE sandbox_id = ANY($1)
-                AND source_node_id = $2
-                AND type = 'full'
-                AND state = 'creating'
-              ORDER BY id
-              FOR UPDATE"
-        ))
-        .bind(&claimed)
-        .bind(node_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let _locked_dead_uploads: Vec<SnapshotId> =
+            lock_creating_full_uploads_from_node(&mut tx, &claimed, node_id).await?;
         // The flip is restricted to the claimed ids: the claim only fences
         // rows that matched at its own snapshot, so a row entering the
         // candidate set after it must wait for the next tick's claim rather

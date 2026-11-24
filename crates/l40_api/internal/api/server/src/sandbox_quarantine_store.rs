@@ -2,8 +2,6 @@
 
 use pplx_space_accounts::NodeId;
 
-use std::sync::LazyLock;
-
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_metrics::publication::{
     StatePublicationComponent, StatePublicationDisposition, StatePublicationField,
@@ -14,9 +12,6 @@ use pplx_space_sandbox_model::{
     SandboxQuarantineReasonCode, SandboxQuarantineRecoveryPolicy, SandboxQuarantineSource,
     SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
-use pplx_space_sandbox_portability::{
-    pre_quarantine_suspend_snapshot_current, quarantine_recovery_suspend_snapshot_current,
-};
 use pplx_space_sandbox_quarantine_store::node_recovery_receipt::{self, NodeRecovery};
 use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
 use pplx_space_sandbox_store::quarantine_publication::{
@@ -25,8 +20,8 @@ use pplx_space_sandbox_store::quarantine_publication::{
 use pplx_space_sandbox_store::quarantine_recovery_authority;
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use pplx_space_sql_locator::sql;
+use sqlx::PgPool;
 use sqlx::types::Json;
-use sqlx::{FromRow, PgPool};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -80,14 +75,6 @@ pub(super) struct QuarantineRecoveryPlanRow {
     pub(super) bytes_uploaded: i64,
 }
 
-#[derive(FromRow)]
-struct RecoverySnapshotRow {
-    snapshot_id: SnapshotId,
-    local_artifact_id: Option<LocalArtifactId>,
-    storage_uri: String,
-    size_bytes: Option<i64>,
-}
-
 fn reject_quarantine_recovery_plan(
     sandbox_id: SandboxId,
     node_id: NodeId,
@@ -103,47 +90,6 @@ fn reject_quarantine_recovery_plan(
     );
     Status::failed_precondition(message)
 }
-
-/// The recovery snapshot lookup, differing between the two policies only in which
-/// currency predicate selects the row.
-///
-/// One builder rather than two copies of the same twelve-line SELECT: a column
-/// added to the projection has to reach both, and both decode into the same
-/// `RecoverySnapshotRow`, so a miss is a runtime Postgres decode error on the
-/// rarely-taken pre-quarantine arm rather than a compile error. Built once — every
-/// input is a literal, so rebuilding it per request only allocated.
-fn recovery_snapshot_query(predicate: &str) -> String {
-    format!(
-        "SELECT snapshot.id AS snapshot_id,
-                snapshot.local_artifact_id,
-                location.storage_connection_string AS storage_uri,
-                snapshot.size_bytes
-           FROM snapshots snapshot
-           JOIN snapshot_storage_locations location
-             ON location.snapshot_id = snapshot.id
-           JOIN sandboxes current_sandbox
-             ON current_sandbox.id = snapshot.sandbox_id
-          WHERE current_sandbox.id = $1
-            AND {predicate}
-          ORDER BY snapshot.timestamp DESC
-          LIMIT 1"
-    )
-}
-
-/// The exact-artifact lookup: the snapshot must name the artifact the node holds.
-static EXACT_ARTIFACT_SNAPSHOT_QUERY: LazyLock<String> = LazyLock::new(|| {
-    let current = quarantine_recovery_suspend_snapshot_current("current_sandbox", "snapshot");
-    sql!(
-        recovery_snapshot_query(&format!("snapshot.local_artifact_id = $2 AND {current}")).as_str()
-    )
-});
-
-/// The pre-quarantine fallback: the newest suspend snapshot from before the
-/// episode was entered, which only `OrphanedSandboxRowMissing`'s policy admits.
-static PRE_QUARANTINE_SNAPSHOT_QUERY: LazyLock<String> = LazyLock::new(|| {
-    let current = pre_quarantine_suspend_snapshot_current("current_sandbox", "snapshot", "$2");
-    sql!(recovery_snapshot_query(&current).as_str())
-});
 
 /// The one message every rejection that turns on node ownership returns.
 ///
@@ -235,17 +181,18 @@ pub(super) async fn get_quarantine_recovery_plan(
         (Some(id), Some("full"), Some("suspend")) => Some(id),
         _ => None,
     };
-    let snapshot: Option<RecoverySnapshotRow> = match (policy, exact_artifact) {
+    let snapshot = match (policy, exact_artifact) {
         (
             SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact
             | SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact,
             Some(local_artifact_id),
         ) => {
-            sqlx::query_as(sqlx::AssertSqlSafe(EXACT_ARTIFACT_SNAPSHOT_QUERY.as_str()))
-                .bind(sandbox_id.as_uuid())
-                .bind(local_artifact_id)
-                .fetch_optional(pool)
-                .await
+            pplx_space_snapshot_store::quarantine_recovery::exact_artifact_snapshot(
+                pool,
+                sandbox_id,
+                local_artifact_id,
+            )
+            .await
         }
         (SandboxQuarantineRecoveryPolicy::ExactSuspendArtifact, None) => {
             return Err(reject_quarantine_recovery_plan(
@@ -256,11 +203,12 @@ pub(super) async fn get_quarantine_recovery_plan(
             ));
         }
         (SandboxQuarantineRecoveryPolicy::ExactOrPreQuarantineSuspendArtifact, None) => {
-            sqlx::query_as(sqlx::AssertSqlSafe(PRE_QUARANTINE_SNAPSHOT_QUERY.as_str()))
-                .bind(sandbox_id.as_uuid())
-                .bind(recovery.entered_at)
-                .fetch_optional(pool)
-                .await
+            pplx_space_snapshot_store::quarantine_recovery::pre_quarantine_snapshot(
+                pool,
+                sandbox_id,
+                recovery.entered_at,
+            )
+            .await
         }
     }
     .map_err(|error| Status::internal(format!("recovery snapshot lookup: {error}")))?;

@@ -6,9 +6,7 @@ use std::time::Duration;
 use pplx_space_public_api::{OperationId, OperationState};
 use pplx_space_public_operation_store as operation_store;
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_sandbox_portability::no_newer_full_snapshot;
 use pplx_space_snapshot_model::LocalArtifactId;
-use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -143,42 +141,12 @@ impl ForkOperationStore {
         &self,
         source_sandbox_id: SandboxId,
     ) -> Result<Option<(SnapshotId, Uuid)>, ForkOperationStoreError> {
-        let no_newer = no_newer_full_snapshot("s", "sn");
-        let query = format!(
-            "SELECT sn.id, ssl.id
-             FROM sandboxes s
-             JOIN snapshots sn
-               ON sn.sandbox_id = s.id
-              AND sn.artifact_kind = 'full'
-              AND sn.type = 'full'
-              AND sn.state = 'ready'
-              AND (sn.artifact_origin IS NULL OR sn.artifact_origin = 'suspend')
-             JOIN LATERAL (
-                 SELECT id
-                 FROM snapshot_storage_locations
-                 WHERE snapshot_id = sn.id AND orphaned_at IS NULL
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1
-             ) ssl ON TRUE
-             WHERE s.id = $1
-               AND s.lifecycle = 'suspended'
-               AND (
-                   (s.current_local_artifact_id IS NOT NULL
-                    AND s.current_local_artifact_origin = 'suspend'
-                    AND sn.local_artifact_id = s.current_local_artifact_id)
-                   OR (s.current_local_artifact_id IS NULL
-                       AND (s.placement_changed_at IS NULL
-                            OR sn.timestamp >= s.placement_changed_at))
-               )
-               AND {no_newer}
-             ORDER BY sn.timestamp DESC, sn.id DESC
-             LIMIT 1"
-        );
-        sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(source_sandbox_id.as_uuid())
-            .fetch_optional(self.pool())
-            .await
-            .map_err(Into::into)
+        let artifact = pplx_space_snapshot_store::fork_source::suspended_artifact(
+            self.pool(),
+            source_sandbox_id,
+        )
+        .await?;
+        Ok(artifact.map(|artifact| (artifact.snapshot_id, artifact.storage_location_id)))
     }
 
     pub async fn select_capture_leader(
@@ -326,23 +294,13 @@ impl ForkOperationStore {
             input.org_id,
         )
         .await?;
-        sqlx::query(sql!(
-            "INSERT INTO snapshot_storage_locations (
-                 id, snapshot_id, storage_connection_string, org_id
-             ) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE
-             SET snapshot_id = EXCLUDED.snapshot_id,
-                 storage_connection_string = EXCLUDED.storage_connection_string,
-                 org_id = EXCLUDED.org_id,
-                 orphaned_at = NULL
-             WHERE snapshot_storage_locations.snapshot_id IS NULL
-               AND snapshot_storage_locations.orphaned_at IS NOT NULL"
-        ))
-        .bind(input.storage_location_id)
-        .bind(input.snapshot_id)
-        .bind(input.destination_storage_uri)
-        .bind(input.org_id)
-        .execute(&mut *tx)
+        pplx_space_snapshot_store::disk_artifact::attach_fork_copy_location(
+            &mut *tx,
+            input.storage_location_id,
+            input.snapshot_id,
+            input.destination_storage_uri,
+            input.org_id,
+        )
         .await?;
         tx.commit().await?;
         Ok(())
@@ -354,23 +312,14 @@ impl ForkOperationStore {
         owner_sandbox_id: SandboxId,
         size_bytes: u64,
     ) -> Result<bool, ForkOperationStoreError> {
-        let updated = sqlx::query(sql!(
-            "UPDATE snapshots
-             SET state = 'ready', size_bytes = $2
-             WHERE id = $1
-               AND sandbox_id = $3
-               AND type = 'disk'
-               AND artifact_kind = 'disk'
-               AND artifact_origin = 'fork'
-               AND state IN ('creating', 'ready')"
-        ))
-        .bind(snapshot_id)
-        .bind(i64::try_from(size_bytes).unwrap_or(i64::MAX))
-        .bind(owner_sandbox_id.as_uuid())
-        .execute(self.pool())
-        .await?
-        .rows_affected();
-        Ok(updated == 1)
+        pplx_space_snapshot_store::disk_artifact::mark_fork_copy_ready(
+            self.pool(),
+            snapshot_id,
+            owner_sandbox_id,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn rebind_copied_artifact_owner(
@@ -379,23 +328,14 @@ impl ForkOperationStore {
         source_sandbox_id: SandboxId,
         target_sandbox_id: SandboxId,
     ) -> Result<bool, ForkOperationStoreError> {
-        let updated = sqlx::query(sql!(
-            "UPDATE snapshots
-             SET sandbox_id = $3
-             WHERE id = $1
-               AND sandbox_id IN ($2, $3)
-               AND type = 'disk'
-               AND artifact_kind = 'disk'
-               AND artifact_origin = 'fork'
-               AND state = 'ready'"
-        ))
-        .bind(snapshot_id)
-        .bind(source_sandbox_id.as_uuid())
-        .bind(target_sandbox_id.as_uuid())
-        .execute(self.pool())
-        .await?
-        .rows_affected();
-        Ok(updated == 1)
+        pplx_space_snapshot_store::disk_artifact::rebind_fork_copy_owner(
+            self.pool(),
+            snapshot_id,
+            source_sandbox_id,
+            target_sandbox_id,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn retire_copied_artifact(
@@ -404,27 +344,14 @@ impl ForkOperationStore {
         storage_location_id: Uuid,
     ) -> Result<(), ForkOperationStoreError> {
         let mut tx = self.pool().begin().await?;
-        sqlx::query(sql!(
-            "UPDATE snapshot_storage_locations
-             SET snapshot_id = NULL, orphaned_at = NOW()
-             WHERE id = $1 AND snapshot_id = $2 AND orphaned_at IS NULL"
-        ))
-        .bind(storage_location_id)
-        .bind(snapshot_id)
-        .execute(&mut *tx)
+        pplx_space_snapshot_store::disk_artifact::orphan_fork_copy_location(
+            &mut *tx,
+            snapshot_id,
+            storage_location_id,
+        )
         .await?;
-        sqlx::query(sql!(
-            "DELETE FROM snapshots s
-             WHERE s.id = $1
-               AND s.artifact_origin = 'fork'
-               AND NOT EXISTS (
-                   SELECT 1 FROM snapshot_storage_locations ssl
-                   WHERE ssl.snapshot_id = s.id AND ssl.orphaned_at IS NULL
-               )"
-        ))
-        .bind(snapshot_id)
-        .execute(&mut *tx)
-        .await?;
+        pplx_space_snapshot_store::disk_artifact::delete_unlocated_fork_copy(&mut *tx, snapshot_id)
+            .await?;
         tx.commit().await?;
         Ok(())
     }

@@ -30,7 +30,6 @@ mod readiness_stub {
 #[cfg(not(feature = "kubernetes"))]
 pub use readiness_stub::ReflectorReady;
 
-use pplx_space_sql_locator::sql;
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
@@ -74,7 +73,6 @@ use pplx_space_node_api_client::{
     },
 };
 use pplx_space_public_api::OperationId;
-use pplx_space_sandbox_portability::deleting_snapshot_matches_artifact;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use time::OffsetDateTime;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
