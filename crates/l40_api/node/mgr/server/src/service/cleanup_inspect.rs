@@ -755,7 +755,8 @@ impl NodeManagerService {
                 .await;
         }
         let service = self.clone();
-        // Optional inventory work must not exhaust the admission Stats uses.
+        // A sandbox-manager without `cgroup_only` still sends Stats here, so
+        // this path takes no diagnostic admission.
         self.off_runtime("inspect sandbox", move || {
             service.inspect_sandbox_blocking(request)
         })
@@ -961,8 +962,9 @@ fn parse_cleanup_request(
     Ok((sandbox_id, request))
 }
 
-/// The sandbox cgroup files Stats reports, from the cgroup
-/// `sandbox_cgroup_dir` picks. Absent files read as empty.
+/// The sandbox cgroup files Stats reports. Reads the jailer (VM) cgroup
+/// `{id}` when it exists, else the sidecar cgroup `sbx-{id}`. Absent files
+/// read as empty.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SandboxCgroup {
     exists: bool,
