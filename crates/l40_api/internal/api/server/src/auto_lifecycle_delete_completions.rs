@@ -24,8 +24,9 @@ use pplx_space_sandbox_quarantine_store::locks::lock_orphan_quarantine_match;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::auto_lifecycle_delete_completion;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
+use pplx_space_sandbox_store::k8s_executions::auto_lifecycle_delete;
 use pplx_space_sql_locator::sql;
-use sqlx::{Acquire as _, FromRow, Postgres, Transaction};
+use sqlx::{Acquire as _, Postgres, Transaction};
 use tonic::Status;
 
 use crate::proto::AutoLifecycleDeleteCompletion;
@@ -93,14 +94,6 @@ impl TryFrom<&AutoLifecycleDeleteCompletion> for ParsedCompletion {
             policy_fingerprint,
         })
     }
-}
-
-#[derive(Debug, FromRow)]
-struct CompletionEvidenceRow {
-    latest_execution_generation: ExecutionGeneration,
-    route_activation_id: Option<SandboxActivationAttemptId>,
-    publisher_owns_execution: bool,
-    creating_snapshot_exists: bool,
 }
 
 /// What one receipt's evaluation decided, before the caller keeps or discards
@@ -472,30 +465,11 @@ async fn apply_receipt(
     // execution and snapshot inserts through their sandboxes foreign key.
     // Keep this as a second statement: PostgreSQL need not acquire a row
     // lock before evaluating subqueries in the locking SELECT itself.
-    let evidence = sqlx::query_as::<_, CompletionEvidenceRow>(sql!(
-        "SELECT execution.generation AS latest_execution_generation,
-                execution.route_activation_id,
-                EXISTS (
-                    SELECT 1
-                      FROM node_k8s
-                     WHERE node_k8s.node_id = $2
-                       AND node_k8s.k8s_node_name = execution.k8s_node_name
-                ) AS publisher_owns_execution,
-                EXISTS (
-                    SELECT 1
-                      FROM snapshots snapshot
-                     WHERE snapshot.sandbox_id = $1
-                       AND snapshot.state = 'creating'
-                ) AS creating_snapshot_exists
-           FROM sandbox_k8s_executions execution
-          WHERE execution.sandbox_id = $1
-          ORDER BY execution.generation DESC
-          LIMIT 1
-          FOR UPDATE OF execution NOWAIT"
-    ))
-    .bind(completion.sandbox_id)
-    .bind(origin_node_id)
-    .fetch_optional(&mut **tx)
+    let evidence = auto_lifecycle_delete::lock_latest_execution_evidence(
+        tx,
+        completion.sandbox_id,
+        origin_node_id,
+    )
     .await;
     let evidence = match evidence {
         Ok(evidence) => evidence,

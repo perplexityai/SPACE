@@ -3,17 +3,17 @@
 //! to `suspended`, or holding an ambiguous one in `quarantined`.
 //!
 //! Also the reconciler's candidate list ([`list_candidates_after`]), with its
-//! database-clock age comparisons. The reconciler keeps everything around
-//! them: its plan read (`SELECT ... FOR UPDATE` on the same guard), the
-//! transaction, the reconcile-state cleanup, and the quarantine state and
-//! history rows. Each write here is one statement whose CTEs also retire the
-//! active execution and reset open port exposures; splitting it would change
-//! what it does.
+//! database-clock age comparisons. Its plan read, `SELECT ... FOR UPDATE` on
+//! the same guard, is [`plan`]. The reconciler
+//! keeps everything around them: the transaction, the reconcile-state
+//! cleanup, and the quarantine state and history rows. Each write here is one
+//! statement whose CTEs also retire the active execution and reset open port
+//! exposures; splitting it would change what it does.
 //!
-//! The classification guard fragments ([`classify_guard_sql`],
-//! [`classify_guard_from_sql`] and [`classify_guard_lock_sql`]) are also
-//! interpolated by the reconciler's plan read. They are public so that each
-//! guard keeps one definition while that read lives elsewhere.
+//! The classification guard fragments (`classify_guard_sql`,
+//! `classify_guard_from_sql` and `classify_guard_lock_sql`) build the writes
+//! here. [`plan`] spells the same guard out in each of its statements, and its
+//! tests compare them with these fragments: change them together.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_ids::PodUid;
@@ -24,6 +24,8 @@ use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_residency::node_observes_sandbox;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgConnection, Postgres, Transaction};
+
+pub mod plan;
 
 /// Stable namespace for the per-sandbox advisory transaction lock that
 /// coordinates node-state publication (`SHARED`) with orphan classification,
@@ -85,12 +87,12 @@ pub async fn lock_orphan_observation(
     Ok(())
 }
 
-/// The classification guard a statement here re-checks, with the values it
-/// binds: the reconciler's own guard, converted at its call site, and the
-/// same lifecycle sets and create age it binds into its plan read.
+/// The classification guard a statement here or in [`plan`] re-checks, with
+/// the values it binds: the reconciler's own guard, lifecycle sets and create
+/// age, converted at its call site.
 ///
-/// Every statement that interpolates the guard fragments binds `$1` = sandbox
-/// id and `$2` = the reconciler's stop lifecycles, then for
+/// Every statement that takes an `OrphanGuard` binds `$1` = sandbox id and
+/// `$2` = the reconciler's stop lifecycles, then for
 /// [`OrphanGuard::PodName`] `$3` = pod name, `$4` = pod UID, `$5` = the
 /// live-pod lifecycles, `$6` = the pending-pod lifecycles and `$7` = the
 /// create age in seconds, and for [`OrphanGuard::Forgotten`] `$3` = the
@@ -481,7 +483,7 @@ pub async fn list_candidates_after(
 /// The guard's lifecycle and execution predicate, on the row aliased `s` and,
 /// for [`OrphanGuard::PodName`], the execution aliased `e` (see
 /// [`classify_guard_from_sql`]). Bind order as on [`OrphanGuard`].
-pub fn classify_guard_sql(guard: &OrphanGuard<'_>) -> &'static str {
+fn classify_guard_sql(guard: &OrphanGuard<'_>) -> &'static str {
     match guard {
         OrphanGuard::PodName { .. } => {
             "(
@@ -519,7 +521,7 @@ pub fn classify_guard_sql(guard: &OrphanGuard<'_>) -> &'static str {
 /// The `FROM` items the guard reads: `sandboxes s`, joined for
 /// [`OrphanGuard::PodName`] to the active execution `e` with the observed pod
 /// name and UID.
-pub fn classify_guard_from_sql(guard: &OrphanGuard<'_>) -> &'static str {
+fn classify_guard_from_sql(guard: &OrphanGuard<'_>) -> &'static str {
     match guard {
         OrphanGuard::PodName { .. } => {
             "sandboxes s
@@ -534,7 +536,7 @@ pub fn classify_guard_from_sql(guard: &OrphanGuard<'_>) -> &'static str {
 }
 
 /// The `FOR UPDATE OF` targets that lock what the guard read.
-pub fn classify_guard_lock_sql(guard: &OrphanGuard<'_>) -> &'static str {
+fn classify_guard_lock_sql(guard: &OrphanGuard<'_>) -> &'static str {
     match guard {
         OrphanGuard::PodName { .. } => "s, e",
         OrphanGuard::Forgotten { .. } | OrphanGuard::LegacyDeleting => "s",

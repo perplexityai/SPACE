@@ -1,0 +1,51 @@
+//! The cluster controller's recovery of an abandoned quarantine publication
+//! after its only execution disappeared: the lock of the sandbox's
+//! executions, and the retire of the execution the recovery proved gone.
+//!
+//! The recovery keeps its transaction and `lock_timeout`, its lock order
+//! (sandbox, quarantine episode, executions, then the snapshot rows), and the
+//! re-read of its candidate under those locks that decides whether the
+//! retire runs.
+
+use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
+use sqlx::{Postgres, Transaction};
+use uuid::Uuid;
+
+/// Lock every execution row of the sandbox, active or not, `FOR UPDATE`.
+/// The lock lasts until the caller's transaction ends.
+pub async fn lock_executions(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT id FROM sandbox_k8s_executions WHERE sandbox_id = $1 FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Retire the execution `execution_id` as `suspended`. **Operation step** of
+/// the recovery: its `WHERE` checks only the id, because the caller's locks
+/// ([`lock_executions`] among them) and its re-read of the candidate guard
+/// it. `false` when there is no such execution, and nothing changes.
+pub async fn retire_recovered_execution(
+    executor: impl sqlx::PgExecutor<'_>,
+    execution_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET active = FALSE, state = 'suspended', pod_ip = NULL,
+             terminated_at = COALESCE(terminated_at, NOW()), updated_at = NOW()
+          WHERE id = $1"
+    ))
+    .bind(execution_id)
+    .execute(executor)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+#[cfg(test)]
+mod tests;

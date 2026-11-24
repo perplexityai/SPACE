@@ -57,7 +57,6 @@ use pplx_space_accounts::NodeId;
 
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
-use pplx_space_sql_locator::sql;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,12 +73,8 @@ use pplx_space_sandbox_model::{
     SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
-use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
 use pplx_space_sandbox_quarantine_store::orphan_quarantine::{self, OrphanQuarantine};
-use pplx_space_sandbox_residency::node_observes_sandbox;
-use pplx_space_sandbox_store::orphan::{
-    self, OrphanGuard, classify_guard_from_sql, classify_guard_lock_sql, classify_guard_sql,
-};
+use pplx_space_sandbox_store::orphan::{self, OrphanGuard};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -1544,62 +1539,31 @@ fn quarantine_reason(guard: &ClassifyGuard) -> (SandboxQuarantineReasonCode, &'s
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct OrphanPlanRow {
-    from_lifecycle: SandboxLifecycle,
-    recoverable: bool,
-    creating_snapshot: bool,
-    node_reports_copy: bool,
-}
-
 async fn plan_orphan_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
     guard: &ClassifyGuard,
     lock: bool,
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
-    if lock {
-        orphan::lock_orphan_observation(tx, sandbox_id).await?;
-    }
-    let eligibility = orphan_recovery_revert_eligibility("s");
-    let recoverable = eligibility.eligible;
-    // internal-api writes a node's observed state only for the rows it is the
-    // active node of, so that is the node whose report counts.
-    let node_observes = node_observes_sandbox("s", "s.active_node_id");
     let store_guard = guard.store_guard();
-    let guard_sql = classify_guard_sql(&store_guard);
-    let guard_from_sql = classify_guard_from_sql(&store_guard);
-    let lock_sql = if lock {
-        format!(" FOR UPDATE OF {}", classify_guard_lock_sql(&store_guard))
+    let row = if lock {
+        orphan::lock_orphan_observation(tx, sandbox_id).await?;
+        orphan::plan::lock_plan(
+            tx,
+            sandbox_id,
+            ORPHAN_RECONCILER_STOP_LIFECYCLES,
+            &store_guard,
+        )
+        .await?
     } else {
-        String::new()
+        orphan::plan::read_plan(
+            &mut **tx,
+            sandbox_id,
+            ORPHAN_RECONCILER_STOP_LIFECYCLES,
+            &store_guard,
+        )
+        .await?
     };
-    let query = format!(
-        "SELECT s.lifecycle AS from_lifecycle,
-                ({recoverable}) AS recoverable,
-                EXISTS (
-                    SELECT 1
-                      FROM snapshots creating_snapshot
-                     WHERE creating_snapshot.sandbox_id = s.id
-                       AND creating_snapshot.state = 'creating'
-                ) AS creating_snapshot,
-                -- The revert restores a snapshot, which loses whatever the
-                -- sandbox wrote since. The activity clocks can't prove it
-                -- wrote nothing, so while the node holding its copy reports
-                -- it, that node decides. The candidate listing skips such a
-                -- row whatever the census's age, so this sees a report the
-                -- node published after the listing, and holds it the same
-                -- way. Any record
-                -- counts, unlike the drain's `vm_observed`: a node that
-                -- reports the sandbox `failed` gets the row projected
-                -- `failed` itself.
-                {node_observes} AS node_reports_copy
-           FROM {guard_from_sql}
-          WHERE s.id = $1
-            AND s.lifecycle <> ALL($2)
-            AND {guard_sql}{lock_sql}"
-    );
-    let row = fetch_guarded_plan(tx, query, sandbox_id, guard).await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -1624,36 +1588,6 @@ async fn plan_orphan_in_tx(
         from_lifecycle: row.from_lifecycle,
         disposition,
     }))
-}
-
-async fn fetch_guarded_plan(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    query: String,
-    sandbox_id: SandboxId,
-    guard: &ClassifyGuard,
-) -> Result<Option<OrphanPlanRow>, sqlx::Error> {
-    let query = sqlx::query_as::<_, OrphanPlanRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES);
-    match guard {
-        ClassifyGuard::PodName { name, uid } => {
-            query
-                .bind(name)
-                .bind(uid)
-                .bind(LIVE_POD_REQUIRED_LIFECYCLES)
-                .bind(PENDING_POD_LIFECYCLES)
-                .bind(CREATE_AGE_THRESHOLD_SECS)
-                .fetch_optional(&mut **tx)
-                .await
-        }
-        ClassifyGuard::Forgotten => {
-            query
-                .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
-                .fetch_optional(&mut **tx)
-                .await
-        }
-        ClassifyGuard::LegacyDeleting { .. } => query.fetch_optional(&mut **tx).await,
-    }
 }
 
 impl SubstrateActionSink {
