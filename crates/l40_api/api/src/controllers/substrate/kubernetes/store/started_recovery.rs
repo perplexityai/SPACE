@@ -251,6 +251,52 @@ impl K8sStore {
         }
     }
 
+    /// Whether a started recovery with no restore source may only be racing
+    /// the node's own suspend: an upload that could become the source the
+    /// next wake accepts ([`pending_suspend_upload_may_become_source`]) whose
+    /// latest attempt started within
+    /// [`pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE`]
+    /// (`COALESCE(last_attempt_at, timestamp)`).
+    ///
+    /// sbx-mgr stamps `last_attempt_at` once per upload attempt, not
+    /// periodically, so a live upload whose current attempt started more
+    /// than the window ago stops counting and the wake gets the usual 412.
+    /// The window reuses the settle bound the lost-sandbox give-up applies
+    /// to the same rows, which ties the client's retry window to that
+    /// constant. It is well inside the stuck-snapshot reaper's age.
+    pub(in crate::controllers::substrate::kubernetes) async fn started_recovery_source_publishing(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        static SOURCE_PUBLISHING: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            let may_become_source = pending_suspend_upload_may_become_source("s", "sn");
+            sql!(
+                format!(
+                    "SELECT EXISTS (
+                     SELECT 1
+                       FROM sandboxes s
+                       JOIN snapshots sn ON sn.sandbox_id = s.id
+                      WHERE s.id = $1
+                        AND {may_become_source}
+                        AND COALESCE(sn.last_attempt_at, sn.timestamp)
+                            >= NOW() - make_interval(secs => $2::BIGINT)
+                 )"
+                )
+                .as_str()
+            )
+        });
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(SOURCE_PUBLISHING.as_str()))
+            .bind(sandbox_id.as_uuid())
+            .bind(
+                pplx_space_sandbox_store::lost::DEAD_UPLOAD_SETTLE
+                    .as_secs()
+                    .cast_signed(),
+            )
+            .fetch_one(&self.pool)
+            .await
+            .db_context("failed to check for an in-flight started recovery upload")
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn replace_started_recovery_execution(
         &self,
         sandbox_id: SandboxId,

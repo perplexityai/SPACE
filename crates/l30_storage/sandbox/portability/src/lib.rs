@@ -1517,6 +1517,37 @@ pub fn newest_suspend_snapshot_current(sandbox_alias: &str) -> String {
     newest_suspend_snapshot_current_with_guards(sandbox_alias, "", &selection_guard)
 }
 
+/// Returns a SQL conjunction that is TRUE when the snapshot aliased
+/// `snapshot_alias` is an unfinished suspend upload that, once ready, started
+/// recovery of the `started` sandbox aliased `sandbox_alias` could accept: a
+/// `creating` full `suspend` snapshot from the sandbox's active node that
+/// covers `last_command_at` and `last_access_at`.
+///
+/// This is the evidence that a wake is racing the node's own suspend: the
+/// marker still names the previous cycle until the upload finalizes. It
+/// authorizes only waiting, never restoring. A checkpoint upload, an upload
+/// from another node, or a suspend older than the last command or access
+/// can never become the source, so it doesn't count.
+pub fn pending_suspend_upload_may_become_source(
+    sandbox_alias: &str,
+    snapshot_alias: &str,
+) -> String {
+    let suspend = ArtifactOrigin::Suspend.as_str();
+    format!(
+        "{snapshot_alias}.sandbox_id = {sandbox_alias}.id\n\
+         AND {sandbox_alias}.lifecycle = 'started'\n\
+         AND {snapshot_alias}.source_node_id = {sandbox_alias}.active_node_id\n\
+         AND {snapshot_alias}.type = 'full'\n\
+         AND {snapshot_alias}.artifact_kind = 'full'\n\
+         AND {snapshot_alias}.artifact_origin = '{suspend}'\n\
+         AND {snapshot_alias}.state = 'creating'\n\
+         AND ({sandbox_alias}.last_command_at IS NULL\n\
+              OR {snapshot_alias}.timestamp >= {sandbox_alias}.last_command_at)\n\
+         AND ({sandbox_alias}.last_access_at IS NULL\n\
+              OR {snapshot_alias}.timestamp >= {sandbox_alias}.last_access_at)"
+    )
+}
+
 fn newest_suspend_snapshot_current_from_active_node(sandbox_alias: &str) -> String {
     let source_guard = format!("AND sn.source_node_id = {sandbox_alias}.active_node_id");
     let selection_guard = format!(
