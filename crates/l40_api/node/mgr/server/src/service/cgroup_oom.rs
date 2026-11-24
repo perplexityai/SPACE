@@ -27,7 +27,6 @@ pub(crate) fn start(shutdown: CancellationToken, tasks: &TaskTracker) {
             match tokio::task::spawn_blocking(move || {
                 let deltas = sampler.sample(Path::new(CGROUP_BASE));
                 for (cgroup, counts) in [
-                    (OomCgroup::Parent, deltas.parent),
                     (OomCgroup::Vm, deltas.vm),
                     (OomCgroup::Sidecar, deltas.sidecar),
                 ] {
@@ -89,14 +88,12 @@ impl Sample {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Deltas {
-    parent: Counts,
     vm: Counts,
     sidecar: Counts,
 }
 
 #[derive(Default)]
 struct Sampler {
-    parent: Option<Sample>,
     // An entry without a reading was present but unreadable. Baseline its first
     // good sample rather than counting historical kills after a read failure.
     sandboxes: Option<HashMap<PathBuf, Option<Sample>>>,
@@ -104,13 +101,6 @@ struct Sampler {
 
 impl Sampler {
     fn sample(&mut self, parent: &Path) -> Deltas {
-        let mut deltas = Deltas::default();
-        if let Some(current) = read_sample(parent)
-            && let Some(previous) = self.parent.replace(current)
-        {
-            deltas.parent = current.delta(previous);
-        }
-
         // A failed listing must not erase the baselines and replay live counts.
         let entries = match fs::read_dir(parent).and_then(Iterator::collect::<io::Result<Vec<_>>>) {
             Ok(entries) => entries,
@@ -118,9 +108,10 @@ impl Sampler {
                 if error.kind() != io::ErrorKind::NotFound {
                     tracing::debug!(%error, "cannot list sandbox cgroups for OOM sampling");
                 }
-                return deltas;
+                return Deltas::default();
             }
         };
+        let mut deltas = Deltas::default();
         let mut next = HashMap::new();
         for entry in entries {
             let name = entry.file_name();
@@ -147,7 +138,7 @@ impl Sampler {
             }
             next.insert(path, current.or_else(|| previous.copied().flatten()));
         }
-        // Forget removed children. Their kills remain in the parent's totals.
+        // Forget removed children so the sampler does not carry stale baselines.
         self.sandboxes = Some(next);
         deltas
     }

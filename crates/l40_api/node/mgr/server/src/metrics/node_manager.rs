@@ -6,9 +6,8 @@ use pplx_space_metrics_emit::{
 
 #[cfg(target_os = "linux")]
 metric_vocabulary!(
-    /// Which cgroup tree supplied the hierarchical memory event counters.
+    /// Which sandbox cgroup tree supplied the memory event counters.
     OomCgroup {
-        Parent => "parent",
         Vm => "vm",
         Sidecar => "sidecar",
     }

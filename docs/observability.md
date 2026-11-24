@@ -1259,20 +1259,28 @@ not.
 
 ## Sandbox cgroup OOM kills
 
-Node-manager samples Linux cgroup v2 `memory.events` every 15 seconds.
+Node-manager samples Linux cgroup v2 `memory.events` in the sandbox VM and
+sidecar cgroups every 15 seconds, without waiting for cgroup teardown.
 `node_memory.cgroup.oom_kills` counts the kernel's `oom_kill` increments;
 `node_memory.cgroup.oom_group_kills` separately counts `oom_group_kill`
 increments on kernels that expose that field. Do not add the two metrics:
 a group kill also contributes to the kernel's process kill counter.
 
-The only metric-specific tag is `cgroup`, with values `parent`, `vm`, and
-`sidecar`. The parent series is the node's sandbox-tree total and already
-includes its descendants: do not sum it with the VM and sidecar series.
-The breakdown can miss kills in cgroups removed before the next poll, but
-the parent's hierarchical counters retain those events. The first poll
-baselines existing counts, so restarts do not replay old kills. The counters
-describe where the killed processes were, not which memory limit triggered
-the kill.
+The only metric-specific tag is `cgroup`, with values `vm` and `sidecar`.
+The first poll baselines existing counts, so restarts do not replay old
+kills. The breakdown can miss kills in cgroups removed before the next poll.
+Use the sandbox parent's hierarchical `memory.events` for the tree-wide
+total; it retains those events and is not additive with the breakdown.
+
+The counters describe where the killed processes were, not which memory
+limit triggered the kill. Use the host kernel's `oom-kill:` log for an
+individual kill. In its [cgroup fields][kernel-oom-cgroup-fields], `oom_memcg`
+identifies the limiting cgroup, `task_memcg` identifies the victim's cgroup,
+and `global_oom` means the event was not limited to a memory cgroup. The
+counters give a node-level signal while sandboxes are still present,
+without requiring kernel log collection.
+
+[kernel-oom-cgroup-fields]: https://github.com/torvalds/linux/blob/v6.18/mm/memcontrol.c
 
 ## Guest memory in use
 
