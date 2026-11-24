@@ -785,6 +785,7 @@ pub mod network_pool_metrics;
 mod node_artifacts;
 pub mod node_cpu_metrics;
 pub mod node_disk_metrics;
+pub mod node_memory_metrics;
 mod orphan_inventory;
 mod permission_tree;
 mod prepared_rootfs;
