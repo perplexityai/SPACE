@@ -3,19 +3,24 @@
 //! It owns `node_dirty_ref_revision`, the node-wide counter whose value
 //! template-manager's `node_dirty_refs` triggers stamp onto each enqueued row,
 //! so that acknowledging a sent reference deletes only the obligation that was
-//! sent. The store owns template-manager's other tables too, but
-//! template-manager's server still writes some of them directly until that
-//! code moves behind the store.
+//! sent. It owns template-manager's other tables too, and holds every statement
+//! template-manager's server issues against them outside its tests, except two
+//! kinds: the digest-pin prunes that bind one placeholder per listed key, which
+//! the server's `pinned_digests` builds per call, and the
+//! `pplx-space-common-jobs` helper's own statements, which its worker runs on
+//! the same connection through [`jobs`].
 //!
 //! [`node_dirty_refs`] holds the statements that enqueue, read and acknowledge
-//! those references, [`network_policy_notifications`] the ones that enqueue
-//! and read the sandbox network-policy outbox, and [`pins`] those of the
-//! digest pins. [`builds`] reads, touches, records and deletes template
+//! those references, [`network_policy_notifications`] the ones that enqueue,
+//! read and acknowledge the sandbox network-policy outbox, and [`pins`] those
+//! of the digest pins. [`builds`] reads, touches, records and deletes template
 //! builds with their child rows, [`template_local_state`] reads and deletes a
 //! template's rows across tables, and [`eviction`] holds the cache eviction's
-//! pin check. [`snapshots`], [`pools`] and [`template_settings`] hold the
-//! statements for those tables. [`database`] migrates and opens the
-//! database, which template-manager does once at startup.
+//! pin check, its `ready → deleting` swap, the reaper's resolutions of a build
+//! left `deleting` and startup recovery's reset of one. [`snapshots`],
+//! [`pools`] and [`template_settings`] hold the statements for those tables.
+//! [`database`] migrates and opens the database, which template-manager does
+//! once at startup.
 //!
 //! Every function outside [`database`] and [`jobs`] that runs a statement
 //! takes a `rusqlite::Connection`, so a
@@ -34,6 +39,12 @@
 //! [`jobs::JobWorker::submit_json`] fails with `tonic::Status`.
 //! template-manager reaches the job worker only through [`jobs::JobWorker`];
 //! `BackgroundWorker` is never re-exported.
+//!
+//! A guarded write, whose `WHERE` re-checks the state or witness its caller
+//! decided on, moves here verbatim with that guard, binds only the caller's
+//! values, and returns whether or how many rows it matched. Matching none,
+//! because another writer won or nothing is left to do, is a normal outcome,
+//! not an error; the caller decides what each outcome means.
 
 #![forbid(unsafe_code)]
 
@@ -49,6 +60,8 @@ pub mod pools;
 pub mod snapshots;
 pub mod template_local_state;
 pub mod template_settings;
+#[cfg(test)]
+mod test_db;
 
 /// The current time in template-manager's stored timestamp format: whole
 /// seconds since the Unix epoch, as text.

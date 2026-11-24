@@ -52,8 +52,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pplx_space_lru_reaper::{self as lru_reaper, EvictionInput};
-use pplx_space_template_mgr_store::{builds, snapshots};
-use rusqlite::{Connection, params};
+use pplx_space_template_mgr_store::{builds, eviction, snapshots};
+use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -344,11 +344,7 @@ fn execute_precheck(
         return Ok(PrecheckOutcome::SkipWarmPool);
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    if pplx_space_template_mgr_store::eviction::digest_is_pinned(
-        &tx,
-        &candidate.name,
-        &candidate.content_hash,
-    )? {
+    if eviction::digest_is_pinned(&tx, &candidate.name, &candidate.content_hash)? {
         return Ok(PrecheckOutcome::SkipPinned);
     }
 
@@ -356,19 +352,14 @@ fn execute_precheck(
     // `state='ready'`. A zero-row UPDATE means the row was deleted
     // out from under us OR another path (manual delete, parallel
     // eviction) already grabbed it.
-    let updated = tx.execute(
-        "UPDATE template_builds SET state = 'deleting'
-         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND state = 'ready'
-           AND (?4 IS NULL
-                OR MAX(CAST(created_at AS INTEGER), CAST(last_used_at AS INTEGER)) <= ?4)",
-        params![
-            candidate.name,
-            candidate.content_hash,
-            candidate.cache_partition.key(),
-            touched_before_secs.map(|secs| i64::try_from(secs).unwrap_or(i64::MAX)),
-        ],
+    let marked = eviction::mark_ready_build_deleting(
+        &tx,
+        &candidate.name,
+        &candidate.content_hash,
+        candidate.cache_partition,
+        touched_before_secs,
     )?;
-    if updated == 0 {
+    if !marked {
         return Ok(PrecheckOutcome::SkipRowMissing);
     }
 
@@ -880,7 +871,6 @@ pub(crate) async fn reap_stuck_deleting(
     let mut handled = 0usize;
     for (name, content_hash, partition) in stuck {
         let state = reaper_probe(&name, &content_hash, partition).await;
-        let partition_key = partition.key();
         let db_for_update = Arc::clone(&db);
         let n = name.clone();
         let h = content_hash.clone();
@@ -890,12 +880,7 @@ pub(crate) async fn reap_stuck_deleting(
                 .map_err(|_| crate::db::mutex_poison_error("template GC reaper update"))?;
             match state {
                 ReaperDiskState::Intact => {
-                    conn.execute(
-                        "UPDATE template_builds SET state = 'ready'
-                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           AND state = 'deleting'",
-                        params![n, h, partition_key],
-                    )?;
+                    eviction::reaper_reset_deleting_build_to_ready(&conn, &n, &h, partition)?;
                 }
                 ReaperDiskState::Missing => {
                     let tx = rusqlite::Transaction::new_unchecked(
@@ -903,23 +888,10 @@ pub(crate) async fn reap_stuck_deleting(
                         rusqlite::TransactionBehavior::Immediate,
                     )?;
                     snapshots::delete_snapshots_for_build(&tx, &n, &h, partition)?;
-                    tx.execute(
-                        "DELETE FROM template_builds
-                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           AND state = 'deleting'",
-                        params![n, h, partition_key],
-                    )?;
+                    eviction::reaper_delete_deleting_build(&tx, &n, &h, partition)?;
                     // Nothing cascades on the runtime connection; drop the
                     // components only if the build row went.
-                    tx.execute(
-                        "DELETE FROM template_build_components
-                         WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           AND NOT EXISTS (
-                               SELECT 1 FROM template_builds
-                               WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                           )",
-                        params![n, h, partition_key],
-                    )?;
+                    eviction::delete_components_of_absent_build(&tx, &n, &h, partition)?;
                     tx.commit()?;
                 }
             }

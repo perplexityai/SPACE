@@ -21,7 +21,9 @@
 //! [`WarmPoolStore`] in `pplx-space-cluster-pool`: per-domain struct
 //! holding a connection handle, methods that lock it and call the
 //! store, no trait abstraction. The prunes that build a placeholder per
-//! listed template or kept key still issue their statements here. Methods are synchronous
+//! listed template or kept key still issue their statements here: their
+//! text depends on how many keys a call passes, so no single statement can
+//! be built once in the store. Methods are synchronous
 //! because the on-node SQLite database is wrapped in
 //! `Arc<Mutex<Connection>>` and must be locked under a
 //! `tokio::task::spawn_blocking` boundary anyway — async wrappers here
