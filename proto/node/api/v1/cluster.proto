@@ -1572,8 +1572,8 @@ message ReportFirewallRulesRequest {
   FirewallRulesCensus census = 6;
   // In any order, each at most once. A MISSING or UNREAD gap names a slot
   // listed in `slots`, at most one gap per slot, so there are at most 3 more
-  // gaps than slots. A MISSING slot is UNKNOWN with NAMESPACE_MISSING, an
-  // UNREAD one UNKNOWN with UNCONFIRMED or NAMESPACE_UNREADABLE.
+  // gaps than slots. A MISSING gap's slot is UNKNOWN with NAMESPACE_MISSING,
+  // an UNREAD gap's UNKNOWN with UNCONFIRMED or NAMESPACE_UNREADABLE.
   repeated FirewallRulesCensusGap census_gaps = 7;
   // At most 16384, each slot ID once, in any order.
   repeated FirewallRulesSlotEvidence slots = 8;

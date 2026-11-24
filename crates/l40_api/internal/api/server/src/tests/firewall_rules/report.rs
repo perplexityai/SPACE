@@ -816,7 +816,7 @@ async fn malformed_reports_write_nothing() -> TestResult {
     let before = row(pool, r.node).await?;
     let too_large = u64::try_from(i64::MAX)? + 1;
     type Malform = fn(&mut ReportFirewallRulesRequest, u64);
-    let malformations: [(&str, Malform); 31] = [
+    let malformations: [(&str, Malform); 32] = [
         ("node_id unset", |q, _| q.node_id.clear()),
         ("round unset", |q, _| q.round = None),
         ("generation unset", |q, _| q.assignment_generation = None),
@@ -859,11 +859,14 @@ async fn malformed_reports_write_nothing() -> TestResult {
         ("gap contradicting its slot", |q, _| {
             q.census_gaps[2] = gap(Gap::Unread, Some(2));
         }),
+        ("missing gap on an unconfirmed slot", |q, _| {
+            q.census_gaps[2] = gap(Gap::Missing, Some(1));
+        }),
         ("slot_id unset", |q, _| q.slots[0].slot_id = None),
         ("slot generation unset", |q, _| {
             q.slots[0].slot_generation = None;
         }),
-        ("slot outcome unset", |q, _| q.slots[0].outcome = 0),
+        ("slot outcome unset", |q, _| q.slots[2].outcome = 0),
         ("verified with a reason", |q, _| {
             q.slots[2].reason = Reason::RulesMismatch.into();
         }),
@@ -871,7 +874,7 @@ async fn malformed_reports_write_nothing() -> TestResult {
         ("failed with an unknown's reason", |q, _| {
             q.slots[3].reason = Reason::TableUnreadable.into();
         }),
-        ("duplicate slot", |q, _| q.slots[1].slot_id = Some(0)),
+        ("duplicate slot", |q, _| q.slots[3].slot_id = Some(2)),
         ("round out of range", |q, n| q.round = Some(n)),
         ("generation out of range", |q, n| {
             q.assignment_generation = Some(n);
@@ -881,9 +884,8 @@ async fn malformed_reports_write_nothing() -> TestResult {
             q.slots[0].slot_generation = Some(n);
         }),
         ("too many slots", |q, _| {
-            q.slots = (0..16_385)
-                .map(|id| slot(id, 0, Slot::Verified, Reason::Unspecified))
-                .collect();
+            q.slots
+                .extend((4..16_385).map(|id| slot(id, 0, Slot::Verified, Reason::Unspecified)));
         }),
         ("node_id not a node", |q, _| q.node_id = "worker-a".into()),
     ];

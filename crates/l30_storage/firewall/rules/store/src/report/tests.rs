@@ -27,20 +27,22 @@ fn incomplete(gaps: Vec<CensusGap>, extra_namespaces: u64) -> Result<Report, Inv
 fn every_document_variant_is_written_as_frozen_and_reads_back() {
     let census = Census::Incomplete {
         gaps: vec![
-            CensusGap::Unread { slot_id: 5 },
-            CensusGap::ListingFailed,
             CensusGap::Missing { slot_id: 4 },
+            CensusGap::ListingFailed,
+            CensusGap::Unread { slot_id: 3 },
             CensusGap::Unowned,
             CensusGap::InventoryFailed,
         ],
         extra_namespaces: 3,
     };
+    // An UNREAD gap's slot below a MISSING gap's, so sorting by kind first
+    // would order them differently.
     let reasons = [
-        UnknownReason::Ineligible,
+        UnknownReason::Unconfirmed,
         UnknownReason::NamespaceMissing,
+        UnknownReason::Ineligible,
         UnknownReason::NamespaceUnreadable,
         UnknownReason::TableUnreadable,
-        UnknownReason::Unconfirmed,
     ];
     let mut slots = [
         SlotOutcome::Verified,
@@ -67,11 +69,11 @@ fn every_document_variant_is_written_as_frozen_and_reads_back() {
         {"outcome": "verified", "slot_id": 0, "slot_generation": 1},
         {"outcome": "applying", "slot_id": 1, "slot_generation": 2},
         {"outcome": "failed", "slot_id": 2, "slot_generation": 3, "reason": "rules_mismatch"},
-        unknown(3, "ineligible"),
+        unknown(3, "unconfirmed"),
         unknown(4, "namespace_missing"),
-        unknown(5, "namespace_unreadable"),
-        unknown(6, "table_unreadable"),
-        unknown(7, "unconfirmed"),
+        unknown(5, "ineligible"),
+        unknown(6, "namespace_unreadable"),
+        unknown(7, "table_unreadable"),
     ]);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&report.document).unwrap(),
@@ -86,8 +88,8 @@ fn every_document_variant_is_written_as_frozen_and_reads_back() {
                 {"gap": "inventory_failed"},
                 {"gap": "unowned"},
                 {"gap": "listing_failed"},
+                {"gap": "unread", "slot_id": 3},
                 {"gap": "missing", "slot_id": 4},
-                {"gap": "unread", "slot_id": 5},
             ],
             "extra_namespaces": 3,
             "slots": slots_json,
