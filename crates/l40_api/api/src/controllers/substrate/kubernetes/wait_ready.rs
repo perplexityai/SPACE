@@ -716,6 +716,10 @@ impl KubernetesSubstrate {
                 });
             }
 
+            // A stale address is re-resolved. The recorded address for the
+            // target's UID is kept until kubelet publishes another, so after a
+            // runtime sandbox is recreated under the same UID the wait binds
+            // its new address at kubelet's pace, as without a node report.
             if probe == PodProxyProbe::Stale
                 && let Some(current) = self
                     .resolve_pod_ip_for_readiness(sandbox_id, &target, deadline)
