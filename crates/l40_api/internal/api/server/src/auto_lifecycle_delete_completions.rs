@@ -465,7 +465,7 @@ async fn apply_receipt(
             AutoLifecycleDeleteCompletionReason::LockContended,
         ));
     }
-    // Older publishers can remove observations without the advisory lock.
+    // Not every writer that deletes observations takes the advisory lock.
     // Claim existing rows first so their deletes cannot race the sandbox lock.
     match observed_states::lock_for_delete_nowait(tx, completion.sandbox_id).await {
         Ok(()) => {}
