@@ -5,14 +5,13 @@
 use std::time::Duration;
 
 use pplx_space_firewall_rules_store::REPORT_MAX_AGE;
+use pplx_space_node_mgr_client::proto::{
+    FirewallRulesCensus as Census, FirewallRulesCensusGap, FirewallRulesCensusGapKind as Gap,
+    FirewallRulesSlotEvidence, FirewallRulesSlotOutcome as Slot, FirewallRulesSlotReason as Reason,
+};
 
 use super::*;
-use crate::proto::{
-    FirewallRulesCensus as Census, FirewallRulesCensusGap, FirewallRulesCensusGapKind as Gap,
-    FirewallRulesReportOutcome as Outcome, FirewallRulesSlotEvidence,
-    FirewallRulesSlotOutcome as Slot, FirewallRulesSlotReason as Reason,
-    ReportFirewallRulesRequest,
-};
+use crate::proto::{FirewallRulesReportOutcome as Outcome, ReportFirewallRulesRequest};
 
 /// Bounds every wait on a lock or the clock.
 const WAIT: Duration = Duration::from_secs(10);

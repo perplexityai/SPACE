@@ -495,6 +495,83 @@ message SyncFirewallRulesResponse {
   FirewallSlotDispatch dispatch = 3;
 }
 
+// The firewall evidence vocabulary below is shared by node-manager's
+// observation and ClusterApi's ReportFirewallRules, so neither reinterprets it.
+
+// Whether the worker accounted for every managed namespace. INCOMPLETE with
+// every slot VERIFIED differs from COMPLETE with one slot FAILED.
+enum FirewallRulesCensus {
+  FIREWALL_RULES_CENSUS_UNSPECIFIED = 0;
+  FIREWALL_RULES_CENSUS_COMPLETE = 1;
+  FIREWALL_RULES_CENSUS_INCOMPLETE = 2;
+}
+
+message FirewallRulesCensusGap {
+  // Retired before any worker sent it; keep its number and name reserved.
+  reserved 3;
+  reserved "omitted";
+
+  FirewallRulesCensusGapKind kind = 1;
+  // Set exactly for MISSING and UNREAD, to a slot the report lists.
+  optional uint32 slot_id = 2;
+}
+
+enum FirewallRulesCensusGapKind {
+  FIREWALL_RULES_CENSUS_GAP_KIND_UNSPECIFIED = 0;
+  // The slot inventory couldn't be read.
+  FIREWALL_RULES_CENSUS_GAP_KIND_INVENTORY_FAILED = 1;
+  // The host names no directory that only managed namespaces occupy.
+  FIREWALL_RULES_CENSUS_GAP_KIND_UNOWNED = 2;
+  // The managed-namespace directory couldn't be listed.
+  FIREWALL_RULES_CENSUS_GAP_KIND_LISTING_FAILED = 3;
+  // An eligible slot has no namespace.
+  FIREWALL_RULES_CENSUS_GAP_KIND_MISSING = 4;
+  // An eligible slot wasn't read at its final lifecycle.
+  FIREWALL_RULES_CENSUS_GAP_KIND_UNREAD = 5;
+  // Retired before any worker sent them: EXTRA became the request's
+  // `extra_namespaces`, which made TRUNCATED unnecessary. Keep their numbers
+  // and names reserved.
+  reserved 6, 7;
+  reserved "FIREWALL_RULES_CENSUS_GAP_KIND_EXTRA", "FIREWALL_RULES_CENSUS_GAP_KIND_TRUNCATED";
+}
+
+message FirewallRulesSlotEvidence {
+  optional uint32 slot_id = 1;
+  // The slot's lifecycle generation when observed.
+  optional uint64 slot_generation = 2;
+  FirewallRulesSlotOutcome outcome = 3;
+  // Set exactly for FAILED and UNKNOWN, from that outcome's reasons.
+  FirewallRulesSlotReason reason = 4;
+}
+
+enum FirewallRulesSlotOutcome {
+  FIREWALL_RULES_SLOT_OUTCOME_UNSPECIFIED = 0;
+  // The slot enforces the revision.
+  FIREWALL_RULES_SLOT_OUTCOME_VERIFIED = 1;
+  // Mismatched while apply work for the slot was pending.
+  FIREWALL_RULES_SLOT_OUTCOME_APPLYING = 2;
+  // The slot enforces something else.
+  FIREWALL_RULES_SLOT_OUTCOME_FAILED = 3;
+  // What the slot enforces couldn't be determined.
+  FIREWALL_RULES_SLOT_OUTCOME_UNKNOWN = 4;
+}
+
+enum FirewallRulesSlotReason {
+  FIREWALL_RULES_SLOT_REASON_UNSPECIFIED = 0;
+  // FAILED: the table lists other rules.
+  FIREWALL_RULES_SLOT_REASON_RULES_MISMATCH = 1;
+  // UNKNOWN: not a slot the apply takes.
+  FIREWALL_RULES_SLOT_REASON_INELIGIBLE = 2;
+  // UNKNOWN: the slot's namespace is gone.
+  FIREWALL_RULES_SLOT_REASON_NAMESPACE_MISSING = 3;
+  // UNKNOWN: the namespace couldn't be opened.
+  FIREWALL_RULES_SLOT_REASON_NAMESPACE_UNREADABLE = 4;
+  // UNKNOWN: the firewall table couldn't be read.
+  FIREWALL_RULES_SLOT_REASON_TABLE_UNREADABLE = 5;
+  // UNKNOWN: read, but not shown unchanged at the end.
+  FIREWALL_RULES_SLOT_REASON_UNCONFIRMED = 6;
+}
+
 message ResolveExecutionEnvironmentRequest {
   // Highest definition schema understood, including its identity encoding.
   // Values below 2 are unsupported. This changes encoding, never selection.

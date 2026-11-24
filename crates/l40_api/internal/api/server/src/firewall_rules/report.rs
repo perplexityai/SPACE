@@ -7,15 +7,17 @@ use pplx_space_firewall_rules_store::{
     Acceptance, Census, CensusGap, Failure, InvalidReport, Report, ReportRefusal, RevisionId,
     SlotEvidence, SlotOutcome, UnknownReason, accept_report,
 };
+use pplx_space_node_mgr_client::proto::{
+    FirewallRulesCensus, FirewallRulesCensusGap, FirewallRulesCensusGapKind,
+    FirewallRulesSlotEvidence, FirewallRulesSlotOutcome, FirewallRulesSlotReason,
+};
 use pplx_space_rpc_auth::{FirewallRulesReportAuthority, NodeApiAuthenticatedCaller};
 use tonic::{Request, Response, Status};
 
 use super::{Call, resolve_worker, reviewed_node};
 use crate::ClusterApiService;
 use crate::proto::{
-    FirewallRulesCensus, FirewallRulesCensusGap, FirewallRulesCensusGapKind,
-    FirewallRulesReportOutcome, FirewallRulesSlotEvidence, FirewallRulesSlotOutcome,
-    FirewallRulesSlotReason, ReportFirewallRulesRequest, ReportFirewallRulesResponse,
+    FirewallRulesReportOutcome, ReportFirewallRulesRequest, ReportFirewallRulesResponse,
 };
 
 fn malformed(what: impl std::fmt::Display) -> Status {
