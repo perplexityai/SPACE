@@ -670,10 +670,8 @@ impl SweepSink for SubstrateSweepSink {
         };
         // Then the active execution's, which the pod-IP writers take, so the
         // CAS's "no pod IP" check reads a committed IP rather than racing one.
-        // Without waiting: the activation-completion receipt locks the
-        // execution before the sandbox, so waiting here while holding the
-        // sandbox could close a cycle with it. A held execution is one whose
-        // owner is writing it right now, so the row defers to the next tick.
+        // If an execution-only writer holds that lock, defer to the next tick
+        // rather than waiting while holding the sandbox lock.
         let execution_locked = sqlx::query(sql!(
             "SELECT id
                FROM sandbox_k8s_executions
