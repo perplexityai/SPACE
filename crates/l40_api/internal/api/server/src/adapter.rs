@@ -379,7 +379,7 @@ impl ClusterApi for ClusterApiService {
         let release_org_id = self
             .lock_template_for_publication(&mut tx, &template_name, template_org)
             .await?;
-        let release = ensure_template_release(
+        let EnsuredRelease { release, twin_of } = ensure_template_release(
             &mut tx,
             template_name.as_str(),
             runtime,
@@ -415,6 +415,20 @@ impl ClusterApi for ClusterApiService {
         tx.commit()
             .await
             .map_err(|err| template_publication::storage_status("commit tx", &err))?;
+        // Logged once committed, so a refused registration's twin isn't. From
+        // the first twin on, rebuilding the `(template_name, hash)` index
+        // fails until the twins are removed, and binaries that read releases
+        // by template and hash alone can't tell this one from its original.
+        if let Some(original_release_id) = twin_of {
+            tracing::info!(
+                template_name = %release.template_name,
+                hash = %release.hash,
+                environment = release.environment.as_deref(),
+                release_id = %release.id,
+                %original_release_id,
+                "inserted template release twin"
+            );
+        }
 
         Ok(Response::new(RegisterTemplateReleaseResponse {
             release: Some(template_release_proto(release)),

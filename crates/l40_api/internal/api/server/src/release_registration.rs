@@ -82,7 +82,7 @@ pub(super) async fn ensure_template_release(
     hash: &str,
     org_id: Option<OrgId>,
     execution: Option<&ReleaseExecution>,
-) -> Result<TemplateReleaseRow, Status> {
+) -> Result<EnsuredRelease, Status> {
     // The original decides which of the digest's spellings (bare or
     // `sha256:`) the release lives under, as before twins. The partition
     // lookup prefers that stored spelling, and the insert uses it only, so a
@@ -104,7 +104,9 @@ pub(super) async fn ensure_template_release(
     )
     .await?
     {
-        return accept_existing_release(tx, existing, runtime, org_id, execution).await;
+        return accept_existing_release(tx, existing, runtime, org_id, execution)
+            .await
+            .map(EnsuredRelease::existing);
     }
     // A twin has its original's runtime and owner. The owner can differ: the
     // `(template_name, org_id)` foreign key doesn't check a release recorded
@@ -125,7 +127,10 @@ pub(super) async fn ensure_template_release(
     .map_err(|error| {
         crate::template_publication::storage_status("insert template release", &error)
     })? {
-        return Ok(TemplateReleaseRow::from(inserted));
+        return Ok(EnsuredRelease {
+            release: TemplateReleaseRow::from(inserted),
+            twin_of: original.map(|original| original.id),
+        });
     }
 
     // The insert conflicted: with a concurrent registration of the same
@@ -148,7 +153,27 @@ pub(super) async fn ensure_template_release(
             ))
         })?,
     };
-    accept_existing_release(tx, existing, runtime, org_id, execution).await
+    accept_existing_release(tx, existing, runtime, org_id, execution)
+        .await
+        .map(EnsuredRelease::existing)
+}
+
+/// The release [`ensure_template_release`] attached to or inserted.
+pub(super) struct EnsuredRelease {
+    pub(super) release: TemplateReleaseRow,
+    /// The original release's id when this registration inserted `release`
+    /// as its twin, which only a schema without the `(template_name, hash)`
+    /// index admits.
+    pub(super) twin_of: Option<Uuid>,
+}
+
+impl EnsuredRelease {
+    fn existing(release: TemplateReleaseRow) -> Self {
+        Self {
+            release,
+            twin_of: None,
+        }
+    }
 }
 
 /// The existing release a registration attaches to: with execution metadata,
