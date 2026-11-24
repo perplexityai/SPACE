@@ -83,6 +83,7 @@ class Scenario(Generic[Fixture]):
     storage_credentials: str | None
     test_hooks: str | None
     drain_v1: bool
+    drain_v2: bool
     browser: str | None
     verify: Callable[[Fixture], None]
     source_module: str
@@ -131,6 +132,7 @@ def scenario(
     storage_credentials: str | None = None,
     test_hooks: str | None = None,
     drain_v1: bool = False,
+    drain_v2: bool = False,
     substrates: Iterable[str] | None = None,
     browser: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
@@ -154,8 +156,12 @@ def scenario(
     `drain_v1` marks a scenario that drives v1 node drains, which the admin
     API refuses while drain v2 is on (`SPACE_DRAIN_V2_ENABLED`: v1 and v2
     drains never run together); a suite run skips it, visibly, on a bench
-    whose public API runs drain v2, as Kind's values do. Run it on a bench
-    with drain v2 off.
+    whose public API runs drain v2, as a Kind bench brought up with
+    SPACE_KIND_DRAIN_V2=on does. Kind's default runs it.
+    `drain_v2` marks a scenario that drives v2 node drains, which need drain
+    v2 on; a suite run skips it, visibly, on a bench whose public API runs
+    drain v2 off, Kind's default. Bring the bench up with
+    SPACE_KIND_DRAIN_V2=on to run it.
     `timeout_minutes` raises the fixture's wall-clock budget for a scenario
     whose own waits outlast it; it never lowers it.
     `browser` names the browser the scenario drives a web UI through
@@ -319,6 +325,7 @@ def scenario(
             storage_credentials=storage_credentials,
             test_hooks=test_hooks,
             drain_v1=drain_v1,
+            drain_v2=drain_v2,
             browser=browser,
             verify=verify,
             source_module=verify.__module__,

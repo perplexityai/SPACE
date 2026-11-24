@@ -20,6 +20,7 @@ HOLD_SECONDS = 60 * 60
 # unsealed, since a sealed node refuses one.
 @smoke.scenario(
     "native.v2_undrain_unseals_the_worker",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=30,

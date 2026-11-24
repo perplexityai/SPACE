@@ -19,6 +19,7 @@ SHUTDOWN_SECONDS = 3600
 # so it runs only by name.
 @smoke.scenario(
     "native.v2_drain_replaced_while_shutting_down",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=45,

@@ -19,6 +19,7 @@ PATH = "/tmp/space-smoke-v2-terminate.txt"
 # only by name.
 @smoke.scenario(
     "native.v2_drain_terminates_its_worker",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     # A re-registration, one suspend and wake, the drained edge, the

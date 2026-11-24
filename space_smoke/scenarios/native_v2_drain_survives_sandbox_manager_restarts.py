@@ -23,6 +23,7 @@ RESTART_MARGIN_SECONDS = 30
 # uploads are let through.
 @smoke.scenario(
     "native.v2_drain_survives_sandbox_manager_restarts",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=45,

@@ -36,6 +36,22 @@ export const FAKE_PROVIDER_PREFIX = 'aws:///kind-a/';
 const FAKE_PROVIDER = /^aws:\/\/\/kind-a\/(i-[0-9a-f]{17})$/;
 
 // A new fake AWS providerID and the instance it names.
+// Whether the bench runs drain v2, from the controller's literal
+// SPACE_DRAIN_V2_ENABLED: Kind runs it off unless its bring-up sets
+// SPACE_KIND_DRAIN_V2=on.
+export function drainV2Enabled(value: string | null): boolean {
+  return value === 'true';
+}
+
+// Why a step is skipped on this bench, or null when it runs: the v1 drain
+// flows need drain v2 off (the API refuses every v1 :drain while it is on),
+// and the v2 flows need it on.
+export function drainModeSkip(needs: 'v1' | 'v2', v2On: boolean): string | null {
+  if (needs === 'v1' && v2On) return 'drain v2 is on; v1 drains are refused';
+  if (needs === 'v2' && !v2On) return 'drain v2 is off on this bench; start it with SPACE_KIND_DRAIN_V2=on to run the v2 flows';
+  return null;
+}
+
 export function fakeProviderId(): { providerId: string; instanceId: string } {
   const instanceId = `i-${randomBytes(9).toString('hex').slice(0, 17)}`;
   return { providerId: `${FAKE_PROVIDER_PREFIX}${instanceId}`, instanceId };

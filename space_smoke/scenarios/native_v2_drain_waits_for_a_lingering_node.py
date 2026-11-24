@@ -11,6 +11,7 @@ import space_smoke as smoke
 # delete the row with no tombstone. It stops a worker, so it runs only by name.
 @smoke.scenario(
     "native.v2_drain_waits_for_a_lingering_node",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=45,

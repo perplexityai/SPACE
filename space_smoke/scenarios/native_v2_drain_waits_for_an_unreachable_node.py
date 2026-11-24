@@ -17,6 +17,7 @@ UNANSWERED_SECONDS = 150
 # answers again the next call reports them and the drain finishes.
 @smoke.scenario(
     "native.v2_drain_waits_for_an_unreachable_node",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=45,

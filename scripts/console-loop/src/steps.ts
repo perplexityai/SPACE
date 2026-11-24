@@ -21,7 +21,7 @@ import {
   panelMismatches, previewAllWaitMs, previewResultsMismatches, previewVerdictIn, previewWaitMs, reportedUnder, rowMismatches,
   type AdminNode, type ApiDrain, type PanelRead, type ResultVerdict,
 } from './nodes.ts';
-import { DRAIN_V2_SWITCH, KindV2Control, V2_CONTROLLER_ENV, V2_CONTROLLER_KEYS, type Lease } from './drain-v2.ts';
+import { KindV2Control, V2_CONTROLLER_ENV, V2_CONTROLLER_KEYS, drainModeSkip, drainV2Enabled, type Lease } from './drain-v2.ts';
 
 export interface Step {
   name: string;
@@ -1659,6 +1659,8 @@ step('node-history-filters', ['nodes'], async (c) => {
 });
 
 step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
+  const skip = drainModeSkip('v1', drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node, kube) => {
     await visit(c, `/dashboard/nodes/${node.id}`, 3000);
     const phrase = node.name ?? node.id;
@@ -1702,6 +1704,8 @@ step('node-forced-drain-undrain', ['nodes', 'flows'], async (c) => {
 }, true);
 
 step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
+  const skip = drainModeSkip('v1', drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node) => {
     const phrase = node.name ?? node.id;
     const drained = await adminFetch(c.page, 'POST', `/admin/api/v1/nodes/${node.id}:drain`, { mode: 'forced' });
@@ -1791,6 +1795,8 @@ step('node-terminate-refused', ['nodes', 'flows'], async (c) => {
 // A v1 gentle drain, as on main: Drain sends `mode: gentle` and no engine,
 // and the page shows no v2 drain.
 step('node-gentle-drain-undrain', ['nodes', 'flows'], async (c) => {
+  const skip = drainModeSkip('v1', drainV2On(c));
+  if (skip) return c.rec.note(skip);
   await withDrainableWorker(c, async (node, kube) => {
     await visit(c, `/dashboard/nodes/${node.id}`, 3000);
     await exactButton(c.page, 'Drain').click();
@@ -2053,6 +2059,27 @@ interface V2Setup {
   workers: Map<string, string>;
 }
 let v2: V2Setup | null = null;
+// Whether `nodes-v2-setup` skipped the v2 flows, drain v2 being off.
+let v2Skipped = false;
+
+// Whether the bench runs drain v2, read once per run from the controller.
+let drainV2Read: boolean | null = null;
+function drainV2On(c: Ctx): boolean {
+  if (drainV2Read === null) drainV2Read = drainV2Enabled(new KindV2Control(c.config.kubeContext).drainV2Switch());
+  return drainV2Read;
+}
+
+// Put the controller's standing config, recorded in `file`, back: the keys a
+// run writes and its replicas. The config put back.
+function putStandingBack(control: KindV2Control, lease: Lease, file: string): Record<string, string | null> {
+  const { env: recorded, replicas } = JSON.parse(fs.readFileSync(file, 'utf8'));
+  // Only the keys a run writes go back; a record from before the switch
+  // moved to Kind's values may also hold it.
+  const env = Object.fromEntries(V2_CONTROLLER_KEYS.map((key) => [key, recorded[key] ?? null]));
+  if (control.controllerReplicas() !== replicas) control.scaleController(lease, replicas);
+  control.setControllerEnv(lease, env);
+  return env;
+}
 const v2StandingPath = (c: Ctx) => path.join(c.config.outDir, 'drain-v2-standing.json');
 
 const progressCard = (page: Page) => page.locator('#drain-progress');
@@ -2099,13 +2126,17 @@ async function waitForV2Ready(c: Ctx, nodeId: string, timeoutMs: number): Promis
 
 step('nodes-v2-setup', V2_AROUND, async (c) => {
   if (v2) return c.rec.note('already set up in this run');
+  // Before any mutation: the v2 flows need drain v2 on.
+  const skip = drainModeSkip('v2', drainV2On(c));
+  if (skip) {
+    v2Skipped = true;
+    return c.rec.note(skip);
+  }
   const control = new KindV2Control(c.config.kubeContext);
   const lease = control.acquireLease('retention');
   let cordonLease: Lease | null = null;
   try {
     cordonLease = control.acquireLease('cordon');
-    const enabled = control.drainV2Switch();
-    c.rec.check(enabled === 'true', `the bench's values turn drain v2 on for the controller (${DRAIN_V2_SWITCH}=${enabled})`);
     // A standing config an interrupted run recorded is the one to put back.
     const file = v2StandingPath(c);
     const standing = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).env : control.controllerEnv();
@@ -2142,6 +2173,17 @@ step('nodes-v2-setup', V2_AROUND, async (c) => {
     c.rec.check(workers.size > 0, `an empty worker is ready for v2 drains (${[...workers.values()].join(', ') || 'none'})`);
     v2 = { control, lease, cordonLease, workers };
   } catch (error) {
+    // The standing config goes back while the Leases are still held, so no
+    // other run sees the controller this setup changed.
+    const file = v2StandingPath(c);
+    try {
+      if (fs.existsSync(file)) {
+        putStandingBack(control, lease, file);
+        fs.rmSync(file, { force: true });
+      }
+    } catch (restoreError) {
+      c.rec.note(`putting the controller's standing config back failed: ${restoreError}; ${file} keeps it`);
+    }
     if (cordonLease) control.releaseLease(cordonLease);
     control.releaseLease(lease);
     throw error;
@@ -2152,7 +2194,8 @@ step('nodes-v2-setup', V2_AROUND, async (c) => {
 // still hold nothing: a flow never drains anyone else's sandbox.
 async function v2Worker(c: Ctx): Promise<{ node: AdminNode; kube: KindNodes } | null> {
   if (!v2) {
-    c.rec.check(false, 'nodes-v2-setup prepared a worker for v2 drains');
+    if (v2Skipped) c.rec.note('nodes-v2-setup skipped the v2 flows: drain v2 is off on this bench');
+    else c.rec.check(false, 'nodes-v2-setup prepared a worker for v2 drains');
     return null;
   }
   const nodes = await adminNodes(c);
@@ -3160,12 +3203,7 @@ step('nodes-v2-teardown', V2_AROUND, async (c) => {
   const { control, lease, cordonLease } = v2;
   try {
     const file = v2StandingPath(c);
-    const { env: recorded, replicas } = JSON.parse(fs.readFileSync(file, 'utf8'));
-    // Only the keys a run writes go back; a record from before the switch
-    // moved to Kind's values may also hold it.
-    const env = Object.fromEntries(V2_CONTROLLER_KEYS.map((key) => [key, recorded[key] ?? null]));
-    if (control.controllerReplicas() !== replicas) control.scaleController(lease, replicas);
-    control.setControllerEnv(lease, env);
+    const env = putStandingBack(control, lease, file);
     const now = control.controllerEnv();
     c.rec.check(JSON.stringify(now) === JSON.stringify(env), `the controller's standing config is back (${JSON.stringify(now)})`);
     fs.rmSync(file, { force: true });

@@ -49,6 +49,7 @@ WINDOW = 8
 # only by name.
 @smoke.scenario(
     "native.v2_drain_outlived_by_a_dead_worker",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=120,

@@ -133,7 +133,8 @@ _DURATION_SECONDS = {
         # The drain set, routine and manual alike, which runs by name and
         # splits across benches with `space_smoke list --prefix native.v2_
         # --shard I/N`: one local Kind run each (2026-11-20, a 32-core
-        # bench, Kind's drain v2 values); the median of two for the undrain.
+        # bench with drain v2 on, SPACE_KIND_DRAIN_V2=on); the median of two
+        # for the undrain.
         # The stopped-sandbox refusal is one local Kind run (2026-11-24, four
         # benches on a 32-core host): four refused stops' retry budgets and
         # a drain held for an hour that the scenario undrains. Replace with

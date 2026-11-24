@@ -50,6 +50,10 @@ or suites.
   cluster for iteration instead of rebuilding it for each change; rerun
   `up.sh` rather than starting a second `tilt up`. Keep `up.sh` and
   `build-seed.sh` idempotent.
+- Drain v2 is off on Kind, as a release installs it, unless the bring-up runs
+  with `SPACE_KIND_DRAIN_V2=on` (`lib/drain-v2.sh`, read by the Tiltfile). A
+  scenario that needs one setting declares `drain_v1` or `drain_v2`, and a
+  suite run skips it by mode on a bench in the other.
 - Keep the builder node outside `node.kubernetes.io/space-enabled=true`.
 - Do not add Postgres access to node services. Credential state belongs to the
   control-plane `space-credmgr-authority` Deployment; each node's

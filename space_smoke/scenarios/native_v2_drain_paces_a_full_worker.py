@@ -33,6 +33,7 @@ SAMPLE_SECONDS = 3
 # bound is the planner's test.
 @smoke.scenario(
     "native.v2_drain_paces_a_full_worker",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     # Thirty creates, thirty suspends and uploads a window at a time, and

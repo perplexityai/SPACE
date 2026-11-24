@@ -26,6 +26,7 @@ HOLD_SECONDS = 60 * 60
 # answered, the same `:drain` is accepted and drains the second.
 @smoke.scenario(
     "native.v2_drain_refused_at_the_cap",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=45,

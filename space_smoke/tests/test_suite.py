@@ -14,7 +14,13 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from space_smoke.__main__ import _apply_drain_v1, _apply_substrate, _failure_detail, _run_all
+from space_smoke.__main__ import (
+    _apply_drain_v1,
+    _apply_drain_v2,
+    _apply_substrate,
+    _failure_detail,
+    _run_all,
+)
 from space_smoke.adapters import KindConfig, KindHarness
 from space_smoke.registry import ScenarioRegistry
 from space_smoke.runtime import CommandResult
@@ -710,6 +716,47 @@ class DrainV1Tests(unittest.TestCase):
 
     def test_a_bench_with_drain_v2_off_runs_them(self) -> None:
         runnable, stdout, _ = self._apply(False)
+        self.assertEqual(runnable, self.KIND)
+        self.assertNotIn("SKIPPED", stdout)
+
+    def test_a_bench_that_cannot_be_read_runs_them(self) -> None:
+        runnable, _, stderr = self._apply(RuntimeError("no API Deployment"))
+        self.assertEqual(runnable, self.KIND)
+        self.assertIn("could not read whether the bench runs drain v2", stderr)
+
+
+class DrainV2Tests(unittest.TestCase):
+    """The v2 drain scenarios are skipped, visibly, on a bench running drain v2
+    off, Kind's default."""
+
+    KIND = tuple(scenario for scenario in REGISTRY if "kind" in scenario.backends)
+
+    def _apply(self, drain_v2):
+        services = mock.Mock()
+        if isinstance(drain_v2, Exception):
+            services.drain_v2_enabled.side_effect = drain_v2
+        else:
+            services.drain_v2_enabled.return_value = drain_v2
+        stdout, stderr = StringIO(), StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            runnable = _apply_drain_v2(self.KIND, services)
+        return runnable, stdout.getvalue(), stderr.getvalue()
+
+    def test_every_v2_drain_scenario_declares_it(self) -> None:
+        v2_scenarios = {s.id for s in REGISTRY if s.id.startswith("native.v2_")}
+        self.assertEqual(len(v2_scenarios), 21)
+        self.assertEqual({s.id for s in REGISTRY if s.drain_v2}, v2_scenarios)
+        self.assertFalse({s.id for s in REGISTRY if s.drain_v1 and s.drain_v2})
+
+    def test_a_bench_with_drain_v2_off_skips_them_visibly(self) -> None:
+        runnable, stdout, _ = self._apply(False)
+        self.assertEqual(runnable, tuple(s for s in self.KIND if not s.drain_v2))
+        for scenario in self.KIND:
+            if scenario.drain_v2:
+                self.assertIn(f"SKIPPED {scenario.id}: needs drain v2", stdout)
+
+    def test_a_bench_running_drain_v2_runs_them(self) -> None:
+        runnable, stdout, _ = self._apply(True)
         self.assertEqual(runnable, self.KIND)
         self.assertNotIn("SKIPPED", stdout)
 

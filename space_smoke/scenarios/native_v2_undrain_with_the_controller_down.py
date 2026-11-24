@@ -18,6 +18,7 @@ CANCEL_SECONDS = 120
 # the residents stay suspended until a wake starts each.
 @smoke.scenario(
     "native.v2_undrain_with_the_controller_down",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=30,

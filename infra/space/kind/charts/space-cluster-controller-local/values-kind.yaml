@@ -20,12 +20,6 @@ reconcilers:
       SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS: "10"
       SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS: "9"
 
-# Drain v2 on the controller (SPACE_DRAIN_V2_ENABLED), as on the API in
-# space-api-local's values-kind.yaml, so the drain v2 scenarios change no
-# Deployment to drain; off in the chart default.
-drainV2:
-  enabled: "true"
-
 # Rendered only for the test-hooks build (values.yaml). The reconcile-queue
 # GC's EC2 instance ticks every 10 s rather than 300 s, so its scenario waits
 # seconds, not up to five minutes, for a tick; the release lane renders no

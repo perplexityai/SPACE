@@ -26,6 +26,7 @@ HELD_PAST_DEADLINE_SECONDS = 90
 # first call evacuates and the node suspends them.
 @smoke.scenario(
     "native.v2_drain_survives_controller_restarts",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=60,

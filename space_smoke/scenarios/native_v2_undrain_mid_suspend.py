@@ -23,6 +23,7 @@ FILL_MIB = 256
 # are crate tests (`service/drain_node/tests.rs`, `node_drain/v2/tests.rs`).
 @smoke.scenario(
     "native.v2_undrain_mid_suspend",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=40,

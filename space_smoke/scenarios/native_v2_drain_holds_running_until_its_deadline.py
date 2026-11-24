@@ -35,6 +35,7 @@ SHORT_AHEAD_SECONDS = 30
 # the controller's call past that deadline says to evacuate.
 @smoke.scenario(
     "native.v2_drain_holds_running_until_its_deadline",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     # A paused resident's suspend and its wake elsewhere, an idle suspend,

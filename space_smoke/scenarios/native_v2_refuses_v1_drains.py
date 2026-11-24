@@ -15,6 +15,7 @@ from space_smoke.drain_v2 import CAP_REFUSAL_CODE_FIELD, V1_REFUSAL_CODE, V1_REF
 # resident are left exactly as they were.
 @smoke.scenario(
     "native.v2_refuses_v1_drains",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
 )

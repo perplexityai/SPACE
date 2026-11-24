@@ -29,6 +29,7 @@ BLOCK_MARGIN_SECONDS = 30
 # node's Rollback refusal the seal's (`activation_seal/tests.rs`).
 @smoke.scenario(
     "native.v2_drain_meets_user_calls",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=45,

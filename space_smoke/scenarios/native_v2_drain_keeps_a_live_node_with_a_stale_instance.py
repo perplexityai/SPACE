@@ -18,6 +18,7 @@ WATCH_SECONDS = 60
 # drain must not let the node go, since EC2 answered about another machine.
 @smoke.scenario(
     "native.v2_drain_keeps_a_live_node_with_a_stale_instance",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=30,

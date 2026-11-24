@@ -21,6 +21,7 @@ BALLAST_MIB = 128
 # resident's timeline is in its snapshot rows.
 @smoke.scenario(
     "native.v2_drain_moves_ten_residents",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     # Ten residents' creates, ten suspends and uploads and ten wakes, on a

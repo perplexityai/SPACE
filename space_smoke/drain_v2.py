@@ -36,10 +36,11 @@ uncordon of the worker; only the control plane may call a node's
 controller uncordons it. An undrain hands nothing back: a resident already
 suspended stays suspended until a user call wakes it.
 
-Kind renders `SPACE_DRAIN_V2_ENABLED` on for the API and the controller
-through its own values (`values-kind.yaml`), and the controller's
-`SPACE_DRAIN_V2_TEST_*` bounds with it, so a run changes no Deployment to
-drain: each batch of runs checks the switches once (`require_drain_v2`). A
+A Kind bench brought up with `SPACE_KIND_DRAIN_V2=on` renders
+`SPACE_DRAIN_V2_ENABLED` on for the API and the controller, and Kind's
+values render the controller's `SPACE_DRAIN_V2_TEST_*` bounds, so a run
+changes no Deployment to drain; on a bench with drain v2 off, Kind's
+default, the runner skips every scenario declaring `drain_v2`: each batch of runs checks the switches once (`require_drain_v2`). A
 run whose drain needs EC2's answers, a terminate or a let-go, scopes the
 `aws` terminator to itself (`v2_controller(aws=True)`), under the
 controller-mutation Lease, with the gone-node loops a let-go node is handed
@@ -257,7 +258,7 @@ def require_drain_v2(fixture: ScenarioFixture, control: DrainV2Control) -> Drain
     fixture.verify(
         all(value == "true" for value in switches.values()) and bool(switches),
         f"drain v2 is off on this bench: {DRAIN_V2_ENABLED_ENV} must be \"true\" on the API and "
-        "the controller, which only Kind's values-kind.yaml sets",
+        "the controller; start the Kind bench with SPACE_KIND_DRAIN_V2=on",
         switches=switches,
     )
     hooks = control.drain_v2_test_hooks()

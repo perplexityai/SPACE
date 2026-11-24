@@ -24,6 +24,7 @@ HOLD_SECONDS = 60 * 60
 # so the resident stays on the drained one.
 @smoke.scenario(
     "native.v2_drain_refuses_stopped_sandboxes",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     # Four refused stops, each retried for its whole budget, on a slow KVM

@@ -43,7 +43,7 @@
 # teardown at the end left benches; else 42 a scenario warned; else 0. The
 # checkout must not change during a run.
 #
-# Env: SPACE_KIND_SUBSTRATE, SPACE_KIND_STORAGE_CREDENTIALS, SPACE_KIND_RUST_BUILD,
+# Env: SPACE_KIND_SUBSTRATE, SPACE_KIND_DRAIN_V2, SPACE_KIND_STORAGE_CREDENTIALS, SPACE_KIND_RUST_BUILD,
 # SPACE_SMOKE_TIERS (default routine), SPACE_SMOKE_INCLUDE_SCENARIOS,
 # SPACE_SMOKE_SUBSTRATE, SPACE_SMOKE_KNOWN_FAILURES, SPACE_KIND_TELEMETRY_MODE
 # (default otel) and SPACE_CI_IMAGE_MIRROR pass through to every bench. SPACE_KIND_BENCH_ROOT
@@ -813,7 +813,7 @@ bench_env() {
     printf 'SPACE_KIND_BUILD_CACHE_REPOSITORY=%s\n' "$LAYER_CACHE"
     local name
     # The lanes' settings (README: release build, Direct substrate) too.
-    for name in SPACE_KIND_SUBSTRATE SPACE_CI_IMAGE_MIRROR \
+    for name in SPACE_KIND_SUBSTRATE SPACE_KIND_DRAIN_V2 SPACE_CI_IMAGE_MIRROR \
         SPACE_KIND_RUST_BUILD SPACE_CONSOLE_PASSWORD SPACE_KIND_STORAGE_CREDENTIALS \
         SPACE_SMOKE_SUBSTRATE SPACE_SMOKE_KNOWN_FAILURES; do
       [[ -n "${!name:-}" ]] && printf '%s=%s\n' "$name" "${!name}"

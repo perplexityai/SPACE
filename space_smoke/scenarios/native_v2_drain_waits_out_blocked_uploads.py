@@ -19,6 +19,7 @@ from space_smoke.drain_v2 import PENDING_SINCE_FIELD, timestamp_seconds
 # fails at once rather than at a timeout.
 @smoke.scenario(
     "native.v2_drain_waits_out_blocked_uploads",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=40,

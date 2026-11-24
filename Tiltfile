@@ -103,6 +103,10 @@ watch_file("infra/space/kind/lib/rust-build.sh")
 # infra/space/kind/README.md.
 SUBSTRATE = str(local(["bash", "infra/space/kind/lib/substrate.sh"], quiet = True)).strip()
 watch_file("infra/space/kind/lib/substrate.sh")
+# Drain v2 on the API and the cluster controller, off unless
+# SPACE_KIND_DRAIN_V2=on (infra/space/kind/lib/drain-v2.sh).
+DRAIN_V2 = str(local(["bash", "infra/space/kind/lib/drain-v2.sh"], quiet = True)).strip()
+watch_file("infra/space/kind/lib/drain-v2.sh")
 local(["bash", "infra/space/kind/lib/substrate.sh", "check", KIND_CLUSTER], quiet = True)
 DIRECT = SUBSTRATE == "direct"
 # The exchange mode's credential-manager authority admits a node service by its
@@ -734,7 +738,7 @@ SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
 # caller-provided-cluster chart must not inherit.
 deploy_yaml(helm_release("space", "infra/space/kind/charts/space-api-local",
                          values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"],
-                         set = ["substrate=" + SUBSTRATE]))
+                         set = ["substrate=" + SUBSTRATE, "drainV2.enabled=" + DRAIN_V2]))
 k8s_resource(
     "space-api",
     labels = ["control-plane"],
@@ -860,7 +864,7 @@ k8s_resource(
 # caller-provided-cluster chart must not inherit.
 deploy_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local",
                          values = ["infra/space/kind/charts/space-cluster-controller-local/values-kind.yaml"],
-                         set = ["substrate=" + SUBSTRATE]))
+                         set = ["substrate=" + SUBSTRATE, "drainV2.enabled=" + DRAIN_V2]))
 k8s_resource(
     "space-cluster-controller",
     labels = ["control-plane"],

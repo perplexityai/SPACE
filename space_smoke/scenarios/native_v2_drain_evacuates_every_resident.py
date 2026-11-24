@@ -24,6 +24,7 @@ PATH = "/tmp/space-smoke-v2-drain.txt"
 # follows a drain is `native.v2_drain_terminates_its_worker`.
 @smoke.scenario(
     "native.v2_drain_evacuates_every_resident",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     # Three suspends, their uploads, three wakes and the drained edge on a

@@ -188,20 +188,29 @@ page's Drain, a v1 gentle drain: it checks that the request is
 `{"mode":"gentle"}` with no engine and that the page shows a mode, no
 engine and no Drain progress panel, then undrains it.
 
+The v1 drain steps (`node-forced-drain-undrain`, `node-terminate-refused`,
+`node-gentle-drain-undrain`) need drain v2 off, Kind's default, since the
+API refuses every v1 `:drain` while it is on; on a bench brought up with
+`SPACE_KIND_DRAIN_V2=on` each notes that and returns. The switch is read
+once per run, from the controller's `SPACE_DRAIN_V2_ENABLED`.
+
 The `drain-v2` steps run v2 drains (`:drain {engine: "v2", hold_seconds}`)
 on a real Kind worker. The API serves them on Kind, but only the cluster
 controller's v2 loop moves one along, and a v2 drain needs the node's EC2
 instance recorded, so `nodes-v2-setup` does what `space_smoke`'s drain v2
-scenarios do, with `kubectl` and `docker` through `--kube-context`: it takes
-the smokes' controller and worker-cordon Leases, checks that the bench's
-values turn `SPACE_DRAIN_V2_ENABLED` on for the controller, records its
+scenarios do, with `kubectl` and `docker` through `--kube-context`. On a
+bench with drain v2 off, Kind's default, it notes that, before changing
+anything, and every v2 step notes it too; bring the bench up with
+`SPACE_KIND_DRAIN_V2=on` to run them. Otherwise it takes the smokes'
+controller and worker-cordon Leases, records the controller's
 standing `SPACE_NODE_DRAIN_TERMINATOR_KIND` and its replicas in
 `out/drain-v2-standing.json`, turns the `aws` terminator on (against Kind's
 fake EC2; Kind's v1 drains run `kube-delete`) and waits for the rollout, and
 re-registers each worker that holds no sandbox under a fake AWS providerID,
 waiting until the node's preview no longer names its instance unrecorded.
 `nodes-v2-teardown` puts the recorded config back and releases the Leases;
-the workers keep their fake instances. Both carry every v2 flow's name as a
+the workers keep their fake instances. A setup that fails part way puts the
+recorded config back too, before it releases the Leases. Both carry every v2 flow's name as a
 tag, so `--only node-drain-progress` runs them around it. A run interrupted
 in between leaves the file, which the next setup restores from, and Leases
 held by a loop process that is gone, which the next run on this host takes

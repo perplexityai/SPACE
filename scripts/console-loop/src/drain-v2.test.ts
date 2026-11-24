@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  DRAIN_V2_SWITCH, V2_CONTROLLER_KEYS, envAssignments, envLiterals, fakeInstanceOf, fakeProviderId, leaseFree, leaseName, withProviderId,
+  DRAIN_V2_SWITCH, V2_CONTROLLER_KEYS, drainModeSkip, drainV2Enabled, envAssignments, envLiterals, fakeInstanceOf, fakeProviderId, leaseFree, leaseName, withProviderId,
 } from './drain-v2.ts';
 import {
   bareSandboxId, drainCountsOf, drainStageOf, panelMismatches, rowMismatches, stalledSince, type ApiDrain, type PanelRead,
@@ -157,4 +157,15 @@ test("the sandboxes' rows must agree with what the report says of them", () => {
   assert.match(off[0], /evacuated \(full\) but its row is started/);
   assert.match(rowMismatches(drain(), new Map([[bareSandboxId(A), 'suspended']]))[0], /held but its row is suspended/);
   assert.deepEqual(rowMismatches(drain({ pending: [{ sandbox_id: A, wait: 'moving', running: true, pool_member: false, reason: null, since: null }] }), new Map([[bareSandboxId(A), 'started']])), [], 'only a hold must still be started');
+});
+
+// The v1 flows run only with drain v2 off, Kind's default, and the v2 flows
+// only with it on; each skip says why.
+test('the drain flows run only under the drain v2 setting they need', () => {
+  assert.equal(drainV2Enabled('true'), true);
+  for (const value of ['false', null, 'TRUE', '1']) assert.equal(drainV2Enabled(value), false, String(value));
+  assert.equal(drainModeSkip('v1', false), null);
+  assert.equal(drainModeSkip('v2', true), null);
+  assert.match(drainModeSkip('v1', true) ?? '', /v1 drains are refused/);
+  assert.match(drainModeSkip('v2', false) ?? '', /SPACE_KIND_DRAIN_V2=on/);
 });

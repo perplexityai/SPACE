@@ -21,6 +21,9 @@ def _inventory(surface):
         and scenario.quarantined is None
         and scenario.tier == "routine"
         and scenario.applies_to(None)
+        # The mocked bench runs drain v2 off, Kind's default, which skips
+        # the drain v2 scenarios by mode.
+        and not scenario.drain_v2
     }
 
 
@@ -35,6 +38,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
 
     seen = []
     empty_passes = []
+    unbootstrapped = []
 
     def execute(scenarios, **kwargs):
         surface = kwargs["environment"].get("SPACE_SMOKE_API_SURFACE")
@@ -69,12 +73,15 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
                 before = len(seen)
                 bootstraps = bootstrap.call_count
                 status = _run_all(shard=(index, count))
-                # A pass whose share is empty skips its bootstrap and passes;
-                # one that ran scenarios reports the first one's failure.
+                # A pass that ran nothing passes: its share was empty, and it
+                # skipped its bootstrap, or the bench's modes skipped all of it
+                # (the drain v2 scenarios on a bench with drain v2 off). One
+                # that ran scenarios reports the first one's failure.
                 if len(seen) == before:
                     assert status == 0
-                    assert bootstrap.call_count == bootstraps
                     empty_passes.append((surface, index))
+                    if bootstrap.call_count == bootstraps:
+                        unbootstrapped.append((surface, index))
                 else:
                     assert status == 1
     expected = {(surface, sid) for surface in ("ecw", "native") for sid in _inventory(surface)}
@@ -82,6 +89,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
     assert set(seen) == expected
     if count == _EMPTY_PASS_COUNT:
         assert empty_passes, "a shard with nothing to run was never exercised"
+        assert unbootstrapped, "a shard with nothing to run still bootstrapped"
 
 
 @pytest.mark.parametrize("shard", ["0/2", "3/2", "1/0", "1", "a/2", "1/2/3"])

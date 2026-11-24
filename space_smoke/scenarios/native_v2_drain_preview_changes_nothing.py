@@ -26,6 +26,7 @@ from space_smoke.drain_v2 import PENDING_RUNNING_FIELD, WAIT_HOLD
 # the directory.
 @smoke.scenario(
     "native.v2_drain_preview_changes_nothing",
+    drain_v2=True,
     api_surfaces=("native",),
     substrates=("kubernetes",),
     timeout_minutes=30,
