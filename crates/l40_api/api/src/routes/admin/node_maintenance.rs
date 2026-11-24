@@ -682,31 +682,18 @@ pub async fn delete_node(
         return err.into_response();
     }
 
-    let result = hard_delete_direct_node(&state.pool, id).await;
+    let result = pplx_space_node_registration_store::direct::delete_direct_node(
+        &state.pool,
+        id,
+        REGISTRY_SUBSTRATE,
+    )
+    .await;
 
     match result {
         Ok(count) if count > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
         Err(err) => db_error(err).into_response(),
     }
-}
-
-async fn hard_delete_direct_node(pool: &sqlx::PgPool, id: NodeId) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(sql!(
-        "DELETE FROM nodes n
-         WHERE n.id = $1
-           AND n.managed_by = $2
-           AND EXISTS (
-               SELECT 1
-               FROM node_direct nd
-               WHERE nd.node_id = n.id
-           )"
-    ))
-    .bind(id)
-    .bind(REGISTRY_SUBSTRATE)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 #[cfg(test)]

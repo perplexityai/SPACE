@@ -1,7 +1,10 @@
-//! Reads of `nodes` that join the node's Direct registration in
-//! `node_direct`: the admin node row, its Kubernetes registration and its
-//! `node_status_snapshots` row, by id, as a filtered listing, and
-//! locked for an administrative transition.
+//! Statements on `nodes` that join or test the node's Direct registration in
+//! `node_direct`. Reads of the admin node row, its Kubernetes registration
+//! and its `node_status_snapshots` row, by id, as a filtered listing, and
+//! locked for an administrative transition; and the two hard deletes of a
+//! Direct node, by id ([`delete_direct_node`]) and of its expired tombstones
+//! ([`prune_expired_direct_node_tombstones`]), whose `node_direct` rows go by
+//! the schema's `ON DELETE CASCADE`.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeAddress, NodeGroupId, NodeManagedBy, NodeRole};
@@ -268,3 +271,84 @@ FOR UPDATE OF n"
     .fetch_optional(&mut **tx)
     .await
 }
+
+/// Hard-delete the `nodes` row of `node_id` when it is managed by
+/// `managed_by` and has a `node_direct` registration, returning the number of
+/// rows deleted: 0 when no such node exists. Rows whose foreign key to
+/// `nodes` cascades, `node_direct` among them, go with it.
+pub async fn delete_direct_node(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+    managed_by: NodeManagedBy,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "DELETE FROM nodes n
+         WHERE n.id = $1
+           AND n.managed_by = $2
+           AND EXISTS (
+               SELECT 1
+               FROM node_direct nd
+               WHERE nd.node_id = n.id
+           )"
+    ))
+    .bind(node_id)
+    .bind(managed_by)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Hard-delete up to `max_records` Direct node tombstones managed by
+/// `managed_by` whose `node_direct` row was deleted more than
+/// `retention_secs` seconds before the database's `NOW()`, oldest first,
+/// returning how many it deleted: 0 when none has expired. A node that a
+/// non-terminal sandbox still names as its active or target node stays.
+/// `NOW()` is the start of the executor's transaction.
+pub async fn prune_expired_direct_node_tombstones(
+    executor: impl PgExecutor<'_>,
+    retention_secs: i64,
+    max_records: i64,
+    managed_by: NodeManagedBy,
+) -> Result<u64, sqlx::Error> {
+    // Quarantined sandboxes are not terminal for tombstone retention:
+    // they intentionally keep the node association until quarantine-aware
+    // cleanup or operator release resolves the preserved state.
+    Ok(sqlx::query_scalar::<_, String>(sql!(
+        "WITH candidates AS (
+             SELECT n.id
+               FROM nodes n
+               JOIN node_direct nd ON nd.node_id = n.id
+              WHERE n.managed_by = $3
+                AND COALESCE(n.state, 'registered') = 'deleted'
+                AND nd.deleted_at IS NOT NULL
+                AND nd.deleted_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM sandboxes s
+                     WHERE s.active_node_id = n.id
+                       AND s.lifecycle NOT IN ('deleted', 'failed')
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM sandboxes s
+                     WHERE s.target_node_id = n.id
+                       AND s.lifecycle NOT IN ('deleted', 'failed')
+                )
+              ORDER BY nd.deleted_at ASC, n.id ASC
+              LIMIT $2
+         )
+         DELETE FROM nodes n
+          USING candidates c
+          WHERE n.id = c.id
+          RETURNING n.id::TEXT"
+    ))
+    .bind(retention_secs)
+    .bind(max_records)
+    .bind(managed_by)
+    .fetch_all(executor)
+    .await?
+    .len() as u64)
+}
+
+#[cfg(test)]
+mod tests;
