@@ -5044,9 +5044,8 @@ async fn autoscaling_follows_the_release_creates_resolve_to() -> TestResult {
 #[case::with_twins(true)]
 #[tokio::test(flavor = "current_thread")]
 async fn retention_and_demand_pick_the_digest_original(#[case] twins: bool) -> TestResult {
-    use pplx_space_template_release_store::spelling_pairs::{
-        OLD_INDEX, seed_spelling_pairs, tag_release,
-    };
+    use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
+    use pplx_space_template_store::test_support::tag_release;
     const TEMPLATE: &str = "spelling-pairs";
     let fixture = postgres_fixture().await?;
     let pool = &fixture.pool;

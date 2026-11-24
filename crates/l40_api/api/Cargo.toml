@@ -25,7 +25,6 @@ kubernetes = [
     "dep:pplx-space-sandbox-pod",
     "dep:pplx-space-kube-client",
     "dep:pplx-space-k8s-node-id",
-    "dep:pplx-space-node-registration-store",
     "pplx-space-rpc-auth/k8s",
 ]
 otel = ["pplx-space-observability/otel"]
@@ -86,6 +85,7 @@ uuid = { workspace = true, features = ["v5", "v7", "serde"] }
 # build-manager is reached indirectly via space-node-api-svc (BuilderApi).
 # The recipe adapter keeps system builds on the same TOML contract as the builder CLI.
 pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-admin-audit-store = { workspace = true }
 pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-bearer-token = { workspace = true }
@@ -93,6 +93,7 @@ pplx-space-build-mgr = { workspace = true }
 pplx-space-build-mgr-client = { workspace = true }
 pplx-space-cluster-id = { workspace = true }
 pplx-space-env-vars = { workspace = true }
+pplx-space-byok-store = { workspace = true }
 pplx-space-byte-size = { workspace = true, features = ["serde"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
@@ -120,8 +121,9 @@ pplx-space-rpc-contracts = { workspace = true }
 pplx-space-sandbox-pod = { workspace = true, optional = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
-pplx-space-node-registration-store = { workspace = true, optional = true }
+pplx-space-node-registration-store = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
+pplx-space-data-plane-session-store = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
@@ -131,6 +133,7 @@ pplx-space-postgres-pool = { workspace = true }
 pplx-space-public-api-http = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-public-api = { workspace = true, features = ["schema", "serde"] }
+pplx-space-public-operation-store = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-template-runtime = { workspace = true }
@@ -141,7 +144,10 @@ pplx-space-cluster-pool = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-policy-authority = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
+pplx-space-node-execution-inventory-store = { workspace = true }
 pplx-space-node-status-store = { workspace = true }
+pplx-space-node-group-store = { workspace = true }
+pplx-space-node-template-inventory-store = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-runtime-environment-catalog-store = { workspace = true }
 pplx-space-runtime-environment-policy-store = { workspace = true }
@@ -158,10 +164,12 @@ pplx-space-snapshot-store = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 pplx-space-template-release-original = { workspace = true }
+pplx-space-template-store = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 
 [dev-dependencies]
 pplx-space-template-release-store = { workspace = true, features = ["test-support"] }
+pplx-space-template-store = { workspace = true, features = ["test-support"] }
 pplx-space-api-route = { workspace = true, features = ["test-support"] }
 pplx-space-ecw-credential = { workspace = true, features = ["test-support"] }
 pplx-space-internal-api-server = { workspace = true }

@@ -9,7 +9,9 @@ use pplx_space_admin_protocol::{
     AdminNodeReconcileTrigger, AdminNodeResponse, AdminNodeRuntimeInstallation,
 };
 
-use super::super::node_store::{AdminNodeStore, NodeRuntimeInstallationRow};
+use pplx_space_node_execution_inventory_store::InstallationGuestRow;
+
+use super::super::node_store::AdminNodeStore;
 use super::super::support::{format_optional_time, format_time};
 use crate::reconcile_trigger::QueuedTrigger;
 use crate::routes::AppState;
@@ -94,7 +96,7 @@ fn admin_reconcile_trigger(trigger: QueuedTrigger) -> AdminNodeReconcileTrigger 
 /// Group guest rows into one installation each. Relies on the store's order:
 /// a node's rows for one runtime version are adjacent.
 fn runtime_installations_by_node(
-    rows: Vec<NodeRuntimeInstallationRow>,
+    rows: Vec<InstallationGuestRow>,
 ) -> HashMap<NodeId, Vec<AdminNodeRuntimeInstallation>> {
     let mut by_node: HashMap<NodeId, Vec<AdminNodeRuntimeInstallation>> = HashMap::new();
     for row in rows {

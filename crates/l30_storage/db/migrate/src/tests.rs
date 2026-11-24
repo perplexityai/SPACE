@@ -38,6 +38,13 @@ async fn suspend_attempt_rollback_preserves_ownership_and_migration_history() {
             .await
             .unwrap();
     }
+    let newest: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(newest, 20261112160000, "suspend_attempt is the newest");
     let conn = Connection::open(&path).unwrap();
     conn.execute(
         "INSERT INTO sandboxes (id, uuid8, state, template, created_at, updated_at,
@@ -552,6 +559,98 @@ async fn runtime_upgrade_downs_refuse_while_a_row_an_older_release_misreads_is_r
         parsed.len() as i64,
         "the outcomes an older release parses are kept"
     );
+}
+
+/// Records the request with each final attempt outcome.
+const ATTEMPT_IDENTITY_MIGRATION: i64 = 20261120180000;
+
+/// The attempt-identity down refuses while a final attempt outcome (one that
+/// records its request) is recorded, since a release without the columns
+/// would take it as final for no attempt and run a retry its caller gave up.
+/// It leaves its migration and columns in place, and goes through over rows
+/// that don't record their request, which it keeps.
+#[tokio::test]
+async fn attempt_identity_down_refuses_while_a_final_attempt_outcome_is_recorded() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let migrator = pplx_space_sbx_mgr_store::db::migration::target().service;
+    let newer = migrator
+        .iter()
+        .filter(|migration| {
+            migration.migration_type.is_up_migration()
+                && migration.version > ATTEMPT_IDENTITY_MIGRATION
+        })
+        .count();
+    let applied = || async {
+        let pool = sqlite_pool(&path).await.unwrap();
+        applied_versions_sqlite(&pool, migrator).await.unwrap()
+    };
+    let execute = |sql: &str| {
+        Connection::open(&path).unwrap().execute(sql, []).unwrap();
+    };
+    let identity_columns = || -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_xinfo('sandbox_runtime_upgrade_attempt_outcomes')
+                  WHERE name IN ('target_environment', 'target_state', 'authorization_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    for _ in 0..newer {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    assert_eq!(identity_columns(), 3);
+    execute(
+        "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+             (operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at)
+         VALUES ('legacy-op', 'attempt-a', 'sandbox', 'rolled_back', NULL, '0')",
+    );
+    execute(
+        "INSERT INTO sandbox_runtime_upgrade_attempt_outcomes
+             (operation_id, attempt_id, sandbox_id, outcome, failure, recorded_at,
+              target_environment, target_state, authorization_id)
+         VALUES ('final-op', 'attempt-a', 'sandbox', 'rolled_back', NULL, '0',
+                 'env', 'started', 'auth')",
+    );
+
+    let refused = rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{refused:?}").contains("CHECK constraint failed"),
+        "{refused:?}"
+    );
+    assert!(applied().await.contains(&ATTEMPT_IDENTITY_MIGRATION));
+    assert_eq!(identity_columns(), 3, "the refused down keeps the columns");
+
+    execute(
+        "DELETE FROM sandbox_runtime_upgrade_attempt_outcomes
+          WHERE target_environment IS NOT NULL",
+    );
+    rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+        .await
+        .unwrap();
+    assert!(!applied().await.contains(&ATTEMPT_IDENTITY_MIGRATION));
+    assert_eq!(identity_columns(), 0);
+    let legacy: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy, 1, "the row without a request is kept");
+    migrate_sqlite_up(database, &path).await.unwrap();
+    assert_eq!(identity_columns(), 3, "up again");
 }
 
 const DIRTY_REF_REVISIONS: i64 = 20261031050126;

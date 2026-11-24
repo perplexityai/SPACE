@@ -37,22 +37,14 @@ pub(super) enum EnvironmentRefs {
 }
 
 impl EnvironmentRefs {
-    /// Whether the publication writes the arrays and their receipt.
-    pub(super) const fn writes(&self) -> bool {
-        !matches!(self, Self::Preserve)
-    }
-
-    pub(super) fn usable(&self) -> Option<&[String]> {
+    /// What the publication writes to the arrays and their receipt.
+    pub(super) fn write(&self) -> pplx_space_node_status_store::EnvironmentRefsWrite<'_> {
         match self {
-            Self::Record { usable, .. } => Some(usable),
-            Self::Preserve | Self::Clear => None,
-        }
-    }
-
-    pub(super) fn known(&self) -> Option<&[String]> {
-        match self {
-            Self::Record { known, .. } => Some(known),
-            Self::Preserve | Self::Clear => None,
+            Self::Preserve => pplx_space_node_status_store::EnvironmentRefsWrite::Preserve,
+            Self::Record { usable, known } => {
+                pplx_space_node_status_store::EnvironmentRefsWrite::Record { usable, known }
+            }
+            Self::Clear => pplx_space_node_status_store::EnvironmentRefsWrite::Clear,
         }
     }
 }

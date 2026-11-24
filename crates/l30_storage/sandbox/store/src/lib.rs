@@ -55,7 +55,11 @@
 //!   would change what it does.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
-//!   the lock. They stay at their call sites.
+//!   the lock. One moves here only as a lock verb: the statement verbatim, on
+//!   the caller's transaction, named and documented as a lock, in a module
+//!   named for the path that takes it (as [`fork_source_lifecycle`] is for
+//!   its advisory lock). The caller keeps its transaction and the re-checks
+//!   it runs under the lock.
 //! * **The node-local SQLite `sandboxes` table** (`crates/l30_storage/sbx/mgr/store`) is a
 //!   different database on a different machine and is out of scope.
 //!
@@ -78,7 +82,28 @@
 //!   count against one node, each with the gate terms that count it, composed
 //!   from the residency and portability fragments those gates read.
 //!   [`node_placements`] pages one node's placement history, every lifecycle
-//!   included.
+//!   included. [`k8s_node_attribution`] lists the registered nodes the
+//!   sandbox's placement, latest execution and a named snapshot attribute to
+//!   it, for scoping the storage credentials a node may receive.
+//! * **So are single-question reads.** A read of the `sandboxes` row that
+//!   callers made inline moves here whole, as a module named for the question
+//!   it answers, such as [`restore_pod_owners`] or [`stopped_replacements`].
+//!   Two such modules also read a table another store owns:
+//!   [`active_quarantines`] and [`quarantine_recovery_authority`] join
+//!   `sandbox_quarantine_state`, which belongs to
+//!   `pplx-space-sandbox-quarantine-store`.
+//! * **Sibling tables get a module each.** The unlocked reads and the
+//!   unguarded steps that callers ran on the sandbox-scoped tables this
+//!   crate declares, mostly inside a larger transaction, move into modules
+//!   named for the table: [`port_exposures`], [`observed_states`],
+//!   [`snapshot_inventory`], [`node_local_backup_pending`],
+//!   [`ecw_credential_epochs`] and [`k8s_executions`]. [`k8s_executions`]
+//!   holds unlocked reads only: the table's writes, the generation
+//!   allocation and its `FOR UPDATE` reads stay with the execution-ownership
+//!   paths that issue them. A step that is part of a transition statement
+//!   stays in that transition's module. A read of the `sandboxes` row
+//!   alone, such as [`runtime_access`], gets a module named for the
+//!   question it answers.
 //!
 //! # Fact kinds
 //!
@@ -119,30 +144,52 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod action_stamp;
+pub mod active_quarantines;
 pub mod admin_occupancy;
 pub mod artifact_marker;
 pub mod attribute_runtime;
 pub mod create;
+pub mod debug_reads;
 pub mod delete;
+pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
+pub mod drain_terminate;
+pub mod ecw_credential_epochs;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
+pub mod k8s_executions;
+pub mod k8s_node_attribution;
 mod lifecycle;
 pub mod lost;
+pub mod node_desired_state;
 pub mod node_holds;
+pub mod node_local_backup_pending;
 pub mod node_placements;
+pub mod observed_states;
 pub mod orphan;
 pub mod pod_tracking;
+pub mod port_exposures;
+pub mod published_quarantine_candidates;
 pub mod quarantine;
+pub mod quarantine_recovery_authority;
 pub mod repair;
 pub mod restore_dispatch_fence;
 pub mod restore_lease;
+pub mod restore_pod_owners;
 pub mod restore_source;
+pub mod row_reads;
+pub mod runtime_access;
 pub mod runtime_population;
+pub mod sandbox_id_bounds;
+pub mod snapshot_capture_fields;
+pub mod snapshot_inventory;
+pub mod stopped_replacement_claim;
+pub mod stopped_replacements;
 pub mod stuck;
 pub mod suspend;
+pub mod suspend_reads;
 pub mod sweeper;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

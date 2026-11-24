@@ -250,7 +250,7 @@ pub(super) struct ObservedResources {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct PodExecution {
     pub id: Uuid,
     pub sandbox_id: SandboxId,
@@ -279,7 +279,7 @@ pub(super) struct SnapshotsSection {
     pub storage_error: Option<String>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct Snapshot {
     pub id: Uuid,
     pub sandbox_id: SandboxId,
@@ -299,9 +299,48 @@ pub(super) struct Snapshot {
     pub failure_reason: Option<String>,
     /// Filled from the snapshot catalog's storage placement after the read.
     /// Omitted when that read failed; the section's `storage_error` says why.
-    #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<SnapshotStorage>,
+}
+
+impl From<pplx_space_snapshot_store::listing::StoredSnapshot> for Snapshot {
+    fn from(row: pplx_space_snapshot_store::listing::StoredSnapshot) -> Self {
+        let pplx_space_snapshot_store::listing::StoredSnapshot {
+            id,
+            sandbox_id,
+            r#type,
+            state,
+            timestamp,
+            source_node_id,
+            label,
+            retention_tier,
+            vcpu,
+            memory_mib,
+            size_bytes,
+            template_id,
+            content_hash,
+            org_id,
+            failure_reason,
+        } = row;
+        Self {
+            id: id.as_uuid(),
+            sandbox_id,
+            r#type,
+            state,
+            timestamp,
+            source_node_id,
+            label,
+            retention_tier,
+            vcpu,
+            memory_mib,
+            size_bytes,
+            template_id,
+            content_hash,
+            org_id,
+            failure_reason,
+            storage: None,
+        }
+    }
 }
 
 /// Where a catalog snapshot's bytes are.
@@ -350,7 +389,7 @@ impl SnapshotStorage {
     }
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct SnapshotInventory {
     pub sandbox_id: SandboxId,
     pub snapshot_id: String,
@@ -417,7 +456,7 @@ pub(super) struct QuarantineHistoryEntry {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct PortExposure {
     pub sandbox_id: SandboxId,
     pub protocol: String,
@@ -438,7 +477,7 @@ pub(super) struct PortExposure {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct TimelineEvent {
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,

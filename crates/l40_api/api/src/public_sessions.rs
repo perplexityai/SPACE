@@ -1,6 +1,7 @@
 use pplx_space_accounts::{OrgId, UserId};
-use pplx_space_sandbox_model::SandboxId;
-
+use pplx_space_data_plane_session_store::{
+    self as data_plane_session_store, Session as PublicSessionRow,
+};
 use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -8,14 +9,13 @@ use std::time::Duration;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_public_api::{
     DataPlaneAttachInfo, DataPlaneScope, DataPlaneSessionId, DataPlaneTokenTransport,
-    OperationKind, OperationState, OperationTargetType, PublicOperationEventType,
-    PublicOperationResult, PublicSandboxId, PublicSession, PublicSessionOperationResult,
-    RequestFingerprint, SessionKind, SessionState, SessionTargetProtocol,
-    data_plane_session_events_path,
+    OperationKind, OperationState, OperationTargetType, PublicOperationResult, PublicSandboxId,
+    PublicSession, PublicSessionOperationResult, RequestFingerprint, SessionKind, SessionState,
+    SessionTargetProtocol, data_plane_session_events_path,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, Postgres, Transaction, types::Json};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -24,6 +24,8 @@ use crate::public_operations::{ApiProduct, HttpOperationMethod, OperationPathTem
 use crate::public_store::{InvalidStoredEnum, parse_stored_enum};
 
 const API_PRODUCT_NATIVE: ApiProduct = ApiProduct::Native;
+/// How long a session create's idempotency record replays it.
+const IDEMPOTENCY_TTL_HOURS: i64 = 24;
 const SESSION_OPERATION_PROGRESS: &str = "session created";
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_ATTACH_DEADLINE: Duration = Duration::from_secs(60);
@@ -131,12 +133,8 @@ impl PublicSessionStore {
                 .await?
                 .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
             tx.commit().await?;
-            return PublicSessionRow::try_into_public(
-                row,
-                Some(token),
-                self.data_plane_base_url.as_str(),
-            )
-            .map(Ok);
+            return session_into_public(row, Some(token), self.data_plane_base_url.as_str())
+                .map(Ok);
         }
         if let Err(refusal) = admit() {
             return Ok(Err(refusal));
@@ -151,58 +149,27 @@ impl PublicSessionStore {
         let attach_deadline_at = now + DEFAULT_ATTACH_DEADLINE;
         let expires_at = now + DEFAULT_SESSION_TTL;
 
-        let row = sqlx::query_as::<_, PublicSessionRow>(sql!(
-            "INSERT INTO data_plane_sessions (
-                 session_id,
-                 org_id,
-                 actor_user_id,
-                 sandbox_id,
-                 kind,
-                 state,
-                 scopes,
-                 token_hash,
-                 token_expires_at,
-                 attach_deadline_at,
-                 target_port,
-                 target_protocol,
-                 target_path,
-                 adapter_state,
-                 expires_at
-             )
-             VALUES (
-                 $1, $2, $3, $4, $5, $6, $7,
-                 $8, $9, $10, $11, $12, $13, $14, $15
-             )
-             RETURNING session_id,
-                       sandbox_id,
-                       kind,
-                       state,
-                       reconnect_count,
-                       last_reconnect_reason,
-                       scopes,
-                       target_port,
-                       target_protocol,
-                       target_path,
-                       created_at,
-                       updated_at,
-                       expires_at"
-        ))
-        .bind(&session_id_string)
-        .bind(input.org_id)
-        .bind(input.actor_user_id)
-        .bind(input.sandbox_id.as_uuid())
-        .bind(input.kind.as_str())
-        .bind(SessionState::Pending.as_str())
-        .bind(vec![scope.as_str().to_string()])
-        .bind(token.hash.as_str())
-        .bind(token_expires_at)
-        .bind(attach_deadline_at)
-        .bind(input.target_port.map(i32::from))
-        .bind(input.target_protocol.map(SessionTargetProtocol::as_str))
-        .bind(input.target_path)
-        .bind(Json(input.adapter_state.clone()))
-        .bind(expires_at)
-        .fetch_one(&mut *tx)
+        let scopes = vec![scope.as_str().to_string()];
+        let row = data_plane_session_store::insert_session(
+            &mut *tx,
+            &data_plane_session_store::NewSession {
+                session_id: &session_id_string,
+                org_id: input.org_id,
+                actor_user_id: input.actor_user_id,
+                sandbox_id: input.sandbox_id.into(),
+                kind: input.kind.as_str(),
+                state: SessionState::Pending.as_str(),
+                scopes: &scopes,
+                token_hash: token.hash.as_str(),
+                token_expires_at,
+                attach_deadline_at,
+                target_port: input.target_port.map(i32::from),
+                target_protocol: input.target_protocol.map(SessionTargetProtocol::as_str),
+                target_path: input.target_path,
+                adapter_state: &input.adapter_state,
+                expires_at,
+            },
+        )
         .await?;
 
         insert_completed_session_operation_tx(
@@ -236,8 +203,7 @@ impl PublicSessionStore {
             OperationState::Succeeded.as_str(),
         );
 
-        PublicSessionRow::try_into_public(row, Some(token), self.data_plane_base_url.as_str())
-            .map(Ok)
+        session_into_public(row, Some(token), self.data_plane_base_url.as_str()).map(Ok)
     }
 
     pub async fn fetch_session(
@@ -254,10 +220,8 @@ impl PublicSessionStore {
             .fetch_optional(&self.pool)
             .await?;
 
-        row.map(|row| {
-            PublicSessionRow::try_into_public(row, None, self.data_plane_base_url.as_str())
-        })
-        .transpose()
+        row.map(|row| session_into_public(row, None, self.data_plane_base_url.as_str()))
+            .transpose()
     }
 
     pub async fn list_sessions(
@@ -306,9 +270,7 @@ impl PublicSessionStore {
         .await?;
 
         rows.into_iter()
-            .map(|row| {
-                PublicSessionRow::try_into_public(row, None, self.data_plane_base_url.as_str())
-            })
+            .map(|row| session_into_public(row, None, self.data_plane_base_url.as_str()))
             .collect()
     }
 
@@ -374,21 +336,12 @@ impl PublicSessionStore {
         .await?;
 
         if transitioned {
-            sqlx::query(sql!(
-                "INSERT INTO data_plane_org_revocation_epochs (org_id, epoch, updated_at)
-                 VALUES ($1, 1, NOW())
-                 ON CONFLICT (org_id) DO UPDATE
-                     SET epoch = data_plane_org_revocation_epochs.epoch + 1,
-                         updated_at = EXCLUDED.updated_at"
-            ))
-            .bind(input.org_id)
-            .execute(&mut *tx)
-            .await?;
+            data_plane_session_store::advance_org_revocation_epoch(&mut *tx, input.org_id).await?;
         }
 
         tx.commit().await?;
 
-        PublicSessionRow::try_into_public(row, None, self.data_plane_base_url.as_str()).map(Some)
+        session_into_public(row, None, self.data_plane_base_url.as_str()).map(Some)
     }
 
     /// The guest process id the data plane bound `session_id` to, if it has
@@ -404,19 +357,13 @@ impl PublicSessionStore {
         sandbox_id: PublicSandboxId,
         session_id: DataPlaneSessionId,
     ) -> Result<Option<String>, PublicSessionStoreError> {
-        let process_id = sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT backend_process_id
-             FROM data_plane_sessions
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND session_id = $3"
-        ))
-        .bind(org_id)
-        .bind(sandbox_id.as_uuid())
-        .bind(session_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(process_id.flatten())
+        Ok(data_plane_session_store::bound_process_id(
+            &self.pool,
+            org_id,
+            sandbox_id.into(),
+            &session_id.to_string(),
+        )
+        .await?)
     }
 
     /// The sessions in `sandbox_id` the data plane bound to any of
@@ -429,18 +376,12 @@ impl PublicSessionStore {
         sandbox_id: PublicSandboxId,
         process_ids: &[String],
     ) -> Result<HashMap<String, DataPlaneSessionId>, PublicSessionStoreError> {
-        let rows = sqlx::query_as::<_, SessionProcessBindingRow>(sql!(
-            "SELECT session_id,
-                    backend_process_id
-             FROM data_plane_sessions
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND backend_process_id = ANY($3)"
-        ))
-        .bind(org_id)
-        .bind(sandbox_id.as_uuid())
-        .bind(process_ids)
-        .fetch_all(&self.pool)
+        let rows = data_plane_session_store::sessions_bound_to_processes(
+            &self.pool,
+            org_id,
+            sandbox_id.into(),
+            process_ids,
+        )
         .await?;
         rows.into_iter()
             .map(|row| {
@@ -452,12 +393,6 @@ impl PublicSessionStore {
             })
             .collect()
     }
-}
-
-#[derive(Debug, FromRow)]
-struct SessionProcessBindingRow {
-    session_id: String,
-    backend_process_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -530,23 +465,6 @@ struct PublicSessionIdempotencyRecord {
 struct PublicSessionIdempotencyRow {
     operation_id: Option<Uuid>,
     request_fingerprint: String,
-}
-
-#[derive(Debug, FromRow)]
-struct PublicSessionRow {
-    session_id: String,
-    sandbox_id: SandboxId,
-    kind: String,
-    state: String,
-    reconnect_count: i64,
-    last_reconnect_reason: Option<String>,
-    scopes: Vec<String>,
-    target_port: Option<i32>,
-    target_protocol: Option<String>,
-    target_path: Option<String>,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-    expires_at: Option<OffsetDateTime>,
 }
 
 const SESSION_SELECT_SQL: &str = sql!(
@@ -649,17 +567,12 @@ async fn fetch_operation_target_session(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: Uuid,
 ) -> Result<Option<DataPlaneSessionId>, PublicSessionStoreError> {
-    let value = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT target_id
-         FROM public_operations
-         WHERE operation_id = $1
-           AND kind = $2
-           AND target_type = $3"
-    ))
-    .bind(operation_id)
-    .bind(OperationKind::CreateSession.as_str())
-    .bind(OperationTargetType::Session.as_str())
-    .fetch_optional(&mut **tx)
+    let value = pplx_space_public_operation_store::operations::target_id(
+        &mut **tx,
+        operation_id,
+        OperationKind::CreateSession,
+        OperationTargetType::Session,
+    )
     .await?;
 
     value
@@ -732,59 +645,24 @@ async fn insert_completed_session_operation_tx(
     let result_json = serde_json::to_value(&result).expect("public session result serializes");
 
     // The operation is new, so its completion is its first event: sequence 1
-    // is what `append_operation_event_tx` would compute. The event's foreign
-    // key is checked at the end of the statement, after the operation row.
-    sqlx::query(sql!(
-        "WITH operation AS (
-         INSERT INTO public_operations (
-             operation_id,
-             org_id,
-             actor_user_id,
-             api_product,
-             kind,
-             target_type,
-             target_id,
-             state,
-             progress_message,
-             result_json,
-             started_at,
-             completed_at,
-             gc_after
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, $6, $7,
-             $8, $9, $10, NOW(), NOW(),
-             NOW() + ('7 days')::INTERVAL
-         )
-         RETURNING operation_id
-         )
-         INSERT INTO public_operation_events (
-             operation_id,
-             sequence,
-             event_type,
-             event_json
-         )
-         SELECT operation_id, 1, $11, $12
-         FROM operation"
-    ))
-    .bind(operation_id)
-    .bind(org_id)
-    .bind(actor_user_id)
-    .bind(API_PRODUCT_NATIVE.as_str())
-    .bind(OperationKind::CreateSession.as_str())
-    .bind(OperationTargetType::Session.as_str())
-    .bind(session_id.to_string())
-    .bind(OperationState::Succeeded.as_str())
-    .bind(SESSION_OPERATION_PROGRESS)
-    .bind(Json(result_json.clone()))
-    .bind(PublicOperationEventType::Completed.as_str())
-    .bind(Json(serde_json::json!({
-        "state": OperationState::Succeeded.as_str(),
-        "result": result_json,
-    })))
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    // is what `append_operation_event_tx` would compute.
+    pplx_space_public_operation_store::operations::insert_completed_session_create(
+        &mut **tx,
+        pplx_space_public_operation_store::operations::CompletedSessionCreate {
+            operation_id,
+            org_id,
+            actor_user_id,
+            api_product: API_PRODUCT_NATIVE.as_str(),
+            session_id: session_id.to_string(),
+            progress_message: SESSION_OPERATION_PROGRESS,
+            result_json: result_json.clone(),
+            event_json: serde_json::json!({
+                "state": OperationState::Succeeded.as_str(),
+                "result": result_json,
+            }),
+        },
+    )
+    .await
 }
 
 async fn insert_idempotency_record_tx(
@@ -794,34 +672,21 @@ async fn insert_idempotency_record_tx(
     request_fingerprint: &RequestFingerprint,
     operation_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "INSERT INTO public_idempotency_records (
-             id,
-             org_id,
-             api_product,
-             method,
-             path_template,
-             idempotency_key,
-             request_fingerprint,
-             operation_id,
-             expires_at
-         )
-         VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8,
-             NOW() + ('24 hours')::INTERVAL
-         )"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(org_id)
-    .bind(API_PRODUCT_NATIVE.as_str())
-    .bind(idempotency.method.as_str())
-    .bind(idempotency.path_template.as_str())
-    .bind(idempotency.key.as_str())
-    .bind(request_fingerprint.as_str())
-    .bind(operation_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_public_operation_store::idempotency::insert_for_operation(
+        &mut **tx,
+        Uuid::now_v7(),
+        API_PRODUCT_NATIVE.as_str(),
+        pplx_space_public_operation_store::idempotency::IdempotencyKeyRef {
+            org_id,
+            method: idempotency.method.as_str(),
+            path_template: idempotency.path_template.as_str(),
+            idempotency_key: idempotency.key.as_str(),
+        },
+        request_fingerprint.as_str(),
+        operation_id,
+        IDEMPOTENCY_TTL_HOURS,
+    )
+    .await
 }
 
 fn request_fingerprint(
@@ -874,65 +739,62 @@ fn token_transport(kind: SessionKind) -> Vec<DataPlaneTokenTransport> {
     }
 }
 
-impl PublicSessionRow {
-    fn try_into_public(
-        row: Self,
-        token: Option<DataPlaneToken>,
-        data_plane_base_url: &str,
-    ) -> Result<PublicSession, PublicSessionStoreError> {
-        let id = row
-            .session_id
-            .parse::<DataPlaneSessionId>()
-            .map_err(|_| PublicSessionStoreError::InvalidStoredSessionId(row.session_id.clone()))?;
-        let kind = parse_stored_enum("kind", &row.kind)?;
-        let sandbox_id = PublicSandboxId::from(row.sandbox_id);
-        let scopes = row
-            .scopes
-            .iter()
-            .map(|scope| parse_stored_enum("scope", scope))
-            .collect::<Result<Vec<DataPlaneScope>, _>>()?;
-        let target_port = row
-            .target_port
-            .map(|port| {
-                u16::try_from(port)
-                    .map_err(|_| PublicSessionStoreError::InvalidStoredTargetPort(port))
-            })
-            .transpose()?;
-        let attach = token.map(|token| DataPlaneAttachInfo {
-            url: attach_url(data_plane_base_url, id, kind),
-            events_url: events_url(data_plane_base_url, id, kind),
-            token: token.raw,
-            expires_at: OffsetDateTime::now_utc() + DEFAULT_ATTACH_TOKEN_TTL,
-            token_transport: token_transport(kind),
-        });
-
-        Ok(PublicSession {
-            id,
-            sandbox_id,
-            kind,
-            state: parse_stored_enum("state", &row.state)?,
-            reconnect_count: u64::try_from(row.reconnect_count).map_err(|_| {
-                PublicSessionStoreError::InvalidStoredReconnectCount(row.reconnect_count)
-            })?,
-            last_reconnect_reason: row
-                .last_reconnect_reason
-                .as_deref()
-                .map(|reason| parse_stored_enum("last_reconnect_reason", reason))
-                .transpose()?,
-            scopes,
-            target_port,
-            target_protocol: row
-                .target_protocol
-                .as_deref()
-                .map(|protocol| parse_stored_enum("target_protocol", protocol))
-                .transpose()?,
-            target_path: row.target_path,
-            attach,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            expires_at: row.expires_at,
+fn session_into_public(
+    row: PublicSessionRow,
+    token: Option<DataPlaneToken>,
+    data_plane_base_url: &str,
+) -> Result<PublicSession, PublicSessionStoreError> {
+    let id = row
+        .session_id
+        .parse::<DataPlaneSessionId>()
+        .map_err(|_| PublicSessionStoreError::InvalidStoredSessionId(row.session_id.clone()))?;
+    let kind = parse_stored_enum("kind", &row.kind)?;
+    let sandbox_id = PublicSandboxId::from(row.sandbox_id);
+    let scopes = row
+        .scopes
+        .iter()
+        .map(|scope| parse_stored_enum("scope", scope))
+        .collect::<Result<Vec<DataPlaneScope>, _>>()?;
+    let target_port = row
+        .target_port
+        .map(|port| {
+            u16::try_from(port).map_err(|_| PublicSessionStoreError::InvalidStoredTargetPort(port))
         })
-    }
+        .transpose()?;
+    let attach = token.map(|token| DataPlaneAttachInfo {
+        url: attach_url(data_plane_base_url, id, kind),
+        events_url: events_url(data_plane_base_url, id, kind),
+        token: token.raw,
+        expires_at: OffsetDateTime::now_utc() + DEFAULT_ATTACH_TOKEN_TTL,
+        token_transport: token_transport(kind),
+    });
+
+    Ok(PublicSession {
+        id,
+        sandbox_id,
+        kind,
+        state: parse_stored_enum("state", &row.state)?,
+        reconnect_count: u64::try_from(row.reconnect_count).map_err(|_| {
+            PublicSessionStoreError::InvalidStoredReconnectCount(row.reconnect_count)
+        })?,
+        last_reconnect_reason: row
+            .last_reconnect_reason
+            .as_deref()
+            .map(|reason| parse_stored_enum("last_reconnect_reason", reason))
+            .transpose()?,
+        scopes,
+        target_port,
+        target_protocol: row
+            .target_protocol
+            .as_deref()
+            .map(|protocol| parse_stored_enum("target_protocol", protocol))
+            .transpose()?,
+        target_path: row.target_path,
+        attach,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        expires_at: row.expires_at,
+    })
 }
 
 impl TryFrom<PublicSessionIdempotencyRow> for PublicSessionIdempotencyRecord {

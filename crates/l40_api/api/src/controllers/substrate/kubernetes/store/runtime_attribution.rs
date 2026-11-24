@@ -138,16 +138,16 @@ impl K8sStore {
                 sandbox: None,
             }));
         }
-        let sandbox = sqlx::query_as::<_, (String, Option<ClientId>)>(sql!(
-            "SELECT lifecycle, activating_client_id FROM sandboxes WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .db_context("failed to read the sandbox's activating client")?;
-        Ok(sandbox.map(|(lifecycle, record)| TrackedPod {
+        let sandbox =
+            pplx_space_sandbox_store::row_reads::activation_record(&mut *conn, sandbox_id)
+                .await
+                .db_context("failed to read the sandbox's activating client")?;
+        Ok(sandbox.map(|sandbox| TrackedPod {
             pod_uid,
-            sandbox: Some(TrackedSandbox { lifecycle, record }),
+            sandbox: Some(TrackedSandbox {
+                lifecycle: sandbox.lifecycle,
+                record: sandbox.activating_client_id,
+            }),
         }))
     }
 

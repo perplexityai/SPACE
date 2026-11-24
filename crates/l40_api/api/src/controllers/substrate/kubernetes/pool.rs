@@ -6,6 +6,7 @@ use pplx_space_cluster_pool::{
 };
 use pplx_space_execution_spec::VcpuCount;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use pplx_space_template_release_original::digest_original;
@@ -841,24 +842,23 @@ async fn named_pool_template_release(
     template_name: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
-    sqlx::query_as::<_, PoolTemplateReleaseRow>(sql!(
-        "SELECT r.id, r.hash AS content_hash
-         FROM template_releases r
-         WHERE r.id = $1
-           AND r.template_name = $2
-           AND ($3::TEXT IS NULL OR r.hash = $3)"
-    ))
-    .bind(release_id)
-    .bind(template_name)
-    .bind(content_hash)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::lookup::named_release(
+        &mut **tx,
+        release_id,
+        template_name,
+        content_hash,
+    )
     .await
+    .map(|release| {
+        release.map(|release| PoolTemplateReleaseRow {
+            id: release.id,
+            content_hash: release.content_hash,
+        })
+    })
     .map_err(|err| db_contention_error("failed to read the named pool template release", &err))
 }
 
-/// The worker registered under the slot pod's Kubernetes node name. Node ids
-/// are scoped by role, so a builder on the same host has its own row under
-/// that name.
+/// The worker registered under the slot pod's Kubernetes node name.
 async fn resolve_pool_slot_node_id(
     tx: &mut Transaction<'_, Postgres>,
     node_name: Option<&str>,
@@ -866,16 +866,7 @@ async fn resolve_pool_slot_node_id(
     let Some(node_name) = node_name else {
         return Ok(None);
     };
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT nk.node_id
-         FROM node_k8s nk
-         JOIN nodes n ON n.id = nk.node_id
-         WHERE nk.k8s_node_name = $1
-           AND n.role = 'worker'"
-    ))
-    .bind(node_name)
-    .fetch_optional(&mut **tx)
-    .await
+    node_lookup::worker_for_k8s_node_name(&mut **tx, node_name).await
 }
 
 async fn fetch_pool_config(

@@ -7,7 +7,9 @@
 //! [`WarmPoolStore`]: pplx_space_cluster_pool::WarmPoolStore
 
 use pplx_space_accounts::{NodeId, OrgId};
-use pplx_space_node_model::{NodeRole, SubstrateKind};
+use pplx_space_node_model::NodeRole;
+use pplx_space_node_registration_store::lookup as node_lookup;
+use pplx_space_node_registration_store::nodes_for_identity;
 
 use std::net::IpAddr;
 
@@ -157,18 +159,7 @@ impl TemplateReleasesStore {
         &self,
         address: IpAddr,
     ) -> Result<TemplateReadScope, sqlx::Error> {
-        let node_ids = sqlx::query_scalar::<_, NodeId>(sql!(
-            "SELECT id
-             FROM nodes
-             WHERE address = $1::INET
-               AND managed_by IN ($2, $3)
-               AND COALESCE(state, 'registered') != 'deleted'"
-        ))
-        .bind(address.to_string())
-        .bind(SubstrateKind::Space)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&self.pool)
-        .await?;
+        let node_ids = node_lookup::live_nodes_at_address(&self.pool, address).await?;
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
@@ -178,12 +169,16 @@ impl TemplateReleasesStore {
         &self,
         node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
     ) -> Result<TemplateReadScope, sqlx::Error> {
-        let node_ids = self
-            .nodes_for_identity(node, &[NodeRole::Worker, NodeRole::Builder])
-            .await?
-            .into_iter()
-            .filter_map(|(id, uid_matches)| (uid_matches == Some(true)).then_some(id))
-            .collect();
+        let node_ids = nodes_for_identity(
+            &self.pool,
+            node.name(),
+            node.uid(),
+            &[NodeRole::Worker, NodeRole::Builder],
+        )
+        .await?
+        .into_iter()
+        .filter_map(|(id, uid_matches)| (uid_matches == Some(true)).then_some(id))
+        .collect();
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
@@ -193,7 +188,8 @@ impl TemplateReleasesStore {
         &self,
         node: &pplx_space_rpc_auth::build::AuthenticatedBuildNode,
     ) -> Result<PublicationNode, sqlx::Error> {
-        let rows = self.nodes_for_identity(node, &[NodeRole::Builder]).await?;
+        let rows =
+            nodes_for_identity(&self.pool, node.name(), node.uid(), &[NodeRole::Builder]).await?;
         if let Some((id, _)) = rows.iter().find(|(_, matches)| *matches == Some(true)) {
             Ok(PublicationNode::Registered(*id))
         } else if rows.iter().any(|(_, matches)| matches.is_none()) {
@@ -201,26 +197,6 @@ impl TemplateReleasesStore {
         } else {
             Ok(PublicationNode::Denied)
         }
-    }
-
-    async fn nodes_for_identity(
-        &self,
-        node: &pplx_space_rpc_auth::AuthenticatedKubernetesNode,
-        roles: &[NodeRole],
-    ) -> Result<Vec<(NodeId, Option<bool>)>, sqlx::Error> {
-        sqlx::query_as(sql!(
-            "SELECT n.id, k.k8s_node_uid = $2
-             FROM nodes n JOIN node_k8s k ON k.node_id = n.id
-             WHERE k.k8s_node_name = $1
-               AND n.managed_by = $3 AND n.role = ANY($4::TEXT[])
-               AND COALESCE(n.state, 'registered') != 'deleted'"
-        ))
-        .bind(node.name().as_str())
-        .bind(node.uid().as_str())
-        .bind(SubstrateKind::Kubernetes)
-        .bind(roles.iter().map(|role| role.as_str()).collect::<Vec<_>>())
-        .fetch_all(&self.pool)
-        .await
     }
 
     /// Unscoped lookups with no caller organization or generic-only requirement
@@ -764,64 +740,4 @@ impl TemplateReleasesStore {
             })
             .collect())
     }
-}
-
-/// Insert the release, or nothing when it conflicts with one already
-/// registered. The conflict target is left out on purpose: Postgres then
-/// treats a violation of any unique index as the conflict, so the statement
-/// works with the `(template_name, hash)` index, which admits no twin, and
-/// with `template_releases_template_name_hash_environment_key`, which admits
-/// one release per environment, together or alone.
-///
-/// The untargeted conflict clause also turns a violation of any other unique
-/// index into "nothing inserted"; today the others all include the generated
-/// `id`, so only the two `(template_name, hash, ..)` indexes can conflict.
-///
-/// `created_at` is the insert's own time, not the transaction's start: the
-/// caller holds the template's publication lock, so insert order is
-/// registration order, and the original release of a hash (the earliest by
-/// `created_at`) is the one inserted first even when a twin's transaction
-/// began earlier.
-pub(super) async fn insert_release(
-    executor: impl sqlx::PgExecutor<'_>,
-    template_name: &str,
-    runtime: &str,
-    hash: &str,
-    org_id: Option<OrgId>,
-    execution_metadata: Option<&serde_json::Value>,
-) -> Result<Option<super::TemplateReleaseRow>, sqlx::Error> {
-    sqlx::query_as::<_, super::TemplateReleaseRow>(sql!(
-        "INSERT INTO template_releases
-             (template_name, type, hash, org_id, execution_metadata, created_at)
-         SELECT $1, $2, $3, COALESCE($4, org_id), $5, clock_timestamp()
-         FROM templates
-         WHERE name = $1
-         ON CONFLICT DO NOTHING
-         RETURNING id, template_name, type, hash, org_id, created_at,
-                   execution_metadata->>'environment' AS environment"
-    ))
-    .bind(template_name)
-    .bind(runtime)
-    .bind(hash)
-    .bind(org_id)
-    .bind(execution_metadata)
-    .fetch_optional(executor)
-    .await
-}
-
-/// The caller holds the release row lock while comparing or filling evidence.
-pub(super) async fn fill_execution_metadata(
-    executor: impl sqlx::PgExecutor<'_>,
-    release_id: Uuid,
-    execution: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE template_releases SET execution_metadata = $2
-         WHERE id = $1 AND execution_metadata IS NULL"
-    ))
-    .bind(release_id)
-    .bind(execution)
-    .execute(executor)
-    .await?;
-    Ok(())
 }

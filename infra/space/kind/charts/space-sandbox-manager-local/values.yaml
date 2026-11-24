@@ -75,8 +75,11 @@ clusterDeletedEvictionQuiescenceSecs: "10"
 # start. A test hook: only a `test-hooks` build reads it, and only the discard
 # does, so recovery keeps its six-hour window. Production waits six hours;
 # `local.interrupted_suspend_keeps_only_copy_until_discard` needs to reach the
-# discard within its run. No other scenario sends a discard.
-discardAttemptWindowSecs: "120"
+# discard within its run. The value is short enough for the scenario to wait
+# out, and long enough for its in-window discard to run before
+# `WINDOW_MARGIN_SECONDS` (see space_smoke/retained_only_copy.py). No other
+# scenario sends a discard.
+discardAttemptWindowSecs: "60"
 
 # Cold-sandbox eviction — sandbox-manager's loop that removes a parked,
 # suspended sandbox's entire local presence (cache dir, instance subvolume,

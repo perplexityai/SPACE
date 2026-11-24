@@ -5,12 +5,16 @@
 //! fragments that the cluster controller's orphaned-sandbox sweep and the
 //! internal API's published-state writer splice into their statements; other
 //! writers of those tables still write their SQL inline. [`active_quarantine`]
-//! and [`quarantine_history`] are the read verbs. sbx-mgr's SQLite tables of
+//! and [`quarantine_history`] are the read verbs;
+//! [`record_recovered_to_suspended`] and [`delete_quarantine_state`] are the
+//! cluster controller's recovery of an abandoned publication, run in its
+//! transaction under its locks and rechecks. sbx-mgr's SQLite tables of
 //! the same names belong to `pplx-space-sbx-mgr-store`, not here. The fragments
 //! stay here until store functions for these tables replace them.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
@@ -106,6 +110,49 @@ pub async fn quarantine_history(
     .bind(i64::from(limit))
     .fetch_all(executor)
     .await
+}
+
+/// Append a `recovered_to_suspended` history event, `history_id`, to the
+/// sandbox's open episode, recording `snapshot_id` in its evidence: the
+/// cluster controller found the worker row and execution pod gone and a
+/// ready suspend snapshot matching the recorded activity. Writes nothing when
+/// the sandbox isn't quarantined. The caller holds the sandbox's and the
+/// episode's row locks and has rechecked the recovery.
+pub async fn record_recovered_to_suspended(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    history_id: Uuid,
+    snapshot_id: SnapshotId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_quarantine_history
+            (id, quarantine_id, sandbox_id, source, action, reason_code, message, attempt_count, evidence)
+         SELECT $2, quarantine_id, sandbox_id, source, 'recovered_to_suspended', reason_code,
+                'Worker row and execution pod absent; ready suspend snapshot metadata matches recorded activity',
+                attempt_count, evidence || jsonb_build_object('snapshot_id', $3::TEXT)
+           FROM sandbox_quarantine_state WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(history_id)
+    .bind(snapshot_id.to_string())
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Close the sandbox's open episode, whichever it is. `false` when it had
+/// none.
+pub async fn delete_quarantine_state(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "DELETE FROM sandbox_quarantine_state WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub fn quarantine_state_insert_columns() -> &'static str {

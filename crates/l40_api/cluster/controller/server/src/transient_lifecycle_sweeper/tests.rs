@@ -2865,9 +2865,8 @@ mod failed_cleanup_stop_route;
 mod postgres_backed {
 
     use super::super::store::{
-        LIST_COMMAND_READY_PENDING_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL,
-        NOTE_FAILED_CLEANUP_ATTEMPT_SQL, failed_active_execution_scope,
-        list_unrestorable_restoring_query,
+        LIST_COMMAND_READY_PENDING_SQL, NOTE_FAILED_CLEANUP_ATTEMPT_SQL,
+        failed_active_execution_scope, list_unrestorable_restoring_query,
     };
     use super::*;
     use pplx_space_accounts::NodeId;
@@ -5427,12 +5426,15 @@ mod postgres_backed {
         }
         let kubernetes = SubstrateKind::Kubernetes;
 
-        let listed: Vec<(SandboxId,)> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
-            .bind(kubernetes)
-            .bind(10_i64)
-            .fetch_all(pool)
-            .await?;
-        assert_eq!(listed, vec![(k8s,)]);
+        let listed: Vec<SandboxId> =
+            pplx_space_sandbox_store::k8s_executions::list_failed_active_executions(
+                pool, kubernetes, 10,
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(listed, vec![k8s]);
 
         let rotated = |sandbox_id: SandboxId| async move {
             sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)

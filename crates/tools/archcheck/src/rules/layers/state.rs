@@ -208,11 +208,9 @@ impl StoreWrite<'_> {
 }
 
 /// Whether `member` is a storage helper: an `l10_foundation` crate that
-/// `[rules.layers.storage] helpers` lists and `legacy` doesn't.
+/// `[rules.layers.storage] helpers` lists.
 fn is_helper(layers: &LayersConfig, member: &Member<'_>) -> bool {
-    member.layer == Some(Layer::Foundation)
-        && layers.storage.helpers.contains(member.name())
-        && !layers.legacy.contains(member.name())
+    member.layer == Some(Layer::Foundation) && layers.storage.helpers.contains(member.name())
 }
 
 /// Every write head in each store's and storage helper's production Rust

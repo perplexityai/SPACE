@@ -21,11 +21,11 @@ use pplx_space_sandbox_portability::{
     suspended_projection_lifecycle_eligible_with_node_evidence,
 };
 use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
+use pplx_space_sandbox_store::quarantine_recovery_authority;
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
-use time::OffsetDateTime;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -77,18 +77,6 @@ pub(super) struct QuarantineRecoveryPlanRow {
     pub(super) local_artifact_id: Option<LocalArtifactId>,
     pub(super) storage_uri: String,
     pub(super) bytes_uploaded: i64,
-}
-
-#[derive(FromRow)]
-struct RecoveryAuthorityRow {
-    quarantine_id: Uuid,
-    reason_code: String,
-    entered_at: OffsetDateTime,
-    active_node_id: Option<NodeId>,
-    execution_generation: Option<i64>,
-    current_local_artifact_id: Option<LocalArtifactId>,
-    current_local_artifact_kind: Option<String>,
-    current_local_artifact_origin: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -180,38 +168,18 @@ pub(super) async fn get_quarantine_recovery_plan(
     sandbox_id: SandboxId,
     node_id: NodeId,
 ) -> Result<QuarantineRecoveryPlanRow, Status> {
-    let recovery: RecoveryAuthorityRow = sqlx::query_as(sql!(
-        "SELECT quarantine.quarantine_id,
-                quarantine.reason_code,
-                quarantine.entered_at,
-                sandbox.active_node_id,
-                execution.generation AS execution_generation,
-                sandbox.current_local_artifact_id,
-                sandbox.current_local_artifact_kind,
-                sandbox.current_local_artifact_origin
-           FROM sandboxes sandbox
-           JOIN sandbox_quarantine_state quarantine
-             ON quarantine.sandbox_id = sandbox.id
-           LEFT JOIN sandbox_k8s_executions execution
-             ON execution.sandbox_id = sandbox.id AND execution.active
-          WHERE sandbox.id = $1
-            AND sandbox.lifecycle = 'quarantined'
-            AND quarantine.source = $2
-            AND quarantine.entered_from_lifecycle = 'restoring'"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(SandboxQuarantineSource::SbxManager.as_str())
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| Status::internal(format!("quarantine recovery lookup: {error}")))?
-    .ok_or_else(|| {
-        reject_quarantine_recovery_plan(
-            sandbox_id,
-            node_id,
-            QuarantineRecoveryPlanRejectionCause::NoActiveQuarantine,
-            no_recovery_authority_message(sandbox_id),
-        )
-    })?;
+    let recovery =
+        quarantine_recovery_authority::get(pool, sandbox_id, SandboxQuarantineSource::SbxManager)
+            .await
+            .map_err(|error| Status::internal(format!("quarantine recovery lookup: {error}")))?
+            .ok_or_else(|| {
+                reject_quarantine_recovery_plan(
+                    sandbox_id,
+                    node_id,
+                    QuarantineRecoveryPlanRejectionCause::NoActiveQuarantine,
+                    no_recovery_authority_message(sandbox_id),
+                )
+            })?;
 
     match recovery.active_node_id {
         None => {
@@ -539,20 +507,10 @@ pub(super) async fn apply_activation_rollback_candidates(
             continue;
         }
 
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-                SET apply_state = 'pending',
-                    last_applied_node_id = NULL,
-                    last_error = NULL,
-                    last_bridge_status = NULL,
-                    last_applied_bridge_generation = NULL,
-                    last_observed_at = NULL,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND desired_state = 'open'"
-        ))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *conn)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut *conn,
+            candidate.sandbox_id,
+        )
         .await
         .map_err(|error| Status::internal(format!("invalidate rollback port state: {error}")))?;
         let converged = pplx_space_sandbox_store::quarantine::converge_activation_rollback(

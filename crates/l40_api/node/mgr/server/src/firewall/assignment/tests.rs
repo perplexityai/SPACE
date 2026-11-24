@@ -174,21 +174,15 @@ fn refused_assignments_change_nothing() {
 
     store.accept(NODE, incoming(12, 1, &rules)).unwrap();
     let invalid = document(&[r#"{"id":"r","all_of":[]}"#]);
-    let rules_over_bound: Vec<_> = (0..80_000)
-        .map(|i| DNS.replace("dns", &format!("r{i}")))
-        .collect();
-    let too_large = document(
-        &rules_over_bound
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    );
+    // Fit the one-rule record already on disk, but not a two-rule replacement.
+    let max_record_bytes = std::fs::metadata(&path).unwrap().len();
+    let two_rules = document(&[DNS, WEB]);
     let refusals = [
         store.accept(NODE, for_other(13)),
         store.accept(other, for_other(13)),
         store.accept(NODE, incoming(13, 2, &invalid)),
         store.accept(NODE, incoming(13, 2, r#"{"schema_version":2,"rules":[]}"#)),
-        store.accept(NODE, incoming(13, 2, &too_large)),
+        store.accept_with_limit(NODE, incoming(13, 2, &two_rules), max_record_bytes),
     ];
     assert!(
         matches!(

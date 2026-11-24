@@ -1,3 +1,5 @@
+use rusqlite::params;
+
 use super::*;
 
 fn store_with_in_memory_db() -> PinnedDigestsStore {

@@ -103,8 +103,8 @@ async fn reconciler_gate(pool: &PgPool, node: Uuid) -> TestResult<i64> {
 /// What the `:terminate` guard counts, through the production function.
 async fn terminate_guard(pool: &PgPool, node: Uuid) -> TestResult<(i64, i64)> {
     let mut tx = pool.begin().await?;
-    let occ = super::sandbox_occupancy_for_node_in_tx(
-        &mut tx,
+    let occ = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+        &mut *tx,
         NodeId::from_uuid(node),
         ResidencyEvidence::LifecycleOnly,
     )

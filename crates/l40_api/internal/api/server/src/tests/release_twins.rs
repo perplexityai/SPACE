@@ -875,7 +875,7 @@ async fn the_original_is_the_first_inserted_not_the_first_begun() -> TestResult 
         .release
         .expect("release");
     let twin_metadata = serde_json::to_value(bound(2))?;
-    let twin = crate::template_releases_store::insert_release(
+    let twin = pplx_space_template_release_store::registration::insert_release(
         &mut *early,
         TEMPLATE,
         "fc",

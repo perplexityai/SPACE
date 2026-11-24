@@ -11,7 +11,7 @@ use pplx_space_public_api::{
 };
 use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::{
@@ -369,15 +369,8 @@ async fn fetch_template_desired_state(
     pool: &PgPool,
     template: &TemplateName,
 ) -> Result<Option<TemplateDesiredState>, sqlx::Error> {
-    let row = sqlx::query(sql!("SELECT desired_state FROM templates WHERE name = $1"))
-        .bind(template.as_str())
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.and_then(|row| {
-        row.try_get::<String, _>("desired_state")
-            .ok()
-            .and_then(|state| state.parse().ok())
-    }))
+    let state = pplx_space_template_store::templates::desired_state(pool, template).await?;
+    Ok(state.and_then(|state| state.parse().ok()))
 }
 
 async fn mark_template_deleting(
@@ -385,22 +378,13 @@ async fn mark_template_deleting(
     template: &TemplateName,
     operation: &ClaimedPublicOperation,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE templates
-         SET desired_state = $2,
-             delete_requested_at = COALESCE(delete_requested_at, NOW()),
-             delete_requested_by = COALESCE(delete_requested_by, $3),
-             delete_operation_id = COALESCE(delete_operation_id, $4),
-             updated_at = NOW()
-         WHERE name = $1"
-    ))
-    .bind(template.as_str())
-    .bind(TemplateDesiredState::Deleting.as_str())
-    .bind(operation.actor_user_id)
-    .bind(operation.id.as_uuid())
-    .execute(pool)
-    .await?;
-    Ok(())
+    pplx_space_template_store::templates::mark_deleting(
+        pool,
+        template,
+        operation.actor_user_id,
+        operation.id.as_uuid(),
+    )
+    .await
 }
 
 async fn nodes_with_template_inventory(
@@ -482,26 +466,16 @@ pub(crate) async fn mark_template_deleted(
         ReconcileElementRef::template_base_snapshot_policy(template.clone()),
     ];
     delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_release_storage_locations
-         WHERE template_release_id IN (
-           SELECT id FROM template_releases WHERE template_name = $1
-         )"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
+    pplx_space_template_release_store::removal::delete_storage_locations_of_template(
+        &mut *tx,
+        template.as_str(),
+    )
     .await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_release_tags WHERE template_name = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    let releases = sqlx::query(sql!(
-        "DELETE FROM template_releases WHERE template_name = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
+    pplx_space_template_store::release_tags::delete_for_template(&mut *tx, template).await?;
+    let releases = pplx_space_template_release_store::removal::delete_releases_of_template(
+        &mut *tx,
+        template.as_str(),
+    )
     .await;
     if let Err(error) = releases {
         // A reference that committed after the check above. A new slot or
@@ -521,36 +495,10 @@ pub(crate) async fn mark_template_deleted(
         }
         return Err(error);
     }
-    sqlx::query(sql!(
-        "DELETE FROM template_pool_policies WHERE template = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_default_auto_lifecycle_policies WHERE template = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "DELETE FROM template_base_snapshot_policies WHERE template = $1"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "UPDATE templates
-         SET desired_state = $2,
-             delete_operation_id = COALESCE(delete_operation_id, $3),
-             updated_at = NOW()
-         WHERE name = $1"
-    ))
-    .bind(template.as_str())
-    .bind(TemplateDesiredState::Deleted.as_str())
-    .bind(operation_id)
-    .execute(&mut *tx)
-    .await?;
+    pplx_space_template_store::pool_policies::delete(&mut *tx, template).await?;
+    pplx_space_template_store::default_auto_lifecycle_policies::delete(&mut *tx, template).await?;
+    pplx_space_template_store::base_snapshot_policies::delete(&mut *tx, template).await?;
+    pplx_space_template_store::templates::mark_deleted(&mut *tx, template, operation_id).await?;
     tx.commit().await?;
     Ok(MarkTemplateDeleted::Deleted)
 }

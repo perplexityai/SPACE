@@ -13,7 +13,7 @@ use pplx_space_admin_protocol::{
     AdminNodeStatusSnapshot, DrainRequest, ForceUploadFailure, ForceUploadLocalSnapshotsResponse,
     GetAdminNodeFilters, ListAdminNodesFilters,
 };
-use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeManagedBy};
+use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase, NodeManagedBy};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
@@ -769,7 +769,7 @@ fn parse_sort(raw: Option<&str>) -> Result<AdminNodeSort, (StatusCode, Json<serd
 /// **Do not set the env var from a test and expect this to see it.** The first
 /// caller in a test binary fixes the value for every later test in that process,
 /// silently. Tests that need a specific policy pass it explicitly to
-/// [`node_store::sandbox_occupancy_for_node_in_tx`] and
+/// [`pplx_space_sandbox_store::admin_occupancy::terminate_occupancy`] and
 /// [`node_store::AdminNodeStore::occupancy_for_nodes`], which is why both take
 /// the evidence as a parameter rather than calling this.
 fn cluster_residency_evidence() -> ResidencyEvidence {
@@ -1024,12 +1024,7 @@ pub(super) async fn list_node_sandboxes(
                 {
                     Ok(rows) => rows
                         .into_iter()
-                        .map(|row| node_store::NodeSandboxRow {
-                            id: row.id,
-                            lifecycle: row.lifecycle.as_str().to_owned(),
-                            active_node_id: row.active_node_id,
-                            target_node_id: row.target_node_id,
-                        })
+                        .map(node_store::NodeSandboxRow::from)
                         .collect(),
                     Err(err) => return db_error(err).into_response(),
                 };
@@ -1832,8 +1827,8 @@ async fn apply_drain_action(
     //   but reads `group_occupancy_in_tx`, which is not census-aware.
     //   Its refusal to move an organization can therefore count phantom rows.
     if matches!(action, DrainAction::Terminate) {
-        let occupancy = match node_store::sandbox_occupancy_for_node_in_tx(
-            &mut tx,
+        let occupancy = match pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+            &mut *tx,
             node_id,
             cluster_residency_evidence(),
         )
@@ -2135,9 +2130,7 @@ const _: () = {
 /// source indentation into the message unless every line ends in a `\`
 /// continuation, which is invisible in review and shows up as runs of spaces in
 /// the API response.
-fn force_upload_gate_open_message(
-    drain_state: Option<NodeDrainState>,
-) -> (&'static str, &'static str) {
+fn force_upload_gate_open_message(drain_state: Option<NodeDrain>) -> (&'static str, &'static str) {
     match drain_state {
         None => (
             "conflict: node is not draining",
@@ -2191,7 +2184,7 @@ async fn apply_force_upload_local_snapshots(
     // canonical S3 copy.
     //
     // So the precondition is not "the node is draining" — it is "the gate is
-    // currently closed", which is exactly `NodeDrainState::blocks_placement`.
+    // currently closed", which is exactly `NodeDrain::refuses_activations`.
     // Those coincided until drain modes existed. They no longer do: a **gentle**
     // drain leaves the gate open on purpose, so it fails this check even though
     // its `drain_phase` is non-NULL. `drained` and `terminating` still pass in
@@ -2204,7 +2197,7 @@ async fn apply_force_upload_local_snapshots(
         .map(NodeDrainPhase::parse)
         .transpose()
     {
-        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()),
+        Ok(phase) => NodeDrain::from_v1_columns(phase, node.drain_mode.as_deref()),
         Err(err) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2213,7 +2206,7 @@ async fn apply_force_upload_local_snapshots(
             .into_response();
         }
     };
-    if !drain_state.is_some_and(NodeDrainState::blocks_placement) {
+    if !drain_state.is_some_and(NodeDrain::refuses_activations) {
         let (error, detail) = force_upload_gate_open_message(drain_state);
         audit::record(AdminAuditEntry {
             actor: &actor,
@@ -2224,7 +2217,7 @@ async fn apply_force_upload_local_snapshots(
             to_phase: None,
             from_drain_mode: None,
             replace_after_terminate: None,
-            drain_mode: drain_state.map(|state| state.mode),
+            drain_mode: drain_state.and_then(NodeDrain::mode),
             success: false,
             error: Some(error),
             outcome_counts: None,

@@ -2,7 +2,8 @@
 //! spellings, so each caller of the original-release rule
 //! (`pplx_space_template_release_original::digest_original`) can show it
 //! resolves the release the rule picks. It lives here because this crate
-//! owns the tables it seeds.
+//! owns the tables it seeds; a tag that points at another release of a pair
+//! is `pplx_space_template_store::test_support::tag_release`.
 //!
 //! Enable the `test-support` feature only from `[dev-dependencies]`.
 
@@ -57,30 +58,6 @@ impl SpellingPair {
             self.canonical
         }
     }
-}
-
-/// Point `tag` of `template_name` at `release`, as a tag written before the
-/// shared rule could: nothing here checks that `release` is the digest
-/// original.
-pub async fn tag_release(
-    pool: &PgPool,
-    template_name: &str,
-    release: Uuid,
-    tag: &str,
-) -> sqlx::Result<()> {
-    sqlx::query(sql!(
-        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (template_name, tag) DO UPDATE
-         SET template_release_id = EXCLUDED.template_release_id,
-             modified_at = clock_timestamp()"
-    ))
-    .bind(release)
-    .bind(template_name)
-    .bind(tag)
-    .execute(pool)
-    .await
-    .map(drop)
 }
 
 /// One pair's layout: the digest's hex character, then each spelling's age

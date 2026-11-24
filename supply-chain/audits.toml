@@ -1,7 +1,11 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.form_urlencoded]]
+who = "gilalon-pplx"
+criteria = "safe-to-deploy"
+delta = "1.2.2 -> 1.2.3"
+notes = "Accepted after an AI-assisted comparison of the published crates. Serializer::for_suffix clamps a start beyond the end of the target instead of panicking; the parser is unchanged. The percent-encoding minimum rises to 2.3.2, already locked by this workspace."
 
 [[trusted.anyhow]]
 criteria = "safe-to-deploy"

@@ -27,7 +27,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::super::nodes::terminate_blocked_by_occupancy;
-use super::{AdminNodeStore, sandbox_occupancy_for_node_in_tx};
+use super::AdminNodeStore;
+use pplx_space_sandbox_store::admin_occupancy::terminate_occupancy;
 
 const LIMIT: NonZeroUsize = NonZeroUsize::new(500).expect("non-zero");
 const LONG_RUNNER_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -291,7 +292,7 @@ async fn assert_cell_agrees(
         .remove(&node)
         .expect("every requested node is reported");
     let live = occupancy.live.expect("counters were requested");
-    let terminate = sandbox_occupancy_for_node_in_tx(terminate_tx, node, residency).await?;
+    let terminate = terminate_occupancy(&mut **terminate_tx, node, residency).await?;
 
     let tagged = |term: fn(&node_holds::NodeHold) -> bool| -> i64 {
         holds.rows.iter().filter(|row| term(row)).count() as i64

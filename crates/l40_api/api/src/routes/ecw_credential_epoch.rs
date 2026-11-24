@@ -6,8 +6,7 @@ use axum::{
 };
 use pplx_space_bearer_token::SPACE_INTERNAL_TOKEN_ENV;
 use pplx_space_postgres_pool::contention;
-use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxId};
-use pplx_space_sql_locator::sql;
+use pplx_space_sandbox_model::SandboxId;
 use subtle::ConstantTimeEq;
 
 use crate::{auth::hash_token, routes::AppState};
@@ -25,19 +24,8 @@ pub async fn advance_sandbox_ecw_credential_epoch(
             .into_response();
     }
 
-    let epoch = sqlx::query_scalar::<_, EcwCredentialEpoch>(sql!(
-        "INSERT INTO sandbox_ecw_credential_epochs (sandbox_id, epoch)
-         SELECT id, 2
-           FROM sandboxes
-          WHERE id = $1
-         ON CONFLICT (sandbox_id) DO UPDATE
-             SET epoch = sandbox_ecw_credential_epochs.epoch + 1,
-                 updated_at = NOW()
-         RETURNING epoch"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&state.pool)
-    .await;
+    let epoch =
+        pplx_space_sandbox_store::ecw_credential_epochs::advance(&state.pool, sandbox_id).await;
     match epoch {
         Ok(Some(epoch)) => Json(serde_json::json!({
             "sandboxId": sandbox_id,

@@ -302,7 +302,7 @@ mode = "required"
 # edges, and `state.writes` scans only stores' and helpers' write statements.
 # Without this ratchet, pplx-space-db-migrate, a store that depends on sqlx
 # and rusqlite, could name sbx-mgr's migrator or a default-path helper for its
-# database again, and a node service with a baselined driver edge
+# database again, and a node service with a baselined `rusqlite` edge
 # (node-ctl-server, node-mgr, node-runtime-manager, template-mgr, volmgr,
 # build-mgr-server) could open `SANDBOX_MANAGER_DB`.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema]
@@ -360,6 +360,10 @@ mode = "advisory"
 # Each store's users: the l40_api and l30_storage crates that own its state
 # and use the store today.
 [rules.layers.store_users]
+pplx-space-admin-audit-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+]
 pplx-space-cluster-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
@@ -371,16 +375,44 @@ pplx-space-cluster-trigger-queue = [
   "pplx-space-cluster-reconciler",
   "pplx-space-internal-api-server",
 ]
+pplx-space-build-mgr-store = ["pplx-space-build-mgr-server"]
+pplx-space-byok-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-data-plane-session-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
+]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-firewall-rules-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
 ]
-pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-node-ctl-store = ["pplx-space-node-ctl-server"]
+pplx-space-node-execution-inventory-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
+]
+pplx-space-node-group-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+]
+pplx-space-node-registration-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
+pplx-space-node-mgr-store = ["pplx-space-node-mgr"]
+pplx-space-node-runtime-manager-store = ["pplx-space-node-runtime-manager"]
 pplx-space-node-status-store = [
   "pplx-space-api",
+  "pplx-space-internal-api-server",
   "pplx-space-runtime-upgrade-campaign-store",
+]
+pplx-space-node-template-inventory-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
 ]
 pplx-space-postgres-pool = [
   "pplx-space-api",
@@ -388,6 +420,7 @@ pplx-space-postgres-pool = [
   "pplx-space-credmgr",
   "pplx-space-internal-api-server",
 ]
+pplx-space-public-operation-store = ["pplx-space-api"]
 pplx-space-runtime-environment-catalog-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
@@ -418,6 +451,7 @@ pplx-space-sandbox-quarantine-store = [
 pplx-space-sandbox-residency = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-node-registration-store",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sandbox-routability = [
@@ -426,12 +460,14 @@ pplx-space-sandbox-routability = [
 pplx-space-sandbox-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
 pplx-space-sandbox-teardown = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sbx-mgr-migrations = ["pplx-space-sbx-mgr-store"]
@@ -443,9 +479,11 @@ pplx-space-snapshot-storage = [
 pplx-space-snapshot-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
+pplx-space-storage-vend-store = ["pplx-space-credmgr"]
 pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
 pplx-space-template-release-original = [
   "pplx-space-api",
@@ -454,15 +492,30 @@ pplx-space-template-release-original = [
   "pplx-space-template-release-store",
 ]
 # The API resolves creates, placement and pool claims to a release's twin
-# through the store, the cluster pool's autoscaler embeds its resolution SQL
-# so demand follows the release creates run, and the cluster controller's
-# template campaign driver pages a campaign's source releases, writes twins'
-# metadata.json through its objects, and inserts the twins.
+# through the store, reads releases for its lookups and admin routes,
+# deletes them with their template or one at a time, and checks a
+# template's encryption sidecars before a visibility widen; the cluster
+# pool's autoscaler embeds its resolution SQL so demand follows the release
+# creates run; the cluster controller's template campaign driver pages a
+# campaign's source releases, writes twins' metadata.json through its
+# objects, and inserts the twins; and the internal API's release
+# registration reads, inserts and fills releases and their storage
+# locations. The credential manager checks whether a release is published
+# before it vends write credentials for its storage.
 pplx-space-template-release-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-cluster-pool",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
 ]
+pplx-space-template-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
+pplx-space-volmgr-store = ["pplx-space-volmgr"]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]
@@ -566,9 +619,9 @@ protocols = [
 # l20_domain dependency on a database driver, aws-sdk-s3 or a storage helper
 # is storage_access's ([rules.layers.storage]), so no family lists them.
 # aws-lc-rs and aws-lc-sys are cryptography, not cloud SDKs. The workspace's
-# own I/O crates need no entry: an l10_foundation crate, legacy or not, with
-# a required dependency on a fenced package is fenced under that package's
-# family, such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
+# own I/O crates need no entry: an l10_foundation crate with a required
+# dependency on a fenced package is fenced under that package's family,
+# such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
 # declared dependencies are seen: tonic's transport brings tokio and hyper
 # into every tonic user's build regardless. Features are not followed, so observability, which brings
 # tokio in only behind its otel feature, is listed; feature-flags, whose

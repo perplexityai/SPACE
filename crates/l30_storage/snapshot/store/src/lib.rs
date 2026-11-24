@@ -23,8 +23,15 @@ use sqlx::types::Json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod attempt;
+pub mod claimed;
+pub mod disk_artifact;
+pub mod environment;
+pub mod listing;
 pub mod lost;
 mod placement;
+pub mod storage_location;
+pub mod upload;
 pub use placement::{SnapshotStoragePlacement, storage_placements};
 
 /// Reading a snapshot catalog row failed.
@@ -902,6 +909,70 @@ pub async fn is_latest_ready_suspend(
     .bind(snapshot_id)
     .fetch_one(executor)
     .await?)
+}
+
+/// Up to `limit` snapshot ids greater than `after` (all ids when `None`), in
+/// ascending order, in whatever state each snapshot is.
+///
+/// One array avoids per-row wire/decoder overhead for a large id page.
+pub async fn snapshot_ids_after(
+    executor: impl sqlx::PgExecutor<'_>,
+    after: Option<SnapshotId>,
+    limit: i64,
+) -> Result<Vec<SnapshotId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT ARRAY(
+             SELECT id FROM snapshots
+              WHERE id > COALESCE($1::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
+              ORDER BY id
+              LIMIT $2
+         )"
+    ))
+    .bind(after)
+    .bind(limit)
+    .fetch_one(executor)
+    .await
+}
+
+/// The live storage location recorded for a snapshot, as
+/// [`org_storage_location`] reads it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrgStorageLocation {
+    /// The verbatim base-table value, which may be an encrypted-row stand-in.
+    pub storage_connection_string: String,
+    /// The snapshot is a fork copy still in `creating`: its destination is
+    /// prepared and its bytes are not written yet.
+    pub creating_fork_copy: bool,
+}
+
+/// The storage location recorded for `snapshot_id`, when it is not orphaned
+/// and the snapshot belongs to `org_id` or to no organization. `None`
+/// otherwise, including when the snapshot is another organization's.
+pub async fn org_storage_location(
+    executor: impl sqlx::PgExecutor<'_>,
+    snapshot_id: SnapshotId,
+    org_id: OrgId,
+) -> Result<Option<OrgStorageLocation>, sqlx::Error> {
+    let row: Option<(String, Option<bool>)> = sqlx::query_as(sql!(
+        "SELECT location.storage_connection_string,
+                snapshot.artifact_origin = 'fork' AND snapshot.state = 'creating'
+         FROM snapshot_storage_locations location
+         JOIN snapshots snapshot ON snapshot.id = location.snapshot_id
+         WHERE location.snapshot_id = $1
+           AND location.orphaned_at IS NULL
+           AND COALESCE(snapshot.org_id, $2) = $2"
+    ))
+    .bind(snapshot_id)
+    .bind(org_id.as_uuid())
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(
+        |(storage_connection_string, creating_fork_copy)| OrgStorageLocation {
+            storage_connection_string,
+            // NULL when the snapshot has no artifact origin: not a fork copy.
+            creating_fork_copy: creating_fork_copy.unwrap_or(false),
+        },
+    ))
 }
 
 /// Fetch one snapshot catalog row by id.

@@ -53,14 +53,14 @@ pub async fn run_queue_metrics(
 }
 
 pub async fn emit_node_queue_depth(pool: &PgPool) {
-    let rows = node_queue_depth_counts(pool).await;
+    let rows = pplx_space_cluster_trigger_queue::reconcile_queue_depth(pool).await;
     match rows {
         Ok(rows) => {
-            for (facet, state, count) in rows {
+            for row in rows {
                 pplx_space_reconcile_metrics::queue_depth(
-                    &facet,
-                    &state,
-                    u64::try_from(count).unwrap_or(0),
+                    &row.facet,
+                    &row.state,
+                    u64::try_from(row.count).unwrap_or(0),
                 );
             }
         }
@@ -68,23 +68,6 @@ pub async fn emit_node_queue_depth(pool: &PgPool) {
             tracing::warn!(%error, "failed to emit node reconcile queue depth metrics");
         }
     }
-}
-
-async fn node_queue_depth_counts(pool: &PgPool) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
-    sqlx::query_as::<_, (String, String, i64)>(sql!(
-        "SELECT facet,
-                CASE
-                    WHEN dead_at IS NOT NULL THEN 'dead'
-                    WHEN claim_token != '' THEN 'claimed'
-                    WHEN next_attempt_at > NOW() THEN 'backoff'
-                    ELSE 'ready'
-                END AS state,
-                COUNT(*)::BIGINT AS count
-         FROM node_reconcile_queue
-         GROUP BY facet, state"
-    ))
-    .fetch_all(pool)
-    .await
 }
 
 pub async fn emit_node_queue_stale_claims(pool: &PgPool) {
@@ -236,24 +219,14 @@ async fn node_queue_lag_seconds(pool: &PgPool) -> Result<Vec<(String, f64, f64)>
 }
 
 pub async fn emit_trigger_depth(pool: &PgPool) {
-    let rows = sqlx::query_as::<_, (String, i64)>(sql!(
-        "SELECT CASE
-                    WHEN dead_at IS NOT NULL THEN 'dead'
-                    WHEN claim_token != '' THEN 'claimed'
-                    WHEN next_attempt_at > NOW() THEN 'backoff'
-                    WHEN attempts > 0 THEN 'retry'
-                    ELSE 'ready'
-                END AS state,
-                COUNT(*)::BIGINT AS count
-         FROM node_reconcile_triggers
-         GROUP BY state"
-    ))
-    .fetch_all(pool)
-    .await;
+    let rows = pplx_space_cluster_trigger_queue::trigger_queue_depth(pool).await;
     match rows {
         Ok(rows) => {
-            for (state, count) in rows {
-                crate::metrics::reconcile::trigger_depth(&state, u64::try_from(count).unwrap_or(0));
+            for row in rows {
+                crate::metrics::reconcile::trigger_depth(
+                    &row.state,
+                    u64::try_from(row.count).unwrap_or(0),
+                );
             }
         }
         Err(error) => {

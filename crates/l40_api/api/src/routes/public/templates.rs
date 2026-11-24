@@ -1,7 +1,6 @@
 use crate::routes::public::error::database_error;
 use pplx_space_accounts::OrgId;
 
-use pplx_space_sql_locator::sql;
 use std::collections::BTreeMap;
 
 use axum::{
@@ -13,10 +12,10 @@ use pplx_space_public_api::{
     PageCursor, PublicPage, PublicTemplate, PublicTemplateSnapshot, PublicTemplateVariant,
     SandboxResources,
 };
-use pplx_space_template_model::{TemplateName, TemplateVisibility};
+use pplx_space_template_model::TemplateName;
+use pplx_space_template_store::templates::VisibleTemplate as TemplateRow;
 use serde::Deserialize;
-use sqlx::{FromRow, PgPool, types::Json as SqlJson};
-use time::OffsetDateTime;
+use sqlx::PgPool;
 
 use crate::{middleware::auth::AuthOrg, routes::AppState};
 
@@ -94,29 +93,8 @@ impl ListTemplatesQuery {
     }
 }
 
-#[derive(Debug, FromRow)]
-struct TemplateRow {
-    name: String,
-    description: Option<String>,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, FromRow)]
-struct TemplateVariantRow {
-    template_name: String,
-    content_hash: String,
-    runtime: Option<String>,
-    arch: Option<String>,
-    built_at: Option<String>,
-    artifact_size_bytes: Option<i64>,
-    has_base_snapshot: bool,
-    base_snapshot_size_bytes: Option<i64>,
-    snapshots: SqlJson<Vec<PublicTemplateSnapshot>>,
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
-    disk_size_mb: Option<i32>,
-}
+type TemplateVariantRow =
+    pplx_space_node_template_inventory_store::TemplateVariant<Vec<PublicTemplateSnapshot>>;
 
 async fn fetch_template_rows(
     pool: &PgPool,
@@ -124,21 +102,8 @@ async fn fetch_template_rows(
     cursor: Option<&str>,
     limit: u16,
 ) -> Result<Vec<TemplateRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateRow>(sql!(
-        "SELECT name, description, created_at, updated_at
-         FROM templates
-         WHERE (visibility = $1 OR org_id = $2)
-           AND desired_state = 'present'
-           AND ($3::TEXT IS NULL OR name > $3)
-         ORDER BY name ASC
-         LIMIT $4"
-    ))
-    .bind(TemplateVisibility::Generic.as_str())
-    .bind(org_id)
-    .bind(cursor)
-    .bind(i64::from(limit) + 1)
-    .fetch_all(pool)
-    .await
+    pplx_space_template_store::templates::list_visible(pool, org_id, cursor, i64::from(limit) + 1)
+        .await
 }
 
 async fn fetch_template_row(
@@ -146,18 +111,7 @@ async fn fetch_template_row(
     org_id: OrgId,
     template_name: &str,
 ) -> Result<Option<TemplateRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateRow>(sql!(
-        "SELECT name, description, created_at, updated_at
-         FROM templates
-         WHERE name = $1
-           AND desired_state = 'present'
-           AND (visibility = $2 OR org_id = $3)"
-    ))
-    .bind(template_name)
-    .bind(TemplateVisibility::Generic.as_str())
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await
+    pplx_space_template_store::templates::get_visible(pool, org_id, template_name).await
 }
 
 async fn fetch_template_variants(
@@ -168,35 +122,7 @@ async fn fetch_template_variants(
         return Ok(Vec::new());
     }
 
-    sqlx::query_as::<_, TemplateVariantRow>(sql!(
-        "SELECT *
-         FROM (
-             SELECT DISTINCT ON (template_name, content_hash, COALESCE(runtime, ''))
-                    template_name,
-                    content_hash,
-                    runtime,
-                    arch,
-                    built_at,
-                    artifact_size_bytes,
-                    has_base_snapshot,
-                    base_snapshot_size_bytes,
-                    snapshots,
-                    vcpu,
-                    memory_mib,
-                    disk_size_mb
-             FROM node_template_inventory
-             WHERE template_name = ANY($1)
-               AND content_hash <> ''
-             ORDER BY template_name,
-                      content_hash,
-                      COALESCE(runtime, ''),
-                      observed_at DESC
-         ) variants
-         ORDER BY template_name ASC, built_at DESC NULLS LAST, content_hash ASC"
-    ))
-    .bind(template_names)
-    .fetch_all(pool)
-    .await
+    pplx_space_node_template_inventory_store::template_variants(pool, template_names).await
 }
 
 fn public_templates(

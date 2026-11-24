@@ -17,20 +17,28 @@
 //! the shared queue's rules ([`pplx_space_rollout_queue`]); [`renew_lease`],
 //! [`requeue`] and [`redrive_expired`] keep or end the lease.
 //! [`issue_first_assignment`] issues a leased target's first assignment with
-//! its node's wakeup.
+//! its node's wakeup. [`lease_first_canary`] and [`issue_canary_and_release`]
+//! do both for a canary's one target, leaving it pending once issued.
+//!
+//! [`fetch_instructions`] reads one node's assignment and pending round.
 
 use std::fmt;
 
 use pplx_space_rollout_queue::HeaderPhase;
 
+mod fetch;
 mod issue;
 mod lease;
 mod read;
 mod start;
 
-pub use issue::{Issuance, Refusal, Stamp, Wakeup, issue_first_assignment};
+pub use fetch::{Assignment, NodeInstructions, PendingRound, fetch_instructions};
+pub use issue::{
+    Issuance, Refusal, Stamp, Wakeup, issue_canary_and_release, issue_first_assignment,
+};
 pub use lease::{
-    LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
+    LeasedTarget, Requeue, Work, lease_first_canary, lease_targets, redrive_expired, renew_lease,
+    requeue,
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
 pub use read::{StoredStateError, read_adopted};
@@ -39,6 +47,8 @@ pub use start::{
     start_rollout,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -94,6 +104,14 @@ impl ItemPhase {
             Self::Failed => "failed",
         }
     }
+}
+
+/// Which verbs a statement serves: all of them, or only
+/// [`lease_first_canary`] and [`issue_canary_and_release`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scope {
+    Any,
+    FirstCanary,
 }
 
 /// Commit on `Ok`, roll back otherwise, so a verb's locks end with it rather

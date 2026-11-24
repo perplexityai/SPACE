@@ -69,7 +69,9 @@ pub(super) struct StartFromCheckpointLaunch<'a> {
 /// kept `instance/` in place and whose publication dir was already reclaimed),
 /// `None` opens the canonical backing directly.
 async fn reconstruct_encrypted_restore_devices(
+    cache_root: &std::path::Path,
     sandbox_id: &str,
+    pinned: crate::rootfs_encryption::PinnedCheckpoint<'_>,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     snapshot_dir: &str,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
@@ -82,7 +84,9 @@ async fn reconstruct_encrypted_restore_devices(
     let snapshot_restore_source = restore_source_if_present("snapshot.luks");
 
     let rootfs_block_device_path = crate::rootfs_encryption::prepare_encrypted_rootfs(
+        cache_root,
         sandbox_id,
+        pinned,
         execution_fence,
         cow_source.as_deref(),
         node_manager,
@@ -831,6 +835,12 @@ impl SandboxManagerService {
         // to see, or can't finish before this restore claims the row.
         self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
             .await?;
+        // A node that refuses activations, sealed or with an unreadable seal,
+        // refuses the restore here, before its claim, its network allocation
+        // or its cleanup episode: the row stays as it was. The admission
+        // below still refuses a seal that lands after this check.
+        self.activation_seal
+            .check(ActivationAdmissionKind::Restore.as_str(), id)?;
 
         let cleanup_episode = {
             let db = self.db_conn()?;
@@ -1130,7 +1140,12 @@ impl SandboxManagerService {
         // sandboxes take the plaintext path with no service round-trip.
         let (rootfs_block_device_path, snapshot_volume_mount_dir) = if sandbox.volume_encryption {
             match reconstruct_encrypted_restore_devices(
+                cache_root,
                 id,
+                crate::rootfs_encryption::PinnedCheckpoint::of(
+                    sandbox,
+                    self.staged_checkpoint_disk,
+                ),
                 execution_fence,
                 &snapshot_dir,
                 &self.node_manager,
@@ -1166,8 +1181,8 @@ impl SandboxManagerService {
             .admit_vm_activation(ActivationAdmissionKind::Restore, id)
             .await
         {
-            Ok(permit) => {
-                activation_cleanup.admit(permit);
+            Ok(admission) => {
+                activation_cleanup.admit_activation(admission);
             }
             Err(status) => {
                 activation_cleanup.cleanup();

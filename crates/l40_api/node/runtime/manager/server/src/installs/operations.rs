@@ -515,7 +515,8 @@ impl Installer {
         let Some(job) = job.filter(|job| job.kind == INSTALL_JOB_KIND) else {
             return Ok(None);
         };
-        let result = store::get_job_result(&self.executor.db(), &job_id)?;
+        let result =
+            store::get_job_result(&self.executor.db(), &job_id).map_err(StoreError::from)?;
         operation(&job, result).map(Some)
     }
 
@@ -545,7 +546,7 @@ impl Installer {
             tokio::task::spawn_blocking(move || store::get_job_result(&reading.db(), &job_id))
                 .await
                 .map_err(LookupOperationError::from)?
-                .map_err(LookupOperationError::from)?;
+                .map_err(|error| LookupOperationError::from(StoreError::from(error)))?;
         if committed.is_some() {
             return Err(CancelOperationError::TooLate(job_id));
         }

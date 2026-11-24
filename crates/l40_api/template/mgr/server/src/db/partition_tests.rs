@@ -801,8 +801,7 @@ fn tag_pins_are_kept_per_partition_and_protect_the_digest() {
 /// Runs one template-manager migration. The shared `db/common` catalog has
 /// its own baseline at the same version, so it's applied separately.
 fn apply(conn: &Connection, version: i64, up: bool) {
-    let service = sqlx::migrate!("../../../../../db/template-manager");
-    for migration in service.iter().filter(|migration| {
+    for migration in database::MIGRATOR.iter().filter(|migration| {
         migration.version == version && migration.migration_type.is_up_migration() == up
     }) {
         // As the production migrator runs it: foreign keys enforced, one
@@ -816,8 +815,7 @@ fn apply(conn: &Connection, version: i64, up: bool) {
 }
 
 fn apply_common_and_baseline(conn: &Connection) {
-    let common = sqlx::migrate!("../../../../../db/common");
-    for migration in common
+    for migration in database::COMMON_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {

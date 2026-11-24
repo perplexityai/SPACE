@@ -21,7 +21,12 @@ use pplx_space_durations::PositiveDuration;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_node_model::{NodeDrainMode, NodeManagedBy, NodeRole, SubstrateKind};
+use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, SubstrateKind};
+use pplx_space_node_registration_store::drain_reads::{self, DrainPhaseCount, NodeInDrainPhase};
+use pplx_space_node_registration_store::lookup::{
+    self as node_lookup, K8sNodeIdentity, NodeApiTargetRow,
+};
+use pplx_space_node_registration_store::tombstone;
 use pplx_space_rpc_contracts::node_drain_signals::{
     EVACUATION_RESTORE_READY_CHANNEL, REUPLOAD_ARTIFACT_MISSING_MARKER,
     REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
@@ -52,7 +57,7 @@ use pplx_space_sandbox_residency::{
 
 use super::{
     DrainingNode, NON_EVACUATABLE_RESIDENT_LIFECYCLES, NodeDrainSink, PHASE_DRAINED,
-    PHASE_DRAINING, PHASE_TERMINATING, PromoteError, ResidencyEvidence, ResidentSandboxCounts,
+    PHASE_DRAINING, PromoteError, ResidencyEvidence, ResidentSandboxCounts,
     SUSPEND_EVACUABLE_LIFECYCLES, TerminationBlockingResidents, enabled_evacuable_lifecycles,
     is_evacuable_lifecycle, is_suspend_evacuable_lifecycle,
 };
@@ -172,26 +177,19 @@ async fn node_api_row(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<Option<OwnedNodeApiTarget>, sqlx::Error> {
-    type Row = (NodeRole, NodeManagedBy, Option<String>);
-    let row: Option<Row> = sqlx::query_as(sql!(
-        "SELECT n.role,
-                n.managed_by,
-                nk.k8s_node_name AS substrate_node_id
-           FROM nodes n
-           LEFT JOIN node_k8s nk ON nk.node_id = n.id
-          WHERE n.id = $1"
-    ))
-    .bind(node_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(
-        row.map(|(role, managed_by, substrate_node_id)| OwnedNodeApiTarget {
+    let row = node_lookup::node_api_target(pool, node_id).await?;
+    Ok(row.map(
+        |NodeApiTargetRow {
+             role,
+             managed_by,
+             substrate_node_id,
+         }| OwnedNodeApiTarget {
             managed_by,
             role,
             direct_endpoint: None,
             substrate_node_id,
-        }),
-    )
+        },
+    ))
 }
 
 /// `$1` = node id, `$2` = evacuable lifecycles as `text[]`. The suspend →
@@ -693,51 +691,10 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
     )
 }
 
-/// Every evacuated `stopped` sandbox that can't serve a `start` yet: released
-/// and on no node, or claimed for re-placement and not yet settled.
-/// Cluster-wide, and **deliberately not** the retry-eligible subset
-/// [`restore_pending_evacuations_query`] returns.
-///
-/// This is the population an on-call alert reads, so it has to answer "how many
-/// sandboxes are currently unstartable", not "how many will the next sweep try".
-/// Those differ by exactly the rows that matter most: a re-placement that keeps
-/// failing carries a `next_restore_attempt_at` up to the 30-minute backoff cap,
-/// which would drop it out of the work list — and therefore out of the gauge —
-/// for the whole window, precisely while it is most stuck. The alert would go
-/// quiet as the incident got worse.
-///
-/// It also omits the durability term the work list applies. A torn-down row
-/// whose backup is *not* resolvable (its only storage location orphaned, say)
-/// is unplaceable rather than un-ready, and dropping it from the count would
-/// silence the one case with no automatic recovery at all.
-///
-/// The two lifecycles are read differently on purpose:
-///
-/// * a `stopped` row counts only with `active_node_id IS NULL`, which is what
-///   makes it "released" rather than "mid evacuation": a claimed row still on
-///   its node is held by the drain, visible as a drain blocker, and startable
-///   again the moment the marker clears;
-/// * a `restoring` row counts whatever its `active_node_id`. The re-placement
-///   pod's placement sets the column as soon as the pod binds, while the row
-///   stays unstartable until the drain settles it, which is exactly where a
-///   re-placement that never converges (a destination whose shim predates
-///   stopped materialization, say) sits indefinitely.
-pub(crate) fn stopped_replacements_pending_query() -> &'static str {
-    sql!(
-        "SELECT COUNT(*)::BIGINT
-           FROM sandboxes s
-          WHERE s.evacuation_restore_target = 'stopped'
-            AND (
-                (s.lifecycle = 'stopped' AND s.active_node_id IS NULL)
-                OR s.lifecycle = 'restoring'
-            )"
-    )
-}
-
 /// How long the longest-stalled stopped evacuation has been waiting for its
 /// bytes, in seconds — `0` when none is waiting, plus the row it measured.
 ///
-/// **The gap this closes.** [`stopped_replacements_pending_query`] counts rows
+/// **The gap this closes.** [`pplx_space_sandbox_store::stopped_replacements::pending`] counts rows
 /// with `active_node_id IS NULL`, i.e. ones already torn down and waiting to be
 /// placed. An evacuation stuck *before* the teardown still has its node, so it
 /// is invisible there — and it is invisible everywhere else too: the only other
@@ -824,26 +781,6 @@ pub(crate) fn stopped_evacuation_stall_secs_query() -> String {
 /// terminating listings bind it, and it is the one substrate that
 /// [`has_node_drain_reconciler`](SubstrateKind::has_node_drain_reconciler).
 pub(crate) const DRAIN_RECONCILER_SUBSTRATE: SubstrateKind = SubstrateKind::Kubernetes;
-
-/// `$1` = drain phase (`draining`), `$2` = [`DRAIN_RECONCILER_SUBSTRATE`]. The
-/// reconciler's per-tick work list: every k8s-managed node in that phase, with
-/// the drain mode chosen for it.
-///
-/// Scoped to `managed_by = 'k8s'` for the same reason as the other two node
-/// scans in this file — `managed_by = 'space'` rows must not be fed to a
-/// Kubernetes/ASG-specific pipeline.
-pub(crate) fn draining_nodes_query() -> &'static str {
-    sql!(
-        "SELECT id, drain_mode FROM nodes
-          WHERE drain_phase = $1 AND managed_by = $2"
-    )
-}
-
-/// `$1` = drain phase (`terminating`), `$2` = [`DRAIN_RECONCILER_SUBSTRATE`].
-/// The terminating-node work list, scoped like [`draining_nodes_query`].
-pub(crate) fn terminating_nodes_query() -> &'static str {
-    sql!("SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2")
-}
 
 /// Per-call ceiling on [`pinned_local_only_sandboxes_query`]'s enumeration.
 ///
@@ -2828,21 +2765,11 @@ impl SubstrateSink {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, EvacuateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT COALESCE(
-                        lifecycle = 'restoring' AND evacuation_restore_target = 'stopped',
-                        FALSE
-                    )
-               FROM sandboxes
-              WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|claimed| claimed.unwrap_or(false))
-        .map_err(|err| {
-            EvacuateError::Lookup(format!("stopped re-placement claim lookup failed: {err}"))
-        })
+        pplx_space_sandbox_store::stopped_replacement_claim::claimed(&self.pool, sandbox_id)
+            .await
+            .map_err(|err| {
+                EvacuateError::Lookup(format!("stopped re-placement claim lookup failed: {err}"))
+            })
     }
 
     /// Restore an evacuated sandbox onto a target-cohort node and finalize
@@ -3101,43 +3028,50 @@ impl NodeDrainSink for SubstrateSink {
         // decode would fail the whole row on a value this build does not
         // recognize, dropping the node out of the drain work list entirely.
         // `from_column_str` resolves both NULL and unrecognized to gentle.
-        let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
-            .bind(PHASE_DRAINING)
-            .bind(DRAIN_RECONCILER_SUBSTRATE)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = drain_reads::nodes_in_drain_phase_with_mode(
+            &self.pool,
+            NodeDrainPhase::Draining,
+            DRAIN_RECONCILER_SUBSTRATE,
+        )
+        .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, mode)| {
-                // The one place a bad column value is worth logging: once per node
-                // per tick, bounded by the draining-node count, and this is the
-                // reader whose answer decides whether the node's sandboxes get
-                // evacuated. `from_column_str` is silent because it also runs on
-                // the per-request API gate.
-                let mode = match NodeDrainMode::from_column_str_checked(mode.as_deref()) {
-                    Ok(mode) => mode,
-                    Err(err) => {
-                        tracing::warn!(
-                            node_id = %id,
-                            error = %err,
-                            "node_drain: nodes.drain_mode holds a value this build does not \
-                             recognize; treating the node as a gentle drain (no proactive \
-                             evacuation)"
-                        );
-                        NodeDrainMode::default()
-                    }
-                };
-                DrainingNode { id, mode }
-            })
+            .map(
+                |NodeInDrainPhase {
+                     id,
+                     drain_mode: mode,
+                 }| {
+                    // The one place a bad column value is worth logging: once per node
+                    // per tick, bounded by the draining-node count, and this is the
+                    // reader whose answer decides whether the node's sandboxes get
+                    // evacuated. `from_column_str` is silent because it also runs on
+                    // the per-request API gate.
+                    let mode = match NodeDrainMode::from_column_str_checked(mode.as_deref()) {
+                        Ok(mode) => mode,
+                        Err(err) => {
+                            tracing::warn!(
+                                node_id = %id,
+                                error = %err,
+                                "node_drain: nodes.drain_mode holds a value this build does not \
+                                 recognize; treating the node as a gentle drain (no proactive \
+                                 evacuation)"
+                            );
+                            NodeDrainMode::default()
+                        }
+                    };
+                    DrainingNode { id, mode }
+                },
+            )
             .collect())
     }
 
     async fn list_terminating_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
-        sqlx::query_scalar::<_, NodeId>(terminating_nodes_query())
-            .bind(PHASE_TERMINATING)
-            .bind(DRAIN_RECONCILER_SUBSTRATE)
-            .fetch_all(&self.pool)
-            .await
+        drain_reads::nodes_in_drain_phase(
+            &self.pool,
+            NodeDrainPhase::Terminating,
+            DRAIN_RECONCILER_SUBSTRATE,
+        )
+        .await
     }
 
     async fn count_resident_sandboxes_on_node(
@@ -3245,7 +3179,7 @@ impl NodeDrainSink for SubstrateSink {
     /// `fresh_ready_snapshot_exists` predicate so this count agrees
     /// with `drained_node_terminator::count_local_snapshots` and the
     /// admin `:terminate` endpoint's
-    /// `sandbox_occupancy_for_node_in_tx` guard — all three observe
+    /// `admin_occupancy::terminate_occupancy` guard — all three observe
     /// the same "is this snapshot portable?" answer.
     async fn count_drain_blocking_sandboxes_on_node(
         &self,
@@ -4766,9 +4700,7 @@ impl NodeDrainSink for SubstrateSink {
     }
 
     async fn count_stopped_replacements_pending(&self) -> Result<u64, sqlx::Error> {
-        let pending: i64 = sqlx::query_scalar(stopped_replacements_pending_query())
-            .fetch_one(&self.pool)
-            .await?;
+        let pending = pplx_space_sandbox_store::stopped_replacements::pending(&self.pool).await?;
         Ok(pending.max(0).cast_unsigned())
     }
 
@@ -5036,14 +4968,13 @@ impl NodeDrainSink for SubstrateSink {
         &self,
         node_id: NodeId,
     ) -> Result<CordonOutcome, CordonError> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(sql!(
-            "SELECT k8s_node_name, k8s_node_uid FROM node_k8s WHERE node_id = $1"
-        ))
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| CordonError::Db(err.to_string()))?;
-        let (node_name, stored_uid) = row.ok_or(CordonError::Unregistered(node_id))?;
+        let K8sNodeIdentity {
+            k8s_node_name: node_name,
+            k8s_node_uid: stored_uid,
+        } = node_lookup::k8s_node_identity(&self.pool, node_id)
+            .await
+            .map_err(|err| CordonError::Db(err.to_string()))?
+            .ok_or(CordonError::Unregistered(node_id))?;
 
         // UID guard: fetch the current kube Node and verify its UID
         // matches the one we previously persisted. On mismatch we
@@ -5086,16 +5017,12 @@ impl NodeDrainSink for SubstrateSink {
         // Only non-NULL drain_phase values, since the metric is the
         // drain-phase distribution; NULL (non-draining nodes) is
         // implicit.
-        let rows: Vec<(Option<String>, i64)> = sqlx::query_as(sql!(
-            "SELECT drain_phase, COUNT(*) FROM nodes
-             WHERE drain_phase IS NOT NULL
-             GROUP BY drain_phase"
-        ))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = drain_reads::drain_phase_counts(&self.pool).await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(phase, n)| phase.map(|s| (s, n.max(0).cast_unsigned())))
+            .filter_map(|DrainPhaseCount { drain_phase, count }| {
+                drain_phase.map(|s| (s, count.max(0).cast_unsigned()))
+            })
             .collect())
     }
 
@@ -5251,19 +5178,12 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
     if result.rows_affected() == 0 {
         return Ok(false);
     }
-    sqlx::query(sql!(
-        "INSERT INTO node_k8s_tombstones (node_id, k8s_node_name, role, reason)
-         VALUES ($1, $2, $3, 'admin-terminate')
-         ON CONFLICT (node_id) DO UPDATE
-         SET terminated_at = NOW(),
-             k8s_node_name = EXCLUDED.k8s_node_name,
-             role          = EXCLUDED.role,
-             reason        = EXCLUDED.reason"
-    ))
-    .bind(node_id)
-    .bind(k8s_node_name.unwrap_or_default())
-    .bind(&role)
-    .execute(&mut *tx)
+    tombstone::record_admin_terminate_tombstone(
+        &mut *tx,
+        node_id,
+        &k8s_node_name.unwrap_or_default(),
+        &role,
+    )
     .await?;
     tx.commit().await?;
     Ok(true)

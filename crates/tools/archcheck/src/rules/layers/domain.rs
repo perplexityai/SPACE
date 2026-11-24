@@ -8,10 +8,10 @@
 //! - `domain_dependencies`: no Domain crate has a normal or build dependency,
 //!   optional or not, on a fenced package: one `[rules.layers.domain_fences]`
 //!   lists, such as an async runtime or an HTTP client, or a Foundation
-//!   crate, legacy or not, with a required (normal or build, not optional)
-//!   dependency on a fenced package, which fences it under that package's
-//!   family. A fenced package that is a driver or a storage helper is left
-//!   to `storage_access`.
+//!   crate with a required (normal or build, not optional) dependency on a
+//!   fenced package, which fences it under that package's family. A fenced
+//!   package that is a driver or a storage helper is left to
+//!   `storage_access`.
 //! - `model_protocol`: no model has a normal or build dependency on a
 //!   protocol.
 
@@ -58,11 +58,10 @@ impl Fence {
 }
 
 /// The fenced packages, to why: those `[rules.layers.domain_fences]` lists,
-/// and, to a fixpoint, each Foundation crate, legacy or not, with a
-/// required dependency on a fenced package, by the earliest such dependency
-/// its manifest declares when the crate is reached. A listed Foundation
-/// crate that its dependencies fence too is derived, so that its entry is
-/// stale.
+/// and, to a fixpoint, each Foundation crate with a required dependency on
+/// a fenced package, by the earliest such dependency its manifest declares
+/// when the crate is reached. A listed Foundation crate that its
+/// dependencies fence too is derived, so that its entry is stale.
 fn fences(config: &LayersConfig, graph: &Graph<'_>) -> BTreeMap<String, Fence> {
     let mut fences: BTreeMap<String, Fence> = config
         .domain_fences

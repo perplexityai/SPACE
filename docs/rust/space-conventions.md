@@ -537,8 +537,7 @@ holds exactly:
   the shutdown token, one `lib::run(config, shutdown).await?`.
 
 Everything else is the service and lives in the library: environment
-resolution and its precedence, `sqlx::migrate!` statics, binding and layering
-servers, service-mutex and handoff sequencing, and every test. The library's
+resolution and its precedence, binding and layering servers, service-mutex and handoff sequencing, and every test. The library's
 `run` returns a `thiserror` enum, never `anyhow` (see
 `scripts/check-rust-error-policy.sh`). The reason is the SPACE OSS model: a
 deployment that needs private wiring supplies its own `main` against the

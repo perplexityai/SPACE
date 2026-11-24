@@ -19,21 +19,21 @@ use super::*;
 use crate::firewall::assignment::IncomingAssignment;
 use crate::slot_pool::NetworkPoolConfig;
 
-mod linux;
+pub(crate) mod linux;
 
-const NODE: NodeId = NodeId::from_uuid(Uuid::from_u128(1));
+pub(crate) const NODE: NodeId = NodeId::from_uuid(Uuid::from_u128(1));
 /// Far beyond any wait a passing run makes, so it never trips on a slow runner.
-const BOUND: Duration = Duration::from_secs(10);
+pub(crate) const BOUND: Duration = Duration::from_secs(10);
 
 /// Fails the test instead of letting a wait that should end hang it.
-async fn bounded<T>(future: impl Future<Output = T>) -> T {
+pub(crate) async fn bounded<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(BOUND, future)
         .await
         .expect("waited past the bound")
 }
 
 /// Generation `generation` drops TCP to the port of that number.
-fn document(generation: u64) -> String {
+pub(crate) fn document(generation: u64) -> String {
     let rule = json!({"id": "port", "all_of": [{
         "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": generation,
     }]});
@@ -41,7 +41,7 @@ fn document(generation: u64) -> String {
 }
 
 /// A store with the `accepted` generation, if any.
-fn store(accepted: Option<u64>) -> (TempDir, Arc<FirewallAssignments>) {
+pub(crate) fn store(accepted: Option<u64>) -> (TempDir, Arc<FirewallAssignments>) {
     let dir = tempfile::tempdir().unwrap();
     let store = FirewallAssignments::open(&dir.path().join("assignment.json")).unwrap();
     if let Some(generation) = accepted {
@@ -50,7 +50,7 @@ fn store(accepted: Option<u64>) -> (TempDir, Arc<FirewallAssignments>) {
     (dir, Arc::new(store))
 }
 
-fn accept(store: &FirewallAssignments, generation: u64) {
+pub(crate) fn accept(store: &FirewallAssignments, generation: u64) {
     let document = document(generation);
     let incoming = IncomingAssignment {
         node_id: NODE,
@@ -62,7 +62,7 @@ fn accept(store: &FirewallAssignments, generation: u64) {
 }
 
 /// The owned table the fake holds once `generation` is installed.
-fn installed(generation: u64) -> Vec<Value> {
+pub(crate) fn installed(generation: u64) -> Vec<Value> {
     let revision = decode_revision(&document(generation)).unwrap();
     render(&revision)
         .commands()
@@ -72,7 +72,7 @@ fn installed(generation: u64) -> Vec<Value> {
 }
 
 /// A pool whose reset wakeups are countable.
-fn pool(slots: u32) -> (Arc<NetworkPool>, mpsc::Receiver<()>) {
+pub(crate) fn pool(slots: u32) -> (Arc<NetworkPool>, mpsc::Receiver<()>) {
     let mut pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(slots));
     let (sender, wakeups) = mpsc::channel(8);
     Arc::get_mut(&mut pool).unwrap().job_tx = sender;
@@ -80,7 +80,7 @@ fn pool(slots: u32) -> (Arc<NetworkPool>, mpsc::Receiver<()>) {
 }
 
 /// A healthy slot, held by `sandbox-{slot_id}` unless it is ready.
-fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, generation: i64) {
+pub(crate) fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, generation: i64) {
     let update = "UPDATE network_slots SET state = ?1, generation = ?2, health = 'healthy',
                   sandbox_id = CASE ?1 WHEN 'ready' THEN NULL ELSE 'sandbox-' || ?3 END
                   WHERE slot_id = ?3";
@@ -88,9 +88,29 @@ fn set_slot(pool: &NetworkPool, slot_id: u32, state: SlotState, generation: i64)
     pool.db.lock().unwrap().execute(update, params).unwrap();
 }
 
+/// Holds the slot as other work would, until dropped.
+pub(crate) fn busy(pool: &Arc<NetworkPool>, slot_id: u32) -> impl Send {
+    SlotGuard::try_acquire(pool, slot_id).unwrap()
+}
+
+/// Poisons the pool's store lock, so every read of it fails.
+pub(crate) fn poison(pool: &Arc<NetworkPool>) {
+    let pool = pool.clone();
+    std::thread::spawn(move || {
+        let _db = pool.db.lock().unwrap();
+        panic!("injected pool store poison");
+    })
+    .join()
+    .unwrap_err();
+}
+
+pub(crate) fn heal(pool: &NetworkPool) {
+    pool.db.clear_poison();
+}
+
 /// How the fake nft departs from a healthy one.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Fault {
+pub(crate) enum Fault {
     /// Commits, then reports failure, as nft can after an ACK overflow.
     Rejects,
     /// Commits, then times out.
@@ -101,9 +121,9 @@ enum Fault {
     Unlistable,
 }
 
-type Hook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
+pub(crate) type Hook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
 
-fn hook(slot: &Hook, hook: impl FnOnce() + Send + 'static) {
+pub(crate) fn hook(slot: &Hook, hook: impl FnOnce() + Send + 'static) {
     *slot.lock().unwrap() = Some(Box::new(hook));
 }
 
@@ -114,20 +134,23 @@ fn fire(slot: &Hook) {
     }
 }
 
-struct FakeHost {
+pub(crate) struct FakeHost {
     links: TempDir,
     fault: Option<Fault>,
-    tables: Mutex<HashMap<NamespaceIdentity, Vec<Value>>>,
-    installs: Mutex<Vec<NamespaceIdentity>>,
+    pub(crate) tables: Mutex<HashMap<NamespaceIdentity, Vec<Value>>>,
+    /// Each install's namespace and the table it submitted.
+    installs: Mutex<Vec<(NamespaceIdentity, Vec<Value>)>>,
     calls: Mutex<Vec<NamespaceIdentity>>,
     /// Fired once, after the next lookup.
-    looked_up: Hook,
+    pub(crate) looked_up: Hook,
     /// Fired once, after the next install commits.
-    installed: Hook,
+    pub(crate) installed: Hook,
+    /// Fired once, after an observation's last read.
+    pub(crate) observed: Hook,
 }
 
 impl FakeHost {
-    fn new(fault: Option<Fault>) -> Arc<Self> {
+    pub(crate) fn new(fault: Option<Fault>) -> Arc<Self> {
         Arc::new(Self {
             links: tempfile::tempdir().unwrap(),
             fault,
@@ -136,37 +159,47 @@ impl FakeHost {
             calls: Mutex::default(),
             looked_up: Mutex::default(),
             installed: Mutex::default(),
+            observed: Mutex::default(),
         })
     }
 
-    fn link(&self, slot_id: u32) -> PathBuf {
+    pub(crate) fn link(&self, slot_id: u32) -> PathBuf {
         self.links.path().join(format!("slot-{slot_id}"))
     }
 
     /// Points the slot's namespace entry at one of this process's namespaces.
-    fn name(&self, slot_id: u32, kind: &str) -> NamespaceIdentity {
+    pub(crate) fn name(&self, slot_id: u32, kind: &str) -> NamespaceIdentity {
         let link = self.link(slot_id);
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(format!("/proc/self/ns/{kind}"), &link).unwrap();
         identity(std::fs::metadata(&link)).unwrap()
     }
 
-    fn installs(&self) -> Vec<NamespaceIdentity> {
+    pub(crate) fn installs(&self) -> Vec<NamespaceIdentity> {
+        let installs = self.installs.lock().unwrap();
+        installs.iter().map(|(namespace, _)| *namespace).collect()
+    }
+
+    pub(crate) fn submissions(&self) -> Vec<(NamespaceIdentity, Vec<Value>)> {
         self.installs.lock().unwrap().clone()
     }
 
-    fn calls(&self) -> Vec<NamespaceIdentity> {
+    pub(crate) fn calls(&self) -> Vec<NamespaceIdentity> {
         self.calls.lock().unwrap().clone()
     }
 
     /// nft's reply, or None once it timed out.
-    fn reply(&self, netns: &File, args: &[&str], stdin: &[u8]) -> Option<Output> {
+    pub(crate) fn reply(&self, netns: &File, args: &[&str], stdin: &[u8]) -> Option<Output> {
         let namespace = identity(netns.metadata()).unwrap();
         self.calls.lock().unwrap().push(namespace);
         if args == ["-j", "-f", "-"] {
-            self.installs.lock().unwrap().push(namespace);
+            let table = added(stdin);
+            self.installs
+                .lock()
+                .unwrap()
+                .push((namespace, table.clone()));
             if self.fault != Some(Fault::Drops) {
-                self.tables.lock().unwrap().insert(namespace, added(stdin));
+                self.tables.lock().unwrap().insert(namespace, table);
             }
             fire(&self.installed);
             return match self.fault {
@@ -190,6 +223,15 @@ impl FakeHost {
         let listing = json!({"nftables": objects}).to_string();
         Some(output(0, listing.into_bytes()))
     }
+}
+
+/// nft as `host` fakes it, timing out where the fake does.
+pub(crate) fn fake_nft(host: &Arc<FakeHost>) -> Arc<Nft<'static>> {
+    let fake = host.clone();
+    Arc::new(move |netns: &File, args: &[&str], stdin: &[u8], _| {
+        fake.reply(netns, args, stdin)
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    })
 }
 
 /// What a submitted batch adds after the add and delete that make the
@@ -216,6 +258,14 @@ impl SlotHost for FakeHost {
     fn looked_up(&self) {
         fire(&self.looked_up);
     }
+
+    fn namespace_dir(&self) -> Option<&Path> {
+        Some(self.links.path())
+    }
+
+    fn observed(&self) {
+        fire(&self.observed);
+    }
 }
 
 async fn apply(
@@ -225,17 +275,24 @@ async fn apply(
     generation: u64,
     slot_id: u32,
 ) -> SlotFirewallReport {
+    apply_expecting(pool, store, host, generation, slot_id, None).await
+}
+
+async fn apply_expecting(
+    pool: &Arc<NetworkPool>,
+    store: &Arc<FirewallAssignments>,
+    host: &Arc<FakeHost>,
+    generation: u64,
+    slot_id: u32,
+    expected: Option<SlotTarget>,
+) -> SlotFirewallReport {
     let request = SlotFirewallRequest {
         node_id: NODE,
         generation,
         slot_id,
+        expected,
     };
-    let fake = host.clone();
-    let nft = move |netns: &File, args: &[&str], stdin: &[u8], _| {
-        fake.reply(netns, args, stdin)
-            .ok_or_else(|| io::ErrorKind::TimedOut.into())
-    };
-    bounded(pool.apply_firewall_rules_with(store, request, host.clone(), Arc::new(nft)))
+    bounded(pool.apply_firewall_rules_with(store, request, host.clone(), fake_nft(host)))
         .await
         .unwrap()
 }
@@ -307,33 +364,37 @@ fn only_healthy_ready_or_leased_slots_are_eligible() {
     assert_eq!(passed, expected);
 }
 
-// Catches nft run, ownership skipped or kept, the assignment read early, or
-// work started during shutdown.
+// Catches nft run, ownership skipped or kept, the assignment read early or
+// after the target checks, or work started during shutdown.
 #[tokio::test]
 async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
     let (_dir, store) = store(None);
     let host = FakeHost::new(None);
-    host.name(0, "net");
+    let net = host.name(0, "net");
     set_slot(&pool, 0, SlotState::Leased, 1);
-    let refused = async |slot_id| match apply(&pool, &store, &host, 12, slot_id).await {
+    let refused = async |slot_id, expected| match apply_expecting(
+        &pool, &store, &host, 12, slot_id, expected,
+    )
+    .await
+    {
         SlotFirewallReport::NotRun(not_run) => not_run,
         SlotFirewallReport::Attempted(attempt) => panic!("attempted: {attempt:?}"),
     };
 
     let guard = SlotGuard::try_acquire(&pool, 0).unwrap();
-    assert!(matches!(refused(0).await, NotRun::Busy));
+    assert!(matches!(refused(0, None).await, NotRun::Busy));
     drop(guard);
     assert!(matches!(
-        refused(0).await,
+        refused(0, None).await,
         NotRun::Assignment(NotRunnable::NoAssignment)
     ));
 
     accept(&store, 12);
-    assert!(matches!(refused(1).await, NotRun::NoSlot));
+    assert!(matches!(refused(1, None).await, NotRun::NoSlot));
     set_slot(&pool, 0, SlotState::Dirty, 1);
     assert!(matches!(
-        refused(0).await,
+        refused(0, None).await,
         NotRun::Ineligible {
             state: SlotState::Dirty,
             ..
@@ -345,17 +406,49 @@ async fn refusals_never_run_nft() {
     hook(&host.looked_up, move || {
         set_slot(&later, 0, SlotState::Leased, 2);
     });
-    assert!(matches!(refused(0).await, NotRun::Changed));
+    assert!(matches!(refused(0, None).await, NotRun::Changed));
+    // Not the occupant an earlier attempt reached, as after a replacement
+    // between attempts.
+    let current = SlotTarget {
+        slot_generation: 2,
+        sandbox_id: Some("sandbox-0".into()),
+        namespace: Some(host.name(0, "uts")),
+    };
+    // Superseded work reads not current, even for a target that changed since.
+    let replaced = SlotTarget {
+        slot_generation: 1,
+        ..current.clone()
+    };
+    assert!(matches!(
+        apply_expecting(&pool, &store, &host, 11, 0, Some(replaced)).await,
+        SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NotCurrent { accepted: 12 }))
+    ));
+    for expected in [
+        SlotTarget {
+            slot_generation: 1,
+            ..current.clone()
+        },
+        SlotTarget {
+            sandbox_id: Some("sandbox-1".into()),
+            ..current.clone()
+        },
+        SlotTarget {
+            namespace: Some(net),
+            ..current
+        },
+    ] {
+        assert!(matches!(refused(0, Some(expected)).await, NotRun::Changed));
+    }
 
     std::fs::remove_file(host.link(0)).unwrap();
     assert!(matches!(
-        refused(0).await,
+        refused(0, None).await,
         NotRun::Namespace(error) if error.kind() == io::ErrorKind::NotFound
     ));
     std::fs::write(host.link(0), b"").unwrap();
-    assert!(matches!(refused(0).await, NotRun::Namespace(_)));
+    assert!(matches!(refused(0, None).await, NotRun::Namespace(_)));
     pool.shutdown_token.cancel();
-    assert!(matches!(refused(0).await, NotRun::ShuttingDown));
+    assert!(matches!(refused(0, None).await, NotRun::ShuttingDown));
     assert!(
         SlotGuard::try_acquire(&pool, 0).is_some(),
         "a refusal kept the slot"

@@ -58,6 +58,7 @@ zeroize = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
+pplx-space-node-mgr-store = { workspace = true }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }
@@ -75,6 +76,7 @@ pplx-space-local-health = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
+# SqliteU64, the u64 bind type of the slot pool's guarded SQL.
 pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
@@ -89,7 +91,6 @@ pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

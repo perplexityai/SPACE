@@ -20,14 +20,36 @@ use crate::firewall::rules::verify::{Verification, verify_with};
 use crate::firewall::rules::{Nft, nft, render};
 use crate::net::SlotInfo;
 
+pub mod observe;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SlotFirewallRequest {
     pub node_id: NodeId,
     pub generation: u64,
     pub slot_id: u32,
+    /// When set, a slot or namespace that isn't this target is `Changed`.
+    pub expected: Option<SlotTarget>,
+}
+
+/// The occupant of a slot, as discovered or as an attempt reached it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotTarget {
+    pub slot_generation: u64,
+    pub sandbox_id: Option<String>,
+    /// Unset until an attempt pinned it.
+    pub namespace: Option<NamespaceIdentity>,
+}
+
+impl SlotTarget {
+    fn of(info: &SlotInfo) -> Self {
+        Self {
+            slot_generation: info.generation,
+            sandbox_id: (!info.sandbox_id.is_empty()).then(|| info.sandbox_id.clone()),
+            namespace: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,15 +136,30 @@ impl SlotFirewallAttempt {
     pub fn verified(&self) -> bool {
         self.readback == Verification::Match && self.current.is_ok()
     }
+
+    pub fn target(&self) -> SlotTarget {
+        SlotTarget {
+            slot_generation: self.slot_generation,
+            sandbox_id: self.sandbox_id.clone(),
+            namespace: Some(self.namespace),
+        }
+    }
 }
 
 /// What the operation reaches beyond the pool and nft; tests substitute it.
-pub(super) trait SlotHost: Send + Sync + 'static {
+pub(crate) trait SlotHost: Send + Sync + 'static {
     fn namespace_path(&self, slot: &SlotInfo) -> PathBuf;
     /// Test seam between the lookup and taking ownership.
     fn looked_up(&self) {}
+    /// A directory only managed namespaces occupy, if the host has one.
+    fn namespace_dir(&self) -> Option<&Path> {
+        None
+    }
+    /// Test seam between an observation's last read and its final checks.
+    fn observed(&self) {}
 }
 
+/// Declares no namespace directory: `/run/netns` also holds CNI-named ones.
 struct Live;
 
 impl SlotHost for Live {
@@ -153,7 +190,7 @@ impl NetworkPool {
             .await
     }
 
-    pub(super) async fn apply_firewall_rules_with(
+    pub(crate) async fn apply_firewall_rules_with(
         self: &Arc<Self>,
         assignments: &Arc<FirewallAssignments>,
         request: SlotFirewallRequest,
@@ -167,6 +204,18 @@ impl NetworkPool {
         self.task_tracker
             .spawn_blocking(move || apply_blocking(&pool, &assignments, request, &*host, &*nft))
             .await
+    }
+
+    /// Every slot an apply would take now, at the incarnation read. The pool
+    /// lock is released on return, before any namespace or nft work.
+    pub fn firewall_targets(&self) -> Result<Vec<(u32, SlotTarget)>, SlotStoreError> {
+        let records = self.all_records()?;
+        let eligible = records
+            .iter()
+            .filter(|record| eligible(record.state, record.health, &record.info.sandbox_id));
+        Ok(eligible
+            .map(|record| (record.info.slot, SlotTarget::of(&record.info)))
+            .collect())
     }
 
     fn lookup_eligible(&self, slot_id: u32) -> Result<SlotRecord, NotRun> {
@@ -229,14 +278,10 @@ fn runnable(
 
 /// `pid` and health change during a lease without changing its lifecycle.
 fn same_lifecycle(now: &SlotRecord, owned: &SlotRecord) -> bool {
-    let key = |record: &SlotRecord| {
-        (
-            record.info.slot,
-            record.info.generation,
-            record.state,
-            record.info.sandbox_id.clone(),
-        )
-    };
+    fn key(record: &SlotRecord) -> (u32, u64, SlotState, &str) {
+        let info = &record.info;
+        (info.slot, info.generation, record.state, &info.sandbox_id)
+    }
     key(now) == key(owned)
 }
 
@@ -259,28 +304,45 @@ fn apply_blocking(
         Ok(owned) => owned,
         Err(not_run) => return SlotFirewallReport::NotRun(not_run),
     };
-    let path = host.namespace_path(&owned.record.info);
-    let (netns, namespace) = match pin(&path) {
-        Ok(pinned) => pinned,
-        Err(error) => return SlotFirewallReport::NotRun(NotRun::Namespace(error)),
-    };
     // Taken under ownership, so an invocation queued behind a newer one
-    // cannot reinstall an older revision.
+    // cannot reinstall an older revision. Before the target checks, so
+    // superseded work reads not current rather than changed.
     let desired = match runnable(assignments.current(), request.node_id, request.generation) {
         Ok(desired) => desired,
         Err(not_runnable) => return SlotFirewallReport::NotRun(not_runnable.into()),
     };
+    let info = &owned.record.info;
+    let SlotTarget {
+        slot_generation,
+        sandbox_id,
+        ..
+    } = SlotTarget::of(info);
+    // Both checked under ownership, before nft runs.
+    let expected = request.expected.as_ref();
+    let changed = |target: &SlotTarget| {
+        (target.slot_generation, &target.sandbox_id) != (slot_generation, &sandbox_id)
+    };
+    if expected.is_some_and(changed) {
+        return SlotFirewallReport::NotRun(NotRun::Changed);
+    }
+    let path = host.namespace_path(info);
+    let (netns, namespace) = match pin(&path) {
+        Ok(pinned) => pinned,
+        Err(error) => return SlotFirewallReport::NotRun(NotRun::Namespace(error)),
+    };
+    if expected.is_some_and(|target| target.namespace.is_some_and(|pinned| pinned != namespace)) {
+        return SlotFirewallReport::NotRun(NotRun::Changed);
+    }
     let submitted = install_with(&render(&desired.revision), &netns, nft);
     let readback = verify_with(&desired.revision, &netns, nft);
     let current = still_current(pool, assignments, &desired, &owned.record, &path, namespace);
-    let info = &owned.record.info;
     SlotFirewallReport::Attempted(Box::new(SlotFirewallAttempt {
         node_id: desired.node_id,
         assignment_generation: desired.generation,
         revision_id: desired.revision_id,
         slot_id: info.slot,
-        slot_generation: info.generation,
-        sandbox_id: (!info.sandbox_id.is_empty()).then(|| info.sandbox_id.clone()),
+        slot_generation,
+        sandbox_id,
         namespace,
         submitted,
         readback,
@@ -291,12 +353,12 @@ fn apply_blocking(
 fn pin(path: &Path) -> io::Result<(File, NamespaceIdentity)> {
     let netns = File::open(path)?;
     // A deleted namespace's entry is unmounted before it is unlinked; opened
-    // in between it is a plain file.
+    // in between it is a plain file, so the namespace is as good as gone.
     if nix::sys::statfs::fstatfs(&netns)?.filesystem_type() != nix::sys::statfs::NSFS_MAGIC {
-        return Err(io::Error::other(format!(
-            "{} is not a mounted namespace",
-            path.display()
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is not a mounted namespace", path.display()),
+        ));
     }
     let namespace = identity(netns.metadata())?;
     Ok((netns, namespace))
@@ -325,11 +387,19 @@ fn still_current(
         Ok(_) => return Err(Stale::Slot),
         Err(error) => return Err(Stale::SlotStore(error)),
     }
-    match identity(std::fs::metadata(path)) {
-        Ok(now) if now == namespace => {}
-        now => return Err(Stale::Namespace(now)),
-    }
+    unchanged(path, namespace).map_err(Stale::Namespace)?;
     runnable(assignments.current(), desired.node_id, desired.generation)
         .map_err(Stale::Assignment)?;
     Ok(())
+}
+
+/// What `path` names now, unless it is still `namespace`.
+fn unchanged(
+    path: &Path,
+    namespace: NamespaceIdentity,
+) -> Result<(), io::Result<NamespaceIdentity>> {
+    match identity(std::fs::metadata(path)) {
+        Ok(now) if now == namespace => Ok(()),
+        now => Err(now),
+    }
 }

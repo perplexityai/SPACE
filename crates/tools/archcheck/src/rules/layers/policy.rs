@@ -17,10 +17,10 @@ use crate::{
 };
 
 /// `unmoved` entries for crates that are gone or in their layer directory,
-/// `legacy` entries for crates that are gone, `store_users` entries that
-/// allow nothing or whose user doesn't use the store, and `allowed_edges`
-/// entries for edges that don't exist or need no exception. An entry naming
-/// a crate without a layer is left to that crate's `placement` finding.
+/// `store_users` entries that allow nothing or whose user doesn't use the
+/// store, and `allowed_edges` entries for edges that don't exist or need no
+/// exception. An entry naming a crate without a layer is left to that
+/// crate's `placement` finding.
 pub(super) fn stale_entries(
     ctx: &Context,
     config: &LayersConfig,
@@ -59,19 +59,6 @@ pub(super) fn stale_entries(
             ),
         ));
     }
-    for package in config.legacy.iter() {
-        if graph.member(package).is_some() {
-            continue;
-        }
-        findings.push(finding(
-            package,
-            policy.legacy.get(package).copied().or(policy.legacy_line),
-            format!(
-                ": is in [rules.{RULE}] legacy in {CONFIG_FILE}, but no workspace member has \
-                 this name. Remove it."
-            ),
-        ));
-    }
     for (store, users) in &config.store_users {
         let (store_line, user_lines) = lines_of(&policy.store_users, store);
         let store_layer = graph.member(store).and_then(|member| member.layer);
@@ -105,14 +92,13 @@ pub(super) fn stale_entries(
                     // A store without a layer is left to its placement
                     // finding.
                     Some(Layer::Api | Layer::Storage)
-                        if store_layer.is_none() || uses(config, graph, user, store) =>
+                        if store_layer.is_none() || graph.depends_on(user, store) =>
                     {
                         continue;
                     }
                     Some(Layer::Api | Layer::Storage) => format!(
-                        "{user} has no normal or build dependency on {store}, directly or \
-                         through a [rules.{RULE}] legacy crate that depends on it, and the list \
-                         says who uses the store today"
+                        "{user} has no normal or build dependency on {store}, and the list says \
+                         who uses the store today"
                     ),
                     Some(layer) => allows_nothing(format!(
                         "only l40_api and l30_storage crates use stores by their users lists, \
@@ -161,18 +147,6 @@ pub(super) fn stale_entries(
         }
     }
     findings
-}
-
-/// Whether `user` uses `store`: a normal or build dependency on it, or on a
-/// legacy crate that has one, as a legacy crate may re-export a store. The list
-/// says who uses the store today, so an entry without such an edge is
-/// stale.
-fn uses(config: &LayersConfig, graph: &Graph<'_>, user: &str, store: &str) -> bool {
-    graph.depends_on(user, store)
-        || config
-            .legacy
-            .iter()
-            .any(|legacy| graph.depends_on(user, legacy) && graph.depends_on(legacy, store))
 }
 
 /// The line of `key`'s entry in `entries`, and the line of each item it
@@ -406,21 +380,6 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
                 format!(": `{package}` was removed from {storage} {key}."),
             ));
         }
-    }
-    for (package, line) in &policy.legacy {
-        if !base.legacy.contains_key(package) {
-            changes.push((*line, format!(": `{package}` was added to {table} legacy.")));
-        }
-    }
-    for package in base
-        .legacy
-        .keys()
-        .filter(|package| !policy.legacy.contains_key(*package))
-    {
-        changes.push((
-            policy.legacy_line.unwrap_or(policy.line),
-            format!(": `{package}` was removed from {table} legacy."),
-        ));
     }
     for (package, line) in &policy.protocols {
         if !base.protocols.contains_key(package) {

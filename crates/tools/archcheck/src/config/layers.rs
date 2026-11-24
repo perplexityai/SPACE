@@ -116,13 +116,6 @@ pub struct LayersConfig {
     pub allowed_edges: BTreeMap<String, PackageSet>,
     /// What `storage_access` and `codec_features` treat as storage.
     pub storage: StorageConfig,
-    /// Crates that predate the layers and are being dissolved. Every check
-    /// covers legacy crates, with today's edges baselined; a store user that
-    /// reaches a store only through one, as through a re-export, still uses
-    /// it. A legacy Foundation crate is no storage helper even with a
-    /// required driver dependency.
-    #[serde(default)]
-    pub legacy: PackageSet,
     /// Domain crates that are protocols although their names don't end in
     /// `-protocol` or `-proto`; every other Domain crate is a model.
     #[serde(default)]
@@ -472,11 +465,6 @@ pub struct LayersPolicy {
     pub store_users: Entries<BTreeMap<String, usize>>,
     pub allowed_edges: Entries<BTreeMap<String, usize>>,
     pub storage: StoragePolicy,
-    /// `legacy`, each package with the line it is written on.
-    pub legacy: BTreeMap<String, usize>,
-    /// The line of the `legacy` key, or without one, of the
-    /// `[rules.layers]` header, if there is one.
-    pub legacy_line: Option<usize>,
     /// `protocols`, each package with the line it is written on.
     pub protocols: BTreeMap<String, usize>,
     /// The line of the `protocols` key, or without one, of the
@@ -546,7 +534,6 @@ struct PolicyTable {
     store_users: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     allowed_edges: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     storage: Option<PolicyStorage>,
-    legacy: Option<Spanned<Vec<Spanned<String>>>>,
     protocols: Option<Spanned<Vec<Spanned<String>>>>,
     domain_fences: Option<BTreeMap<String, Vec<Spanned<String>>>>,
     placement: Option<PolicyBehaviour>,
@@ -702,11 +689,6 @@ impl LayersPolicy {
                 },
             },
         };
-        let legacy_line = match &table.legacy {
-            Some(legacy) => Some(line(legacy.span())),
-            None => header_line(text, "[rules.layers]"),
-        };
-        let legacy = packages(table.legacy.map(Spanned::into_inner));
         let protocols_line = match &table.protocols {
             Some(protocols) => Some(line(protocols.span())),
             None => header_line(text, "[rules.layers]"),
@@ -780,8 +762,6 @@ impl LayersPolicy {
             store_users,
             allowed_edges,
             storage,
-            legacy,
-            legacy_line,
             protocols,
             protocols_line,
             domain_fences,

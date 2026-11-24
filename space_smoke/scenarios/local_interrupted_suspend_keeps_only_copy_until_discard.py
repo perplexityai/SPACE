@@ -5,15 +5,17 @@ import space_smoke as smoke
 
 # The fault holds node-manager for a few seconds while the suspend sits in
 # `suspending` (see `space_smoke.retained_only_copy`). Kind's discard window
-# is 120 s (`discardAttemptWindowSecs`), which the scenario waits out before
-# the discard that must succeed. Do not run concurrently with another
-# suspend-bearing smoke on the same node: holding node-manager stalls them.
+# is 60 s (`discardAttemptWindowSecs`), which the scenario waits out before
+# the discard that must succeed; the ordinary deletes run inside that wait.
+# Do not run concurrently with another suspend-bearing smoke on the same node:
+# holding node-manager stalls them.
 @smoke.scenario(
     "local.interrupted_suspend_keeps_only_copy_until_discard",
-    # Worst cases add to 1200 s: the pause 120 s, the row reaching
+    # Worst cases add to about 1380 s: the pause 120 s, the row reaching
     # `suspending` 60 s and `quarantined` 180 s, the deletes 3 x 180 s, Kind's
-    # 120 s window plus slack, the row going 60 s, and the control plane's
-    # delete and the pod's release 2 x 180 s. Create and the reads come on top.
+    # 60 s window plus slack (the window wait shrinks by whatever the deletes
+    # spent), the row going 60 s, and the control plane's delete and the pod's
+    # release 2 x 180 s. Create and the reads come on top.
     sandbox=smoke.SandboxConfig(timeout=1500),
     # Kind's discard window; the release lane renders no test hook and keeps
     # the six-hour window, which no smoke can wait out.
@@ -35,14 +37,21 @@ def interrupted_suspend_keeps_only_copy_until_discard(test: smoke.KindEcw) -> No
     with test.phase("fail the suspend with its runtime gone and no capture"):
         only_copy.interrupt_suspend()
 
-    with test.phase("every ordinary delete refuses the only copy"):
-        only_copy.expect_ordinary_deletes_refused()
-
+    # The in-window discard first, while the window is surely open: the
+    # ordinary deletes can take a minute each in the worst case, and the
+    # refusal they must show doesn't depend on the window.
     with test.phase("the discard refuses while the suspend attempt could finish"):
         only_copy.expect_discard_refused_inside_window()
+
+    with test.phase("every ordinary delete refuses the only copy"):
+        only_copy.expect_ordinary_deletes_refused()
 
     with test.phase("after the window the discard erases it"):
         only_copy.expect_discard_erases()
 
     with test.phase("the control plane then deletes it and releases its pod"):
         only_copy.expect_control_plane_releases()
+
+    # Last, so a bench too slow for the in-window discard still ran every
+    # other check before the run is called inconclusive.
+    only_copy.expect_in_window_checked()

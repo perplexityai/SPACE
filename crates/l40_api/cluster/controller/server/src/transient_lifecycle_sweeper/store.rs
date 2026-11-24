@@ -69,92 +69,6 @@ pub(super) const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
      LIMIT $3"
 );
 
-/// Failed-cleanup candidates: `failed` rows that still carry an active
-/// execution, oldest attempt first. Bind order: `$1` =
-/// [`SubstrateKind::Kubernetes`] (see [`failed_active_execution_scope`]),
-/// `$2` = batch limit.
-///
-/// `first_activation_unfinished` says the execution's first activation, for
-/// a cold create the create itself, never finished: the execution never
-/// reached `running` (still `creating`, or `created` once its pod UID was
-/// written; the wake dial can record a pod IP without moving it on), and
-/// it still holds an activation attempt, the route's or a later one.
-/// `first_activation_abandoned` adds that the attempt's lease has expired. It
-/// is the same predicate the repair CAS refuses, without the expiry. A finished
-/// activation leaves the execution `running`, and a started recovery
-/// `recovering`, even when the best-effort release of its attempt was missed.
-/// Like the sweep's `creating` owner check, it reads whichever attempt the
-/// execution holds. Unlike it, it needs no full age window past the expiry:
-/// that window spares a create that may still finish, and this row is already
-/// `failed`, so its create can't. An owner that finds its row failed rolls the
-/// create back and deletes the sandbox.
-///
-/// An execution that never reached `running` and whose last owner gave up its
-/// activation without dispatching it counts too: it holds no attempt, but
-/// keeps the expiry `give_up_activation_attempt_best_effort` cut to when it
-/// gave up, so it reads as abandoned once that passes. A start that adopts a
-/// crashed create's row and fails before its wake leaves this shape when it
-/// never recorded the pod as running. A finished activation clears its expiry
-/// along with its attempt, so it can't take this shape, and an execution with
-/// no lease at all (a non-blocking warm-pool adoption never takes one) counts
-/// as finished. A start that found the pod up records it first
-/// (`ensure_pod_exists` moves the execution to `running`), and a `running`
-/// execution counts as finished here: the sweep still fails that row (no
-/// attempt is left for a completion receipt to finish it), but if its retire
-/// doesn't complete, the repair below can put it back to `started`.
-pub(super) const LIST_FAILED_ACTIVE_EXECUTIONS_SQL: &str = sql!(
-    "SELECT s.id, e.k8s_node_name, e.pod_name, e.activation_attempt_id, e.generation,
-            NULLIF(BTRIM(e.pod_uid), '') AS pod_uid, e.route_activation_id,
-            COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL),
-                FALSE
-            ) AS first_activation_unfinished,
-            COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL)
-                    AND e.activation_attempt_expires_at < NOW(),
-                FALSE
-            ) AS first_activation_abandoned
-     FROM sandboxes s
-     JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-     WHERE s.managed_by = $1
-       AND s.lifecycle = 'failed'
-       AND e.active
-     ORDER BY e.updated_at ASC, s.id
-     LIMIT $2"
-);
-
-/// Re-read one failed-cleanup candidate's first activation just before an
-/// alive retire, so an execution that reached `running` since the listing
-/// (and the probe) moves it off the retire. Its two columns are the listing's, spelled the same way.
-/// Bind order: `$1` = sandbox id, `$2` = [`SubstrateKind::Kubernetes`] (see
-/// [`failed_active_execution_scope`]). No row: the sandbox is no longer
-/// `failed` with an active execution.
-pub(super) const FIRST_ACTIVATION_SQL: &str = sql!(
-    "SELECT COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL),
-                FALSE
-            ) AS first_activation_unfinished,
-            COALESCE(
-                e.state IN ('creating', 'created')
-                    AND (e.activation_attempt_id IS NOT NULL
-                         OR e.activation_attempt_expires_at IS NOT NULL)
-                    AND e.activation_attempt_expires_at < NOW(),
-                FALSE
-            ) AS first_activation_abandoned
-     FROM sandboxes s
-     JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-     WHERE s.id = $1
-       AND s.managed_by = $2
-       AND s.lifecycle = 'failed'
-       AND e.active"
-);
-
 /// Rotate a failed-cleanup candidate behind the others by bumping its active
 /// execution's `updated_at`. Bind order: `$1` = sandbox id, `$2` =
 /// [`SubstrateKind::Kubernetes`] (see [`failed_active_execution_scope`]).
@@ -185,20 +99,6 @@ pub(super) fn failed_active_execution_scope(managed_by: &str) -> Option<Substrat
 /// cluster-wide incident wedges a large population at once; the remainder
 /// rolls to the next tick.
 const SWEEP_CANDIDATE_BATCH: i64 = 100;
-
-/// Raw row shape of the failed-cleanup listing.
-#[derive(sqlx::FromRow)]
-struct FailedCleanupRow {
-    id: SandboxId,
-    k8s_node_name: Option<String>,
-    pod_name: String,
-    activation_attempt_id: Option<SandboxActivationAttemptId>,
-    generation: i64,
-    pod_uid: Option<PodUid>,
-    route_activation_id: Option<SandboxActivationAttemptId>,
-    first_activation_unfinished: bool,
-    first_activation_abandoned: bool,
-}
 
 /// Raw row shape of [`LIST_COMMAND_READY_PENDING_SQL`].
 #[derive(sqlx::FromRow)]
@@ -425,20 +325,9 @@ async fn retire_reverted_restore_execution(
         // row left reading as placed is one nothing revisits.
         sweeper::unplace_reverted_restore(tx, sandbox_id).await?;
         // The node state the open exposures described died with the runtime.
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-                SET apply_state = 'pending',
-                    last_applied_node_id = NULL,
-                    last_error = NULL,
-                    last_bridge_status = NULL,
-                    last_applied_bridge_generation = NULL,
-                    last_observed_at = NULL,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND desired_state = 'open'"
-        ))
-        .bind(sandbox_id)
-        .execute(&mut **tx)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut **tx, sandbox_id,
+        )
         .await?;
     }
     Ok(retired)
@@ -917,17 +806,7 @@ impl SweepSink for SubstrateSweepSink {
                 retire_reverted_restore_execution(&mut tx, sandbox_id, pod_fence).await?
             }
             RetireFence::NoExecution => {
-                !sqlx::query_scalar::<_, bool>(sql!(
-                    "SELECT EXISTS (
-                     SELECT 1
-                       FROM sandbox_k8s_executions
-                      WHERE sandbox_id = $1
-                        AND active
-                 )"
-                ))
-                .bind(sandbox_id)
-                .fetch_one(&mut *tx)
-                .await?
+                !pplx_space_sandbox_store::k8s_executions::exists(&mut *tx, sandbox_id).await?
             }
             // The candidate select always observes one of the two above; a
             // caller that observed nothing can't name the execution to retire.
@@ -1048,11 +927,10 @@ impl SweepSink for SubstrateSweepSink {
         let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
             return Ok(Vec::new());
         };
-        let rows: Vec<FailedCleanupRow> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
-            .bind(managed_by)
-            .bind(batch_size)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = pplx_space_sandbox_store::k8s_executions::list_failed_active_executions(
+            &self.pool, managed_by, batch_size,
+        )
+        .await?;
         let observed = observe_candidate_pods(
             &self.substrate,
             rows.iter().map(|row| row.pod_name.as_str()),
@@ -1087,13 +965,16 @@ impl SweepSink for SubstrateSweepSink {
         let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
             return Ok(None);
         };
-        let columns: Option<(bool, bool)> = sqlx::query_as(FIRST_ACTIVATION_SQL)
-            .bind(sandbox_id)
-            .bind(managed_by)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(columns
-            .map(|(unfinished, abandoned)| FirstActivation::from_columns(unfinished, abandoned)))
+        let columns = pplx_space_sandbox_store::k8s_executions::first_activation(
+            &self.pool, sandbox_id, managed_by,
+        )
+        .await?;
+        Ok(columns.map(|columns| {
+            FirstActivation::from_columns(
+                columns.first_activation_unfinished,
+                columns.first_activation_abandoned,
+            )
+        }))
     }
 
     async fn note_failed_cleanup_attempt(&self, sandbox_id: SandboxId) -> Result<(), sqlx::Error> {

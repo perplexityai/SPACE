@@ -96,19 +96,10 @@ impl RepairDbStore {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(sql!(
-            "UPDATE sandbox_port_exposures
-                SET apply_state = 'pending',\n\
-                    last_applied_node_id = NULL,\n\
-                    last_error = NULL,\n\
-                    last_bridge_status = NULL,\n\
-                    last_applied_bridge_generation = NULL,\n\
-                    last_observed_at = NULL,\n\
-                    updated_at = NOW()
-              WHERE sandbox_id = $1 AND desired_state = 'open'"
-        ))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *tx)
+        pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+            &mut *tx,
+            candidate.sandbox_id,
+        )
         .await?;
 
         tx.commit().await?;

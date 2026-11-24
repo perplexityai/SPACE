@@ -1,12 +1,12 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_db_test_fixtures::{pg_test_db, try_pg_test_db};
 use pplx_space_sandbox_residency::ResidencyEvidence;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::fleet_occupancy;
+use super::{fleet_occupancy, terminate_occupancy};
 
 async fn insert_node(pool: &PgPool) -> TestResult<NodeId> {
     let node = NodeId::new();
@@ -75,6 +75,86 @@ async fn ranked_fleet_occupancy_counts_only_unmarked_restores_as_drain_blockers(
         };
         assert_eq!(drain_blockers(marked), Some((0, 0)), "{residency:?}");
         assert_eq!(drain_blockers(unmarked), Some((0, 1)), "{residency:?}");
+    }
+    Ok(())
+}
+
+/// The `:terminate` guard's `active` count applies the census discount, so it
+/// refuses exactly what node-drain's gate and `mark_terminating_query` refuse.
+///
+/// This is the wedge the guard would otherwise be: `active` used to restate the
+/// exclusion list with no census term. A worker whose own census disproves its
+/// phantom `active_node_id` rows clears the census-aware drain gate, reaches
+/// `drained` — and a guard that still counted those rows would 409 every
+/// `:terminate` for the rest of the node's life, with `space-rollout-mng.py`
+/// permanently excluding it.
+///
+/// The `LifecycleOnly` half of the loop is the kill switch: with the discount
+/// off, the phantom row counts again and the guard refuses. Fail-closed.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_guard_active_count_honors_the_census_discount() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.71'::inet, 'worker', 'k8s', 'registered')"
+    ))
+    .bind(node)
+    .execute(&db.pool)
+    .await?;
+    // Reachable with a fresh heartbeat: the only state in which the census may
+    // be read as proof of absence.
+    sqlx::query(sql!(
+        // `sandbox_inventory_pruned_at` is the second, independent precondition
+        // of the census discount (`node_census_fresh`): a fresh heartbeat alone
+        // no longer earns it. Stamped current so this fixture isolates the thing
+        // it is about — whether the guard applies the discount — rather than
+        // withholding it for a reason the test never mentions.
+        "INSERT INTO node_status_snapshots (
+             node_id, observed_at, stale_after, reachable, role,
+             scheduling_status, services, sandbox_inventory_pruned_at, updated_at
+         )
+         VALUES ($1, NOW(), NOW() + INTERVAL '30 seconds', TRUE,
+                 'worker', 'ready', '[]'::jsonb, NOW(), NOW())"
+    ))
+    .bind(node)
+    .execute(&db.pool)
+    .await?;
+    // A phantom: `active_node_id` names the node, placement settled long ago,
+    // and the node's census carries no row for it.
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, placement, managed_by,
+             active_node_id, placement_changed_at, network_policy_generation
+         )
+         VALUES (
+             $1,
+             '00000000-0000-0000-0000-000000000010',
+             '00000000-0000-0000-0000-000000000001',
+             'started', 'on_node', 'k8s',
+             $2, NOW() - INTERVAL '1 hour', 1
+         )"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(node)
+    .execute(&db.pool)
+    .await?;
+
+    for (residency, want_active) in [
+        (ResidencyEvidence::NodeCensusAware, 0),
+        (ResidencyEvidence::LifecycleOnly, 1),
+    ] {
+        let mut tx = db.pool.begin().await?;
+        let occ = terminate_occupancy(&mut *tx, node, residency).await?;
+        tx.commit().await?;
+        assert_eq!(
+            occ.active, want_active,
+            "{residency}: a census-absent row must be discounted here exactly as \
+             the drain gate discounts it, or `:terminate` refuses a node the \
+             drain gate already released"
+        );
     }
     Ok(())
 }

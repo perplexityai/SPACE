@@ -201,9 +201,12 @@ async fn live_at(pool: &PgPool, node_id: NodeId, age: Duration) -> TestResult<No
 /// keep the guard reading as it did before the discount existed.
 async fn in_tx_local_snapshots(pool: &PgPool, node: NodeId) -> TestResult<i64> {
     let mut tx = pool.begin().await?;
-    let occupancy =
-        super::sandbox_occupancy_for_node_in_tx(&mut tx, node, ResidencyEvidence::LifecycleOnly)
-            .await?;
+    let occupancy = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+        &mut *tx,
+        node,
+        ResidencyEvidence::LifecycleOnly,
+    )
+    .await?;
     tx.commit().await?;
     Ok(occupancy.drain_blockers)
 }
@@ -948,7 +951,12 @@ async fn the_guard_refuses_exactly_what_the_listing_calls_terminate_blockers() -
         let predicted = listed.live.expect("threshold supplied").terminate_blockers;
 
         let mut tx = pool.begin().await?;
-        let guard = super::sandbox_occupancy_for_node_in_tx(&mut tx, node, CENSUS_AWARE).await?;
+        let guard = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+            &mut *tx,
+            node,
+            CENSUS_AWARE,
+        )
+        .await?;
         tx.commit().await?;
 
         assert_eq!(

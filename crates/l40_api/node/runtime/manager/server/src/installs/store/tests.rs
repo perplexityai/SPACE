@@ -1,3 +1,9 @@
+use std::path::PathBuf;
+
+use pplx_space_accounts::JobId;
+use pplx_space_content_digest::Digest;
+use rusqlite::params;
+
 use super::*;
 #[tokio::test]
 async fn a_job_result_is_replaced_as_the_job_progresses() {
@@ -40,22 +46,6 @@ async fn the_schema_refuses_a_result_that_is_both_or_neither() {
         )
         .unwrap_err();
     }
-}
-
-#[test]
-fn closed_vocabularies_round_trip_through_text() {
-    for phase in [JobPhase::Publishing, JobPhase::Removing] {
-        assert_eq!(phase.to_string().parse::<JobPhase>().unwrap(), phase);
-    }
-    for outcome in [
-        JobOutcome::Installed,
-        JobOutcome::AlreadyInstalled,
-        JobOutcome::Uninstalled,
-    ] {
-        assert_eq!(outcome.to_string().parse::<JobOutcome>().unwrap(), outcome);
-    }
-    "rolling-back".parse::<JobPhase>().unwrap_err();
-    "kept".parse::<JobOutcome>().unwrap_err();
 }
 
 #[tokio::test]
@@ -179,11 +169,11 @@ async fn prior_database(dir: &Path, prototype: bool) -> Connection {
     };
     let path = dir.join(DATABASE_FILE);
     pplx_space_sqlite::migrate_embedded(
-        DATABASE_NAME,
+        "runtime-manager",
         &path,
         pplx_space_sqlite::EmbeddedMigrators {
             service: &migrator,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
+            common: Some(&database::COMMON_MIGRATOR),
         },
     )
     .await

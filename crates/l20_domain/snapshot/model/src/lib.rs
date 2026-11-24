@@ -995,6 +995,7 @@ impl SnapshotConfig {
 }
 
 #[cfg(feature = "sqlx")]
-mod postgres;
+pplx_space_uuid_id::postgres_uuid!(LocalArtifactId, SnapshotId);
+
 #[cfg(test)]
 mod tests;

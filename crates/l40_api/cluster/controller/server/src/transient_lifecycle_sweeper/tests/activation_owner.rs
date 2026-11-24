@@ -22,10 +22,7 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::super::lifecycle_writer_tests::{age, direct_sink};
-use super::super::store::{
-    FIRST_ACTIVATION_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL, LOCK_SANDBOX_ROW_SQL,
-    candidate_pod_fence_with_observation,
-};
+use super::super::store::{LOCK_SANDBOX_ROW_SQL, candidate_pod_fence_with_observation};
 use super::super::{FailGuard, SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_node, insert_sandbox,
@@ -468,13 +465,6 @@ async fn a_new_owner_that_claims_first_keeps_the_row(
     Ok(())
 }
 
-/// The two failed-cleanup listing columns this test reads.
-#[derive(sqlx::FromRow)]
-struct FailedListing {
-    id: SandboxId,
-    first_activation_abandoned: bool,
-}
-
 /// A `failed` Kubernetes sandbox whose execution never reached `running` and
 /// whose last owner gave its activation up (a start that adopted a crashed
 /// create's row, say, which the sweep then failed with the VM alive) is
@@ -503,22 +493,19 @@ async fn a_failed_row_its_owner_gave_up_on_is_never_repaired() -> TestResult {
         let id =
             insert_row_with(pool, "failed", kubernetes.as_str(), execution_state, lease).await?;
 
-        let listed: Vec<FailedListing> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
-            .bind(kubernetes)
-            .bind(10_000_i64)
-            .fetch_all(pool)
-            .await?;
+        let listed = pplx_space_sandbox_store::k8s_executions::list_failed_active_executions(
+            pool, kubernetes, 10_000,
+        )
+        .await?;
         let reported = listed
             .iter()
             .find(|row| row.id == id)
             .map(|row| row.first_activation_abandoned);
         // The re-read just before an alive retire must agree with the listing.
-        let reread: Option<(bool, bool)> = sqlx::query_as(FIRST_ACTIVATION_SQL)
-            .bind(id)
-            .bind(kubernetes)
-            .fetch_optional(pool)
-            .await?;
-        let reread = reread.map(|(_unfinished, abandoned)| abandoned);
+        let reread =
+            pplx_space_sandbox_store::k8s_executions::first_activation(pool, id, kubernetes)
+                .await?
+                .map(|columns| columns.first_activation_abandoned);
         let claimed: Option<SandboxId> = sqlx::query_scalar(REPAIR_FAILED_ACTIVE_EXECUTION_SQL)
             .bind(id)
             .bind(kubernetes)

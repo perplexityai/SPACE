@@ -16,9 +16,9 @@ use pplx_space_service_mutex::{
     AcquireError as ServiceMutexAcquireError, AcquireOutcome, SERVICE_MUTEX_POLL_INTERVAL,
     ServiceMutex,
 };
-use pplx_space_sqlite::SqliteError;
 use pplx_space_unix_socket_bind::BindUnixSocketError;
 use pplx_space_unix_socket_bind::UnixSocketOptions;
+use pplx_space_volmgr_store::database::{self, SqliteError};
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
@@ -33,22 +33,6 @@ const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 // different mutex files and both acquire concurrently.
 pub const SERVICE_MUTEX_PATH: &str = "/space/run/volume-manager/service.mutex";
 const UNEXPECTED_SERVER_EXIT_CODE: i32 = 1;
-
-static VOLUME_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
-    sqlx::migrate!("../../../../db/volume-manager");
-static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../db/common");
-
-pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteError> {
-    pplx_space_sqlite::migrate_embedded(
-        "volume-manager",
-        path,
-        pplx_space_sqlite::EmbeddedMigrators {
-            service: &VOLUME_MANAGER_MIGRATOR,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
-        },
-    )
-    .await
-}
 
 // Static S3 credential escape hatch, resolved here at the deployment boundary
 // (not inside the platform library). When these are set — e.g. a local kind
@@ -486,7 +470,7 @@ pub async fn run(
         })?;
     }
 
-    migrate_volume_manager_db(std::path::Path::new(&config.db_path))
+    database::migrate(std::path::Path::new(&config.db_path))
         .await
         .map_err(|source| RunVolmgrError::Migrate {
             path: PathBuf::from(&config.db_path),

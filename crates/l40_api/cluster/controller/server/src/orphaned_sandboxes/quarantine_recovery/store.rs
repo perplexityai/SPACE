@@ -127,15 +127,13 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     if current.as_slice() != std::slice::from_ref(expected) {
         return Ok(false);
     }
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_quarantine_history
-            (id, quarantine_id, sandbox_id, source, action, reason_code, message, attempt_count, evidence)
-         SELECT $2, quarantine_id, sandbox_id, source, 'recovered_to_suspended', reason_code,
-                'Worker row and execution pod absent; ready suspend snapshot metadata matches recorded activity',
-                attempt_count, evidence || jsonb_build_object('snapshot_id', $3::TEXT)
-           FROM sandbox_quarantine_state WHERE sandbox_id = $1"
-    )).bind(expected.sandbox_id).bind(Uuid::now_v7()).bind(expected.snapshot_id.to_string())
-        .execute(&mut *tx).await?;
+    pplx_space_sandbox_quarantine_store::record_recovered_to_suspended(
+        &mut *tx,
+        expected.sandbox_id,
+        Uuid::now_v7(),
+        expected.snapshot_id,
+    )
+    .await?;
     pplx_space_sandbox_store::repair::recover_quarantined_publication_to_suspended(
         &mut tx,
         expected.sandbox_id,
@@ -150,27 +148,14 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     .bind(expected.execution_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
-    ))
-    .bind(expected.sandbox_id)
-    .execute(&mut *tx)
+    pplx_space_sandbox_store::observed_states::delete(&mut *tx, expected.sandbox_id).await?;
+    pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
+        &mut *tx,
+        expected.sandbox_id,
+    )
     .await?;
-    sqlx::query(sql!(
-        "UPDATE sandbox_port_exposures SET apply_state = 'pending', last_applied_node_id = NULL,
-             last_error = NULL, last_bridge_status = NULL, last_applied_bridge_generation = NULL,
-             last_observed_at = NULL, updated_at = NOW()
-          WHERE sandbox_id = $1 AND desired_state = 'open'"
-    ))
-    .bind(expected.sandbox_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_quarantine_state WHERE sandbox_id = $1"
-    ))
-    .bind(expected.sandbox_id)
-    .execute(&mut *tx)
-    .await?;
+    pplx_space_sandbox_quarantine_store::delete_quarantine_state(&mut *tx, expected.sandbox_id)
+        .await?;
     pplx_space_sandbox_teardown::delete_reconcile_state_for_elements(
         &mut tx,
         &[

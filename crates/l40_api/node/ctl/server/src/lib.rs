@@ -31,14 +31,16 @@ use pplx_space_node_api_client::proto::{
     SetFacetSyncDisabledResponse, TriggerStateReconciliationRequest,
     TriggerStateReconciliationResponse,
 };
+use pplx_space_node_ctl_store::reconciliation_status;
 use pplx_space_node_mgr_client::{
     CacheDiskSchedulingEffect, NetworkPoolStatusReader, NodeManagerGrpcClient,
     NodeResourceStatusReader,
 };
 use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
+use pplx_space_state_reconciliation::ReconcileReason;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -49,6 +51,7 @@ use tracing::Instrument as _;
 mod cluster_reconcile_trigger;
 mod dirty_state;
 mod facets;
+mod firewall_rules;
 #[cfg(feature = "kubernetes")]
 mod kubernetes_controller;
 pub mod metrics;
@@ -58,6 +61,8 @@ mod twin_metadata_report;
 mod util;
 
 use cluster_reconcile_trigger::{ClusterReconcileTrigger, trigger_request_reason};
+#[cfg(any(test, feature = "test-support"))]
+pub use firewall_rules::serve_firewall_wake_for_test;
 use outbound_retry::{OutboundOutcome, OutboundPass, OutboundRetry};
 
 /// The group node-ctl's clients reach its production socket through.
@@ -157,7 +162,6 @@ const SPACE_NODE_ID_ENV: &str = "SPACE_NODE_ID";
 const SPACE_NODE_ROLE_ENV: &str = "SPACE_NODE_ROLE";
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 const SKIP_CLUSTER_SYNC_METADATA: &str = "x-space-skip-cluster-sync";
-static NODE_CTL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/node-ctl");
 static CLUSTER_NODE_API_ENDPOINT: OnceLock<Option<String>> = OnceLock::new();
 const ALLOW_NODE_CTL_OBSERVER: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
@@ -181,6 +185,18 @@ const ALLOW_NODE_CTL_OPERATOR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Operator),
 ];
+
+fn peer_authorizer() -> UdsPeerAuthorizer {
+    UdsPeerAuthorizer::new_with_default_local_roles(
+        SERVICE_NAME,
+        [
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODEAPI.name, users::SPACE_NODEAPI.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_SBXMGR.name, users::SPACE_SBXMGR.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_TMPLMGR.name, users::SPACE_TMPLMGR.uid),
+            UdsPeerAccount::with_fallback_uid(users::SPACE_NODECTL.name, users::SPACE_NODECTL.uid),
+        ],
+    )
+}
 
 fn facet_scope_span_fields(scope: &facets::FacetScope) -> (&'static str, usize) {
     match scope {
@@ -252,9 +268,9 @@ pub enum RunNodeCtlError {
     #[error("failed to acquire the node-ctl service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate node-ctl's SQLite database: {0}")]
-    Migrate(#[source] pplx_space_sqlite::SqliteError),
+    Migrate(#[source] pplx_space_node_ctl_store::database::SqliteError),
     #[error("failed to open node-ctl's SQLite database: {0}")]
-    OpenDatabase(#[source] pplx_space_sqlite::SqliteError),
+    OpenDatabase(#[source] pplx_space_node_ctl_store::database::SqliteError),
     #[error("failed to seed reconciliation status rows: {0}")]
     InitReconciliationStatus(#[source] rusqlite::Error),
     #[error("failed to bind the node-ctl socket: {0}")]
@@ -293,6 +309,25 @@ struct NodeCtlService {
     cluster_reconcile_trigger: cluster_reconcile_trigger::ClusterReconcileTrigger,
     db: Arc<Mutex<Connection>>,
     peer_authorizer: UdsPeerAuthorizer,
+    /// Firewall rule delivery, which only a test fixture turns on.
+    firewall_rules: Option<firewall_rules::Wake>,
+}
+
+impl NodeCtlService {
+    fn new(
+        tx: mpsc::Sender<WorkItem>,
+        cluster_reconcile_trigger: ClusterReconcileTrigger,
+        db: Arc<Mutex<Connection>>,
+        firewall_rules: Option<firewall_rules::Wake>,
+    ) -> Self {
+        Self {
+            tx,
+            cluster_reconcile_trigger,
+            db,
+            peer_authorizer: peer_authorizer(),
+            firewall_rules,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -598,14 +633,11 @@ pub async fn run(
     );
     health_server.mark_starting();
 
-    pplx_space_sqlite::migrate("node-ctl", &cli.db_path, &NODE_CTL_MIGRATOR)
+    pplx_space_node_ctl_store::database::migrate(&cli.db_path)
         .await
         .map_err(RunNodeCtlError::Migrate)?;
-    let db = pplx_space_sqlite::open_rusqlite(
-        &cli.db_path,
-        pplx_space_sqlite::RusqliteOpenOptions::default(),
-    )
-    .map_err(RunNodeCtlError::OpenDatabase)?;
+    let db = pplx_space_node_ctl_store::database::open(&cli.db_path)
+        .map_err(RunNodeCtlError::OpenDatabase)?;
     init_reconciliation_status(&db, poll_interval_secs)
         .map_err(RunNodeCtlError::InitReconciliationStatus)?;
     let db = Arc::new(Mutex::new(db));
@@ -681,32 +713,12 @@ pub async fn run(
         .layer(pplx_space_grpc_rate_limiter::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
         .layer(pplx_space_grpc_server::grpc_trace_layer())
         .add_service(health_service)
-        .add_service(NodeCtlServer::new(NodeCtlService {
+        .add_service(NodeCtlServer::new(NodeCtlService::new(
             tx,
             cluster_reconcile_trigger,
             db,
-            peer_authorizer: UdsPeerAuthorizer::new_with_default_local_roles(
-                SERVICE_NAME,
-                [
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_NODEAPI.name,
-                        users::SPACE_NODEAPI.uid,
-                    ),
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_SBXMGR.name,
-                        users::SPACE_SBXMGR.uid,
-                    ),
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_TMPLMGR.name,
-                        users::SPACE_TMPLMGR.uid,
-                    ),
-                    UdsPeerAccount::with_fallback_uid(
-                        users::SPACE_NODECTL.name,
-                        users::SPACE_NODECTL.uid,
-                    ),
-                ],
-            ),
-        }))
+            None,
+        )))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown);
 
     let mut service_mutex = Some(service_mutex);
@@ -839,21 +851,7 @@ fn init_reconciliation_status(conn: &Connection, poll_interval_secs: u64) -> rus
         TEMPLATE_INVENTORY_OUTBOUND_RECONCILER,
         NODE_STATUS_OUTBOUND_RECONCILER,
     ] {
-        conn.execute(
-            "INSERT INTO reconciliation_status
-                 (name, poll_interval_secs, next_due_at, running, updated_at)
-             VALUES (?1, ?2, ?3, 0, ?3)
-             ON CONFLICT(name) DO UPDATE
-             SET poll_interval_secs = excluded.poll_interval_secs,
-                 next_due_at = CASE
-                     WHEN reconciliation_status.running != 0
-                     THEN ?3
-                     ELSE reconciliation_status.next_due_at
-                 END,
-                 running = 0,
-                 updated_at = ?3",
-            params![name, poll_interval_secs.cast_signed(), now],
-        )?;
+        reconciliation_status::register(conn, name, poll_interval_secs.cast_signed(), now)?;
     }
     Ok(())
 }
@@ -1067,6 +1065,11 @@ impl NodeCtl for NodeCtlService {
             ALLOW_NODE_CTL_REFRESH,
         )?;
         let reason = trigger_request_reason(request.into_inner());
+        if let Some(firewall_rules) = &self.firewall_rules
+            && reason.includes(ReconcileReason::FirewallRulesChanged)
+        {
+            firewall_rules.wake();
+        }
         self.cluster_reconcile_trigger.trigger(reason).await?;
         Ok(Response::new(TriggerStateReconciliationResponse {}))
     }
@@ -1698,13 +1701,7 @@ impl NodeCtlWorker {
             TEMPLATE_INVENTORY_OUTBOUND_RECONCILER,
             NODE_STATUS_OUTBOUND_RECONCILER,
         ] {
-            tx.execute(
-                "UPDATE reconciliation_status
-                 SET next_due_at = ?1,
-                     updated_at = ?2
-                 WHERE name = ?3",
-                params![next_due_at, now_secs(), name],
-            )?;
+            reconciliation_status::set_next_due(&tx, name, next_due_at, now_secs())?;
         }
         tx.commit()
     }
@@ -1937,15 +1934,7 @@ impl NodeCtlWorker {
             .db
             .lock()
             .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-        db.execute(
-            "UPDATE reconciliation_status
-             SET last_started_at = ?1,
-                 running = 1,
-                 updated_at = ?1
-             WHERE name = ?2",
-            params![now, name],
-        )?;
-        Ok(())
+        reconciliation_status::mark_started(&db, name, now)
     }
 
     async fn claim_cluster_reconcile_refs(&self) -> Option<ClusterReconcileClaim> {
@@ -2106,30 +2095,19 @@ impl NodeCtlWorker {
             .db
             .lock()
             .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-        db.execute(
-            "UPDATE reconciliation_status
-             SET last_completed_at = ?1,
-                 last_success_at = CASE WHEN ?2 != 0 THEN ?1 ELSE last_success_at END,
-                 running = 0,
-                 templates_seen = ?3,
-                 sandboxes_seen = ?4,
-                 templates_applied = ?5,
-                 sandboxes_applied = ?6,
-                 last_error = ?7,
-                 updated_at = ?1
-             WHERE name = ?8",
-            params![
-                now,
-                i64::from(success),
-                stats.templates_seen.cast_signed(),
-                stats.sandboxes_seen.cast_signed(),
-                stats.templates_applied.cast_signed(),
-                stats.sandboxes_applied.cast_signed(),
-                error.unwrap_or(""),
-                name,
-            ],
-        )?;
-        Ok(())
+        reconciliation_status::mark_finished(
+            &db,
+            name,
+            &reconciliation_status::FinishedRun {
+                completed_at: now,
+                success,
+                templates_seen: stats.templates_seen.cast_signed(),
+                sandboxes_seen: stats.sandboxes_seen.cast_signed(),
+                templates_applied: stats.templates_applied.cast_signed(),
+                sandboxes_applied: stats.sandboxes_applied.cast_signed(),
+                last_error: error.unwrap_or(""),
+            },
+        )
     }
 }
 
@@ -2139,39 +2117,24 @@ fn read_reconciliation_statuses(
     let db = db
         .lock()
         .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-    let mut stmt = db.prepare(
-        "SELECT name,
-                poll_interval_secs,
-                last_started_at,
-                last_completed_at,
-                last_success_at,
-                next_due_at,
-                running,
-                templates_seen,
-                sandboxes_seen,
-                templates_applied,
-                sandboxes_applied,
-                last_error
-         FROM reconciliation_status
-         ORDER BY name ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(ReconciliationStatus {
-            name: row.get(0)?,
-            poll_interval_secs: i64_to_u64(row.get(1)?),
-            last_started_at_unix_secs: i64_to_u64(row.get(2)?),
-            last_completed_at_unix_secs: i64_to_u64(row.get(3)?),
-            last_success_at_unix_secs: i64_to_u64(row.get(4)?),
-            next_due_at_unix_secs: i64_to_u64(row.get(5)?),
-            running: row.get::<_, i64>(6)? != 0,
-            templates_seen: i64_to_u64(row.get(7)?),
-            sandboxes_seen: i64_to_u64(row.get(8)?),
-            templates_applied: i64_to_u64(row.get(9)?),
-            sandboxes_applied: i64_to_u64(row.get(10)?),
-            last_error: row.get(11)?,
+    let rows = reconciliation_status::list(&db)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ReconciliationStatus {
+            name: row.name,
+            poll_interval_secs: i64_to_u64(row.poll_interval_secs),
+            last_started_at_unix_secs: i64_to_u64(row.last_started_at),
+            last_completed_at_unix_secs: i64_to_u64(row.last_completed_at),
+            last_success_at_unix_secs: i64_to_u64(row.last_success_at),
+            next_due_at_unix_secs: i64_to_u64(row.next_due_at),
+            running: row.running,
+            templates_seen: i64_to_u64(row.templates_seen),
+            sandboxes_seen: i64_to_u64(row.sandboxes_seen),
+            templates_applied: i64_to_u64(row.templates_applied),
+            sandboxes_applied: i64_to_u64(row.sandboxes_applied),
+            last_error: row.last_error,
         })
-    })?;
-    rows.collect()
+        .collect())
 }
 
 fn group_refs(refs: Vec<dirty_state::FacetRef>) -> BTreeMap<facets::FacetKind, facets::FacetScope> {

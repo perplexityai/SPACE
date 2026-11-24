@@ -1,0 +1,22 @@
+[package]
+name = "pplx-space-build-mgr-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+sqlite.build-manager = ["build_job_results", "jobs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+# internal
+pplx-space-job-id = { workspace = true, features = ["rusqlite"] }
+pplx-space-sql-locator = { workspace = true }

@@ -192,5 +192,36 @@ pub async fn retired_among(
     Ok(retired.into_iter().collect())
 }
 
+/// One catalog environment with its edges, as stored: references are text,
+/// for the caller to parse and to report a bad one its own way.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct CatalogEnvironmentRow {
+    pub environment_ref: String,
+    pub runtime: String,
+    pub runtime_version: String,
+    pub kernel_version: String,
+    pub state_format_name: String,
+    pub state_format_version: String,
+    pub upgrade_edges: Vec<String>,
+    pub memory_edges: Vec<String>,
+}
+
+/// Every catalog environment that isn't retired, with its edges, sorted by
+/// the text of `environment_ref`. Accepts a pool or a transaction connection;
+/// takes no lock.
+pub async fn unretired_environments(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<CatalogEnvironmentRow>, sqlx::Error> {
+    sqlx::query_as::<_, CatalogEnvironmentRow>(sql!(
+        "SELECT environment_ref, runtime, runtime_version, kernel_version,
+                state_format_name, state_format_version, upgrade_edges, memory_edges
+           FROM runtime_environments
+          WHERE retired_at IS NULL
+          ORDER BY environment_ref"
+    ))
+    .fetch_all(executor)
+    .await
+}
+
 #[cfg(test)]
 mod tests;

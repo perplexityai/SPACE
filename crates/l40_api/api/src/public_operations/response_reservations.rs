@@ -143,21 +143,14 @@ impl PublicOperationStore {
         )
         .await?;
         let id = Uuid::now_v7();
-        sqlx::query(sql!(
-            "INSERT INTO public_idempotency_records
-             (id, org_id, api_product, method, path_template, idempotency_key,
-              request_fingerprint, response_json)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-        ))
-        .bind(id)
-        .bind(org_id)
-        .bind(api_product.as_str())
-        .bind(idempotency.method.as_str())
-        .bind(idempotency.path_template.as_str())
-        .bind(idempotency.key.as_str())
-        .bind(idempotency.request_fingerprint.as_str())
-        .bind(Json(StoredReservation::RESERVED))
-        .execute(&mut *tx)
+        operation_store::idempotency::insert_reply(
+            &mut *tx,
+            id,
+            api_product.as_str(),
+            idempotency.store_key(org_id),
+            idempotency.request_fingerprint.as_str(),
+            &StoredReservation::RESERVED,
+        )
         .await?;
         tx.commit().await?;
         Ok(ResponseReservation::Reserved(ReservationId(id)))

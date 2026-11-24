@@ -1662,7 +1662,7 @@ mod slot_pool_tests {
             )
             .unwrap();
 
-            backfill_active_memory_reservations(&conn, 8320).unwrap();
+            slots::backfill_active_memory_reservations(&conn, 8320).unwrap();
         }
 
         assert_eq!(record(&pool, 0).memory_reservation_mib, Some(8320));
@@ -1702,6 +1702,53 @@ mod slot_pool_tests {
         assert_eq!(record(&pool, 1).state, SlotState::Dirty);
         assert_eq!(record(&pool, 0).info.sandbox_id, "sandbox-a");
         assert_eq!(record(&pool, 1).info.sandbox_id, "sandbox-a");
+    }
+
+    #[test]
+    fn current_lease_prefix_lookup_matches_literally() {
+        let mut config = NetworkPoolConfig::new(4);
+        config.target_ready_slots = 0;
+        config.retained_ready_slots = 0;
+        config.min_ready_slots = 0;
+        let pool = test_pool(config);
+        let conn = pool.db.lock().unwrap();
+        let lease = |slot_id: u32, sandbox_id: &str| {
+            conn.execute(
+                "UPDATE network_slots
+                 SET generation = 1, state = 'leased', health = 'healthy',
+                     sandbox_id = ?1, sandbox_uid = ?2, lease_kind = ?3
+                 WHERE slot_id = ?4",
+                params![
+                    sandbox_id,
+                    net::sandbox_uid_for_slot(slot_id),
+                    LeaseKind::Ephemeral.as_str(),
+                    slot_id
+                ],
+            )
+            .unwrap();
+        };
+        lease(0, "abcd1234-5678-4abc-8def-000000000001");
+        lease(1, "feed0000-5678-4abc-8def-000000000001");
+        lease(2, "feed0000-5678-4abc-8def-000000000002");
+        lease(3, "ab\\cd_9");
+        let slot = |lookup: &str| {
+            query_current_lease_by_sandbox(&conn, lookup)
+                .unwrap()
+                .map(|record| record.info.slot)
+        };
+
+        assert_eq!(slot("abcd1234"), Some(0));
+        assert_eq!(slot("ABCD1234"), Some(0));
+        assert_eq!(slot("abcd_234"), None);
+        assert_eq!(slot("abcd%234"), None);
+        assert_eq!(slot("abc%"), None);
+        assert_eq!(slot("abcd1234-5678-4abc-8def-00000000000_"), None);
+        assert_eq!(slot("feed0000"), None);
+        assert_eq!(slot("feed0000-5678-4abc-8def-000000000002"), Some(2));
+        assert_eq!(slot("ab\\cd_"), Some(3));
+        assert_eq!(slot("ab\\c"), Some(3));
+        assert_eq!(slot("ab\\"), Some(3));
+        assert_eq!(slot("ab\\cd%"), None);
     }
 
     #[test]

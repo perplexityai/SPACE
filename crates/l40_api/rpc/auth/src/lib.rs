@@ -216,6 +216,18 @@ impl NodeApiAuthConfig {
         Self::from_environment_impl(env, role, static_token, static_control_token)
     }
 
+    /// Grant `service_account` the firewall-rules fetch authority that
+    /// production grants no one; panics without Kubernetes auth.
+    #[cfg(all(feature = "k8s", any(test, feature = "test-support")))]
+    #[must_use]
+    pub fn grant_firewall_rules_fetch_for_test(mut self, service_account: &str) -> Self {
+        self.k8s
+            .as_mut()
+            .expect("firewall-rules fetch grant needs Kubernetes auth")
+            .grant_firewall_rules_fetch(service_account);
+        self
+    }
+
     fn from_environment_impl(
         env: &dyn pplx_space_env_vars::Environment,
         role: NodeRole,
@@ -301,6 +313,7 @@ pub struct NodeApiAuthenticatedCaller {
     data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority,
     template_release_read_authority: TemplateReleaseReadAuthority,
     template_transfer_authority: template_transfer::TemplateTransferAuthority,
+    firewall_rules_fetch_authority: FirewallRulesFetchAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,6 +373,16 @@ pub enum TemplateReleaseReadAuthority {
     Unscoped,
 }
 
+/// Whether the caller may fetch its node's firewall instructions as node-ctl
+/// (`FetchFirewallRules`). No node-ctl principal is approved yet, so no
+/// production caller, static or reviewed, is granted it; tests grant it to a
+/// named service account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirewallRulesFetchAuthority {
+    Denied,
+    Granted,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KubernetesAuthenticationMode {
     Disabled,
@@ -411,6 +434,7 @@ impl NodeApiAuthenticatedCaller {
                     template_transfer::TemplateTransferAuthority::Denied
                 }
             },
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -427,6 +451,7 @@ impl NodeApiAuthenticatedCaller {
             data_plane_session_refresh_authority,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -441,6 +466,7 @@ impl NodeApiAuthenticatedCaller {
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Granted,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -454,6 +480,7 @@ impl NodeApiAuthenticatedCaller {
             data_plane_session_refresh_authority: DataPlaneSessionRefreshAuthority::Denied,
             template_release_read_authority: TemplateReleaseReadAuthority::NodeScoped,
             template_transfer_authority: template_transfer::TemplateTransferAuthority::Denied,
+            firewall_rules_fetch_authority: FirewallRulesFetchAuthority::Denied,
         }
     }
 
@@ -481,6 +508,10 @@ impl NodeApiAuthenticatedCaller {
 
     pub const fn template_release_read_authority(&self) -> TemplateReleaseReadAuthority {
         self.template_release_read_authority
+    }
+
+    pub const fn firewall_rules_fetch_authority(&self) -> FirewallRulesFetchAuthority {
+        self.firewall_rules_fetch_authority
     }
 }
 

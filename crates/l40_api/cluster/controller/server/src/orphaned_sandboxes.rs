@@ -12,10 +12,12 @@
 //! A recovery to `suspended` restores the row's snapshot, which loses what
 //! the node holding the sandbox wrote since, and the activity clocks can't
 //! rule that out. The candidate listing skips a row whose active node has
-//! reported it, for as long as that observed state exists. A report that
-//! commits after the listing reaches the plan, which defers to the node, and
-//! the recovery's own statement checks it again; a publish still uncommitted
-//! when that statement runs isn't seen.
+//! reported it, for as long as that observed state exists. Live classification
+//! acquires the per-sandbox observation advisory lock before its plan read, so
+//! any `present: true` publication already holding the shared lock finishes
+//! first: if the active node's publication committed, the plan sees it and
+//! defers to the node, just as it does for an already-committed report, and
+//! `recover_orphan_to_suspended` re-checks the invariant itself.
 //!
 //! The reconciler's actions (deletes, recoveries to `suspended` and
 //! quarantines) are capped at `max_classifications_per_minute` in a 60-second
@@ -1215,17 +1217,13 @@ impl OrphanActionSink for SubstrateActionSink {
     }
 
     async fn current_max_sandbox_id(&self) -> Result<Option<SandboxId>, sqlx::Error> {
-        // Pre-PG-15 has no `max(uuid)` aggregate, so use ORDER BY DESC
-        // LIMIT 1 instead. The primary key index makes this an index-only
-        // scan that returns immediately. `fetch_optional` correctly returns
-        // `None` for an empty table.
-        let row: Option<(SandboxId,)> = sqlx::query_as(sql!(
-            "SELECT id FROM sandboxes WHERE managed_by = $1 ORDER BY id DESC LIMIT 1"
-        ))
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(id,)| id))
+        Ok(
+            pplx_space_sandbox_store::sandbox_id_bounds::newest_managed_by(
+                &self.pool,
+                SubstrateKind::Kubernetes,
+            )
+            .await?,
+        )
     }
 
     async fn classify_orphan(
@@ -1437,14 +1435,9 @@ impl OrphanActionSink for SubstrateActionSink {
     }
 
     async fn active_quarantine_count(&self) -> Result<u32, OrphanClassifyError> {
-        let count: i64 = sqlx::query_scalar(sql!(
-            "SELECT COUNT(*)::BIGINT
-               FROM sandbox_quarantine_state quarantine
-               JOIN sandboxes sandbox ON sandbox.id = quarantine.sandbox_id
-              WHERE sandbox.lifecycle = 'quarantined'"
-        ))
-        .fetch_one(&self.pool)
-        .await?;
+        let count = pplx_space_sandbox_store::active_quarantines::count(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 }
@@ -1591,6 +1584,9 @@ async fn plan_orphan_in_tx(
     guard: &ClassifyGuard,
     lock: bool,
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
+    if lock {
+        orphan::lock_orphan_observation(tx, sandbox_id).await?;
+    }
     let eligibility = orphan_recovery_revert_eligibility("s");
     let recoverable = eligibility.eligible;
     // internal-api writes a node's observed state only for the rows it is the

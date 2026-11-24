@@ -1259,19 +1259,11 @@ impl ClusterApi for ClusterApiService {
         // payload columns are projected only for assigned-here rows; other
         // rows contribute 17 bytes to the partition instead of their
         // jsonb policy.
-        let rows = sqlx::query_as::<_, SandboxDesiredStateRow>(sql!(
-            "SELECT id AS sandbox_id,
-                    (active_node_id = $2) IS TRUE AS assigned_here,
-                    CASE WHEN active_node_id = $2
-                         THEN snapshots_enabled_desired END AS snapshots_enabled_desired,
-                    CASE WHEN active_node_id = $2
-                         THEN auto_lifecycle_json END AS auto_lifecycle_json
-             FROM sandboxes
-             WHERE id = ANY($1)"
-        ))
-        .bind(&sandbox_ids)
-        .bind(origin.id)
-        .fetch_all(&self.pool)
+        let rows = pplx_space_sandbox_store::node_desired_state::partition(
+            &self.pool,
+            &sandbox_ids,
+            origin.id,
+        )
         .await
         .map_err(|err| Status::internal(format!("query sandbox desired state: {err}")))?;
 
@@ -1693,19 +1685,13 @@ impl ClusterApi for ClusterApiService {
                 "node-ctl reconciliation failed without an error message".to_string()
             });
             let facet_for_metrics = reference.facet.clone();
-            let attempts = sqlx::query_scalar::<_, i32>(sql!(
-                "SELECT attempts
-                 FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .fetch_optional(&mut *tx)
+            let attempts = pplx_space_cluster_trigger_queue::claimed_ref_attempts(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("read reconcile retry count: {err}")))?
             .unwrap_or(0);
@@ -1992,6 +1978,13 @@ impl ClusterApi for ClusterApiService {
         request: Request<crate::proto::GetExecutionCurrencyRequest>,
     ) -> Result<Response<crate::proto::GetExecutionCurrencyResponse>, Status> {
         ClusterApiService::get_execution_currency(self, request).await
+    }
+
+    async fn fetch_firewall_rules(
+        &self,
+        request: Request<crate::proto::FetchFirewallRulesRequest>,
+    ) -> Result<Response<crate::proto::FetchFirewallRulesResponse>, Status> {
+        ClusterApiService::fetch_firewall_rules(self, request).await
     }
 }
 

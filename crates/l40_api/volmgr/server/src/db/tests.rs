@@ -1,10 +1,13 @@
 use super::*;
+use rusqlite::params;
 
 #[tokio::test]
 async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("volume-manager.sqlite");
-    crate::run::migrate_volume_manager_db(&path).await.unwrap();
+    pplx_space_volmgr_store::database::migrate(&path)
+        .await
+        .unwrap();
     let mut conn = Connection::open(&path).unwrap();
     let mut expected = Vec::new();
     // One transaction for the seed: committing each row would pay a sync per
@@ -48,7 +51,9 @@ async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {
 async fn historical_attachment_keys_remain_addressable_without_merging_aliases() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("volume-manager.sqlite");
-    crate::run::migrate_volume_manager_db(&path).await.unwrap();
+    pplx_space_volmgr_store::database::migrate(&path)
+        .await
+        .unwrap();
     let conn = Connection::open(&path).unwrap();
     let spellings = [
         "019d84bd-280d-7331-99c6-b63377f3a3a2",

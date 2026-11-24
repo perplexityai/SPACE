@@ -161,9 +161,7 @@ async fn insert_audit_event(
 }
 
 async fn audit_event_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(sql!("SELECT COUNT(*) FROM admin_audit_events"))
-        .fetch_one(pool)
-        .await
+    pplx_space_admin_audit_store::count(pool).await
 }
 
 async fn audit_path_exists(pool: &PgPool, path: &str) -> Result<bool, sqlx::Error> {

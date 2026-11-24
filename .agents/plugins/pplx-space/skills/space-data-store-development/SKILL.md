@@ -94,31 +94,86 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   `get(..).is_some_and(..)`, a hand-rolled probe onto a shared fragment) pins
   the equivalence with a Postgres-backed test before it merges.
 
-Not store verbs — leave these where they are:
+Not plain store verbs. Leave these where they are unless an item below says
+how one may move. A statement that fits several items moves only if each
+item it fits allows it: the guarded-transition item decides whether and
+where a guarded statement moves, and the lock and clock items say what any
+move must keep.
 
 - **Guarded state transitions**, where the `WHERE` re-checks a precondition
-  (a lifecycle CAS, a lease-token or generation guard). The guard is the
-  correctness mechanism; flattening one into a plain `update` re-opens the
-  drift class where a pooled wake resurrected torn-down sandboxes. The
-  `sandboxes` row is the exception to leaving them in place: its guarded
-  transitions move into `pplx-space-sandbox-store`, in modules named for the
-  transition or for the path that issues them (as `lost` and `delete` are),
-  and its canonical hard delete is that crate's
+  (a lifecycle CAS, a lease-, claim-token or generation guard). The guard is
+  the correctness mechanism; flattening one into a plain `update` re-opens
+  the drift class where a pooled wake resurrected torn-down sandboxes. A
+  guarded transition moves into the store that owns its table only in this
+  form:
+  - the statement verbatim, with its guard whole and bound to the values
+    the caller decided on, never values the verb reads for itself;
+  - a verb named for the transition (`release_claim`, not `update_row`);
+  - the outcome returned (`bool`, `Option`, the affected count, or the rows
+    its `RETURNING` lists): matching no row is a normal outcome, such as
+    another writer winning or nothing left to do, never an error;
+  - a store test that pins the losing case, where the guard matches no row
+    and nothing changes.
+
+  The caller keeps its transaction, its locks, and the decision of what to do
+  with each outcome. Two kinds stay with the paths that issue them: the
+  execution-ownership writes of `sandbox_k8s_executions`, as
+  `pplx-space-sandbox-store`'s `k8s_executions` docs say, and node drain's
+  phase compare-and-sets, as `pplx-space-node-registration-store`'s docs say.
+  Other store docs that say a guarded write stays at its call site do not
+  override this item; the change that moves the write updates them. The
+  `sandboxes` row's guarded transitions live in `pplx-space-sandbox-store`,
+  in modules named for the transition or for the path that issues them (as
+  `lost` and `delete` are), and its canonical hard delete is that crate's
   `delete::delete_with_dependents`. A write that is one step of such a
   transition stays in its module even when its own `WHERE` checks only the
   id, because the caller's locks and re-checks guard it (as with
   `delete::mark_deleting`). A step that writes a table another store owns can
   instead be a verb of that store, run in the caller's transaction with its
   guard whole, as `pplx-space-snapshot-store`'s
-  `lost::fail_quiet_full_uploads_from_node` is for the lost give-ups. Other
-  unguarded writes of the row, such as its desired-configuration columns,
-  belong in ordinary verbs like `update_desired_state`. The caller keeps its
-  locks and transaction (see the crate docs).
-- **`SELECT ... FOR UPDATE`**: a lock acquisition inside the caller's
-  transaction. Converting it to a store read silently drops the lock.
-- **Predicates evaluated against the database clock** (`NOW()`-relative
-  freshness checks). Moving the comparison client-side changes clock
-  authority.
+  `lost::fail_quiet_full_uploads_from_node` is for the lost give-ups. Such a
+  step, run in the transaction whose own guarded statement already decided
+  the transition, may return nothing, as that verb does. Other unguarded
+  writes of the row, such as its desired-configuration columns, belong in
+  ordinary verbs like `update_desired_state`. The caller keeps its locks and
+  transaction (see the crate docs).
+- **Locks the caller relies on after the statement.** A lock taken by a
+  standalone `SELECT ... FOR UPDATE` (or `FOR NO KEY UPDATE`, `FOR SHARE`,
+  `FOR KEY SHARE`), a `LOCK TABLE`, or a transaction-level advisory lock
+  (`pg_advisory_xact_lock` and its `try_` and `_shared` forms) lasts until
+  the caller's transaction ends, or until a rollback to a savepoint taken
+  before it. A store read that drops the clause takes no lock; on a pool the
+  lock ends with the statement, and `LOCK TABLE` fails. Such a statement may
+  still move as a store verb, under these conditions:
+  - the statement moves verbatim, lock clause included (`OF …`, `NOWAIT`,
+    `SKIP LOCKED`), along with any setting written in the same statement;
+  - the verb takes the caller's `&mut sqlx::Transaction<'_, Postgres>`, or
+    `&mut sqlx::PgConnection` when every caller passes its open transaction
+    (`&mut *tx`). It never takes `impl PgExecutor`, which also accepts a
+    pool;
+  - its name says it locks (`lock_…`, `share_lock_…`, `…_locked`), and its
+    doc says the lock lasts until the caller's transaction ends, as
+    `pplx-space-runtime-environment-policy-store`'s `lock_generation` and
+    `pplx-space-runtime-upgrade-campaign-store`'s `unfinished_from_locked`
+    do.
+
+  Settings that only serve the lock, such as
+  `set_config('lock_timeout', …, true)` or `SET LOCAL lock_timeout`, stay
+  with the caller that owns the transaction. A lock that serves only its own
+  statement, such as a `FOR UPDATE` CTE or subquery that feeds the same
+  statement's `UPDATE` or `DELETE`, needs no caller transaction, and its
+  verb may be executor-generic, as `pplx-space-sandbox-store`'s
+  `ingest::mark_published_failed` is. A session-level advisory lock
+  (`pg_advisory_lock`) outlives the transaction; leave it with the code that
+  unlocks it.
+- **Database-clock predicates.** A `NOW()`-relative freshness check decides
+  on the database clock, and computing it client-side changes clock
+  authority. The statement may still move, verbatim, with the comparison
+  left in its SQL, and each caller keeps the executor it used: `NOW()` and
+  `CURRENT_TIMESTAMP` are the transaction's start time, so the same
+  statement run on a pool or in a later transaction compares against a later
+  instant. The verb binds the same values the caller bound (an interval, a
+  grace period), never a client timestamp in place of `NOW()`.
 
 When a store change adds a workspace crate or dependency edge, run a lib-only
 `cargo check -p <crate>` — `--all-targets` pulls dev-dependencies into feature

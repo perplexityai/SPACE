@@ -51,6 +51,15 @@ fn sandbox_artifact_metadata_in(
     }
 }
 
+/// The guest memory a sandbox's activation recorded on the node, if its
+/// artifact metadata names one.
+pub(super) fn sandbox_guest_memory(sandbox_id: &str) -> Option<pplx_space_byte_size::MemorySize> {
+    sandbox_artifact_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
+        .ok()
+        .flatten()
+        .and_then(|metadata| metadata.guest_memory)
+}
+
 pub(super) fn sandbox_execution_metadata(
     sandbox_id: &str,
 ) -> Result<pplx_space_execution_spec::ExecutionMetadata, RuntimeArtifactReadError> {
@@ -128,14 +137,23 @@ pub(super) fn activation_metadata_json(
     cpu_budget: Option<pplx_space_execution_spec::VcpuCount>,
     guest_memory: Option<pplx_space_byte_size::MemorySize>,
 ) -> Result<String, Status> {
-    use pplx_space_artifact_model::SandboxArtifactMetadata;
-    let invalid = |error: String| Status::failed_precondition(error);
     let execution = match sandbox.execution_metadata.clone() {
         Some(execution) => execution,
-        None => {
-            initial_firecracker_execution_metadata().map_err(|error| invalid(error.to_string()))?
-        }
+        None => initial_firecracker_execution_metadata()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?,
     };
+    sandbox_artifact_metadata_json(sandbox, execution, cpu_budget, guest_memory)
+}
+
+/// The sandbox's `metadata.json`, recording `execution` as its disk's.
+pub(super) fn sandbox_artifact_metadata_json(
+    sandbox: &crate::db::SandboxRow,
+    execution: pplx_space_execution_spec::ExecutionMetadata,
+    cpu_budget: Option<pplx_space_execution_spec::VcpuCount>,
+    guest_memory: Option<pplx_space_byte_size::MemorySize>,
+) -> Result<String, Status> {
+    use pplx_space_artifact_model::SandboxArtifactMetadata;
+    let invalid = |error: String| Status::failed_precondition(error);
     let mut metadata = SandboxArtifactMetadata::new(
         sandbox
             .id
