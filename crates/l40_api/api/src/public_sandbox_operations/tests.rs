@@ -1258,21 +1258,13 @@ fn create_from_a_template_with_no_release_fails_with_its_own_reason() {
 }
 
 /// A node's memory refusal retries a create only while it has made fewer
-/// than its bound of attempts, two when pinned to a node pool and three
-/// otherwise, then fails it
-/// with the retryable `capacity_unavailable` and the `node_memory_capacity`
-/// reason, which a retry carries too.
-#[rstest::rstest]
-#[case::pinned(true, 2)]
-#[case::unpinned(false, 3)]
-fn node_memory_refusal_fails_the_create_after_its_attempt_bound(
-    #[case] pinned: bool,
-    #[case] max_attempts: i32,
-) {
+/// than three attempts, then fails it with the retryable
+/// `capacity_unavailable` and the `node_memory_capacity` reason, which a
+/// retry carries too.
+#[test]
+fn node_memory_refusal_fails_the_create_after_its_attempt_bound() {
+    let max_attempts = 3;
     let mut operation = claimed_create_operation();
-    if pinned {
-        operation.payload = serde_json::json!({ "node_pool": "isolated" });
-    }
     let refusal = "node memory admission refused: insufficient node memory";
     for attempts in 1..=max_attempts {
         operation.attempts = attempts;
@@ -1303,19 +1295,20 @@ fn node_memory_refusal_fails_the_create_after_its_attempt_bound(
     }
 }
 
-/// The bound counts every attempt, not only memory refusals: a pinned create
-/// whose first attempt hit another retryable error fails on its first memory
-/// refusal, at its second attempt.
+/// The bound counts every attempt, not only memory refusals: a create whose
+/// first two attempts hit another retryable error fails on its first memory
+/// refusal, at its third attempt.
 #[test]
 fn node_memory_refusal_bound_counts_earlier_attempts_of_any_kind() {
     let mut operation = claimed_create_operation();
-    operation.payload = serde_json::json!({ "node_pool": "isolated" });
-    operation.attempts = 1;
-    let unavailable = ControllerError::service_unavailable("no free network slot");
-    let result = CreateSandboxExecutionError::Controller(unavailable).into_result(&operation);
-    assert_eq!(result.state, OperationState::Queued);
+    for attempts in 1..=2 {
+        operation.attempts = attempts;
+        let unavailable = ControllerError::service_unavailable("no free network slot");
+        let result = CreateSandboxExecutionError::Controller(unavailable).into_result(&operation);
+        assert_eq!(result.state, OperationState::Queued);
+    }
 
-    operation.attempts = 2;
+    operation.attempts = 3;
     let refusal = ControllerError::from(
         crate::controllers::substrate::SubstrateError::NodeMemoryCapacity {
             message: "node memory admission refused: insufficient node memory".to_string(),

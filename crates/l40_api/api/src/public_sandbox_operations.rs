@@ -1484,15 +1484,10 @@ impl CreateSandboxExecutionError {
     }
 }
 
-/// Total create attempts, of any outcome, after which a create pinned to a
-/// node pool fails on a node's memory refusal instead of retrying. Nothing
-/// steers a retry away from the refusing node, so a retry waits for memory
-/// to free; a pinned create cannot leave its pool, so it gets one retry.
-const PINNED_NODE_MEMORY_ATTEMPTS: i32 = 2;
-
-/// Total create attempts, of any outcome, after which an unpinned create
-/// fails on a node's memory refusal. Its retries may land on the same node.
-const UNPINNED_NODE_MEMORY_ATTEMPTS: i32 = 3;
+/// Total create attempts, of any outcome, after which a create fails on a
+/// node's memory refusal instead of retrying. Nothing steers a retry away
+/// from the refusing node, so a retry may land on it again.
+const NODE_MEMORY_ATTEMPTS: i32 = 3;
 
 /// A create a node refused for lack of memory headroom: retry it after the
 /// jittered capacity hint while the operation has made fewer attempts than
@@ -1504,22 +1499,6 @@ fn node_memory_capacity_result(
     operation: &ClaimedPublicOperation,
     error: ControllerError,
 ) -> PublicOperationExecutionResult {
-    let pinned = operation
-        .payload
-        .get("node_pool")
-        .is_some_and(|node_pool| !node_pool.is_null());
-    let (max_attempts, progress) = if pinned {
-        (
-            PINNED_NODE_MEMORY_ATTEMPTS,
-            "a node in the requested node pool had no memory headroom for this sandbox; retry \
-             later or choose another node pool",
-        )
-    } else {
-        (
-            UNPINNED_NODE_MEMORY_ATTEMPTS,
-            "a node had no memory headroom for this sandbox; retry later or request less memory",
-        )
-    };
     let mut terminal_error = terminal_error_json(operation, error.to_string());
     if let Some(fields) = terminal_error.as_object_mut() {
         fields.insert(
@@ -1527,9 +1506,9 @@ fn node_memory_capacity_result(
             pplx_space_public_api::CAPACITY_REASON_NODE_MEMORY.into(),
         );
     }
-    if operation.attempts >= max_attempts {
+    if operation.attempts >= NODE_MEMORY_ATTEMPTS {
         return PublicOperationExecutionResult::failed(
-            progress,
+            "a node had no memory headroom for this sandbox; retry later or request less memory",
             PublicErrorCode::CapacityUnavailable,
             terminal_error,
         );
