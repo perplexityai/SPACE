@@ -17,6 +17,7 @@ pub const DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB: u64 = 8192;
 pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 = 128;
 pub const DEFAULT_MEMORY_MAX_MIB: u64 =
     DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB + DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
+pub const MIN_PARENT_MEMORY_RESERVE_MIB: u64 = 1024;
 pub const DEFAULT_PARENT_CPU_RESERVED_COUNT: u32 = 2;
 const MIB_BYTES: u64 = 1024 * 1024;
 const CGROUP_CPU_PERIOD_US: u64 = 100_000;
@@ -177,6 +178,7 @@ pub struct ParentCpuLimit {
 
 pub struct ParentMemoryLimit {
     pub host_memory_bytes: u64,
+    pub reserve_bytes: u64,
     pub memory_max: String,
     pub memory_swap_max: String,
 }
@@ -187,6 +189,15 @@ pub enum ParentMemoryLimitError {
     ReadMeminfo(#[source] std::io::Error),
     #[error("/proc/meminfo has a missing, invalid, or too small MemTotal in kB")]
     InvalidMemTotal,
+    #[error("parent memory reserve {reserve_mib} MiB must be at least {min_mib} MiB")]
+    ReserveBelowMinimum { reserve_mib: u64, min_mib: u64 },
+    #[error(
+        "parent memory reserve {reserve_mib} MiB leaves less than 1 MiB of {host_memory_bytes} bytes host memory"
+    )]
+    ReserveExceedsHostMemory {
+        reserve_mib: u64,
+        host_memory_bytes: u64,
+    },
     #[error("failed to write {path}: {source}")]
     Write {
         path: PathBuf,
@@ -323,18 +334,33 @@ pub fn sandbox_cgroup_total_memory_mib(
     sandbox_cgroup_memory_mib.checked_mul(u64::from(max_slots))
 }
 
-/// Cap aggregate sandbox memory at 90% of host RAM, rounded down to MiB,
+/// Cap aggregate sandbox memory below host RAM, rounded down to MiB,
 /// independently of slot count and individual limits so overcommit remains possible.
-pub fn apply_parent_memory_limit() -> Result<ParentMemoryLimit, ParentMemoryLimitError> {
+///
+/// When `reserve_mib` is `None`, reserves 10% of host RAM (rounded up).
+/// When `Some`, reserves that exact amount in MiB after enforcing
+/// [`MIN_PARENT_MEMORY_RESERVE_MIB`].
+pub fn apply_parent_memory_limit(
+    reserve_mib: Option<u64>,
+) -> Result<ParentMemoryLimit, ParentMemoryLimitError> {
     let meminfo =
         fs::read_to_string("/proc/meminfo").map_err(ParentMemoryLimitError::ReadMeminfo)?;
-    apply_parent_memory_limit_at(Path::new(CGROUP_BASE), &meminfo)
+    apply_parent_memory_limit_at(Path::new(CGROUP_BASE), &meminfo, reserve_mib)
 }
 
 fn apply_parent_memory_limit_at(
     cgroup_path: &Path,
     meminfo: &str,
+    reserve_mib: Option<u64>,
 ) -> Result<ParentMemoryLimit, ParentMemoryLimitError> {
+    if let Some(reserve_mib) = reserve_mib
+        && reserve_mib < MIN_PARENT_MEMORY_RESERVE_MIB
+    {
+        return Err(ParentMemoryLimitError::ReserveBelowMinimum {
+            reserve_mib,
+            min_mib: MIN_PARENT_MEMORY_RESERVE_MIB,
+        });
+    }
     let host_memory_bytes = meminfo
         .lines()
         .find_map(|line| line.strip_prefix("MemTotal:"))
@@ -347,13 +373,36 @@ fn apply_parent_memory_limit_at(
             kib.checked_mul(1024).filter(|bytes| *bytes > 0)
         })
         .ok_or(ParentMemoryLimitError::InvalidMemTotal)?;
-    // Reserve a rounded-up tenth to floor the 90% cap without overflowing.
-    let memory_max_bytes =
-        (host_memory_bytes - host_memory_bytes.div_ceil(10)) / MIB_BYTES * MIB_BYTES;
-    // MiB alignment avoids the kernel rounding an unaligned limit upward.
-    if memory_max_bytes == 0 {
-        return Err(ParentMemoryLimitError::InvalidMemTotal);
-    }
+    let (reserve_bytes, memory_max_bytes) = match reserve_mib {
+        None => {
+            // Reserve a rounded-up tenth to floor the 90% cap without overflowing.
+            let reserve_bytes = host_memory_bytes.div_ceil(10);
+            let memory_max_bytes = (host_memory_bytes - reserve_bytes) / MIB_BYTES * MIB_BYTES;
+            // MiB alignment avoids the kernel rounding an unaligned limit upward.
+            if memory_max_bytes == 0 {
+                return Err(ParentMemoryLimitError::InvalidMemTotal);
+            }
+            (reserve_bytes, memory_max_bytes)
+        }
+        Some(reserve_mib) => {
+            let reserve_bytes = reserve_mib.checked_mul(MIB_BYTES).ok_or(
+                ParentMemoryLimitError::ReserveExceedsHostMemory {
+                    reserve_mib,
+                    host_memory_bytes,
+                },
+            )?;
+            // MiB alignment avoids the kernel rounding an unaligned limit upward.
+            let memory_max_bytes = host_memory_bytes
+                .checked_sub(reserve_bytes)
+                .map(|remaining| remaining / MIB_BYTES * MIB_BYTES)
+                .filter(|bytes| *bytes > 0)
+                .ok_or(ParentMemoryLimitError::ReserveExceedsHostMemory {
+                    reserve_mib,
+                    host_memory_bytes,
+                })?;
+            (reserve_bytes, memory_max_bytes)
+        }
+    };
     let memory_max = memory_max_bytes.to_string();
     let memory_swap_max = "0".to_string();
 
@@ -367,6 +416,7 @@ fn apply_parent_memory_limit_at(
 
     Ok(ParentMemoryLimit {
         host_memory_bytes,
+        reserve_bytes,
         memory_max,
         memory_swap_max,
     })

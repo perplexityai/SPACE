@@ -7,10 +7,12 @@ fn parent_memory_cap_leaves_ten_percent_of_host_ram() {
     let limit = apply_parent_memory_limit_at(
         root.path(),
         "MemTotal:       268435456 kB\nMemAvailable:   1024 kB\n",
+        None,
     )
     .unwrap();
 
     assert_eq!(limit.host_memory_bytes, 274_877_906_944);
+    assert_eq!(limit.reserve_bytes, 27_487_790_695);
     assert_eq!(limit.memory_max, "247389487104");
     assert_eq!(
         fs::read_to_string(root.path().join("memory.max")).unwrap(),
@@ -22,8 +24,82 @@ fn parent_memory_cap_leaves_ten_percent_of_host_ram() {
     );
 
     // A non-divisible total must round down, never above 90%.
-    let limit = apply_parent_memory_limit_at(root.path(), "MemTotal: 2048 kB\n").unwrap();
+    let limit = apply_parent_memory_limit_at(root.path(), "MemTotal: 2048 kB\n", None).unwrap();
     assert_eq!(limit.memory_max, "1048576");
+}
+
+#[test]
+fn parent_memory_cap_applies_explicit_reserve_and_rounds_down_to_mib() {
+    let root = tempfile::tempdir().unwrap();
+    // 256 GiB host with 16 GiB explicit reserve leaves 240 GiB.
+    let limit =
+        apply_parent_memory_limit_at(root.path(), "MemTotal: 268435456 kB\n", Some(16 * 1024))
+            .unwrap();
+
+    assert_eq!(limit.host_memory_bytes, 256 * 1024 * MIB_BYTES);
+    assert_eq!(limit.reserve_bytes, 16 * 1024 * MIB_BYTES);
+    assert_eq!(limit.memory_max, (240 * 1024 * MIB_BYTES).to_string());
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.max")).unwrap(),
+        limit.memory_max
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.swap.max")).unwrap(),
+        "0"
+    );
+
+    // Non-MiB-aligned MemTotal rounds down so the reserve is never undercut.
+    let limit = apply_parent_memory_limit_at(
+        root.path(),
+        "MemTotal: 2098688 kB\n", // 2049.5 MiB
+        Some(MIN_PARENT_MEMORY_RESERVE_MIB),
+    )
+    .unwrap();
+    assert_eq!(limit.memory_max, (1025 * MIB_BYTES).to_string());
+}
+
+#[test]
+fn parent_memory_reserve_guard_rejects_too_small_or_excessive_values() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("memory.max"), "original").unwrap();
+    fs::write(root.path().join("memory.swap.max"), "0").unwrap();
+
+    for reserve_mib in [0, 1, MIN_PARENT_MEMORY_RESERVE_MIB - 1] {
+        assert!(matches!(
+            apply_parent_memory_limit_at(
+                root.path(),
+                "MemTotal: 268435456 kB\n",
+                Some(reserve_mib),
+            ),
+            Err(ParentMemoryLimitError::ReserveBelowMinimum {
+                reserve_mib: actual,
+                min_mib: MIN_PARENT_MEMORY_RESERVE_MIB,
+            }) if actual == reserve_mib
+        ));
+    }
+
+    // 2 GiB host: reserving 2048 MiB leaves 0, reserving 2047.5 MiB leaves < 1 MiB,
+    // and u64::MAX overflows byte conversion.
+    for (meminfo, reserve_mib) in [
+        ("MemTotal: 2097152 kB\n", 2048),
+        ("MemTotal: 2097152 kB\n", 4096),
+        ("MemTotal: 1049088 kB\n", 1024), // 1024.5 MiB - 1024 MiB = 0.5 MiB -> rounds to 0
+        ("MemTotal: 2097152 kB\n", u64::MAX),
+    ] {
+        assert!(matches!(
+            apply_parent_memory_limit_at(root.path(), meminfo, Some(reserve_mib)),
+            Err(ParentMemoryLimitError::ReserveExceedsHostMemory { .. })
+        ));
+    }
+
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.max")).unwrap(),
+        "original"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("memory.swap.max")).unwrap(),
+        "0"
+    );
 }
 
 #[test]
@@ -42,7 +118,7 @@ fn invalid_host_memory_does_not_change_parent_limits() {
         "MemTotal: 18446744073709551615 kB\n",
     ] {
         assert!(matches!(
-            apply_parent_memory_limit_at(root.path(), meminfo),
+            apply_parent_memory_limit_at(root.path(), meminfo, None),
             Err(ParentMemoryLimitError::InvalidMemTotal)
         ));
         assert_eq!(
@@ -61,7 +137,7 @@ fn parent_memory_write_failure_is_not_ignored() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("memory.max")).unwrap();
     assert!(matches!(
-        apply_parent_memory_limit_at(root.path(), "MemTotal: 2048 kB\n"),
+        apply_parent_memory_limit_at(root.path(), "MemTotal: 2048 kB\n", None),
         Err(ParentMemoryLimitError::Write { .. })
     ));
     assert!(!root.path().join("memory.swap.max").exists());
