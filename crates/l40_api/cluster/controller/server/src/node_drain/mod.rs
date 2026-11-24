@@ -1466,7 +1466,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     ///
     /// The list is **ordered by ascending failed-attempt count, then
     /// most-recently-active first** (see
-    /// [`store::restore_pending_evacuations_query`] for why attempt count
+    /// `SubstrateSink::list_restore_pending_evacuations` for why attempt count
     /// must outrank recency). [`Reconciler::spawn_restores`] fills the
     /// bounded cluster restore budget in list order, so under slot pressure
     /// never-failed sandboxes win the slots, hottest first within a tier.
@@ -1502,7 +1502,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// the half that one cannot see: a stall *before* the teardown still has
     /// its node, so it never enters the unplaced population. Both are needed
     /// for "a stopped evacuation is wedged" to be alertable at all — see
-    /// [`store::stopped_evacuation_stall_secs_query`].
+    /// `SubstrateSink::stopped_evacuation_stall`.
     /// `None` when nothing is waiting, which the caller publishes as `0` — the
     /// gauge has to be emitted every sweep, including zero, or an alert on it
     /// goes stale rather than quiet.
@@ -1666,8 +1666,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// reaper is disabled). Same flip the reaper applies, triggered by the
     /// EC2-terminated verdict instead of age, under the same identity
     /// guards as the other gone-node writes (see
-    /// `fail_inflight_snapshots_on_gone_node_query` in `store`). Returns
-    /// the number of snapshot rows flipped.
+    /// `pplx_space_snapshot_store::lost::fail_inflight_uploads_from_gone_node`).
+    /// Returns the number of snapshot rows flipped.
     fn fail_inflight_snapshots_on_gone_node(
         &self,
         node_id: NodeId,
@@ -3495,7 +3495,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             //
             // Reachable with the feature *off*, deliberately: the listing keeps
             // offering a row that already carries the marker (see
-            // `evacuatable_sandbox_rows_query`'s third disjunct), so an
+            // `evacuation_candidates::list_on_node`'s third disjunct), so an
             // evacuation opened before the flag was turned off can still be
             // finished. The flag bites on the claim, not here.
             if pre_lifecycle == SandboxLifecycle::Stopped {

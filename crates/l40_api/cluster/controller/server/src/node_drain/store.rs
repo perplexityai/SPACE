@@ -1,4 +1,3 @@
-use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_sql_locator::sql;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -30,6 +29,7 @@ use pplx_space_node_registration_store::lookup::{
     self as node_lookup, K8sNodeIdentity, NodeApiTargetRow,
 };
 use pplx_space_node_registration_store::tombstone;
+use pplx_space_node_status_store::backup_inventory;
 use pplx_space_rpc_contracts::node_drain_signals::{
     EVACUATION_RESTORE_READY_CHANNEL, REUPLOAD_ARTIFACT_MISSING_MARKER,
     REUPLOAD_SANDBOX_RESTORING_MARKER, REUPLOAD_SANDBOX_UNKNOWN_MARKER,
@@ -37,25 +37,24 @@ use pplx_space_rpc_contracts::node_drain_signals::{
 };
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_pod::EvacuationPlacement;
-use pplx_space_sandbox_portability::{
-    current_disk_artifact_backup_ready, drain_gate_blockers_for_node,
-    inflight_suspend_upload_exists, latest_full_snapshot_ready,
-    snapshot_durable_for_source_release, snapshot_is_current_local_artifact,
-};
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sandbox_store::drain::{
     self, StoppedEvacuationClaim, claim_evacuation_suspend, claim_stopped_evacuation,
-    gone_node_identity_guards, record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
+    record_stopped_evacuation_artifact, revert_evacuation_suspend_claim,
 };
+use pplx_space_sandbox_store::evacuation_candidates::EvacuationCandidate;
+use pplx_space_sandbox_store::evacuation_restores::RestorePendingEvacuation;
+use pplx_space_sandbox_store::node_local_backup_pending::QueuedBackupCandidate;
+use pplx_space_sandbox_store::stopped_evacuations::{LongestStall, StoppedEvacuationRow};
 use pplx_space_snapshot_model::{ArtifactKind, BackupSource, LocalArtifactId};
+use pplx_space_snapshot_store::lost::{self as snapshot_lost, FailedUpload};
 
 use pplx_space_api::metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::NodeApiClient;
 use sqlx::PgPool;
 
 use pplx_space_sandbox_residency::{
-    active_resident_predicate, node_backup_inventory_fresh, occupies_node_predicate,
-    resident_lifecycle, resident_lifecycle_strs,
+    active_resident_predicate, occupies_node_predicate, resident_lifecycle, resident_lifecycle_strs,
 };
 
 use super::{
@@ -195,150 +194,6 @@ async fn node_api_row(
     ))
 }
 
-/// `$1` = node id, `$2` = evacuable lifecycles as `text[]`. The suspend →
-/// restore work queue for one draining node.
-///
-/// Census-absent rows are excluded here rather than filtered in Rust: the whole
-/// point is to keep them out of the per-node parallelism budget. A large
-/// historical set could otherwise consume every slot with nonexistent sandboxes.
-///
-/// The third disjunct is the **in-flight** clause, and it deliberately does not
-/// consult `$2`. `$2` carries the lifecycles this environment has *enabled*, so
-/// a stopped evacuation opened while the feature was on would vanish from this
-/// list the moment an operator turned it off — with its disk artifact published
-/// and its local copy still on the node, holding the drain and refusing its
-/// owner's `start` forever. A row already carrying the marker is work in
-/// progress, and this queue has to keep offering it until it finishes.
-/// [`claim_stopped_evacuation`] is where the flag actually bites: it refuses to
-/// open a new evacuation while resuming an existing one.
-///
-/// **The `ORDER BY` is load-bearing, not tidiness.** `spawn_bounded` walks this
-/// list in order and stops at the per-node slot budget (16), so list position
-/// decides who is dispatched at all. Every other population in this list
-/// eventually leaves it — a suspend commits and the lifecycle moves, or the
-/// stale-abandon sweep flips a wedged transient to `failed`. A `stopped` row
-/// that refuses on provenance writes **nothing**: it returns before the claim,
-/// so its lifecycle, marker and placement are untouched and it matches the
-/// first disjunct again on the next tick, unchanged. With no ordering, Postgres
-/// returns an unmodified heap in a stable order, so the same rows win every
-/// tick — and if 16 or more of them are `stopped` refusals sitting ahead of the
-/// `started` residents, those residents are never dispatched and the drain
-/// never converges. That is the inverse of this feature's purpose: it would
-/// hold live sandboxes on a node in order to keep retrying rows that cannot
-/// move.
-///
-/// So the suspend population is dispatched first. It is finite and it drains —
-/// a draining node is cordoned, so no new residents arrive — after which the
-/// stopped rows get the whole budget. Ordering the other way, or not at all, is
-/// the only version that can starve.
-///
-/// Oldest-first within each population, because under budget pressure list
-/// position is the only fairness knob there is.
-///
-/// One residual: a `stopped` row that can *never* be attributed still
-/// re-competes for a slot every tick, so a large enough set of them can crowd
-/// out the *evacuable* stopped rows behind them. That is bounded by the
-/// `unattributable_artifact` counter being visible, and it stops mattering when
-/// the refusal stops being the common case — see [`claim_stopped_evacuation`]
-/// for the node-side fact that makes it rare.
-///
-/// **An encrypted `stopped` sandbox is never listed**, on either the fresh or
-/// the in-flight disjunct. Its disk artifact can't be re-placed:
-/// sandbox-manager refuses to materialize an encrypted capture as a stopped
-/// sandbox, since it stages no plaintext rootfs. Evacuating one would publish
-/// it, release the node holding the only usable copy, and leave the sandbox on
-/// no node with nothing able to place it. Left unlisted, it keeps its node and
-/// its local copy like any other unevacuated `stopped` resident, and the
-/// termination-blocking gate holds that node in `draining` rather than letting
-/// it terminate. The exits are the ones such a park already has: the owner
-/// deleting the sandbox, or an operator undraining the node. The in-flight
-/// disjunct is covered too because a marker written before this exclusion
-/// existed would otherwise carry such a row to the teardown.
-/// `volume_encryption` is decided once, at create (`create_with_sandbox_id_inner`
-/// in `pplx-space-api`), so the listing can't race a change to it. NULL reads
-/// as plaintext, the way the API's sandbox projection reads it.
-fn evacuatable_sandbox_rows_query(residency: ResidencyEvidence) -> String {
-    let occupies = occupies_node_predicate("s", "$1", residency);
-    format!(
-        "SELECT s.id,
-                CASE
-                    WHEN s.lifecycle = 'suspending' THEN s.evacuation_restore_target
-                    ELSE s.lifecycle
-                END AS lifecycle
-           FROM sandboxes s
-          WHERE s.active_node_id = $1
-            AND (
-                s.lifecycle = ANY($2)
-                OR (
-                    s.lifecycle = 'suspending'
-                    AND s.evacuation_restore_target = ANY($2)
-                )
-                OR (
-                    s.lifecycle = 'stopped'
-                    AND s.evacuation_restore_target = 'stopped'
-                )
-            )
-            AND NOT (
-                s.lifecycle = 'stopped'
-                AND COALESCE(s.volume_encryption, FALSE)
-            )
-            AND {occupies}
-          ORDER BY CASE WHEN s.lifecycle = 'stopped' THEN 1 ELSE 0 END,
-                   s.lifecycle_changed_at,
-                   s.id"
-    )
-}
-
-/// `$1` = node id, `$2` = `RESIDENT_LIFECYCLES` as `text[]`.
-/// `(occupying, total)` for one draining node: rows that still block
-/// `draining → drained`, and every row in a resident lifecycle pinned to it.
-/// The caller derives the discounted count by subtraction.
-///
-/// Counts, not ids — the reconciler only asks "how many" and "any left?", and
-/// returning ids would ship discarded historical rows over the wire every tick.
-///
-/// Flat, with the expensive absence proof appearing exactly once inside the
-/// `FILTER`: the bare `COUNT(*)` does not reference it, so there is nothing for
-/// the planner to duplicate. Returning `total` rather than a second
-/// `COUNT(*) FILTER (WHERE NOT …)` is what keeps that true.
-fn resident_sandbox_counts_query(residency: ResidencyEvidence) -> String {
-    let occupies = occupies_node_predicate("s", "$1", residency);
-    format!(
-        "SELECT COUNT(*) FILTER (WHERE {occupies})::BIGINT AS occupying,
-                COUNT(*)::BIGINT AS total
-           FROM sandboxes s
-          WHERE s.active_node_id = $1
-            AND s.lifecycle = ANY($2)"
-    )
-}
-
-/// `$1` = node id. Per-lifecycle count of the sandboxes that would make the
-/// drained-node terminator's resident guard refuse this node.
-///
-/// The predicate is `sandbox_residency::active_resident_predicate` itself — the
-/// same string `mark_terminating_query` and the KubeNodeGone reap re-check
-/// atomically — not a restatement of it. Its docs carry which lifecycles that
-/// is and why it differs from [`resident_sandbox_counts_query`]'s include-list.
-///
-/// Unordered on purpose: `GROUP BY` alone lets the planner hash-aggregate, while
-/// `ORDER BY lifecycle` can tip it into sorting every input row (thousands, on
-/// the nodes where this matters) to order a handful of groups. The column is
-/// plain `TEXT` with no CHECK, and the predicate is an exclusion list, so an
-/// unmodelled string counts too and the group count has no hard bound. In
-/// practice: 14 of the 16 `SandboxLifecycle` variants qualify, and at the only
-/// call site the resident scan has already reported zero, so the ten
-/// include-list lifecycles are absent and four modelled groups remain. The
-/// caller sorts them.
-fn termination_blocking_residents_query(residency: ResidencyEvidence) -> String {
-    let resident = active_resident_predicate("sandboxes", "$1", residency);
-    format!(
-        "SELECT lifecycle, COUNT(*)::BIGINT AS blocking
-           FROM sandboxes
-          WHERE {resident}
-          GROUP BY lifecycle"
-    )
-}
-
 /// How long the drain-completion write waits for the `nodes` row lock before
 /// giving up and deferring to the next tick.
 ///
@@ -410,7 +265,7 @@ enum GuardScope {
     /// writes). No residency guard at all.
     None,
     /// Gate off: the resident include-list only — the same population
-    /// `resident_sandbox_counts_query` counts, so this refuses exactly what the
+    /// the resident scan's `occupying` counts, so this refuses exactly what the
     /// pre-check already refused and adds only atomicity.
     Resident,
     /// Gate on: the drained-node terminator's exclusion list, which is a
@@ -423,7 +278,7 @@ fn set_drain_phase_query(residency: ResidencyEvidence, scope: GuardScope) -> Str
     let resident_guard = match scope {
         GuardScope::None => String::new(),
         GuardScope::Resident => {
-            // Mirrors `resident_sandbox_counts_query`'s `occupying` count: the
+            // Mirrors the resident scan's `occupying` count: the
             // include-list plus the census term, over `active_node_id`.
             let occupies = occupies_node_predicate("sandboxes", "$1", residency);
             let resident = resident_lifecycle("sandboxes");
@@ -454,6 +309,69 @@ fn set_drain_phase_query(residency: ResidencyEvidence, scope: GuardScope) -> Str
     )
 }
 
+/// The suspend → restore work queue for one draining node
+/// (`pplx_space_sandbox_store::evacuation_candidates::list_on_node`), with the
+/// evacuable lifecycles this environment has enabled.
+///
+/// Census-absent rows are excluded in the statement rather than filtered in Rust: the whole
+/// point is to keep them out of the per-node parallelism budget. A large
+/// historical set could otherwise consume every slot with nonexistent sandboxes.
+///
+/// The third disjunct is the **in-flight** clause, and it deliberately does not
+/// consult `$2`. `$2` carries the lifecycles this environment has *enabled*, so
+/// a stopped evacuation opened while the feature was on would vanish from this
+/// list the moment an operator turned it off — with its disk artifact published
+/// and its local copy still on the node, holding the drain and refusing its
+/// owner's `start` forever. A row already carrying the marker is work in
+/// progress, and this queue has to keep offering it until it finishes.
+/// [`claim_stopped_evacuation`] is where the flag actually bites: it refuses to
+/// open a new evacuation while resuming an existing one.
+///
+/// **The `ORDER BY` is load-bearing, not tidiness.** `spawn_bounded` walks this
+/// list in order and stops at the per-node slot budget (16), so list position
+/// decides who is dispatched at all. Every other population in this list
+/// eventually leaves it — a suspend commits and the lifecycle moves, or the
+/// stale-abandon sweep flips a wedged transient to `failed`. A `stopped` row
+/// that refuses on provenance writes **nothing**: it returns before the claim,
+/// so its lifecycle, marker and placement are untouched and it matches the
+/// first disjunct again on the next tick, unchanged. With no ordering, Postgres
+/// returns an unmodified heap in a stable order, so the same rows win every
+/// tick — and if 16 or more of them are `stopped` refusals sitting ahead of the
+/// `started` residents, those residents are never dispatched and the drain
+/// never converges. That is the inverse of this feature's purpose: it would
+/// hold live sandboxes on a node in order to keep retrying rows that cannot
+/// move.
+///
+/// So the suspend population is dispatched first. It is finite and it drains —
+/// a draining node is cordoned, so no new residents arrive — after which the
+/// stopped rows get the whole budget. Ordering the other way, or not at all, is
+/// the only version that can starve.
+///
+/// Oldest-first within each population, because under budget pressure list
+/// position is the only fairness knob there is.
+///
+/// One residual: a `stopped` row that can *never* be attributed still
+/// re-competes for a slot every tick, so a large enough set of them can crowd
+/// out the *evacuable* stopped rows behind them. That is bounded by the
+/// `unattributable_artifact` counter being visible, and it stops mattering when
+/// the refusal stops being the common case — see [`claim_stopped_evacuation`]
+/// for the node-side fact that makes it rare.
+///
+/// **An encrypted `stopped` sandbox is never listed**, on either the fresh or
+/// the in-flight disjunct. Its disk artifact can't be re-placed:
+/// sandbox-manager refuses to materialize an encrypted capture as a stopped
+/// sandbox, since it stages no plaintext rootfs. Evacuating one would publish
+/// it, release the node holding the only usable copy, and leave the sandbox on
+/// no node with nothing able to place it. Left unlisted, it keeps its node and
+/// its local copy like any other unevacuated `stopped` resident, and the
+/// termination-blocking gate holds that node in `draining` rather than letting
+/// it terminate. The exits are the ones such a park already has: the owner
+/// deleting the sandbox, or an operator undraining the node. The in-flight
+/// disjunct is covered too because a marker written before this exclusion
+/// existed would otherwise carry such a row to the teardown.
+/// `volume_encryption` is decided once, at create (`create_with_sandbox_id_inner`
+/// in `pplx-space-api`), so the listing can't race a change to it. NULL reads
+/// as plaintext, the way the API's sandbox projection reads it.
 async fn list_evacuatable_sandbox_rows(
     pool: &PgPool,
     node_id: NodeId,
@@ -468,316 +386,17 @@ async fn list_evacuatable_sandbox_rows(
         .iter()
         .map(|lifecycle| lifecycle.as_str())
         .collect();
-    let query = evacuatable_sandbox_rows_query(residency);
-    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(&evacuable_strs)
-        .fetch_all(pool)
-        .await
-}
-
-// ---------------------------------------------------------------------------
-// SQL builders (extracted so the backup/portability gate is unit-testable against
-// a live Postgres without constructing a full `KubernetesSubstrate`).
-// ---------------------------------------------------------------------------
-
-/// `$1` = node id. Counts sandboxes that **block** `draining → drained` for
-/// the node: the mid-flight / not-yet-portable suspended set pinned to the
-/// node, **plus** any sandbox whose artifact backup is still in flight *from*
-/// this node (`state='creating'`, `source_node_id = $1`).
-/// The in-flight-upload term is load-bearing: a backup-in-flight sandbox must
-/// hold the node until the volume manager finalizes the attempt `ready`,
-/// otherwise terminating the node kills the in-flight upload worker and
-/// strands the only durable copy.
-///
-/// ## Why this counts the batched pair form rather than scanning `sandboxes`
-///
-/// `drain_gate_blocks_source_release` cannot drive a scan of `sandboxes`. Its
-/// two disjuncts attribute to different columns — one to the sandbox's
-/// `target_node_id`, one to a snapshot's `source_node_id` — so an `OR` over
-/// both leaves the planner no indexable driver and it seq-scans the table.
-/// That is documented on [`drain_gate_blocker_pairs`](pplx_space_sandbox_portability::drain_gate_blocker_pairs), which exists because of
-/// it, giving each attribution its own indexable driver and an
-/// already-differential-tested equivalence with the single-node form. Even
-/// a single-node request must avoid scanning the whole cluster.
-///
-/// **Deliberately uncapped, unlike [`pinned_local_only_sandboxes_query`].** An
-/// outer `LIMIT` is the lever there and is not one here, because
-/// [`drain_gate_blocker_pairs`](pplx_space_sandbox_portability::drain_gate_blocker_pairs) is a `UNION`: Postgres has to consume and
-/// deduplicate both branches before an outer limit can return anything, so the
-/// limit truncates the result without bounding the scan. The indexable driver
-/// and reshaped in-flight predicate bound the work; the uncapped result keeps
-/// `node_drain.drain_blockers` exact.
-///
-/// Cost tracks the node's accumulated `target_node_id` history, with lifecycle
-/// filtering and per-row durability probes. Naming `ARRAY[$1]` inline and
-/// filtering `node_id = $1` outside keeps the node filter visible to the planner
-/// instead of encouraging a cluster-wide lifecycle bitmap.
-pub(crate) fn drain_blocking_sandboxes_query() -> String {
-    // The predicate itself lives in `pplx-space-sandbox-portability` so
-    // anything that predicts this gate counts the same rows it counts. Its docs
-    // carry the per-state rationale, including why an evacuation `restoring` is
-    // excluded and why two of the blocking states pin through `target_node_id`
-    // with `active_node_id` NULL.
-    //
-    // `drain_gate_blockers_for_node` rather than a wrapper written here: the
-    // drained-node terminator needs the same rows for the same node, and one
-    // builder is what keeps the two gates counting the same set. Its docs carry
-    // why the single-node predicate cannot drive a `sandboxes` scan.
-    let blockers = drain_gate_blockers_for_node("$1");
-    format!(
-        "SELECT COUNT(*)::BIGINT
-           FROM (
-{blockers}
-               ) node_blockers"
+    let rows = sandbox_store::evacuation_candidates::list_on_node(
+        pool,
+        node_id,
+        &evacuable_strs,
+        residency,
     )
-}
-
-/// Sandboxes anywhere in the cluster that were evacuated off a draining node
-/// and are now ready to be placed onto a target-cohort node: a non-NULL
-/// `evacuation_restore_target` marker, a lifecycle this evacuation can rest or
-/// re-drive in, **and** a ready remote backup of the bytes its restore will
-/// read.
-///
-/// Which backup that is depends on the marker. A `started`/`paused` evacuation
-/// suspended the VM, so it waits on the newest full snapshot; a `stopped`
-/// evacuation published a disk artifact instead, so it waits on that pinned
-/// artifact. See the comment on the two arms below.
-///
-/// For identity-backed rows, `latest_full_snapshot_ready` requires the ready
-/// backup to match `current_local_artifact_id`. Nullable rollout-skew rows
-/// retain the newest-full legacy test so a prior-cycle snapshot cannot satisfy
-/// a later suspend. This predicate matches restore storage-URI selection.
-///
-/// `restoring` is included for **crash recovery**: if the controller dies
-/// after `begin_evacuation_restore_lifecycle` claimed `suspended → restoring` but before
-/// the finalize cleared the marker, the row is left `restoring` with the
-/// marker still set. A live controller's in-memory `restore_in_flight` dedups
-/// the active task so this only re-drives after a restart (when that set is
-/// empty); `begin_evacuation_restore_lifecycle` accepts an already-
-/// `restoring` row, so the re-drive resumes the wake + finalize idempotently.
-///
-/// Intentionally **not** scoped to any node: the cohort restore is decoupled
-/// from the source node's drain (the source may already have drained and
-/// terminated once the artifact was backed up — the restore reads from S3).
-/// Keying on the mutable `target_node_id` would lose the sandbox the moment
-/// the restore's pod placement moves it to the cohort node, so the scan keys
-/// only on the immutable marker + portability. The marker is set in
-/// [`SubstrateSink::evacuate_sandbox`]'s suspend claim and cleared when the
-/// restore finalizes (or by a user restore/Start that takes the sandbox over,
-/// via the marker-clearing trigger), so a plain user-suspended sandbox (NULL
-/// marker) is never selected.
-///
-/// **Retry backoff + composed ordering (attempt tiers, then recency).** A
-/// row whose previous cohort restore failed carries
-/// `next_restore_attempt_at` ([`drain::schedule_restore_retry_query`]); when
-/// `honor_backoff_windows` is true the gate here keeps it out of the sweep
-/// until that instant passes, so a deterministic failer is retried on an
-/// exponential schedule instead of on every reconciler tick (and every
-/// backup-ready NOTIFY). When the operator disables the backoff
-/// (`honor_backoff_windows = false`) the scan ignores the backoff state
-/// entirely — the window gate is omitted, **and** the attempt-tier ordering
-/// key is dropped in favor of the pure recency ordering. Both halves matter
-/// for the escape hatch: stale windows written before the disable must not
-/// keep suppressing rows, and frozen pre-disable attempt counts must not
-/// keep sorting a row behind every fresh evacuation (under slot pressure
-/// that starves it just as effectively as the gate). Disabled mode is
-/// therefore exactly the pre-backoff recency behavior, immediately.
-///
-/// The ordering composes the backoff tiers with the recency ordering:
-/// `restore_attempt_count ASC` first, then `lifecycle_changed_at DESC, id
-/// DESC` within a tier. Attempt count must be the **primary** key: every
-/// failed restore cycle bumps `lifecycle_changed_at` (the `suspended →
-/// restoring` claim and the post-failure revert both fire the
-/// lifecycle-changed trigger), so recency alone would perpetually classify a
-/// serial failer as the hottest row and hand it the scarce slots ahead of
-/// never-failed evacuations. Within a tier, most-recently-active first:
-/// [`super::Reconciler::spawn_restores`] fills the bounded cluster budget in
-/// list order, and for a *suspend* evacuation `lifecycle_changed_at` is the
-/// evacuation-suspend (or crash-left `restoring`) transition time — the
-/// closest activity-recency proxy while nothing populates
-/// `sandboxes.last_used_at`. **That reading does not carry to the stopped
-/// arm**, whose claim and teardown both leave the lifecycle alone, so there the
-/// column holds the user's original stop and says nothing about the evacuation;
-/// the per-arm key below is what makes the ordering mean one thing. The `id DESC` tiebreaker (UUIDv7, so
-/// time-ordered) keeps the order deterministic for rows suspended in the
-/// same instant. The backoff state
-/// is reset by the `sandboxes_clear_evacuation_restore_target` trigger the
-/// moment the marker clears (restore success or user takeover).
-pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> String {
-    let snapshot_exists = latest_full_snapshot_ready("s");
-    let disk_backup_ready = current_disk_artifact_backup_ready("s");
-    let (backoff_gate, attempt_tier_key) = if honor_backoff_windows {
-        (
-            "AND (s.next_restore_attempt_at IS NULL OR s.next_restore_attempt_at <= NOW())",
-            "s.restore_attempt_count ASC,",
-        )
-    } else {
-        ("", "")
-    };
-    // Two populations, discriminated by the marker rather than by the
-    // lifecycle, because `restoring` is reachable from both and says nothing
-    // about which kind of evacuation is mid-flight.
-    //
-    // The **stopped** arm differs from the suspend arm in three ways, each
-    // load-bearing:
-    //
-    // * Its resting lifecycle is `stopped`, not `suspended` — a stopped
-    //   evacuation never enters the suspend pipeline, so there is no
-    //   `suspended` state to rest in.
-    // * Its durability proof is the pinned *disk* artifact, not the newest
-    //   full snapshot. A stopped sandbox has no memory image, so
-    //   `latest_full_snapshot_ready` is unsatisfiable for it and would hide
-    //   the row from the sweep forever.
-    // * `active_node_id IS NULL` gates the resting case. That is the teardown
-    //   having completed, and it is what keeps the sweep off a row whose bytes
-    //   are already durable but whose node the drain has not released
-    //   yet — re-placing that sandbox while it is still resident would give it
-    //   two homes. The `restoring` case is deliberately outside the term: the
-    //   restore's own pod placement re-populates the column, so applying it
-    //   there would strand a crash-recovery re-drive.
-    // The recency key is per-arm, because `lifecycle_changed_at` does not mean
-    // the same thing on both. For a suspend evacuation it is the
-    // evacuation-suspend transition — when the row became this sweep's
-    // responsibility. For a stopped one it is the **user's original stop**: the
-    // claim deliberately changes no lifecycle, and neither does the teardown,
-    // so a sandbox stopped three weeks ago and evacuated a minute ago carries a
-    // three-week-old key and sorts behind every fresh suspend evacuation.
-    //
-    // That inverts the priority exactly where it matters most. Under budget
-    // pressure the starved row is the only one in the list with no live copy
-    // anywhere: a suspend evacuation still has its snapshot and its owner gets
-    // a retryable error, while a torn-down stopped sandbox is on no node and
-    // its owner's `start` is a hard 503 until the sweep reaches it.
-    //
-    // `placement_changed_at` is the stopped arm's equivalent: the teardown's
-    // placement clear (`forget_pod_tracking_if_no_active_execution`, in delete
-    // mode) runs under `PlacementClock::Bump` (only `Retire` preserves), so it
-    // is stamped at exactly the moment the row became
-    // unplaced — the same "became the sweep's responsibility" instant the
-    // suspend arm gets from its own column. The `CASE` costs an in-memory sort
-    // the sweep was already doing over a set bounded by the marker's partial
-    // index.
-    format!(
-        "SELECT s.id, s.evacuation_restore_target
-           FROM sandboxes s
-          WHERE s.evacuation_restore_target IS NOT NULL
-            AND s.lifecycle IN ('suspended', 'restoring', 'stopped')
-            {backoff_gate}
-            AND (
-                (
-                    s.evacuation_restore_target <> 'stopped'
-                    AND s.lifecycle IN ('suspended', 'restoring')
-                    AND {snapshot_exists}
-                )
-                OR (
-                    s.evacuation_restore_target = 'stopped'
-                    AND (
-                        (s.lifecycle = 'stopped' AND s.active_node_id IS NULL)
-                        -- A re-placement the claim already took: one whose
-                        -- controller died mid-restore, or whose attempt failed
-                        -- after the claim (a fresh stopped claim is never rolled
-                        -- back). This arm is how it is re-driven; omitting it
-                        -- would strand exactly those rows.
-                        OR s.lifecycle = 'restoring'
-                    )
-                    AND {disk_backup_ready}
-                )
-            )
-          ORDER BY {attempt_tier_key}
-                   CASE
-                       WHEN s.evacuation_restore_target = 'stopped'
-                       THEN COALESCE(s.placement_changed_at, s.lifecycle_changed_at)
-                       ELSE s.lifecycle_changed_at
-                   END DESC,
-                   s.id DESC"
-    )
-}
-
-/// How long the longest-stalled stopped evacuation has been waiting for its
-/// bytes, in seconds — `0` when none is waiting, plus the row it measured.
-///
-/// **The gap this closes.** [`pplx_space_sandbox_store::stopped_replacements::pending`] counts rows
-/// with `active_node_id IS NULL`, i.e. ones already torn down and waiting to be
-/// placed. An evacuation stuck *before* the teardown still has its node, so it
-/// is invisible there — and it is invisible everywhere else too: the only other
-/// signals are a `debug` log and
-/// `node_drain.stopped_evacuation{outcome=awaiting_durable_disk}`, which by
-/// design looks identical to a healthy multi-gigabyte upload. So a claim that
-/// can never satisfy its durability gate parks the node with the alert flat at
-/// zero — precisely the failure this feature's safety argument leans on being
-/// *visible*, since fail-closed is only a defence if someone finds out.
-///
-/// **An age rather than a thresholded count**, so the operator owns the window.
-/// Any constant chosen here would be a guess about the largest legitimate
-/// rootfs upload on the slowest link in the fleet; a monitor can say
-/// `> 1h for 10m` and be retuned without a deploy.
-///
-/// The age is measured from the pinned artifact's **earliest** catalog
-/// registration — `snapshots.timestamp`, stamped when a publish first reached
-/// the cluster. `MIN`, not `MAX`: `insert_snapshot` conflicts only on `id`, so
-/// re-registering the same artifact adds a row, and taking the newest would
-/// *shorten* the reported age on exactly the sandboxes that have been retried
-/// most.
-///
-/// Three clocks, tried in order, so the expression can never resolve to NULL —
-/// which the caller would publish as a reassuring `0` for the very node nobody
-/// is watching. A row with no catalog row has not published, and falls back to
-/// the drain's start; a draining node with no start time (a bug to notice in its
-/// own right) falls back to when the sandbox became `stopped`. The first clock
-/// is registration time, which comes after the claim, so it can under-report;
-/// the value also drops when the first catalog row appears and the clock
-/// switches from the drain's start to it. None is a
-/// claim about the artifact's *contents* — see [`claim_stopped_evacuation`] for
-/// why no timestamp here could be.
-///
-/// **Scoped to claimed evacuations, and only those.** This selects on the
-/// marker, which means it sees exactly the population that has work in flight:
-/// a claim whose upload is slow or whose durability gate is not opening. It does
-/// **not** see the refusal — a sandbox whose *node* reports an artifact this
-/// drain did not mint — and that is deliberate rather than a gap. An earlier
-/// revision carried a second disjunct for it, `current_local_artifact_id IS NOT
-/// NULL`, which reads the **cluster** column; on the `managed_by = 'k8s'` nodes
-/// this reconciler drains, nothing ever writes a `disk`/`stop` pin there (see
-/// [`SubstrateSink::node_reported_artifact`] for the three reasons), so the
-/// disjunct could not fire and only its tests, which set the column by hand,
-/// suggested otherwise. The refusal is counted on
-/// `node_drain.stopped_evacuation{outcome=unattributable_artifact}` and logged
-/// with the node, the sandbox and the node's stopped-since time, which is where
-/// a responder should be sent for it.
-///
-/// The `s.id` tiebreak is not decoration: the age is an integer number of
-/// seconds, so two evacuations that started in the same second compare equal,
-/// and without it the paced WARN would name a different sandbox from one hour to
-/// the next for an unchanged incident. `restore_pending_evacuations_query` orders
-/// on `s.id DESC` for the same reason.
-///
-/// **Forced drains only.** A claim can only be opened on one, and a marker that
-/// outlives an `:undrain` is drift the claim refuses as `Deferred` rather than a
-/// stall. Without this term the first gentle drain of a node holding a marked
-/// row would report an age against a documented one-hour alert.
-pub(crate) fn stopped_evacuation_stall_secs_query() -> String {
-    let pinned = snapshot_is_current_local_artifact("s", "sn");
-    format!(
-        "SELECT EXTRACT(EPOCH FROM (NOW() - COALESCE(
-                    (SELECT MIN(sn.timestamp)
-                       FROM snapshots sn
-                      WHERE sn.sandbox_id = s.id
-                        AND {pinned}),
-                    n.drain_started_at,
-                    s.lifecycle_changed_at
-                )))::BIGINT AS stall_secs,
-                s.id AS sandbox_id,
-                n.id AS node_id
-           FROM sandboxes s
-           JOIN nodes n ON n.id = s.active_node_id
-          WHERE s.lifecycle = 'stopped'
-            AND {node_force_draining}
-            AND s.evacuation_restore_target = 'stopped'
-          ORDER BY stall_secs DESC, s.id DESC
-          LIMIT 1",
-        node_force_draining = node_is_force_draining("n.id"),
-    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|EvacuationCandidate { id, lifecycle }| (id, lifecycle))
+        .collect())
 }
 
 /// The substrate whose nodes this reconciler drains: its draining and
@@ -785,7 +404,8 @@ pub(crate) fn stopped_evacuation_stall_secs_query() -> String {
 /// [`has_node_drain_reconciler`](SubstrateKind::has_node_drain_reconciler).
 pub(crate) const DRAIN_RECONCILER_SUBSTRATE: SubstrateKind = SubstrateKind::Kubernetes;
 
-/// Per-call ceiling on [`pinned_local_only_sandboxes_query`]'s enumeration.
+/// Per-call ceiling on the pinned-local enumeration
+/// (`pplx_space_sandbox_store::pinned_local_only::page`).
 ///
 /// Two different numbers bound this, and only the smaller one is a correctness
 /// floor. No consumer reads past its own per-tick ceiling — the promote path
@@ -799,7 +419,28 @@ pub(crate) const DRAIN_RECONCILER_SUBSTRATE: SubstrateKind = SubstrateKind::Kube
 /// Raising the cap weakens the planner's low-startup-cost bias.
 pub(crate) const PINNED_LOCAL_ONLY_ENUMERATION_CAP: NonZeroUsize = NonZeroUsize::new(512).unwrap();
 
-/// `$1` = node id. Suspended, locally-pinned sandboxes whose current artifact
+// The pinned-local page and the queued read spell their `LIMIT` as a literal
+// in both shapes (four statements); it is this cap plus the sentinel row.
+const _: () = assert!(
+    PINNED_LOCAL_ONLY_ENUMERATION_CAP.get() + 1 == sandbox_store::pinned_local_only::PAGE_LIMIT
+        && sandbox_store::node_local_backup_pending::QUEUED_CANDIDATES_LIMIT
+            == sandbox_store::pinned_local_only::PAGE_LIMIT
+);
+
+/// Choose and run one node's pinned-local enumeration.
+///
+/// A free function rather than a method so the tests can drive the *decision*
+/// — flag, then gate, then which statement — against a real Postgres without
+/// standing up a `KubernetesSubstrate` the choice never consults. A test that
+/// exercised the two statements separately would assert about SQL and leave
+/// the branch between them, which is the part carrying the rollout risk,
+/// uncovered.
+///
+/// # The history statement
+///
+/// `pplx_space_sandbox_store::pinned_local_only::page`.
+///
+/// Suspended, locally-pinned sandboxes whose current artifact
 /// is not yet portable: the work queue the promotion step backs up. Excludes
 /// sandboxes whose backup is still in flight from this node
 /// (`state='creating'`): repeating those attempts is redundant and racy, and
@@ -827,16 +468,17 @@ pub(crate) const PINNED_LOCAL_ONLY_ENUMERATION_CAP: NonZeroUsize = NonZeroUsize:
 /// unaffected — their staging directory is keyed by that id, so a re-suspend
 /// allocates a new one and cannot disturb an upload in flight.
 ///
-/// ## Why `limit` exists, and why it is a literal
+/// ## Why the limit exists, and why it is a literal
 ///
-/// `limit` caps how many ids one call enumerates, and is interpolated as a SQL
-/// **literal** rather than bound as `$2`. Both choices are load-bearing rather
-/// than stylistic.
+/// The statement's `LIMIT` caps how many ids one call enumerates, and is
+/// spelled in its text as a SQL **literal**
+/// (`pplx_space_sandbox_store::pinned_local_only::PAGE_LIMIT`) rather than
+/// bound as `$2`. Both choices are load-bearing rather than stylistic.
 ///
-/// Note that `limit` is the value the statement emits, not the cap: the sink
-/// passes `PINNED_LOCAL_ONLY_ENUMERATION_CAP + 1`, so the rendered statement
-/// says `LIMIT 513`, and the extra row is the sentinel that lets the caller
-/// tell "exactly the cap" from "more than the cap".
+/// Note that the literal is not the cap: it is
+/// `PINNED_LOCAL_ONLY_ENUMERATION_CAP + 1`, so the statement says `LIMIT 513`,
+/// and the extra row is the sentinel that lets the caller tell "exactly the
+/// cap" from "more than the cap".
 ///
 /// Read this section after the scalar-subquery fence below, not before it. The
 /// fence is what makes the expensive half's plan deterministic; the cap does
@@ -901,8 +543,8 @@ pub(crate) const PINNED_LOCAL_ONLY_ENUMERATION_CAP: NonZeroUsize = NonZeroUsize:
 /// Routine autoanalyze can change cost estimates and reverse a `LIMIT`-only
 /// plan choice; the scalar subquery removes that alternative structurally.
 ///
-/// Fenced here at the query site rather than inside
-/// [`snapshot_durable_for_source_release`], because most of that fragment's
+/// Fenced at the store statement's query site rather than inside
+/// `snapshot_durable_for_source_release`, because most of that fragment's
 /// callers read it positively, where a sublink pulls up into a semi-join and
 /// should. The in-flight sublink beside it is deliberately left unfenced: it
 /// quantifies over the cluster's `state='creating'` full snapshots, a few
@@ -913,49 +555,33 @@ pub(crate) const PINNED_LOCAL_ONLY_ENUMERATION_CAP: NonZeroUsize = NonZeroUsize:
 /// a *generic* plan is built, so there is no fraction to apply and the bias is
 /// lost — and sqlx prepares every statement, so the plan cache decides which
 /// kind of plan the reconciler gets. Keep the limit literal to preserve this
-/// bias even under `plan_cache_mode = force_generic_plan`. `limit` is an
-/// in-process constant, never caller- or operator-supplied, and `NonZeroUsize`
-/// renders as digits only, so interpolating it cannot inject SQL.
-pub(crate) fn pinned_local_only_sandboxes_query(
-    exclude_legacy_rows: bool,
-    limit: NonZeroUsize,
-) -> String {
-    // Marker-aware (`snapshot_durable_for_source_release`), matching the
-    // source-release guards and the restore predicate: an evacuation-marked
-    // sandbox needs backup when its current artifact has no ready copy
-    // (not when it lacks a *placement-fresh* one). This is what re-drives a
-    // marked sandbox whose current evacuation upload **failed**: its newest
-    // snapshot is `failed`, so it is not durable -> enumerated here -> retried
-    // → new `ready` → restore-pending → restored. Using `fresh_ready` instead
-    // would skip such a row if an older placement-fresh `ready` snapshot also
-    // existed, wedging it (blocks drain, not restore-pending, not retried).
-    // For an unmarked sandbox the predicate is identical to `fresh_ready`.
-    let snapshot_exists = snapshot_durable_for_source_release("s");
-    // Node-agnostic: skip the backup/give-up path for a sandbox whose
-    // upload is in flight from *any* node — including the case where its
-    // `target_node_id` drifted to this node while the upload started
-    // elsewhere. A compatibility reupload from this node could probe pruned
-    // or wrong-codec local artifacts and surface a spurious `ArtifactMissing`.
-    let inflight_upload = inflight_suspend_upload_exists("s");
-    let legacy_filter = if exclude_legacy_rows {
-        "AND s.current_local_artifact_id IS NOT NULL"
-    } else {
-        ""
-    };
-    format!(
-        "SELECT s.id
-           FROM sandboxes s
-          WHERE s.target_node_id = $1
-            AND s.lifecycle = 'suspended'
-            AND NOT (SELECT {snapshot_exists})
-            AND NOT {inflight_upload}
-            {legacy_filter}
-          LIMIT {limit}"
-    )
-}
-
-/// `$1` = node id. The node's queued backup rows: a subset of
-/// [`pinned_local_only_sandboxes_query`]'s answer, each carrying the artifact
+/// bias even under `plan_cache_mode = force_generic_plan`. The store spells it
+/// in the statement's text, so no caller value reaches it.
+///
+/// The durability check is marker-aware (`snapshot_durable_for_source_release`),
+/// matching the source-release guards and the restore predicate: an evacuation-marked
+/// sandbox needs backup when its current artifact has no ready copy
+/// (not when it lacks a *placement-fresh* one). This is what re-drives a
+/// marked sandbox whose current evacuation upload **failed**: its newest
+/// snapshot is `failed`, so it is not durable -> enumerated here -> retried
+/// → new `ready` → restore-pending → restored. Using `fresh_ready` instead
+/// would skip such a row if an older placement-fresh `ready` snapshot also
+/// existed, wedging it (blocks drain, not restore-pending, not retried).
+/// For an unmarked sandbox the predicate is identical to `fresh_ready`.
+///
+/// The in-flight check is node-agnostic: it skips the backup/give-up path for
+/// a sandbox whose
+/// upload is in flight from *any* node — including the case where its
+/// `target_node_id` drifted to this node while the upload started
+/// elsewhere. A compatibility reupload from this node could probe pruned
+/// or wrong-codec local artifacts and surface a spurious `ArtifactMissing`.
+///
+/// # The queue statement
+///
+/// `pplx_space_sandbox_store::node_local_backup_pending::queued_candidates`.
+///
+/// The node's queued backup rows: a subset of
+/// the history statement's answer, each carrying the artifact
 /// the node reported. The caller interleaves them with the history rows they
 /// do not name, so this statement narrows nothing on its own; what it adds is
 /// the identity.
@@ -970,7 +596,7 @@ pub(crate) fn pinned_local_only_sandboxes_query(
 /// `target_node_id` is a placement diagnostic suspend never clears, so that one
 /// grows without bound. The live drain still reads history too.
 ///
-/// # The queue narrows; the predicates decide
+/// ## The queue narrows; the predicates decide
 ///
 /// Every surviving row is re-checked against the *same* two fragments the
 /// history statement applies — `snapshot_durable_for_source_release` and
@@ -989,7 +615,7 @@ pub(crate) fn pinned_local_only_sandboxes_query(
 /// Promotion doesn't send it: it names the `sandboxes` marker, which the pair
 /// can only match or lag behind.
 ///
-/// # Why both `q.node_id` and `s.target_node_id` are matched
+/// ## Why both `q.node_id` and `s.target_node_id` are matched
 ///
 /// They are not redundant, and dropping the second one silently breaks the
 /// invariant this whole design rests on. The queue row is keyed by the node
@@ -1015,7 +641,7 @@ pub(crate) fn pinned_local_only_sandboxes_query(
 /// promotion from the old node. Adding the scope preserves parity with shipped
 /// behaviour rather than narrowing past it.
 ///
-/// # `artifact_kind`
+/// ## `artifact_kind`
 ///
 /// The table's `CHECK` admits `'disk'` and `'full'` because the node reports
 /// both, so this statement carries its own kind predicate rather than assuming
@@ -1024,10 +650,10 @@ pub(crate) fn pinned_local_only_sandboxes_query(
 /// requires `sn.type = 'full'` — so a `'disk'` row would be enumerated and then
 /// judged by a predicate that cannot describe it.
 ///
-/// # Fences carried over
+/// ## Fences carried over
 ///
 /// The durability probe stays inside a scalar subquery for the reason
-/// [`pinned_local_only_sandboxes_query`] documents at length: a bare sublink is
+/// the history statement's section documents: a bare sublink is
 /// pullable and can be realised as a hash or merge anti-join over the whole
 /// snapshot table, and autoanalyze can flip that choice under a `LIMIT`-only
 /// plan. It matters less here, where the driving set is small, but the two
@@ -1037,40 +663,32 @@ pub(crate) fn pinned_local_only_sandboxes_query(
 /// The limit is likewise a literal,
 /// not a bind parameter, so the `tuple_fraction` bias survives
 /// `plan_cache_mode = force_generic_plan`.
-pub(crate) fn queued_local_backup_candidates_query(
-    exclude_legacy_rows: bool,
-    limit: NonZeroUsize,
-) -> String {
-    let snapshot_exists = snapshot_durable_for_source_release("s");
-    let inflight_upload = inflight_suspend_upload_exists("s");
-    let legacy_filter = if exclude_legacy_rows {
-        "AND s.current_local_artifact_id IS NOT NULL"
-    } else {
-        ""
-    };
-    format!(
-        "SELECT q.sandbox_id, q.artifact_id, q.artifact_kind
-           FROM node_local_backup_pending q
-           JOIN sandboxes s ON s.id = q.sandbox_id
-          WHERE q.node_id = $1
-            AND s.target_node_id = $1
-            AND q.artifact_kind = 'full'
-            AND s.lifecycle = 'suspended'
-            AND NOT (SELECT {snapshot_exists})
-            AND NOT {inflight_upload}
-            {legacy_filter}
-          LIMIT {limit}"
-    )
-}
-
-/// Choose and run one node's pinned-local enumeration.
 ///
-/// A free function rather than a method so the tests can drive the *decision*
-/// — flag, then gate, then which statement — against a real Postgres without
-/// standing up a `KubernetesSubstrate` the choice never consults. A test that
-/// exercised the two statements separately would assert about SQL and leave
-/// the branch between them, which is the part carrying the rollout risk,
-/// uncovered.
+/// # The freshness gate
+///
+/// `pplx_space_node_status_store::backup_inventory::fresh`.
+///
+/// TRUE iff this node's backup inventory is fresh enough that
+/// an **empty** queue may be read as "nothing pending" rather than "never
+/// reported".
+///
+/// Asked as its own round trip rather than folded into
+/// the queue statement as a `WHERE` term, because the two
+/// answers a fold would produce are indistinguishable and mean opposite
+/// things: a stale gate and a genuinely empty queue would both return zero
+/// rows. The live drain reads history either way, so for it the gate decides
+/// only whether the queue is read at all. The extra round trip happens only
+/// when the flag is on, and
+/// `node_status_snapshots` is keyed by `node_id`, so it is a primary-key
+/// lookup.
+///
+/// Reading the gate and the queue in separate statements admits a window where
+/// freshness changes between them. Both directions are benign: a gate that
+/// goes stale just after the check leaves the read using an inventory at most
+/// one window old, and one that goes fresh just after leaves the node
+/// enumerated from history for one tick. Neither can release a node, because
+/// neither changes what
+/// the drain gate's blocker count counts.
 pub(crate) async fn list_pinned_local_candidates(
     pool: &PgPool,
     node_id: NodeId,
@@ -1088,13 +706,8 @@ pub(crate) async fn list_pinned_local_candidates(
     // extra round trip, and the statement below is the pre-change one
     // unchanged. That is what makes merging this inert.
     if backup_queue_enabled {
-        let gate = node_backup_inventory_gate_query();
-        let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(gate.as_str())))
-            .bind(node_id)
-            .fetch_one(pool)
-            .await?;
+        let fresh = backup_inventory::fresh(pool, node_id).await?;
         if fresh {
-            let query = queued_local_backup_candidates_query(exclude_legacy_rows, limit);
             // `artifact_kind` is decoded as its wire `TEXT` and parsed
             // rather than trusted. The column's CHECK admits only `disk`
             // and `full` and the statement asks for `full`, so a parse
@@ -1103,14 +716,20 @@ pub(crate) async fn list_pinned_local_candidates(
             // panic: the one way to reach it is a future migration
             // widening the CHECK, and a drain tick is not a place to
             // abort the process over that.
-            let rows: Vec<(SandboxId, LocalArtifactId, String)> =
-                sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id)
-                    .fetch_all(pool)
-                    .await?;
+            let rows = sandbox_store::node_local_backup_pending::queued_candidates(
+                pool,
+                node_id,
+                exclude_legacy_rows,
+            )
+            .await?;
             let candidates = rows
                 .into_iter()
-                .map(|(sandbox_id, artifact_id, kind)| {
+                .map(|row| {
+                    let QueuedBackupCandidate {
+                        sandbox_id,
+                        artifact_id,
+                        artifact_kind: kind,
+                    } = row;
                     let artifact_kind = kind
                         .parse::<ArtifactKind>()
                         .map_err(|err| sqlx::Error::Decode(Box::new(err)))?;
@@ -1165,12 +784,8 @@ pub(crate) async fn list_pinned_local_candidates(
             // unnamed, as history would send them; what cannot be trusted is
             // the label that says the census missed them.
             let queue_page_full = candidates.len() >= limit.get();
-            let query = pinned_local_only_sandboxes_query(exclude_legacy_rows, limit);
-            let history: Vec<SandboxId> =
-                sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id)
-                    .fetch_all(pool)
-                    .await?;
+            let history =
+                sandbox_store::pinned_local_only::page(pool, node_id, exclude_legacy_rows).await?;
             let unnamed = history
                 .into_iter()
                 .filter(|sandbox_id| !queued.contains(sandbox_id))
@@ -1190,11 +805,7 @@ pub(crate) async fn list_pinned_local_candidates(
         }
     }
 
-    let query = pinned_local_only_sandboxes_query(exclude_legacy_rows, limit);
-    let ids: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .fetch_all(pool)
-        .await?;
+    let ids = sandbox_store::pinned_local_only::page(pool, node_id, exclude_legacy_rows).await?;
     Ok(PinnedLocalPage {
         candidates: ids
             .into_iter()
@@ -1246,31 +857,6 @@ fn interleave<T>(first: Vec<T>, second: impl IntoIterator<Item = T>) -> Vec<T> {
     }
     out.extend(second);
     out
-}
-
-/// `$1` = node id. TRUE iff this node's backup inventory is fresh enough that
-/// an **empty** queue may be read as "nothing pending" rather than "never
-/// reported".
-///
-/// Asked as its own round trip rather than folded into
-/// [`queued_local_backup_candidates_query`] as a `WHERE` term, because the two
-/// answers a fold would produce are indistinguishable and mean opposite
-/// things: a stale gate and a genuinely empty queue would both return zero
-/// rows. The live drain reads history either way, so for it the gate decides
-/// only whether the queue is read at all. The extra round trip happens only
-/// when the flag is on, and
-/// `node_status_snapshots` is keyed by `node_id`, so it is a primary-key
-/// lookup.
-///
-/// Reading the gate and the queue in separate statements admits a window where
-/// freshness changes between them. Both directions are benign: a gate that
-/// goes stale just after the check leaves the read using an inventory at most
-/// one window old, and one that goes fresh just after leaves the node
-/// enumerated from history for one tick. Neither can release a node, because
-/// neither changes what
-/// [`crate::node_drain::store::drain_blocking_sandboxes_query`] counts.
-pub(crate) fn node_backup_inventory_gate_query() -> String {
-    format!("SELECT {}", node_backup_inventory_fresh("$1"))
 }
 
 /// A sandbox on a draining node that still owes a durable backup, plus the
@@ -1331,84 +917,10 @@ pub enum PinnedLocalSource {
     HistoryQueueIncomplete,
 }
 
-/// The "this node is still being force-drained" guard, as a composable
-/// conjunct. `node_ref` is whatever names the node — a bind placeholder like
-/// `$2`, or a joined alias's column like `n.id`.
-///
-/// **One condition, several spellings.** This fragment interpolates it for
-/// [`stopped_evacuation_stall_secs_query`] and `SubstrateSink::stopped_evacuation_state`.
-/// The pod-less give-up's precheck binds [`PHASE_DRAINING`] and
-/// [`NodeDrainMode::Forced`]. Three statements in `pplx_space_sandbox_store::drain`
-/// ([`claim_evacuation_suspend`], [`claim_stopped_evacuation`],
-/// [`record_stopped_evacuation_artifact`]) bind `NodeDrainPhase::Draining` and
-/// `NodeDrainMode::Forced`. All of them render `'draining'` and `'forced'`. The
-/// binding statements are left as they are, because converting a guarded
-/// `UPDATE` from a `sql!` literal to a `format!` is three chances to shift a bind
-/// index for no behavioural gain.
-///
-/// **`drain_mode = 'forced'` is matched literally rather than "not gentle".** A
-/// NULL or unrecognized mode reads as gentle everywhere else
-/// ([`NodeDrainMode::from_column_str`]), so requiring the explicit token keeps
-/// every reader consistent and keeps evacuation reachable only through a mode
-/// someone actually asked for. That decision used to be argued in two separate
-/// docstrings and silently assumed at the other three sites; it belongs here,
-/// once.
-///
-/// The alias is `n_fd` rather than `n` so the fragment composes into a query
-/// that already joins `nodes n` — as the stall gauge does — without shadowing
-/// it.
-///
-/// Local rather than in `pplx-space-sandbox-residency`: only this file
-/// interpolates it, unlike the residency predicates, which live in that crate
-/// precisely because several crates must count the same rows.
-fn node_is_force_draining(node_ref: &str) -> String {
-    format!(
-        "EXISTS (
-                SELECT 1
-                  FROM nodes n_fd
-                 WHERE n_fd.id = {node_ref}
-                   AND n_fd.drain_phase = '{PHASE_DRAINING}'
-                   AND n_fd.drain_mode = '{forced}'
-            )",
-        forced = NodeDrainMode::Forced.as_str(),
-    )
-}
-
 /// `failure_reason` stamped on `creating` suspend-snapshot rows terminalized
 /// by the gone-node recovery (mirrors the stuck-snapshot reaper's stamp).
 pub(crate) const GONE_NODE_UPLOAD_FAILURE_REASON: &str = "source node's kube Node is gone and its EC2 instance is terminated; \
      the upload worker died with the instance";
-
-/// `$1` = node id, `$2` = the observed `node_k8s.k8s_node_uid` (nullable),
-/// `$3` = the failure reason to stamp. Terminalize every in-flight
-/// (`state='creating'`, `type='full'`) suspend-snapshot upload sourced from a
-/// node whose kube Node is gone and whose EC2 instance is confirmed
-/// terminated: the upload worker ran on that instance, so no finalize can
-/// ever arrive. This is exactly the flip the stuck-snapshot reaper would
-/// apply after its age window — applied immediately under the EC2 verdict
-/// instead, because the drain blocker count's in-flight-upload term counts
-/// these rows regardless of the owning sandbox's lifecycle: without this, a
-/// bulk-failed resident with a `creating` row keeps the node wedged in
-/// `draining` until the reaper runs (≈10h), or forever where the reaper is
-/// disabled. The identity guards refuse once a same-name replacement
-/// registered, so a fresh node's genuinely-live uploads are never killed.
-/// `failure_reason` is stamped only when still NULL, preserving any reason
-/// the worker recorded on an earlier best-effort attempt (same contract as
-/// the reaper). Returns `(snapshot_id, sandbox_id)` per flipped row so the
-/// caller can emit the per-snapshot `suspend_failed` event.
-pub(crate) fn fail_inflight_snapshots_on_gone_node_query() -> String {
-    let identity_guards = gone_node_identity_guards("$1", "$2");
-    format!(
-        "UPDATE snapshots
-            SET state = 'failed',
-                failure_reason = COALESCE(failure_reason, $3)
-          WHERE state = 'creating'
-            AND type = 'full'
-            AND source_node_id = $1
-            {identity_guards}
-          RETURNING id, sandbox_id"
-    )
-}
 
 /// `$3` for [`drain::mark_sandbox_failed_on_node_query`]: the lifecycles the suspend
 /// pipeline evacuates, as `text[]`.
@@ -2360,7 +1872,7 @@ impl SubstrateSink {
     ///   `:undrain` between the claim and here withdraws the authority to
     ///   disrupt this resident at all.
     /// - the bytes are durable, via the shared
-    ///   [`current_disk_artifact_backup_ready`] fragment, so the gate that
+    ///   [`current_disk_artifact_backup_ready`](pplx_space_sandbox_portability::current_disk_artifact_backup_ready) fragment, so the gate that
     ///   authorizes the destruction and the selector that later resolves the
     ///   artifact to a restore URI cannot disagree.
     ///
@@ -2697,42 +2209,27 @@ impl SubstrateSink {
         // teardown permanently, for a draining node whose start time is unset.
         // A redundant conjunct that can only fail spuriously is a wedge waiting
         // to happen.
-        let ready = current_disk_artifact_backup_ready("s");
-        let node_force_draining = node_is_force_draining("$2");
-        let pinned = snapshot_is_current_local_artifact("s", "sn");
-        // `COALESCE(..., FALSE)`, because two of the conjuncts are nullable
-        // columns and SQL's `TRUE AND NULL` is NULL, not FALSE. An unmarked row
-        // (`evacuation_restore_target IS NULL`) and a torn-down one
-        // (`active_node_id IS NULL`) are exactly the shapes this has to report
-        // as "no claim" — and without the coalesce they decode as a NULL bool
-        // and fail the query instead, turning a clean deferral into an error.
-        let query = format!(
-            "SELECT COALESCE((
-                 s.lifecycle = 'stopped'
-                 AND s.evacuation_restore_target = 'stopped'
-                 AND s.active_node_id = $2
-                 AND {node_force_draining}
-             ), FALSE) AS claim_holds,
-             {ready} AS bytes_durable,
-             s.current_local_artifact_id,
-             COALESCE(s.evacuation_restore_target = 'stopped', FALSE) AS marked,
-             EXISTS (
-                 SELECT 1
-                   FROM snapshots sn
-                  WHERE sn.sandbox_id = s.id
-                    AND {pinned}
-                    AND sn.state = 'creating'
-             ) AS upload_in_flight
-             FROM sandboxes s
-             WHERE s.id = $1"
-        );
-        let row: Option<(bool, bool, Option<LocalArtifactId>, bool, bool)> =
-            sqlx::query_as::<_, (bool, bool, Option<LocalArtifactId>, bool, bool)>(
-                sqlx::AssertSqlSafe(sql!(query.as_str())),
-            )
-            .bind(sandbox_id)
-            .bind(source_node_id)
-            .fetch_optional(&self.pool)
+        //
+        // `COALESCE(..., FALSE)` in the statement, because two of the
+        // conjuncts are nullable columns and SQL's `TRUE AND NULL` is NULL, not
+        // FALSE. An unmarked row (`evacuation_restore_target IS NULL`) and a
+        // torn-down one (`active_node_id IS NULL`) are exactly the shapes this
+        // has to report as "no claim" — and without the coalesce they decode as
+        // a NULL bool and fail the query instead, turning a clean deferral into
+        // an error.
+        //
+        // **"Still force-drained" is one condition with several spellings.**
+        // This statement and the stall gauge's spell it `drain_phase =
+        // 'draining' AND drain_mode = 'forced'`; the pod-less give-up's
+        // precheck binds `PHASE_DRAINING` and `NodeDrainMode::Forced`, and the
+        // evacuation claims in `pplx_space_sandbox_store::drain` bind
+        // `NodeDrainPhase::Draining` and `NodeDrainMode::Forced`. All of them
+        // render `'draining'` and `'forced'`. The mode is matched literally
+        // rather than as "not gentle": a NULL or unrecognized mode reads as
+        // gentle everywhere else (`NodeDrainMode::from_column_str`), so
+        // requiring the explicit token keeps evacuation reachable only through
+        // a mode someone actually asked for.
+        let row = sandbox_store::stopped_evacuations::state(&self.pool, sandbox_id, source_node_id)
             .await
             .map_err(|err| {
                 // `Lookup`, not `Publish`: this is a Postgres read, and `Publish`
@@ -2746,7 +2243,13 @@ impl SubstrateSink {
         // a row that drifted, which is the fail-closed reading of both.
         Ok(row.map_or(
             StoppedEvacuationState::default(),
-            |(claim_holds, bytes_durable, pinned_artifact, marked, upload_in_flight)| {
+            |StoppedEvacuationRow {
+                 claim_holds,
+                 bytes_durable,
+                 current_local_artifact_id: pinned_artifact,
+                 marked,
+                 upload_in_flight,
+             }| {
                 StoppedEvacuationState {
                     claim_holds,
                     marked,
@@ -2816,7 +2319,7 @@ impl SubstrateSink {
         // defer cleanly. The atomic backstop for the residual micro-window is
         // the marker-guarded `begin_evacuation_restore_lifecycle` inside
         // `restore_evacuated_execution`. Uses `latest_full_snapshot_ready` (no
-        // placement-freshness gate) to match `restore_pending_evacuations_query`
+        // placement-freshness gate) to match the restore-pending sweep
         // and stay robust to a failed restore's placement bump.
         //
         // A `stopped` target reads the *disk* artifact's readiness instead, for
@@ -2825,24 +2328,14 @@ impl SubstrateSink {
         // unsatisfiable for it and would defer every attempt forever. Selecting
         // the predicate off `target_lifecycle` — the same value the sweep
         // selected the row by — is what keeps the two in step.
-        let ready_exists = if target_lifecycle == SandboxLifecycle::Stopped {
-            current_disk_artifact_backup_ready("s")
-        } else {
-            latest_full_snapshot_ready("s")
-        };
-        let eligible_query = format!(
-            "SELECT (s.evacuation_restore_target IS NOT NULL AND {ready_exists}) \
-             FROM sandboxes s WHERE s.id = $1"
-        );
-        let eligible: bool =
-            sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql!(eligible_query.as_str())))
-                .bind(sandbox_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|err| {
-                    EvacuateError::Restore(format!("restore eligibility query failed: {err}"))
-                })?
-                .unwrap_or(false);
+        let eligible = sandbox_store::evacuation_restores::restore_eligible(
+            &self.pool,
+            sandbox_id,
+            target_lifecycle,
+        )
+        .await
+        .map_err(|err| EvacuateError::Restore(format!("restore eligibility query failed: {err}")))?
+        .unwrap_or(false);
         if !eligible {
             return Ok(RestoreOutcome::Deferred);
         }
@@ -3078,17 +2571,31 @@ impl NodeDrainSink for SubstrateSink {
         .await
     }
 
+    /// `(occupying, total)` for one draining node
+    /// (`pplx_space_sandbox_store::node_residents::counts`, over
+    /// `RESIDENT_LIFECYCLES`): rows that still block
+    /// `draining → drained`, and every row in a resident lifecycle pinned to it.
+    /// The caller derives the discounted count by subtraction.
+    ///
+    /// Counts, not ids — the reconciler only asks "how many" and "any left?", and
+    /// returning ids would ship discarded historical rows over the wire every tick.
+    ///
+    /// Flat, with the expensive absence proof appearing exactly once inside the
+    /// `FILTER`: the bare `COUNT(*)` does not reference it, so there is nothing for
+    /// the planner to duplicate. Returning `total` rather than a second
+    /// `COUNT(*) FILTER (WHERE NOT …)` is what keeps that true.
     async fn count_resident_sandboxes_on_node(
         &self,
         node_id: NodeId,
     ) -> Result<ResidentSandboxCounts, sqlx::Error> {
-        let query = resident_sandbox_counts_query(self.residency_evidence);
-        let (occupying, total): (i64, i64) =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(node_id)
-                .bind(resident_lifecycle_strs())
-                .fetch_one(&self.pool)
-                .await?;
+        let sandbox_store::node_residents::ResidentCounts { occupying, total } =
+            sandbox_store::node_residents::counts(
+                &self.pool,
+                node_id,
+                &resident_lifecycle_strs(),
+                self.residency_evidence,
+            )
+            .await?;
         let occupying = occupying.unsigned_abs();
         // `occupying` is a FILTER over exactly the rows `total` counts, so it
         // cannot exceed it unless the two are edited into disagreeing scans.
@@ -3101,15 +2608,35 @@ impl NodeDrainSink for SubstrateSink {
         })
     }
 
+    /// Per-lifecycle count
+    /// (`pplx_space_sandbox_store::node_residents::termination_blocking_by_lifecycle`)
+    /// of the sandboxes that would make the
+    /// drained-node terminator's resident guard refuse this node.
+    ///
+    /// The predicate is `sandbox_residency::active_resident_predicate` itself — the
+    /// same string `mark_terminating_query` and the KubeNodeGone reap re-check
+    /// atomically — not a restatement of it. Its docs carry which lifecycles that
+    /// is and why it differs from the resident scan's include-list.
+    ///
+    /// Unordered on purpose: `GROUP BY` alone lets the planner hash-aggregate, while
+    /// `ORDER BY lifecycle` can tip it into sorting every input row (thousands, on
+    /// the nodes where this matters) to order a handful of groups. The column is
+    /// plain `TEXT` with no CHECK, and the predicate is an exclusion list, so an
+    /// unmodelled string counts too and the group count has no hard bound. In
+    /// practice: 14 of the 16 `SandboxLifecycle` variants qualify, and at the only
+    /// call site the resident scan has already reported zero, so the ten
+    /// include-list lifecycles are absent and four modelled groups remain. The
+    /// caller sorts them.
     async fn count_termination_blocking_residents_on_node(
         &self,
         node_id: NodeId,
     ) -> Result<TerminationBlockingResidents, sqlx::Error> {
-        let query = termination_blocking_residents_query(self.residency_evidence);
-        let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node_id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sandbox_store::node_residents::termination_blocking_by_lifecycle(
+            &self.pool,
+            node_id,
+            self.residency_evidence,
+        )
+        .await?;
         let mut by_lifecycle: Vec<(String, u64)> = rows
             .into_iter()
             .map(|(lifecycle, count)| (lifecycle, count.unsigned_abs()))
@@ -3153,7 +2680,7 @@ impl NodeDrainSink for SubstrateSink {
     /// fresh `state='ready'` snapshot are portable and drop out;
     /// sandboxes whose durable upload is still in flight from this node
     /// are also excluded (promoting them is racy — see
-    /// [`pinned_local_only_sandboxes_query`]). `suspending`/`restoring`
+    /// [`list_pinned_local_candidates`]). `suspending`/`restoring`
     /// lifecycles do **not** appear here either — they aren't promotable
     /// (no snapshot exists yet) but they DO block drain completion,
     /// counted separately via
@@ -3178,22 +2705,54 @@ impl NodeDrainSink for SubstrateSink {
     /// artifacts aren't promotable yet); `suspended` blocks only when
     /// no fresh `state='ready'` S3 snapshot exists; and any sandbox
     /// whose durable upload is still in flight from this node blocks
-    /// regardless of placement (see [`drain_blocking_sandboxes_query`]).
+    /// regardless of placement (see below).
     /// Routes the portability check through the shared
     /// `fresh_ready_snapshot_exists` predicate so this count agrees
     /// with `drained_node_terminator::count_local_snapshots` and the
     /// admin `:terminate` endpoint's
     /// `admin_occupancy::terminate_occupancy` guard — all three observe
     /// the same "is this snapshot portable?" answer.
+    ///
+    /// The blockers are the mid-flight / not-yet-portable suspended set pinned
+    /// to the node, **plus** any sandbox whose artifact backup is still in
+    /// flight *from* this node (`state='creating'`, `source_node_id` the node).
+    /// The in-flight-upload term is load-bearing: a backup-in-flight sandbox must
+    /// hold the node until the volume manager finalizes the attempt `ready`,
+    /// otherwise terminating the node kills the in-flight upload worker and
+    /// strands the only durable copy.
+    ///
+    /// # Why this counts the batched pair form rather than scanning `sandboxes`
+    ///
+    /// `drain_gate_blocks_source_release` cannot drive a scan of `sandboxes`. Its
+    /// two disjuncts attribute to different columns — one to the sandbox's
+    /// `target_node_id`, one to a snapshot's `source_node_id` — so an `OR` over
+    /// both leaves the planner no indexable driver and it seq-scans the table.
+    /// That is documented on [`drain_gate_blocker_pairs`](pplx_space_sandbox_portability::drain_gate_blocker_pairs), which exists because of
+    /// it, giving each attribution its own indexable driver and an
+    /// already-differential-tested equivalence with the single-node form. Even
+    /// a single-node request must avoid scanning the whole cluster.
+    ///
+    /// **Deliberately uncapped, unlike the pinned-local enumeration.** An
+    /// outer `LIMIT` is the lever there and is not one here, because
+    /// [`drain_gate_blocker_pairs`](pplx_space_sandbox_portability::drain_gate_blocker_pairs) is a `UNION`: Postgres has to consume and
+    /// deduplicate both branches before an outer limit can return anything, so the
+    /// limit truncates the result without bounding the scan. The indexable driver
+    /// and reshaped in-flight predicate bound the work; the uncapped result keeps
+    /// `node_drain.drain_blockers` exact.
+    ///
+    /// Cost tracks the node's accumulated `target_node_id` history, with lifecycle
+    /// filtering and per-row durability probes. Naming `ARRAY[$1]` inline and
+    /// filtering `node_id = $1` outside keeps the node filter visible to the planner
+    /// instead of encouraging a cluster-wide lifecycle bitmap.
+    ///
+    /// The count is `pplx_space_sandbox_store::drain_gate_blockers::count_on_node`,
+    /// which the drained-node terminator's `drained → terminating` pre-check also
+    /// reads: one statement keeps the two gates counting the same set.
     async fn count_drain_blocking_sandboxes_on_node(
         &self,
         node_id: NodeId,
     ) -> Result<i64, sqlx::Error> {
-        let query = drain_blocking_sandboxes_query();
-        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node_id)
-            .fetch_one(&self.pool)
-            .await
+        sandbox_store::drain_gate_blockers::count_on_node(&self.pool, node_id).await
     }
 
     /// Back up one local-only suspended sandbox from its source node.
@@ -3532,22 +3091,44 @@ impl NodeDrainSink for SubstrateSink {
     /// node (kube Node gone + EC2 instance confirmed terminated) and emit a
     /// per-snapshot `suspend_failed` event — the same event the
     /// stuck-snapshot reaper emits for its age-based flip of the same rows.
+    ///
+    /// Terminalize every in-flight
+    /// (`state='creating'`, `type='full'`) suspend-snapshot upload sourced from a
+    /// node whose kube Node is gone and whose EC2 instance is confirmed
+    /// terminated: the upload worker ran on that instance, so no finalize can
+    /// ever arrive. This is exactly the flip the stuck-snapshot reaper would
+    /// apply after its age window — applied immediately under the EC2 verdict
+    /// instead, because the drain blocker count's in-flight-upload term counts
+    /// these rows regardless of the owning sandbox's lifecycle: without this, a
+    /// bulk-failed resident with a `creating` row keeps the node wedged in
+    /// `draining` until the reaper runs (≈10h), or forever where the reaper is
+    /// disabled. The identity guards refuse once a same-name replacement
+    /// registered, so a fresh node's genuinely-live uploads are never killed.
+    /// `failure_reason` is stamped only when still NULL, preserving any reason
+    /// the worker recorded on an earlier best-effort attempt (same contract as
+    /// the reaper). The write is
+    /// `pplx_space_snapshot_store::lost::fail_inflight_uploads_from_gone_node`,
+    /// which returns each flipped row so the per-snapshot `suspend_failed` event
+    /// can be emitted.
     async fn fail_inflight_snapshots_on_gone_node(
         &self,
         node_id: NodeId,
         expected_uid: Option<&str>,
     ) -> Result<u64, sqlx::Error> {
-        let query = fail_inflight_snapshots_on_gone_node_query();
-        let flipped: Vec<(SnapshotId, SandboxId)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(node_id)
-                .bind(expected_uid)
-                .bind(GONE_NODE_UPLOAD_FAILURE_REASON)
-                .fetch_all(&self.pool)
-                .await?;
+        let flipped = snapshot_lost::fail_inflight_uploads_from_gone_node(
+            &self.pool,
+            node_id,
+            expected_uid,
+            GONE_NODE_UPLOAD_FAILURE_REASON,
+        )
+        .await?;
 
         let node_label = node_id.to_string();
-        for (snapshot_id, sandbox_id) in &flipped {
+        for FailedUpload {
+            snapshot_id,
+            sandbox_id,
+        } in &flipped
+        {
             emit_node_drain_event(
                 *sandbox_id,
                 SandboxEventType::SuspendFailed,
@@ -3625,7 +3206,7 @@ impl NodeDrainSink for SubstrateSink {
     /// and must not race it into failing an adoptable row (see
     /// [`drain::mark_sandbox_lost_on_gone_node_query`]) — and refuses once a
     /// same-name kube Node replacement bumped the observed uid or reset the
-    /// drain phase (see [`gone_node_identity_guards`]).
+    /// drain phase (see [`gone_node_identity_guards`](drain::gone_node_identity_guards)).
     async fn mark_sandbox_lost_on_gone_node(
         &self,
         sandbox_id: SandboxId,
@@ -4133,7 +3714,7 @@ impl NodeDrainSink for SubstrateSink {
         //    backup worker registers this artifact `ready`, the restore is driven
         //    independently — immediately via the snapshot-register trigger,
         //    and by the cluster-wide restore reconciler as the fallback (see
-        //    `restore_evacuated_sandbox` / `restore_pending_evacuations_query`).
+        //    `restore_evacuated_sandbox` / the restore-pending sweep).
         //    The sandbox rests in `suspended` carrying the
         //    `evacuation_restore_target` marker (set in step 1) until then.
         //    The source node is free to finish draining once the backup
@@ -4639,17 +4220,135 @@ impl NodeDrainSink for SubstrateSink {
         .await
     }
 
+    /// Sandboxes anywhere in the cluster that were evacuated off a draining node
+    /// and are now ready to be placed onto a target-cohort node: a non-NULL
+    /// `evacuation_restore_target` marker, a lifecycle this evacuation can rest or
+    /// re-drive in, **and** a ready remote backup of the bytes its restore will
+    /// read.
+    ///
+    /// Which backup that is depends on the marker. A `started`/`paused` evacuation
+    /// suspended the VM, so it waits on the newest full snapshot; a `stopped`
+    /// evacuation published a disk artifact instead, so it waits on that pinned
+    /// artifact. See the comment on the two arms below.
+    ///
+    /// For identity-backed rows, `latest_full_snapshot_ready` requires the ready
+    /// backup to match `current_local_artifact_id`. Nullable rollout-skew rows
+    /// retain the newest-full legacy test so a prior-cycle snapshot cannot satisfy
+    /// a later suspend. This predicate matches restore storage-URI selection.
+    ///
+    /// `restoring` is included for **crash recovery**: if the controller dies
+    /// after `begin_evacuation_restore_lifecycle` claimed `suspended → restoring` but before
+    /// the finalize cleared the marker, the row is left `restoring` with the
+    /// marker still set. A live controller's in-memory `restore_in_flight` dedups
+    /// the active task so this only re-drives after a restart (when that set is
+    /// empty); `begin_evacuation_restore_lifecycle` accepts an already-
+    /// `restoring` row, so the re-drive resumes the wake + finalize idempotently.
+    ///
+    /// Intentionally **not** scoped to any node: the cohort restore is decoupled
+    /// from the source node's drain (the source may already have drained and
+    /// terminated once the artifact was backed up — the restore reads from S3).
+    /// Keying on the mutable `target_node_id` would lose the sandbox the moment
+    /// the restore's pod placement moves it to the cohort node, so the scan keys
+    /// only on the immutable marker + portability. The marker is set in
+    /// [`SubstrateSink::evacuate_sandbox`]'s suspend claim and cleared when the
+    /// restore finalizes (or by a user restore/Start that takes the sandbox over,
+    /// via the marker-clearing trigger), so a plain user-suspended sandbox (NULL
+    /// marker) is never selected.
+    ///
+    /// **Retry backoff + composed ordering (attempt tiers, then recency).** A
+    /// row whose previous cohort restore failed carries
+    /// `next_restore_attempt_at` ([`drain::schedule_restore_retry_query`]); when
+    /// `honor_backoff_windows` is true the statement's gate keeps it out of the sweep
+    /// until that instant passes, so a deterministic failer is retried on an
+    /// exponential schedule instead of on every reconciler tick (and every
+    /// backup-ready NOTIFY). When the operator disables the backoff
+    /// (`honor_backoff_windows = false`) the scan ignores the backoff state
+    /// entirely — the window gate is omitted, **and** the attempt-tier ordering
+    /// key is dropped in favor of the pure recency ordering. Both halves matter
+    /// for the escape hatch: stale windows written before the disable must not
+    /// keep suppressing rows, and frozen pre-disable attempt counts must not
+    /// keep sorting a row behind every fresh evacuation (under slot pressure
+    /// that starves it just as effectively as the gate). Disabled mode is
+    /// therefore exactly the pre-backoff recency behavior, immediately.
+    ///
+    /// The ordering composes the backoff tiers with the recency ordering:
+    /// `restore_attempt_count ASC` first, then `lifecycle_changed_at DESC, id
+    /// DESC` within a tier. Attempt count must be the **primary** key: every
+    /// failed restore cycle bumps `lifecycle_changed_at` (the `suspended →
+    /// restoring` claim and the post-failure revert both fire the
+    /// lifecycle-changed trigger), so recency alone would perpetually classify a
+    /// serial failer as the hottest row and hand it the scarce slots ahead of
+    /// never-failed evacuations. Within a tier, most-recently-active first:
+    /// [`super::Reconciler::spawn_restores`] fills the bounded cluster budget in
+    /// list order, and for a *suspend* evacuation `lifecycle_changed_at` is the
+    /// evacuation-suspend (or crash-left `restoring`) transition time — the
+    /// closest activity-recency proxy while nothing populates
+    /// `sandboxes.last_used_at`. **That reading does not carry to the stopped
+    /// arm**, whose claim and teardown both leave the lifecycle alone, so there the
+    /// column holds the user's original stop and says nothing about the evacuation;
+    /// the per-arm key below is what makes the ordering mean one thing. The `id DESC` tiebreaker (UUIDv7, so
+    /// time-ordered) keeps the order deterministic for rows suspended in the
+    /// same instant. The backoff state
+    /// is reset by the `sandboxes_clear_evacuation_restore_target` trigger the
+    /// moment the marker clears (restore success or user takeover).
+    ///
+    /// The two shapes are `pplx_space_sandbox_store::evacuation_restores::pending`'s
+    /// statements, chosen by `honor_backoff_windows`.
     async fn list_restore_pending_evacuations(
         &self,
         honor_backoff_windows: bool,
     ) -> Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error> {
-        let query = restore_pending_evacuations_query(honor_backoff_windows);
-        let rows: Vec<(SandboxId, String)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .fetch_all(&self.pool)
-                .await?;
+        // Two populations, discriminated by the marker rather than by the
+        // lifecycle, because `restoring` is reachable from both and says nothing
+        // about which kind of evacuation is mid-flight.
+        //
+        // The **stopped** arm differs from the suspend arm in three ways, each
+        // load-bearing:
+        //
+        // * Its resting lifecycle is `stopped`, not `suspended` — a stopped
+        //   evacuation never enters the suspend pipeline, so there is no
+        //   `suspended` state to rest in.
+        // * Its durability proof is the pinned *disk* artifact, not the newest
+        //   full snapshot. A stopped sandbox has no memory image, so
+        //   `latest_full_snapshot_ready` is unsatisfiable for it and would hide
+        //   the row from the sweep forever.
+        // * `active_node_id IS NULL` gates the resting case. That is the teardown
+        //   having completed, and it is what keeps the sweep off a row whose bytes
+        //   are already durable but whose node the drain has not released
+        //   yet — re-placing that sandbox while it is still resident would give it
+        //   two homes. The `restoring` case is deliberately outside the term: the
+        //   restore's own pod placement re-populates the column, so applying it
+        //   there would strand a crash-recovery re-drive.
+        // The recency key is per-arm, because `lifecycle_changed_at` does not mean
+        // the same thing on both. For a suspend evacuation it is the
+        // evacuation-suspend transition — when the row became this sweep's
+        // responsibility. For a stopped one it is the **user's original stop**: the
+        // claim deliberately changes no lifecycle, and neither does the teardown,
+        // so a sandbox stopped three weeks ago and evacuated a minute ago carries a
+        // three-week-old key and sorts behind every fresh suspend evacuation.
+        //
+        // That inverts the priority exactly where it matters most. Under budget
+        // pressure the starved row is the only one in the list with no live copy
+        // anywhere: a suspend evacuation still has its snapshot and its owner gets
+        // a retryable error, while a torn-down stopped sandbox is on no node and
+        // its owner's `start` is a hard 503 until the sweep reaches it.
+        //
+        // `placement_changed_at` is the stopped arm's equivalent: the teardown's
+        // placement clear (`forget_pod_tracking_if_no_active_execution`, in delete
+        // mode) runs under `PlacementClock::Bump` (only `Retire` preserves), so it
+        // is stamped at exactly the moment the row became
+        // unplaced — the same "became the sweep's responsibility" instant the
+        // suspend arm gets from its own column. The `CASE` costs an in-memory sort
+        // the sweep was already doing over a set bounded by the marker's partial
+        // index.
+        let rows =
+            sandbox_store::evacuation_restores::pending(&self.pool, honor_backoff_windows).await?;
         let mut out = Vec::with_capacity(rows.len());
-        for (id, target_str) in rows {
+        for RestorePendingEvacuation {
+            id,
+            evacuation_restore_target: target_str,
+        } in rows
+        {
             // The CHECK on `evacuation_restore_target` restricts the column
             // to `'started'`/`'paused'`/`'stopped'`, so both guards are
             // unreachable in production — the price for reusing
@@ -4686,21 +4385,85 @@ impl NodeDrainSink for SubstrateSink {
         Ok(out)
     }
 
+    /// How long the longest-stalled stopped evacuation has been waiting for its
+    /// bytes, in seconds — `0` when none is waiting, plus the row it measured.
+    ///
+    /// **The gap this closes.** [`pplx_space_sandbox_store::stopped_replacements::pending`] counts rows
+    /// with `active_node_id IS NULL`, i.e. ones already torn down and waiting to be
+    /// placed. An evacuation stuck *before* the teardown still has its node, so it
+    /// is invisible there — and it is invisible everywhere else too: the only other
+    /// signals are a `debug` log and
+    /// `node_drain.stopped_evacuation{outcome=awaiting_durable_disk}`, which by
+    /// design looks identical to a healthy multi-gigabyte upload. So a claim that
+    /// can never satisfy its durability gate parks the node with the alert flat at
+    /// zero — precisely the failure this feature's safety argument leans on being
+    /// *visible*, since fail-closed is only a defence if someone finds out.
+    ///
+    /// **An age rather than a thresholded count**, so the operator owns the window.
+    /// Any constant chosen here would be a guess about the largest legitimate
+    /// rootfs upload on the slowest link in the fleet; a monitor can say
+    /// `> 1h for 10m` and be retuned without a deploy.
+    ///
+    /// The age is measured from the pinned artifact's **earliest** catalog
+    /// registration — `snapshots.timestamp`, stamped when a publish first reached
+    /// the cluster. `MIN`, not `MAX`: `insert_snapshot` conflicts only on `id`, so
+    /// re-registering the same artifact adds a row, and taking the newest would
+    /// *shorten* the reported age on exactly the sandboxes that have been retried
+    /// most.
+    ///
+    /// Three clocks, tried in order, so the expression can never resolve to NULL —
+    /// which the caller would publish as a reassuring `0` for the very node nobody
+    /// is watching. A row with no catalog row has not published, and falls back to
+    /// the drain's start; a draining node with no start time (a bug to notice in its
+    /// own right) falls back to when the sandbox became `stopped`. The first clock
+    /// is registration time, which comes after the claim, so it can under-report;
+    /// the value also drops when the first catalog row appears and the clock
+    /// switches from the drain's start to it. None is a
+    /// claim about the artifact's *contents* — see [`claim_stopped_evacuation`] for
+    /// why no timestamp here could be.
+    ///
+    /// **Scoped to claimed evacuations, and only those.** This selects on the
+    /// marker, which means it sees exactly the population that has work in flight:
+    /// a claim whose upload is slow or whose durability gate is not opening. It does
+    /// **not** see the refusal — a sandbox whose *node* reports an artifact this
+    /// drain did not mint — and that is deliberate rather than a gap. An earlier
+    /// revision carried a second disjunct for it, `current_local_artifact_id IS NOT
+    /// NULL`, which reads the **cluster** column; on the `managed_by = 'k8s'` nodes
+    /// this reconciler drains, nothing ever writes a `disk`/`stop` pin there (see
+    /// [`SubstrateSink::node_reported_artifact`] for the three reasons), so the
+    /// disjunct could not fire and only its tests, which set the column by hand,
+    /// suggested otherwise. The refusal is counted on
+    /// `node_drain.stopped_evacuation{outcome=unattributable_artifact}` and logged
+    /// with the node, the sandbox and the node's stopped-since time, which is where
+    /// a responder should be sent for it.
+    ///
+    /// The `s.id` tiebreak is not decoration: the age is an integer number of
+    /// seconds, so two evacuations that started in the same second compare equal,
+    /// and without it the paced WARN would name a different sandbox from one hour to
+    /// the next for an unchanged incident. The restore-pending sweep orders on
+    /// `s.id DESC` for the same reason.
+    ///
+    /// **Forced drains only.** A claim can only be opened on one, and a marker that
+    /// outlives an `:undrain` is drift the claim refuses as `Deferred` rather than a
+    /// stall. Without this term the first gentle drain of a node holding a marked
+    /// row would report an age against a documented one-hour alert.
+    ///
+    /// The statement is `pplx_space_sandbox_store::stopped_evacuations::longest_stall`.
     async fn stopped_evacuation_stall(
         &self,
     ) -> Result<Option<StoppedEvacuationStall>, sqlx::Error> {
-        let query = stopped_evacuation_stall_secs_query();
-        let row: Option<(i64, SandboxId, NodeId)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(
-            row.map(|(secs, sandbox_id, node_id)| StoppedEvacuationStall {
+        let row = sandbox_store::stopped_evacuations::longest_stall(&self.pool).await?;
+        Ok(row.map(
+            |LongestStall {
+                 stall_secs: secs,
+                 sandbox_id,
+                 node_id,
+             }| StoppedEvacuationStall {
                 age: Duration::from_secs(secs.max(0).cast_unsigned()),
                 sandbox_id,
                 node_id,
-            }),
-        )
+            },
+        ))
     }
 
     async fn count_stopped_replacements_pending(&self) -> Result<u64, sqlx::Error> {
@@ -5215,13 +4978,6 @@ mod durable_upload_gate_tests;
 /// is where the rollout risk is — either statement alone is sound.
 #[cfg(test)]
 mod backup_queue_tests;
-
-/// Scale regression for the pinned local-only work queue: the shape of the
-/// statement, not the rows it returns. `durable_upload_gate_tests` covers the
-/// rows; this covers how the work of finding them grows with a node's suspend
-/// history, so large histories cannot make a forced drain time out.
-#[cfg(test)]
-mod pinned_local_only_scale_tests;
 
 /// Postgres-backed coverage for how the reconciler reads and re-checks
 /// `nodes.drain_mode`: the draining listing resolves NULL and unrecognized

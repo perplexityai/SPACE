@@ -11,9 +11,12 @@ use uuid::Uuid;
 use super::{
     DEAD_UPLOAD_SETTLE, DrainedNodeTerminatorSink, NodeDbStore, OrphanDeleteOutcome,
     OrphanDeleteRefusal, PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence,
-    delete_drained_node_if_orphan_query, local_snapshots_count_query, mark_terminating_query,
+    delete_drained_node_if_orphan_query, mark_terminating_query,
 };
-use pplx_space_sandbox_store::lost::mark_unrecoverable_sandboxes_lost_query;
+use pplx_space_sandbox_store::drain_gate_blockers;
+use pplx_space_sandbox_store::lost::{
+    lock_unrecoverable_candidates, mark_unrecoverable_sandboxes_lost_query,
+};
 
 use pplx_space_test_env::TestResult;
 
@@ -85,10 +88,7 @@ async fn inflight_upload_blocks_terminate_until_finalized() -> TestResult {
     insert_drained_node(pool, node).await?;
     insert_suspended_sandbox_with_creating_snapshot(pool, node).await?;
 
-    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(local_snapshots_count_query())))
-        .bind(node)
-        .fetch_one(pool)
-        .await?;
+    let count: i64 = drain_gate_blockers::count_on_node(pool, node).await?;
     assert_eq!(
         count, 1,
         "in-flight upload must count as a blocking snapshot"
@@ -196,10 +196,7 @@ async fn evacuation_restoring_does_not_block_terminate() -> TestResult {
     let node_a = NodeId::new();
     insert_drained_node(pool, node_a).await?;
     insert_restoring_sandbox(pool, node_a, Some("started")).await?;
-    let count_a: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(local_snapshots_count_query())))
-        .bind(node_a)
-        .fetch_one(pool)
-        .await?;
+    let count_a: i64 = drain_gate_blockers::count_on_node(pool, node_a).await?;
     assert_eq!(
         count_a, 0,
         "an evacuation restore must not block termination"
@@ -222,10 +219,7 @@ async fn evacuation_restoring_does_not_block_terminate() -> TestResult {
     let node_b = NodeId::new();
     insert_drained_node(pool, node_b).await?;
     insert_restoring_sandbox(pool, node_b, None).await?;
-    let count_b: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(local_snapshots_count_query())))
-        .bind(node_b)
-        .fetch_one(pool)
-        .await?;
+    let count_b: i64 = drain_gate_blockers::count_on_node(pool, node_b).await?;
     assert_eq!(
         count_b, 1,
         "a non-evacuation restore still blocks termination"
@@ -313,10 +307,7 @@ async fn terminate_blocks_marked_sandbox_until_current_upload_ready() -> TestRes
     .execute(pool)
     .await?;
 
-    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(local_snapshots_count_query())))
-        .bind(node)
-        .fetch_one(pool)
-        .await?;
+    let count: i64 = drain_gate_blockers::count_on_node(pool, node).await?;
     assert_eq!(count, 1, "current upload in flight must block terminate");
     let flipped = sqlx::query(sqlx::AssertSqlSafe(sql!(mark_terminating_query(
         ResidencyEvidence::default()
@@ -1421,20 +1412,35 @@ async fn the_claim_locks_only_rows_without_a_durable_copy() -> TestResult {
     let durable = insert_suspended_with_durable_snapshot(pool, node).await?;
     let casualty = insert_suspended_without_snapshots(pool, node).await?;
 
+    /// A claim to hold while probing: a control statement, or the give-up's
+    /// own lock verb.
+    #[derive(Clone, Copy)]
+    enum Claim<'a> {
+        Control(&'a str),
+        GiveUp,
+    }
+
     /// Is the row `probe` selects for `$1 = id` free while `claim` holds its
     /// locks?
     async fn free_under(
         pool: &PgPool,
-        claim: &str,
+        claim: Claim<'_>,
         node: NodeId,
         probe: &str,
         id: SandboxId,
     ) -> TestResult<bool> {
         let mut claim_tx = pool.begin().await?;
-        sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql!(claim)))
-            .bind(node)
-            .fetch_all(&mut *claim_tx)
-            .await?;
+        match claim {
+            Claim::Control(statement) => {
+                sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql!(statement)))
+                    .bind(node)
+                    .fetch_all(&mut *claim_tx)
+                    .await?;
+            }
+            Claim::GiveUp => {
+                lock_unrecoverable_candidates(&mut claim_tx, node).await?;
+            }
+        }
         let mut probe_tx = pool.begin().await?;
         // Only `lock_not_available` (55P03) means "locked"; any other error
         // fails the test rather than reading as a lock.
@@ -1464,7 +1470,14 @@ async fn the_claim_locks_only_rows_without_a_durable_copy() -> TestResult {
                        ORDER BY id
                        FOR UPDATE";
     assert!(
-        !free_under(pool, historical, node, SANDBOX_PROBE, durable).await?,
+        !free_under(
+            pool,
+            Claim::Control(historical),
+            node,
+            SANDBOX_PROBE,
+            durable
+        )
+        .await?,
         "control: the historical claim locks the durable row, so the probe can \
          tell the two claims apart"
     );
@@ -1479,27 +1492,27 @@ async fn the_claim_locks_only_rows_without_a_durable_copy() -> TestResult {
                      FOR UPDATE";
     for probe in [SNAPSHOT_PROBE, STORAGE_LOCATION_PROBE] {
         assert!(
-            !free_under(pool, joined, node, probe, durable).await?,
+            !free_under(pool, Claim::Control(joined), node, probe, durable).await?,
             "control: a claim joining the durability tables locks their rows, \
              so {probe:?} can see such a lock"
         );
     }
 
-    let claim = super::gone_node_giveup_claim_query();
+    let claim = Claim::GiveUp;
     assert!(
-        free_under(pool, &claim, node, SANDBOX_PROBE, durable).await?,
+        free_under(pool, claim, node, SANDBOX_PROBE, durable).await?,
         "the claim must not lock a row with a durable copy"
     );
     assert!(
-        free_under(pool, &claim, node, SNAPSHOT_PROBE, durable).await?,
+        free_under(pool, claim, node, SNAPSHOT_PROBE, durable).await?,
         "the claim must not lock the snapshot rows its durability check reads"
     );
     assert!(
-        free_under(pool, &claim, node, STORAGE_LOCATION_PROBE, durable).await?,
+        free_under(pool, claim, node, STORAGE_LOCATION_PROBE, durable).await?,
         "...nor the storage-location rows it reads"
     );
     assert!(
-        !free_under(pool, &claim, node, SANDBOX_PROBE, casualty).await?,
+        !free_under(pool, claim, node, SANDBOX_PROBE, casualty).await?,
         "...but it must lock the row it claims, or the flip races the \
          concurrent BeginArtifactBackup insert the lock serializes against"
     );

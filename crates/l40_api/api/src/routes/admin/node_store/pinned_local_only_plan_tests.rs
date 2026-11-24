@@ -435,7 +435,7 @@ async fn seed_fleet(pool: &PgPool, fleet_elsewhere: usize) -> TestResult<Fleet> 
 /// One `EXPLAIN (ANALYZE, FORMAT JSON)` statement's result.
 ///
 /// Typed rather than walked as a `serde_json::Value`, following the shape in
-/// `node_drain/store/pinned_local_only_scale_tests.rs`: serde handles the root
+/// `pplx-space-sandbox-store`'s `src/pinned_local_only/tests.rs`: serde handles the root
 /// array, the `Plan` wrapper and the `Plans` nesting declaratively, so a
 /// traversal that silently misses one of the three — which reads exactly like
 /// "the pathology is absent" — is not expressible.

@@ -97,14 +97,17 @@
 //!   it, for scoping the storage credentials a node may receive.
 //!   [`spaced_version_counts`] groups the rows and the observed states nodes
 //!   publish by the template, `spaced` version and status the admin list
-//!   shows.
+//!   shows. [`drain_gate_blockers`] counts the rows that block one node's
+//!   release, and [`node_residents`] the rows node drain's resident scan and
+//!   termination-blocking gate count against it.
 //! * **So are single-question reads.** A read of the `sandboxes` row that
 //!   callers made inline moves here whole, as a module named for the question
 //!   it answers, such as [`restore_pod_owners`], [`stale_suspended_executions`],
-//!   [`stopped_replacements`], [`placement_gate`] or [`template_usage`], and so
-//!   does one that joins the row to what it references, as
-//!   [`row_reads::owner`] (its organization) and [`debug_reads::record`]
-//!   (its nodes) do.
+//!   [`stopped_replacements`], [`placement_gate`] or [`template_usage`]
+//!   (node drain's are [`evacuation_candidates`], [`evacuation_restores`],
+//!   [`pinned_local_only`] and [`stopped_evacuations`]), and so does one
+//!   that joins the row to what it references, as [`row_reads::owner`]
+//!   (its organization) and [`debug_reads::record`] (its nodes) do.
 //!   The two restore-lease reads the Direct restore takes before and after
 //!   its claim stay beside that claim in [`direct`].
 //!   Some such modules also read tables another store owns. For example,
@@ -115,7 +118,9 @@
 //!   [`quarantine_publication::lock_pause_failed_recovery_candidates`] also
 //!   locks the joined episode rows (`FOR UPDATE OF s, qs`).
 //!   [`debug_reads::record`] joins `nodes` and `node_k8s`, which belong to
-//!   `pplx-space-node-registration-store`.
+//!   `pplx-space-node-registration-store`; [`stopped_evacuations`] reads
+//!   `nodes` too, and `snapshots`, which belongs to
+//!   `pplx-space-snapshot-store`.
 //!   [`org_storage`] joins the owning organization's row in `organizations`,
 //!   which no store owns yet, for its configured snapshot storage.
 //! * **Sibling tables get a module each.** The unlocked reads and the
@@ -187,8 +192,11 @@ pub mod delete;
 pub mod deleted_rows;
 pub mod direct;
 pub mod drain;
+pub mod drain_gate_blockers;
 pub mod drain_terminate;
 pub mod ecw_credential_epochs;
+pub mod evacuation_candidates;
+pub mod evacuation_restores;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
@@ -200,9 +208,11 @@ pub mod node_desired_state;
 pub mod node_holds;
 pub mod node_local_backup_pending;
 pub mod node_placements;
+pub mod node_residents;
 pub mod observed_states;
 pub mod org_storage;
 pub mod orphan;
+pub mod pinned_local_only;
 pub mod placement_gate;
 pub mod pod_tracking;
 pub mod port_exposures;
@@ -229,6 +239,7 @@ pub mod snapshot_retention_finalize;
 pub mod spaced_version_counts;
 pub mod stale_suspended_executions;
 pub mod started_recovery_source;
+pub mod stopped_evacuations;
 pub mod stopped_replacement_claim;
 pub mod stopped_replacements;
 pub mod stuck;

@@ -387,7 +387,7 @@ pub fn non_resident_lifecycle_exclusion(sandbox_alias: &str) -> String {
 /// refuse on a match, and the terminator's KubeNodeGone reap **deletes** the
 /// `nodes` row behind the same `resident_blocking_clause`. Two ungated readers
 /// refuse nothing at all — node-drain's per-lifecycle gauge and the terminator's
-/// `delete_refusal_diagnostics_query`, which exist so an environment can measure
+/// refusal diagnosis (`pplx_space_node_registration_store::orphan_reap_refusal::diagnose`), which exist so an environment can measure
 /// this population before it holds anything on it. So neither "it refuses" nor
 /// "the flag governs it" generalizes across the set; grep the callers rather
 /// than trusting this list, which has grown before.

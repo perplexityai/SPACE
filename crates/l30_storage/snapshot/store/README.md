@@ -98,7 +98,12 @@ storage-backend bytes.
 The `lost` module holds what the lost-sandbox give-ups run in their flip's
 transaction: the `FOR UPDATE` locks they take on `creating` full uploads
 before the flip, and the guarded write that then fails the gone node's quiet
-`creating` full uploads for the sandboxes they flipped.
+`creating` full uploads for the sandboxes they flipped. It also holds node
+drain's guarded write for a node whose instance is confirmed terminated:
+failing every `creating` full upload from it while the node is still
+`draining` under the Kubernetes identity the caller observed
+(`fail_inflight_uploads_from_gone_node`). Its guard reads `nodes` and
+`node_k8s`, which belong to `pplx-space-node-registration-store`.
 
 The `claimed` module holds the reads of snapshots a committed claim parked in
 `deleting`. Retention's recovery runs two of them: the highest claimed id

@@ -276,7 +276,7 @@ pub const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
 ///    node-drain's in-flight evacuation **restore** — a marked `restoring` row
 ///    legitimately polls the rebuilt pod for up to the evacuate-timeout (the
 ///    same order of magnitude as this sweep's default age) and has its own
-///    re-drive path (`restore_pending_evacuations_query` + `restore_in_flight`),
+///    re-drive path ([`crate::evacuation_restores::pending`] + `restore_in_flight`),
 ///    so the backstop must not race it. The clear-trigger only keeps the marker
 ///    on `suspending`/`suspended`/`restoring`, and `suspended` isn't sweepable,
 ///    so `restoring` is the only lifecycle this exemption actually spares. A

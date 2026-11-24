@@ -421,6 +421,7 @@ pplx-space-node-runtime-manager-store = [
 ]
 pplx-space-node-status-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
   "pplx-space-runtime-upgrade-campaign-store",
 ]
@@ -455,6 +456,7 @@ pplx-space-sandbox-portability = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+  "pplx-space-node-registration-store",
   "pplx-space-sandbox-store",
   "pplx-space-snapshot-store",
 ]
@@ -467,6 +469,7 @@ pplx-space-sandbox-residency = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-node-registration-store",
+  "pplx-space-node-status-store",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sandbox-routability = [
