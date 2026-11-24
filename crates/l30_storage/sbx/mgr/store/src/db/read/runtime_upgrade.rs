@@ -73,13 +73,22 @@ pub fn runtime_upgrade_attempt_outcome(
     crate::db::runtime_upgrade_attempt_outcome(conn, operation_id, attempt_id)
 }
 
-/// The sandbox the attempt `attempt_id`'s final outcome under
-/// `operation_id` was recorded for, `None` without one; it outlives the
-/// sandbox's row.
-pub fn runtime_upgrade_attempt_sandbox(
+/// [`runtime_upgrade_attempt_outcome`], with the request the outcome was
+/// recorded for, from the same row; see [`RuntimeUpgradeRequestIdentity`].
+pub fn runtime_upgrade_attempt_outcome_with_request(
     conn: &Connection,
     operation_id: RuntimeUpgradeOperationId,
     attempt_id: &str,
-) -> Result<Option<String>> {
-    crate::db::runtime_upgrade_attempt_sandbox(conn, operation_id, attempt_id)
+) -> Result<Option<(RuntimeUpgradeAttemptOutcome, RuntimeUpgradeRequestIdentity)>> {
+    crate::db::runtime_upgrade_attempt_outcome_with_request(conn, operation_id, attempt_id)
+}
+
+/// What the operation `operation_id` asked for, as its attempts' final
+/// outcomes recorded it, one entry per distinct request; empty without one.
+/// These outlive the sandbox's row.
+pub fn retained_runtime_upgrade_requests(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+) -> Result<Vec<crate::db::RuntimeUpgradeRequestIdentity>> {
+    crate::db::retained_runtime_upgrade_requests(conn, operation_id)
 }
