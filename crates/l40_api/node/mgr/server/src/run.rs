@@ -918,6 +918,8 @@ pub async fn run(
             shutdown_token.child_token(),
             &task_tracker,
         );
+        #[cfg(target_os = "linux")]
+        crate::service::cgroup_oom::start(shutdown_token.child_token(), &task_tracker);
         service
             .disk_admission()
             .start_refresh_loop(shutdown_token.child_token(), &task_tracker);

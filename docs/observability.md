@@ -1257,6 +1257,23 @@ disk sample and the disk distribution can count fewer calls than the vCPU and
 memory ones. A known disk size is recorded even when the vCPU and memory are
 not.
 
+## Sandbox cgroup OOM kills
+
+Node-manager samples Linux cgroup v2 `memory.events` every 15 seconds.
+`node_memory.cgroup.oom_kills` counts the kernel's `oom_kill` increments;
+`node_memory.cgroup.oom_group_kills` separately counts `oom_group_kill`
+increments on kernels that expose that field. Do not add the two metrics:
+a group kill also contributes to the kernel's process kill counter.
+
+The only metric-specific tag is `cgroup`, with values `parent`, `vm`, and
+`sidecar`. The parent series is the node's sandbox-tree total and already
+includes its descendants: do not sum it with the VM and sidecar series.
+The breakdown can miss kills in cgroups removed before the next poll, but
+the parent's hierarchical counters retain those events. The first poll
+baselines existing counts, so restarts do not replay old kills. The counters
+describe where the killed processes were, not which memory limit triggered
+the kill.
+
 ## Guest memory in use
 
 Sandbox-manager records the memory each running sandbox's guest is using as

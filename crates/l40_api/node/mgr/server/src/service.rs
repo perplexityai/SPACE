@@ -763,6 +763,8 @@ mod btrfs_delegation;
 mod btrfs_send_source;
 mod btrfs_send_stream;
 mod btrfs_send_transport;
+#[cfg(target_os = "linux")]
+pub(crate) mod cgroup_oom;
 pub mod cgroup_reclaim;
 #[cfg(test)]
 mod claim_contention_tests;
