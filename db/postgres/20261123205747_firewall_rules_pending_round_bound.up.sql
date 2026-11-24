@@ -8,9 +8,9 @@ SET LOCAL statement_timeout = '5s';
 -- only after that migration's down ran and its up was reapplied, or by hand.
 -- The CHECK below is validated, so this refuses with its name while one
 -- remains. Replace each with a new round, numbered past both its pending and
--- accepted rounds and bound to the generation to verify, as the round opener
--- does. Never clear it or bind it under its old number: an answer to the round
--- it was before may still carry that number.
+-- accepted rounds and bound to the generation to verify. Never clear it or
+-- bind it under its old number: an answer to the round it was before may still
+-- carry that number.
 --
 -- The table has one row per node, so validating holds ACCESS EXCLUSIVE only
 -- briefly; NOT VALID and a VALIDATE in this transaction would hold it as long.
