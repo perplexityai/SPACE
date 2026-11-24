@@ -3053,6 +3053,19 @@ pub(crate) mod service_tests {
         );
         assert_eq!(reported_ip(started).await.as_deref(), Some("10.1.2.4"));
         service
+            .external_addresses
+            .record(&started.to_string(), &execution(2, "pod-a"), None);
+        assert_eq!(
+            reported_ip(started).await,
+            None,
+            "an allocation without an address must not report the previous one"
+        );
+        service.external_addresses.record(
+            &started.to_string(),
+            &execution(2, "pod-a"),
+            Some("10.1.2.4"),
+        );
+        service
             .db
             .lock()
             .unwrap()

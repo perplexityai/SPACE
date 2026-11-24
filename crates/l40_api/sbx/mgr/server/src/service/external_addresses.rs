@@ -34,22 +34,26 @@ pub(super) struct ExternalAddresses(DashMap<SandboxId, ExternalAddress>);
 impl ExternalAddresses {
     /// Record the address the node manager allocated for the execution
     /// `route_identity` names. An activation without an execution generation
-    /// and instance, or an address that does not parse, records nothing.
+    /// and instance records nothing; one whose address is missing or does not
+    /// parse clears the sandbox's entry.
     pub(super) fn record(
         &self,
         sandbox_id: &str,
         route_identity: &SpaceApiRouteIdentity,
         address: Option<&str>,
     ) {
-        let (Some(address), Some(execution_generation), Some(pod_uid)) = (
-            address,
+        let (Some(execution_generation), Some(pod_uid), Ok(sandbox_id)) = (
             route_identity.execution_generation,
             route_identity.pod_uid.clone(),
+            sandbox_id.parse::<SandboxId>(),
         ) else {
             return;
         };
-        let (Ok(sandbox_id), Ok(address)) = (sandbox_id.parse(), address.parse()) else {
-            tracing::warn!(sandbox_id, address, "ignoring unparseable external address");
+        let Some(Ok(address)) = address.map(str::parse::<IpAddr>) else {
+            if let Some(address) = address {
+                tracing::warn!(%sandbox_id, address, "ignoring unparseable external address");
+            }
+            self.0.remove(&sandbox_id);
             return;
         };
         let now = Instant::now();
