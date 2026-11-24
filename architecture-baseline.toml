@@ -109,7 +109,6 @@ pplx-space-snapshot-retention = [
   "sqlx",
 ]
 pplx-space-template-mgr = [
-  "pplx-space-common-jobs",
   "rusqlite",
 ]
 pplx-space-template-publisher = [

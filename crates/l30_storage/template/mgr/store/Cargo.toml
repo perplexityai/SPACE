@@ -28,12 +28,15 @@ workspace = true
 
 [dependencies]
 rusqlite = { workspace = true }
+serde = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tonic = { workspace = true }
 
 # internal
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
+pplx-space-common-jobs = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-policy-authority = { workspace = true }
 pplx-space-sql-locator = { workspace = true }

@@ -411,7 +411,7 @@ pub struct TemplateManagerService {
     /// failed transiently). New job kinds add a `match` arm in
     /// [`crate::background_jobs::TemplateBackgroundExecutor`] — no
     /// new worker.
-    background_worker: pplx_space_common_jobs::BackgroundWorker<
+    background_worker: pplx_space_template_mgr_store::jobs::JobWorker<
         crate::background_jobs::TemplateBackgroundExecutor,
     >,
     /// Connect budget this service spends reaching sandbox-manager.
@@ -1832,8 +1832,9 @@ impl TemplateManagerService {
     /// to call `recover_and_log` at startup and `shutdown` at exit.
     pub fn background_worker(
         &self,
-    ) -> pplx_space_common_jobs::BackgroundWorker<crate::background_jobs::TemplateBackgroundExecutor>
-    {
+    ) -> pplx_space_template_mgr_store::jobs::JobWorker<
+        crate::background_jobs::TemplateBackgroundExecutor,
+    > {
         self.background_worker.clone()
     }
 
