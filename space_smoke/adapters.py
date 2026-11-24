@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -88,6 +89,7 @@ from space_smoke.capabilities import (
     EcwSandboxDeleteRetryable,
     EcwSandboxInfo,
     EcwSandboxPages,
+    EcwSandboxReconcileUnmatched,
     EcwSandboxState,
     EcwSandboxUnavailable,
     EcwWatchHandle,
@@ -168,6 +170,7 @@ from space_smoke.runtime import (
     CommandExecutor,
     CommandResult,
     REPO_ROOT,
+    ScenarioTimedOut,
     SmokeConfigurationError,
     run_concurrently,
 )
@@ -728,6 +731,12 @@ ENVIRONMENT_PLACEMENT_GATE_ANNOTATION = "space.pplx.net/smoke-environment-placem
 # them, put back by the next holder's repair as the gate's are.
 TEMPLATE_CAMPAIGN_ENV_ANNOTATION = "space.pplx.net/smoke-template-campaign-env"
 REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
+# The floor of a strict Redis rollout budget held back for the Lease read and
+# patch that clear the Redis record once the rollout is confirmed. Each takes
+# tens of milliseconds on an idle Kind bench; the floor leaves room for a
+# loaded API server without taking the rollout's time, and the clear also gets
+# whatever the rollout leaves unused.
+REDIS_RECORD_CLEAR_SECONDS = 2.0
 # A rollout a scenario starts only to apply or restore its env
 # (`KindHarness._fast_rollout`) runs with every replacement surged at once and
 # no `minReadySeconds`, and the Deployment carries the `minReadySeconds` and
@@ -898,7 +907,40 @@ SELECT state FROM snapshots WHERE sandbox_id = '{sandbox_id}'::uuid AND type = '
 """
 KIND_REDIS_POD_SELECTOR = "app.kubernetes.io/name=space-redis"
 SANDBOX_ID_LABEL = "space.pplx.net/sandbox-id"
+# The label the activating client's id is carried on, and the column it is
+# recorded in. Both are read-only here: the smoke asserts what the API wrote,
+# and writing either from the harness would be asserting its own value back.
+ACTIVATION_CLIENT_LABEL = "space.pplx.net/client-id"
+# The selector the API's own pod reflector watches. The live cap counts from
+# that reflector, so a count taken here has to carry this label too: the
+# client-id label alone would also match a pod the API does not manage, and the
+# whole point of the count is to be the one the cap is working from.
+SANDBOX_MANAGED_BY_SELECTOR = "space.pplx.net/managed-by=space-api"
+# Whether the sandbox row can hold an activating client at all. Necessary for
+# the capability, never sufficient for it: migrations land in their own change
+# ahead of the code that reads them, so a tree can carry this column and none
+# of the writer. The phase runs unconditionally and uses this only to report
+# a missing column as a precondition rather than as an attribution failure.
+ACTIVATION_ATTRIBUTION_COLUMN_SQL = """
+SELECT count(*)
+  FROM information_schema.columns
+ WHERE table_schema = current_schema()
+   AND table_name = 'sandboxes'
+   AND column_name = 'activating_client_id';
+"""
+SANDBOX_LIFECYCLE_SQL = """
+SELECT 'row:' || lifecycle
+  FROM sandboxes
+ WHERE id = '{sandbox_id}'::uuid;
+"""
+SANDBOX_ACTIVATING_CLIENT_SQL = """
+SELECT 'row:' || coalesce(activating_client_id, '')
+  FROM sandboxes
+ WHERE id = '{sandbox_id}';
+"""
 CHECKPOINT_ANNOTATION = "space.pplx.net/checkpoint"
+# The checkpoint value a stopped sandbox's materialization pod carries.
+STOPPED_MATERIALIZATION_CHECKPOINT = "stopped-materialization"
 RESTORE_SOURCE_NODE_ANNOTATION = "space.pplx.net/suspend-restore-source-node"
 RESTORE_STORAGE_URI_ANNOTATION = "space.pplx.net/suspend-restore-storage-uri"
 SANDBOX_EXECUTIONS_SQL = """\
@@ -1198,9 +1240,57 @@ _RETENTION_BOOLEAN_ENV_VALUES = {
 }
 _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
 # Limiter values: booleans, small numbers, a redis:// URL, a client id, and
-# a comma-separated list (SPACE_NATIVE_INLINE_KINDS).
-_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@,-]{1,64}")
+# comma-separated lists — `SPACE_NATIVE_INLINE_KINDS`, and
+# `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS`, which is an allowlist by the
+# limiter's own grammar, so any value naming more than one client needs the
+# comma. One class covers every limiter key, so this admits a comma in the
+# others too; that is safe rather than intended — `_apply_public_api_env`
+# hands each value to `kubectl set env` as one `key=value` argv element, and
+# kubectl splits that on the first `=` and never on a comma, with no shell in
+# between. Everything this guard exists to refuse — whitespace, quotes, `$`,
+# backticks, newlines — stays out.
+LIMITER_ENV_VALUE_MAX = 64
+LIMITER_ENV_VALUE = re.compile(rf"[A-Za-z0-9._:/@,-]{{1,{LIMITER_ENV_VALUE_MAX}}}")
+_LIMITER_ENV_VALUE = LIMITER_ENV_VALUE
+CLIENT_LABEL_VALUE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
+
+
+def _live_cap_counts_pod(pod: Mapping[str, Any]) -> bool:
+    """Whether the live cap's index would count this pod (`client_live_pods.rs`).
+
+    Neither terminal, nor being deleted, nor a stopped-materialization
+    checkpoint pod.
+    """
+
+    metadata = pod.get("metadata") or {}
+    if metadata.get("deletionTimestamp"):
+        return False
+    if (pod.get("status") or {}).get("phase") in ("Succeeded", "Failed"):
+        return False
+    annotations = metadata.get("annotations") or {}
+    return annotations.get(CHECKPOINT_ANNOTATION) != STOPPED_MATERIALIZATION_CHECKPOINT
+
+
+def _live_cap_sandbox_id(pod: Mapping[str, Any]) -> str | None:
+    """The sandbox a qualifying pod counts for, read as the cap's index reads it.
+
+    `annotation_or_label` takes the annotation whenever the key is present,
+    even empty, and the index drops a value that doesn't parse as a
+    `SandboxId` (a UUID), so a census that fell back to the label or kept an
+    unparseable id would count a pod the cap doesn't.
+    """
+
+    metadata = pod.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    if SANDBOX_ID_LABEL in annotations:
+        value = annotations[SANDBOX_ID_LABEL]
+    else:
+        value = (metadata.get("labels") or {}).get(SANDBOX_ID_LABEL)
+    try:
+        return str(uuid.UUID(str(value))) if value is not None else None
+    except ValueError:
+        return None
 
 
 def _env_flag_default(value: str | None, default: bool) -> bool:
@@ -1299,6 +1389,15 @@ NATIVE_OPERATION_READY_ENVS = (
 )
 
 
+class AdminReapIncomplete(SmokeConfigurationError):
+    """A run-metadata admin reap that raised, with the ids whose deletes it
+    queued or left of unknown outcome, for the caller to keep polling."""
+
+    def __init__(self, message: str, pending: Sequence[str]) -> None:
+        super().__init__(message)
+        self.pending = list(pending)
+
+
 class KindHarness:
     def __init__(
         self,
@@ -1316,6 +1415,7 @@ class KindHarness:
         self._liveness_budget_target: tuple[str, str] | None = None
         self._cordon_lease_ownership: _LeaseOwnership | None = None
         self._public_api_lease_ownership: _LeaseOwnership | None = None
+        self._redis_fault_clear_ready: bool = False
         self._drain_gate_lease_ownership: _LeaseOwnership | None = None
         self._node_ctl_lease_ownership: _LeaseOwnership | None = None
         self._node_manager_lease_ownership: _LeaseOwnership | None = None
@@ -1324,6 +1424,11 @@ class KindHarness:
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
         # The operator session the console scenarios' API reads and writes use.
         self._console_token: str | None = None
+        # The late probe reap's force-delete per sandbox: the idempotency key
+        # reserved before its first POST and the operation it was accepted
+        # under, so no caller or retry queues a second (`admin_force_delete_sandbox`).
+        self._late_reap_deletes: dict[str, dict[str, str]] = {}
+        self._late_reap_lock = threading.Lock()
 
     def kubectl(
         self,
@@ -1380,7 +1485,7 @@ class KindHarness:
         )
         try:
             try:
-                response = urlopen(request, timeout=30)
+                response = _URL_OPEN(request, timeout=30)
             except HTTPError as error:
                 response = error
             with response:
@@ -1876,6 +1981,8 @@ class KindHarness:
         ownership: _LeaseOwnership,
         action: str,
         annotations: Mapping[str, str | None] | None = None,
+        *,
+        deadline: float | None = None,
     ) -> None:
         """Renew our live Lease and set or clear `annotations` in one guarded patch.
 
@@ -1884,10 +1991,19 @@ class KindHarness:
         and repaired its records; the patch tests uid, resourceVersion and
         holder, so that runner fails here instead of undoing the successor's
         fault or erasing its records, and a renewed Lease cannot expire under
-        the write that follows.
+        the write that follows. With `deadline` (a `time.monotonic()` value),
+        the read and the patch each get only what is left of it.
         """
 
-        metadata, _ = self._assert_lease_owned(ownership, action)
+        def request_timeout() -> float:
+            if deadline is None:
+                return 15.0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{action} ran out of its budget before the Lease write")
+            return min(15.0, remaining)
+
+        metadata, _ = self._assert_lease_owned(ownership, action, timeout=request_timeout())
         existing = metadata.get("annotations")
         existing = existing if isinstance(existing, dict) else None
         patch: list[dict[str, object]] = [
@@ -1915,7 +2031,13 @@ class KindHarness:
                 existing = {}
             patch.append({"op": "add", "path": path, "value": value})
         result = self.kubectl(
-            "patch", "lease", ownership.name, "--type=json", "--patch", json.dumps(patch)
+            "patch",
+            "lease",
+            ownership.name,
+            "--type=json",
+            "--patch",
+            json.dumps(patch),
+            timeout=request_timeout(),
         )
         if result.returncode != 0:
             raise SmokeConfigurationError(
@@ -3457,10 +3579,10 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- concurrent restore contention -------------------------------------
 
-    def _public_api_deployment(self) -> str:
+    def _public_api_deployment(self, *, timeout: float = 15) -> str:
         result = self.kubectl(
             "get", "deploy", "-l", PUBLIC_API_DEPLOYMENT_SELECTOR,
-            "-o", "jsonpath={.items[*].metadata.name}", timeout=15,
+            "-o", "jsonpath={.items[*].metadata.name}", timeout=timeout,
         )
         names = _require_ok(result, "find the public API Deployment").split()
         if len(names) != 1:
@@ -3538,23 +3660,59 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"set {name} bounds to {minimum}..{maximum}",
         )
 
-    def wait_public_api_rollout(self, *, timeout: float) -> None:
-        name = self._public_api_deployment()
+    def wait_public_api_rollout(
+        self, *, timeout: float, shared_deadline: bool = False
+    ) -> None:
+        if not shared_deadline:
+            name = self._public_api_deployment()
+            rollout_seconds = max(1, math.ceil(timeout))
+            grace_seconds = min(30.0, max(5.0, timeout * 0.25))
+            _require_ok(
+                self.kubectl(
+                    "rollout",
+                    "status",
+                    f"deploy/{name}",
+                    f"--timeout={rollout_seconds}s",
+                    timeout=rollout_seconds + grace_seconds,
+                ),
+                f"await rollout of {name}",
+            )
+            self._wait_deployment_pods_drained(name, timeout=timeout)
+            return
+
+        deadline = time.monotonic() + timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"public API rollout budget ({timeout:g}s) is already exhausted")
+        name = self._public_api_deployment(timeout=min(15.0, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"await rollout of {name} exhausted its {timeout:g}s budget during Deployment lookup"
+            )
+        # kubectl's own `--timeout` takes whole seconds (and 0 means "wait
+        # forever"), so it rounds up; the process timeout is the remaining
+        # budget itself, so no call outlives the shared deadline.
         _require_ok(
             self.kubectl(
-                "rollout", "status", f"deploy/{name}", f"--timeout={int(timeout)}s",
-                timeout=timeout + 30,
+                "rollout",
+                "status",
+                f"deploy/{name}",
+                f"--timeout={max(1, math.ceil(remaining))}s",
+                timeout=remaining,
             ),
             f"await rollout of {name}",
         )
-        self._wait_deployment_pods_drained(name, timeout=timeout)
+        self._wait_deployment_pods_drained(name, timeout=timeout, deadline=deadline)
 
     def wait_public_api_pods_drained(self, *, timeout: float) -> None:
         """Block until only the Deployment's desired API pods exist, none Terminating."""
 
         self._wait_deployment_pods_drained(self._public_api_deployment(), timeout=timeout)
 
-    def _wait_deployment_pods_drained(self, name: str, *, timeout: float) -> None:
+    def _wait_deployment_pods_drained(
+        self, name: str, *, timeout: float, deadline: float | None = None
+    ) -> None:
         """Block until only the Deployment's desired pods exist, none Terminating.
 
         `kubectl rollout status` completes a rolling update, or a scale-down,
@@ -3566,12 +3724,26 @@ ON CONFLICT (key_hash) DO NOTHING;
         connections first.
         """
 
-        deadline = time.monotonic() + timeout
+        strict_deadline = deadline is not None
+        effective_deadline = time.monotonic() + timeout if deadline is None else deadline
+
+        def _read_timeout() -> float:
+            remaining = effective_deadline - time.monotonic()
+            if not strict_deadline:
+                return min(15.0, max(5.0, remaining + 5.0))
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"{name} pods did not drain within {timeout:g}s"
+                )
+            return min(15.0, remaining)
+
         while True:
             # Re-read each poll: an autoscaler may move the desired count.
             deployment = json.loads(
                 _require_ok(
-                    self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                    self.kubectl(
+                        "get", "deploy", name, "-o", "json", timeout=_read_timeout()
+                    ),
                     f"read {name}",
                 )
             )
@@ -3582,21 +3754,28 @@ ON CONFLICT (key_hash) DO NOTHING;
             selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
             pods = json.loads(
                 _require_ok(
-                    self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15),
+                    self.kubectl(
+                        "get", "pods", "-l", selector, "-o", "json", timeout=_read_timeout()
+                    ),
                     f"list {name} pods",
                 )
             ).get("items", [])
             terminating = [
                 pod["metadata"]["name"] for pod in pods if pod["metadata"].get("deletionTimestamp")
             ]
+            status_detail = f"(present={len(pods)}, terminating={terminating})"
+            if strict_deadline and time.monotonic() >= effective_deadline:
+                raise RuntimeError(
+                    f"{name} pods did not drain to {desired} within {timeout:g}s {status_detail}"
+                )
             if not terminating and len(pods) == desired:
                 return
-            if time.monotonic() > deadline:
+            remaining = effective_deadline - time.monotonic()
+            if remaining < 0 or (strict_deadline and remaining <= 0):
                 raise RuntimeError(
-                    f"{name} pods did not drain to {desired} within {timeout:g}s "
-                    f"(present={len(pods)}, terminating={terminating})"
+                    f"{name} pods did not drain to {desired} within {timeout:g}s {status_detail}"
                 )
-            time.sleep(1)
+            time.sleep(min(1.0, remaining) if strict_deadline else 1)
 
     # --- node groups ----------------------------------------------------------
 
@@ -3735,7 +3914,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         """
 
         ownership = ownership or self._held_public_api_lease(f"a fast rollout of {name}")
-        self._assert_lease_owned(ownership, f"a fast rollout of {name}")
+        self._assert_lease_owned(ownership, f"a fast rollout of {name}", timeout=15)
 
         # Armed before the first patch is sent: a patch whose reply is lost,
         # or that a deadline interrupts, may still have committed, and the
@@ -3745,7 +3924,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._speed_up_rollout(name, armed.append)
             yield
         except BaseException as error:
-            if armed:
+            if armed and isinstance(error, ScenarioTimedOut):
+                error.add_note(
+                    f"skipping rollout pace restore of {name} after deadline; "
+                    "the next scenario's preflight repair restores it from the Deployment's record"
+                )
+            elif armed:
                 try:
                     self._restore_rollout_pace(name, armed[-1])
                 except Exception as restore_error:  # noqa: BLE001 - attached to the body's error below
@@ -4429,7 +4613,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=body,
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with _URL_OPEN(request, timeout=30) as response:
                 payload = json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native create returned HTTP {error.code}") from None
@@ -4487,7 +4671,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=json.dumps(body).encode(),
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 return int(response.status), response.read().decode(errors="replace")[:2_000]
         except HTTPError as error:
             return error.code, error.read(2_000).decode(errors="replace")
@@ -4728,7 +4912,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=b"{}",
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 payload = json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native :suspend returned HTTP {error.code}") from None
@@ -4753,7 +4937,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             headers={"Authorization": "Bearer " + self._admin_token()},
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 return json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native {method} /v1/{resource} returned HTTP {error.code}") from None
@@ -4934,7 +5118,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             },
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 payload = json.load(response)
         except HTTPError as error:
             if error.code == 404:
@@ -4963,11 +5147,15 @@ ON CONFLICT (key_hash) DO NOTHING;
             duration_seconds=duration_seconds,
         )
         self._public_api_lease_ownership = ownership
+        self._redis_fault_clear_ready = False
 
         def release() -> None:
-            self._release_lease(ownership)
-            if self._public_api_lease_ownership is ownership:
-                self._public_api_lease_ownership = None
+            try:
+                self._release_lease(ownership)
+            finally:
+                if self._public_api_lease_ownership is ownership:
+                    self._public_api_lease_ownership = None
+                    self._redis_fault_clear_ready = False
 
         return release
 
@@ -4991,7 +5179,22 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         recorded_env = annotations.get(LIMITER_ENV_ANNOTATION)
         if isinstance(recorded_env, str) and recorded_env:
-            standing = _recorded_limiter_env(recorded_env)
+            try:
+                standing = _recorded_limiter_env(recorded_env)
+            except ValueError as error:
+                # A record a newer runner wrote, naming limiter keys this
+                # checkout doesn't know. The exact recovery goes in the error:
+                # a runner that knows the keys repairs it (restoring the env and
+                # clearing the record); clearing it by hand only unblocks this
+                # one and leaves the env as the aborted run set it.
+                raise ValueError(
+                    f"{error}. The limiter env record on Lease {ownership.name} was written "
+                    "by a newer smoke runner. Run any Kind scenario from a checkout that "
+                    "knows these keys to restore the env and clear the record, or clear "
+                    "the record by hand (the limiter env then stays as that run left it): "
+                    f"kubectl annotate lease {ownership.name} {LIMITER_ENV_ANNOTATION}- "
+                    f"-n {KIND_NAMESPACE} --context {self.config.context}"
+                ) from error
             self._renew_lease(ownership, "an orphaned limiter env repair")
             self._apply_public_api_env(
                 standing, "restore the limiter env a previous smoke Lease holder left", ownership
@@ -5159,7 +5362,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         return ownership
 
     def _lease_annotation(self, ownership: _LeaseOwnership, key: str) -> str | None:
-        current = self.kubectl("get", "lease", ownership.name, "-o", "json")
+        current = self.kubectl("get", "lease", ownership.name, "-o", "json", timeout=15)
         _require_ok(current, f"read the {ownership.subject} Lease")
         value = _lease_annotations(_lease_document(current.stdout)).get(key)
         return value if isinstance(value, str) and value else None
@@ -5185,8 +5388,21 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         return self._deployment_env_literals(self._public_api_deployment(), keys)
 
+    def public_api_has_env_from(self) -> bool:
+        result = self.kubectl(
+            "get", "deploy", self._public_api_deployment(), "-o",
+            "jsonpath={.spec.template.spec.containers[0].envFrom}", timeout=15,
+        )
+        return bool(json.loads(_require_ok(result, "read the public API envFrom") or "[]"))
+
     def _apply_public_api_env(
-        self, values: Mapping[str, str | None], action: str, ownership: _LeaseOwnership | None = None
+        self,
+        values: Mapping[str, str | None],
+        action: str,
+        ownership: _LeaseOwnership | None = None,
+        *,
+        rollout_timeout: float = 240,
+        shared_deadline: bool = False,
     ) -> None:
         _require_limiter_env_keys(values)
         self._require_isolated_kind("public API env override")
@@ -5202,7 +5418,9 @@ ON CONFLICT (key_hash) DO NOTHING;
                 self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
                 action,
             )
-            self.wait_public_api_rollout(timeout=240)
+            self.wait_public_api_rollout(
+                timeout=rollout_timeout, shared_deadline=shared_deadline
+            )
 
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None:
         from space_smoke.rate_limiters import LIMITER_ENV_KEYS
@@ -5220,11 +5438,23 @@ ON CONFLICT (key_hash) DO NOTHING;
         record: dict[str, str | None] = {}
         if self._lease_annotation(ownership, LIMITER_ENV_ANNOTATION) is None:
             standing = self.public_api_env(LIMITER_ENV_KEYS)
-            record[LIMITER_ENV_ANNOTATION] = json.dumps(standing, sort_keys=True)
+            recorded = json.dumps(standing, sort_keys=True)
+            # Refused here, before anything is written, if the orphan repair
+            # couldn't restore it: a run that died after the override would
+            # otherwise leave a record the next run refuses, and the
+            # overrides in place.
+            _recorded_limiter_env(recorded)
+            record[LIMITER_ENV_ANNOTATION] = recorded
         self._renew_lease(ownership, action, record)
         self._apply_public_api_env(overrides, "set the public API limiter env")
 
-    def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None:
+    def restore_public_api_env(
+        self,
+        standing: Mapping[str, str | None],
+        *,
+        rollout_timeout: float = 240,
+        shared_deadline: bool = False,
+    ) -> None:
         """Put the standing env back, then clear its record; both only while the Lease is ours.
 
         A runner that lost its Lease refuses: the successor that took it over
@@ -5235,7 +5465,12 @@ ON CONFLICT (key_hash) DO NOTHING;
         action = "restoring the public API limiter env"
         ownership = self._held_public_api_lease(action)
         self._renew_lease(ownership, action)
-        self._apply_public_api_env(standing, "restore the public API limiter env")
+        self._apply_public_api_env(
+            standing,
+            "restore the public API limiter env",
+            rollout_timeout=rollout_timeout,
+            shared_deadline=shared_deadline,
+        )
         self._renew_lease(
             ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
         )
@@ -5256,6 +5491,131 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise RuntimeError(f"the public API did not report /readyz=200 within {timeout:g}s")
             time.sleep(1)
 
+    def activation_attribution_available(self) -> bool:
+        """Whether this build records the activating client on the sandbox row.
+
+        Reads `information_schema`, so it answers for the schema the running
+        API is actually against rather than for the source tree the bench was
+        built from -- the two can differ when a rollout is stale.
+        """
+
+        count = self._psql(
+            ACTIVATION_ATTRIBUTION_COLUMN_SQL,
+            action="probe for the activating-client column",
+        )
+        return count.strip() == "1"
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str | None:
+        """The activating client recorded on the sandbox row, empty when unset.
+
+        `None` when there's no row, which an unset column must not read as.
+        """
+
+        value = self._psql(
+            SANDBOX_ACTIVATING_CLIENT_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's activating client",
+        ).strip()
+        return value.removeprefix("row:") if value.startswith("row:") else None
+
+    def sandbox_lifecycle(self, sandbox_id: str) -> str | None:
+        """The lifecycle stored on the sandbox row, `None` when there's no row."""
+
+        value = self._psql(
+            SANDBOX_LIFECYCLE_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read the sandbox's lifecycle",
+        ).strip()
+        return value.removeprefix("row:") if value.startswith("row:") else None
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        """The activating-client label of each of the sandbox's live pods.
+
+        Live as the live cap counts them: terminal, deleting and
+        stopped-materialization pods are dropped, so an empty list can mean
+        the sandbox has only dead pods.
+
+        A pod carrying no such label contributes an empty string rather than
+        being dropped, so a caller can tell "no pod" from "a pod the API never
+        labelled" -- the second is the defect, and silently filtering it out
+        would make the verdict pass by having nothing to judge.
+        """
+
+        return [
+            str(((pod.get("metadata") or {}).get("labels") or {}).get(ACTIVATION_CLIENT_LABEL, ""))
+            for pod in self._live_sandbox_pods(sandbox_id)
+        ]
+
+    def sandbox_live_pod_phases(self, sandbox_id: str) -> list[str]:
+        """The phase of each of the sandbox's live pods, filtered as above."""
+
+        return [
+            str((pod.get("status") or {}).get("phase") or "")
+            for pod in self._live_sandbox_pods(sandbox_id)
+        ]
+
+    def _live_sandbox_pods(self, sandbox_id: str) -> list[Mapping[str, Any]]:
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "read the sandbox's live pods")
+        # Only the pods the live cap would count: a prior execution's pod that
+        # is terminating or terminal can predate the activation being judged,
+        # and its label or phase would misjudge a build that worked.
+        return [
+            pod
+            for pod in json.loads(result.stdout or "{}").get("items", [])
+            if _live_cap_counts_pod(pod)
+        ]
+
+    def live_client_sandboxes(self, client_id: str) -> list[str]:
+        """The client's live *sandboxes*, as the live cap counts them.
+
+        Not pod names, and not every pod: the cap's index maps a client-id
+        label to "the sandboxes that have at least one qualifying pod
+        carrying it: a sandbox or restore pod that's neither terminal nor
+        being deleted" (`client_live_pods.rs`). Two things follow, and both
+        are easy to get wrong in the direction that breaks a verdict:
+
+        * **Deduplicate by sandbox.** A wake is exactly the case that has a
+          restore pod and a sandbox pod at once, so counting pods would read
+          one capped sandbox as two and red a working cap.
+        * **Drop deleting pods.** The cap excludes them deliberately -- one
+          stuck terminating on a lost node must not hold its client's slot --
+          so counting them lets a leftover satisfy a verdict that is supposed
+          to prove something was placed. Terminal pods and stopped-
+          materialization checkpoint pods are dropped for the same reason.
+        """
+
+        if not CLIENT_LABEL_VALUE.fullmatch(client_id):
+            raise ValueError(
+                f"refusing invalid client_id label value {client_id!r}"
+            )
+        result = self.kubectl(
+            "get",
+            "pods",
+            "-l",
+            f"{SANDBOX_MANAGED_BY_SELECTOR},{ACTIVATION_CLIENT_LABEL}={client_id}",
+            "-o",
+            "json",
+            timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, "count the client's live sandboxes")
+        sandboxes: set[str] = set()
+        for pod in json.loads(result.stdout or "{}").get("items", []):
+            if not _live_cap_counts_pod(pod):
+                continue
+            sandbox_id = _live_cap_sandbox_id(pod)
+            if sandbox_id:
+                sandboxes.add(sandbox_id)
+        return sorted(sandboxes)
+
     def redis_replicas(self) -> int:
         previous = _require_ok(
             self.kubectl(
@@ -5270,9 +5630,10 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         Every Kind API, admin API and cluster-controller replica runs its
         limiters against this store, so scaling it to zero is recorded on the
-        Lease first, where the next holder scales it back if this run does
-        not. A runner that lost its Lease refuses either way, so it cannot
-        undo or erase a successor's fault.
+        Lease first, and the record is cleared only once `wait_redis_rollout`
+        confirms the store is back, leaving it for the next holder if this run
+        does not finish recovery. A runner that lost its Lease refuses either
+        way, so it cannot undo or erase a successor's fault.
         """
 
         self._require_isolated_kind("Redis scaling")
@@ -5282,6 +5643,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         ownership = self._held_public_api_lease(action)
         previous = self.redis_replicas()
         if replicas == 0:
+            self._redis_fault_clear_ready = False
             record: dict[str, str | None] = {}
             if self._lease_annotation(ownership, REDIS_REPLICAS_ANNOTATION) is None:
                 record[REDIS_REPLICAS_ANNOTATION] = str(previous)
@@ -5290,9 +5652,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         else:
             self._renew_lease(ownership, action)
             self._scale_redis_deployment(replicas)
-            self._renew_lease(
-                ownership, "clearing the Redis record", {REDIS_REPLICAS_ANNOTATION: None}
-            )
+            self._redis_fault_clear_ready = True
         return previous
 
     def _scale_redis_deployment(self, replicas: int) -> None:
@@ -5337,14 +5697,53 @@ ON CONFLICT (key_hash) DO NOTHING;
                 raise RuntimeError("Redis endpoints did not drain after the pod left")
             time.sleep(1)
 
-    def wait_redis_rollout(self, *, timeout: float) -> None:
+    def wait_redis_rollout(self, *, timeout: float, shared_deadline: bool = False) -> None:
+        """Await the Redis rollout, then clear the Lease's Redis record if it was armed.
+
+        `shared_deadline=True` makes `timeout` a hard bound on the rollout and
+        the record clear together, for a caller whose own budget ends with it:
+        the rollout gets `timeout` less `REDIS_RECORD_CLEAR_SECONDS` when a
+        clear will follow, and the Lease read and patch get what is left. A
+        clear that runs out fails and leaves the record for the orphan repair.
+        Otherwise kubectl gets a grace period past its own `--timeout`, and
+        the clear its usual per-request timeouts.
+        """
+
+        if timeout <= 0:
+            raise RuntimeError(f"Redis rollout budget ({timeout:g}s) is already exhausted")
+        clearing = self._redis_fault_clear_ready and self._public_api_lease_ownership is not None
+        deadline: float | None = None
+        if shared_deadline:
+            deadline = time.monotonic() + timeout
+            process_timeout = timeout - (REDIS_RECORD_CLEAR_SECONDS if clearing else 0.0)
+            if process_timeout <= 0:
+                raise RuntimeError(
+                    f"Redis rollout budget ({timeout:g}s) leaves nothing past the record "
+                    f"clear's {REDIS_RECORD_CLEAR_SECONDS:g}s; the record stays for the repair"
+                )
+            rollout_seconds = max(1, math.ceil(process_timeout))
+        else:
+            rollout_seconds = max(1, math.ceil(timeout))
+            process_timeout = rollout_seconds + min(30.0, max(5.0, timeout * 0.25))
         _require_ok(
             self.kubectl(
-                "rollout", "status", f"deploy/{KIND_REDIS_DEPLOYMENT}",
-                f"--timeout={int(timeout)}s", timeout=timeout + 30,
+                "rollout",
+                "status",
+                f"deploy/{KIND_REDIS_DEPLOYMENT}",
+                f"--timeout={rollout_seconds}s",
+                timeout=process_timeout,
             ),
             "await the Redis rollout",
         )
+        if clearing:
+            ownership = self._held_public_api_lease("clearing the Redis record")
+            self._renew_lease(
+                ownership,
+                "clearing the Redis record",
+                {REDIS_REPLICAS_ANNOTATION: None},
+                deadline=deadline,
+            )
+            self._redis_fault_clear_ready = False
 
     # --- admin console ---------------------------------------------------------
     #
@@ -5422,7 +5821,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=None if body is None else json.dumps(body).encode(),
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with _URL_OPEN(request, timeout=30) as response:
                 status, raw = int(response.status), response.read()
         except HTTPError as error:
             with error:
@@ -5435,6 +5834,142 @@ ON CONFLICT (key_hash) DO NOTHING;
         except ValueError:
             parsed = raw.decode(errors="replace")[:500]
         return ConsoleApiResponse(status, parsed)
+
+    # --- late probe cleanup ---------------------------------------------------
+    #
+    # A limiter probe's create can answer after the sweep moved past it, and
+    # after teardown deleted the run's ECW key, so the late reap goes through
+    # the admin API with the bench's admin bearer instead.
+
+    def admin_force_delete_sandbox(self, sandbox_id: str) -> bool:
+        """Drive the admin `:force-delete` of one sandbox; whether it's done.
+
+        Done is a sandbox already gone or a delete operation that succeeded;
+        a queued or running one answers `False` for the caller to poll again.
+        The admin route queues another delete for each new idempotency key:
+        unlike the ECW DELETE it doesn't join one already active. So one key
+        per sandbox is reserved before the first POST and shared by every
+        caller and by a retry whose reply was lost, which the route answers
+        with the operation already queued under it. Only an operation that
+        ended failed, canceled or expired gets a fresh key and a new delete.
+        """
+
+        target = _sql_uuid(sandbox_id.removeprefix("sbx_"))
+        with self._late_reap_lock:
+            entry = self._late_reap_deletes.setdefault(
+                target, {"key": str(uuid.uuid4()), "operation": ""}
+            )
+            operation = entry["operation"]
+        if operation:
+            answer = self.console_api(
+                "GET", f"/admin/api/v1/operations/{quote(operation, safe='')}"
+            )
+            state = answer.body.get("state") if isinstance(answer.body, dict) else None
+            if answer.status == 200 and state == "succeeded":
+                # Kept: a later call answers done from it instead of reserving
+                # a fresh key and queueing a delete the row may not reflect yet.
+                return True
+            if answer.status == 200 and state in ("queued", "running"):
+                return False
+            if answer.status == 200 and state in ("failed", "canceled", "expired"):
+                with self._late_reap_lock:
+                    if self._late_reap_deletes.get(target) is entry:
+                        entry = {"key": str(uuid.uuid4()), "operation": ""}
+                        self._late_reap_deletes[target] = entry
+                    else:
+                        entry = self._late_reap_deletes.setdefault(
+                            target, {"key": str(uuid.uuid4()), "operation": ""}
+                        )
+            elif answer.status != 404:
+                raise SmokeConfigurationError(
+                    f"admin operation read answered HTTP {answer.status}"
+                )
+        answer = self.console_api(
+            "POST",
+            f"/admin/api/v1/sandboxes/{target}:force-delete",
+            idempotency_key=entry["key"],
+        )
+        if answer.status == 404:
+            with self._late_reap_lock:
+                self._late_reap_deletes.pop(target, None)
+            return True
+        if answer.status not in (200, 202):
+            raise SmokeConfigurationError(f"admin force-delete answered HTTP {answer.status}")
+        operation_id = answer.body.get("operation_id") if isinstance(answer.body, dict) else None
+        if isinstance(operation_id, str) and operation_id:
+            with self._late_reap_lock:
+                entry["operation"] = operation_id
+        return False
+
+    def admin_force_delete_matching(
+        self, metadata: Mapping[str, str], *, max_pages: int = 20
+    ) -> list[str]:
+        """Force-delete every live sandbox whose metadata holds each pair, and
+        return those whose delete is queued but not yet confirmed done.
+
+        The admin list has no metadata filter, so each page is matched here, as
+        the ECW list's JSONB containment would: every given key, string-equal.
+        Every match is attempted, including those found before a page failed;
+        an incomplete scan, else the first delete failure, is raised after as
+        `AdminReapIncomplete`, carrying the ids still pending.
+        """
+
+        matched: list[str] = []
+        scan_error: SmokeConfigurationError | None = None
+        cursor = ""
+        try:
+            for _ in range(max_pages):
+                query = urlencode({"cursor": cursor, "limit": 1000})
+                answer = self.console_api("GET", f"/admin/api/v1/sandboxes?{query}")
+                if answer.status != 200 or not isinstance(answer.body, dict):
+                    raise SmokeConfigurationError(
+                        f"admin sandbox list answered HTTP {answer.status}"
+                    )
+                for row in answer.body.get("sandboxes") or []:
+                    if not isinstance(row, dict) or row.get("status") == "deleted":
+                        continue
+                    stored = row.get("metadata")
+                    if isinstance(stored, dict) and all(
+                        stored.get(key) == value for key, value in metadata.items()
+                    ):
+                        matched.append(str(row["id"]))
+                next_cursor = answer.body.get("next_cursor")
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    break
+                cursor = next_cursor
+            else:
+                raise SmokeConfigurationError(
+                    f"admin sandbox list ran past {max_pages} pages while matching run metadata"
+                )
+        except SmokeConfigurationError as error:
+            # The pages already read still name sandboxes of this run: delete
+            # those before reporting, or a page that keeps failing would keep
+            # them alive across every rescan.
+            scan_error = error
+        # Every match is attempted before a failure is reported: one sandbox
+        # whose delete keeps failing must not keep the rest alive. A row whose
+        # delete went through stops matching once it reads deleted, so a
+        # rescan retries only what is still live.
+        first_error: Exception | None = None
+        pending: list[str] = []
+        for sandbox_id in matched:
+            try:
+                if not self.admin_force_delete_sandbox(sandbox_id):
+                    pending.append(sandbox_id)
+            except Exception as error:  # noqa: BLE001 - finish the other deletes first
+                # Its outcome is unknown, and its reserved key makes a retry safe.
+                pending.append(sandbox_id)
+                first_error = first_error or error
+        # Either failure carries what is still pending, so the caller polls the
+        # deletes this call queued even though it raised.
+        if scan_error is not None:
+            raise AdminReapIncomplete(
+                f"run-metadata scan incomplete after {len(matched)} match(es): {scan_error}",
+                pending,
+            ) from scan_error
+        if first_error is not None:
+            raise AdminReapIncomplete(f"a matched delete failed: {first_error}", pending) from first_error
+        return pending
 
     # --- node drain ----------------------------------------------------------
 
@@ -7046,7 +7581,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=b"{}",
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 response.read()
         except HTTPError as error:
             raise RuntimeError(f"native :pause returned HTTP {error.code}") from None
@@ -7071,7 +7606,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             headers={"Authorization": "Bearer " + self._admin_token()},
         )
         try:
-            with urlopen(request, timeout=20) as response:
+            with _URL_OPEN(request, timeout=20) as response:
                 response.read()
                 return True
         except HTTPError as error:
@@ -7095,7 +7630,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             },
         )
         try:
-            with urlopen(request, timeout=60) as response:
+            with _URL_OPEN(request, timeout=60) as response:
                 payload = json.load(response)
         except HTTPError as error:
             raise RuntimeError(f"native delete returned HTTP {error.code}") from None
@@ -8312,7 +8847,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             data=b"{}",
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with _URL_OPEN(request, timeout=30) as response:
                 return TerminateAttempt(response.status, _json_object(response.read()))
         except HTTPError as error:
             # A refusal is the expected answer, so the error carries the body.
@@ -10365,12 +10900,39 @@ class EcwSdk:
         *,
         attempts: int = 10,
         interval_seconds: float = 1.0,
+        scan_whole_window: bool = False,
     ) -> None:
+        """Kill what matches `metadata`, polling until something does.
+
+        By default the first scan that matches ends it. `scan_whole_window`
+        keeps scanning for every attempt instead, for a caller with several
+        creates of unknown outcome under the same metadata: one becoming
+        visible says nothing about the others, which may commit later. In
+        that mode a failed DELETE doesn't stop the others: the sandbox stays
+        eligible for the next scan, and a failure no later DELETE cleared is
+        raised once the window ends.
+        """
+
         if attempts <= 0:
             raise ValueError("reconciliation attempts must be positive")
         e2b = importlib.import_module("e2b")
+        matched_any = False
+        unresolved: dict[str, Exception] = {}
+        def kill(sandbox_id: str) -> None:
+            try:
+                _kill_with_sdk(e2b.Sandbox.kill, sandbox_id, **self.config.sdk_options())
+            except ScenarioTimedOut:
+                raise
+            except Exception as error:
+                if not scan_whole_window:
+                    raise
+                unresolved[sandbox_id] = error
+            else:
+                unresolved.pop(sandbox_id, None)
+
         for attempt in range(attempts):
             matched = False
+            seen: set[str] = set()
             paginator = e2b.Sandbox.list(
                 query=e2b.SandboxQuery(metadata=dict(metadata)),
                 limit=100,
@@ -10379,16 +10941,23 @@ class EcwSdk:
             while paginator.has_next:
                 for sandbox in paginator.next_items():
                     matched = True
-                    _kill_with_sdk(
-                        e2b.Sandbox.kill,
-                        sandbox.sandbox_id,
-                        **self.config.sdk_options(),
-                    )
-            if matched:
+                    seen.add(sandbox.sandbox_id)
+                    kill(sandbox.sandbox_id)
+            # A DELETE whose reply was lost may have committed, so its sandbox
+            # can drop out of the list: retry it by id, which counts a gone
+            # sandbox as done, rather than report it as a failure.
+            for sandbox_id in [sid for sid in unresolved if sid not in seen]:
+                kill(sandbox_id)
+            matched_any = matched_any or matched
+            if matched and not scan_whole_window:
                 return
             if attempt + 1 < attempts:
                 time.sleep(interval_seconds)
-        raise RuntimeError(
+        if unresolved:
+            raise next(iter(unresolved.values()))
+        if matched_any:
+            return
+        raise EcwSandboxReconcileUnmatched(
             "sandbox create may have committed, but no sandbox became visible "
             "during run-metadata reconciliation"
         )

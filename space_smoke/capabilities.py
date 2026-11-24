@@ -98,6 +98,10 @@ class EcwSandboxBusy(EcwSandboxDeleteRetryable):
     """A sandbox delete conflicts with an in-flight lifecycle transition."""
 
 
+class EcwSandboxReconcileUnmatched(RuntimeError):
+    """Run-metadata reconciliation found no sandbox matching an uncertain create."""
+
+
 class EcwSandboxState(StrEnum):
     RUNNING = "running"
     PAUSED = "paused"
@@ -532,8 +536,9 @@ class RateLimitProbe(Protocol):
     """Raw ECW control-plane requests for one client id, plus their cleanup.
 
     The limiter scenario judges statuses and headers the SDK hides, so it
-    goes to the route directly; every create it admits carries the metadata
-    `kill_matching` later deletes by.
+    goes to the route directly; admitted creates are deleted by id through
+    `kill_sandbox`, and every create carries run metadata so an unanswered one
+    can still be reconciled by `kill_matching`.
     """
 
     def race_ecw_request(
@@ -547,7 +552,12 @@ class RateLimitProbe(Protocol):
         gate: Callable[[], None] | None = None,
     ) -> LimiterProbeOutcome: ...
 
-    def kill_matching(self, metadata: Mapping[str, str]) -> None: ...
+    def kill_matching(
+        self, metadata: Mapping[str, str], *, scan_whole_window: bool = False
+    ) -> None:
+        """Kill the run's matching sandboxes; `scan_whole_window` keeps polling
+        after a match, for several creates of unknown outcome."""
+        ...
 
     def kill_sandbox(self, sandbox_id: str) -> None:
         """ECW kill of one bare sandbox uuid, not-found counting as done."""
@@ -568,11 +578,56 @@ class RateLimiterControl(Protocol):
 
     def public_api_env(self, keys: Sequence[str]) -> dict[str, str | None]: ...
 
+    def public_api_has_env_from(self) -> bool:
+        """Whether the public API container takes env from `envFrom` sources."""
+        ...
+
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None: ...
 
-    def restore_public_api_env(self, standing: Mapping[str, str | None]) -> None: ...
+    def restore_public_api_env(
+        self,
+        standing: Mapping[str, str | None],
+        *,
+        rollout_timeout: float = 240,
+        shared_deadline: bool = False,
+    ) -> None: ...
 
     def wait_public_api_ready(self, *, timeout: float) -> None: ...
+
+    def activation_attribution_available(self) -> bool:
+        """Whether the sandbox row can hold an activating client at all.
+
+        A cross-check for the attribution phase, never its probe: the column
+        ships as a migration, and migrations land ahead of the code that
+        writes them, so its presence says nothing about whether a writer
+        exists. The phase runs unconditionally; this read turns a missing
+        column into a precondition failure instead of an attribution red.
+        """
+        ...
+
+    def sandbox_activating_client(self, sandbox_id: str) -> str | None:
+        """The activating client recorded on the sandbox row, empty when unset
+        and `None` when there's no row."""
+        ...
+
+    def sandbox_lifecycle(self, sandbox_id: str) -> str | None:
+        """The lifecycle stored on the sandbox row, `None` when there's no row."""
+        ...
+
+    def sandbox_pod_client_ids(self, sandbox_id: str) -> list[str]:
+        """The activating-client label of each of the sandbox's live pods (as the
+        live cap counts them), empty when a pod carries none."""
+        ...
+
+    def sandbox_live_pod_phases(self, sandbox_id: str) -> list[str]:
+        """The phase of each of the sandbox's live pods, as the live cap
+        counts them: terminal, deleting and stopped-materialization pods are
+        dropped, so a prior generation's pod can't speak for this one."""
+        ...
+
+    def live_client_sandboxes(self, client_id: str) -> list[str]:
+        """The client's live sandboxes, counted the way the live cap counts them."""
+        ...
 
     def redis_replicas(self) -> int:
         """The Redis Deployment's current `.spec.replicas`, read without writing."""
@@ -582,7 +637,19 @@ class RateLimiterControl(Protocol):
 
     def wait_redis_unreachable(self, *, timeout: float) -> None: ...
 
-    def wait_redis_rollout(self, *, timeout: float) -> None: ...
+    def admin_force_delete_sandbox(self, sandbox_id: str) -> bool:
+        """Force-delete one sandbox through the admin API, not the run's ECW key;
+        whether the delete is confirmed done (`False` while it is still queued)."""
+        ...
+
+    def admin_force_delete_matching(self, metadata: Mapping[str, str]) -> list[str]:
+        """Force-delete every live sandbox whose metadata holds each pair; the ids
+        whose delete is queued but not yet confirmed done."""
+        ...
+
+    def wait_redis_rollout(self, *, timeout: float, shared_deadline: bool = False) -> None:
+        """`shared_deadline=True`: `timeout` bounds the rollout and its record clear together."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -1426,6 +1493,7 @@ class EcwSandboxes(Protocol):
         *,
         attempts: int = 10,
         interval_seconds: float = 1.0,
+        scan_whole_window: bool = False,
     ) -> None: ...
 
     def list_pages(
