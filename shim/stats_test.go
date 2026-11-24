@@ -37,6 +37,10 @@ func TestStatsReportsAFailedSampleAsAbsentNotZero(t *testing.T) {
 			Memory: &cgroupsv2.MemoryStat{Usage: 1 << 20, UsageLimit: 1 << 30},
 			Pids:   &cgroupsv2.PidsStat{Current: 3, Limit: 64},
 		}},
+		{"without_cpu_usage", &statsClient{response: &pb.StatsResponse{MemoryCurrent: 1 << 20, MemoryMax: 1 << 30, PidsCurrent: 3}}, &cgroupsv2.Metrics{
+			Memory: &cgroupsv2.MemoryStat{Usage: 1 << 20, UsageLimit: 1 << 30},
+			Pids:   &cgroupsv2.PidsStat{Current: 3},
+		}},
 		{"rejected", &statsClient{err: status.Error(codes.ResourceExhausted, "busy")}, &cgroupsv2.Metrics{}},
 		{"without_cgroup_figures", &statsClient{response: &pb.StatsResponse{NetworkTxBytes: 9}}, &cgroupsv2.Metrics{}},
 	} {

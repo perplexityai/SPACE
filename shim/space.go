@@ -2015,10 +2015,9 @@ func (s *spaceTaskService) Stats(ctx context.Context, r *taskAPI.StatsRequest) (
 	s.mu.Unlock()
 
 	// Always return a typed cgroup v2 Metrics, the payload containerd's CRI
-	// decodes. A sample sandbox-manager could not take leaves
-	// the CPU, memory and pids sections absent, which CRI reports as no
-	// sample, rather than zeros, which read as an idle sandbox and as a reset
-	// of the cumulative CPU counter.
+	// decodes. A figure sandbox-manager could not read leaves its section
+	// absent, which CRI reports as no sample, rather than zero, which reads as
+	// an idle sandbox and, for the cumulative CPU counter, as a reset.
 	metrics := &cgroupsv2.Metrics{}
 	if sandboxID != "" {
 		resp, err := s.fetchSandboxStats(ctx, sandboxID)
@@ -2030,9 +2029,13 @@ func (s *spaceTaskService) Stats(ctx context.Context, r *taskAPI.StatsRequest) (
 			// sandbox-manager answered without the cgroup figures.
 			statsFailures.report(time.Now(), "Stats: sbx-manager Stats(%s) answered without cgroup figures", sandboxID)
 		default:
-			metrics.CPU = &cgroupsv2.CPUStat{UsageUsec: resp.CpuUsageUsec}
 			metrics.Memory = &cgroupsv2.MemoryStat{Usage: resp.MemoryCurrent, UsageLimit: resp.MemoryMax}
 			metrics.Pids = &cgroupsv2.PidsStat{Current: resp.PidsCurrent, Limit: resp.PidsMax}
+			// A running VM has used CPU time. Zero means the cgroup's
+			// cpu.stat had no usage line, so CPU is reported as no sample.
+			if resp.CpuUsageUsec != 0 {
+				metrics.CPU = &cgroupsv2.CPUStat{UsageUsec: resp.CpuUsageUsec}
+			}
 		}
 	}
 
