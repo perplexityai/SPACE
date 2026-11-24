@@ -51,14 +51,22 @@ pub struct CgroupMemoryPressure {
 }
 
 /// Reads the memory files of the cgroup at `cgroup`. Fails when `memory.max`,
-/// `memory.current`, `memory.stat` or `memory.events` is unreadable or
-/// malformed; an unreadable `memory.pressure` yields `pressure: None`.
+/// `memory.current`, `memory.stat` or `memory.events` is unreadable, or when
+/// one of their values read here is malformed; an unreadable
+/// `memory.pressure` yields `pressure: None`.
 pub fn read_cgroup_memory_state(cgroup: &Path) -> io::Result<CgroupMemoryState> {
     let read = |file: &str| std::fs::read_to_string(cgroup.join(file));
     let max = read("memory.max")?;
     let current = read("memory.current")?;
     let stat = read("memory.stat")?;
     let events = read("memory.events")?;
+    let keyed = |file: &str, content: &str, key: &str| {
+        keyed_u64(content, key)
+            .map(|value| parse_u64(cgroup, &format!("{file} {key}"), value))
+            .transpose()
+    };
+    // A counter the running kernel does not report has never fired.
+    let event = |key: &str| Ok::<_, io::Error>(keyed("memory.events", &events, key)?.unwrap_or(0));
     Ok(CgroupMemoryState {
         max_bytes: match max.trim() {
             "max" => None,
@@ -66,20 +74,20 @@ pub fn read_cgroup_memory_state(cgroup: &Path) -> io::Result<CgroupMemoryState> 
         },
         current_bytes: parse_u64(cgroup, "memory.current", current.trim())?,
         stat: CgroupMemoryStat {
-            anon: keyed_u64(&stat, "anon"),
-            file: keyed_u64(&stat, "file"),
-            kernel: keyed_u64(&stat, "kernel"),
-            pagetables: keyed_u64(&stat, "pagetables"),
-            sec_pagetables: keyed_u64(&stat, "sec_pagetables"),
-            shmem: keyed_u64(&stat, "shmem"),
+            anon: keyed("memory.stat", &stat, "anon")?,
+            file: keyed("memory.stat", &stat, "file")?,
+            kernel: keyed("memory.stat", &stat, "kernel")?,
+            pagetables: keyed("memory.stat", &stat, "pagetables")?,
+            sec_pagetables: keyed("memory.stat", &stat, "sec_pagetables")?,
+            shmem: keyed("memory.stat", &stat, "shmem")?,
         },
         events: CgroupMemoryEvents {
-            low: keyed_u64(&events, "low").unwrap_or(0),
-            high: keyed_u64(&events, "high").unwrap_or(0),
-            max: keyed_u64(&events, "max").unwrap_or(0),
-            oom: keyed_u64(&events, "oom").unwrap_or(0),
-            oom_kill: keyed_u64(&events, "oom_kill").unwrap_or(0),
-            oom_group_kill: keyed_u64(&events, "oom_group_kill").unwrap_or(0),
+            low: event("low")?,
+            high: event("high")?,
+            max: event("max")?,
+            oom: event("oom")?,
+            oom_kill: event("oom_kill")?,
+            oom_group_kill: event("oom_group_kill")?,
         },
         pressure: read("memory.pressure")
             .ok()
@@ -98,10 +106,10 @@ fn parse_u64(cgroup: &Path, file: &str, value: &str) -> io::Result<u64> {
 }
 
 /// The value of a `key value` line, as in `memory.stat` and `memory.events`.
-fn keyed_u64(content: &str, key: &str) -> Option<u64> {
+fn keyed_u64<'a>(content: &'a str, key: &str) -> Option<&'a str> {
     content.lines().find_map(|line| {
         let (name, value) = line.split_once(' ')?;
-        (name == key).then(|| value.trim().parse().ok()).flatten()
+        (name == key).then(|| value.trim())
     })
 }
 
@@ -228,5 +236,22 @@ mod tests {
         );
         let error = read_cgroup_memory_state(dir.path()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        for (file, content) in [
+            ("memory.stat", "anon invalid\n"),
+            ("memory.events", "oom invalid\n"),
+        ] {
+            write_cgroup(
+                dir.path(),
+                &[
+                    ("memory.max", "max\n"),
+                    ("memory.stat", STAT),
+                    ("memory.events", EVENTS),
+                    (file, content),
+                ],
+            );
+            let error = read_cgroup_memory_state(dir.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{file}");
+        }
     }
 }
