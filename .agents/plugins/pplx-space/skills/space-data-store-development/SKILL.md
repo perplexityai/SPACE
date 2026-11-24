@@ -80,7 +80,7 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   warm against different releases of one digest. Build the statement once,
   bind every value, and keep the rest of the statement whole at its query
   site.
-- The last is the column list of one row type read from one table: a shared
+- Another is the column list of one row type read from one table: a shared
   constant of that table's bare column names, with no expressions, aliases, or
   joined columns, matching one `FromRow` struct field for field. Interpolate it
   only as the entire `SELECT` list of a statement whose only `FROM` item is that
@@ -89,7 +89,24 @@ Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
   column to one SQL edit, and no read falls back to `SELECT *`, whose cached
   statements fail with `0A000` once the table gains or loses a column. Nothing
   else is exempt: predicates, joins, `FROM` clauses, assignments, ordering, and
-  any other column list stay whole at their query sites.
+  any other column list stay whole at their query sites, except as the next
+  item allows.
+- The last is a store-private projection and join for one family of reads: a
+  store module may keep one constant of the select list (columns and
+  expressions across joined tables, each named for a field of one `FromRow`
+  struct) and one constant of the joins that list needs, lateral subqueries
+  included, used only by that module's own statements. Each such statement
+  decodes that struct, directly or through a `#[sqlx(flatten)]` field of a
+  row that adds the statement's own columns after the list, such as a page's
+  `has_next`. Keep both constants private to the module (no `pub` of any
+  kind) and build each statement once (a `LazyLock<String>`) from them plus
+  everything else written whole in that statement, or interpolated as an item
+  above allows: its CTEs, the `FROM` items the joins follow, its predicates,
+  any keyset condition or page walk, its ordering and its limits. Bind every
+  value. Nothing else builds part of these statements, inside the module or
+  out of it. It exists for read families that share a wide multi-table
+  projection, such as the sandbox listing and fetch reads, so a column change
+  stays one edit.
 - A migration that changes a predicate's shape (`SELECT EXISTS(..)` to
   `get(..).is_some_and(..)`, a hand-rolled probe onto a shared fragment) pins
   the equivalence with a Postgres-backed test before it merges.
