@@ -1484,17 +1484,19 @@ impl CreateSandboxExecutionError {
     }
 }
 
-/// Attempts after which a create pinned to a node pool fails on a node's
-/// memory refusal rather than trying again: one retry, since the pool's
-/// nodes may free memory but the create cannot leave the pool.
+/// Total create attempts, of any outcome, after which a create pinned to a
+/// node pool fails on a node's memory refusal instead of retrying. Nothing
+/// steers a retry away from the refusing node, so a retry waits for memory
+/// to free; a pinned create cannot leave its pool, so it gets one retry.
 const PINNED_NODE_MEMORY_ATTEMPTS: i32 = 2;
 
-/// Attempts after which an unpinned create fails on a node's memory refusal,
-/// so it is placed on at most this many nodes before the caller hears why.
+/// Total create attempts, of any outcome, after which an unpinned create
+/// fails on a node's memory refusal. Its retries may land on the same node.
 const UNPINNED_NODE_MEMORY_ATTEMPTS: i32 = 3;
 
 /// A create a node refused for lack of memory headroom: retry it after the
-/// jittered capacity hint until its attempt bound, then fail it with
+/// jittered capacity hint while the operation has made fewer attempts than
+/// its bound, counting attempts that failed otherwise, then fail it with
 /// `capacity_unavailable` and the reason `node_memory_capacity`, which tells
 /// the caller the same request may succeed later. The retry carries that
 /// error too, so a deadline or exhausted budget reports it.
@@ -1509,13 +1511,13 @@ fn node_memory_capacity_result(
     let (max_attempts, progress) = if pinned {
         (
             PINNED_NODE_MEMORY_ATTEMPTS,
-            "the requested node pool has no memory headroom for this sandbox; retry later or \
-             choose another node pool",
+            "a node in the requested node pool had no memory headroom for this sandbox; retry \
+             later or choose another node pool",
         )
     } else {
         (
             UNPINNED_NODE_MEMORY_ATTEMPTS,
-            "no node had memory headroom for this sandbox; retry later or request less memory",
+            "a node had no memory headroom for this sandbox; retry later or request less memory",
         )
     };
     let mut terminal_error = terminal_error_json(operation, error.to_string());
