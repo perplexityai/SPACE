@@ -171,6 +171,7 @@ or (package(pplx-space-node-mgr) and test(=service::btrfs_send_transport::tests:
 or (package(pplx-space-node-mgr) and test(=service::prepared_rootfs::tests::prepared_instance_and_clone_use_real_btrfs_subvolumes))
 or (package(pplx-space-node-mgr) and test(/::startup_containment::tests::linux::linux_containment_benchmark$/))
 or (package(pplx-space-node-mgr) and test(=firewall::tests::linux::reinstall_over_a_leftover_sandbox_table_fails_whole))
+or (package(pplx-space-node-mgr) and test(=firewall::tests::linux::scrub_removes_every_owned_table_including_firewall_rules))
 or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::install_creates_and_replaces_only_the_owned_table))
 or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::late_kernel_refusal_leaves_the_previous_table))
 or (package(pplx-space-node-mgr) and test(=firewall::rules::install::tests::timeout_after_dispatch_is_unknown_and_reaps_the_child))
