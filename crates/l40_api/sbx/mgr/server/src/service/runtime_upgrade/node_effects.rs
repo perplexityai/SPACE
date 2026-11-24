@@ -125,6 +125,26 @@ fn required_file(path: &Path, what: &str) -> Result<(), Status> {
     }
 }
 
+/// An unencrypted disk is its `rootfs.ext4`, which must be one node-manager's
+/// rollback of the preserved copy restores: a non-empty regular file with one
+/// link, found without following a final symlink
+/// (`sandbox_storage::restorable_disk`).
+pub(super) fn require_plaintext_rootfs(rootfs: &Path) -> Result<(), Status> {
+    use pplx_space_sandbox_model::sandbox_storage::{DiskFile, DiskForm, restorable_disk};
+    let found = crate::rootfs_encryption::disk_file(rootfs).map_err(|error| {
+        Status::failed_precondition(format!("inspect {}: {error}", rootfs.display()))
+    })?;
+    if found == DiskFile::Absent {
+        return required_file(rootfs, "rootfs");
+    }
+    restorable_disk(DiskForm::Rootfs, found, DiskFile::Absent).map_err(|incomplete| {
+        Status::failed_precondition(format!(
+            "a runtime upgrade needs a local disk it can roll back; {incomplete} at {}",
+            rootfs.display()
+        ))
+    })
+}
+
 /// The superseded checkpoint can't be told apart from bytes another catalog
 /// row owns. Nothing is deleted, and the upgrade stays verified, refusing
 /// warm start and restore, until the conflict clears: the sandbox's next
@@ -195,6 +215,27 @@ impl NodeRuntimeUpgradeEffects {
 
 #[tonic::async_trait]
 impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
+    async fn complete_staged_disk(&self, sandbox: &SandboxRow) -> Result<(), Status> {
+        self.service.complete_staged_upgrade_disk(sandbox).await
+    }
+
+    async fn checkpoint_execution(
+        &self,
+        sandbox: &SandboxRow,
+    ) -> Result<ExecutionMetadata, Status> {
+        let checkpoint =
+            canonical_suspend_snapshot_dir(&self.service.cache_root().join(&sandbox.id));
+        Ok(checkpoint_execution_metadata(&checkpoint.to_string_lossy())
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .into_execution())
+    }
+
+    async fn require_pinned_checkpoint(&self, sandbox: &SandboxRow) -> Result<(), Status> {
+        let checkpoint =
+            canonical_suspend_snapshot_dir(&self.service.cache_root().join(&sandbox.id));
+        super::staged_disk::require_pinned_checkpoint_identity(sandbox, &checkpoint).map(drop)
+    }
+
     async fn inspect_local_disk(&self, sandbox: &SandboxRow) -> Result<LocalDisk, Status> {
         let cache_root = self.service.cache_root();
         crate::service::create_support::repair_retained_instance_traversal(
@@ -206,10 +247,69 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
         let sandbox_dir = cache_root.join(&sandbox.id);
         let instance = sandbox_dir.join("instance");
         let rootfs = instance.join("rootfs.ext4");
-        required_file(&rootfs, "rootfs")?;
         if sandbox.volume_encryption {
-            // Without the COW the encrypted cold start has nothing to reopen.
-            required_file(&instance.join("cow.luks"), "encrypted rootfs COW")?;
+            // The guest's writes are all in the COW, which the cold start
+            // reopens. The rootfs is the read-only origin under it, which the
+            // cold start clones from the template when absent, as a restore
+            // staged on another node does
+            // (`template_source_for_sandbox_prepare_in`), so only the
+            // template's digest names it then. And the disk must be one
+            // node-manager's rollback of the preserved copy restores, which
+            // the same rule requires.
+            let cow = instance.join(crate::rootfs_encryption::ROOTFS_COW_FILE);
+            let file = |path: &Path| {
+                crate::rootfs_encryption::disk_file(path).map_err(|error| {
+                    Status::failed_precondition(format!("inspect {}: {error}", path.display()))
+                })
+            };
+            let origin_named = sandbox.template_hash.as_deref().is_some_and(|digest| {
+                digest
+                    .parse::<pplx_space_content_digest::ContentHash>()
+                    .is_ok()
+            });
+            let rootfs_file = file(&rootfs)?;
+            pplx_space_sandbox_model::sandbox_storage::bootable_encrypted_disk(
+                rootfs_file,
+                file(&cow)?,
+                origin_named,
+            )
+            .map_err(|incomplete| {
+                Status::failed_precondition(format!(
+                    "a runtime upgrade needs a local encrypted disk it can boot and roll back; in \
+                     {}, {incomplete}",
+                    instance.display()
+                ))
+            })?;
+            // A copy without the rootfs is one only a node-manager that
+            // advertises it restores, asked per call because a node-manager
+            // replaced since may be older, whoever asked for the upgrade.
+            // With the switch off it's refused before that, as it was before
+            // the switch existed, so a copy an earlier upgrade finished
+            // starts no new one once the switch is off ahead of a
+            // node-manager downgrade.
+            if rootfs_file == pplx_space_sandbox_model::sandbox_storage::DiskFile::Absent {
+                if !self.service.staged_checkpoint_disk {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox {}'s encrypted disk has no rootfs.ext4, which a runtime upgrade \
+                         admits only with {} on",
+                        sandbox.id,
+                        crate::service::STAGED_CHECKPOINT_DISK_ENV
+                    )));
+                }
+                let mut client = self.service.node_manager.connect().await.map_err(|error| {
+                    Status::unavailable(format!("connect to node-manager: {error}"))
+                })?;
+                if !super::staged_disk::supports_staged_checkpoint_disk(&mut client).await? {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox {}'s encrypted disk has no rootfs.ext4, and this node-manager \
+                         can't restore such a copy if the upgrade's boot fails; roll \
+                         node-manager out first",
+                        sandbox.id
+                    )));
+                }
+            }
+        } else {
+            require_plaintext_rootfs(&rootfs)?;
         }
         let execution = sandbox_execution_metadata_in(cache_root, &sandbox.id)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;

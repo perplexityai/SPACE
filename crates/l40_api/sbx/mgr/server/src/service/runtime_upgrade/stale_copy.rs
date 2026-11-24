@@ -16,8 +16,12 @@
 //! checkpoint's ready backup was captured by a later execution than the
 //! copy's. Without a capture generation on both backups nothing orders them,
 //! and the copy is refused, as every copy pinning another checkpoint was
-//! before replacement existed. An encrypted copy is left too, since an
-//! encrypted checkpoint staged here can't be cold-booted.
+//! before replacement existed. An encrypted copy is replaced the same way
+//! only with [`crate::service::STAGED_CHECKPOINT_DISK_ENV`] on and a
+//! node-manager that advertises finishing a staged checkpoint's disk for its
+//! cold boot ([`super::staged_disk`]), asked before anything is claimed.
+//! Otherwise it's left, as it was before the switch existed, since an
+//! encrypted checkpoint staged here couldn't be cold-booted.
 
 use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
@@ -36,6 +40,14 @@ fn unproven(sandbox_id: &str) -> Status {
     ))
 }
 
+fn unbootable_encrypted_stage(sandbox_id: &str) -> Status {
+    Status::failed_precondition(format!(
+        "sandbox {sandbox_id}'s checkpoint on this node isn't the one its runtime upgrade was \
+         decided from, and an encrypted checkpoint staged in its place can't be cold-booted; \
+         refusing to replace it"
+    ))
+}
+
 impl crate::service::SandboxManagerService {
     /// Evict this node's suspended copy of `sandbox_id` when it pins an
     /// artifact other than `decided`, the checkpoint upgrade `operation_id`
@@ -50,8 +62,10 @@ impl crate::service::SandboxManagerService {
     ///
     /// A copy that isn't replaced is refused before any node work:
     /// `FailedPrecondition` when nothing proves it backed, when nothing shows
-    /// the decided checkpoint was captured after it, when it's encrypted, or
-    /// when the sandbox holds a user snapshot no local artifact records,
+    /// the decided checkpoint was captured after it, when it's encrypted and
+    /// the switch is off or node-manager can't finish a staged encrypted
+    /// disk, or when the sandbox holds a user snapshot no local artifact
+    /// records,
     /// and `Unavailable` when the proof couldn't be had or another upgrade
     /// still owns the copy. So is a request whose stage would be refused for
     /// its form or route identity, and a retry of an activation the row
@@ -92,7 +106,7 @@ impl crate::service::SandboxManagerService {
         // eviction's claim re-asserts the proven pin and the activation
         // generations read here, so a generation an activation retains after
         // the checks below fails the claim.
-        let (pinned, generations) = {
+        let (pinned, generations, encrypted) = {
             let db = self.db_conn()?;
             let sandbox = crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|error| Status::internal(format!("db sandbox lookup failed: {error}")))?;
@@ -114,12 +128,8 @@ impl crate::service::SandboxManagerService {
             // loop finishes it.
             super::refuse_runtime_upgrade_fence_in(&db, sandbox_id)?;
             super::refuse_unretired_runtime_upgrade_in(&db, sandbox_id)?;
-            if sandbox.volume_encryption {
-                return Err(Status::failed_precondition(format!(
-                    "sandbox {sandbox_id}'s checkpoint on this node isn't the one its runtime \
-                     upgrade was decided from, and an encrypted checkpoint staged in its place \
-                     can't be cold-booted; refusing to replace it"
-                )));
+            if sandbox.volume_encryption && !self.staged_checkpoint_disk {
+                return Err(unbootable_encrypted_stage(sandbox_id));
             }
             let evidence = crate::sandbox_eviction::gather_local_evidence(&db, sandbox_id)
                 .map_err(|error| {
@@ -140,8 +150,22 @@ impl crate::service::SandboxManagerService {
                     ))
                 })?
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
-            (pinned, generations)
+            (pinned, generations, sandbox.volume_encryption)
         };
+        // Asked per call, never cached across a reconnect: a node-manager
+        // replaced since may be older.
+        if encrypted {
+            let mut client = self.node_manager.connect().await.map_err(|error| {
+                Status::unavailable(format!("connect to node-manager: {error}"))
+            })?;
+            if !super::staged_disk::supports_staged_checkpoint_disk(&mut client).await? {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {sandbox_id}'s checkpoint on this node isn't the one its runtime \
+                     upgrade was decided from, and this node-manager can't finish an encrypted \
+                     checkpoint staged in its place; roll node-manager out first"
+                )));
+            }
+        }
         // A stage that would be refused stages nothing in the copy's place,
         // and an activation the row would refuse, such as one at a generation
         // it already retained, must not get past it by removing the row.

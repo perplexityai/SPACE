@@ -1801,9 +1801,18 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
    encrypted sandbox `cow.luks` and the suspend volume. The sandbox's
    `metadata.json`, the disk's record of its execution, sits outside the
    subvolume and the boot rewrites it, so sandbox-manager keeps its bytes beside
-   it. The checkpoint directory isn't touched. A sandbox without its local rootfs, or an encrypted one without
-   `cow.luks`, is refused before the fence: a cold start would otherwise boot a
-   fresh template clone.
+   it. The checkpoint directory isn't touched. An unencrypted sandbox without
+   its local rootfs is refused before the fence: a cold start would boot a
+   fresh template clone. An encrypted sandbox's writes are all in `cow.luks`,
+   over a read-only origin cloned from its template, so it's refused without
+   a non-empty regular `cow.luks` with one link, which node-manager's restore
+   of a copy without the rootfs requires. A rootfs that is there must also be
+   a non-empty regular file with one link, which the restore of any copy
+   requires (node-manager opens no hard-linked file as a disk), and
+   without one the sandbox is refused only when its row records no template
+   digest. Without the rootfs the copy holds the COW alone, which
+   node-manager's instance restore accepts, and the cold start clones the
+   origin, as a restore staged on another node does.
 3. **Select the consumer.** The move must follow a certified upgrade edge from
    the environment the sandbox last ran under: its checkpoint's producer when
    suspended, otherwise its saved consumer. Unbound metadata counts as the
@@ -1980,7 +1989,18 @@ predates the checkpoint passes `runtime-upgrade` through as a `Start`
 checkpoint, which sandbox-manager refuses for a local row in any state and for
 a sandbox absent from the node, so the pod fails without booting anything. A
 sandbox-manager that predates activation answers `ALREADY_ON_TARGET` with no
-execution, and the shim fails the create.
+execution, and the shim fails the create. Node-manager ships no later than
+sandbox-manager: an older node-manager refuses to restore an upgrade's
+preserved copy that holds a staged encrypted checkpoint's COW and no rootfs,
+so a failed cold boot of one would leave the upgrade unable to roll back, and
+the sandbox fenced, until node-manager is updated. The same holds for a
+rollback of node-manager. First stop new upgrades from starting on the node:
+keep `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` off on the API and cluster
+controller, the only switch that sends one today, or downgrade sandbox-manager
+below this release, since an older one never preserves a copy without its
+rootfs. Then downgrade node-manager only once every upgrade on the node that
+preserved such a copy has settled, since the copy stays until a verified boot
+deletes it.
 
 A sandbox-manager from this release applies the
 `sandbox_runtime_upgrade_outcomes` migration at startup, and an older one,
@@ -2092,7 +2112,7 @@ is stranded.
    An unproven copy may be the only one of something, so it's refused with
    `FailedPrecondition` before any node work, as is an unpinned one, one the
    named checkpoint wasn't captured after (the decision is stale, and staging
-   it would roll the sandbox back) and an encrypted one. Which checkpoint is
+   it would roll the sandbox back). Which checkpoint is
    newer isn't read from the checkpoint ids, whose order depends on the clocks
    of the nodes that minted them, nor from which backup registered last, since
    a re-upload registers an old checkpoint again. A backup registration
@@ -2146,10 +2166,59 @@ is stranded.
    generations rather than its `updated_at`, which is kept in whole seconds;
    a cleanup that fails after the eviction's claim leaves the
    row's cleanup failed, with its delete intent kept, until the cleanup
-   machinery finishes it. Staging an
-   encrypted checkpoint writes no plaintext rootfs, so an encrypted sandbox
-   restored away from its checkpoint is refused before the fence, and an
-   encrypted stale copy is left in place.
+   machinery finishes it.
+
+   With `SPACE_SBXMGR_STAGED_CHECKPOINT_DISK` on, before reading the disk the
+   upgrade finishes the parts of a staged checkpoint a restore would finish at
+   launch, since it boots the disk cold instead
+   (`service/runtime_upgrade/staged_disk.rs`), under the same artifact lock it
+   fences under. It first checks what it can refuse without touching the node:
+   a suspended sandbox already on its target, an operation that already found
+   its target, an uncertified edge from the checkpoint's producer, and an
+   authorization that doesn't accept memory loss, and then a cleanup that owns
+   the sandbox, which the fence refuses again in its own transaction. It then
+   requires the row's
+   pin to name the checkpoint, as an encrypted full suspend checkpoint of this
+   sandbox written over the template the row names, even when `metadata.json`
+   and the instance COW are both there already. Node-manager does the writes
+   as root through one idempotent call, `MaterializeStagedCheckpointDisk`,
+   since a launched instance belongs to the VM owner. It creates the
+   `instance/` subvolume when absent and always copies the checkpoint's
+   non-empty `cow.luks` over whatever the instance holds, as a restore does,
+   refusing an empty one, so the disk the upgrade preserves is the pinned
+   checkpoint's. It keeps a `metadata.json` already there and otherwise writes
+   the one sandbox-manager built from the checkpoint's producer, with the same
+   writer `PrepareSandbox` uses. Before it writes anything it checks that the
+   staged `snapshot.json` names the sandbox, the pinned artifact and the
+   template, and it answers with that checkpoint and which parts it wrote and
+   which it kept; sandbox-manager requires the answer to name the pinned
+   checkpoint and the COW to be written, so every attempt, from the pod's `UpgradeRuntime` or a Direct Wake,
+   finishes whatever an earlier one left missing. The cold start clones the
+   rootfs origin from the template.
+
+   Sandbox-manager asks node-manager's `GetCloneCapabilities` for
+   `staged_checkpoint_disk` on every call and refuses with
+   `FailedPrecondition` before fencing when it's absent, so a new
+   sandbox-manager next to an older node-manager changes nothing on the node.
+   Roll node-manager out first, then turn the switch on. To roll back, turn
+   the switch off, let the upgrades it started finish, and only then downgrade
+   node-manager. With the switch off, an upgrade of an encrypted copy without
+   its `rootfs.ext4` is refused before it fences, as it was before the switch
+   existed, so a copy an earlier upgrade finished starts no new upgrade.
+
+   A cold start of an encrypted sandbox whose instance has no `cow.luks` while
+   its checkpoint has one is refused with `FailedPrecondition` whether the
+   switch is on or off: node-manager would format a fresh COW and boot the
+   guest without its writes. With the switch on, a cold start of a suspended
+   encrypted sandbox, as the upgrade boots it, hands node-manager the COW of
+   the checkpoint the row pins to lay over whatever the instance holds, as a
+   restore does, since a suspended sandbox's checkpoint is its disk; any other
+   checkpoint, or a row that pins none, is refused. So is a pinned checkpoint
+   whose `cow.luks` isn't a non-empty regular file with one link, with
+   `FailedPrecondition` before node-manager is asked, since node-manager
+   replaces the instance's COW with the one it's handed. Node-manager also
+   refuses to lay an empty COW, for a restore too, and keeps the instance's.
+   Off, the instance's own COW is opened as before.
 
 While an upgrade holds the sandbox, other activations get the retryable 503
 the restore and activation leases already give, and a Wake that meets the

@@ -8,15 +8,14 @@ use pplx_space_execution_spec::ExecutionMetadata;
 use pplx_space_node_mgr_client::proto::{
     CreateBtrfsSnapshotRequest, CreateBtrfsSnapshotResponse, DeleteBtrfsSnapshotRequest,
     DeleteBtrfsSnapshotResponse, ResolveExecutionEnvironmentRequest,
-    ResolveExecutionEnvironmentResponse, RestoreInstanceSnapshotRequest,
-    RestoreInstanceSnapshotResponse,
+    RestoreInstanceSnapshotRequest, RestoreInstanceSnapshotResponse,
 };
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::LocalArtifactId;
 use tonic::Status;
 
 use super::super::node_effects::tests::{
-    Fixture, certified_target, environments, fixture, recording,
+    Fixture, certified_target, checkpoint_sidecar, environments, fixture, recording, resolution_of,
 };
 use crate::db::{RuntimeUpgradeOperationId, RuntimeUpgradePhase};
 use crate::node_manager_transport::fake::FakeNodeManager;
@@ -148,23 +147,7 @@ fn node_reaching_the_boot(
     target: &ExecutionMetadata,
     calls: &Arc<Mutex<Vec<String>>>,
 ) -> FakeNodeManager {
-    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
-    let compiled =
-        CompiledEnvironment::for_architecture(pplx_space_cpu_arch::Arch::X86_64).unwrap();
-    let definition = compiled
-        .iter()
-        .find(|environment| Some(environment.definition().reference()) == target.environment())
-        .unwrap()
-        .definition()
-        .clone();
-    let execution = definition
-        .bind_execution(definition.execution_requirements().unwrap())
-        .unwrap();
-    let resolved = ResolveExecutionEnvironmentResponse {
-        accepted_selection: 0,
-        definition: Some((&definition).into()),
-        execution: Some((&execution).into()),
-    };
+    let resolved = resolution_of(target);
     let (deleted, created, restored) = (calls.clone(), calls.clone(), calls.clone());
     FakeNodeManager::default()
         .unary(
@@ -696,6 +679,7 @@ async fn a_suspended_sandbox_already_on_its_target_is_restored_in_place() {
     )
     .unwrap();
     let checkpoint = f.adopt_checkpoint();
+    f.write_sidecar(checkpoint_sidecar(&f, false, Some(checkpoint)));
     f.materialize_local_snapshot();
     let operation_id = operation();
     let mut request = pod_upgrade(
@@ -716,6 +700,70 @@ async fn a_suspended_sandbox_already_on_its_target_is_restored_in_place() {
         report(&f.service, &f.sandbox_id, operation_id).status,
         RuntimeUpgradeStatus::AlreadyOnTarget as i32
     );
+}
+
+/// A suspended sandbox whose checkpoint here was produced by the target is
+/// on its target only if the checkpoint is the one the row pins and the
+/// upgrade was decided from. A sidecar naming another artifact, as a
+/// checkpoint left in the pinned one's place would, is refused and records
+/// nothing, so the same operation answers once the pinned checkpoint is back.
+#[tokio::test]
+async fn a_checkpoint_on_the_target_counts_only_if_it_is_the_pinned_one() {
+    for encrypted in [false, true] {
+        let f = fixture(
+            SandboxState::Suspended,
+            encrypted,
+            FakeNodeManager::default(),
+        );
+        let target = certified_target(&f.source);
+        std::fs::write(
+            f.checkpoint().join("runtime.json"),
+            serde_json::to_vec(
+                &pplx_space_execution_spec::SnapshotExecutionMetadata::new(target.clone()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let pinned = f.adopt_checkpoint();
+        f.write_sidecar(checkpoint_sidecar(
+            &f,
+            encrypted,
+            Some(LocalArtifactId::new()),
+        ));
+        let operation_id = operation();
+        let request = || {
+            let mut request = pod_upgrade(
+                &f.sandbox_id,
+                &target,
+                operation_id,
+                WakeTargetState::Stopped,
+            );
+            request.checkpoint_local_artifact_id = Some(pinned.to_string());
+            request
+        };
+
+        let refused = upgrade(&f.service, request()).await.unwrap_err();
+
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
+        assert!(
+            refused.message().contains("checkpoint it pins"),
+            "{refused}"
+        );
+        assert_eq!(
+            report(&f.service, &f.sandbox_id, operation_id).status,
+            RuntimeUpgradeStatus::Absent as i32,
+            "encrypted: {encrypted}"
+        );
+        assert_eq!(f.row().current_local_artifact_id, Some(pinned));
+
+        f.write_sidecar(checkpoint_sidecar(&f, encrypted, Some(pinned)));
+        upgrade(&f.service, request()).await.unwrap();
+        assert_eq!(
+            report(&f.service, &f.sandbox_id, operation_id).status,
+            RuntimeUpgradeStatus::AlreadyOnTarget as i32,
+            "encrypted: {encrypted}"
+        );
+    }
 }
 
 /// A suspended sandbox absent from the node is staged from `stage_from`

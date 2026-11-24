@@ -619,7 +619,9 @@ async fn stage_restore_cow(
     let source = source.to_path_buf();
     let cow_path = cow_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        crate::contained_copy::stage_file_contained(&root, &source, &cow_path)
+        // An encrypted COW is never empty: an empty one would replace the
+        // instance's COW, whatever it holds, with one that has no LUKS header.
+        crate::contained_copy::stage_disk_file_contained(&root, &source, &cow_path)
     })
     .await
     // A JoinError is a staging-task panic — a server fault, so map it to an
