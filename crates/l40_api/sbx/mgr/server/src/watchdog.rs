@@ -38,6 +38,7 @@ use crate::sidecar::{sidecar_alive, sidecar_live_pid};
 use crate::snapshot_scheduler::SnapshotScheduler;
 
 mod diagnostics;
+mod vm_memory;
 
 /// Health transition lines keep the watchdog's target, which log searches
 /// already select on, though `diagnostics` writes them.
@@ -299,6 +300,7 @@ pub struct SidecarInfo {
     pub guest_image: pplx_space_execution_spec::guest_image::GuestImageContract,
     pub node_execution_id: Option<pplx_space_sandbox_model::SandboxActivationAttemptId>,
     pub sandbox_id: String,
+    pub(crate) created_at: Option<crate::db::timestamps::EpochSeconds>,
     pub template: String,
     pub uid: Option<u32>,
     pub runtime_pid: Option<u32>,
@@ -315,6 +317,7 @@ fn sidecar_info_from_row(row: &crate::db::SandboxRow) -> SidecarInfo {
         guest_image: row.guest_image,
         node_execution_id: row.node_execution_id,
         sandbox_id: row.id.clone(),
+        created_at: crate::db::timestamps::EpochSeconds::parse(&row.created_at).ok(),
         template: row.template.clone(),
         uid: row.uid,
         runtime_pid: row.pid,
@@ -906,6 +909,14 @@ impl SandboxWatchdog {
             drain_state,
         );
         let restored_guests = crate::vm_diagnostics::RestoredGuests::default();
+        let host_reads = diagnostics::host_reads();
+        if pplx_space_observability::metrics_enabled() {
+            task_tracker.spawn(vm_memory::run(
+                Arc::clone(&sidecars),
+                host_reads.clone(),
+                shutdown_token.child_token(),
+            ));
+        }
         let health = composed_health_loop(
             state.clone(),
             sidecars.clone(),
@@ -916,6 +927,7 @@ impl SandboxWatchdog {
             shutdown_token.child_token(),
             node_manager.clone(),
             restored_guests.clone(),
+            host_reads,
         );
         task_tracker.spawn(async move {
             let _guard = health_guard;
@@ -2516,6 +2528,7 @@ async fn composed_health_loop(
     shutdown_token: CancellationToken,
     node_manager: NodeManagerConnector,
     restored_guests: crate::vm_diagnostics::RestoredGuests,
+    host_reads: diagnostics::HostReads,
 ) {
     let mut interval = tokio::time::interval(HEALTH_SCHEDULER_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2525,8 +2538,12 @@ async fn composed_health_loop(
     let evidence_queue = Arc::new(diagnostics::admission::EvidenceQueue::new(
         diagnostics::admission::EVIDENCE_QUEUE_CAPACITY,
     ));
-    let host_reads = diagnostics::host_reads();
     let cgroup_parent = diagnostics::sandbox_cgroup_parent().await;
+    tracing::info!(
+        target: LOG_TARGET,
+        cgroup_parent = %cgroup_parent.display(),
+        "guest-health evidence samples VM jailer cgroups under this parent"
+    );
     let mut evidence_collectors = tokio::task::JoinSet::new();
     for _ in 0..diagnostics::admission::EVIDENCE_COLLECTORS {
         evidence_collectors.spawn(diagnostics::run_evidence_collector(

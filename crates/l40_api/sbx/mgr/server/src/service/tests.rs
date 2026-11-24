@@ -11534,6 +11534,7 @@ pub(crate) mod service_tests {
                 guest_image: Default::default(),
                 node_execution_id: None,
                 sandbox_id: sandbox_id.to_string(),
+                created_at: None,
                 uid: None,
                 runtime_pid: None,
                 spaced_host_pid: None,
