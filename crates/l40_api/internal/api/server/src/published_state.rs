@@ -29,13 +29,6 @@ use pplx_space_sandbox_model::{
     SandboxQuarantineSource, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
     SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
-use pplx_space_sandbox_portability::{
-    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
-};
-use pplx_space_sandbox_quarantine_store::{
-    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-    quarantine_state_insert_columns,
-};
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
 };
@@ -1873,71 +1866,23 @@ pub(super) async fn publish_sandbox_states_with_census(
                 let updated_json = Json(serde_json::to_value(&updated_sql).map_err(|err| {
                     Status::internal(format!("serialize updated quarantine input: {err}"))
                 })?);
-                let state_columns = quarantine_state_insert_columns();
-                let state_conflict_assignments = quarantine_state_conflict_assignments();
-                let query = format!(
-                    "INSERT INTO sandbox_quarantine_state ({state_columns})
-                     SELECT
-                         input.sandbox_id,
-                         input.quarantine_id,
-                         NOW(),
-                         NOW(),
-                         input.from_lifecycle,
-                         input.source,
-                         input.reason_code,
-                         NULLIF(BTRIM(input.failure_reason), ''),
-                         jsonb_build_object('node_id', $3::TEXT),
-                         $2,
-                         $1
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         from_lifecycle TEXT,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID
-                     )
-                     ON CONFLICT (sandbox_id) DO UPDATE SET {state_conflict_assignments}",
-                );
-                sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id)
-                    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                    .bind(node_id.to_string())
-                    .bind(updated_json.clone())
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|err| Status::internal(format!("record quarantine state: {err}")))?;
-                let history_columns = quarantine_history_insert_columns();
-                let query = format!(
-                    "INSERT INTO sandbox_quarantine_history ({history_columns})
-                     SELECT
-                         input.history_id,
-                         input.quarantine_id,
-                         input.sandbox_id,
-                         NOW(),
-                         input.source,
-                         $2,
-                         input.reason_code,
-                         NULLIF(BTRIM(input.failure_reason), ''),
-                         $3,
-                         jsonb_build_object('node_id', $1::TEXT)
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID,
-                         history_id UUID
-                     )",
-                );
-                sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id.to_string())
-                    .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
-                    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                    .bind(updated_json)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|err| Status::internal(format!("record quarantine history: {err}")))?;
+                pplx_space_sandbox_quarantine_store::published_quarantine::upsert_states(
+                    &mut *conn,
+                    node_id,
+                    SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    updated_json.clone(),
+                )
+                .await
+                .map_err(|err| Status::internal(format!("record quarantine state: {err}")))?;
+                pplx_space_sandbox_quarantine_store::published_quarantine::insert_history(
+                    &mut *conn,
+                    node_id,
+                    SandboxQuarantineHistoryAction::EnteredQuarantine,
+                    SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    updated_json,
+                )
+                .await
+                .map_err(|err| Status::internal(format!("record quarantine history: {err}")))?;
                 quarantined_sandboxes = updated
                     .iter()
                     .map(|row| (row.sandbox_id, row.from_lifecycle.clone()))
@@ -2109,49 +2054,17 @@ pub(crate) async fn project_ready_suspend_snapshot(
     conn: &mut sqlx::PgConnection,
     snapshot_id: SnapshotId,
 ) -> Result<Option<(SandboxId, NodeId, String)>, Status> {
-    let eligibility = started_suspend_revert_eligibility("s");
-    let clear_marker = eligibility.clear_marker;
-    let eligible = eligibility.eligible;
-    let committed_suspend_evidence = "
-        s.current_local_artifact_id = sn.local_artifact_id
-        AND s.current_local_artifact_kind = sn.artifact_kind
-        AND s.current_local_artifact_origin = 'suspend'
-    ";
-    let lifecycle_eligible =
-        suspended_projection_lifecycle_eligible("s", committed_suspend_evidence);
-    let candidate_query = format!(
-        "SELECT s.id,
-                {clear_marker} AS clear_marker,
-                sn.source_node_id,
-                s.lifecycle
-           FROM snapshots sn
-           JOIN sandboxes s ON s.id = sn.sandbox_id
-          WHERE sn.id = $1
-            AND sn.state = 'ready'
-            AND sn.type = 'full'
-            AND (sn.artifact_origin IS NULL OR sn.artifact_origin = 'suspend')
-            AND sn.source_node_id IS NOT NULL
-            AND s.active_node_id = sn.source_node_id
-            AND {lifecycle_eligible}
-            AND EXISTS (
-                SELECT 1
-                  FROM snapshot_storage_locations ssl
-                 WHERE ssl.snapshot_id = sn.id
-            )
-            AND {eligible}
-          FOR UPDATE OF s",
-    );
-    let candidates: Vec<(SandboxId, bool, NodeId, String)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(sql!(candidate_query.as_str())))
-            .bind(snapshot_id)
-            .fetch_all(&mut *conn)
+    let candidates =
+        pplx_space_sandbox_store::ready_suspend_projection::lock_candidates(conn, snapshot_id)
             .await
             .map_err(|err| Status::internal(format!("select ready suspend projection: {err}")))?;
-    let Some((sandbox_id, clear_marker, source_node_id, from_lifecycle)) =
-        candidates.first().cloned()
-    else {
+    let Some(candidate) = candidates.first().cloned() else {
         return Ok(None);
     };
+    let sandbox_id = candidate.sandbox_id;
+    let clear_marker = candidate.clear_marker;
+    let source_node_id = candidate.source_node_id;
+    let from_lifecycle = candidate.lifecycle;
 
     let projected = apply_suspended_k8s_finalization(
         conn,

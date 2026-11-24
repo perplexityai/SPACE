@@ -1,13 +1,9 @@
 //! Postgres store for the failed-restorable repair loop.
 
-use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_snapshot_model::LocalArtifactId;
 
 use pplx_space_durations::PositiveDuration;
-use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use pplx_space_sandbox_store::repair;
-use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use super::{ApplyOutcome, RepairCandidate};
@@ -32,36 +28,16 @@ impl RepairDbStore {
         after_sandbox_id: Option<SandboxId>,
         min_age: PositiveDuration,
     ) -> Result<Vec<RepairCandidate>, sqlx::Error> {
-        let eligibility = failed_repair_revert_eligibility("s");
-        let guards = repair::failed_repair_row_state_guards("$4", "$1");
-        let query = format!(
-            "SELECT s.id, s.current_local_artifact_id, {clear} AS clear_marker
-               FROM sandboxes s
-              WHERE {guards}
-                AND {eligible}
-                AND ($2::uuid IS NULL OR s.id > $2)
-              ORDER BY s.id
-              LIMIT $3",
-            clear = eligibility.clear_marker,
-            eligible = eligibility.eligible,
-        );
-        let rows: Vec<(SandboxId, Option<LocalArtifactId>, bool)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(duration_secs_i64(min_age))
-                .bind(after_sandbox_id)
-                .bind(i64::from(batch_size))
-                .bind(SubstrateKind::Kubernetes)
-                .fetch_all(&self.pool)
+        let rows =
+            repair::failed_restorable_candidates(&self.pool, batch_size, after_sandbox_id, min_age)
                 .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(sandbox_id, current_local_artifact_id, clear_marker)| RepairCandidate {
-                    sandbox_id,
-                    current_local_artifact_id,
-                    clear_marker,
-                },
-            )
+            .map(|row| RepairCandidate {
+                sandbox_id: row.sandbox_id,
+                current_local_artifact_id: row.current_local_artifact_id,
+                clear_marker: row.clear_marker,
+            })
             .collect())
     }
 
@@ -107,8 +83,4 @@ impl RepairDbStore {
             ApplyOutcome::RevertedToSuspended
         })
     }
-}
-
-fn duration_secs_i64(duration: PositiveDuration) -> i64 {
-    i64::try_from(duration.get().as_secs()).unwrap_or(i64::MAX)
 }

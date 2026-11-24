@@ -75,16 +75,12 @@ use pplx_space_sandbox_model::{
     SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
 use pplx_space_sandbox_portability::orphan_recovery_revert_eligibility;
-use pplx_space_sandbox_quarantine_store::{
-    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-    quarantine_state_insert_columns,
-};
+use pplx_space_sandbox_quarantine_store::orphan_quarantine::{self, OrphanQuarantine};
 use pplx_space_sandbox_residency::node_observes_sandbox;
 use pplx_space_sandbox_store::orphan::{
     self, OrphanGuard, classify_guard_from_sql, classify_guard_lock_sql, classify_guard_sql,
 };
 use sqlx::PgPool;
-use sqlx::types::Json;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -1353,43 +1349,29 @@ impl OrphanActionSink for SubstrateActionSink {
             let history_id = Uuid::now_v7();
             let evidence = quarantine_evidence(&guard, row.active_node_id);
             let (reason_code, reason_message) = quarantine_reason(&guard);
-            let state_columns = quarantine_state_insert_columns();
-            let state_conflict_assignments = quarantine_state_conflict_assignments();
-            let query = format!(
-                "INSERT INTO sandbox_quarantine_state ({state_columns})
-                 VALUES ($1, $2, NOW(), NOW(), $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (sandbox_id) DO UPDATE SET {state_conflict_assignments}",
-            );
-            sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(sandbox_id)
-                .bind(quarantine_id)
-                .bind(row.from_lifecycle)
-                .bind(SandboxQuarantineSource::ClusterController.as_str())
-                .bind(reason_code.as_str())
-                .bind(reason_message)
-                .bind(Json(evidence.clone()))
-                .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                .bind(row.active_node_id)
-                .execute(&mut *tx)
-                .await?;
-
-            let history_columns = quarantine_history_insert_columns();
-            let query = format!(
-                "INSERT INTO sandbox_quarantine_history ({history_columns})
-                 VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, $8, $9)",
-            );
-            sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(history_id)
-                .bind(quarantine_id)
-                .bind(sandbox_id)
-                .bind(SandboxQuarantineSource::ClusterController.as_str())
-                .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
-                .bind(reason_code.as_str())
-                .bind(reason_message)
-                .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                .bind(Json(evidence))
-                .execute(&mut *tx)
-                .await?;
+            let quarantine = OrphanQuarantine {
+                sandbox_id,
+                quarantine_id,
+                source: SandboxQuarantineSource::ClusterController,
+                reason_code,
+                reason_message,
+                next_action: SandboxQuarantineNextAction::RequiresOperatorAttention,
+                evidence: &evidence,
+            };
+            orphan_quarantine::upsert_state(
+                &mut *tx,
+                &quarantine,
+                row.from_lifecycle,
+                row.active_node_id,
+            )
+            .await?;
+            orphan_quarantine::insert_history(
+                &mut *tx,
+                &quarantine,
+                history_id,
+                SandboxQuarantineHistoryAction::EnteredQuarantine,
+            )
+            .await?;
 
             tx.commit().await?;
             let mut details = details_for_guard(&guard)

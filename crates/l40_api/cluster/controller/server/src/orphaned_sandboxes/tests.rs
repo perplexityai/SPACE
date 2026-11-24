@@ -12,6 +12,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStage,
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+use sqlx::types::Json;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
