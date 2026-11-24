@@ -39,6 +39,27 @@ fn lock_db(ctx: &CheckpointContext) -> Result<crate::db::ConnectionGuard<'_>, St
         .map_err(|error| format!("database mutex poisoned: {error}"))
 }
 
+/// Admit a scheduled capture of `sandbox_id`, `producer` naming it, with the
+/// activation seal, holding the sandbox's artifact lock: see
+/// [`crate::activation_seal::ActivationSeal::admit_producer`]. A row that is
+/// missing or can't be read has no VM, which only a sealed node refuses.
+fn admit_scheduled_producer(
+    ctx: &CheckpointContext,
+    producer: &str,
+    sandbox_id: &str,
+) -> Result<crate::activation_seal::ArtifactProducerToken, String> {
+    let has_vm = {
+        let db = lock_db(ctx)?;
+        crate::db::read::sandbox(&db, sandbox_id)
+            .ok()
+            .flatten()
+            .is_some_and(|sandbox| crate::activation_seal::has_vm(sandbox.state))
+    };
+    ctx.activation_seal
+        .admit_producer(producer, sandbox_id, has_vm)
+        .map_err(|refusal| refusal.message().to_owned())
+}
+
 /// `do_checkpoint`'s admission to the node-local SQLite `sandboxes.state`:
 /// `started` or `paused` to `checkpointing`, under the connection guard that
 /// read the state. Guard refusals and a missing row render
@@ -257,6 +278,8 @@ pub struct CheckpointContext {
     pub auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator,
     pub health_lifecycle: crate::watchdog::HealthLifecycleEpochs,
     pub node_manager: crate::node_manager_transport::NodeManagerConnector,
+    /// Admits each scheduled capture as a node-local artifact producer.
+    pub(crate) activation_seal: Arc<crate::activation_seal::ActivationSeal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,6 +655,7 @@ async fn do_scheduled_checkpoint(
         .auto_lifecycle
         .artifact_publication_locks(sandbox_id, ArtifactKind::Full)
         .await;
+    let _producer = admit_scheduled_producer(ctx, "scheduled checkpoint", sandbox_id)?;
     let completion = do_checkpoint(ctx, sandbox_id, snapshot_name).await?;
     // A skipped capture wrote nothing: publishing would create a Ready
     // artifact row (and event) pointing at files that do not exist.

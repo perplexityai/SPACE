@@ -1813,6 +1813,7 @@ impl SandboxManagerService {
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: health_lifecycle.clone(),
             node_manager: options.node_manager.clone(),
+            activation_seal: Arc::clone(&activation_seal),
         });
         let snapshot_scheduler = Arc::new(
             crate::snapshot_scheduler::SnapshotScheduler::new_with_ownership(

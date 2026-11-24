@@ -981,6 +981,37 @@ async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
     }
 }
 
+/// A v2 drain doesn't move a stopped sandbox, so a due auto-lifecycle Stop of
+/// a `suspended` row waits while the node is sealed: the row stays
+/// `suspended`, the stage isn't recorded as fired, and nothing is reported as
+/// an error. The first run after the node is unsealed stops it.
+#[tokio::test]
+async fn auto_lifecycle_stop_of_a_suspended_row_waits_for_an_unseal() {
+    let scratch = tempfile::tempdir().unwrap();
+    let service = isolated_service(scratch.path());
+    let id = SandboxId::new().to_string();
+    insert_due_suspended_sandbox(&service, &id, 10);
+    service.activation_seal.seal(&service.db, 5).unwrap();
+
+    service.run_due_auto_lifecycle(&id).await.unwrap();
+    {
+        let db = service.db.lock().unwrap();
+        let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxStatus::from(SandboxState::Suspended));
+        assert!(
+            row.auto_lifecycle_state.next_auto_event_at.is_some(),
+            "the Stop stage is still due"
+        );
+    }
+
+    service.activation_seal.unseal(&service.db, 5).unwrap();
+    service.run_due_auto_lifecycle(&id).await.unwrap();
+    let db = service.db.lock().unwrap();
+    let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
+    assert_eq!(row.auto_lifecycle_state.next_auto_event_at, None);
+}
+
 /// Stop admits a `suspended` row only while its runtime is live: in the
 /// window between Stop's runtime gate and its cleanup fence, or with a leaked
 /// runtime. A Stop admitted between auto-lifecycle Stop's re-read and its
