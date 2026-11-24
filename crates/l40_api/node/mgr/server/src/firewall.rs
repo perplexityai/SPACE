@@ -517,8 +517,8 @@ pub fn teardown_proxy_rules(ns: &str) {
 
 /// Remove every nft table SPACE owns in a reusable slot's namespace, ahead of
 /// the in-place reset's rebuild. The next occupant starts like a fresh slot,
-/// which has no firewall-rules table: the next apply or the start gate
-/// installs the current assignment. Failing to delete the firewall-rules table
+/// which has no firewall-rules table: the next apply installs the current
+/// assignment. Failing to delete the firewall-rules table
 /// leaves an unverified one, so that is an error and the caller rebuilds the
 /// slot; the sandbox table's teardown is best effort because its rebuild
 /// refuses to run over a leftover.
