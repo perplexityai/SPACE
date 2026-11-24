@@ -2,6 +2,7 @@ use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_data_plane_session_store::{
     self as data_plane_session_store, Session as PublicSessionRow,
 };
+use pplx_space_public_operation_store as operation_store;
 use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use pplx_space_public_api::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -461,12 +462,6 @@ struct PublicSessionIdempotencyRecord {
     request_fingerprint: RequestFingerprint,
 }
 
-#[derive(Debug, FromRow)]
-struct PublicSessionIdempotencyRow {
-    operation_id: Option<Uuid>,
-    request_fingerprint: String,
-}
-
 const SESSION_SELECT_SQL: &str = sql!(
     "SELECT session_id,
        sandbox_id,
@@ -499,32 +494,16 @@ async fn find_idempotency_record(
     // unique, so a live record and an expired one never coexist: this deletes
     // only when the lookup comes back empty. `NOW()` is the transaction's
     // start, so the two predicates partition the record exactly.
-    let row = sqlx::query_as::<_, PublicSessionIdempotencyRow>(sql!(
-        "WITH expired AS (
-             DELETE FROM public_idempotency_records
-             WHERE org_id = $1
-               AND api_product = $2
-               AND method = $3
-               AND path_template = $4
-               AND idempotency_key = $5
-               AND expires_at <= NOW()
-         )
-         SELECT operation_id, request_fingerprint
-         FROM public_idempotency_records
-         WHERE org_id = $1
-           AND api_product = $2
-           AND method = $3
-           AND path_template = $4
-           AND idempotency_key = $5
-           AND expires_at > NOW()
-         FOR UPDATE"
-    ))
-    .bind(org_id)
-    .bind(API_PRODUCT_NATIVE.as_str())
-    .bind(idempotency.method.as_str())
-    .bind(idempotency.path_template.as_str())
-    .bind(idempotency.key.as_str())
-    .fetch_optional(&mut **tx)
+    let row = operation_store::idempotency::delete_expired_and_lock_live(
+        tx,
+        API_PRODUCT_NATIVE.as_str(),
+        operation_store::idempotency::IdempotencyKeyRef {
+            org_id,
+            method: idempotency.method.as_str(),
+            path_template: idempotency.path_template.as_str(),
+            idempotency_key: idempotency.key.as_str(),
+        },
+    )
     .await?;
 
     row.map(TryInto::try_into).transpose()
@@ -535,10 +514,7 @@ async fn lock_idempotency_key(
     org_id: OrgId,
     idempotency: CreatePublicSessionIdempotency<'_>,
 ) -> Result<(), PublicSessionStoreError> {
-    sqlx::query(sql!("SELECT pg_advisory_xact_lock($1)"))
-        .bind(idempotency_lock_key(org_id, idempotency))
-        .execute(&mut **tx)
-        .await?;
+    operation_store::idempotency::lock_key(tx, idempotency_lock_key(org_id, idempotency)).await?;
     Ok(())
 }
 
@@ -797,10 +773,10 @@ fn session_into_public(
     })
 }
 
-impl TryFrom<PublicSessionIdempotencyRow> for PublicSessionIdempotencyRecord {
+impl TryFrom<operation_store::idempotency::OperationKeyRow> for PublicSessionIdempotencyRecord {
     type Error = PublicSessionStoreError;
 
-    fn try_from(row: PublicSessionIdempotencyRow) -> Result<Self, Self::Error> {
+    fn try_from(row: operation_store::idempotency::OperationKeyRow) -> Result<Self, Self::Error> {
         Ok(Self {
             operation_id: row.operation_id,
             request_fingerprint: RequestFingerprint::parse(row.request_fingerprint.clone())

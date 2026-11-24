@@ -5,6 +5,7 @@ use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use super::*;
 use crate::fork_operations::{ForkRequest, ForkTargetConfig};
 use pplx_space_db_test_fixtures::try_pg_test_db;
+use sqlx::types::Json;
 
 #[test]
 fn leader_selection_prefers_an_existing_leader() {
