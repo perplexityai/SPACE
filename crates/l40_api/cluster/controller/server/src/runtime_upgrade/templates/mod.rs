@@ -613,9 +613,10 @@ impl TemplateDriver {
         tx.commit()
             .await
             .map_err(|error| MoveError::database("inserting the twin", error))?;
-        // Registration logs the twins it inserts with the same text and
-        // fields but `campaign_id` (`RegisterTemplateRelease`), so one search
-        // finds both.
+        // The message contains the text registration logs its twins with
+        // (`RegisterTemplateRelease`), so one substring search finds both.
+        // `subject_id` is the release copied, as in `item finished`; after an
+        // earlier campaign it can itself be a twin, not the hash's original.
         if new {
             tracing::info!(
                 campaign_id = %campaign.id,
@@ -623,7 +624,7 @@ impl TemplateDriver {
                 hash = %subject.hash,
                 environment = %campaign.to,
                 release_id = %inserted,
-                original_release_id = %subject.id,
+                subject_id = %subject.id,
                 "runtime_upgrade: inserted template release twin"
             );
         }

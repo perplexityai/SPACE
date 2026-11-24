@@ -416,7 +416,8 @@ impl ClusterApi for ClusterApiService {
             .await
             .map_err(|err| template_publication::storage_status("commit tx", &err))?;
         // Logged once committed, so a refused registration's twin isn't.
-        // Template campaigns log the twins they insert with the same text.
+        // Template campaigns log the twins they insert with a message that
+        // contains this one.
         // A twin keeps the `(template_name, hash)` index from being rebuilt,
         // and binaries that read releases by template and hash alone can't
         // tell it from its original. An unbound twin has no `environment`.
