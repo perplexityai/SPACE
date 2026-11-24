@@ -49,9 +49,8 @@ async fn sweep<T: Send, F: Future<Output = ()> + Send>(
         .count()
         .await;
     if completed < len {
-        // Don't keep sampling only the same prefix when sweeps hit the deadline.
-        // Advance by completions, not started reads that were dropped on timeout.
-        *cursor = (start + completed.max(1)) % len;
+        // Give every target a turn first, regardless of read completion order.
+        *cursor = (start + 1) % len;
         return true;
     }
     false
