@@ -577,7 +577,7 @@ impl TemplateDriver {
                 readers.holding, readers.workers
             )));
         }
-        let inserted = match releases::insert_twin(
+        let (inserted, new) = match releases::insert_twin(
             &mut tx,
             subject.id,
             target,
@@ -587,7 +587,8 @@ impl TemplateDriver {
         .await
         .map_err(|error| MoveError::database("inserting the twin", error))?
         {
-            InsertTwin::Inserted(twin) | InsertTwin::Existing(twin) => twin,
+            InsertTwin::Inserted(twin) => (twin, true),
+            InsertTwin::Existing(twin) => (twin, false),
             InsertTwin::OriginalGone => {
                 return Ok(Moved::Skipped(
                     "the release or its template went away".to_owned(),
@@ -612,6 +613,20 @@ impl TemplateDriver {
         tx.commit()
             .await
             .map_err(|error| MoveError::database("inserting the twin", error))?;
+        // Registration logs the twins it inserts with the same text and
+        // fields but `campaign_id` (`RegisterTemplateRelease`), so one search
+        // finds both.
+        if new {
+            tracing::info!(
+                campaign_id = %campaign.id,
+                template_name = %subject.template_name,
+                hash = %subject.hash,
+                environment = %campaign.to,
+                release_id = %inserted,
+                original_release_id = %subject.id,
+                "runtime_upgrade: inserted template release twin"
+            );
+        }
         Ok(Moved::Done)
     }
 
