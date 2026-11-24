@@ -130,39 +130,29 @@ struct BackupAttemptFinalization<'a> {
     suspend_uncommitted: bool,
 }
 
-/// The `snapshots` row [`ClusterApiService::finalize_backup_attempt`] flips,
-/// exactly as that statement's `RETURNING` produces it.
-#[derive(Debug, FromRow)]
-struct FinalizedSnapshotRow {
-    sandbox_id: SandboxId,
-    source_node_id: Option<NodeId>,
-    local_artifact_id: Option<LocalArtifactId>,
-    artifact_kind: Option<String>,
-}
-
-impl FinalizedSnapshotRow {
-    /// The pending-backup queue identity this finalize is entitled to delete,
-    /// if the row carries a complete one.
-    ///
-    /// `source_node_id` is NULL on rows that predate node attribution and
-    /// `local_artifact_id` on rollout-skew rows with no artifact identity; a
-    /// row missing either cannot name a queue row, since every mirrored row
-    /// carries both, so `None` costs nothing the census set-replace does not
-    /// heal.
-    ///
-    /// The `artifact_kind` arm is unreachable rather than lenient:
-    /// `snapshots_artifact_identity_check` makes the column non-NULL whenever
-    /// `local_artifact_id` is, and its own `CHECK` admits only `disk` and
-    /// `full`. It is written as a fallible parse anyway because the type
-    /// system cannot see either constraint.
-    fn artifact(&self) -> Option<node_local_backup_pending::FinalizedArtifact> {
-        Some(node_local_backup_pending::FinalizedArtifact {
-            source_node_id: self.source_node_id?,
-            sandbox_id: self.sandbox_id,
-            artifact_id: self.local_artifact_id?,
-            artifact_kind: ArtifactKind::from_str(self.artifact_kind.as_deref()?).ok()?,
-        })
-    }
+/// The pending-backup queue identity a finalize is entitled to delete, if the
+/// row [`ClusterApiService::finalize_backup_attempt`] flipped carries a
+/// complete one.
+///
+/// `source_node_id` is NULL on rows that predate node attribution and
+/// `local_artifact_id` on rollout-skew rows with no artifact identity; a row
+/// missing either cannot name a queue row, since every mirrored row carries
+/// both, so `None` costs nothing the census set-replace does not heal.
+///
+/// The `artifact_kind` arm is unreachable rather than lenient:
+/// `snapshots_artifact_identity_check` makes the column non-NULL whenever
+/// `local_artifact_id` is, and its own `CHECK` admits only `disk` and `full`.
+/// It is written as a fallible parse anyway because the type system cannot
+/// see either constraint.
+fn finalized_artifact(
+    row: &snapshot_store::upload::FinalizedAttempt,
+) -> Option<node_local_backup_pending::FinalizedArtifact> {
+    Some(node_local_backup_pending::FinalizedArtifact {
+        source_node_id: row.source_node_id?,
+        sandbox_id: row.sandbox_id,
+        artifact_id: row.local_artifact_id?,
+        artifact_kind: ArtifactKind::from_str(row.artifact_kind.as_deref()?).ok()?,
+    })
 }
 
 #[path = "published_state.rs"]
@@ -775,23 +765,13 @@ impl ClusterApiService {
         // the node's pending-backup mirror. Taking all four from the row this
         // statement just flipped is what makes that delete safe: nothing else
         // here knows which artifact the caller finalized.
-        let finalized_snapshot: Option<FinalizedSnapshotRow> = sqlx::query_as(sql!(
-            "UPDATE snapshots
-                SET state = $2,
-                    size_bytes = COALESCE($3, size_bytes),
-                    failure_reason = CASE
-                        WHEN $2 = 'failed' THEN COALESCE($4, failure_reason)
-                        ELSE NULL
-                    END
-              WHERE id = $1
-                AND state IN ('creating', $2)
-            RETURNING sandbox_id, source_node_id, local_artifact_id, artifact_kind"
-        ))
-        .bind(snapshot_id)
-        .bind(target_state.as_str())
-        .bind(size_bytes)
-        .bind(failure_reason)
-        .fetch_optional(&mut *tx)
+        let finalized_snapshot = snapshot_store::upload::finalize_attempt(
+            &mut *tx,
+            snapshot_id,
+            target_state,
+            size_bytes,
+            failure_reason,
+        )
         .await
         .map_err(|e| Status::internal(format!("finalize snapshot: {e}")))?;
 
@@ -857,8 +837,10 @@ impl ClusterApiService {
         // every mirrored row carries a non-null node and artifact — so the
         // fast path skips it and the census set-replace stays the backstop for
         // every row this path does not reach.
-        let cleared_pending_backup = match (target_state.is_ready(), finalized_snapshot.artifact())
-        {
+        let cleared_pending_backup = match (
+            target_state.is_ready(),
+            finalized_artifact(&finalized_snapshot),
+        ) {
             (true, Some(artifact)) => {
                 node_local_backup_pending::clear_finalized(&mut tx, artifact).await?
             }
@@ -908,16 +890,9 @@ impl ClusterApiService {
     /// no value in distinguishing "missing" from "already terminal" with an
     /// error the caller would only swallow.
     async fn touch_backup_attempt(&self, snapshot_id: SnapshotId) -> Result<(), Status> {
-        sqlx::query(sql!(
-            "UPDATE snapshots
-                SET last_attempt_at = NOW()
-              WHERE id = $1
-                AND state = 'creating'"
-        ))
-        .bind(snapshot_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Status::internal(format!("touch snapshot: {e}")))?;
+        snapshot_store::upload::touch_attempt(&self.pool, snapshot_id)
+            .await
+            .map_err(|e| Status::internal(format!("touch snapshot: {e}")))?;
 
         Ok(())
     }

@@ -38,15 +38,15 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     .bind(expected.sandbox_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(sql!("SELECT id FROM snapshots WHERE id = $1 FOR SHARE"))
-        .bind(expected.snapshot_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(sql!(
-        "SELECT snapshot_id FROM snapshot_storage_locations WHERE snapshot_id = $1 FOR SHARE"
-    ))
-    .bind(expected.snapshot_id)
-    .execute(&mut *tx)
+    pplx_space_snapshot_store::quarantine_recovery::share_lock_snapshot(
+        &mut tx,
+        expected.snapshot_id,
+    )
+    .await?;
+    pplx_space_snapshot_store::quarantine_recovery::share_lock_storage_location(
+        &mut tx,
+        expected.snapshot_id,
+    )
     .await?;
     let current = candidates(&mut *tx, None, Some(expected.sandbox_id), 2).await?;
     if current.as_slice() != std::slice::from_ref(expected) {

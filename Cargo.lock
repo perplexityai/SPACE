@@ -8424,7 +8424,6 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "pplx-space-sandbox-model",
- "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
  "pplx-space-snapshot-model",
  "pplx-space-snapshot-storage",
