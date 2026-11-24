@@ -1377,7 +1377,7 @@ fn serves_target(
                 .zip(info.pod_uid.as_deref())
                 .is_none_or(|(expected, reported)| expected == reported)
             && info
-                .pod_ip
+                .external_address
                 .as_deref()
                 .is_none_or(|reported| PodIp::parse(reported).ok() == Some(pod_ip))
     })
@@ -1406,7 +1406,7 @@ fn node_reported_address(
                 && info.execution_generation == Some(generation)
                 && info.pod_uid.as_deref() == Some(pod_uid)
         })
-        .and_then(|info| PodIp::parse(info.pod_ip.as_deref()?).ok())
+        .and_then(|info| PodIp::parse(info.external_address.as_deref()?).ok())
 }
 
 #[cfg(test)]
@@ -1419,7 +1419,7 @@ mod node_reported_address_tests {
             sandbox_id: sandbox_id.to_string(),
             execution_generation: Some(generation),
             pod_uid: Some(pod_uid.to_owned()),
-            pod_ip: Some(pod_ip.to_owned()),
+            external_address: Some(pod_ip.to_owned()),
             ..Default::default()
         }
     }
