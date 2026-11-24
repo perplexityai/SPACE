@@ -109,22 +109,59 @@ async fn open(
     manager_epoch: i64,
     wakeup: &mut impl Wakeup,
 ) -> Result<Opening, sqlx::Error> {
+    let locked = match lock_question(tx, target, manager_epoch).await? {
+        Ok(locked) => locked,
+        Err(refusal) => return Ok(Opening::Refused(refusal)),
+    };
+    if let Pending::Live(question) = locked.pending {
+        return Ok(Opening::AlreadyOpen(question));
+    }
+    let asked = ask(tx, target, locked.assignment_generation, wakeup).await?;
+    Ok(asked.map_or(Opening::Refused(OpenRefusal::Lapsed), Opening::Opened))
+}
+
+/// What [`lock_question`] read under the opener's locks.
+pub(crate) struct Locked {
+    pub(crate) assignment_generation: u64,
+    pub(crate) revision: uuid::Uuid,
+    pub(crate) pending: Pending,
+}
+
+/// The pending round, as it stands for the generation the item issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Pending {
+    /// None asks about it: there's no round, or one naming an earlier
+    /// generation or none.
+    None,
+    /// One asks about it and can still be answered.
+    Live(PendingRound),
+    /// One asks about it and can no longer be answered.
+    Expired,
+}
+
+/// Take the opener's locks up to the observation row, creating that row,
+/// and judge authority under them.
+pub(crate) async fn lock_question(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &LeasedTarget,
+    manager_epoch: i64,
+) -> Result<Result<Locked, OpenRefusal>, sqlx::Error> {
     // The header shared: a pause or abort waits, other openings don't.
     let Some(item) = lock_leased_item(tx, target, HeaderLock::Share).await? else {
-        return Ok(Opening::Refused(OpenRefusal::NotATarget));
+        return Ok(Err(OpenRefusal::NotATarget));
     };
     if !item.working {
-        return Ok(Opening::Refused(OpenRefusal::NotChecking));
+        return Ok(Err(OpenRefusal::NotChecking));
     }
     if !item.leased {
-        return Ok(Opening::Refused(OpenRefusal::LeaseLost));
+        return Ok(Err(OpenRefusal::LeaseLost));
     }
     let Work::Check {
         assignment_generation,
         ..
     } = item.work(target)?
     else {
-        return Ok(Opening::Refused(OpenRefusal::NotIssued));
+        return Ok(Err(OpenRefusal::NotIssued));
     };
     let current = sqlx::query_scalar::<_, bool>(sql!(
         "SELECT assignment_generation = $2 AND revision_id = $3
@@ -139,7 +176,7 @@ async fn open(
     .fetch_optional(&mut **tx)
     .await?;
     if current != Some(true) {
-        return Ok(Opening::Refused(OpenRefusal::Superseded));
+        return Ok(Err(OpenRefusal::Superseded));
     }
     // Created on first use; a refusal rolls the row back with the rest. The
     // caller supplies the epoch and the first opener's sticks: nothing moves a
@@ -169,26 +206,41 @@ async fn open(
         .fetch_one(&mut **tx)
         .await?;
     if epoch != manager_epoch {
-        return Ok(Opening::Refused(OpenRefusal::EpochMismatch));
+        return Ok(Err(OpenRefusal::EpochMismatch));
     }
-    match (round, round_issued_at, bound.map(non_negative).transpose()?) {
-        (Some(round), Some(issued_at), Some(bound))
-            if bound == assignment_generation && !expired =>
-        {
-            return Ok(Opening::AlreadyOpen(pending_round(
+    let pending = match (round, round_issued_at, bound.map(non_negative).transpose()?) {
+        (Some(_), Some(_), Some(bound)) if bound == assignment_generation && expired => {
+            Pending::Expired
+        }
+        (Some(round), Some(issued_at), Some(bound)) if bound == assignment_generation => {
+            Pending::Live(pending_round(
                 round,
                 issued_at,
                 Some(assignment_generation),
-            )?));
+            )?)
         }
         (_, _, Some(bound)) if bound > assignment_generation => {
-            return Ok(Opening::Refused(OpenRefusal::LaterGeneration));
+            return Ok(Err(OpenRefusal::LaterGeneration));
         }
-        // Replaced: no round, an expired one for this generation, one for an
-        // earlier generation, or an unbound one, left from before rounds
-        // named their generation.
-        _ => {}
-    }
+        // Replaced when asked: no round, one for an earlier generation, or an
+        // unbound one, left from before rounds named their generation.
+        _ => Pending::None,
+    };
+    Ok(Ok(Locked {
+        assignment_generation,
+        revision: item.revision,
+        pending,
+    }))
+}
+
+/// Queue the wakeup and open the round, under [`lock_question`]'s locks.
+/// `None` when the lease lapsed meanwhile.
+pub(crate) async fn ask(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &LeasedTarget,
+    assignment_generation: u64,
+    wakeup: &mut impl Wakeup,
+) -> Result<Option<PendingRound>, sqlx::Error> {
     wake_one(tx, wakeup, target.node_id).await?;
     // After the wakeup, which may have waited, on one clock reading. The item
     // lock, held since the item was read, keeps its token as checked.
@@ -213,12 +265,7 @@ async fn open(
     .bind(target.rollout_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((round, issued_at)) = opened else {
-        return Ok(Opening::Refused(OpenRefusal::Lapsed));
-    };
-    Ok(Opening::Opened(pending_round(
-        round,
-        issued_at,
-        Some(assignment_generation),
-    )?))
+    opened
+        .map(|(round, issued_at)| pending_round(round, issued_at, Some(assignment_generation)))
+        .transpose()
 }

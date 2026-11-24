@@ -3,7 +3,8 @@
 //! an assignment, an issuance stamp, an observation or a wakeup;
 //! [`issue_first_assignment`](crate::issue_first_assignment) writes the
 //! assignment, issuance stamp and wakeup under the lease, and no observation.
-//! Only a retried check reschedules `next_check_at` ([`Requeue::Retry`]).
+//! Only a retried or waiting check reschedules `next_check_at`
+//! ([`Requeue::Retry`], [`Requeue::Wait`]).
 //!
 //! Claims and renewals run [`pplx_space_rollout_queue::claim`] and
 //! [`pplx_space_rollout_queue::renew`] on these tables, in their lock order:
@@ -547,6 +548,9 @@ pub enum Requeue {
         next_check_in: Duration,
         error: Option<String>,
     },
+    /// Not attempted yet: a check that waits on its node. The attempt is
+    /// given back, the error cleared, and the check next due as for `Retry`.
+    Wait { next_check_in: Duration },
 }
 
 /// End `target`'s lease and return the item to pending. `false` when the
@@ -560,15 +564,16 @@ pub async fn requeue(
     requeue: &Requeue,
 ) -> Result<bool, sqlx::Error> {
     let (refund, next_check_in, error): (i64, _, _) = match requeue {
-        Requeue::Release { error } => (1, None, error),
+        Requeue::Release { error } => (1, None, error.as_deref()),
         Requeue::Retry {
             next_check_in,
             error,
-        } => (0, Some(next_check_in.as_secs_f64()), error),
+        } => (0, Some(next_check_in.as_secs_f64()), error.as_deref()),
+        Requeue::Wait { next_check_in } => (1, Some(next_check_in.as_secs_f64()), None),
     };
     // As the schema's check allows: no NULs, which Postgres text can't hold,
     // at most 4096 characters, and never empty.
-    let error = error.as_deref().and_then(|error| {
+    let error = error.and_then(|error| {
         let error: String = error.chars().filter(|c| *c != '\0').take(4096).collect();
         (!error.is_empty()).then_some(error)
     });
