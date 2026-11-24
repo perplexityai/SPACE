@@ -55,7 +55,7 @@ use pplx_space_sandbox_store::ingest::SuspendedFinalizationCandidate;
 use pplx_space_sandbox_store::published_quarantine_candidates::{
     self, PublishedQuarantineCandidate,
 };
-use pplx_space_sandbox_teardown::{conditions, observed_status};
+use pplx_space_sandbox_teardown::{conditions, direct, observed_status};
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
 
@@ -1647,98 +1647,29 @@ pub(super) async fn publish_sandbox_states_with_census(
         accepted = accepted.saturating_add(usize_to_u64(result.len()));
     }
 
-    let failure_episode_rows_json = Json(serde_json::Value::Array(failure_episode_rows));
-    sqlx::query(sql!(
-        "INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_payload, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             input.sandbox_id::TEXT,
-             jsonb_build_object(
-                 $4::TEXT,
-                 jsonb_strip_nulls(jsonb_build_object(
-                     $5::TEXT, input.execution_generation,
-                     $6::TEXT, input.pod_uid,
-                     $7::TEXT, input.activation_attempt_id
-                 ))
-             ),
-             NOW(),
-             NOW()
-         FROM jsonb_to_recordset($2::JSONB) AS input(
-             sandbox_id UUID,
-             published_lifecycle TEXT,
-             state_degraded BOOLEAN,
-             execution_generation BIGINT,
-             pod_uid TEXT,
-             activation_attempt_id TEXT
-         )
-         JOIN sandboxes s
-           ON s.id = input.sandbox_id
-         LEFT JOIN sandbox_direct_route_identities direct_route
-           ON direct_route.sandbox_id = s.id
-         WHERE COALESCE(direct_route.current_node_id, s.active_node_id) = $1
-           AND input.published_lifecycle = 'failed'
-           AND NOT input.state_degraded
-           AND input.execution_generation IS NOT NULL
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_payload =
-                 (COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
-                     - $4::TEXT)
-                 || EXCLUDED.observed_payload,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE node_facet_observed_status.observed_payload -> $4::TEXT
-               IS DISTINCT FROM EXCLUDED.observed_payload -> $4::TEXT"
-    ))
-    .bind(node_id)
-    .bind(failure_episode_rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(SANDBOX_FAILURE_EPISODE_KEY)
-    .bind(SANDBOX_FAILURE_EXECUTION_GENERATION_KEY)
-    .bind(SANDBOX_FAILURE_POD_UID_KEY)
-    .bind(SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY)
-    .execute(&mut *conn)
+    let failure_episode_rows = serde_json::Value::Array(failure_episode_rows);
+    direct::record_failure_episodes(
+        &mut *conn,
+        node_id,
+        &failure_episode_rows,
+        FACET_SANDBOX_DESIRED_STATE,
+        direct::FailureEpisodeKeys {
+            episode: SANDBOX_FAILURE_EPISODE_KEY,
+            execution_generation: SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
+            pod_uid: SANDBOX_FAILURE_POD_UID_KEY,
+            activation_attempt_id: SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
+        },
+    )
     .await
     .map_err(|err| Status::internal(format!("write sandbox failure episode: {err}")))?;
 
-    sqlx::query(sql!(
-        "UPDATE node_facet_observed_status observed
-         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
-                                    - $4::TEXT,
-             observed_at = NOW(),
-             updated_at = NOW()
-         FROM jsonb_to_recordset($2::JSONB) AS input(
-             sandbox_id UUID,
-             published_lifecycle TEXT,
-             state_degraded BOOLEAN,
-             execution_generation BIGINT,
-             pod_uid TEXT,
-             activation_attempt_id TEXT
-         )
-         JOIN sandboxes s
-           ON s.id = input.sandbox_id
-         LEFT JOIN sandbox_direct_route_identities direct_route
-           ON direct_route.sandbox_id = s.id
-         WHERE COALESCE(direct_route.current_node_id, s.active_node_id) = $1
-           AND observed.node_id = $1
-           AND observed.facet = $3
-           AND observed.element = input.sandbox_id::TEXT
-           AND (
-               input.published_lifecycle IS DISTINCT FROM 'failed'
-               OR (
-                   NOT input.state_degraded
-                   AND input.execution_generation IS NULL
-               )
-           )
-           AND observed.observed_payload ? $4::TEXT"
-    ))
-    .bind(node_id)
-    .bind(failure_episode_rows_json)
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(SANDBOX_FAILURE_EPISODE_KEY)
-    .execute(&mut *conn)
+    direct::clear_failure_episodes(
+        &mut *conn,
+        node_id,
+        &failure_episode_rows,
+        FACET_SANDBOX_DESIRED_STATE,
+        SANDBOX_FAILURE_EPISODE_KEY,
+    )
     .await
     .map_err(|err| Status::internal(format!("clear sandbox failure episode: {err}")))?;
 

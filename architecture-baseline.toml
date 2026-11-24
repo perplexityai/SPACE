@@ -20,7 +20,7 @@
 "crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
 "crates/l40_api/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
 "crates/l40_api/internal/api/server/src/lib.rs" = 1
-"crates/l40_api/internal/api/server/src/published_state.rs" = 4
+"crates/l40_api/internal/api/server/src/published_state.rs" = 2
 
 [pattern_ratchet.kubernetes_access]
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
