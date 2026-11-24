@@ -5336,6 +5336,7 @@ dependencies = [
  "pplx-space-job-id",
  "pplx-space-sql-locator",
  "rusqlite",
+ "sqlx",
  "thiserror 2.0.20",
 ]
 

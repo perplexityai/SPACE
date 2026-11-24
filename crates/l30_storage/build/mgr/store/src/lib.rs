@@ -1,14 +1,17 @@
 //! build-manager's node-local SQLite store: `build_job_results`, what each
-//! finished build job produced, and build-manager's reads of its shared `jobs`
-//! table.
+//! finished build job produced, and build-manager's reads of its shared
+//! `jobs` table and its expired-lease give-up there.
 //!
 //! The database's opening and PRAGMAs stay in `pplx-space-build-mgr-server`,
 //! and `pplx-space-db-migrate` applies its migrations. The job queue itself is
 //! read and written through `pplx-space-common-jobs`. The lease-guarded result
-//! write and the expired-lease give-up stay in the server: their `WHERE`
-//! re-checks the job's lease. Each function takes a `rusqlite::Connection`, so
-//! a caller can pass its own open transaction, and returns rusqlite's error
-//! unchanged.
+//! write and the expired-lease give-up are verbs here with their `WHERE`
+//! whole. The result write's guard checks that the job the caller names is
+//! `running` under the lease owner the caller passes. The give-up's guard
+//! compares each running build job's lease expiry with SQLite's clock, and a
+//! job with no expiry counts as expired. Matching no row is an outcome, not an
+//! error. Each function takes a `rusqlite::Connection`, so a caller can pass
+//! its own open transaction, and returns rusqlite's error unchanged.
 
 #![forbid(unsafe_code)]
 
@@ -128,6 +131,88 @@ pub fn upsert_build_result(
         ],
     )?;
     Ok(())
+}
+
+/// Record a job's result, replacing anything recorded for it before, only
+/// while the job is `running` and its `lease_owner` is `lease_owner`. Returns
+/// whether the row was written; `false` means the job is not running under
+/// `lease_owner`, and nothing changed.
+pub fn record_build_result_as_lease_owner(
+    conn: &Connection,
+    job_id: &JobId,
+    lease_owner: &str,
+    result: &BuildJobResult,
+) -> rusqlite::Result<bool> {
+    let rows = conn.execute(
+        sql!(
+            "INSERT INTO build_job_results (job_id, template_id, state, content_hash, error)
+         SELECT ?1, ?3, ?4, ?5, ?6
+         WHERE EXISTS (
+             SELECT 1 FROM jobs
+             WHERE job_id = ?1
+               AND lease_owner = ?2
+               AND status = 'running'
+         )
+         ON CONFLICT(job_id) DO UPDATE SET
+             template_id = excluded.template_id,
+             state = excluded.state,
+             content_hash = excluded.content_hash,
+             error = excluded.error,
+             completed_at = datetime('now')
+         WHERE EXISTS (
+             SELECT 1 FROM jobs
+             WHERE job_id = ?1
+               AND lease_owner = ?2
+               AND status = 'running'
+         )"
+        ),
+        params![
+            job_id,
+            lease_owner,
+            result.template_id,
+            result.state.as_str(),
+            result.content_hash,
+            result.error,
+        ],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Permanently fails running build jobs whose lease expired (or that predate
+/// lease tracking) and returns the failed `(job_id, subject_id)` pairs so the
+/// caller can reap each job's staging directory — the owning process is gone
+/// and won't clean up after itself. An empty result means no running build
+/// job had an expired or missing lease.
+///
+/// A single `UPDATE … RETURNING` keeps the expiry check and the row capture
+/// atomic: a select-then-update split would let a live worker's heartbeat
+/// land between the two, failing a healthy build and deleting its staging
+/// dir out from under it. The expiry compares against SQLite's clock.
+pub fn fail_expired_running_builds(
+    conn: &Connection,
+    error: &str,
+) -> rusqlite::Result<Vec<(JobId, Option<String>)>> {
+    let mut stmt = conn.prepare(sql!(
+        "UPDATE jobs
+         SET status = 'failed',
+             error_kind = 'permanent',
+             error = ?2,
+             completed_at = datetime('now'),
+             lease_owner = NULL,
+             lease_expires_at = NULL,
+             heartbeat_at = NULL
+         WHERE kind = ?1
+           AND status = 'running'
+           AND (
+               lease_expires_at IS NULL
+               OR lease_expires_at <= datetime('now')
+           )
+         RETURNING job_id, subject_id"
+    ))?;
+    stmt.query_map(params![BUILD_JOB_KIND, error], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?
+    .collect()
 }
 
 /// Number of build jobs for `subject_id` (the template) that are pending or
