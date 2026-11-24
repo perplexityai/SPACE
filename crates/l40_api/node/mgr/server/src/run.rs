@@ -882,6 +882,11 @@ pub async fn run(
             shutdown_token.child_token(),
             &task_tracker,
         );
+        crate::service::node_memory_metrics::start_node_memory_metrics(
+            std::path::PathBuf::from(pplx_space_node_runtime_core::cgroup_paths::CGROUP_BASE),
+            shutdown_token.child_token(),
+            &task_tracker,
+        );
         crate::service::network_pool_metrics::start_network_pool_metrics(
             service.pool(),
             shutdown_token.child_token(),
