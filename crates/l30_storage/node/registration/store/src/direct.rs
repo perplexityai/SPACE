@@ -4,7 +4,10 @@
 //! locked for an administrative transition; and the two hard deletes of a
 //! Direct node, by id ([`delete_direct_node`]) and of its expired tombstones
 //! ([`prune_expired_direct_node_tombstones`]), whose `node_direct` rows go by
-//! the schema's `ON DELETE CASCADE`.
+//! the schema's `ON DELETE CASCADE`. [`registry`] holds the admin Direct node
+//! registry's statements on `nodes`.
+
+pub mod registry;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::{NodeAddress, NodeGroupId, NodeManagedBy, NodeRole};

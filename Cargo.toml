@@ -152,6 +152,7 @@ members = [
     "crates/l10_foundation/feature/flags",
     "crates/l20_domain/events",
     "crates/l30_storage/data/plane/session/store",
+    "crates/l30_storage/direct/coordinator",
     "crates/l30_storage/direct/store",
     "crates/l30_storage/admin/audit/store",
     "crates/l30_storage/federated/grant/store",
@@ -434,6 +435,7 @@ pplx-space-cpu-arch = { path = "crates/l10_foundation/cpu/arch" }
 pplx-space-data-plane-server = { path = "crates/l40_api/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/l30_storage/db/migrate" }
 pplx-space-db-test-fixtures = { path = "crates/test_support/db/test/fixtures" }
+pplx-space-direct-coordinator = { path = "crates/l30_storage/direct/coordinator" }
 pplx-space-direct-store = { path = "crates/l30_storage/direct/store" }
 pplx-space-dependency-drain = { path = "crates/l10_foundation/dependency/drain" }
 pplx-space-ecw-credential = { path = "crates/l20_domain/ecw/credential" }

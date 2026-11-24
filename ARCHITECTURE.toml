@@ -3,20 +3,24 @@
 # Direct-only control-plane Postgres tables belong to the Direct substrate and
 # its store, pplx-space-direct-store; existing users outside them are baselined
 # until moved behind them. Postgres folds unquoted identifiers, so the names
-# match in any case. Naming the store's crate counts as a use, so its verbs
-# stay behind the Direct substrate too. A store's `direct` module may also name
-# these tables: a statement whose main table that store owns, but which joins a
-# Direct table, moves there verbatim.
+# match in any case. Naming the store's crate, or `pplx-space-direct-coordinator`'s,
+# counts as a use, so the store's verbs stay behind the Direct substrate and the
+# coordinator, and the coordinator's callers outside the Direct substrate stay
+# baselined. A store's `direct` module may also name these tables: a statement
+# whose main table that store owns, but which joins a Direct table, moves there
+# verbatim.
 [rules.pattern_ratchet.direct_tables]
 patterns = [
   '(?i)\bnode_direct\b',
   '(?i)\bsandbox_direct_route_identities\b',
   '(?i)\bsandbox_direct_route_provenance\b',
   '\bpplx_space_direct_store\b',
+  '\bpplx_space_direct_coordinator\b',
 ]
 allow = [
   "crates/l40_api/api/src/controllers/substrate/direct.rs",
   "crates/l40_api/api/src/controllers/substrate/direct/**",
+  "crates/l30_storage/direct/coordinator/**",
   "crates/l30_storage/direct/store/**",
   "crates/l30_storage/**/src/direct.rs",
   "crates/l30_storage/**/src/direct/**",
@@ -392,7 +396,10 @@ pplx-space-data-plane-session-store = [
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
-pplx-space-direct-store = ["pplx-space-api"]
+pplx-space-direct-store = [
+  "pplx-space-api",
+  "pplx-space-direct-coordinator",
+]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-firewall-rules-store = [
   "pplx-space-api",
@@ -412,6 +419,7 @@ pplx-space-node-registration-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-credmgr",
+  "pplx-space-direct-coordinator",
   "pplx-space-internal-api-server",
 ]
 pplx-space-node-mgr-store = ["pplx-space-node-mgr"]
@@ -436,7 +444,10 @@ pplx-space-postgres-pool = [
   "pplx-space-cluster-reconciler",
   "pplx-space-cluster-trigger-queue",
   "pplx-space-credmgr",
+  "pplx-space-direct-coordinator",
+  "pplx-space-direct-store",
   "pplx-space-internal-api-server",
+  "pplx-space-node-registration-store",
 ]
 pplx-space-public-operation-store = ["pplx-space-api"]
 pplx-space-runtime-environment-catalog-store = [
@@ -539,8 +550,10 @@ pplx-space-volmgr-store = ["pplx-space-volmgr"]
 # Each coordinator's users: the l40_api crates that run its transaction
 # today. A coordinator (l30_storage, named *-coordinator) runs one transaction
 # across the stores that list it in store_users, owns no tables and holds no
-# SQL. None exists yet.
+# SQL.
 [rules.layers.coordinator_users]
+# The admin node registry registers, reactivates and updates Direct nodes.
+pplx-space-direct-coordinator = ["pplx-space-api"]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]

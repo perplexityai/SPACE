@@ -14,8 +14,9 @@
 //! [`orphan_reap_refusal`] says why the drained-node terminator's reap of a
 //! gone node's row refused. [`direct`] reads the admin node row, which joins
 //! the node's Direct registration, and hard-deletes Direct nodes and their
-//! expired tombstones. [`stale_reconcile_work`] finds the Kubernetes nodes the
-//! reconcile queue GC may treat as gone.
+//! expired tombstones; [`direct::registry`] writes a Direct node's `nodes` row
+//! for the admin node registry. [`stale_reconcile_work`] finds the Kubernetes
+//! nodes the reconcile queue GC may treat as gone.
 //! [`orphan_reap_refusal`] also counts `sandboxes` rows, which belong to
 //! `pplx-space-sandbox-store`, through the residency and portability
 //! fragments the reap's guards use.

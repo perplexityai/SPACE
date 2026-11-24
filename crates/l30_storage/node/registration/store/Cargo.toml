@@ -26,6 +26,7 @@ pplx-space-node-model = { workspace = true, features = ["sqlx"] }
 pplx-space-k8s-ids = { workspace = true }
 pplx-space-k8s-node-id = { workspace = true }
 pplx-space-node-drain = { workspace = true }
+pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
