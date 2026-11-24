@@ -635,6 +635,7 @@ fn reconnect_error_outcome(
         SubstrateError::Unavailable { .. }
         | SubstrateError::SandboxNoPod { .. }
         | SubstrateError::Unschedulable { .. }
+        | SubstrateError::NodeMemoryCapacity { .. }
         | SubstrateError::NodeDeleteNotAdmitted { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),

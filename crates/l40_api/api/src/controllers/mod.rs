@@ -77,6 +77,12 @@ enum ControllerErrorKind {
     /// the concurrency limiter's, rather than as the cluster saturation a
     /// bare 429 with a `Retry-After` would read as.
     LiveCapRefusal,
+    /// The node the sandbox's pod landed on refused it for lack of memory
+    /// headroom. Carried so the create executor can bound its retries and
+    /// fail with `node_memory_capacity`, and so the surface translators can
+    /// answer with that reason and a `Retry-After` after a create's rollback
+    /// has stripped the hint.
+    NodeMemoryCapacity,
     /// Work refused because the sandbox is at rest and its wake policy does
     /// not let this request wake it. Carried so the Native translators can
     /// answer with the details `createCommand` gives the same refusal. Boxed
@@ -242,9 +248,14 @@ impl ControllerError {
     /// [`ControllerErrorKind::LockContention`] set, and the public and ECW
     /// translators rebuild a retryable 503 from the kind alone.
     pub(crate) fn demoted_after_side_effect(mut self) -> Self {
-        if matches!(self.kind, ControllerErrorKind::LockContention) {
-            self.kind = ControllerErrorKind::General;
-            self.status = StatusCode::INTERNAL_SERVER_ERROR;
+        match self.kind {
+            ControllerErrorKind::LockContention => {
+                self.kind = ControllerErrorKind::General;
+                self.status = StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            // The translators rebuild a retry hint from this kind.
+            ControllerErrorKind::NodeMemoryCapacity => self.kind = ControllerErrorKind::General,
+            _ => {}
         }
         self.retry_after = None;
         self.retry_after_header = None;
@@ -389,6 +400,20 @@ impl ControllerError {
             ControllerErrorKind::TemplateReleaseMiss(miss) => Some(miss),
             _ => None,
         }
+    }
+
+    /// A 503 for a node that refused the sandbox for lack of memory headroom,
+    /// with the jittered capacity `Retry-After`.
+    pub(crate) fn node_memory_capacity(message: impl Into<String>) -> Self {
+        let mut error = Self::service_unavailable(message)
+            .with_retry_after_header(crate::cluster_admission::capacity_retry_after());
+        error.kind = ControllerErrorKind::NodeMemoryCapacity;
+        error
+    }
+
+    /// Whether a node refused this request for lack of memory headroom.
+    pub(crate) const fn is_node_memory_capacity(&self) -> bool {
+        matches!(self.kind, ControllerErrorKind::NodeMemoryCapacity)
     }
 
     pub(crate) const fn is_sandbox_already_exists(&self) -> bool {

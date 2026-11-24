@@ -40,7 +40,7 @@ fn pod_sandbox_rejection_error(
     // ResourceExhausted also covers transient queue/slot pressure. The
     // allocation path's explicit prefix distinguishes memory admission.
     let (_, reason) = reason.split_once(MEMORY_ADMISSION_REFUSAL_PREFIX)?;
-    Some(SubstrateError::Unavailable {
+    Some(SubstrateError::NodeMemoryCapacity {
         message: format!("{MEMORY_ADMISSION_REFUSAL_PREFIX} {}", reason.trim()),
     })
 }

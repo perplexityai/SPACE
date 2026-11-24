@@ -851,7 +851,7 @@ async fn create_handles_node_refusal(#[case] refusal: NodeRefusal) -> TestResult
     }
 
     match (&error, refusal) {
-        (SubstrateError::Unavailable { message }, NodeRefusal::Memory) => {
+        (SubstrateError::NodeMemoryCapacity { message }, NodeRefusal::Memory) => {
             assert!(message.contains("node memory admission refused"));
         }
         (

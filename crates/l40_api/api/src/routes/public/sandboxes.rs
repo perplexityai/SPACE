@@ -1538,6 +1538,13 @@ pub(crate) fn controller_error(error: ControllerError) -> PublicApiError {
     if error.is_lock_contention() {
         return PublicApiError::lock_contention();
     }
+    // A create's rollback strips the hint, so it is rebuilt from the kind.
+    if error.is_node_memory_capacity() {
+        let retry_after = error
+            .retry_after_header()
+            .unwrap_or_else(crate::cluster_admission::capacity_retry_after);
+        return PublicApiError::node_memory_capacity(error.to_string(), retry_after);
+    }
     let retry_after = error.retry_after_header();
     match error.status() {
         StatusCode::BAD_REQUEST => PublicApiError::bad_request(error.to_string()),

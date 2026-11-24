@@ -657,6 +657,12 @@ pub enum SubstrateError {
     /// rolls back and strips every retry hint from its error.
     #[error("{message}")]
     Unschedulable { message: String },
+    /// The node the sandbox pod landed on refused it for lack of memory
+    /// headroom. Raised only while `SPACE_CREATE_FAIL_FAST_ON_NODE_REJECTION`
+    /// is on. Another node, or the same node later, may take it, so callers
+    /// see a retryable 503 that names the reason, `node_memory_capacity`.
+    #[error("{message}")]
+    NodeMemoryCapacity { message: String },
     #[error("{message}")]
     Conflict { message: String },
     #[error("{message}")]
@@ -975,6 +981,9 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::Unschedulable { message } => {
                 ControllerError::service_unavailable(message)
                     .with_retry_after_header(crate::cluster_admission::capacity_retry_after())
+            }
+            SubstrateError::NodeMemoryCapacity { message } => {
+                ControllerError::node_memory_capacity(message)
             }
             SubstrateError::Conflict { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)

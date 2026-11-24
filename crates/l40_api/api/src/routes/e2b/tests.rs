@@ -7051,3 +7051,28 @@ async fn ecw_create_cleans_up_a_failed_create_after_its_client_disconnects() -> 
     assert_eq!(get.status(), StatusCode::NOT_FOUND);
     Ok(())
 }
+
+/// A node's memory refusal answers an ECW create's retryable `503` with a
+/// `Retry-After`, which the create's rollback stripped from the error.
+#[test]
+fn ecw_node_memory_refusal_is_a_503_with_retry_after() {
+    use axum::response::IntoResponse;
+
+    let refusal = crate::controllers::ControllerError::from(
+        crate::controllers::substrate::SubstrateError::NodeMemoryCapacity {
+            message: "node memory admission refused: insufficient node memory".into(),
+        },
+    )
+    .without_retry_after();
+    let response = super::translate::controller_error(refusal).into_response();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let retry_after: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=5).contains(&retry_after), "{retry_after}");
+}

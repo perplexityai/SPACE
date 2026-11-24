@@ -48,7 +48,9 @@ pub struct PublicApiError {
 /// empty-cluster case is deliberately not `CapacityUnavailable`: at admission
 /// the API cannot tell a node roll from an outage, so it asks for backoff
 /// rather than declaring capacity gone. `CapacityUnavailable` is reserved for
-/// placement failing after a request was admitted. The limiter's slot check
+/// placement failing after a request was admitted, such as a node refusing the
+/// sandbox for lack of memory headroom
+/// ([`PublicApiError::node_memory_capacity`]). The limiter's slot check
 /// refuses only a cold create, which the native API queues: its operation
 /// retries on the hint, and if the cluster stays full it fails with
 /// `retry_attempts_exhausted`, not with this code.
@@ -153,6 +155,24 @@ impl PublicApiError {
             ResponseOrigin::Cluster,
             ResponseKind::Admission,
         )
+    }
+
+    /// A `capacity_unavailable` for a node that refused to start the sandbox
+    /// for lack of memory headroom, with the reason
+    /// [`pplx_space_public_api::CAPACITY_REASON_NODE_MEMORY`].
+    pub fn node_memory_capacity(message: impl Into<String>, retry_after: Duration) -> Self {
+        let mut error = Self::from_contract(
+            PublicErrorCode::CapacityUnavailable,
+            message,
+            ResponseOrigin::Node,
+            ResponseKind::Admission,
+        )
+        .with_retry_after(retry_after);
+        error.details.push(PublicErrorDetail {
+            key: pplx_space_public_api::CONFLICT_REASON_DETAIL_KEY.to_string(),
+            value: pplx_space_public_api::CAPACITY_REASON_NODE_MEMORY.to_string(),
+        });
+        error
     }
 
     pub fn rate_limited(message: impl Into<String>) -> Self {

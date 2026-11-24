@@ -1077,6 +1077,15 @@ pub(super) fn controller_error(err: ControllerError) -> E2bApiError {
     if err.is_lock_contention() {
         return E2bApiError::lock_contention();
     }
+    // A create's rollback strips the hint, so it is rebuilt from the kind.
+    if err.is_node_memory_capacity() {
+        let retry_after = err
+            .retry_after_header()
+            .unwrap_or_else(crate::cluster_admission::capacity_retry_after);
+        return E2bApiError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+            .with_classification(ResponseOrigin::Node, ResponseKind::Admission)
+            .with_retry_after(retry_after);
+    }
     if let Some(mapped) = sdk_recoverable_timeout(&err) {
         return mapped;
     }

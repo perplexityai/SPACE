@@ -100,3 +100,49 @@ async fn ended_session_replay_is_a_non_retryable_conflict_with_a_reason() {
         }]
     );
 }
+
+/// A node's memory refusal answers a retryable `capacity_unavailable` with a
+/// `Retry-After` and the `node_memory_capacity` reason, even after a create's
+/// rollback stripped the hint; once demoted it is a plain 503 without them.
+#[tokio::test(flavor = "current_thread")]
+async fn node_memory_refusal_is_a_typed_retryable_503() {
+    use axum::response::IntoResponse;
+
+    let refusal = || {
+        crate::controllers::ControllerError::from(
+            crate::controllers::substrate::SubstrateError::NodeMemoryCapacity {
+                message: "node memory admission refused: insufficient node memory".into(),
+            },
+        )
+    };
+    let response =
+        crate::routes::public::sandboxes::controller_error(refusal().without_retry_after())
+            .into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let retry_after: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=5).contains(&retry_after), "{retry_after}");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let envelope: PublicErrorEnvelope = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope.code, PublicErrorCode::CapacityUnavailable);
+    assert!(envelope.retryable);
+    assert!(
+        envelope
+            .details
+            .iter()
+            .any(|detail| detail.key == "reason" && detail.value == "node_memory_capacity"),
+        "{:?}",
+        envelope.details
+    );
+
+    let demoted =
+        crate::routes::public::sandboxes::controller_error(refusal().demoted_after_side_effect())
+            .into_response();
+    assert!(!demoted.headers().contains_key("retry-after"));
+    let body = demoted.into_body().collect().await.unwrap().to_bytes();
+    let envelope: PublicErrorEnvelope = serde_json::from_slice(&body).unwrap();
+    assert!(envelope.details.is_empty(), "{:?}", envelope.details);
+}

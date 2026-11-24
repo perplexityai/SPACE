@@ -1257,6 +1257,51 @@ fn create_from_a_template_with_no_release_fails_with_its_own_reason() {
     }
 }
 
+/// A node's memory refusal retries a create only up to its attempt bound,
+/// two attempts when pinned to a node pool and three otherwise, then fails it
+/// with the retryable `capacity_unavailable` and the `node_memory_capacity`
+/// reason, which a retry carries too.
+#[rstest::rstest]
+#[case::pinned(true, 2)]
+#[case::unpinned(false, 3)]
+fn node_memory_refusal_fails_the_create_after_its_attempt_bound(
+    #[case] pinned: bool,
+    #[case] max_attempts: i32,
+) {
+    let mut operation = claimed_create_operation();
+    if pinned {
+        operation.payload = serde_json::json!({ "node_pool": "isolated" });
+    }
+    let refusal = "node memory admission refused: insufficient node memory";
+    for attempts in 1..=max_attempts {
+        operation.attempts = attempts;
+        // The create path's rollback strips the hint; the kind survives it.
+        let error = ControllerError::from(
+            crate::controllers::substrate::SubstrateError::NodeMemoryCapacity {
+                message: refusal.to_string(),
+            },
+        )
+        .without_retry_after();
+        let result = CreateSandboxExecutionError::Controller(error).into_result(&operation);
+
+        let terminal = result.terminal_error_json.expect("the refusal is carried");
+        assert_eq!(terminal["reason"], "node_memory_capacity");
+        assert_eq!(terminal["message"], refusal);
+        assert_eq!(
+            result.terminal_error_code,
+            Some(PublicErrorCode::CapacityUnavailable)
+        );
+        if attempts < max_attempts {
+            assert_eq!(result.state, OperationState::Queued, "attempt {attempts}");
+            let retry_after = result.retry_after.expect("a retry hint");
+            assert!((1..=5).contains(&retry_after.as_secs()), "{retry_after:?}");
+        } else {
+            assert_eq!(result.state, OperationState::Failed, "attempt {attempts}");
+            assert_eq!(result.retry_after, None);
+        }
+    }
+}
+
 #[test]
 fn completed_lifecycle_target_state_rejects_active_transitions() {
     assert_eq!(

@@ -2152,7 +2152,10 @@ pub struct PublicErrorEnvelope {
     /// the sandbox is yours and the path inside it does not exist; any other
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
-    /// carries `{"key": "reason", "value": "session_ended"}`. A `conflict`
+    /// carries `{"key": "reason", "value": "session_ended"}`. A
+    /// `capacity_unavailable` because the node refused the sandbox for lack of
+    /// memory headroom carries
+    /// `{"key": "reason", "value": "node_memory_capacity"}`. A `conflict`
     /// refusing a command, or a file or process request, because the sandbox
     /// is not running carries `reason`
     /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
@@ -2240,9 +2243,10 @@ pub const INVALID_REQUEST_FIELD_DETAIL_KEY: &str = "field";
 /// command created with `Accept: text/event-stream` and a `pty`.
 pub const INVALID_REQUEST_FIELD_PTY: &str = "pty";
 
-/// [`PublicErrorDetail::key`] naming why a `conflict`, or an
-/// `invalid_request` such as [`INVALID_REQUEST_REASON_COMMAND_NOT_STARTED`],
-/// was refused.
+/// [`PublicErrorDetail::key`] naming why a `conflict`, an `invalid_request`
+/// such as [`INVALID_REQUEST_REASON_COMMAND_NOT_STARTED`], or a
+/// `capacity_unavailable` such as [`CAPACITY_REASON_NODE_MEMORY`], was
+/// refused.
 pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
 
 /// [`CONFLICT_REASON_DETAIL_KEY`] value of an `invalid_request` for a
@@ -2276,6 +2280,14 @@ impl fmt::Display for CommandStartField {
         formatter.write_str(self.as_str())
     }
 }
+
+/// Why a node refused to start a sandbox for lack of memory headroom: the
+/// [`CONFLICT_REASON_DETAIL_KEY`] value of a `capacity_unavailable` (503,
+/// retryable, with `Retry-After`), and the `terminal_error.reason` of a
+/// create operation that fails with `capacity_unavailable` for it. The same
+/// request can succeed later, on a node with headroom or once this one frees
+/// memory; a smaller `memory_mib` fits sooner.
+pub const CAPACITY_REASON_NODE_MEMORY: &str = "node_memory_capacity";
 
 /// [`CONFLICT_REASON_DETAIL_KEY`] value of a `conflict` for replaying a
 /// session create whose session was revoked, has expired or is no longer
