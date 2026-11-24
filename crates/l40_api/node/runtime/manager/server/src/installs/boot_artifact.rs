@@ -2,9 +2,9 @@
 //! pipeline as downloaded artifacts. The feed supplies bytes, never trust.
 use super::executor::{InstallExecutor, permanent, retriable};
 use super::staging::{StagedImage, StagingError};
-use pplx_space_common_jobs::JobError;
 use pplx_space_node_runtime_core::artifact_store::{BOOT_ARTIFACT_IMAGE, boot_artifact_directory};
 use pplx_space_node_runtime_core::catalog::PinnedBootArtifact;
+use pplx_space_node_runtime_manager_store::jobs::JobError;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use tokio::io::AsyncReadExt as _;

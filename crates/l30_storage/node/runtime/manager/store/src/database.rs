@@ -1,21 +1,31 @@
 //! Migrating and opening runtime-manager's database, which runtime-manager
 //! does when its operations start: [`migrate`], then [`open`] for the one
-//! connection it shares. `pplx-space-db-migrate` applies the same catalog
-//! through [`MIGRATOR`] and [`catalog`].
+//! connection it shares through a [`SharedConnection`]. `pplx-space-db-migrate`
+//! applies the same catalog through [`MIGRATOR`] and [`catalog`].
+//!
+//! The handle types here are what callers outside the store name: the
+//! [`Connection`] every store function takes, the [`SharedConnection`] the
+//! executor and the jobs worker share, its [`ConnectionGuard`], and the
+//! [`Error`] a failed statement returns. The rusqlite types they wrap stay
+//! inside the store, except through the `test-support` feature.
 //!
 //! Runtime-manager's two deployed baseline catalogs converge through a forward
 //! migration. The prototype baseline changed executable SQL, so it must not use
 //! the equivalent-checksum registry. Keep its actual SQL and history intact.
 
 use std::borrow::Cow;
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, LockResult, Mutex, MutexGuard, PoisonError};
 
 use pplx_space_sql_locator::sql;
 pub use pplx_space_sqlite::SqliteError;
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
+use ref_cast::{RefCastCustom, ref_cast_custom};
+use rusqlite::{OpenFlags, OptionalExtension as _};
 use sqlx::SqlSafeStr as _;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
+
+use crate::jobs::{JobExecutor, JobWorker, WorkerConfig};
 
 const DATABASE_NAME: &str = "runtime-manager";
 
@@ -59,8 +69,8 @@ pub fn catalog(path: &Path) -> Result<&'static Migrator, SqliteError> {
             })?;
         }
     }
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|error| {
+    let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| {
             SqliteError::context("cannot read runtime-manager migration history", error)
         })?;
     let exists: bool = conn
@@ -114,4 +124,90 @@ pub async fn migrate(path: &Path) -> Result<(), SqliteError> {
 /// with `synchronous=NORMAL`.
 pub fn open(path: &Path) -> Result<Connection, SqliteError> {
     pplx_space_sqlite::open_rusqlite(path, pplx_space_sqlite::RusqliteOpenOptions::default())
+        .map(Connection)
+}
+
+/// A failed SQLite statement. `Display` and `source` are the underlying
+/// rusqlite error's, unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct Error(#[from] rusqlite::Error);
+
+/// A connection to runtime-manager's database, as store functions take it.
+/// `&Connection` also views the connection a [`ConnectionGuard`] holds.
+#[derive(Debug, RefCastCustom)]
+#[repr(transparent)]
+pub struct Connection(pub(crate) rusqlite::Connection);
+
+impl Connection {
+    #[ref_cast_custom]
+    fn view(raw: &rusqlite::Connection) -> &Self;
+
+    /// An empty in-memory database, without the schema.
+    #[cfg(feature = "test-support")]
+    #[allow(
+        clippy::expect_used,
+        reason = "test-support only: a test that cannot open an in-memory database has nothing to run against"
+    )]
+    pub fn open_in_memory() -> Self {
+        Self(rusqlite::Connection::open_in_memory().expect("open an in-memory SQLite database"))
+    }
+
+    /// Wraps a connection a test opened itself.
+    #[cfg(feature = "test-support")]
+    pub fn from_raw(raw: rusqlite::Connection) -> Self {
+        Self(raw)
+    }
+
+    /// The underlying connection, for tests that seed or inspect the
+    /// database directly.
+    #[cfg(feature = "test-support")]
+    pub fn raw(&self) -> &rusqlite::Connection {
+        &self.0
+    }
+}
+
+/// The process's connection to runtime-manager's database, shared behind one
+/// mutex by the install executor and the jobs worker. A panic while it is
+/// locked poisons it, as for any [`Mutex`].
+#[derive(Clone)]
+pub struct SharedConnection(Arc<Mutex<rusqlite::Connection>>);
+
+impl SharedConnection {
+    pub fn new(conn: Connection) -> Self {
+        Self(Arc::new(Mutex::new(conn.0)))
+    }
+
+    /// [`Mutex::lock`]: a poisoned mutex still yields its guard through the
+    /// [`PoisonError`].
+    pub fn lock(&self) -> LockResult<ConnectionGuard<'_>> {
+        match self.0.lock() {
+            Ok(guard) => Ok(ConnectionGuard(guard)),
+            Err(poisoned) => Err(PoisonError::new(ConnectionGuard(poisoned.into_inner()))),
+        }
+    }
+
+    /// A jobs worker over this connection, sharing its mutex.
+    pub fn background_worker<E: JobExecutor>(
+        &self,
+        executor: E,
+        config: WorkerConfig,
+    ) -> JobWorker<E> {
+        JobWorker::new(pplx_space_common_jobs::BackgroundWorker::new(
+            Arc::clone(&self.0),
+            executor,
+            config,
+        ))
+    }
+}
+
+/// A held [`SharedConnection`] lock.
+pub struct ConnectionGuard<'a>(MutexGuard<'a, rusqlite::Connection>);
+
+impl Deref for ConnectionGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        Connection::view(&self.0)
+    }
 }

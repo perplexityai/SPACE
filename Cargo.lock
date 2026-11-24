@@ -7475,13 +7475,18 @@ name = "pplx-space-node-runtime-manager-store"
 version = "0.8.2"
 dependencies = [
  "jiff",
+ "pplx-space-common-jobs",
  "pplx-space-content-digest",
  "pplx-space-job-id",
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
+ "ref-cast",
  "rusqlite",
+ "serde",
  "sqlx",
  "thiserror 2.0.20",
+ "tokio-util",
+ "tonic",
 ]
 
 [[package]]
