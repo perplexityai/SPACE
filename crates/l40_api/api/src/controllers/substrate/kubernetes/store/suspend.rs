@@ -31,22 +31,16 @@ impl K8sStore {
             });
         };
 
-        let execution_active = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT active
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND pod_uid = $3
-                AND state = $4
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(expected_generation.get())
-        .bind(expected_pod_uid.as_str())
-        .bind(ActiveExecutionState::Suspended.as_str())
-        .fetch_optional(&mut *tx)
-        .await
-        .db_context("failed to lock suspended Kubernetes execution")?;
+        let execution_active =
+            pplx_space_sandbox_store::k8s_executions::suspend::lock_suspended_execution(
+                &mut tx,
+                sandbox_id,
+                expected_generation.get(),
+                expected_pod_uid.as_str(),
+                ActiveExecutionState::Suspended.as_str(),
+            )
+            .await
+            .db_context("failed to lock suspended Kubernetes execution")?;
         let Some(execution_active) = execution_active else {
             return Err(SubstrateError::Unavailable {
                 message: "sandbox execution changed before suspended pod retirement".to_string(),
@@ -127,52 +121,28 @@ impl K8sStore {
         // completion retries that replay an artifact after its snapshot row
         // has already moved to `deleting`.
         reject_deleting_current_local_artifact(&mut tx, sandbox_id, published_artifact).await?;
-        let execution_updated = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET state = $4,
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND active
-                AND pod_uid = $3
-                AND state IN ($4, $5)"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(generation.get())
-        .bind(expected_pod_uid.as_str())
-        .bind(ActiveExecutionState::Suspended.as_str())
-        .bind(ActiveExecutionState::Running.as_str())
-        .execute(&mut *tx)
+        let execution_updated = pplx_space_sandbox_store::k8s_executions::suspend::mark_committed(
+            &mut *tx,
+            sandbox_id,
+            generation.get(),
+            expected_pod_uid.as_str(),
+            ActiveExecutionState::Suspended.as_str(),
+            ActiveExecutionState::Running.as_str(),
+        )
         .await
         .db_context("failed to mark Kubernetes execution suspend committed")?;
-        if execution_updated.rows_affected() == 0 {
-            let forgotten_execution_committed = sqlx::query(sql!(
-                "UPDATE sandbox_k8s_executions e
-                    SET state = $4,
-                        updated_at = NOW()
-                   FROM sandboxes s
-                  WHERE e.sandbox_id = $1
-                    AND e.generation = $2
-                    AND e.pod_uid = $3
-                    AND NOT e.active
-                    AND e.state = 'forgotten'
-                    AND s.id = e.sandbox_id
-                    AND s.lifecycle = 'suspending'
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM sandbox_k8s_executions successor
-                         WHERE successor.sandbox_id = e.sandbox_id
-                           AND successor.generation > e.generation
-                    )"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .bind(generation.get())
-            .bind(expected_pod_uid.as_str())
-            .bind(ActiveExecutionState::Suspended.as_str())
-            .execute(&mut *tx)
-            .await
-            .db_context("failed to commit suspend after terminal Kubernetes pod cleanup")?;
-            if forgotten_execution_committed.rows_affected() == 1 {
+        if execution_updated == 0 {
+            let forgotten_execution_committed =
+                pplx_space_sandbox_store::k8s_executions::suspend::mark_forgotten_committed(
+                    &mut *tx,
+                    sandbox_id,
+                    generation.get(),
+                    expected_pod_uid.as_str(),
+                    ActiveExecutionState::Suspended.as_str(),
+                )
+                .await
+                .db_context("failed to commit suspend after terminal Kubernetes pod cleanup")?;
+            if forgotten_execution_committed == 1 {
                 pplx_space_sandbox_store::suspend::finalize_with_committed_artifact(
                     &mut *tx,
                     sandbox_id,
