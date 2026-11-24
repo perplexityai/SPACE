@@ -1,9 +1,11 @@
 //! Owning store for runtime-manager's `operation_results`, in its node-local
 //! SQLite database: what each install or uninstall job did on disk.
 //!
-//! The database's opening and migrations stay in
+//! [`database`] migrates and opens the database for
 //! `pplx-space-node-runtime-manager`; its shared `jobs` table is read and
 //! written through `pplx-space-common-jobs`.
+
+pub mod database;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

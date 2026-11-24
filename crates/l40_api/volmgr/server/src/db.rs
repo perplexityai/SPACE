@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use rusqlite::Connection;
 
 pub(crate) use pplx_space_volmgr_store::active_btrfs_upload_payloads;
@@ -8,7 +10,7 @@ pub use pplx_space_volmgr_store::{
 /// Open the volume manager SQLite database. The service must run its embedded
 /// migrations after taking ownership and before calling this function.
 pub fn open(path: &str) -> rusqlite::Result<Connection> {
-    Connection::open(path)
+    pplx_space_volmgr_store::database::open(Path::new(path))
 }
 
 #[cfg(test)]

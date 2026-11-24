@@ -20,12 +20,12 @@ workspace = true
 
 [dependencies]
 rusqlite = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
 
 # internal
 pplx-space-sql-locator = { workspace = true }
+pplx-space-sqlite = { workspace = true }
 
 [dev-dependencies]
-pplx-space-sqlite = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

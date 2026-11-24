@@ -169,11 +169,11 @@ async fn prior_database(dir: &Path, prototype: bool) -> Connection {
     };
     let path = dir.join(DATABASE_FILE);
     pplx_space_sqlite::migrate_embedded(
-        DATABASE_NAME,
+        "runtime-manager",
         &path,
         pplx_space_sqlite::EmbeddedMigrators {
             service: &migrator,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
+            common: Some(&database::COMMON_MIGRATOR),
         },
     )
     .await

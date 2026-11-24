@@ -37,7 +37,6 @@ rustix = { workspace = true, features = ["fs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
 tar = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
@@ -55,7 +54,6 @@ pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-grpc-server = { workspace = true }
 pplx-space-observability = { workspace = true }
-pplx-space-sqlite = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store"] }
@@ -67,5 +65,8 @@ pplx-space-unix-socket-bind = { workspace = true }
 pplx-space-unix-socket-path = { workspace = true }
 
 [dev-dependencies]
+# The deployed-baseline tests seed a database with each prior catalog.
+pplx-space-sqlite = { workspace = true }
+sqlx = { workspace = true, features = ["migrate"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

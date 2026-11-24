@@ -29,10 +29,6 @@ const BACKGROUND_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 // different mutex files and both acquire concurrently.
 const SERVICE_MUTEX_PATH: &str = "/space/run/template-manager/service.mutex";
 
-static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/common");
-static TEMPLATE_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
-    sqlx::migrate!("../../../../../db/template-manager");
-
 /// Everything [`run`] needs from the process that hosts it: the binary's
 /// flags, already parsed. Environment-driven tuning (cache budget, prefetch
 /// tags, node endpoints) stays with the code that reads it.
@@ -65,9 +61,9 @@ pub enum RunTemplateMgrError {
     #[error("failed to acquire the template-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate the template-manager SQLite database: {0}")]
-    Migrate(#[source] pplx_space_sqlite::SqliteError),
+    Migrate(#[source] pplx_space_template_mgr_store::database::SqliteError),
     #[error("failed to open the template-manager SQLite database: {0}")]
-    OpenDatabase(#[source] pplx_space_sqlite::SqliteError),
+    OpenDatabase(#[source] pplx_space_template_mgr_store::database::SqliteError),
     #[error("failed to initialize template-manager service state: {0}")]
     InitializeService(#[source] rusqlite::Error),
     #[error("failed to bind the template-manager socket: {0}")]
@@ -164,16 +160,9 @@ async fn run_service(
             .map_err(RunTemplateMgrError::RootfsBackingFilesystem)?;
     }
 
-    pplx_space_sqlite::migrate_embedded(
-        "template-manager",
-        std::path::Path::new(DB_PATH),
-        pplx_space_sqlite::EmbeddedMigrators {
-            service: &TEMPLATE_MANAGER_MIGRATOR,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
-        },
-    )
-    .await
-    .map_err(RunTemplateMgrError::Migrate)?;
+    pplx_space_template_mgr_store::database::migrate(std::path::Path::new(DB_PATH))
+        .await
+        .map_err(RunTemplateMgrError::Migrate)?;
 
     let conn = crate::db::open().map_err(RunTemplateMgrError::OpenDatabase)?;
 

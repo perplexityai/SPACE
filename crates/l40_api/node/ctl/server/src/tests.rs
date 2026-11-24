@@ -380,14 +380,10 @@ async fn worker_publishing_to(
     NodeObjectPasses,
 ) {
     let db_path = dir.join("node-ctl.db");
-    pplx_space_sqlite::migrate("node-ctl", &db_path, &NODE_CTL_MIGRATOR)
+    pplx_space_node_ctl_store::database::migrate(&db_path)
         .await
         .expect("migrate node-ctl database");
-    let conn = pplx_space_sqlite::open_rusqlite(
-        &db_path,
-        pplx_space_sqlite::RusqliteOpenOptions::default(),
-    )
-    .expect("open node-ctl database");
+    let conn = pplx_space_node_ctl_store::database::open(&db_path).expect("open node-ctl database");
     init_reconciliation_status(&conn, DEFAULT_POLL_INTERVAL_SECS).expect("seed statuses");
     let db = Arc::new(Mutex::new(conn));
     let (tx, rx) = mpsc::channel(WORK_QUEUE_CAPACITY);

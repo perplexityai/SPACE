@@ -1,7 +1,9 @@
 fn main() {
-    // sqlx::migrate! tracks existing files, but a newly added migration must
-    // also invalidate the embedded schema.
-    watch("../../../../../db/node-ctl");
+    // Volume manager: sqlx::migrate! embeds db/volume-manager and
+    // db/common into pplx-space-volmgr-store. It tracks existing files, but a
+    // newly added migration must also invalidate the embedded schema.
+    watch("../../../../db/volume-manager");
+    watch("../../../../db/common");
 }
 
 // Cargo treats a missing watched path as changed on every build, so a wrong

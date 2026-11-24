@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 rusqlite = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
 
 # internal

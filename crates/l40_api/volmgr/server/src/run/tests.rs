@@ -41,7 +41,7 @@ impl JobExecutor for GatedExecutor {
 
 fn create_jobs_db(path: &Path) {
     let conn = rusqlite::Connection::open(path).unwrap();
-    for migration in super::COMMON_SCHEMA_MIGRATOR
+    for migration in pplx_space_volmgr_store::database::COMMON_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
@@ -585,7 +585,7 @@ async fn interrupted_transfer_is_recovered_once_by_successor() {
 async fn embedded_migrations_converge_volume_manager_service_and_common_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("volume-manager.db");
-    super::migrate_volume_manager_db(&db_path)
+    pplx_space_volmgr_store::database::migrate(&db_path)
         .await
         .expect("apply embedded migrations");
 
@@ -600,7 +600,7 @@ async fn embedded_migrations_converge_volume_manager_service_and_common_schema()
             .expect("inspect jobs column");
         assert_eq!(count, 1, "embedded migration must install {column}");
     }
-    let latest_common_version = super::COMMON_SCHEMA_MIGRATOR
+    let latest_common_version = pplx_space_volmgr_store::database::COMMON_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
         .map(|migration| migration.version)

@@ -14,20 +14,22 @@
 //! builds with their child rows, [`template_local_state`] reads and deletes a
 //! template's rows across tables, and [`eviction`] holds the cache eviction's
 //! pin check. [`snapshots`], [`pools`] and [`template_settings`] hold the
-//! statements for those tables.
+//! statements for those tables. [`database`] migrates and opens the
+//! database, which template-manager does once at startup.
 //!
-//! Each function takes a `rusqlite::Connection`, so a caller can pass its own
-//! open transaction, or a `rusqlite::Transaction` where its statements are
-//! only correct together. None opens a connection or a transaction: callers
-//! keep both, with their busy timeout and transaction behavior, and their
-//! checks between statements. Each returns rusqlite's error, except
-//! [`template_settings::try_update_template_network_policy_tx`], whose error
-//! also reports a generation conflict.
+//! Every function outside [`database`] takes a `rusqlite::Connection`, so a
+//! caller can pass its own open transaction, or a `rusqlite::Transaction`
+//! where its statements are only correct together. None of them opens a
+//! connection or a transaction: callers keep both, with their transaction
+//! behavior, and their checks between statements. Each returns rusqlite's
+//! error, except [`template_settings::try_update_template_network_policy_tx`],
+//! whose error also reports a generation conflict.
 
 #![forbid(unsafe_code)]
 
 pub mod builds;
 mod codec;
+pub mod database;
 pub mod eviction;
 pub mod network_policy_notifications;
 pub mod node_dirty_refs;

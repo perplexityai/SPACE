@@ -7,17 +7,15 @@ use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sql_locator::sql;
 use pplx_space_template_mgr_store::builds::{self, TemplateBuildRow};
+use pplx_space_template_mgr_store::database;
 use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
 use pplx_space_template_mgr_store::template_local_state;
 use pplx_space_template_mgr_store::{network_policy_notifications, pins};
 
 pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;
 
-pub fn open() -> Result<Connection, pplx_space_sqlite::SqliteError> {
-    pplx_space_sqlite::open_rusqlite(
-        Path::new(DB_PATH),
-        pplx_space_sqlite::RusqliteOpenOptions::default(),
-    )
+pub fn open() -> Result<Connection, database::SqliteError> {
+    database::open(Path::new(DB_PATH))
 }
 
 fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
@@ -26,11 +24,9 @@ fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>>
 
 #[cfg(test)]
 pub fn init_in_memory(conn: &mut Connection) {
-    let service = sqlx::migrate!("../../../../../db/template-manager");
-    let common = sqlx::migrate!("../../../../../db/common");
-    for migration in common
+    for migration in database::COMMON_MIGRATOR
         .iter()
-        .chain(service.iter())
+        .chain(database::MIGRATOR.iter())
         .filter(|migration| migration.migration_type.is_up_migration())
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();

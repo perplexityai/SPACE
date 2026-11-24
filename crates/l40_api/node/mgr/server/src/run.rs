@@ -83,8 +83,6 @@ const ENV_DISK_IO_RESERVATION_ENABLED: &[&str] = &["SPACE_NODEMGR_DISK_IO_RESERV
 const DISK_IO_SANDBOX_CAPACITY_PERCENT: u64 = 70;
 const DISK_IO_READ_WEIGHT_PERCENT: u64 = 50;
 const DISK_IO_WRITE_WEIGHT_PERCENT: u64 = 50;
-static NODE_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
-    sqlx::migrate!("../../../../../db/node-manager");
 const REQUIRED_RUNTIME_GROUPS: &[&str] = &[
     group_names::SPACE_NODECLIENTS,
     group_names::SPACE_SBXMGR,
@@ -210,7 +208,7 @@ pub enum RunNodeMgrError {
     #[error("failed to apply sandbox parent disk I/O reservation: {0}")]
     ApplyParentDiskIoReservation(String),
     #[error("failed to migrate node-manager's SQLite database: {0}")]
-    Migrate(#[source] pplx_space_sqlite::SqliteError),
+    Migrate(#[source] pplx_space_node_mgr_store::database::SqliteError),
     /// Incompatible ownership or slot-store state found before any host limit
     /// could shrink beneath live sandboxes.
     #[error("node-manager slot pool startup validation failed: {0}")]
@@ -676,7 +674,7 @@ pub async fn run(
     // Reject incompatible ownership before any host limit can shrink beneath
     // live sandboxes. Pool construction repeats this check before row repair.
     let db_path = Path::new(pplx_space_host_layout::paths::NODE_MANAGER_DB);
-    pplx_space_sqlite::migrate("node-manager", db_path, &NODE_MANAGER_MIGRATOR)
+    pplx_space_node_mgr_store::database::migrate(db_path)
         .await
         .map_err(RunNodeMgrError::Migrate)?;
     crate::slot_pool::NetworkPool::validate_startup(&pool_config, db_path)

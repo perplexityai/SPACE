@@ -1,20 +1,14 @@
 use rusqlite::Connection;
 
-use crate::{dirty_facets, facet_sync_overrides, reconciliation_status};
-
-static NODE_CTL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/node-ctl");
+use crate::{database, dirty_facets, facet_sync_overrides, reconciliation_status};
 
 async fn migrated_db() -> (tempfile::TempDir, Connection) {
     let temp = tempfile::tempdir().expect("create temp dir");
     let db_path = temp.path().join("node-ctl.db");
-    pplx_space_sqlite::migrate("node-ctl-store-test", &db_path, &NODE_CTL_MIGRATOR)
+    database::migrate(&db_path)
         .await
         .expect("migrate node-ctl database");
-    let conn = pplx_space_sqlite::open_rusqlite(
-        &db_path,
-        pplx_space_sqlite::RusqliteOpenOptions::default(),
-    )
-    .expect("open node-ctl database");
+    let conn = database::open(&db_path).expect("open node-ctl database");
     (temp, conn)
 }
 

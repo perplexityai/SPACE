@@ -93,22 +93,17 @@ pplx-space-internal-api-server = [
   "sqlx",
 ]
 pplx-space-node-ctl-server = [
-  "pplx-space-sqlite",
   "rusqlite",
-  "sqlx",
 ]
 pplx-space-node-mgr = [
   "pplx-space-sqlite",
   "rusqlite",
-  "sqlx",
 ]
 pplx-space-node-runtime-manager = [
   "aws-sdk-s3",
   "pplx-space-common-jobs",
   "pplx-space-s3-http-client",
-  "pplx-space-sqlite",
   "rusqlite",
-  "sqlx",
 ]
 pplx-space-snapshot-retention = [
   "sqlx",
@@ -118,9 +113,7 @@ pplx-space-state-reconciliation = [
 ]
 pplx-space-template-mgr = [
   "pplx-space-common-jobs",
-  "pplx-space-sqlite",
   "rusqlite",
-  "sqlx",
 ]
 pplx-space-template-publisher = [
   "pplx-space-object-store",
@@ -128,9 +121,7 @@ pplx-space-template-publisher = [
 pplx-space-volmgr = [
   "pplx-space-common-jobs",
   "pplx-space-object-store",
-  "pplx-space-sqlite",
   "rusqlite",
-  "sqlx",
 ]
 
 [layers.unowned]

@@ -28,6 +28,7 @@ workspace = true
 
 [dependencies]
 rusqlite = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
@@ -36,4 +37,5 @@ pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-policy-authority = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-sqlite = { workspace = true }
 pplx-space-template-model = { workspace = true }
