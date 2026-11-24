@@ -48,6 +48,7 @@ members = [
     "crates/test_support/test/env",
     "crates/l10_foundation/bearer/token",
     "crates/l10_foundation/tokio/runtime",
+    "crates/l30_storage/accounts/store",
     "crates/l30_storage/sandbox/store",
     "crates/l30_storage/sandbox/quarantine/store",
     "crates/l30_storage/sandbox/teardown",
@@ -448,6 +449,7 @@ pplx-space-node-status-store = { path = "crates/l30_storage/node/status/store" }
 pplx-space-node-execution-inventory-store = { path = "crates/l30_storage/node/execution/inventory/store" }
 pplx-space-feature-flags = { path = "crates/l10_foundation/feature/flags" }
 pplx-space-events = { path = "crates/l20_domain/events" }
+pplx-space-accounts-store = { path = "crates/l30_storage/accounts/store" }
 pplx-space-data-plane-session-store = { path = "crates/l30_storage/data/plane/session/store" }
 pplx-space-admin-audit-store = { path = "crates/l30_storage/admin/audit/store" }
 pplx-space-federated-grant-store = { path = "crates/l30_storage/federated/grant/store" }

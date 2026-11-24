@@ -7,6 +7,7 @@ use super::{
 use crate::models::{Organization, User};
 use crate::user_role::UserRole;
 use pplx_space_accounts::{OrgId, SandboxOwnerSource, UserId};
+use pplx_space_accounts_store::{FederatedOrganization, FederatedUser, organizations, users};
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -136,62 +137,46 @@ pub(super) async fn materialize_owner_in_tx(
     owner: &FederatedOwner,
 ) -> Result<FederatedOwnerRecord, MaterializeOwnerError> {
     let proposed_org_id = OrgId::new();
-    let (org_id,): (OrgId,) = sqlx::query_as(sql!(
-        "INSERT INTO organizations (
-             id, name, slug, owner_source, upstream_issuer, upstream_org_id
-         )
-         VALUES ($1, $2, $3, 'federated_identity', $4, $5)
-         ON CONFLICT (upstream_issuer, upstream_org_id)
-             WHERE owner_source = 'federated_identity'
-         DO UPDATE SET name = organizations.name
-         RETURNING id"
-    ))
-    .bind(proposed_org_id)
-    .bind(format!(
-        "Federated {} org {}",
-        owner.issuer.as_str(),
-        owner.org_id.as_str()
-    ))
-    .bind(format!("federated-{proposed_org_id}"))
-    .bind(owner.issuer.as_str())
-    .bind(owner.org_id.as_str())
-    .fetch_one(&mut **tx)
+    let org_id = organizations::upsert_federated_organization(
+        &mut **tx,
+        FederatedOrganization {
+            proposed_id: proposed_org_id,
+            name: &format!(
+                "Federated {} org {}",
+                owner.issuer.as_str(),
+                owner.org_id.as_str()
+            ),
+            slug: &format!("federated-{proposed_org_id}"),
+            upstream_issuer: owner.issuer.as_str(),
+            upstream_org_id: owner.org_id.as_str(),
+        },
+    )
     .await
     .map_err(MaterializeOwnerError::Organization)?;
 
     let proposed_user_id = UserId::new();
     let email = format!("federated-{proposed_user_id}@space.invalid");
-    let (user_id, email): (UserId, String) = sqlx::query_as(sql!(
-        "INSERT INTO users (
-             id, email, password_hash, display_name, org_id, role,
-             owner_source, upstream_issuer, upstream_subject_id
-         )
-         VALUES (
-             $1, $2, 'federated-user-no-local-password', $3, $4, 'member',
-             'federated_identity', $5, $6
-         )
-         ON CONFLICT (org_id, upstream_issuer, upstream_subject_id)
-             WHERE owner_source = 'federated_identity'
-         DO UPDATE SET display_name = users.display_name
-         RETURNING id, email"
-    ))
-    .bind(proposed_user_id)
-    .bind(&email)
-    .bind(format!(
-        "Federated {} user {}",
-        owner.issuer.as_str(),
-        owner.subject_id.as_str()
-    ))
-    .bind(org_id)
-    .bind(owner.issuer.as_str())
-    .bind(owner.subject_id.as_str())
-    .fetch_one(&mut **tx)
+    let user = users::upsert_federated_user(
+        &mut **tx,
+        FederatedUser {
+            proposed_id: proposed_user_id,
+            proposed_email: &email,
+            display_name: &format!(
+                "Federated {} user {}",
+                owner.issuer.as_str(),
+                owner.subject_id.as_str()
+            ),
+            org_id,
+            upstream_issuer: owner.issuer.as_str(),
+            upstream_subject_id: owner.subject_id.as_str(),
+        },
+    )
     .await
     .map_err(MaterializeOwnerError::User)?;
 
     Ok(FederatedOwnerRecord {
-        user_id,
+        user_id: user.id,
         org_id,
-        email,
+        email: user.email,
     })
 }

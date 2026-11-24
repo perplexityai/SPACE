@@ -48,6 +48,7 @@ uuid = { workspace = true, features = ["v7"] }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["serde"] }
+pplx-space-accounts-store = { workspace = true }
 pplx-space-api-route = { workspace = true }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }

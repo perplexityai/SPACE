@@ -5,13 +5,14 @@
 //! orchestration, and audit logging; the helpers they call live here.
 //! Multi-step guarded writes (assign-org, set-default, delete) lock the group
 //! row `FOR UPDATE` and run their residue checks inside the same transaction so
-//! two operators cannot race a guard. This module keeps the organization
-//! check; the template `FOR SHARE` read is `pplx-space-template-store`'s
-//! `templates::share_lock_visibilities`. The node-group and allowlist
+//! two operators cannot race a guard. This module keeps no statements of its
+//! own: the template `FOR SHARE` read is `pplx-space-template-store`'s
+//! `templates::share_lock_visibilities`; the node-group and allowlist
 //! statements, the group reads and the group-row and default-row locks among
-//! them, are verbs of `pplx-space-node-group-store`, the cached-template count
-//! is `pplx-space-node-template-inventory-store`'s and the occupancy count is
-//! `pplx-space-sandbox-store`'s; each runs on the pool or transaction its
+//! them, are verbs of `pplx-space-node-group-store`; the cached-template count
+//! is `pplx-space-node-template-inventory-store`'s, the occupancy count is
+//! `pplx-space-sandbox-store`'s and the organization check is
+//! `pplx-space-accounts-store`'s; each runs on the pool or transaction its
 //! helper is given.
 
 use pplx_space_accounts::OrgId;
@@ -20,7 +21,6 @@ use std::collections::HashMap;
 
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
-use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use super::node_store::SandboxOccupancy;
@@ -201,12 +201,7 @@ pub(super) async fn org_exists_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1)"
-    ))
-    .bind(org_id)
-    .fetch_one(&mut **tx)
-    .await
+    pplx_space_accounts_store::organizations::organization_exists(&mut **tx, org_id).await
 }
 
 /// Apply an org assignment/release. When `reset_policy` is set (any org

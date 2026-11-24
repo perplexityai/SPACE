@@ -1,6 +1,10 @@
 use super::*;
 use crate::auth::hash_token;
-use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_accounts::UserId;
+use pplx_space_accounts_store::ApiSurface;
+use pplx_space_accounts_store::api_keys::{
+    CreateApiKey, create_api_key, list_organization_api_keys,
+};
 
 use crate::routes::admin::test_fixtures::{TestResult, postgres_fixture};
 
@@ -21,7 +25,7 @@ async fn create_list_and_org_scoped_revoke_preserve_key_metadata() -> TestResult
     let key_id = ApiKeyId::new();
     let raw_key = "store-test-key-without-a-vendor-prefix";
 
-    let created = create(
+    let created = create_api_key(
         &db.pool,
         CreateApiKey {
             id: key_id,
@@ -59,7 +63,7 @@ async fn create_list_and_org_scoped_revoke_preserve_key_metadata() -> TestResult
     .execute(&db.pool)
     .await?;
 
-    let listed = list_for_organization(&db.pool, org_id, false).await?;
+    let listed = list_organization_api_keys(&db.pool, org_id, false).await?;
     assert!(listed.iter().any(|key| key.id == key_id));
     assert!(
         listed
@@ -100,13 +104,13 @@ async fn create_list_and_org_scoped_revoke_preserve_key_metadata() -> TestResult
         );
     }
     assert!(
-        !list_for_organization(&db.pool, org_id, false)
+        !list_organization_api_keys(&db.pool, org_id, false)
             .await?
             .iter()
             .any(|key| key.id == key_id),
         "a revoked key is listed only on request"
     );
-    let revoked = list_for_organization(&db.pool, org_id, true)
+    let revoked = list_organization_api_keys(&db.pool, org_id, true)
         .await?
         .into_iter()
         .find(|key| key.id == key_id)
@@ -121,7 +125,7 @@ async fn create_list_and_org_scoped_revoke_preserve_key_metadata() -> TestResult
         revoke(&db.pool, org_id, key_id).await?,
         RevokeOutcome::AlreadyRevoked
     );
-    let revoked_again = list_for_organization(&db.pool, org_id, true)
+    let revoked_again = list_organization_api_keys(&db.pool, org_id, true)
         .await?
         .into_iter()
         .find(|key| key.id == key_id)

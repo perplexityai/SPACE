@@ -100,18 +100,13 @@ pplx-space-volmgr = [
 
 [layers.unowned]
 postgres = [
-  "api_keys",
-  "clusters",
   "data_plane_session_output_events",
   "org_credentials",
-  "organizations",
   "sandbox_archives",
   "sandbox_encrypted_fields",
-  "sessions",
   "template_encrypted_fields",
   "template_release_storage_location_encrypted_fields",
   "user_credentials",
-  "users",
 ]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such
