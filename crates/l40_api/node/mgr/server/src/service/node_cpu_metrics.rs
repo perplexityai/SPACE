@@ -104,10 +104,15 @@ impl NodeCpuSampler {
     }
 
     pub fn sample_and_emit(&mut self) {
-        let _ = self.sample_and_emit_at(Instant::now());
+        let _ = self.sample_and_emit_with(Instant::now);
     }
 
+    #[cfg(test)]
     pub(crate) fn sample_and_emit_at(&mut self, now: Instant) -> NodeCpuTickSample {
+        self.sample_and_emit_with(|| now)
+    }
+
+    fn sample_and_emit_with(&mut self, mut now: impl FnMut() -> Instant) -> NodeCpuTickSample {
         let mut tick = NodeCpuTickSample::default();
 
         match std::fs::read_to_string(&self.sources.proc_pressure_cpu) {
@@ -144,6 +149,7 @@ impl NodeCpuSampler {
 
         match std::fs::read_to_string(&self.sources.parent_cgroup_cpu_stat) {
             Ok(content) => {
+                let observed_at = now();
                 let stat = parse_cgroup_cpu_stat(&content);
                 if stat.is_empty() {
                     self.prev_cgroup_stat = None;
@@ -162,23 +168,31 @@ impl NodeCpuSampler {
                         );
                         self.warned_cgroup_stat = false;
                     }
-                    if let Some((prev_at, prev_stat)) = self.prev_cgroup_stat.replace((now, stat)) {
-                        if let Some(rate) =
-                            counter_rate(prev_at, prev_stat.usage_usec, now, stat.usage_usec)
-                        {
+                    if let Some((prev_at, prev_stat)) =
+                        self.prev_cgroup_stat.replace((observed_at, stat))
+                    {
+                        if let Some(rate) = counter_rate(
+                            prev_at,
+                            prev_stat.usage_usec,
+                            observed_at,
+                            stat.usage_usec,
+                        ) {
                             crate::metrics::node_cpu::space_cgroup_usage_usec_per_sec(rate);
                             tick.cgroup_usage_usec_per_sec = Some(rate);
                         }
-                        if let Some(rate) =
-                            counter_rate(prev_at, prev_stat.nr_throttled, now, stat.nr_throttled)
-                        {
+                        if let Some(rate) = counter_rate(
+                            prev_at,
+                            prev_stat.nr_throttled,
+                            observed_at,
+                            stat.nr_throttled,
+                        ) {
                             crate::metrics::node_cpu::space_cgroup_nr_throttled_per_sec(rate);
                             tick.cgroup_nr_throttled_per_sec = Some(rate);
                         }
                         if let Some(rate) = counter_rate(
                             prev_at,
                             prev_stat.throttled_usec,
-                            now,
+                            observed_at,
                             stat.throttled_usec,
                         ) {
                             crate::metrics::node_cpu::space_cgroup_throttled_usec_per_sec(rate);
