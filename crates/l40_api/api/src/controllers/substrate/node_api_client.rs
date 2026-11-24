@@ -309,6 +309,25 @@ where
     Ok((endpoint_addr, client))
 }
 
+/// The internal (control-plane) node-api client of the node `target` names,
+/// for the RPCs only the control plane may call, such as `DrainNode`.
+pub async fn connect_internal_node_api_client_for_target<A>(
+    substrate: &A,
+    target: &NodeApiTarget<'_>,
+    request_timeout: Duration,
+) -> Result<RuntimeInternalClient, SubstrateError>
+where
+    A: SubstrateAdapter + ?Sized,
+{
+    let endpoint_addr = substrate.resolve_node_api_endpoint(target).await?;
+    let endpoint = node_api_endpoint(&endpoint_addr, Duration::from_secs(3), request_timeout)?;
+    connect_worker_internal(endpoint)
+        .await
+        .map_err(|err| SubstrateError::Unavailable {
+            message: format!("node-api not reachable at {endpoint_addr}: {err}"),
+        })
+}
+
 pub async fn connect_retrying_node_api_client_for_target<A>(
     substrate: &A,
     target: &NodeApiTarget<'_>,
