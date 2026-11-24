@@ -772,9 +772,19 @@ async fn stats_rejects_polls_beyond_its_cap_without_queueing() {
             })
         })
         .collect::<Vec<_>>();
-    while service.stats_admission.available_permits() > 0 {
+    // Each spawned call takes its permit on its first poll; a bounded number
+    // of yields lets them all run that far.
+    for _ in 0..1_000 {
+        if service.stats_admission.available_permits() == 0 {
+            break;
+        }
         tokio::task::yield_now().await;
     }
+    assert_eq!(
+        service.stats_admission.available_permits(),
+        0,
+        "the stalled Stats calls did not hold every slot"
+    );
 
     let started = tokio::time::Instant::now();
     let error = service
