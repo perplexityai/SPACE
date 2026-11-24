@@ -96,9 +96,7 @@ pplx-space-node-mgr = [
 ]
 pplx-space-node-runtime-manager = [
   "aws-sdk-s3",
-  "pplx-space-common-jobs",
   "pplx-space-s3-http-client",
-  "rusqlite",
 ]
 pplx-space-snapshot-retention = [
   "sqlx",
@@ -127,9 +125,6 @@ postgres = [
   "template_release_storage_location_encrypted_fields",
   "user_credentials",
   "users",
-]
-"sqlite.runtime-manager" = [
-  "jobs",
 ]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such

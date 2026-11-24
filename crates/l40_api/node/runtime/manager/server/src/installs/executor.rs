@@ -12,13 +12,13 @@ use super::source::KernelSources;
 use super::staging;
 use super::store::{self, JobOutcome, JobPhase, JobResult};
 use pplx_space_accounts::JobId;
-use pplx_space_common_jobs::{Job, JobError, JobExecutor};
 use pplx_space_content_digest::Digest;
 use pplx_space_cpu_arch::Arch;
 use pplx_space_node_runtime_core::artifact_store::{StagedName, kernel_staging, release_staging};
-use rusqlite::Connection;
+use pplx_space_node_runtime_manager_store::database::{ConnectionGuard, SharedConnection};
+use pplx_space_node_runtime_manager_store::jobs::{Job, JobError, JobExecutor};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -48,7 +48,7 @@ pub(super) struct ExecutorContext {
     pub(super) releases: ReleaseSources,
     pub(super) publisher: Arc<dyn ArtifactPublisher>,
     pub(super) pins: Arc<dyn PinSource>,
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     // Cancellation and durable mutation intent are mutually exclusive.
     pub(super) commit_gate: tokio::sync::Mutex<()>,
 }
@@ -61,7 +61,7 @@ pub(super) fn permanent(error: &(dyn std::error::Error + 'static)) -> JobError {
 }
 
 impl InstallExecutor {
-    pub(super) fn new(parts: ExecutorParts, db: Arc<Mutex<Connection>>) -> Self {
+    pub(super) fn new(parts: ExecutorParts, db: SharedConnection) -> Self {
         let ExecutorParts {
             kernels_root,
             boot_source,
@@ -93,7 +93,7 @@ impl InstallExecutor {
     pub(super) fn context(&self) -> &ExecutorContext {
         &self.context
     }
-    pub(super) fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(super) fn db(&self) -> ConnectionGuard<'_> {
         self.context
             .db
             .lock()

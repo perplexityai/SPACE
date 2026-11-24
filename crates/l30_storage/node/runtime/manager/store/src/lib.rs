@@ -2,11 +2,14 @@
 //! SQLite database: what each install or uninstall job did on disk.
 //!
 //! [`database`] migrates and opens the database for
-//! `pplx-space-node-runtime-manager`, and gives `pplx-space-db-migrate` its
-//! migration catalog; its shared `jobs` table is read and written through
-//! `pplx-space-common-jobs`.
+//! `pplx-space-node-runtime-manager`, holds the connection types callers
+//! name, and gives `pplx-space-db-migrate` its migration catalog. Its shared
+//! `jobs` table is read and written by the common-jobs worker, which
+//! runtime-manager reaches only through [`jobs::JobWorker`]. This crate's
+//! `AGENTS.md` states the rules for extending either.
 
 pub mod database;
+pub mod jobs;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -14,7 +17,9 @@ use std::str::FromStr;
 use pplx_space_content_digest::Digest;
 use pplx_space_job_id::JobId;
 use pplx_space_sql_locator::sql;
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{OptionalExtension as _, params};
+
+use crate::database::Connection;
 
 /// The on-disk step a job is part-way through.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,7 +135,7 @@ impl JobResult {
 #[derive(Debug, thiserror::Error)]
 pub enum JobResultError {
     #[error("runtime-manager database")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] database::Error),
     #[error("runtime-manager database holds an unreadable {column} value '{value}'")]
     Corrupt { column: &'static str, value: String },
 }
@@ -147,6 +152,7 @@ pub fn get_job_result(
     job_id: &JobId,
 ) -> Result<Option<JobResult>, JobResultError> {
     let row = conn
+        .0
         .query_row(
             sql!("SELECT phase, outcome, path, digest FROM operation_results WHERE job_id = ?1"),
             params![job_id],
@@ -159,7 +165,8 @@ pub fn get_job_result(
                 ))
             },
         )
-        .optional()?;
+        .optional()
+        .map_err(database::Error::from)?;
     let Some((phase, outcome, path, digest)) = row else {
         return Ok(None);
     };
@@ -197,36 +204,41 @@ pub fn put_job_result(
         JobResult::InProgress { phase, .. } => (Some(phase.as_str()), None),
         JobResult::Done { outcome, .. } => (None, Some(outcome.as_str())),
     };
-    conn.execute(
-        sql!(
-            "INSERT INTO operation_results (job_id, phase, outcome, path, digest, updated_at_unix_ms)
+    conn.0
+        .execute(
+            sql!(
+                "INSERT INTO operation_results (job_id, phase, outcome, path, digest, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (job_id) DO UPDATE SET phase = excluded.phase,
                  outcome = excluded.outcome, path = excluded.path, digest = excluded.digest,
                  updated_at_unix_ms = excluded.updated_at_unix_ms"
-        ),
-        params![
-            job_id,
-            phase,
-            outcome,
-            path_text(result.path()),
-            result.digest().to_string(),
-            at.as_millisecond(),
-        ],
-    )?;
+            ),
+            params![
+                job_id,
+                phase,
+                outcome,
+                path_text(result.path()),
+                result.digest().to_string(),
+                at.as_millisecond(),
+            ],
+        )
+        .map_err(database::Error::from)?;
     Ok(())
 }
 
 /// Drop results once their terminal jobs have expired. A later request is
 /// idempotent at node-manager; it needs no provenance from an earlier job.
 pub fn delete_orphaned_job_results(conn: &Connection) -> Result<usize, JobResultError> {
-    Ok(conn.execute(
-        sql!(
-            "DELETE FROM operation_results
+    Ok(conn
+        .0
+        .execute(
+            sql!(
+                "DELETE FROM operation_results
              WHERE job_id NOT IN (SELECT job_id FROM jobs)"
-        ),
-        [],
-    )?)
+            ),
+            [],
+        )
+        .map_err(database::Error::from)?)
 }
 
 fn path_text(path: &Path) -> String {
