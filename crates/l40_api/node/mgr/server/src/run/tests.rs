@@ -300,3 +300,37 @@ async fn an_exhausted_drain_budget_asks_the_remaining_work_to_stop() {
     .await
     .expect("the drain ends once its budget asks the work to stop");
 }
+
+#[test]
+fn memory_admission_parent_cgroup_check_is_opt_in_and_needs_an_active_level() {
+    let resolve = |toml_text: &str| {
+        let config: NodeConfig = toml::from_str(toml_text).unwrap();
+        resolve_memory_admission_config(&memory_cli_config(None), &config.memory_admission)
+    };
+    assert_eq!(resolve("").unwrap(), MemoryAdmissionConfig::default());
+    assert_eq!(
+        resolve("[memory_admission]\nmode = \"parent_cgroup\"\nactive_level_mib = 2048")
+            .unwrap()
+            .parent_cgroup,
+        Some(ParentCgroupAdmission {
+            active_level_mib: 2048,
+            file_floor_mib: DEFAULT_MEMORY_ADMISSION_FILE_FLOOR_MIB,
+        })
+    );
+    assert!(matches!(
+        resolve("[memory_admission]\nmode = \"parent_cgroup\""),
+        Err(RunNodeMgrError::MemoryAdmissionActiveLevelRequired)
+    ));
+    assert!(matches!(
+        resolve("[memory_admission]\nmode = \"parent_cgroup\"\nactive_level_mib = 0"),
+        Err(RunNodeMgrError::MemoryAdmissionActiveLevelZero)
+    ));
+    assert!(matches!(
+        resolve("[memory_admission]\nfile_floor_mib = 512"),
+        Err(
+            RunNodeMgrError::MemoryAdmissionSettingRequiresParentCgroup {
+                setting: "file_floor_mib"
+            }
+        )
+    ));
+}

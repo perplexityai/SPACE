@@ -7,6 +7,7 @@ use pplx_space_host_layout::paths;
 use pplx_space_linux_ids::LinuxPid;
 use pplx_space_sandbox_model::SandboxId;
 
+use crate::memory_admission::NodeMemoryCapacityError;
 use crate::metrics::node_memory::{
     MemoryAdmissionOutcome, admission_booked_growth, admission_decision,
 };
@@ -119,29 +120,61 @@ pub(super) enum AllocateNewLeaseError {
     Slot(#[from] AllocateSlotError),
 }
 
-fn record_memory_admission_error(error: &MemoryAdmissionEvaluationError) {
-    let (outcome, booked_growth_mib) = match error {
-        MemoryAdmissionEvaluationError::NodeMemory(_) => {
-            (MemoryAdmissionOutcome::NodeMemoryUnobservable, None)
+/// The decision an unobservable node memory records.
+fn node_memory_unobservable_outcome(error: &NodeMemoryCapacityError) -> MemoryAdmissionOutcome {
+    match error {
+        NodeMemoryCapacityError::ParentCgroupRead(_)
+        | NodeMemoryCapacityError::ParentCgroupStatMissing
+        | NodeMemoryCapacityError::ParentCgroupUnlimited => {
+            MemoryAdmissionOutcome::ParentCgroupUnobservable
         }
-        MemoryAdmissionEvaluationError::Admission(MemoryAdmissionError::InsufficientCapacity {
+        NodeMemoryCapacityError::Read { .. }
+        | NodeMemoryCapacityError::Missing { .. }
+        | NodeMemoryCapacityError::Invalid { .. }
+        | NodeMemoryCapacityError::AvailableExceedsTotal { .. } => {
+            MemoryAdmissionOutcome::NodeMemoryUnobservable
+        }
+    }
+}
+
+/// The decision a refusal records, and the booked growth of the limit it
+/// was refused against.
+fn refusal_outcome(error: &MemoryAdmissionError) -> (MemoryAdmissionOutcome, u64) {
+    match *error {
+        MemoryAdmissionError::InsufficientCapacity {
             existing_growth_reserve_mib,
             ..
-        }) => (
+        } => (
             MemoryAdmissionOutcome::InsufficientCapacity,
-            Some(*existing_growth_reserve_mib),
+            existing_growth_reserve_mib,
         ),
-        MemoryAdmissionEvaluationError::Admission(MemoryAdmissionError::RequirementOverflow {
+        MemoryAdmissionError::RequirementOverflow {
             existing_growth_reserve_mib,
             ..
-        }) => (
+        } => (
             MemoryAdmissionOutcome::RequirementOverflow,
-            Some(*existing_growth_reserve_mib),
+            existing_growth_reserve_mib,
         ),
-    };
-    admission_decision(outcome);
-    if let Some(booked_growth_mib) = booked_growth_mib {
-        admission_booked_growth("host", booked_growth_mib);
+        MemoryAdmissionError::ParentCgroupInsufficientCapacity {
+            parent_cgroup_booked_growth_mib,
+            ..
+        } => (
+            MemoryAdmissionOutcome::ParentCgroupInsufficientCapacity,
+            parent_cgroup_booked_growth_mib,
+        ),
+    }
+}
+
+fn record_memory_admission_error(error: &MemoryAdmissionEvaluationError) {
+    match error {
+        MemoryAdmissionEvaluationError::NodeMemory(error) => {
+            admission_decision(node_memory_unobservable_outcome(error));
+        }
+        MemoryAdmissionEvaluationError::Admission(error) => {
+            let (outcome, booked_growth_mib) = refusal_outcome(error);
+            admission_decision(outcome);
+            admission_booked_growth(error.limit().as_str(), booked_growth_mib);
+        }
     }
 }
 
@@ -178,6 +211,9 @@ impl NodeManagerService {
                 .inspect_err(record_memory_admission_error)?;
             admission_decision(MemoryAdmissionOutcome::Accepted);
             admission_booked_growth("host", measurement.existing_growth_reserve_mib);
+            if let Some(parent) = measurement.parent_cgroup {
+                admission_booked_growth("parent_cgroup", parent.parent_cgroup_booked_growth_mib);
+            }
             self.pool.claim_allocation(
                 &sandbox_id.to_string(),
                 pod_netns,
@@ -331,6 +367,7 @@ impl NodeManagerService {
                 .emit_with(
                     SandboxEventDetails::default()
                         .reason("memory_admission_unavailable")
+                        .error_kind(node_memory_unobservable_outcome(&error).reason())
                         .error(status.message().to_string())
                         .logged_by_caller(),
                 );
@@ -374,14 +411,39 @@ impl NodeManagerService {
                             "rejecting new sandbox allocation because measured memory demand overflows"
                         );
                     }
+                    MemoryAdmissionError::ParentCgroupInsufficientCapacity {
+                        parent_cgroup_limit_mib,
+                        parent_cgroup_used_mib,
+                        parent_cgroup_booked_growth_mib,
+                        sandbox_cgroup_memory_mib,
+                        reserve_mib,
+                        file_floor_mib,
+                        required_mib,
+                    } => {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            parent_cgroup_used_mib,
+                            parent_cgroup_booked_growth_mib,
+                            sandbox_cgroup_memory_mib,
+                            reserve_mib,
+                            file_floor_mib,
+                            required_mib,
+                            parent_cgroup_limit_mib,
+                            "rejecting new sandbox allocation because measured memory demand exceeds the sandbox parent cgroup limit"
+                        );
+                    }
                 }
                 let details = SandboxEventDetails::default()
                     .reason("memory_admission_resource_exhausted")
+                    .error_kind(refusal_outcome(&error).0.reason())
                     .error(error.to_string());
                 // A capacity refusal is normal operation. An overflow means the
                 // reservation state is corrupt or saturated, so it stays a WARN.
                 let details = match &error {
-                    MemoryAdmissionError::InsufficientCapacity { .. } => details.routine(),
+                    MemoryAdmissionError::InsufficientCapacity { .. }
+                    | MemoryAdmissionError::ParentCgroupInsufficientCapacity { .. } => {
+                        details.routine()
+                    }
                     MemoryAdmissionError::RequirementOverflow { .. } => details,
                 };
                 SandboxEvent::new(
