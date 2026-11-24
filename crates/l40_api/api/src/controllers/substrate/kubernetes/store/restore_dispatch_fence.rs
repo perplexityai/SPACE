@@ -50,7 +50,7 @@ impl K8sStore {
         let stop = tokio_util::sync::CancellationToken::new();
         let pool = self.pool.clone();
         let stopped = stop.clone();
-        tokio::spawn(async move {
+        crate::task_scope::spawn(async move {
             let mut renewed_once = false;
             loop {
                 tokio::select! {

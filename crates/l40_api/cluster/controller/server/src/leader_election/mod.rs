@@ -110,7 +110,7 @@
 //! # What the budget doesn't cover
 //!
 //! * **The holder.** A holder that can't renew is forced out at `renew_deadline`
-//!   — `lease_ttl - 12s`, so 48s at the fixed 60s TTL — by [`renew_loop`],
+//!   — `lease_ttl - 13s`, so 47s at the fixed 60s TTL — by [`renew_loop`],
 //!   independently of this budget. A restarted pod re-enters [`campaign`] as a
 //!   standby and can only reach that path by *acquiring*, which a lease-path
 //!   outage prevents — so during a sustained outage that exit happens at most
@@ -160,13 +160,18 @@
 //! expires, using a renew deadline (`lease_ttl - RENEW_DEADLINE_MARGIN`) whose
 //! margin covers the reconciler drain and abort windows. On graceful shutdown
 //! the holder confirms its reconciler tasks have stopped before releasing the
-//! lease. An operation already sent to another service may still finish, as
-//! with a crash (for example, `node_group_mirror`'s idempotent bulk UPDATE,
-//! bounded by its `WRITE_BACKSTOP`). The lease does **not** hard-fence: if a
-//! holder's process is frozen past the TTL (e.g. `SIGSTOP`, VM suspension, total runtime
-//! starvation) a standby will acquire and, when the frozen process resumes, an
-//! already-in-flight reconciler tick could run once more before the renewal
-//! task is next polled and cancels the reconciler token. True fencing would
+//! lease. Lease expiry and release are not server-side fences: either can
+//! leave an already-issued statement or API request finishing on the other
+//! end, just as a crash can. Dispatchers guard operation updates with claim
+//! tokens; sandbox execution cleanup checks the observed execution identity
+//! and state; restore-pod GC deletes are preconditioned on UID and
+//! resourceVersion. Derived-state writes such as node inventory sync and the
+//! node-group mirror are idempotent; the mirror also bounds its statement
+//! and documents the remaining late-commit case under its `WRITE_BACKSTOP`.
+//! If a holder's process is frozen past the TTL (e.g. `SIGSTOP`, VM
+//! suspension, total runtime starvation) a standby will acquire and, when
+//! the frozen process resumes, an in-flight reconciler tick could run once
+//! more before the renewal task is next polled and cancels the token. True fencing would
 //! require a fencing token threaded through every reconciler write; the
 //! reconcilers are instead written to be CAS-safe / idempotent, which bounds
 //! the damage of such a rare overlap to the same window a crash-and-restart
@@ -314,8 +319,8 @@ const _: () = assert!(MAX_LEASE_TTL.as_secs() == 300);
 // `2 > 0` and passes — verified. Pin them absolutely, and pin the drain window
 // they derive from, so a change there fails the build rather than the prose.
 const _: () = assert!(crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_secs() == 10);
-const _: () = assert!(RENEW_DEADLINE_MARGIN.as_secs() == 12);
-const _: () = assert!(MIN_LEASE_TTL.as_secs() == 18);
+const _: () = assert!(RENEW_DEADLINE_MARGIN.as_secs() == 13);
+const _: () = assert!(MIN_LEASE_TTL.as_secs() == 19);
 // The marker I/O bound must stay under the tightest renewal cadence, which is
 // `(MIN_LEASE_TTL - RENEW_DEADLINE_MARGIN) / 3` = 2s.
 const _: () = assert!(
@@ -392,8 +397,11 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// stop before any standby starts its own. The extra buffer covers scheduling
 /// and clock skew. See the module's safety model for the limits of this margin.
 /// `renew_deadline = lease_ttl - RENEW_DEADLINE_MARGIN`.
-const RENEW_DEADLINE_MARGIN: Duration =
-    Duration::from_secs(crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_secs() + 2);
+const RENEW_DEADLINE_MARGIN: Duration = Duration::from_secs(
+    crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+        + crate::reconcilers::SHUTDOWN_ABORT_TIMEOUT.as_secs()
+        + 2,
+);
 
 /// Ceiling for the lease TTL. The TTL bounds crash-failover time, so a value
 /// beyond a few minutes is already a misconfiguration — but without a ceiling it
@@ -661,7 +669,7 @@ impl Timings {
             .saturating_sub(renew_interval)
             .saturating_sub(FIRST_RENEWAL_HEADROOM);
         let retry_ceiling = lease_ttl.min(MAX_RETRY_INTERVAL).min(first_renewal_room);
-        // `clamp` can't panic: at the smallest TTL (18s) the deadline is 6s, the
+        // `clamp` can't panic: at the smallest TTL (19s) the deadline is 6s, the
         // renew interval 2s and the marker bound 1s, leaving a 2s ceiling — at
         // the 1s floor or above, asserted at the constants.
         let retry_interval = requested_retry.clamp(Duration::from_secs(1), retry_ceiling);

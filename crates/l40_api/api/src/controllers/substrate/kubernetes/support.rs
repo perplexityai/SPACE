@@ -1222,7 +1222,8 @@ impl Drop for CancelGuard {
                 "create_execution cancelled before its pod create was sent — releasing the \
                  claimed execution"
             );
-            self.task_tracker.spawn(
+            crate::task_scope::spawn_in(
+                &self.task_tracker,
                 release_claimed_execution(
                     store,
                     self.sandbox_id,
@@ -1273,7 +1274,8 @@ impl Drop for CancelGuard {
             pod_name = %pod_name,
         );
 
-        self.task_tracker.spawn(
+        crate::task_scope::spawn_in(
+            &self.task_tracker,
             async move {
                 let Some(store) = store else {
                     return;

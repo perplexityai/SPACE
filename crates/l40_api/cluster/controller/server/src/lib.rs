@@ -231,7 +231,7 @@ pub async fn run(
     )
     .await;
 
-    // Release only after all reconciler work has been confirmed stopped.
+    // Release only after the reconciler loops and their background tasks stop.
     // If shutdown cannot confirm this, or a reconciler panicked, let the Lease
     // expire rather than making it immediately available.
     if let Some(leadership) = leadership {

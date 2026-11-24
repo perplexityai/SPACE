@@ -200,7 +200,7 @@ impl Drop for RedriveClaimGuard {
             "re-drive dropped mid-flight; retiring creating claim in background"
         );
         let span = tracing::info_span!(parent: &self.span, "substrate.wake.redrive_cleanup", sandbox_id = %sandbox_id, generation);
-        tokio::spawn(
+        crate::task_scope::spawn(
             async move {
                 let retired = match store
                     .abandon_unmaterialized_create_claim_by_generation(

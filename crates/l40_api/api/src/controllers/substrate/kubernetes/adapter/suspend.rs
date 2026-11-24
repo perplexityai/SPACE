@@ -12,8 +12,7 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, SubstrateError>> + Send + 'static,
 {
-    task_tracker
-        .spawn(continuation.in_current_span())
+    crate::task_scope::spawn_in(task_tracker, continuation.in_current_span())
         .await
         .map_err(|error| SubstrateError::Failed {
             message: format!("sandbox suspend task stopped unexpectedly: {error}"),

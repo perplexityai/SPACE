@@ -110,7 +110,7 @@ impl LiveReservation {
         let sandbox = self.sandbox;
         let owner = self.owner.clone();
         let timing = self.timing;
-        let previous = self.renewer.replace(tokio::spawn(async move {
+        let previous = self.renewer.replace(crate::task_scope::spawn(async move {
             let mut ticks = tokio::time::interval(renew_interval(timing));
             ticks.tick().await;
             loop {
@@ -215,7 +215,7 @@ impl Drop for LiveReservation {
         let client = self.client.clone();
         let sandbox = self.sandbox;
         let owner = std::mem::take(&mut self.owner);
-        runtime.spawn(async move {
+        runtime.spawn(crate::task_scope::track(async move {
             let member = Member {
                 client: &client,
                 sandbox,
@@ -228,7 +228,7 @@ impl Drop for LiveReservation {
                     "live-cap pending member release failed; it lapses after its TTL"
                 );
             }
-        });
+        }));
     }
 }
 

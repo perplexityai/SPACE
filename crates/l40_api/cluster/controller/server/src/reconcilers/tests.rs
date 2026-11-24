@@ -117,6 +117,35 @@ async fn reconciler_and_its_child_stop_before_release_after_the_drain_deadline()
     ));
 }
 
+#[tokio::test(start_paused = true)]
+async fn shutdown_cannot_release_while_cleanup_spawned_by_abort_is_pending() {
+    struct SpawnCleanupOnDrop(Option<oneshot::Receiver<()>>);
+
+    impl Drop for SpawnCleanupOnDrop {
+        fn drop(&mut self) {
+            let done = self.0.take().unwrap();
+            // Match a background API cleanup started as the reconciler is aborted.
+            tokio::spawn(pplx_space_api::task_scope::track(async move {
+                let _ = done.await;
+            }));
+        }
+    }
+
+    let mut tasks = ReconcilerTasks::default();
+    let (finish_cleanup, cleanup) = oneshot::channel();
+    let (started, ready) = oneshot::channel();
+    tasks.spawn(async move {
+        let _cleanup = SpawnCleanupOnDrop(Some(cleanup));
+        started.send(()).unwrap();
+        pending::<()>().await;
+    });
+    ready.await.unwrap();
+
+    assert_eq!(tasks.stop().await, ShutdownOutcome::StopUnconfirmed);
+    let _ = finish_cleanup.send(());
+    tasks.join().await;
+}
+
 #[test]
 fn terminator_kind_accepts_canonical_names_and_defaults_to_aws() {
     assert_eq!(TerminatorKind::parse(None).unwrap(), TerminatorKind::Aws);

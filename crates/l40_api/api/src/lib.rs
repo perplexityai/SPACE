@@ -50,6 +50,7 @@ pub(crate) mod redis_otel;
 pub mod retry_deferral;
 pub mod routes;
 mod run;
+pub mod task_scope;
 pub mod template_build_jobs_store;
 mod template_inventory_store;
 mod template_releases_store;

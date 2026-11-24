@@ -497,7 +497,7 @@ impl KubernetesSubstrate {
                         Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
                     let pod_name = claim.pod_name.clone();
                     let sandbox_id_bg = sandbox_id;
-                    tokio::spawn(async move {
+                    crate::task_scope::spawn(async move {
                         if let Err(err) = pods
                             .patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch))
                             .await

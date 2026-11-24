@@ -92,6 +92,7 @@ use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::{NodeApiTarget, Substrate, SubstrateError};
 use pplx_space_api::egress_profiles::EgressProfiles;
+use pplx_space_api::task_scope;
 use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
@@ -154,7 +155,7 @@ pub enum ReconcilerRuntimeError {
     RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
 }
 
-/// Whether all reconciler work was confirmed stopped on shutdown.
+/// Whether the reconciler loops and tracked background work stopped on shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownOutcome {
     /// Every task drained or was aborted and joined. The Lease can be released.
@@ -1038,10 +1039,6 @@ pub async fn run_reconcilers(
     }
 }
 
-tokio::task_local! {
-    static RECONCILER_CHILDREN: TaskTracker;
-}
-
 /// Spawn a child that can drive reconciliation. Its local JoinSet owns
 /// cancellation; the tracker confirms its future was dropped even if that set
 /// is dropped without joining (for example when aborting its parent).
@@ -1050,12 +1047,7 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    match RECONCILER_CHILDREN.try_with(Clone::clone) {
-        Ok(tracker) => {
-            set.spawn(tracker.track_future(RECONCILER_CHILDREN.scope(tracker.clone(), future)))
-        }
-        Err(_) => set.spawn(future),
-    }
+    set.spawn(task_scope::track(future))
 }
 
 #[derive(Default)]
@@ -1067,13 +1059,13 @@ struct ReconcilerTasks {
 impl ReconcilerTasks {
     fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
         self.loops
-            .spawn(RECONCILER_CHILDREN.scope(self.children.clone(), future));
+            .spawn(task_scope::scope(self.children.clone(), future));
     }
 
     async fn join(&mut self) {
         while self.loops.join_next().await.is_some() {}
-        // With all parent loops joined, there can be no new children except
-        // from an existing child that is itself still tracked.
+        // This includes API background work started when dropping a parent
+        // future. Once all parents join, only tracked children can add work.
         self.children.close();
         self.children.wait().await;
     }

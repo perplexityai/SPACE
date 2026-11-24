@@ -114,7 +114,7 @@ const WRITE_ROUND_TRIPS: u64 = 3;
 /// Those cases hold for every lease handoff. The backstop can fire inside a
 /// clean shutdown drain too, when shutdown lands late in a write on a
 /// connection that stopped answering, and a lease left to expire or *lost* to
-/// a missed renewal (a standby may acquire `RENEW_DEADLINE_MARGIN`, 12 s,
+/// a missed renewal (a standby may acquire `RENEW_DEADLINE_MARGIN`, 13 s,
 /// after this process stops acting) can change hands inside the window as
 /// well. So on a slow connection an old write can still commit after the new
 /// leader's first tick. That is an exception to the leader-election module's

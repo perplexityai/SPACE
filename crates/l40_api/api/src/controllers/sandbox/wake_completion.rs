@@ -212,13 +212,13 @@ impl Drop for WakeCompletionGuard {
             sandbox_id = %self.sandbox_id,
             action = %self.action,
         );
-        runtime.spawn(tracing::Instrument::instrument(
+        runtime.spawn(crate::task_scope::track(tracing::Instrument::instrument(
             async move {
                 let _slot = permit;
                 completion.await;
             },
             span,
-        ));
+        )));
     }
 }
 

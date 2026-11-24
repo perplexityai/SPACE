@@ -1931,7 +1931,8 @@ impl KubernetesSubstrate {
         let sandbox_id = prepared.sandbox.id;
         let leader_span = tracing::info_span!("substrate.wake.leader", sandbox_id = %sandbox_id);
         let wake_trace = crate::wake_trace::current();
-        let leader = self.task_tracker.spawn(
+        let leader = crate::task_scope::spawn_in(
+            &self.task_tracker,
             crate::wake_trace::scope(wake_trace, async move {
                 // Boxed: `drive_prepared_wake` is the largest future on this
                 // path, so only a pointer to it moves with the task.

@@ -394,15 +394,12 @@ fn derive_timings_preserves_ordering_and_margin() {
     assert!(t.renew_interval < t.renew_deadline, "{t:?}");
     assert!(t.renew_deadline < t.lease_ttl, "{t:?}");
     // The safety invariant: the margin between "stop acting" and "lease
-    // expires" must cover the reconciler drain window.
-    // Absolute, not `lease_ttl - renew_deadline > SHUTDOWN_DRAIN_TIMEOUT`: that
-    // form reduces to `RENEW_DEADLINE_MARGIN - DRAIN > 0`, i.e. `2 > 0`, and so
-    // passes for any margin of the form `DRAIN + k`. Verified — shrinking the
-    // buffer to 1s kept the whole suite green.
+    // expires" must cover the drain and abort windows, plus the two-second
+    // scheduling and clock buffer.
     assert_eq!(
         t.lease_ttl - t.renew_deadline,
-        Duration::from_secs(12),
-        "the holder must stop acting a full 12s before the lease can expire: {t:?}"
+        Duration::from_secs(13),
+        "the holder must stop acting a full 13s before the lease can expire: {t:?}"
     );
     // The renewal cadence has to leave at least two attempts *strictly* inside
     // the deadline. With `deadline / 3` the third attempt ties with the deadline
@@ -1408,7 +1405,7 @@ fn derive_timings_floors_an_operator_supplied_liveness_budget() {
     );
 
     // The floor uses the *resolved* TTL: a sub-floor TTL is raised to
-    // MIN_LEASE_TTL first, so the budget floor is 4x18s rather than 4x1s.
+    // MIN_LEASE_TTL first, so the budget floor is 4x19s rather than 4x1s.
     let tiny_ttl = Timings::derive(
         Duration::from_secs(1),
         retry,
@@ -1529,7 +1526,7 @@ fn derive_timings_bounds_the_cadence_floor_for_an_absurd_retry_interval() {
     // A 1e9s retry interval clamps to 10s at this TTL — the room left after the
     // renewal cadence, the readiness write and a strictness margin — so the
     // cadence floor is 300s rather than the years the raw value would demand.
-    let ttl = Duration::from_secs(30);
+    let ttl = Duration::from_secs(31);
     let derived = Timings::derive(
         ttl,
         Duration::from_secs(1_000_000_000),
@@ -1727,11 +1724,11 @@ fn the_budget_is_spread_across_replica_identities() {
 fn derive_timings_floors_the_budget_against_the_retry_cadence() {
     use super::{MIN_GRACE_RETRY_INTERVALS, Timings};
 
-    // At a 30s TTL the deadline is 18s and the renewal cadence 6s, so the retry
+    // At a 31s TTL the deadline is 18s and the renewal cadence 6s, so the retry
     // ceiling is 10s — the room left for one renewal attempt strictly inside the
     // deadline once the readiness write is accounted for, tighter than both the
     // TTL and MAX_RETRY_INTERVAL.
-    let ttl = Duration::from_secs(30);
+    let ttl = Duration::from_secs(31);
     let floored = Timings::derive(
         ttl,
         Duration::from_secs(600),
@@ -1752,7 +1749,7 @@ fn derive_timings_floors_the_budget_against_the_retry_cadence() {
     );
 
     // 100s at that cadence is 10 samples, so the cadence floor raises it to 300s
-    // — above the 120s the TTL floor would have asked for.
+    // — above the 124s the TTL floor would have asked for.
     let too_few = Timings::derive(
         ttl,
         Duration::from_secs(600),
@@ -1790,14 +1787,14 @@ fn derive_timings_floors_the_budget_against_the_retry_cadence() {
 /// crash-loop with no reconciler running that the liveness budget never sees,
 /// because every call *succeeded*.
 ///
-/// The TTL cap alone accepts it: at a 30s TTL, a 25s retry interval
+/// The TTL cap alone accepts it: at a 31s TTL, a 25s retry interval
 /// sits under both the TTL and `MAX_RETRY_INTERVAL`. Worse, the operator text
 /// used to suggest raising this very knob when acquisitions time out.
 #[test]
 fn derive_timings_leaves_room_for_a_renewal_inside_the_deadline() {
     use super::Timings;
 
-    for ttl_secs in [18u64, 20, 30, 41, 60, 120, 300] {
+    for ttl_secs in [19u64, 20, 31, 41, 60, 120, 300] {
         let t = Timings::derive(
             Duration::from_secs(ttl_secs),
             Duration::from_secs(ttl_secs),
@@ -1806,7 +1803,7 @@ fn derive_timings_leaves_room_for_a_renewal_inside_the_deadline() {
         );
         // Strict, and inclusive of the readiness write that sits between the
         // acquire returning and the renewal loop's first tick. Non-strict was
-        // reachable at ttl 18 (4 + 2 == 6 == deadline), where a tie makes
+        // reachable at ttl 19 (4 + 2 == 6 == deadline), where a tie makes
         // `renew_loop`'s `select!` a coin flip on resigning with no renewal
         // attempted at all.
         // Note this reduces to `1s > 0` whenever the deadline-room term is the
@@ -1827,7 +1824,7 @@ fn derive_timings_leaves_room_for_a_renewal_inside_the_deadline() {
 
     // The specific configuration that used to be accepted.
     let t = Timings::derive(
-        Duration::from_secs(30),
+        Duration::from_secs(31),
         Duration::from_secs(25),
         PositiveDuration::new(Duration::from_secs(600)),
         "me",
