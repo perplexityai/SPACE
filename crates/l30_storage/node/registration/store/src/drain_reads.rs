@@ -1,6 +1,7 @@
 //! Unguarded reads of `nodes` drain columns: one node's drain columns, the
-//! per-phase work lists and counts, the terminate re-read, and the draining
-//! rows behind a Kubernetes node name.
+//! per-phase work lists and counts, the terminate re-read, the draining rows
+//! behind a Kubernetes node name, and the read before a terminating node's
+//! delete.
 //! The drain-phase compare-and-sets stay with their callers;
 //! [`crate::drain_write`] holds the writes that check only the node id.
 
@@ -147,5 +148,34 @@ pub async fn draining_nodes_for_k8s_node_name(
     ))
     .bind(k8s_node_name)
     .fetch_all(executor)
+    .await
+}
+
+/// A Kubernetes node in `drain_phase = 'terminating'`: its role, undecoded,
+/// and its Kubernetes node name when it has a registration.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct TerminatingK8sNode {
+    pub role: String,
+    pub k8s_node_name: Option<String>,
+}
+
+/// [`TerminatingK8sNode`] of `node_id`; `None` when the `nodes` row is gone,
+/// isn't Kubernetes-managed, or isn't `terminating`. A read only: the delete
+/// that follows re-checks the phase itself.
+pub async fn terminating_k8s_node(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+) -> Result<Option<TerminatingK8sNode>, sqlx::Error> {
+    sqlx::query_as::<_, TerminatingK8sNode>(sql!(
+        "SELECT n.role, nk.k8s_node_name
+         FROM nodes n
+         LEFT JOIN node_k8s nk ON nk.node_id = n.id
+         WHERE n.id = $1
+           AND n.drain_phase = 'terminating'
+           AND n.managed_by = $2"
+    ))
+    .bind(node_id)
+    .bind(SubstrateKind::Kubernetes)
+    .fetch_optional(executor)
     .await
 }

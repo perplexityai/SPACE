@@ -100,6 +100,8 @@
 //!   `pplx-space-sandbox-quarantine-store`, and [`debug_reads::record`] joins
 //!   `nodes` and `node_k8s`, which belong to
 //!   `pplx-space-node-registration-store`.
+//!   [`org_storage`] joins the owning organization's row in `organizations`,
+//!   which no store owns yet, for its configured snapshot storage.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
 //!   crate declares, mostly inside a larger transaction, move into modules
@@ -179,6 +181,7 @@ pub mod node_holds;
 pub mod node_local_backup_pending;
 pub mod node_placements;
 pub mod observed_states;
+pub mod org_storage;
 pub mod orphan;
 pub mod pod_tracking;
 pub mod port_exposures;

@@ -52,6 +52,7 @@ pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-semver = { workspace = true, features = ["sqlx"] }
 pplx-space-snapshot-model = { workspace = true, features = ["sqlx"] }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

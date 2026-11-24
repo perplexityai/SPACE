@@ -100,11 +100,12 @@ the table, and `list` projects the snapshot's age from the database clock.
 is the raw id page retention's discovery reads before it checks eligibility.
 
 Some narrower operations live in modules named for their question: `attempt`
-(one attempt's stored state), `disk_artifact` (the disk artifacts a fork reads
-and copies), `environment` (the environment a snapshot was produced under),
-`listing` (every row of a sandbox, unparsed, for debug views),
-`storage_location` (one live location's connection string) and `upload`
-(uploads still in flight).
+(one attempt's stored state), `checkpoint` (the execution a restore's
+checkpoint was produced under), `disk_artifact` (the disk artifacts a fork
+reads and copies), `environment` (the environment a snapshot was produced
+under), `listing` (every row of a sandbox, unparsed, for debug views),
+`public` (the snapshots the public API advertises), `storage_location` (one
+live location's connection string) and `upload` (uploads still in flight).
 
 Add further typed CRUD incrementally with each migrated caller. Add claim/prune
 with its live retention workflow, after the workflow has a complete protection
