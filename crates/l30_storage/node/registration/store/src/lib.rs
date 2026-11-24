@@ -11,7 +11,8 @@
 //! id, [`tombstone`] records terminated nodes, [`inventory`] lists the
 //! Kubernetes nodes, and [`node_group`] mirrors their node-group labels.
 //! [`direct`] reads the admin node row, which joins the node's Direct
-//! registration.
+//! registration. [`stale_reconcile_work`] finds the Kubernetes nodes the
+//! reconcile queue GC may treat as gone.
 //!
 //! Every verb runs on the caller's executor, so it composes into the
 //! caller's transaction; [`direct::lock_admin_node`] takes that transaction,
@@ -31,6 +32,7 @@ pub mod inventory;
 pub mod lookup;
 pub mod node_group;
 mod register;
+pub mod stale_reconcile_work;
 pub mod tombstone;
 pub use register::{
     K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, register_k8s_node,

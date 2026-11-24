@@ -14,7 +14,9 @@ use time::OffsetDateTime;
 mod depth;
 mod lag;
 pub mod metrics;
+pub mod queue_gc;
 mod reconcile_refs;
+pub mod ref_claims;
 pub mod signal;
 pub use depth::{
     ReconcileQueueDepth, ReconcileQueueStaleClaims, TriggerQueueDepth, reconcile_queue_depth,

@@ -380,6 +380,7 @@ pplx-space-cluster-pool = [
 ]
 pplx-space-cluster-trigger-queue = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-cluster-reconciler",
   "pplx-space-internal-api-server",
 ]
