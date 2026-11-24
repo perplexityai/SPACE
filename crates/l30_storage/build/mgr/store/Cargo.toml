@@ -20,3 +20,6 @@ thiserror = { workspace = true }
 # internal
 pplx-space-job-id = { workspace = true, features = ["rusqlite"] }
 pplx-space-sql-locator = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true, features = ["macros", "migrate"] }
