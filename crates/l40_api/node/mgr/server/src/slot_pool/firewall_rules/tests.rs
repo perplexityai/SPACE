@@ -41,7 +41,7 @@ pub(crate) fn document(generation: u64) -> String {
 }
 
 /// A store with the `accepted` generation, if any.
-fn store(accepted: Option<u64>) -> (TempDir, Arc<FirewallAssignments>) {
+pub(crate) fn store(accepted: Option<u64>) -> (TempDir, Arc<FirewallAssignments>) {
     let dir = tempfile::tempdir().unwrap();
     let store = FirewallAssignments::open(&dir.path().join("assignment.json")).unwrap();
     if let Some(generation) = accepted {
@@ -50,7 +50,7 @@ fn store(accepted: Option<u64>) -> (TempDir, Arc<FirewallAssignments>) {
     (dir, Arc::new(store))
 }
 
-fn accept(store: &FirewallAssignments, generation: u64) {
+pub(crate) fn accept(store: &FirewallAssignments, generation: u64) {
     let document = document(generation);
     let incoming = IncomingAssignment {
         node_id: NODE,
@@ -72,7 +72,7 @@ pub(crate) fn installed(generation: u64) -> Vec<Value> {
 }
 
 /// A pool whose reset wakeups are countable.
-fn pool(slots: u32) -> (Arc<NetworkPool>, mpsc::Receiver<()>) {
+pub(crate) fn pool(slots: u32) -> (Arc<NetworkPool>, mpsc::Receiver<()>) {
     let mut pool = NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(slots));
     let (sender, wakeups) = mpsc::channel(8);
     Arc::get_mut(&mut pool).unwrap().job_tx = sender;
@@ -145,6 +145,8 @@ pub(crate) struct FakeHost {
     pub(crate) looked_up: Hook,
     /// Fired once, after the next install commits.
     pub(crate) installed: Hook,
+    /// Fired once, after an observation's last read.
+    pub(crate) observed: Hook,
 }
 
 impl FakeHost {
@@ -157,6 +159,7 @@ impl FakeHost {
             calls: Mutex::default(),
             looked_up: Mutex::default(),
             installed: Mutex::default(),
+            observed: Mutex::default(),
         })
     }
 
@@ -222,6 +225,15 @@ impl FakeHost {
     }
 }
 
+/// nft as `host` fakes it, timing out where the fake does.
+pub(crate) fn fake_nft(host: &Arc<FakeHost>) -> Arc<Nft<'static>> {
+    let fake = host.clone();
+    Arc::new(move |netns: &File, args: &[&str], stdin: &[u8], _| {
+        fake.reply(netns, args, stdin)
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    })
+}
+
 /// What a submitted batch adds after the add and delete that make the
 /// replacement valid.
 fn added(batch: &[u8]) -> Vec<Value> {
@@ -245,6 +257,14 @@ impl SlotHost for FakeHost {
 
     fn looked_up(&self) {
         fire(&self.looked_up);
+    }
+
+    fn namespace_dir(&self) -> Option<&Path> {
+        Some(self.links.path())
+    }
+
+    fn observed(&self) {
+        fire(&self.observed);
     }
 }
 
@@ -272,12 +292,7 @@ async fn apply_expecting(
         slot_id,
         expected,
     };
-    let fake = host.clone();
-    let nft = move |netns: &File, args: &[&str], stdin: &[u8], _| {
-        fake.reply(netns, args, stdin)
-            .ok_or_else(|| io::ErrorKind::TimedOut.into())
-    };
-    bounded(pool.apply_firewall_rules_with(store, request, host.clone(), Arc::new(nft)))
+    bounded(pool.apply_firewall_rules_with(store, request, host.clone(), fake_nft(host)))
         .await
         .unwrap()
 }

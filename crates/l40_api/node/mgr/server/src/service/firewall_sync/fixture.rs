@@ -55,6 +55,7 @@ use crate::slot_pool::{
     NetworkPool, NotRun, NotRunnable, SlotFirewallReport, SlotFirewallRequest, SlotTarget, Stale,
 };
 
+mod rounds;
 #[cfg(test)]
 mod tests;
 
@@ -117,6 +118,10 @@ pub(crate) struct FirewallSync {
     wanted: watch::Sender<Option<Wanted>>,
     /// Cancelled once the worker ends, which ends the binding.
     ended: CancellationToken,
+    /// Recent verification rounds, for replay.
+    rounds: std::sync::Mutex<rounds::Rounds>,
+    /// Held by each round's sweep, so sweeps read one at a time.
+    sweeps: tokio::sync::Mutex<()>,
 }
 
 /// The latest generation armed, and how far its pass got.
@@ -182,6 +187,8 @@ impl NodeManagerService {
             assignments,
             wanted: watch::Sender::new(None),
             ended: CancellationToken::new(),
+            rounds: std::sync::Mutex::default(),
+            sweeps: tokio::sync::Mutex::new(()),
         });
         self.device_op_tasks
             .spawn(sync.clone().work(self.pool.clone()));

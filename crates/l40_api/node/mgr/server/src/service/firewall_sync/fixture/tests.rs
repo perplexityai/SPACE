@@ -3,7 +3,6 @@
 //! the bound slot, so an apply there would show. `linux` repeats one delivery
 //! against nftables.
 
-use std::fs::File;
 use std::io;
 
 use pplx_space_host_layout::identities::users;
@@ -18,8 +17,8 @@ use crate::firewall::rules::install::InstallOutcome;
 use crate::proto::FirewallRulesAssignment;
 use crate::service::tests::service_tests::service_for_unit_tests;
 use crate::slot_pool::firewall_rules::tests::{
-    BOUND, FakeHost, Fault, Hook, NODE, bounded, busy, document, heal, hook, installed, poison,
-    set_slot,
+    BOUND, FakeHost, Fault, Hook, NODE, bounded, busy, document, fake_nft, heal, hook, installed,
+    poison, set_slot,
 };
 use crate::slot_pool::{
     NamespaceIdentity, NetworkPoolConfig, NotRunnable, SlotFirewallAttempt, SlotHealth, SlotState,
@@ -27,6 +26,7 @@ use crate::slot_pool::{
 };
 
 mod linux;
+mod observe;
 
 const SLOT: u32 = 1;
 /// Within `BOUND`, so a reply always comes before the test gives up.
@@ -85,18 +85,14 @@ async fn bind_slots(
         namespaces.push(host.name(slot, kind));
         set_slot(&service.pool, slot, *state, 1);
     }
-    let fake = host.clone();
-    let nft = move |netns: &File, args: &[&str], stdin: &[u8], _| {
-        fake.reply(netns, args, stdin)
-            .ok_or_else(|| io::ErrorKind::TimedOut.into())
-    };
+    let nft = fake_nft(&host);
     let service = service
         .with_firewall_sync(FirewallSyncFixture {
             node_id: NODE,
             slots,
             assignment_path: path.clone(),
             host: host.clone(),
-            nft: Arc::new(nft),
+            nft,
             wait,
         })
         .unwrap();
