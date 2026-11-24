@@ -133,7 +133,10 @@ move must keep.
     and nothing changes.
 
   The caller keeps its transaction, its locks, and the decision of what to do
-  with each outcome. Two kinds stay with the paths that issue them: the
+  with each outcome. A guarded statement that writes two owners' tables
+  splits into one such verb per store, which a coordinator runs, in the
+  caller's open transaction when the statement was one step of it (see
+  Coordinators). Two kinds stay with the paths that issue them: the
   execution-ownership writes of `sandbox_k8s_executions`, as
   `pplx-space-sandbox-store`'s `k8s_executions` docs say, and node drain's
   phase compare-and-sets, as `pplx-space-node-registration-store`'s docs say.
@@ -197,6 +200,49 @@ When a store change adds a workspace crate or dependency edge, run a lib-only
 unification and can mask a missing cargo feature on the crate itself. Release
 artifact digests read the crate graph from the workspace manifests, so no
 input list needs updating.
+
+### Coordinators
+
+A coordinator (`crates/l30_storage/<area>/coordinator`,
+`pplx-space-<area>-coordinator`) runs one transaction across two or more
+stores: it calls each store's verb for that store's own rows and keeps which
+rows change together and in what order they are locked. When the split
+statement is one step of a transaction a service already owns, such as
+internal-api's node-state publish, the coordinator's verb takes that open
+transaction, and its docs say which locks the caller must already hold;
+otherwise the coordinator opens and commits the transaction itself. The
+caller decides what to write and when, passes that in, and gets each guarded
+verb's outcome back to act on. Make one only when one of
+these holds:
+
+- a statement writes two owners' tables (today through a co-writer grant),
+  including a guarded transition that spans stores: split it into one verb
+  per store and run them from the coordinator. Each verb that keeps a guard
+  takes the guarded-transition form above, its guard whole and bound to the
+  caller's values, named for the transition, its outcome returned and its
+  losing case pinned by a store test. The split takes the guard or row lock
+  the old statement relied on first. The steps that follow it may return
+  nothing, as that item allows, and run only if the guard matched. A
+  Postgres-backed test shows the split keeps the old statement's
+  all-or-nothing result, losing case included;
+- two or more services run the same multi-store transaction;
+- a cross-store invariant or lock order needs enforcing in one place.
+
+A statement in one store that writes only another store's table needs no
+coordinator: it moves into the owning store as a verb, which the first store
+calls as one of its users.
+
+Otherwise the service opens its own transaction and calls the stores.
+
+Each coordinator documents its lock order in its crate docs: which rows it
+locks, in which order, and why. It owns no tables and has no normal or build
+dependency on a driver, storage helper or codec facade, which archcheck's
+`layers` rule enforces, as it does the `[rules.layers.coordinator_users]`
+list in `ARCHITECTURE.toml`. It holds no SQL either; archcheck reports only a
+write statement in it that names a table a store owns
+(`layers.state.writes`) and checks no other SQL. No long
+external I/O (network calls, object storage, waits on another service) runs
+while its transaction is open. archcheck does not check for it.
 
 ## PostgreSQL migrations
 
