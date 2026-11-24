@@ -14,7 +14,6 @@
 "crates/l40_api/api/src/controllers/sandbox/spaced.rs" = 1
 "crates/l40_api/api/src/public_template_operations.rs" = 1
 "crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 7
-"crates/l40_api/api/src/routes/admin/node_store.rs" = 1
 "crates/l40_api/api/src/routes/admin/templates.rs" = 1
 "crates/l40_api/api/src/routes/public/sandboxes.rs" = 1
 "crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 2

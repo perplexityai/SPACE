@@ -14,6 +14,7 @@ use pplx_space_admin_protocol::{
     GetAdminNodeFilters, ListAdminNodesFilters,
 };
 use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase, NodeManagedBy};
+use pplx_space_node_registration_store::direct;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
@@ -437,7 +438,7 @@ fn admin_node_status(row: &AdminNodeRow) -> Option<AdminNodeStatusSnapshot> {
             .as_ref()
             .zip(row.execution_inventory_received_at)
             .map(|(status, received_at)| {
-                let (policy, policy_received_at) = match row.execution_policy() {
+                let (policy, policy_received_at) = match node_store::execution_policy(row) {
                     Some((policy, received_at)) => (Some(policy), received_at.map(format_time)),
                     None => (None, None),
                 };
@@ -1643,7 +1644,7 @@ async fn apply_drain_action(
         Err(err) => return db_error(err).into_response(),
     };
 
-    let current = match node_store::lock_node_for_update(&mut tx, node_id).await {
+    let current: AdminNodeRow = match direct::lock_admin_node(&mut tx, node_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node not found").into_response();

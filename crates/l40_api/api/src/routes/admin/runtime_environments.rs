@@ -55,7 +55,7 @@ use time::OffsetDateTime;
 use pplx_space_runtime_upgrade_campaign_store::{self as campaign_store, CampaignId, CampaignKind};
 
 use super::audit::{self, AdminRuntimeEnvironmentAuditEntry};
-use super::node_store::{AdminNodeRow, AdminNodeStore};
+use super::node_store::{self, AdminNodeRow, AdminNodeStore};
 use super::runtime_environment_store as store;
 use super::runtime_upgrade_campaigns::campaign_read_error;
 use super::support::{
@@ -1085,7 +1085,7 @@ fn node_status(
     row: AdminNodeRow,
     now: OffsetDateTime,
 ) -> NodeRuntimePolicyStatus {
-    let enforced = row.execution_policy();
+    let enforced = node_store::execution_policy(&row);
     let applied_generation = enforced
         .as_ref()
         .and_then(|(policy, _)| policy.applied_generation());

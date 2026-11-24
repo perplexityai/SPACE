@@ -13,9 +13,8 @@ use pplx_space_admin_protocol::{
     AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters,
 };
 use pplx_space_node_execution_inventory_store::InstallationGuestRow;
-use pplx_space_node_model::{
-    NodeAddress, NodeDrain, NodeDrainMode, NodeDrainPhase, NodeGroupId, NodeManagedBy, NodeRole,
-};
+use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase};
+use pplx_space_node_registration_store::direct;
 use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
 use pplx_space_node_registration_store::drain_write::{self, DrainColumnsUpdate};
 use pplx_space_sandbox_model::SandboxId;
@@ -36,80 +35,30 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use time::OffsetDateTime;
 
+/// The admin node row with api's node health types for its JSON columns.
+pub(super) type AdminNodeRow =
+    direct::AdminNodeRow<Vec<AdminNodeServiceHealth>, AdminNodeCtlStatus>;
+
 #[cfg(test)]
 mod fleet_occupancy;
 #[cfg(test)]
 mod single_node_occupancy;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct AdminNodeRow {
-    pub(super) id: NodeId,
-    pub(super) name: Option<String>,
-    pub(super) address: Option<NodeAddress>,
-    pub(super) node_api_endpoint: Option<String>,
-    pub(super) role: NodeRole,
-    pub(super) managed_by: NodeManagedBy,
-    pub(super) state: Option<String>,
-    pub(super) scheduling_status: Option<String>,
-    pub(super) scheduling_reason: Option<String>,
-    pub(super) status_stale_after: Option<OffsetDateTime>,
-    pub(super) status_reachable: Option<bool>,
-    pub(super) status_error: Option<String>,
-    pub(super) status_role: Option<String>,
-    pub(super) status_node_id_reported: Option<String>,
-    pub(super) network_slots_ready: Option<i32>,
-    pub(super) network_pool_min_ready: Option<i32>,
-    pub(super) network_slots_degraded: Option<i32>,
-    pub(super) network_slots_quarantined: Option<i32>,
-    pub(super) network_slots_total: Option<i32>,
-    pub(super) network_slots_leased: Option<i32>,
-    pub(super) network_pool_max_slots: Option<i32>,
-    pub(super) drain_phase: Option<String>,
-    /// Raw column value, not a decoded [`NodeDrainMode`]: a typed decode fails
-    /// the whole row on a value this build does not recognize, which would turn
-    /// one bad column into a 500 for the entire node listing. Callers resolve
-    /// it through `NodeDrainMode::from_column_str`.
-    pub(super) drain_mode: Option<String>,
-    pub(super) drain_started_at: Option<OffsetDateTime>,
-    pub(super) drain_last_error: Option<String>,
-    pub(super) terminate_decrement_capacity: bool,
-    pub(super) node_group_id: Option<NodeGroupId>,
-    pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
-    pub(super) last_heartbeat: Option<OffsetDateTime>,
-    pub(super) status_observed_at: Option<OffsetDateTime>,
-    // Decode diagnostics after reading the row: unknown policy schemas must
-    // not prevent node inspection or the lock used by administrative actions.
-    pub(super) execution_policy: Option<sqlx::types::Json<serde_json::Value>>,
-    pub(super) execution_policy_received_at: Option<OffsetDateTime>,
-    pub(super) execution_inventory_status: Option<String>,
-    pub(super) execution_inventory_received_at: Option<OffsetDateTime>,
-    pub(super) status_health_healthy: Option<bool>,
-    pub(super) status_services: Option<sqlx::types::Json<Vec<AdminNodeServiceHealth>>>,
-    pub(super) status_node_ctl: Option<sqlx::types::Json<AdminNodeCtlStatus>>,
-    pub(super) created_at: OffsetDateTime,
-    pub(super) updated_at: Option<OffsetDateTime>,
-    pub(super) deleted_at: Option<OffsetDateTime>,
-    pub(super) substrate_node_id: Option<String>,
-}
-
-impl AdminNodeRow {
-    /// The node's published execution policy and its receipt time. `None`
-    /// when the node published none, or published one this build can't
-    /// decode: that withholds the policy evidence rather than failing the
-    /// node read.
-    pub(super) fn execution_policy(
-        &self,
-    ) -> Option<(
-        pplx_space_execution_spec::ExecutionPolicyObservation,
-        Option<OffsetDateTime>,
-    )> {
-        let value = self.execution_policy.as_ref()?;
-        match serde_json::from_value(value.0.clone()) {
-            Ok(policy) => Some((policy, self.execution_policy_received_at)),
-            Err(error) => {
-                tracing::warn!(node_id = %self.id, %error, "invalid stored execution policy; withholding policy evidence");
-                None
-            }
+/// The node's published execution policy and its receipt time. `None` when
+/// the node published none, or published one this build can't decode: that
+/// withholds the policy evidence rather than failing the node read.
+pub(super) fn execution_policy(
+    row: &AdminNodeRow,
+) -> Option<(
+    pplx_space_execution_spec::ExecutionPolicyObservation,
+    Option<OffsetDateTime>,
+)> {
+    let value = row.execution_policy.as_ref()?;
+    match serde_json::from_value(value.0.clone()) {
+        Ok(policy) => Some((policy, row.execution_policy_received_at)),
+        Err(error) => {
+            tracing::warn!(node_id = %row.id, %error, "invalid stored execution policy; withholding policy evidence");
+            None
         }
     }
 }
@@ -327,55 +276,10 @@ fn long_runner_age_secs(age: Duration) -> i64 {
         .expect("clamped to MAX_LONG_RUNNER_AGE, which fits in i64")
 }
 
-const ADMIN_NODE_SELECT: &str = "SELECT n.id,
-       nd.name,
-       host(n.address) AS address,
-       nd.node_api_endpoint,
-       n.role,
-       n.managed_by,
-       n.state,
-       nss.scheduling_status,
-       nss.scheduling_reason,
-       nss.stale_after AS status_stale_after,
-       nss.reachable AS status_reachable,
-       nss.error AS status_error,
-       nss.role AS status_role,
-       nss.node_id_reported AS status_node_id_reported,
-       nss.network_slots_ready,
-       nss.network_pool_min_ready,
-       nss.network_slots_degraded,
-       nss.network_slots_quarantined,
-       nss.network_slots_total,
-       nss.network_slots_leased,
-       nss.network_pool_max_slots,
-       n.drain_phase,
-       n.drain_mode,
-       n.drain_started_at,
-       n.drain_last_error,
-       n.terminate_decrement_capacity,
-       n.node_group_id,
-       nd.metadata,
-       n.last_heartbeat,
-       nss.observed_at AS status_observed_at,
-       nss.execution_policy,
-       nss.execution_policy_received_at,
-       nss.execution_inventory_status,
-       nss.execution_inventory_received_at,
-       nss.health_healthy AS status_health_healthy,
-       nss.services AS status_services,
-       nss.node_ctl AS status_node_ctl,
-       n.created_at,
-       nd.updated_at,
-       nd.deleted_at,
-       nk.k8s_node_name AS substrate_node_id
-FROM nodes n
-LEFT JOIN node_direct nd ON nd.node_id = n.id
-LEFT JOIN node_k8s nk ON nk.node_id = n.id
-LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id";
-
-/// Pool-bound repository for admin node queries. Operations that need their
-/// own transaction (locking + writing under `FOR UPDATE`) live as free
-/// functions below, since a `Transaction` cannot be held inside `&self`.
+/// Pool-bound repository for admin node queries. Operations that run in the
+/// caller's transaction (the writes made under [`direct::lock_admin_node`]'s
+/// row lock) live as free functions below, since a `Transaction` cannot be
+/// held inside `&self`.
 #[derive(Clone)]
 pub(super) struct AdminNodeStore {
     pool: PgPool,
@@ -405,46 +309,29 @@ impl AdminNodeStore {
         Ok(rows.into_iter().map(NodeSandboxRow::from).collect())
     }
 
+    /// The node's admin row: [`direct::admin_node`].
     pub(super) async fn fetch(&self, node_id: NodeId) -> Result<Option<AdminNodeRow>, sqlx::Error> {
-        sqlx::query_as::<_, AdminNodeRow>(sqlx::AssertSqlSafe(sql!(format!(
-            "{ADMIN_NODE_SELECT}\nWHERE n.id = $1"
-        ))))
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await
+        direct::admin_node(&self.pool, node_id).await
     }
 
+    /// The admin rows matching `filters`: [`direct::list_admin_nodes`].
     pub(super) async fn list(
         &self,
         filters: &ListAdminNodesFilters,
     ) -> Result<Vec<AdminNodeRow>, sqlx::Error> {
-        // Three filterable axes layered onto the base SELECT. We bind
-        // sentinels rather than concatenate to keep the prepared-statement
-        // cache useful.
-        let phase_param: Option<String> = match filters.drain_phase.as_deref() {
-            Some("none") => Some(String::new()),
-            Some(other) => Some(other.to_string()),
-            None => None,
+        // Three filterable axes, each bound as a nullable sentinel rather
+        // than concatenated, to keep the prepared-statement cache useful.
+        let phase_param: Option<&str> = match filters.drain_phase.as_deref() {
+            Some("none") => Some(""),
+            other => other,
         };
-        let query = format!(
-            "{ADMIN_NODE_SELECT}\n\
-             WHERE ($1::TEXT IS NULL OR n.role = $1)\n\
-               AND ($2::BOOL OR nd.deleted_at IS NULL)\n\
-               AND (\n\
-                 $3::TEXT IS NULL\n\
-                 OR ($3 = '' AND n.drain_phase IS NULL)\n\
-                 OR n.drain_phase = $3\n\
-               )\n\
-             ORDER BY n.role ASC,\n\
-                      COALESCE(nd.name, nk.k8s_node_name) ASC NULLS LAST,\n\
-                      nd.node_api_endpoint ASC NULLS LAST"
-        );
-        sqlx::query_as::<_, AdminNodeRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(filters.role.as_deref())
-            .bind(filters.include_deleted)
-            .bind(phase_param)
-            .fetch_all(&self.pool)
-            .await
+        direct::list_admin_nodes(
+            &self.pool,
+            filters.role.as_deref(),
+            filters.include_deleted,
+            phase_param,
+        )
+        .await
     }
 
     /// The runtime installations each of `node_ids` last reported, one row
@@ -840,20 +727,6 @@ impl AdminNodeStore {
             );
         }
     }
-}
-
-/// `SELECT ... FOR UPDATE OF n` — admin handlers lock the row for the duration
-/// of the validate + write window so two operators cannot race transitions.
-pub(super) async fn lock_node_for_update(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-) -> Result<Option<AdminNodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, AdminNodeRow>(sqlx::AssertSqlSafe(sql!(format!(
-        "{ADMIN_NODE_SELECT}\nWHERE n.id = $1\nFOR UPDATE OF n"
-    ))))
-    .bind(node_id)
-    .fetch_optional(&mut **tx)
-    .await
 }
 
 /// `$1` = node id. Suspended sandboxes whose `target_node_id` points at this
