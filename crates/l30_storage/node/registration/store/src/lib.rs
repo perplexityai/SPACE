@@ -12,8 +12,9 @@
 //! Kubernetes nodes, [`demotion`] demotes ready ones missing from the
 //! cluster, and [`node_group`] mirrors their node-group labels.
 //! [`direct`] reads the admin node row, which joins the node's Direct
-//! registration. [`stale_reconcile_work`] finds the Kubernetes nodes the
-//! reconcile queue GC may treat as gone.
+//! registration, and hard-deletes Direct nodes and their expired tombstones.
+//! [`stale_reconcile_work`] finds the Kubernetes nodes the reconcile queue GC
+//! may treat as gone.
 //!
 //! Every verb runs on the caller's executor, so it composes into the
 //! caller's transaction. The row locks in [`locks`] and

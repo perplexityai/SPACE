@@ -13,10 +13,10 @@
 "crates/l40_api/api/src/controllers/sandbox/responses.rs" = 4
 "crates/l40_api/api/src/controllers/sandbox/spaced.rs" = 1
 "crates/l40_api/api/src/public_template_operations.rs" = 1
-"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 7
+"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 6
 "crates/l40_api/api/src/routes/admin/templates.rs" = 1
 "crates/l40_api/api/src/routes/public/sandboxes.rs" = 1
-"crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 2
+"crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 1
 "crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
 "crates/l40_api/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
 "crates/l40_api/internal/api/server/src/lib.rs" = 1

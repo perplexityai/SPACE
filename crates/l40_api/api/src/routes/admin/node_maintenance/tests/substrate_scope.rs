@@ -5,6 +5,8 @@
 //! `managed_by` is `'k8s'`. Both keep a `node_direct` row, so only the
 //! `managed_by` predicates decide which one a registry statement acts on.
 
+use pplx_space_node_registration_store::direct::delete_direct_node;
+
 use super::*;
 
 async fn insert_registered_node(
@@ -174,8 +176,14 @@ async fn node_registry_writes_only_direct_nodes() -> TestResult {
         );
     }
 
-    assert_eq!(hard_delete_direct_node(pool, live_kubernetes).await?, 0);
+    assert_eq!(
+        delete_direct_node(pool, live_kubernetes, REGISTRY_SUBSTRATE).await?,
+        0
+    );
     assert_eq!(registration(pool, live_kubernetes).await?.0, "k8s");
-    assert_eq!(hard_delete_direct_node(pool, live_direct).await?, 1);
+    assert_eq!(
+        delete_direct_node(pool, live_direct, REGISTRY_SUBSTRATE).await?,
+        1
+    );
     Ok(())
 }
