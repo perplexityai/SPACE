@@ -136,9 +136,7 @@ move must keep.
   with each outcome. A guarded statement that writes two owners' tables
   splits into one such verb per store, which a coordinator runs, in the
   caller's open transaction when the statement was one step of it (see
-  Coordinators). Two kinds stay with the paths that issue them: the
-  execution-ownership writes of `sandbox_k8s_executions`, as
-  `pplx-space-sandbox-store`'s `k8s_executions` docs say, and node drain's
+  Coordinators). One kind stays with the path that issues it: node drain's
   phase compare-and-sets, as `pplx-space-node-registration-store`'s docs say.
   Other store docs that say a guarded write stays at its call site do not
   override this item; the change that moves the write updates them. The

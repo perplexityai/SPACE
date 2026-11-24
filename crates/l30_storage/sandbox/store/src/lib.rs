@@ -129,12 +129,14 @@
 //!   named for the table: [`port_exposures`], [`observed_states`],
 //!   [`snapshot_inventory`], [`node_local_backup_pending`],
 //!   [`ecw_credential_epochs`] and [`k8s_executions`]. [`k8s_executions`]
-//!   holds unlocked reads only: the table's writes, the generation
-//!   allocation and its `FOR UPDATE` reads stay with the execution-ownership
-//!   paths that issue them. A step that is part of a transition statement
-//!   stays in that transition's module. The other sibling-table modules
-//!   also hold the guarded writes confined to their table, each a statement
-//!   of its own with its guard whole, such as
+//!   holds the table's unlocked reads; its submodules, named for the
+//!   transition or the path that issues them, hold the execution-ownership
+//!   transitions and lock verbs, such as [`k8s_executions::activation_fence`],
+//!   and the callers keep their transactions, lock order and outcome
+//!   decisions (see the [`k8s_executions`] module docs). A step that is part
+//!   of a transition statement stays in that transition's module. The other
+//!   sibling-table modules also hold the guarded writes confined to their
+//!   table, each a statement of its own with its guard whole, such as
 //!   [`port_exposures::record_apply_states`],
 //!   [`port_exposures::mark_applied`] and [`port_exposures::mark_failed`],
 //!   and a step that more than one transition runs, such as
