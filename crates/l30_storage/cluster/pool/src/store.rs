@@ -1723,11 +1723,12 @@ impl WarmPoolStore {
     }
 
     /// Read the claimed slot's pod identity for the bind transaction. This is
-    /// a column read only: the bind's writes go to sandbox-owned tables and
-    /// live with the API substrate that owns them, keeping each domain's
-    /// tables written from one home. `None` means the claim vanished between
-    /// the claim transaction and the bind (reaped or invalidated), and the
-    /// caller must abort the bind. Runs after [`Self::bind_claimed_slot`],
+    /// a column read only: the bind's write to the sandbox's execution row is
+    /// `pplx-space-sandbox-store`'s
+    /// `k8s_executions::pool_claim::insert_first_generation`, keeping each
+    /// domain's tables written from one home. `None` means the claim vanished
+    /// between the claim transaction and the bind (reaped or invalidated), and
+    /// the caller must abort the bind. Runs after [`Self::bind_claimed_slot`],
     /// whose CAS already row-locks the slot; the `FOR UPDATE` here keeps the
     /// read self-sufficiently locked if callers ever reorder.
     pub async fn bind_source(
