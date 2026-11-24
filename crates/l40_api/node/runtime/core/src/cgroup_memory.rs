@@ -19,6 +19,23 @@ pub struct CgroupMemoryState {
     pub pressure: Option<CgroupMemoryPressure>,
 }
 
+impl CgroupMemoryState {
+    /// Anonymous plus kernel memory: what reclaim cannot drop without
+    /// swap, which sandbox cgroups do not have. `None` when the kernel
+    /// reports no `anon` or `kernel`.
+    pub fn unreclaimable_bytes(&self) -> Option<u64> {
+        self.stat.anon?.checked_add(self.stat.kernel?)
+    }
+
+    /// `memory.max` minus [`Self::unreclaimable_bytes`], saturating at zero:
+    /// what the cgroup can still fault in before it must reclaim file cache
+    /// and then OOM-kill. `None` when unlimited or when unreclaimable memory
+    /// is unknown.
+    pub fn headroom_bytes(&self) -> Option<u64> {
+        Some(self.max_bytes?.saturating_sub(self.unreclaimable_bytes()?))
+    }
+}
+
 /// Selected `memory.stat` keys, in bytes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CgroupMemoryStat {
@@ -164,6 +181,8 @@ mod tests {
 
         let state = read_cgroup_memory_state(dir.path()).unwrap();
 
+        assert_eq!(state.unreclaimable_bytes(), Some(3700));
+        assert_eq!(state.headroom_bytes(), Some(8_589_934_592 - 3700));
         assert_eq!(
             state,
             CgroupMemoryState {
@@ -211,6 +230,8 @@ mod tests {
         let state = read_cgroup_memory_state(dir.path()).unwrap();
 
         assert_eq!(state.max_bytes, None);
+        assert_eq!(state.headroom_bytes(), None);
+        assert_eq!(state.unreclaimable_bytes(), None);
         assert_eq!(state.stat.anon, Some(7));
         assert_eq!(state.stat.kernel, None);
         assert_eq!(state.events.oom_group_kill, 0);
