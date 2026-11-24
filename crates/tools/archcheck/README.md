@@ -486,9 +486,13 @@ Foundation crates and the stores that list it as a user,
   whose path below the layer ends in `coordinator` but whose name doesn't
   end in `-coordinator`, shown on its `name =` line, since archcheck would
   check it as a store (`layout`'s leaf rule accepts `<area>/coordinator`
-  for `pplx-space-<area>`, so only this check makes name and path agree);
-  and a coordinator's normal or build dependency on another coordinator,
-  shown on the manifest line that declares it: coordinators don't nest, so
+  for `pplx-space-<area>`, so only this check makes name and path agree); a
+  coordinator in a leaf directory below `<area>/coordinator`, such as
+  `<area>/coordinator/server`, shown on its `name =` line, since the same
+  leaf rule would accept it but a coordinator sits exactly at
+  `<area>/coordinator` (`layout` reports any other path); and a
+  coordinator's normal or build dependency on another coordinator, shown on
+  the manifest line that declares it: coordinators don't nest, so
   the outer one calls the stores' verbs itself, in the inner one's lock
   order, or the two merge.
 - `coordinator_edges`: an API crate depending on a coordinator whose

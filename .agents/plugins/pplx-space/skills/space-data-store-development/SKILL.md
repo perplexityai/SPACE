@@ -167,10 +167,11 @@ move must keep.
   still move as a store verb, under these conditions:
   - the statement moves verbatim, lock clause included (`OF …`, `NOWAIT`,
     `SKIP LOCKED`), along with any setting written in the same statement;
-  - the verb takes the caller's `&mut sqlx::Transaction<'_, Postgres>`, or
+  - the verb takes the caller's open transaction: `&mut Tx` from
+    `pplx-space-postgres-pool`, `&mut sqlx::Transaction<'_, Postgres>`, or
     `&mut sqlx::PgConnection` when every caller passes its open transaction
-    (`&mut *tx`). It never takes `impl PgExecutor`, which also accepts a
-    pool;
+    (`&mut *tx`). It never takes `impl PgExecutor` or postgres-pool's
+    `impl Executor`, which also accept a pool;
   - its name says it locks (`lock_…`, `share_lock_…`, `…_locked`), and its
     doc says the lock lasts until the caller's transaction ends, as
     `pplx-space-runtime-environment-policy-store`'s `lock_generation` and
@@ -210,8 +211,19 @@ rows change together and in what order they are locked. When the split
 statement is one step of a transaction a service already owns, such as
 internal-api's node-state publish, the coordinator's verb takes that open
 transaction, and its docs say which locks the caller must already hold;
-otherwise the coordinator opens and commits the transaction itself. The
-caller decides what to write and when, passes that in, and gets each guarded
+otherwise the coordinator opens and commits the transaction itself. It
+reaches Postgres through `pplx-space-postgres-pool` alone: it takes the
+caller's open transaction as `&mut pplx_space_postgres_pool::Tx`, or opens
+its own with `Db::begin` and ends it with `Tx::commit`. It passes the
+transaction to each store verb (`&mut tx` for one it opened, `&mut *tx` for
+one it was given), which takes `impl Executor<'_>`, except a verb whose lock
+the caller relies on after the statement: that one takes the open transaction
+(see "Locks the caller relies on after the statement" above). So neither the
+coordinator nor its callers name a driver type. While its caller still opens
+the transaction with the driver and passes `&mut *tx`, the verb takes any
+`&mut C` where `&mut C: Executor`, documents that the caller must pass an open
+transaction, and narrows to `Tx` once the caller moves. The caller decides what
+to write and when, passes that in, and gets each guarded
 verb's outcome back to act on. Make one only when one of
 these holds:
 
