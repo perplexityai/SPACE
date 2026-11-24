@@ -1,30 +1,15 @@
 //! Production [`RetireSink`] backed by Postgres.
 
-use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
-use pplx_space_snapshot_model::LocalArtifactId;
 
 use pplx_space_durations::PositiveDuration;
-use pplx_space_sandbox_portability::newest_suspend_snapshot_current;
 use pplx_space_sandbox_store::repair::unplace_suspended_after_execution_retired;
 use pplx_space_sandbox_store::row_locks;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
 use super::{RetireOutcome, RetireSink, StaleExecutionCandidate};
-
-/// Row shape of the candidate scan: `(sandbox_id, generation, pod_name,
-/// pod_uid, execution_state, active_node_id, current_local_artifact_id)`.
-type CandidateRow = (
-    SandboxId,
-    i64,
-    String,
-    Option<String>,
-    String,
-    Option<NodeId>,
-    Option<LocalArtifactId>,
-);
 
 pub struct ExecutionDbStore {
     pool: PgPool,
@@ -34,12 +19,6 @@ impl ExecutionDbStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-}
-
-/// `make_interval(secs => $n::BIGINT)` needs an i64 bind. Saturate rather
-/// than wrap: any value above i64::MAX means "never act" in human terms.
-fn min_age_secs_i64(min_age: PositiveDuration) -> i64 {
-    i64::try_from(min_age.get().as_secs()).unwrap_or(i64::MAX)
 }
 
 impl RetireSink for ExecutionDbStore {
@@ -59,53 +38,25 @@ impl RetireSink for ExecutionDbStore {
         upper_bound: SandboxId,
         min_age: PositiveDuration,
     ) -> Result<Vec<StaleExecutionCandidate>, sqlx::Error> {
-        let markerless_snapshot_current = newest_suspend_snapshot_current("s");
-        let query = format!(
-            "SELECT s.id, e.generation, e.pod_name, e.pod_uid, e.state, s.active_node_id,
-                    s.current_local_artifact_id
-               FROM sandboxes s
-               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
-              WHERE s.managed_by = $5
-                AND s.lifecycle = 'suspended'
-                AND s.lifecycle_changed_at <= NOW() - make_interval(secs => $1::BIGINT)
-                AND e.created_at <= NOW() - make_interval(secs => $1::BIGINT)
-                AND ({markerless_snapshot_current})
-                AND ($2::uuid IS NULL OR s.id > $2)
-                AND s.id <= $3
-              ORDER BY s.id
-              LIMIT $4"
-        );
-        let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(min_age_secs_i64(min_age))
-            .bind(after_sandbox_id)
-            .bind(upper_bound)
-            .bind(i64::from(batch_size))
-            .bind(SubstrateKind::Kubernetes)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = pplx_space_sandbox_store::stale_suspended_executions::list(
+            &self.pool,
+            batch_size,
+            after_sandbox_id,
+            upper_bound,
+            min_age,
+        )
+        .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(
-                    sandbox_id,
-                    generation,
-                    pod_name,
-                    pod_uid,
-                    execution_state,
-                    active_node_id,
-                    current_local_artifact_id,
-                )| {
-                    StaleExecutionCandidate {
-                        sandbox_id,
-                        generation,
-                        pod_name,
-                        pod_uid,
-                        execution_state,
-                        active_node_id,
-                        current_local_artifact_id,
-                    }
-                },
-            )
+            .map(|row| StaleExecutionCandidate {
+                sandbox_id: row.sandbox_id,
+                generation: row.generation,
+                pod_name: row.pod_name,
+                pod_uid: row.pod_uid,
+                execution_state: row.execution_state,
+                active_node_id: row.active_node_id,
+                current_local_artifact_id: row.current_local_artifact_id,
+            })
             .collect())
     }
 

@@ -60,7 +60,9 @@
 //!   by-id row locks that several paths share live in [`row_locks`]; a lock
 //!   that carries a guard, joins another table or serves one path lives in a
 //!   module named for that path (as [`fork_source_lifecycle`] is for its
-//!   advisory lock, [`snapshot_retention_claim`] for retention's claim and
+//!   advisory lock, [`snapshot_retention_claim`] for retention's claim,
+//!   [`snapshot_retention_finalize`] for its finalizer's row lock,
+//!   [`ready_suspend_projection`] for the published suspend projection, and
 //!   [`sweeper::lock_placement_changed_at`] for the sweeper's revert). The
 //!   caller keeps its transaction, its lock settings and errors, and the
 //!   re-checks it runs under the lock.
@@ -94,10 +96,10 @@
 //!   shows.
 //! * **So are single-question reads.** A read of the `sandboxes` row that
 //!   callers made inline moves here whole, as a module named for the question
-//!   it answers, such as [`restore_pod_owners`] or [`stopped_replacements`],
-//!   and so does one that joins the row to what it references, as
-//!   [`row_reads::owner`] (its organization) and [`debug_reads::record`]
-//!   (its nodes) do.
+//!   it answers, such as [`restore_pod_owners`], [`stale_suspended_executions`]
+//!   or [`stopped_replacements`], and so does one that joins the row to what
+//!   it references, as [`row_reads::owner`] (its organization) and
+//!   [`debug_reads::record`] (its nodes) do.
 //!   The two restore-lease reads the Direct restore takes before and after
 //!   its claim stay beside that claim in [`direct`].
 //!   Some such modules also read tables another store owns. For example,
@@ -203,6 +205,7 @@ pub mod quarantine;
 pub mod quarantine_publication;
 pub mod quarantine_recovery_authority;
 pub mod quarantine_recovery_candidates;
+pub mod ready_suspend_projection;
 pub mod repair;
 pub mod restore_dispatch_fence;
 pub mod restore_lease;
@@ -216,7 +219,9 @@ pub mod sandbox_id_bounds;
 pub mod snapshot_capture_fields;
 pub mod snapshot_inventory;
 pub mod snapshot_retention_claim;
+pub mod snapshot_retention_finalize;
 pub mod spaced_version_counts;
+pub mod stale_suspended_executions;
 pub mod stopped_replacement_claim;
 pub mod stopped_replacements;
 pub mod stuck;

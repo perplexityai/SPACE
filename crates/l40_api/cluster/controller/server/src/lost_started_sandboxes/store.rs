@@ -1,17 +1,12 @@
 //! Postgres-backed [`super::LostStartedSink`].
 
-use pplx_space_accounts::NodeId;
-use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_snapshot_model::SnapshotId;
 
-use std::sync::LazyLock;
-
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
 use pplx_space_node_registration_store::locks;
-use pplx_space_sandbox_portability::started_restore_source_absent;
 use pplx_space_sandbox_store::lost::{
-    DEAD_UPLOAD_SETTLE, mark_started_lost, write_off_lost_sandboxes,
+    DEAD_UPLOAD_SETTLE, mark_started_lost, started_lost_candidates, write_off_lost_sandboxes,
 };
 use pplx_space_sandbox_store::row_locks;
 use pplx_space_snapshot_store::lost::fail_quiet_full_uploads_from_node;
@@ -20,54 +15,6 @@ use sqlx::PgPool;
 
 use super::{LostCandidate, LostStartedSink, SourceNode};
 use crate::gone_node_write_off::{emit_lost_and_failed, node_identity_holds};
-
-type CandidateRow = (SandboxId, i64, NodeId, bool, Option<String>, Option<String>);
-
-/// `$1` = [`SubstrateKind::Kubernetes`], `$2` = scan cursor (nullable),
-/// `$3` = limit, `$4` = [`DEAD_UPLOAD_SETTLE`] seconds. The candidate scan.
-///
-/// The execution must track no pod. A recovery that materialized a
-/// replacement pod records its identity before the pod's placement moves
-/// `active_node_id`, so a tracked pod may be live on another node; the
-/// failed-recovery convergence likewise waits for an authoritative absence
-/// check to clear it.
-///
-/// A sandbox whose source node is in any drain phase is left to `node_drain`
-/// and `drained_node_terminator`, which own residents of a drained node. The
-/// restore-source condition is the one the flip re-checks
-/// ([`started_restore_source_absent`]).
-static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
-    let no_restore_source = started_restore_source_absent("s", "$4");
-    sql!(
-        format!(
-            "SELECT s.id,
-                    e.generation,
-                    s.active_node_id,
-                    n.id IS NOT NULL AS node_row_exists,
-                    nk.k8s_node_name,
-                    nk.k8s_node_uid
-               FROM sandboxes s
-               JOIN sandbox_k8s_executions e
-                 ON e.sandbox_id = s.id
-                AND e.active
-                AND e.state = 'recovery_failed'
-                AND NULLIF(BTRIM(e.pod_uid), '') IS NULL
-                AND e.pod_ip IS NULL
-                AND e.k8s_node_name IS NULL
-               LEFT JOIN nodes n ON n.id = s.active_node_id
-               LEFT JOIN node_k8s nk ON nk.node_id = n.id
-              WHERE s.managed_by = $1
-                AND s.lifecycle = 'started'
-                AND s.active_node_id IS NOT NULL
-                AND (n.id IS NULL OR (n.managed_by = $1 AND n.drain_phase IS NULL))
-                AND ($2::UUID IS NULL OR s.id > $2)
-                AND {no_restore_source}
-              ORDER BY s.id
-              LIMIT $3"
-        )
-        .as_str()
-    )
-});
 
 pub struct LostStartedDbStore {
     pool: PgPool,
@@ -85,33 +32,25 @@ impl LostStartedSink for LostStartedDbStore {
         limit: u32,
         after: Option<SandboxId>,
     ) -> Result<Vec<LostCandidate>, sqlx::Error> {
-        let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(LIST_CANDIDATES.as_str()))
-            .bind(SubstrateKind::Kubernetes)
-            .bind(after)
-            .bind(i64::from(limit))
-            .bind(DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = started_lost_candidates(&self.pool, after, limit, DEAD_UPLOAD_SETTLE).await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(sandbox_id, generation, source_node_id, node_row_exists, name, uid)| {
-                    let source_node = match (node_row_exists, name) {
-                        (false, _) => SourceNode::RowDeleted,
-                        (true, Some(k8s_node_name)) => SourceNode::Registered {
-                            k8s_node_name,
-                            k8s_node_uid: uid,
-                        },
-                        (true, None) => SourceNode::Unverifiable,
-                    };
-                    LostCandidate {
-                        sandbox_id,
-                        generation,
-                        source_node_id,
-                        source_node,
-                    }
-                },
-            )
+            .map(|row| {
+                let source_node = match (row.node_row_exists, row.k8s_node_name) {
+                    (false, _) => SourceNode::RowDeleted,
+                    (true, Some(k8s_node_name)) => SourceNode::Registered {
+                        k8s_node_name,
+                        k8s_node_uid: row.k8s_node_uid,
+                    },
+                    (true, None) => SourceNode::Unverifiable,
+                };
+                LostCandidate {
+                    sandbox_id: row.sandbox_id,
+                    generation: row.generation,
+                    source_node_id: row.active_node_id,
+                    source_node,
+                }
+            })
             .collect())
     }
 

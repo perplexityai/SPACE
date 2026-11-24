@@ -1,5 +1,6 @@
 //! Guarded writes for sandboxes given up as lost because the node holding
-//! their only copy is gone.
+//! their only copy is gone, and the scan that finds the `started` ones
+//! ([`started_lost_candidates`]).
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
@@ -27,6 +28,89 @@ use sqlx::{Postgres, Transaction};
 /// one quiet for longer can no longer become `ready` and is finalized
 /// `failed` so the reap converges.
 pub const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
+
+/// A `started` Kubernetes sandbox whose recovery failed on a source node that
+/// may be gone, from [`started_lost_candidates`].
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StartedLostCandidate {
+    #[sqlx(rename = "id")]
+    pub sandbox_id: SandboxId,
+    /// The active `recovery_failed` execution's generation.
+    pub generation: i64,
+    /// The source node, `sandboxes.active_node_id`.
+    pub active_node_id: NodeId,
+    /// Whether the source node's `nodes` row still exists.
+    pub node_row_exists: bool,
+    pub k8s_node_name: Option<String>,
+    pub k8s_node_uid: Option<String>,
+}
+
+/// One keyset page, ordered by id, of the candidates for
+/// [`mark_started_lost`]: at most `limit` rows strictly after `after`
+/// (`None` starts a scan), each with its source node's `nodes` and
+/// `node_k8s` identity when those rows exist. `dead_upload_settle` is the
+/// settle window of [`started_restore_source_absent`].
+///
+/// The execution must track no pod. A recovery that materialized a
+/// replacement pod records its identity before the pod's placement moves
+/// `active_node_id`, so a tracked pod may be live on another node; the
+/// failed-recovery convergence likewise waits for an authoritative absence
+/// check to clear it.
+///
+/// A sandbox whose source node is in any drain phase is left to `node_drain`
+/// and `drained_node_terminator`, which own residents of a drained node. The
+/// restore-source condition is the one the flip re-checks
+/// ([`started_restore_source_absent`]).
+///
+/// A plain read; the settle window compares with `NOW()`, so it reads the
+/// clock of the executor's transaction.
+pub async fn started_lost_candidates(
+    executor: impl sqlx::PgExecutor<'_>,
+    after: Option<SandboxId>,
+    limit: u32,
+    dead_upload_settle: Duration,
+) -> Result<Vec<StartedLostCandidate>, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static LIST_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+        let no_restore_source = started_restore_source_absent("s", "$4");
+        sql!(
+            format!(
+                "SELECT s.id,
+                        e.generation,
+                        s.active_node_id,
+                        n.id IS NOT NULL AS node_row_exists,
+                        nk.k8s_node_name,
+                        nk.k8s_node_uid
+                   FROM sandboxes s
+                   JOIN sandbox_k8s_executions e
+                     ON e.sandbox_id = s.id
+                    AND e.active
+                    AND e.state = 'recovery_failed'
+                    AND NULLIF(BTRIM(e.pod_uid), '') IS NULL
+                    AND e.pod_ip IS NULL
+                    AND e.k8s_node_name IS NULL
+                   LEFT JOIN nodes n ON n.id = s.active_node_id
+                   LEFT JOIN node_k8s nk ON nk.node_id = n.id
+                  WHERE s.managed_by = $1
+                    AND s.lifecycle = 'started'
+                    AND s.active_node_id IS NOT NULL
+                    AND (n.id IS NULL OR (n.managed_by = $1 AND n.drain_phase IS NULL))
+                    AND ($2::UUID IS NULL OR s.id > $2)
+                    AND {no_restore_source}
+                  ORDER BY s.id
+                  LIMIT $3"
+            )
+            .as_str()
+        )
+    });
+    sqlx::query_as(sqlx::AssertSqlSafe(LIST_CANDIDATES.as_str()))
+        .bind(SubstrateKind::Kubernetes)
+        .bind(after)
+        .bind(i64::from(limit))
+        .bind(dead_upload_settle.as_secs().cast_signed())
+        .fetch_all(executor)
+        .await
+}
 
 /// The guarded flip of `sandboxes` from `started` to `failed`. Returns
 /// whether the row flipped.

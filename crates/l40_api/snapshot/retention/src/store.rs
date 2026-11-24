@@ -6,14 +6,12 @@ use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
-use pplx_space_sandbox_model::SandboxLifecycle;
-use pplx_space_sandbox_portability::{
-    snapshot_is_current_local_artifact, snapshot_is_live_restore_source,
-};
+use pplx_space_sandbox_portability::snapshot_is_live_restore_source;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
 use pplx_space_sandbox_store::snapshot_retention_claim;
+use pplx_space_sandbox_store::snapshot_retention_finalize::lock_owner_marks_snapshot;
 use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_snapshot_store::claimed::{self, ClaimedSnapshot};
 use pplx_space_snapshot_store::{delete_snapshot_catalog, snapshot_ids_after};
@@ -500,12 +498,12 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // finalize — reaping its blobs was harmless since that data was
         // being removed anyway.
         //
-        // The marker is projected by this same statement rather than read
-        // back separately. Under READ COMMITTED, EvalPlanQual refreshes the
-        // locked `sandboxes` row after a wait, so its marker is post-lock.
-        // That guarantee does not refresh the unlocked `snapshots` row;
-        // projecting its artifact identity is safe only because those
-        // columns are immutable after insertion.
+        // The marker is projected by the locking statement itself rather
+        // than read back separately. Under READ COMMITTED, EvalPlanQual
+        // refreshes the locked `sandboxes` row after a wait, so its marker
+        // is post-lock. That guarantee does not refresh the unlocked
+        // `snapshots` row; projecting its artifact identity is safe only
+        // because those columns are immutable after insertion.
         //
         // What this projects is narrower than what the guards match, on
         // purpose. The guards are enforcement, so erring wide is free. This
@@ -528,26 +526,12 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // already documented as a floor rather than an exact count. On a
         // metric whose contract is "expected zero, investigate if not", a
         // false positive costs more than a missed rare case.
-        let restoring = SandboxLifecycle::Restoring.as_str();
-        let marker_query = format!(
-            "SELECT (sb.lifecycle <> '{restoring}' AND {marked})
-               FROM snapshots cur
-               JOIN sandboxes sb ON sb.id = cur.sandbox_id
-              WHERE cur.id = $1
-                FOR UPDATE OF sb",
-            marked = snapshot_is_current_local_artifact("sb", "cur"),
-        );
-        // No row means the snapshot is already gone. Bind the boolean here
-        // rather than re-unwrapping later: a `unwrap_or(false)` further down
-        // would read as "unknown means not pinned", which is the wrong
-        // default for a data-loss signal even when the branch is provably
-        // dead.
-        let Some(is_pinned) =
-            sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql!(marker_query.as_str())))
-                .bind(snapshot_id)
-                .fetch_optional(&mut *tx)
-                .await?
-        else {
+        //
+        // Bind the boolean here rather than re-unwrapping later: a
+        // `unwrap_or(false)` further down would read as "unknown means not
+        // pinned", which is the wrong default for a data-loss signal even
+        // when the branch is provably dead.
+        let Some(is_pinned) = lock_owner_marks_snapshot(&mut tx, snapshot_id).await? else {
             tx.rollback().await?;
             return Ok(PruneFinalize::AlreadyGone);
         };
