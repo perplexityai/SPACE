@@ -124,6 +124,7 @@ pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-registration-store = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-data-plane-session-store = { workspace = true }
+pplx-space-direct-store = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }

@@ -5,8 +5,9 @@
 //!
 //! The adoption's guard also reads the Direct-only route-identity and
 //! provenance tables, which `pattern_ratchet.direct_tables` confines to the
-//! Direct substrate. The substrate evaluates that part and passes what it
-//! decided; [`adopt_live_execution`] guards on the row's own columns.
+//! Direct substrate and its store. The substrate evaluates that part and
+//! passes what it decided; [`adopt_live_execution`] guards on the row's own
+//! columns.
 //!
 //! The substrate keeps everything around them: the row locks
 //! (`SELECT ... FOR UPDATE` for restore ownership, `FOR NO KEY UPDATE` for
