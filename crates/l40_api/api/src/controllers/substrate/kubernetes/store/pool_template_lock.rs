@@ -25,16 +25,12 @@ impl K8sStore {
     /// committed yet, which takes no config row.
     pub(in crate::controllers::substrate::kubernetes) async fn lock_template_against_twin_inserts(
         &self,
-        conn: &mut PgConnection,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         template_name: &str,
     ) -> Result<(), SubstrateError> {
-        sqlx::query(sql!(
-            "SELECT 1 FROM templates WHERE name = $1 AND desired_state = 'present' FOR SHARE"
-        ))
-        .bind(template_name)
-        .execute(&mut *conn)
-        .await
-        .db_context("failed to lock the template against twin inserts")?;
+        pplx_space_template_store::templates::share_lock_if_present(tx, template_name)
+            .await
+            .db_context("failed to lock the template against twin inserts")?;
         Ok(())
     }
 

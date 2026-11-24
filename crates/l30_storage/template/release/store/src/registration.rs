@@ -1,10 +1,14 @@
 //! Statements release registration (`RegisterTemplateRelease`, in
 //! internal-api) runs under the template's publication lock, in its
-//! transaction. None takes a lock of its own.
+//! transaction. None takes a lock of its own but
+//! [`lock_execution_metadata`], whose release row lock lasts until the
+//! caller's transaction ends.
 
 use pplx_space_accounts::OrgId;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::digest_original;
 use sqlx::PgExecutor;
+use std::sync::LazyLock;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -232,4 +236,52 @@ pub async fn adopt_storage_location_owner(
     .execute(executor)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Release `release_id`'s execution metadata, `None` when it records none,
+/// locking the release's row `FOR UPDATE` until the caller's transaction
+/// ends, so a check and fill of the metadata
+/// ([`fill_execution_metadata`]) is one step against other writers. Fails
+/// with [`sqlx::Error::RowNotFound`] when there is no release `release_id`.
+pub async fn lock_execution_metadata(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    release_id: Uuid,
+) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT execution_metadata FROM template_releases WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(release_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// The original release of `template_name` stored as `canonical_hash` or
+/// `bare_hash`, the two spellings of one digest, chosen by
+/// `pplx_space_template_release_original::digest_original`: the release a
+/// lookup with no environment resolves, never a twin. `None` when no
+/// release has the digest.
+pub async fn original_release(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    canonical_hash: &str,
+    bare_hash: &str,
+) -> Result<Option<RegisteredRelease>, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
+                    r.execution_metadata->>'environment' AS environment
+             FROM template_releases r
+             WHERE r.template_name = $1
+               AND r.hash IN ($2, $3)
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_as::<_, RegisteredRelease>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name)
+        .bind(canonical_hash)
+        .bind(bare_hash)
+        .fetch_optional(executor)
+        .await
 }

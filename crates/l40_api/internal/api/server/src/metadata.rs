@@ -25,13 +25,6 @@ pub(super) struct TemplateRow {
     pub(super) network_policy_generation: i64,
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplatePolicyRow {
-    pub(super) template: String,
-    pub(super) network_policy_json: Json<NetworkPolicyV1>,
-    pub(super) network_policy_generation: i64,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct SandboxPolicyRow {
     pub(super) sandbox_id: SandboxId,
@@ -86,29 +79,6 @@ impl TryFrom<pplx_space_sandbox_store::SandboxNetworkPolicyInputs> for SandboxPo
 /// separate `TemplateNetworkPolicyState` lineage, not a sandbox's apply.
 pub(super) fn sandbox_effective_policy_generation(row: &SandboxPolicyRow) -> i64 {
     row.network_policy_generation
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct NodeTemplateBaseSnapshotPolicyRow {
-    pub(super) template: String,
-    pub(super) ensure_base_snapshot: bool,
-    pub(super) snapshot_vcpu: Option<i32>,
-    pub(super) snapshot_memory_mib: Option<i32>,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplateDesiredStateRow {
-    pub(super) template: String,
-    pub(super) desired_state: String,
-    pub(super) default_auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
-    pub(super) pool_target: Option<i32>,
-    pub(super) pool_boot_mode: Option<String>,
-    pub(super) pool_vcpu: Option<i32>,
-    pub(super) pool_memory_mib: Option<i32>,
-    /// The node has a reason to hold the template, so it is answered.
-    pub(super) admitted: bool,
-    /// The node's published inventory lists the template.
-    pub(super) held_here: bool,
 }
 
 #[derive(Debug, Clone)]

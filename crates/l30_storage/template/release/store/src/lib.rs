@@ -16,19 +16,27 @@
 //! [`catalog`]'s, and the template and admin release deletes remove rows
 //! through [`removal`]'s. The credential manager asks
 //! [`release_published`] before it vends write credentials for a release's
-//! storage, and refuses them for a published release. Other statements
-//! against these tables still run in api and internal-api:
+//! storage, and refuses them for a published release. Of the other
+//! statements against these tables:
 //!
-//! * the locking reads (`FOR UPDATE`, `FOR NO KEY UPDATE`) of registration
-//!   and the admin routes stay with their callers, whose locks and re-checks
-//!   keep them correct; registration's fills of a release's execution
+//! * the locking reads (`FOR UPDATE`) of registration and the admin routes
+//!   are [`registration::lock_execution_metadata`],
+//!   [`lookup::lock_release_of_present_template`] and
+//!   [`removal::lock_releases_of_digest`]; each takes the caller's
+//!   transaction, and its lock lasts until that transaction ends. The
+//!   callers keep the order they take locks in and the re-checks those
+//!   locks keep correct. Registration's fills of a release's execution
 //!   metadata and of a found storage location's owner are
-//!   [`registration`]'s, run under those locks;
+//!   [`registration`]'s, run under those locks. The template row locks
+//!   they take first are `pplx-space-template-store`'s;
 //! * statements that interpolate `digest_original` or `spelling_original`
-//!   in the api's admin release routes and in internal-api's original
-//!   lookup haven't moved yet; the api's create, base, placement and pool
-//!   target resolvers and the admin release population are [`lookup`]'s,
-//!   and internal-api's catalog lookups are [`catalog`]'s;
+//!   are this store's, except `pplx-space-cluster-pool`'s reads of the
+//!   releases its pool policies retain and of observed demand: the api's
+//!   create, base, placement and pool target resolvers, the admin release
+//!   population, the tag move's original lookup and the release delete's tag
+//!   and twin checks are [`lookup`]'s, internal-api's catalog lookups are
+//!   [`catalog`]'s, and registration's original lookup is
+//!   [`registration::original_release`];
 //! * other reads of other tables that join a release, and test fixtures,
 //!   stay where they are; the create's tag lookup, which reads the tags,
 //!   is [`lookup::resolve_by_tag`].

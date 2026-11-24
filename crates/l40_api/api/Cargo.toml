@@ -164,7 +164,6 @@ pplx-space-service-lifecycle = { workspace = true }
 pplx-space-snapshot-store = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
-pplx-space-template-release-original = { workspace = true }
 pplx-space-template-store = { workspace = true }
 pplx-space-test-hooks = { workspace = true }
 

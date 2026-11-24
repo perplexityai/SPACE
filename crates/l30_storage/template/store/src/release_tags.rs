@@ -1,13 +1,16 @@
 //! The tags that name a template's releases (`template_release_tags`).
 //!
 //! The tag move (the admin route that points a tag at another release)
-//! locks the tag row and compares it at its call site, in its transaction;
-//! the retarget of a tag it holds locked is [`retarget`], and the insert of
-//! a tag it found absent is [`insert_if_absent`].
+//! locks the tag row with [`current_release_locked`] and compares it at its
+//! call site, in its transaction; the retarget of a tag it holds locked is
+//! [`retarget`], and the insert of a tag it found absent is
+//! [`insert_if_absent`]. Release registration share-locks the tags it
+//! confirms with [`share_lock_tags_of_digest`]. Each locking verb takes the
+//! caller's transaction, and its lock lasts until that transaction ends.
 
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{TemplateName, TemplateTag};
-use sqlx::{FromRow, PgExecutor};
+use sqlx::{FromRow, PgExecutor, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -152,4 +155,53 @@ pub async fn delete_for_template(
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// The release `tag` of `template_name` points at, or `None` when the
+/// template has no such tag, locking the tag's row `FOR UPDATE` until the
+/// caller's transaction ends.
+pub async fn current_release_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    template_name: &str,
+    tag: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT template_release_id
+         FROM template_release_tags
+         WHERE template_name = $1 AND tag = $2
+         FOR UPDATE"
+    ))
+    .bind(template_name)
+    .bind(tag)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// The tags among `tags` of `template_name` that name a release of the
+/// digest stored as `hash` (bare `bare_hash`), under either spelling, by
+/// tag, share-locking each tag's row `FOR SHARE` until the caller's
+/// transaction ends.
+pub async fn share_lock_tags_of_digest(
+    tx: &mut Transaction<'_, Postgres>,
+    template_name: &str,
+    tags: &[String],
+    hash: &str,
+    bare_hash: &str,
+) -> Result<Vec<RegisteredTag>, sqlx::Error> {
+    sqlx::query_as::<_, RegisteredTag>(sql!(
+        "SELECT t.id, t.tag, t.created_at
+         FROM template_release_tags t
+         JOIN template_releases r ON r.id = t.template_release_id
+         WHERE t.template_name = $1
+           AND t.tag = ANY($2)
+           AND r.hash IN ($3, $4, 'sha256:' || $4)
+         ORDER BY t.tag
+         FOR SHARE OF t"
+    ))
+    .bind(template_name)
+    .bind(tags)
+    .bind(hash)
+    .bind(bare_hash)
+    .fetch_all(&mut **tx)
+    .await
 }
