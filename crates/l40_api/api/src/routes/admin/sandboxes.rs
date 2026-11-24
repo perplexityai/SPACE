@@ -220,13 +220,16 @@ pub async fn create_sandbox(
     }
 }
 
-/// The checks that precede the target organization resolving: the placement
-/// gate and the organization's existence.
+/// The checks that precede the target organization resolving: the shared
+/// create-request limits, the placement gate, and the organization's existence.
 async fn admin_create_precheck(
     pool: &sqlx::PgPool,
     sandbox_controller: &SandboxController,
     request: &AdminCreateSandboxRequest,
 ) -> Result<(), AdminSandboxActionError> {
+    pplx_space_public_api::limits::validate_create_request(&request.sandbox).map_err(|error| {
+        AdminSandboxActionError::new(StatusCode::BAD_REQUEST, error.to_string())
+    })?;
     let org_id = request.org_id;
     // Placement is off by default; a pin issued while the gate is off is
     // rejected outright (no persisted intent, no deferred replay).
