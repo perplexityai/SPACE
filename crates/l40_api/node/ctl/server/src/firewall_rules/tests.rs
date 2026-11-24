@@ -71,9 +71,9 @@ impl Node {
         let service = NodeCtlService::new(
             tx.clone(),
             crate::ClusterReconcileTrigger::new(tx, NODE),
-            Arc::new(std::sync::Mutex::new(
-                rusqlite::Connection::open_in_memory().expect("open in-memory SQLite"),
-            )),
+            pplx_space_node_ctl_store::database::SharedConnection::new(
+                pplx_space_node_ctl_store::database::Connection::open_in_memory(),
+            ),
             Some(wake),
         );
         Self {

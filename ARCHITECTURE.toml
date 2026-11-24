@@ -310,9 +310,8 @@ mode = "required"
 # edges, and `state.writes` scans only stores' and helpers' write statements.
 # Without this ratchet, pplx-space-db-migrate, a store that depends on sqlx
 # and rusqlite, could name sbx-mgr's migrator or a default-path helper for its
-# database again, and a node service with a baselined `rusqlite` edge
-# (node-ctl-server, node-mgr, template-mgr,
-# build-mgr-server) could open `SANDBOX_MANAGER_DB`.
+# database again, and a node service with a baselined `rusqlite` edge could open
+# `SANDBOX_MANAGER_DB`.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema]
 patterns = [
   '\bpplx_space_sbx_mgr_migrations\b',

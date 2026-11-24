@@ -1,9 +1,11 @@
 //! The `dirty_facets` queue: one row per facet, or per element of a facet,
 //! that node-ctl has to sync. The empty element stands for the whole facet.
 
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::{OptionalExtension, params};
 
 use pplx_space_sql_locator::sql;
+
+use crate::database::{Connection, Result};
 
 /// A claimed row: the facet, its element and the generation that was claimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +29,7 @@ pub struct DirtyFacetQueueRow {
 /// Delete the facet's per-element rows, leaving its whole-facet row. Run it in
 /// the transaction that then marks the whole facet dirty.
 pub fn delete_element_rows(conn: &Connection, facet: &str) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!("DELETE FROM dirty_facets WHERE facet = ?1 AND element != ''"),
         params![facet],
     )?;
@@ -37,18 +39,20 @@ pub fn delete_element_rows(conn: &Connection, facet: &str) -> Result<()> {
 /// The `dirty` flag of the facet's whole-facet row, or `None` when it has
 /// none. Run it in the transaction whose write depends on it.
 pub fn whole_facet_dirty(conn: &Connection, facet: &str) -> Result<Option<i64>> {
-    conn.query_row(
-        sql!("SELECT dirty FROM dirty_facets WHERE facet = ?1 AND element = ''"),
-        params![facet],
-        |row| row.get(0),
-    )
-    .optional()
+    Ok(conn
+        .0
+        .query_row(
+            sql!("SELECT dirty FROM dirty_facets WHERE facet = ?1 AND element = ''"),
+            params![facet],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// Mark the element dirty at `now`: insert its row, or bump its generation
 /// and reset its retry, dead-letter and claim state.
 pub fn mark_dirty(conn: &Connection, facet: &str, element: &str, now: i64) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "INSERT INTO dirty_facets
                  (facet, element, dirty, dirty_generation, attempts, last_error,
@@ -81,7 +85,7 @@ pub fn claim_due(
     now: i64,
     stale_before: i64,
 ) -> Result<usize> {
-    conn.execute(
+    Ok(conn.0.execute(
         sql!(
             "UPDATE dirty_facets
              SET claim_token = ?1,
@@ -96,7 +100,7 @@ pub fn claim_due(
                )"
         ),
         params![claim_token, now, stale_before],
-    )
+    )?)
 }
 
 /// Delete the element's row if `claim_token` still holds it at
@@ -109,7 +113,7 @@ pub fn delete_synced(
     dirty_generation: i64,
     claim_token: &str,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let changed = conn.0.execute(
         sql!(
             "DELETE FROM dirty_facets
              WHERE facet = ?1
@@ -131,7 +135,7 @@ pub fn release_claim(
     element: &str,
     claim_token: &str,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let changed = conn.0.execute(
         sql!(
             "UPDATE dirty_facets
              SET claim_token = '',
@@ -163,7 +167,7 @@ pub struct FailedAttempt<'a> {
 /// `dirty_generation`. Returns `false` when the row is gone, another claim
 /// took it, or it was marked dirty again since the claim.
 pub fn dead_letter_failed_attempt(conn: &Connection, attempt: &FailedAttempt<'_>) -> Result<bool> {
-    let changed = conn.execute(
+    let changed = conn.0.execute(
         sql!(
             "UPDATE dirty_facets
              SET attempts = attempts + 1,
@@ -200,7 +204,7 @@ pub fn back_off_failed_attempt(
     attempt: &FailedAttempt<'_>,
     next_attempt_at: i64,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let changed = conn.0.execute(
         sql!(
             "UPDATE dirty_facets
              SET attempts = attempts + 1,
@@ -238,7 +242,7 @@ pub fn release_claim_due_now(
     claim_token: &str,
     now: i64,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let changed = conn.0.execute(
         sql!(
             "UPDATE dirty_facets
              SET claim_token = '',
@@ -256,7 +260,7 @@ pub fn release_claim_due_now(
 
 /// The dirty rows that `claim_token` claimed, ordered by facet and element.
 pub fn claimed(conn: &Connection, claim_token: &str) -> Result<Vec<ClaimedDirtyFacetRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT facet, element, dirty_generation
          FROM dirty_facets
          WHERE dirty != 0
@@ -270,34 +274,34 @@ pub fn claimed(conn: &Connection, claim_token: &str) -> Result<Vec<ClaimedDirtyF
             dirty_generation: row.get(2)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Every dirty row, ordered by facet and element.
 pub fn queue(conn: &Connection) -> Result<Vec<DirtyFacetQueueRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT facet, element, attempts, last_error, updated_at, last_attempt_at
          FROM dirty_facets
          WHERE dirty != 0
          ORDER BY facet ASC, element ASC"
     ))?;
     let rows = stmt.query_map([], queue_row)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The facet's dirty rows, ordered by element.
 pub fn facet_queue(conn: &Connection, facet: &str) -> Result<Vec<DirtyFacetQueueRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT facet, element, attempts, last_error, updated_at, last_attempt_at
          FROM dirty_facets
          WHERE dirty != 0 AND facet = ?1
          ORDER BY facet ASC, element ASC"
     ))?;
     let rows = stmt.query_map(params![facet], queue_row)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn queue_row(row: &rusqlite::Row<'_>) -> Result<DirtyFacetQueueRow> {
+fn queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirtyFacetQueueRow> {
     let element = row.get(1)?;
     Ok(DirtyFacetQueueRow {
         facet: row.get(0)?,
@@ -312,10 +316,12 @@ fn queue_row(row: &rusqlite::Row<'_>) -> Result<DirtyFacetQueueRow> {
 /// The element's failed-attempt count, or `None` when it has no row. Run it
 /// in the transaction whose write depends on it.
 pub fn attempts(conn: &Connection, facet: &str, element: &str) -> Result<Option<i64>> {
-    conn.query_row(
-        sql!("SELECT attempts FROM dirty_facets WHERE facet = ?1 AND element = ?2"),
-        params![facet, element],
-        |row| row.get(0),
-    )
-    .optional()
+    Ok(conn
+        .0
+        .query_row(
+            sql!("SELECT attempts FROM dirty_facets WHERE facet = ?1 AND element = ?2"),
+            params![facet, element],
+            |row| row.get(0),
+        )
+        .optional()?)
 }

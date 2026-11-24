@@ -88,9 +88,6 @@ pplx-space-credmgr = [
 pplx-space-internal-api-server = [
   "sqlx",
 ]
-pplx-space-node-ctl-server = [
-  "rusqlite",
-]
 pplx-space-node-mgr = [
   "rusqlite",
 ]

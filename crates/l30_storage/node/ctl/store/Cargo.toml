@@ -18,9 +18,18 @@ sqlite.node-ctl = [
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes the raw connection to node-ctl's test suites, which enable it as a
+# dev-dependency to seed and inspect the database directly, and an in-memory
+# connection to node-ctl's own `test-support` serving helper.
+test-support = []
+
 [dependencies]
+ref-cast = { workspace = true }
 rusqlite = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
+thiserror = { workspace = true }
 
 # internal
 pplx-space-sql-locator = { workspace = true }

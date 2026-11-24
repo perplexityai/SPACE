@@ -1,6 +1,7 @@
+use rusqlite::params;
 use rusqlite::types::Value;
-use rusqlite::{Connection, params};
 
+use crate::database::{Connection, Transaction};
 use crate::{database, dirty_facets, facet_sync_overrides, reconciliation_status};
 
 async fn migrated_db() -> (tempfile::TempDir, Connection) {
@@ -15,8 +16,8 @@ async fn migrated_db() -> (tempfile::TempDir, Connection) {
 
 #[tokio::test]
 async fn dirty_facets_mark_list_and_count_attempts() {
-    let (_temp, mut conn) = migrated_db().await;
-    let tx = conn.transaction().expect("begin");
+    let (_temp, conn) = migrated_db().await;
+    let tx = Transaction::deferred(&conn).expect("begin");
     dirty_facets::mark_dirty(&tx, "template_inventory", "tpl", 12).expect("mark other facet");
     dirty_facets::mark_dirty(&tx, "sandbox_inventory", "", 10).expect("mark whole facet");
     dirty_facets::mark_dirty(&tx, "sandbox_inventory", "sbx-a", 10).expect("mark element");
@@ -39,7 +40,7 @@ async fn dirty_facets_mark_list_and_count_attempts() {
         dirty_facets::attempts(&conn, "sandbox_inventory", "missing").expect("read attempts"),
         None
     );
-    conn.execute(
+    conn.0.execute(
         "UPDATE dirty_facets SET attempts = 2, last_error = 'boom', last_attempt_at = 9 WHERE facet = 'sandbox_inventory' AND element = 'sbx-a'",
         [],
     )
@@ -96,11 +97,12 @@ async fn dirty_facets_claimed_lists_only_the_claims_rows() {
     dirty_facets::mark_dirty(&conn, "node_status", "", 10).expect("mark");
     dirty_facets::mark_dirty(&conn, "node_status", "", 11).expect("remark");
     dirty_facets::mark_dirty(&conn, "network_policy", "", 10).expect("mark");
-    conn.execute(
-        "UPDATE dirty_facets SET claim_token = 'claim-1' WHERE facet = 'node_status'",
-        [],
-    )
-    .expect("claim");
+    conn.0
+        .execute(
+            "UPDATE dirty_facets SET claim_token = 'claim-1' WHERE facet = 'node_status'",
+            [],
+        )
+        .expect("claim");
 
     assert_eq!(
         dirty_facets::claimed(&conn, "claim-1").expect("list claimed"),
@@ -115,16 +117,17 @@ async fn dirty_facets_claimed_lists_only_the_claims_rows() {
 /// Every column of the element's `dirty_facets` row, to show a write that
 /// lost its guard changed nothing.
 fn dirty_facet_row(conn: &Connection, facet: &str, element: &str) -> Vec<Value> {
-    conn.query_row(
-        "SELECT facet, element, dirty, dirty_generation, attempts, last_error,
+    conn.0
+        .query_row(
+            "SELECT facet, element, dirty, dirty_generation, attempts, last_error,
                 updated_at, last_attempt_at, next_attempt_at, claim_token,
                 claimed_at, dead_at, dead_reason
          FROM dirty_facets
          WHERE facet = ?1 AND element = ?2",
-        params![facet, element],
-        |row| (0..13).map(|index| row.get(index)).collect(),
-    )
-    .expect("read dirty facet row")
+            params![facet, element],
+            |row| (0..13).map(|index| row.get(index)).collect(),
+        )
+        .expect("read dirty facet row")
 }
 
 /// A `dirty_facets` row's columns in [`dirty_facet_row`]'s order.
@@ -192,22 +195,23 @@ async fn dirty_facets_claim_due_takes_unclaimed_and_stale_claims_only() {
         5
     );
     // node_status's claim goes stale; network_policy's stays fresh.
-    conn.execute(
-        "UPDATE dirty_facets SET claimed_at = 5 WHERE facet = 'node_status'",
-        [],
-    )
-    .expect("age claim");
-    conn.execute(
+    conn.0
+        .execute(
+            "UPDATE dirty_facets SET claimed_at = 5 WHERE facet = 'node_status'",
+            [],
+        )
+        .expect("age claim");
+    conn.0.execute(
         "UPDATE dirty_facets SET claim_token = '', claimed_at = 0 WHERE facet = 'template_inventory'",
         [],
     )
     .expect("release claim");
-    conn.execute(
+    conn.0.execute(
         "UPDATE dirty_facets SET claim_token = '', claimed_at = 0, dead_at = 15 WHERE element = 'dead'",
         [],
     )
     .expect("dead-letter row");
-    conn.execute(
+    conn.0.execute(
         "UPDATE dirty_facets SET claim_token = '', claimed_at = 0, next_attempt_at = 31 WHERE element = 'later'",
         [],
     )
@@ -283,11 +287,12 @@ async fn dirty_facets_delete_synced_and_release_claim_need_the_claim() {
     // The generation moved while the claim still holds (set directly here;
     // `mark_dirty` would also clear the claim): the delete loses on the
     // generation alone, and the release still matches.
-    conn.execute(
-        "UPDATE dirty_facets SET dirty_generation = 2 WHERE facet = 'node_status'",
-        [],
-    )
-    .expect("bump the generation under the claim");
+    conn.0
+        .execute(
+            "UPDATE dirty_facets SET dirty_generation = 2 WHERE facet = 'node_status'",
+            [],
+        )
+        .expect("bump the generation under the claim");
     assert!(!dirty_facets::delete_synced(&conn, "node_status", "", 1, "claim-1").expect("delete"));
     assert!(dirty_facets::release_claim(&conn, "node_status", "", "claim-1").expect("release"));
     assert_eq!(
@@ -393,7 +398,7 @@ async fn dirty_facets_release_claim_due_now_ignores_the_generation() {
     let (_temp, conn) = migrated_db().await;
     dirty_facets::mark_dirty(&conn, "node_status", "", 10).expect("mark");
     dirty_facets::claim_due(&conn, "claim-1", 20, 0).expect("claim");
-    conn.execute(
+    conn.0.execute(
         "UPDATE dirty_facets SET dirty_generation = 2, next_attempt_at = 90 WHERE facet = 'node_status'",
         [],
     )

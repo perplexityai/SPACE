@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = []
 # `serve_firewall_wake_for_test`, for another crate's end-to-end test.
-test-support = []
+test-support = ["pplx-space-node-ctl-store/test-support"]
 otel = [
     "pplx-space-observability/otel",
     "pplx-space-template-mgr-client/otel",
@@ -78,7 +78,6 @@ pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -97,7 +96,11 @@ http-body = { workspace = true }
 insta = { workspace = true }
 # `serde` reads the E0 fixture document the environment-label tests build on.
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
+# `test-support` lets the tests seed and inspect node-ctl's database through
+# the store's raw connection, and serve on an in-memory one.
+pplx-space-node-ctl-store = { workspace = true, features = ["test-support"] }
 pplx-space-sbx-mgr-client = { workspace = true, features = ["test-support"] }
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the facet
 # stall-watchdog tests run on virtual time.

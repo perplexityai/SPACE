@@ -1,9 +1,11 @@
 //! `facet_sync_overrides`: an operator's pause of one facet's sync in one
 //! direction, until a time or, with no time, until cleared.
 
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::{OptionalExtension, params};
 
 use pplx_space_sql_locator::sql;
+
+use crate::database::{Connection, Result};
 
 /// An override row. `disabled_until` is `None` for an override with no end.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +26,7 @@ pub fn upsert(
     reason: &str,
     now: i64,
 ) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "INSERT INTO facet_sync_overrides
                  (facet, direction, disabled_until, reason, updated_at)
@@ -41,7 +43,7 @@ pub fn upsert(
 
 /// Delete the override for the facet and direction, if there is one.
 pub fn delete(conn: &Connection, facet: &str, direction: &str) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!("DELETE FROM facet_sync_overrides WHERE facet = ?1 AND direction = ?2"),
         params![facet, direction],
     )?;
@@ -55,22 +57,24 @@ pub fn disabled_until(
     facet: &str,
     direction: &str,
 ) -> Result<Option<Option<i64>>> {
-    conn.query_row(
-        sql!(
-            "SELECT disabled_until
+    Ok(conn
+        .0
+        .query_row(
+            sql!(
+                "SELECT disabled_until
              FROM facet_sync_overrides
              WHERE facet = ?1 AND direction = ?2"
-        ),
-        params![facet, direction],
-        |row| row.get(0),
-    )
-    .optional()
+            ),
+            params![facet, direction],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// The overrides with no end or that end after `now`, ordered by facet and
 /// direction.
 pub fn active(conn: &Connection, now: i64) -> Result<Vec<FacetSyncOverrideRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT facet, direction, disabled_until, reason, updated_at
          FROM facet_sync_overrides
          WHERE disabled_until IS NULL OR disabled_until > ?1
@@ -87,5 +91,5 @@ pub fn active(conn: &Connection, now: i64) -> Result<Vec<FacetSyncOverrideRow>> 
             updated_at: row.get(4)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
