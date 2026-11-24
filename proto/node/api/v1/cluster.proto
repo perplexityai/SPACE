@@ -1537,4 +1537,8 @@ message FirewallRulesPendingRound {
   uint64 round = 1;
   // When the control plane first issued the round.
   google.protobuf.Timestamp issued_at = 2;
+  // The assignment generation the round asks about, which needn't be this
+  // response's assignment; 0 is a generation. Absent from older servers and
+  // for a round that names none: such a round can't be answered.
+  optional uint64 assignment_generation = 3;
 }

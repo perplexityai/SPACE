@@ -18,7 +18,7 @@ async fn open_with(
     open_round(&mut conn, target, EPOCH, &mut queue).await
 }
 
-async fn opened(pool: &PgPool, target: &LeasedTarget) -> TestResult<Question> {
+async fn opened(pool: &PgPool, target: &LeasedTarget) -> TestResult<PendingRound> {
     match open_with(pool, target, Queue::Wake).await? {
         Opening::Opened(question) => Ok(question),
         other => panic!("{target:?} opened nothing: {other:?}"),
@@ -104,7 +104,10 @@ async fn racing_and_repeated_opens_converge_on_one_round_and_one_wakeup() -> Tes
         _ => panic!("racing opens didn't converge: {outcomes:?}"),
     };
     assert_eq!(question.round, 1);
-    assert_eq!(question.assignment_generation, stamp.assignment_generation);
+    assert_eq!(
+        question.assignment_generation,
+        Some(stamp.assignment_generation)
+    );
     assert!((start..=end).contains(&question.issued_at), "{question:?}");
 
     let open = effects(&db.pool, rollout, node).await?;
@@ -388,9 +391,12 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     let (first, target, stamp) = issued_target(&db.pool, "rolling").await?;
     let node = target.node_id;
     let generation = stamp.assignment_generation;
-    let asked = |q: Question| (q.round, q.assignment_generation);
+    let asked = |q: PendingRound| (q.round, q.assignment_generation);
 
-    assert_eq!(asked(opened(&db.pool, &target).await?), (1, generation));
+    assert_eq!(
+        asked(opened(&db.pool, &target).await?),
+        (1, Some(generation))
+    );
     accept(&db.pool, node).await?;
     let accepted = |effects: Effects| {
         effects.observation.map(|o| {
@@ -402,7 +408,10 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
         })
     };
     let evidence = accepted(effects(&db.pool, first, node).await?);
-    assert_eq!(asked(opened(&db.pool, &target).await?), (2, generation));
+    assert_eq!(
+        asked(opened(&db.pool, &target).await?),
+        (2, Some(generation))
+    );
 
     // Round 2 is still pending when the next rollout assigns the node anew.
     assert!(requeue(&db.pool, &target, &RELEASE).await?);
@@ -411,7 +420,10 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     save_targets(&db.pool, next, &[node]).await?;
     let target = lease(&db.pool, next, 1).await?.remove(0);
     let generation = issued(&db.pool, &target).await?.assignment_generation;
-    assert_eq!(asked(opened(&db.pool, &target).await?), (3, generation));
+    assert_eq!(
+        asked(opened(&db.pool, &target).await?),
+        (3, Some(generation))
+    );
 
     // Round 3 unbound, as 20261123200458's down and up leave a round. The
     // migration that then requires a generation won't apply over one, so its
@@ -429,7 +441,10 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     .bind(node)
     .execute(&db.pool)
     .await?;
-    assert_eq!(asked(opened(&db.pool, &target).await?), (4, generation));
+    assert_eq!(
+        asked(opened(&db.pool, &target).await?),
+        (4, Some(generation))
+    );
 
     assert_eq!(accepted(effects(&db.pool, next, node).await?), evidence);
     Ok(())

@@ -240,6 +240,7 @@ async fn each_wake_syncs_only_a_fetched_assignment_at_most_once() {
             pending_round: Some(FirewallRulesPendingRound {
                 round: 1,
                 issued_at: None,
+                assignment_generation: Some(1),
             }),
         }))
         .unwrap();

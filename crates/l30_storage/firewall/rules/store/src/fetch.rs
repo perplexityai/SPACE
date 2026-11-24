@@ -35,6 +35,10 @@ pub struct Assignment {
 pub struct PendingRound {
     pub round: u64,
     pub issued_at: Timestamp,
+    /// The assignment generation the round asks about, read from the round
+    /// rather than the assignment. `None` for a round that names none, which
+    /// can't be answered.
+    pub assignment_generation: Option<u64>,
 }
 
 /// Read `node`'s assignment and pending round.
@@ -43,19 +47,21 @@ pub async fn fetch_instructions(
     node: NodeId,
 ) -> Result<NodeInstructions, StoredStateError> {
     // Anchored on the node, so a round without an assignment still returns.
-    let (generation, revision_id, round, issued_at) = sqlx::query_as::<
+    let (generation, revision_id, round, issued_at, round_generation) = sqlx::query_as::<
         _,
         (
             Option<i64>,
             Option<RevisionId>,
             Option<i64>,
             Option<OffsetDateTime>,
+            Option<i64>,
         ),
     >(sql!(
         "SELECT a.assignment_generation,
                 a.revision_id,
                 o.pending_round,
-                o.pending_round_issued_at
+                o.pending_round_issued_at,
+                o.pending_assignment_generation
          FROM (SELECT $1::uuid AS node_id) n
          LEFT JOIN firewall_rules_node_assignments a ON a.node_id = n.node_id
          LEFT JOIN firewall_rules_node_observations o ON o.node_id = n.node_id"
@@ -73,7 +79,11 @@ pub async fn fetch_instructions(
     };
     // The schema sets the round and its issue time together.
     let pending_round = match (round, issued_at) {
-        (Some(round), Some(issued_at)) => Some(pending_round(round, issued_at)?),
+        (Some(round), Some(issued_at)) => Some(pending_round(
+            round,
+            issued_at,
+            round_generation.map(non_negative).transpose()?,
+        )?),
         _ => None,
     };
     Ok(NodeInstructions {
@@ -82,16 +92,18 @@ pub async fn fetch_instructions(
     })
 }
 
-/// A pending round's number and issue time as stored, decoded alike for Fetch
-/// and the round opener.
+/// A pending round as stored, with the generation it asks about, decoded
+/// alike for Fetch and the round opener.
 pub(crate) fn pending_round(
     round: i64,
     issued_at: OffsetDateTime,
+    assignment_generation: Option<u64>,
 ) -> Result<PendingRound, sqlx::Error> {
     Ok(PendingRound {
         round: non_negative(round)?,
         issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+        assignment_generation,
     })
 }
 
