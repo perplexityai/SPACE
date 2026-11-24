@@ -124,7 +124,7 @@ test-group = "state-render"
 # CI sets SPACE_CI_REQUIRE_TEST_PRIVILEGE, as the root halves do.
 #
 # Root to create network namespaces and nftables tables: the node-mgr firewall
-# installation tests.
+# installation tests and the pod IP read.
 #
 # Root only for an incidental step, until the test loses it: the net-gateway
 # exemption test's relay sets SO_MARK (CAP_NET_RAW).
@@ -183,6 +183,7 @@ or (package(pplx-space-node-mgr) and test(=slot_pool::firewall_rules::tests::lin
 or (package(pplx-space-node-mgr) and test(=service::firewall_sync::fixture::tests::linux::a_delivery_applies_only_to_the_bound_namespace))
 or (package(pplx-space-node-mgr) and test(=service::firewall_sync::fixture::tests::linux::a_delivery_applies_to_every_eligible_namespace))
 or (package(pplx-space-node-mgr) and test(=slot_pool::firewall_rules::observe::tests::linux::reads_real_tables_and_leaves_drift_alone))
+or (package(pplx-space-node-mgr) and test(=net::tests::pod_ip_is_the_default_route_interface_address))
 or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_service_uids_can_exchange_downloads))
 or (package(pplx-space-sbx-mgr) and test(=snapshot_upload::tests::volume_manager_reads_deferred_metadata_through_the_shared_cache_group))
 or (package(pplx-space-sbx-mgr) and test(=snapshot_restore::tests::volume_manager_downloads_into_scoped_restore_staging_through_the_shared_cache_group))

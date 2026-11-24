@@ -258,8 +258,7 @@ fn firewall_setup_classifier_preserves_transient_and_permanent_sources() {
 #[cfg(target_os = "linux")]
 #[test]
 fn pod_ip_is_the_default_route_interface_address() {
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("requires root to create a network namespace");
+    if !pplx_space_test_env::root_or_skip("create a network namespace") {
         return;
     }
     struct Namespace(String);
