@@ -130,3 +130,24 @@ async fn delete_beyond_newest_removes_the_oldest_overflow() -> TestResult {
     assert_eq!(paths(&list_newest(&db.pool, 10).await?), ["/e", "/d"]);
     Ok(())
 }
+
+/// Catches the aged delete removing rows inside the retention, deleting past
+/// its limit, or deleting the newest of the aged rows first.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_older_than_removes_the_oldest_aged_rows() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    for (path, age_days) in [("/b", 4), ("/d", 1), ("/a", 5), ("/c", 3)] {
+        insert_aged(&db.pool, path, age_days).await?;
+    }
+    let two_days = 2 * 24 * 60 * 60;
+
+    assert_eq!(delete_older_than(&db.pool, two_days, 1).await?, 1);
+    assert_eq!(paths(&list_newest(&db.pool, 10).await?), ["/d", "/c", "/b"]);
+
+    assert_eq!(delete_older_than(&db.pool, two_days, 10).await?, 2);
+    assert_eq!(delete_older_than(&db.pool, two_days, 10).await?, 0);
+    assert_eq!(paths(&list_newest(&db.pool, 10).await?), ["/d"]);
+    Ok(())
+}

@@ -3,40 +3,7 @@
 
 use super::*;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SessionRouteRow {
-    pub(super) session_id: String,
-    pub(super) protocol_session_id: Option<String>,
-    pub(super) org_id: OrgId,
-    pub(super) sandbox_id: SandboxId,
-    pub(super) kind: String,
-    pub(super) target_port: Option<i32>,
-    pub(super) target_protocol: Option<String>,
-    pub(super) target_path: Option<String>,
-    pub(super) adapter_state_json: String,
-    pub(super) route_generation: RouteGeneration,
-    pub(super) current_node_id: Option<NodeId>,
-    pub(super) backend_endpoint: Option<String>,
-    pub(super) backend_transport: Option<String>,
-    pub(super) revocation_epoch: i64,
-    pub(super) revocation_status: String,
-    pub(super) revocation_reason: Option<String>,
-    pub(super) revocation_updated_at: OffsetDateTime,
-    pub(super) org_revocation_epoch: i64,
-    pub(super) scopes: Vec<String>,
-    pub(super) token_hash: Option<String>,
-    pub(super) token_expires_at: Option<OffsetDateTime>,
-    pub(super) sandbox_active_node_id: Option<NodeId>,
-    pub(super) sandbox_lifecycle: SandboxLifecycle,
-    pub(super) node_address: Option<String>,
-    pub(super) node_managed_by: Option<String>,
-    pub(super) k8s_node_name: Option<String>,
-    pub(super) direct_node_api_endpoint: Option<String>,
-    pub(super) sandbox_pod_uid: Option<PodUid>,
-    pub(super) execution_generation: Option<ExecutionGeneration>,
-    pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
-    pub(super) backend_process_id: Option<String>,
-}
+pub(super) use pplx_space_data_plane_session_store::direct::SessionRoute;
 
 pub(crate) async fn resolve_session_route(
     budget: Duration,
@@ -382,7 +349,7 @@ pub(super) async fn implicit_wake_queued(
 }
 
 pub(super) fn space_api_route_token_for_session(
-    row: &SessionRouteRow,
+    row: &SessionRoute,
     current_node_id: NodeId,
     route_ed25519_authority: Option<&SpaceApiRouteEd25519Authority>,
 ) -> Result<Option<ProtoSpaceApiRouteToken>, Status> {
@@ -466,7 +433,7 @@ pub(super) fn data_plane_session_transport(
     }
 }
 
-pub(super) fn validate_ingress_session(row: &SessionRouteRow) -> Result<(), Status> {
+pub(super) fn validate_ingress_session(row: &SessionRoute) -> Result<(), Status> {
     validate_ingress_session_access(
         &row.revocation_status,
         row.token_expires_at,
@@ -489,7 +456,7 @@ pub(super) fn validate_ingress_session_access(
 }
 
 pub(super) fn validate_attach_authorization(
-    row: &SessionRouteRow,
+    row: &SessionRoute,
     refresh_authority: Option<DataPlaneSessionRefreshAuthority>,
     token_sha256: Option<&str>,
     required_scope: Option<&str>,
