@@ -326,16 +326,11 @@ pub(super) async fn reset_slot_with(
             Some(mutation_claim)
         };
         let reset_key = ResetKey::from_record(&record);
-        let changed = match tx.execute(
-            "UPDATE network_slots
-                 SET state = 'resetting', updated_at = ?1
-                 WHERE slot_id = ?2 AND generation = ?3
-                   AND state IN ('dirty', 'resetting')",
-            params![
-                SqliteU64(now_secs()),
-                reset_key.slot_id,
-                SqliteU64(reset_key.generation)
-            ],
+        let changed = match slots::reset::begin_reset(
+            &tx,
+            reset_key.slot_id,
+            reset_key.generation,
+            now_secs(),
         ) {
             Ok(changed) => changed,
             Err(error) => {
@@ -443,49 +438,19 @@ pub(super) async fn reset_slot_with(
                 };
                 let now = now_secs();
                 let result = if reset_kind == LeaseKind::Pooled {
-                    conn.execute(
-                        concat!(
-                            "UPDATE network_slots
-                             SET state = 'ready', health = 'healthy',
-                                 sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                                 last_error = NULL, pod_netns_path = ?1, lease_kind = ?2,
-                                 memory_reservation_mib = NULL,
-                                 ",
-                            clear_cleanup_reset_retry_sql!(),
-                            ",
-                                 updated_at = ?3, last_reset_at = ?3
-                             WHERE slot_id = ?4 AND generation = ?5
-                               AND state = 'resetting'"
-                        ),
-                        params![
-                            config.pod_netns_path,
-                            LeaseKind::Pooled.as_str(),
-                            SqliteU64(now),
-                            reset_key.slot_id,
-                            SqliteU64(reset_key.generation)
-                        ],
+                    slots::reset::finish_pooled_reset(
+                        &conn,
+                        reset_key.slot_id,
+                        reset_key.generation,
+                        config.pod_netns_path.as_deref(),
+                        now,
                     )
                 } else {
-                    conn.execute(
-                        concat!(
-                            "UPDATE network_slots
-                             SET state = 'missing', health = 'unknown',
-                                 sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
-                                 last_error = NULL, pod_netns_path = NULL, lease_kind = ?1,
-                                 memory_reservation_mib = NULL,
-                                 ",
-                            clear_cleanup_reset_retry_sql!(),
-                            ",
-                                 updated_at = ?2, last_reset_at = ?2
-                             WHERE slot_id = ?3 AND generation = ?4
-                               AND state = 'resetting'"
-                        ),
-                        params![
-                            LeaseKind::Pooled.as_str(),
-                            SqliteU64(now),
-                            reset_key.slot_id,
-                            SqliteU64(reset_key.generation)
-                        ],
+                    slots::reset::finish_ephemeral_reset(
+                        &conn,
+                        reset_key.slot_id,
+                        reset_key.generation,
+                        now,
                     )
                 };
                 match result {
@@ -546,18 +511,12 @@ pub(super) async fn reset_slot_with(
                         retry_after_secs = POOL_FILL_RETRY_DELAY.as_secs(),
                         "network slot reset deferred while leased process is still alive"
                     );
-                    match conn.execute(
-                        "UPDATE network_slots
-                     SET state = 'dirty', health = 'degraded',
-                         last_error = ?1, updated_at = ?2
-                     WHERE slot_id = ?3 AND generation = ?4
-                       AND state = 'resetting'",
-                        params![
-                            error.to_string(),
-                            SqliteU64(now_secs()),
-                            reset_key.slot_id,
-                            SqliteU64(reset_key.generation)
-                        ],
+                    match slots::reset::defer_reset(
+                        &conn,
+                        reset_key.slot_id,
+                        reset_key.generation,
+                        &error.to_string(),
+                        now_secs(),
                     ) {
                         Ok(changed) if changed > 0 => {
                             clear_cleanup_reset_db_failure(&pool, &reset_key);
@@ -696,18 +655,12 @@ pub(super) async fn reset_slot_with(
                         retry_after_secs = POOL_FILL_RETRY_DELAY.as_secs(),
                         "network slot reset deferred until previous sandbox cleanup completes"
                     );
-                    match conn.execute(
-                        "UPDATE network_slots
-                     SET state = 'dirty', health = 'degraded',
-                         last_error = ?1, updated_at = ?2
-                     WHERE slot_id = ?3 AND generation = ?4
-                       AND state = 'resetting'",
-                        params![
-                            error.to_string(),
-                            SqliteU64(now_secs()),
-                            reset_key.slot_id,
-                            SqliteU64(reset_key.generation)
-                        ],
+                    match slots::reset::defer_reset(
+                        &conn,
+                        reset_key.slot_id,
+                        reset_key.generation,
+                        &error.to_string(),
+                        now_secs(),
                     ) {
                         Ok(changed) if changed > 0 => {
                             pool.mark_node_status_dirty();
@@ -774,18 +727,12 @@ pub(super) async fn reset_slot_with(
                         retry_after_secs = POOL_FILL_RETRY_DELAY.as_secs(),
                         "network slot reset hit transient host networking error"
                     );
-                    match conn.execute(
-                        "UPDATE network_slots
-                     SET state = 'dirty', health = 'degraded',
-                         last_error = ?1, updated_at = ?2
-                     WHERE slot_id = ?3 AND generation = ?4
-                       AND state = 'resetting'",
-                        params![
-                            error.to_string(),
-                            SqliteU64(now_secs()),
-                            reset_key.slot_id,
-                            SqliteU64(reset_key.generation)
-                        ],
+                    match slots::reset::defer_reset(
+                        &conn,
+                        reset_key.slot_id,
+                        reset_key.generation,
+                        &error.to_string(),
+                        now_secs(),
                     ) {
                         Ok(changed) if changed > 0 => {
                             pool.mark_node_status_dirty();

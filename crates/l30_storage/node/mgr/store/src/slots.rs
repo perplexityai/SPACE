@@ -1,5 +1,13 @@
 //! `network_slots`: one row per network slot, with its persisted state,
 //! health and lease.
+//!
+//! This module holds the verbs of allocation, release, PID publication,
+//! operator repair and startup repair; [`reset`] holds the reset worker's
+//! and [`worker`] the maintenance worker's. A guarded transition returns
+//! what its guard matched: the affected count or, for
+//! [`reset::record_cleanup_reset_failure`], the counter its `RETURNING`
+//! reads. Zero or `None` means another writer won or there is nothing left
+//! to do, and the caller decides what follows.
 
 use std::fmt;
 use std::str::FromStr;
@@ -151,11 +159,11 @@ impl fmt::Display for LeaseKind {
     }
 }
 
+pub mod reset;
+pub mod worker;
+
 /// The `SELECT` list [`SlotRow::from_row`] decodes, in its column order.
-///
-/// node-mgr's slot reads that still build their predicate at the call site
-/// interpolate it with [`SlotRow::from_row`] until they move here.
-pub const SLOT_COLUMNS: &str = "slot_id, generation, state, health, sandbox_id, sandbox_uid,
+pub(crate) const SLOT_COLUMNS: &str = "slot_id, generation, state, health, sandbox_id, sandbox_uid,
                             pod_netns_path, lease_kind, pid, last_error, memory_reservation_mib";
 
 /// One `network_slots` row, read through [`SLOT_COLUMNS`].
@@ -177,7 +185,7 @@ pub struct SlotRow {
 impl SlotRow {
     /// Decode a row selected with [`SLOT_COLUMNS`]. An unknown state, health
     /// or lease kind is a conversion failure of its column.
-    pub fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             slot_id: row.get::<_, u32>(0)?,
             generation: row.get::<_, SqliteU64>(1)?.0,
@@ -802,3 +810,399 @@ pub fn slot_to_destroy(conn: &Connection, retained: u32) -> rusqlite::Result<Opt
     )
     .optional()
 }
+
+/// Every slot, in slot order.
+pub fn all_slots(conn: &Connection) -> rusqlite::Result<Vec<SlotRow>> {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT {SLOT_COLUMNS} FROM network_slots ORDER BY slot_id"
+        ))
+    });
+    let mut stmt = conn.prepare(&SQL)?;
+    stmt.query_map([], SlotRow::from_row)?.collect()
+}
+
+/// The leasing or leased slots whose sandbox id is exactly `sandbox_id`, in
+/// slot order. Unlike [`current_lease_by_sandbox`], it never matches a prefix.
+pub fn exact_leases(conn: &Connection, sandbox_id: &str) -> rusqlite::Result<Vec<SlotRow>> {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT {SLOT_COLUMNS} FROM network_slots WHERE sandbox_id = ?1 AND state IN ('leasing', 'leased') ORDER BY slot_id"
+        ))
+    });
+    slot_rows(conn, &SQL, sandbox_id)
+}
+
+/// The dirty or resetting slots whose previous lease was `sandbox_id`, in
+/// slot order.
+pub fn previous_leases(conn: &Connection, sandbox_id: &str) -> rusqlite::Result<Vec<SlotRow>> {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT {SLOT_COLUMNS} FROM network_slots WHERE sandbox_id = ?1 AND state IN ('dirty', 'resetting') ORDER BY slot_id"
+        ))
+    });
+    slot_rows(conn, &SQL, sandbox_id)
+}
+
+/// What [`claim_ephemeral_lease`] writes, and the slot it claims as read.
+pub struct EphemeralClaim<'a> {
+    pub slot_id: u32,
+    /// The generation and state the claim read: the write matches only while
+    /// the slot still has both and no sandbox.
+    pub read_generation: u64,
+    pub read_state: &'a str,
+    /// The lease's generation, the slot's next one.
+    pub generation: u64,
+    pub sandbox_id: &'a str,
+    pub sandbox_uid: u32,
+    /// The slot's namespace as read, which the claim keeps until setup hands
+    /// it off.
+    pub pod_netns_path: Option<&'a str>,
+    pub memory_reservation_mib: u64,
+    pub now: u64,
+}
+
+/// Claim an idle slot for an ephemeral lease, leaving it `leasing`.
+pub fn claim_ephemeral_lease(
+    conn: &Connection,
+    claim: &EphemeralClaim<'_>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots
+                     SET generation = ?1, state = 'leasing', health = 'unknown',
+                         sandbox_id = ?2, sandbox_uid = ?3, pid = NULL,
+                         pod_netns_path = ?4, lease_kind = ?5, memory_reservation_mib = ?6,
+                         last_error = NULL,
+                         cleanup_reset_attempts = 0, last_reset_retry_at = NULL,
+                         updated_at = ?7, reuse_count = reuse_count + 1
+                     WHERE slot_id = ?8 AND generation = ?9 AND state = ?10 AND sandbox_id IS NULL"
+        ),
+        params![
+            SqliteU64(claim.generation),
+            claim.sandbox_id,
+            claim.sandbox_uid,
+            claim.pod_netns_path,
+            LeaseKind::Ephemeral.as_str(),
+            SqliteU64(claim.memory_reservation_mib),
+            SqliteU64(claim.now),
+            claim.slot_id,
+            SqliteU64(claim.read_generation),
+            claim.read_state,
+        ],
+    )
+}
+
+/// Record that slot `slot_id`'s network now lives in `target`, while it is
+/// still at `generation` in `state` with the namespace `previous` the caller
+/// tore down.
+pub fn hand_off_namespace(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    state: SlotState,
+    previous: Option<&str>,
+    target: Option<&str>,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots SET pod_netns_path = ?1, updated_at = ?2
+             WHERE slot_id = ?3 AND generation = ?4 AND state = ?5 AND pod_netns_path IS ?6"
+        ),
+        params![
+            target,
+            SqliteU64(now),
+            slot_id,
+            SqliteU64(generation),
+            state.as_str(),
+            previous
+        ],
+    )
+}
+
+/// Complete a set-up ephemeral lease: `leasing` becomes a healthy `leased`.
+pub fn mark_ephemeral_leased(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    sandbox_id: &str,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots
+                     SET state = 'leased', health = 'healthy', last_error = NULL,
+                         cleanup_reset_attempts = 0, last_reset_retry_at = NULL,
+                         updated_at = ?1
+                     WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
+                       AND state = 'leasing' AND lease_kind = ?5"
+        ),
+        params![
+            SqliteU64(now),
+            slot_id,
+            SqliteU64(generation),
+            sandbox_id,
+            LeaseKind::Ephemeral.as_str(),
+        ],
+    )
+}
+
+/// A failed ephemeral setup, written by [`fail_ephemeral_setup`] or
+/// [`quarantine_ephemeral_setup`] onto the `leasing` lease it identifies.
+pub struct EphemeralSetupFailure<'a> {
+    pub slot_id: u32,
+    pub generation: u64,
+    pub sandbox_id: &'a str,
+    pub state: SlotState,
+    pub health: SlotHealth,
+    pub error: &'a str,
+    pub now: u64,
+}
+
+/// Give up a failed ephemeral setup: the lease leaves the slot, which takes
+/// `failure.state` and `failure.health` as a pooled slot.
+pub fn fail_ephemeral_setup(
+    conn: &Connection,
+    failure: &EphemeralSetupFailure<'_>,
+) -> rusqlite::Result<usize> {
+    ephemeral_setup_failure(
+        conn,
+        sql!(
+            "UPDATE network_slots
+                     SET state = ?1, health = ?2,
+                         sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
+                         lease_kind = ?3, memory_reservation_mib = NULL,
+                         cleanup_reset_attempts = 0, last_reset_retry_at = NULL,
+                         last_error = ?4, updated_at = ?5
+                     WHERE slot_id = ?6 AND generation = ?7 AND sandbox_id = ?8
+                   AND state = 'leasing' AND lease_kind = ?9"
+        ),
+        failure,
+    )
+}
+
+/// [`fail_ephemeral_setup`], also counting a quarantine.
+pub fn quarantine_ephemeral_setup(
+    conn: &Connection,
+    failure: &EphemeralSetupFailure<'_>,
+) -> rusqlite::Result<usize> {
+    ephemeral_setup_failure(
+        conn,
+        sql!(
+            "UPDATE network_slots
+                     SET state = ?1, health = ?2,
+                         sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
+                         lease_kind = ?3, memory_reservation_mib = NULL,
+                         cleanup_reset_attempts = 0, last_reset_retry_at = NULL,
+                         last_error = ?4, updated_at = ?5,
+                         quarantine_count = quarantine_count + 1
+                     WHERE slot_id = ?6 AND generation = ?7 AND sandbox_id = ?8
+                   AND state = 'leasing' AND lease_kind = ?9"
+        ),
+        failure,
+    )
+}
+
+fn ephemeral_setup_failure(
+    conn: &Connection,
+    sql: &str,
+    failure: &EphemeralSetupFailure<'_>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql,
+        params![
+            failure.state.as_str(),
+            failure.health.as_str(),
+            LeaseKind::Pooled.as_str(),
+            failure.error,
+            SqliteU64(failure.now),
+            failure.slot_id,
+            SqliteU64(failure.generation),
+            failure.sandbox_id,
+            LeaseKind::Ephemeral.as_str(),
+        ],
+    )
+}
+
+/// Hand a `leasing` ephemeral lease whose completion could not be recorded to
+/// cleanup as degraded and dirty.
+pub fn dirty_failed_ephemeral_completion(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    sandbox_id: &str,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots SET state = 'dirty', health = 'degraded',
+                 memory_reservation_mib = NULL,
+                 last_error = 'ephemeral completion failed; cleanup required', updated_at = ?1
+             WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
+               AND state = 'leasing' AND lease_kind = ?5"
+        ),
+        params![
+            SqliteU64(now),
+            slot_id,
+            SqliteU64(generation),
+            sandbox_id,
+            LeaseKind::Ephemeral.as_str()
+        ],
+    )
+}
+
+/// Release a leasing or leased lease to reset: the slot turns dirty.
+///
+/// The slot keeps `sandbox_id` and `sandbox_uid` as previous-lease metadata.
+/// Active lease lookups only consider leasing and leased slots, so the same
+/// sandbox can take a new slot while reset still knows which retained cache
+/// UID must be scrubbed before reuse.
+pub fn release_lease(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    sandbox_id: &str,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots
+                         SET state = 'dirty', health = 'unknown',
+                             memory_reservation_mib = NULL, updated_at = ?1
+                         WHERE slot_id = ?2 AND generation = ?3 AND sandbox_id = ?4
+                           AND state IN ('leasing', 'leased')"
+        ),
+        params![SqliteU64(now), slot_id, SqliteU64(generation), sandbox_id],
+    )
+}
+
+/// Operator repair: schedule every quarantined slot no sandbox owns for
+/// rebuild as a missing pooled slot.
+pub fn rebuild_idle_quarantined(conn: &Connection, now: u64) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots
+                     SET state = 'missing', health = 'degraded',
+                         last_error = 'operator requested quarantined slot rebuild',
+                         sandbox_id = NULL, sandbox_uid = NULL, pid = NULL,
+                         lease_kind = ?1, memory_reservation_mib = NULL,
+                         cleanup_reset_attempts = 0, last_reset_retry_at = NULL,
+                         updated_at = ?2
+                     WHERE state = 'quarantined' AND sandbox_id IS NULL"
+        ),
+        params![LeaseKind::Pooled.as_str(), SqliteU64(now)],
+    )
+}
+
+/// Retire a leased lease whose pod namespace disappeared: the slot turns
+/// dirty and degraded with `last_error`.
+pub fn retire_stale_pod_namespace_lease(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    sandbox_id: &str,
+    last_error: &str,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots
+             SET state = 'dirty', health = 'degraded',
+                 last_error = ?1, updated_at = ?2
+             WHERE slot_id = ?3 AND generation = ?4 AND sandbox_id = ?5
+               AND state = 'leased'"
+        ),
+        params![
+            last_error,
+            SqliteU64(now),
+            slot_id,
+            SqliteU64(generation),
+            sandbox_id,
+        ],
+    )
+}
+
+/// Startup reconcile: hand a lease whose runtime is gone to cleanup with
+/// `error`. The guard is the lease identity alone.
+pub fn dirty_reconciled_lease(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    sandbox_id: &str,
+    error: &str,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots
+                     SET state = 'dirty', health = 'unknown',
+                         memory_reservation_mib = NULL, last_error = ?1, updated_at = ?2
+                     WHERE slot_id = ?3 AND generation = ?4 AND sandbox_id = ?5"
+        ),
+        params![
+            error,
+            SqliteU64(now),
+            slot_id,
+            SqliteU64(generation),
+            sandbox_id
+        ],
+    )
+}
+
+/// Startup reconcile: promote a lease whose runtime is live to `leased`,
+/// writing back the health and error it was read with. The guard is the
+/// lease identity alone.
+pub fn promote_reconciled_lease(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    sandbox_id: &str,
+    health: SlotHealth,
+    last_error: Option<&str>,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots
+                     SET state = 'leased', health = ?1, last_error = ?2, updated_at = ?3
+                     WHERE slot_id = ?4 AND generation = ?5 AND sandbox_id = ?6"
+        ),
+        params![
+            health.as_str(),
+            last_error,
+            SqliteU64(now),
+            slot_id,
+            SqliteU64(generation),
+            sandbox_id
+        ],
+    )
+}
+
+/// Record `pid` on a leasing or leased lease.
+pub fn record_lease_pid(
+    conn: &Connection,
+    slot_id: u32,
+    generation: u64,
+    sandbox_id: &str,
+    pid: u32,
+    now: u64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        sql!(
+            "UPDATE network_slots SET pid = ?1, updated_at = ?2
+         WHERE slot_id = ?3 AND generation = ?4 AND sandbox_id = ?5
+           AND state IN ('leasing', 'leased')"
+        ),
+        params![
+            pid,
+            SqliteU64(now),
+            slot_id,
+            SqliteU64(generation),
+            sandbox_id
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests;

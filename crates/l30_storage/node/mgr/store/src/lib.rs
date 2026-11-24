@@ -11,9 +11,17 @@
 //! row with the write bound to it, so the caller's checks run in between and
 //! the write cannot reach another row or transaction.
 //!
-//! The store owns these tables, but node-manager's server still runs its
-//! guarded writes and its predicate-built slot reads on them directly until
-//! that code moves behind the store.
+//! Outside its tests, node-manager's server runs no SQL of its own here.
+//! Its guarded transitions, which re-check the row's state, owner,
+//! generation or execution in their own `WHERE`, are verbs here, named for
+//! the transition and grouped by the code they serve: [`slots`] for
+//! allocation, release, PID publication, operator repair and startup
+//! repair, [`slots::reset`] for the reset worker, [`slots::worker`] for pool
+//! maintenance, and [`executions::retire_execution`] for the execution
+//! fence. Each runs its statement with the guard whole, bound to the values
+//! the caller passes, and returns what the guard matched; matching no row
+//! is an outcome, not an error. The caller keeps its transaction, its pool
+//! lock and the decision of what each outcome means.
 
 pub mod database;
 pub mod executions;

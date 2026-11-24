@@ -52,3 +52,17 @@ pub fn bind_execution(
     )?;
     Ok(())
 }
+
+/// Retire `sandbox_id`'s fence while its current execution is still
+/// `expected`. Returns whether a fence was retired.
+pub fn retire_execution(
+    conn: &Connection,
+    sandbox_id: &str,
+    expected: SandboxActivationAttemptId,
+) -> rusqlite::Result<bool> {
+    let retired = conn.execute(
+        sql!("DELETE FROM sandbox_executions WHERE sandbox_id = ?1 AND execution_id = ?2"),
+        params![sandbox_id, expected.to_string()],
+    )?;
+    Ok(retired != 0)
+}
