@@ -464,176 +464,30 @@ pub(super) async fn fetch_sandbox_observed_states(
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let rows = sqlx::query_as::<_, SandboxObservedState>(
-        sql!("SELECT sos.sandbox_id,
-                sos.node_id,
-                COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
-                observed_node.role AS node_role,
-                observed_node.managed_by AS node_managed_by,
-                observed_direct.node_api_endpoint AS node_api_endpoint,
-                observed_k8s.k8s_node_name AS substrate_node_id,
-                COALESCE(sos.template, s.template_id, observed_template.template_name) AS template,
-                sos.status,
-                sos.spaced_version,
-                sos.pid,
-                sos.namespace,
-                sos.uptime,
-                sos.sandbox_owner,
-                sos.image_hash,
-                sos.snapshots_enabled,
-                sos.disk_usage_bytes,
-                sos.pool_template,
-                sos.failure_reason,
-                sos.observed_created_at,
-                sos.observed_at,
-                COALESCE(observed_release_tags.tags, ARRAY[]::TEXT[]) AS release_tags,
-                nfos.observed_payload AS observed_network_policy,
-                nfos.observed_generation AS observed_network_policy_generation,
-                nfos.applied_source AS observed_network_policy_source,
-                nfos.applied_authority AS observed_network_policy_authority,
-                nfos.observed_at AS observed_network_policy_at,
-                nfc.network_policy_conditions
-         FROM sandbox_observed_states sos
-         LEFT JOIN sandboxes s ON s.id = sos.sandbox_id
-         LEFT JOIN nodes observed_node ON observed_node.id = sos.node_id
-         LEFT JOIN node_direct observed_direct ON observed_direct.node_id = observed_node.id
-         LEFT JOIN node_k8s observed_k8s ON observed_k8s.node_id = observed_node.id
-         LEFT JOIN LATERAL (
-             SELECT nti.template_name
-             FROM node_template_inventory nti
-             WHERE nti.node_id = sos.node_id
-               AND sos.image_hash IS NOT NULL
-               AND nti.content_hash = sos.image_hash
-             ORDER BY nti.observed_at DESC, nti.template_name ASC
-             LIMIT 1
-         ) observed_template ON TRUE
-         LEFT JOIN LATERAL (
-             SELECT ARRAY_AGG(trt.tag ORDER BY trt.tag) AS tags
-             FROM template_releases tr
-             JOIN template_release_tags trt ON trt.template_release_id = tr.id
-             WHERE tr.template_name = COALESCE(sos.template, s.template_id, observed_template.template_name)
-               AND sos.image_hash IS NOT NULL
-               AND tr.hash = sos.image_hash
-         ) observed_release_tags ON TRUE
-         LEFT JOIN node_facet_observed_status nfos
-           ON nfos.node_id = sos.node_id
-          AND nfos.facet = $2
-          AND nfos.element = 'sandbox:' || sos.sandbox_id::text
-         LEFT JOIN LATERAL (
-             SELECT COALESCE(
-                 jsonb_agg(
-                     jsonb_build_object(
-                         'type', condition_type,
-                         'status', condition_status,
-                         'reason', reason,
-                         'message', message,
-                         'last_transition_at', last_transition_at
-                     )
-                     ORDER BY condition_type ASC
-                 ),
-                 '[]'::jsonb
-             ) AS network_policy_conditions
-             FROM node_facet_conditions
-             WHERE node_id = sos.node_id
-               AND facet = $2
-               AND element = 'sandbox:' || sos.sandbox_id::text
-         ) nfc ON TRUE
-         WHERE sos.sandbox_id = ANY($1)"),
+    let rows = sandbox_store::direct::observed_reads::observed_states(
+        pool,
+        ids,
+        ReconcileFacet::NetworkPolicy.as_str(),
     )
-    .bind(ids)
-    .bind(ReconcileFacet::NetworkPolicy.as_str())
-    .fetch_all(pool)
     .await
     .map_err(|err| db_contention_error("query sandbox observed state", &err))?;
-    Ok(rows.into_iter().map(|row| (row.sandbox_id, row)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.sandbox_id, SandboxObservedState::from(row)))
+        .collect())
 }
 
 pub(super) async fn fetch_observed_only_sandboxes(
     pool: &PgPool,
     known_ids: &[SandboxId],
 ) -> Result<Vec<SandboxObservedState>, ControllerError> {
-    sqlx::query_as::<_, SandboxObservedState>(
-        sql!("SELECT sos.sandbox_id,
-                sos.node_id,
-                COALESCE(observed_direct.name, observed_k8s.k8s_node_name) AS node_name,
-                observed_node.role AS node_role,
-                observed_node.managed_by AS node_managed_by,
-                observed_direct.node_api_endpoint AS node_api_endpoint,
-                observed_k8s.k8s_node_name AS substrate_node_id,
-                COALESCE(sos.template, s.template_id, observed_template.template_name) AS template,
-                sos.status,
-                sos.spaced_version,
-                sos.pid,
-                sos.namespace,
-                sos.uptime,
-                sos.sandbox_owner,
-                sos.image_hash,
-                sos.snapshots_enabled,
-                sos.disk_usage_bytes,
-                sos.pool_template,
-                sos.failure_reason,
-                sos.observed_created_at,
-                sos.observed_at,
-                COALESCE(observed_release_tags.tags, ARRAY[]::TEXT[]) AS release_tags,
-                nfos.observed_payload AS observed_network_policy,
-                nfos.observed_generation AS observed_network_policy_generation,
-                nfos.applied_source AS observed_network_policy_source,
-                nfos.applied_authority AS observed_network_policy_authority,
-                nfos.observed_at AS observed_network_policy_at,
-                nfc.network_policy_conditions
-         FROM sandbox_observed_states sos
-         LEFT JOIN sandboxes s ON s.id = sos.sandbox_id
-         LEFT JOIN nodes observed_node ON observed_node.id = sos.node_id
-         LEFT JOIN node_direct observed_direct ON observed_direct.node_id = observed_node.id
-         LEFT JOIN node_k8s observed_k8s ON observed_k8s.node_id = observed_node.id
-         LEFT JOIN LATERAL (
-             SELECT nti.template_name
-             FROM node_template_inventory nti
-             WHERE nti.node_id = sos.node_id
-               AND sos.image_hash IS NOT NULL
-               AND nti.content_hash = sos.image_hash
-             ORDER BY nti.observed_at DESC, nti.template_name ASC
-             LIMIT 1
-         ) observed_template ON TRUE
-         LEFT JOIN LATERAL (
-             SELECT ARRAY_AGG(trt.tag ORDER BY trt.tag) AS tags
-             FROM template_releases tr
-             JOIN template_release_tags trt ON trt.template_release_id = tr.id
-             WHERE tr.template_name = COALESCE(sos.template, s.template_id, observed_template.template_name)
-               AND sos.image_hash IS NOT NULL
-               AND tr.hash = sos.image_hash
-         ) observed_release_tags ON TRUE
-         LEFT JOIN node_facet_observed_status nfos
-           ON nfos.node_id = sos.node_id
-          AND nfos.facet = $2
-          AND nfos.element = 'sandbox:' || sos.sandbox_id::text
-         LEFT JOIN LATERAL (
-             SELECT COALESCE(
-                 jsonb_agg(
-                     jsonb_build_object(
-                         'type', condition_type,
-                         'status', condition_status,
-                         'reason', reason,
-                         'message', message,
-                         'last_transition_at', last_transition_at
-                     )
-                     ORDER BY condition_type ASC
-                 ),
-                 '[]'::jsonb
-             ) AS network_policy_conditions
-             FROM node_facet_conditions
-             WHERE node_id = sos.node_id
-               AND facet = $2
-               AND element = 'sandbox:' || sos.sandbox_id::text
-         ) nfc ON TRUE
-         WHERE s.id IS NULL
-           AND NOT (sos.sandbox_id = ANY($1))
-         ORDER BY sos.observed_at DESC"),
+    sandbox_store::direct::observed_reads::observed_only(
+        pool,
+        known_ids,
+        ReconcileFacet::NetworkPolicy.as_str(),
     )
-    .bind(known_ids)
-    .bind(ReconcileFacet::NetworkPolicy.as_str())
-    .fetch_all(pool)
     .await
+    .map(|rows| rows.into_iter().map(SandboxObservedState::from).collect())
     .map_err(|err| db_contention_error("query observed-only sandboxes", &err))
 }
 

@@ -36,12 +36,11 @@ use pplx_space_sbx_mgr_client::proto::{
     TouchAutoLifecycleResponse, UpdateRequest, WakeRequest,
 };
 use pplx_space_semver::SemVer;
-use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileFacet};
 use pplx_space_template_model::{
     TemplateDesiredState, TemplateName, TemplateReference, TemplateTag, TemplateVisibility,
 };
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -66,7 +65,7 @@ use crate::reconcile_queue::{
     enqueue_sandbox_reconcile_and_trigger_tx, finalize_sandbox_db_delete_user_initiated,
     sandbox_reconcile_cleanup_refs,
 };
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 struct SandboxObservedState {
     sandbox_id: SandboxId,
     node_id: Option<NodeId>,
@@ -77,7 +76,6 @@ struct SandboxObservedState {
     substrate_node_id: Option<String>,
     template: Option<String>,
     status: Option<String>,
-    #[sqlx(flatten)]
     version: ObservedSpacedVersion,
     pid: Option<i32>,
     namespace: Option<String>,
@@ -97,6 +95,55 @@ struct SandboxObservedState {
     observed_network_policy_authority: Option<String>,
     observed_network_policy_at: Option<time::OffsetDateTime>,
     network_policy_conditions: sqlx::types::Json<Vec<NetworkPolicyCondition>>,
+}
+
+impl From<pplx_space_sandbox_store::direct::observed_reads::ObservedStateRow>
+    for SandboxObservedState
+{
+    fn from(row: pplx_space_sandbox_store::direct::observed_reads::ObservedStateRow) -> Self {
+        Self {
+            sandbox_id: row.sandbox_id,
+            node_id: row.node_id,
+            node_name: row.node_name,
+            node_role: row.node_role,
+            node_managed_by: row.node_managed_by,
+            node_api_endpoint: row.node_api_endpoint,
+            substrate_node_id: row.substrate_node_id,
+            template: row.template,
+            status: row.status,
+            version: row.version,
+            pid: row.pid,
+            namespace: row.namespace,
+            uptime: row.uptime,
+            sandbox_owner: row.sandbox_owner,
+            image_hash: row.image_hash,
+            snapshots_enabled: row.snapshots_enabled,
+            disk_usage_bytes: row.disk_usage_bytes,
+            pool_template: row.pool_template,
+            failure_reason: row.failure_reason,
+            observed_created_at: row.observed_created_at,
+            observed_at: row.observed_at,
+            release_tags: row.release_tags,
+            observed_network_policy: row.observed_network_policy,
+            observed_network_policy_generation: row.observed_network_policy_generation,
+            observed_network_policy_source: row.observed_network_policy_source,
+            observed_network_policy_authority: row.observed_network_policy_authority,
+            observed_network_policy_at: row.observed_network_policy_at,
+            network_policy_conditions: sqlx::types::Json(
+                row.network_policy_conditions
+                    .0
+                    .into_iter()
+                    .map(|condition| NetworkPolicyCondition {
+                        condition_type: condition.condition_type,
+                        status: condition.status,
+                        reason: condition.reason,
+                        message: condition.message,
+                        last_transition_at: condition.last_transition_at,
+                    })
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// Budget for blocking create/restore/wake/access waits. Sized below the

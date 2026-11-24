@@ -7,7 +7,8 @@
 //! The Direct substrate (`controllers/substrate/direct.rs` in
 //! `pplx-space-api`) runs the statements whose main table is a route-identity
 //! or provenance table through these verbs; its reads that only join them
-//! onto `sandboxes` stay in `direct.rs`. Each verb takes any executor, so it
+//! onto `sandboxes` are `pplx-space-sandbox-store`'s, in its `direct`
+//! module. Each verb takes any executor, so it
 //! composes into the caller's open transaction, and the caller keeps
 //! everything around it: the transactions and their order, the `sandboxes`
 //! row locks it takes first, the decoding of what a verb returns and the

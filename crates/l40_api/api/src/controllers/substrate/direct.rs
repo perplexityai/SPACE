@@ -135,9 +135,6 @@ use pplx_space_sandbox_model::{
     SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SandboxRouteIdentity,
     SandboxRouteIdentityInvariantError,
 };
-use pplx_space_sandbox_portability::{
-    no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
-};
 use pplx_space_sandbox_store::direct as sandbox_direct;
 use pplx_space_sbx_mgr_client::proto::{
     BootMode, StartRequest, SuspendRequest, WakeResponse, WakeTransition,
@@ -189,6 +186,15 @@ struct GatedDirectNode {
     environment_refusal: Option<String>,
 }
 
+impl From<sandbox_direct::node_endpoints::DirectNodeEndpoint> for DirectNode {
+    fn from(node: sandbox_direct::node_endpoints::DirectNodeEndpoint) -> Self {
+        Self {
+            id: node.id,
+            node_api_endpoint: node.node_api_endpoint,
+        }
+    }
+}
+
 impl From<GatedDirectNode> for DirectNode {
     fn from(row: GatedDirectNode) -> Self {
         Self {
@@ -237,18 +243,8 @@ struct DirectRestoreResult {
     execution_generation: u64,
 }
 
-#[derive(Debug, Clone, FromRow)]
-struct DirectRestoreCandidateRow {
-    id: NodeId,
-    node_api_endpoint: String,
-    storage_uri: Option<String>,
-    source_node_id: Option<NodeId>,
-    /// As [`GatedDirectNode::environment_refusal`].
-    environment_refusal: Option<String>,
-}
-
 impl DirectRestoreCandidate {
-    fn source_node(row: DirectRestoreCandidateRow) -> Self {
+    fn source_node(row: sandbox_direct::restore_candidates::RestoreCandidateRow) -> Self {
         Self {
             node: DirectNode {
                 id: row.id,
@@ -260,7 +256,7 @@ impl DirectRestoreCandidate {
         }
     }
 
-    fn remote_snapshot(row: DirectRestoreCandidateRow) -> Self {
+    fn remote_snapshot(row: sandbox_direct::restore_candidates::RestoreCandidateRow) -> Self {
         Self {
             node: DirectNode {
                 id: row.id,
@@ -2570,22 +2566,10 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<DirectNode>, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM sandboxes s
-             JOIN nodes n ON n.id = s.active_node_id
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))
+        sandbox_direct::node_endpoints::active_node(&self.pool, sandbox_id)
+            .await
+            .map(|node| node.map(DirectNode::from))
+            .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))
     }
 
     /// The worker holding a sandbox's node-local state: its active node, or,
@@ -2598,49 +2582,27 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<DirectNode, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM sandboxes s
-             JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| format!("failed to load local-state node for sandbox {sandbox_id}"))?
-        .ok_or_else(|| SubstrateError::Unavailable {
-            message: format!("sandbox {sandbox_id} has no worker node holding its local state"),
-        })
+        sandbox_direct::node_endpoints::local_state_node(&self.pool, sandbox_id)
+            .await
+            .map(|node| node.map(DirectNode::from))
+            .db_context_with(|| {
+                format!("failed to load local-state node for sandbox {sandbox_id}")
+            })?
+            .ok_or_else(|| SubstrateError::Unavailable {
+                message: format!("sandbox {sandbox_id} has no worker node holding its local state"),
+            })
     }
 
     async fn direct_provenance_source_node(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<DirectNode>, SubstrateError> {
-        sqlx::query_as::<_, DirectNode>(sql!(
-            "SELECT n.id, nd.node_api_endpoint
-             FROM sandboxes s
-             JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
-             JOIN node_direct nd ON nd.node_id = n.id
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .fetch_optional(&self.pool)
-        .await
-        .db_context_with(|| {
-            format!("failed to load provenance source node for sandbox {sandbox_id}")
-        })
+        sandbox_direct::node_endpoints::provenance_source_node(&self.pool, sandbox_id)
+            .await
+            .map(|node| node.map(DirectNode::from))
+            .db_context_with(|| {
+                format!("failed to load provenance source node for sandbox {sandbox_id}")
+            })
     }
 
     async fn worker_client_for_node(
@@ -2716,132 +2678,12 @@ impl DirectSubstrate {
         restore_retry: bool,
     ) -> Result<Vec<DirectRestoreCandidate>, SubstrateError> {
         let mut candidates = Vec::new();
-        let retry_source = restore_retry_source_snapshot_is_current("s", "sn");
-        let source_snapshot = if restore_retry {
-            retry_source.as_str()
-        } else {
-            "TRUE"
-        };
-
-        // A fresh restore uses the newest full row regardless of upload state:
-        // those execution columns describe the artifact held by the source
-        // node even when its upload failed or its durable copy was claimed.
-        // A retry instead uses the same pre-claim source row as the remote leg;
-        // newer post-claim attempts are not authoritative for compatibility.
-        // The observed-state join supplies only existence and placement.
-        let source_query = format!(
-            "WITH latest_snapshot AS (
-                 SELECT sn.runtime,
-                        sn.guest_os,
-                        sn.guest_arch,
-                        sn.state_format_name,
-                        sn.state_format_version,
-                        sn.execution_metadata
-                 FROM sandboxes s
-                 JOIN snapshots sn ON sn.sandbox_id = s.id
-                 WHERE s.id = $1
-                   AND sn.type = 'full'
-                   AND {source_snapshot}
-                 ORDER BY sn.timestamp DESC, sn.id DESC
-                 LIMIT 1
-             )
-             SELECT n.id,
-                    nd.node_api_endpoint,
-                    NULL::TEXT AS storage_uri,
-                    COALESCE(s.target_node_id, s.active_node_id) AS source_node_id,
-                    environment_gate.refusal AS environment_refusal
-             FROM sandboxes s
-             CROSS JOIN latest_snapshot
-             JOIN sandbox_observed_states sos
-               ON sos.sandbox_id = s.id
-              AND sos.node_id = COALESCE(s.target_node_id, s.active_node_id)
-             JOIN nodes n ON n.id = sos.node_id
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE s.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-               AND (latest_snapshot.runtime = 'fc' OR (
-                    nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND latest_snapshot.execution_metadata IS NOT NULL
-               ))
-               AND latest_snapshot.runtime IS NOT NULL
-               AND latest_snapshot.guest_os IS NOT NULL
-               AND latest_snapshot.guest_arch IS NOT NULL
-               AND latest_snapshot.state_format_name IS NOT NULL
-               AND latest_snapshot.state_format_version IS NOT NULL
-               AND (($3::BOOLEAN IS TRUE AND latest_snapshot.execution_metadata->>'environment' IS NOT NULL)
-                    OR EXISTS (
-                    SELECT 1
-                    FROM node_runtime_installations runtime
-                    JOIN node_runtime_guests guest
-                      ON guest.node_id = runtime.node_id
-                     AND guest.runtime = runtime.runtime
-                     AND guest.runtime_version = runtime.runtime_version
-                    WHERE runtime.node_id = n.id
-                      AND runtime.runtime = latest_snapshot.runtime
-                      AND guest.guest_os = latest_snapshot.guest_os
-                      AND guest.guest_arch = latest_snapshot.guest_arch
-                      AND EXISTS (
-                              SELECT 1
-                              FROM node_runtime_state_formats state_format
-                              WHERE state_format.node_id = runtime.node_id
-                                AND state_format.runtime = runtime.runtime
-                                AND state_format.runtime_version = runtime.runtime_version
-                                AND state_format.state_format_name = latest_snapshot.state_format_name
-                                AND split_part(state_format.state_format_version, '.', 1)
-                                    = split_part(latest_snapshot.state_format_version, '.', 1)
-                                AND state_format.can_load IS TRUE
-                          )
-                   ))
-                   AND NOT EXISTS (
-                    SELECT 1
-                    FROM jsonb_to_recordset(
-                             COALESCE(latest_snapshot.execution_metadata->'components',
-                                      '[]'::jsonb)
-                         ) AS requested(kind text, role text, digest text,
-                                        version text, format text)
-                    WHERE (latest_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM node_artifact_components installed
-                          WHERE installed.node_id = n.id
-                            AND installed.kind = requested.kind
-                            AND installed.role_key = COALESCE(requested.role, '')
-                            AND (
-                                (requested.digest IS NOT NULL AND installed.digest = requested.digest)
-                                OR (
-                                    requested.digest IS NULL
-                                    AND (requested.version IS NULL OR installed.version = requested.version)
-                                    AND (requested.format IS NULL OR installed.format = requested.format)
-                                )
-                            )
-                      )
-               )
-               AND (
-                    $3::BOOLEAN IS FALSE
-                    OR environment_gate.refusal IS NULL
-               )
-             LIMIT 1",
-            refusal = environment_refusal("nss", "latest_snapshot.execution_metadata->>'environment'"),
-        );
-        let source_candidates = sqlx::query_as::<_, DirectRestoreCandidateRow>(
-            sqlx::AssertSqlSafe(sql!(source_query.as_str())),
+        let source_candidates = sandbox_direct::restore_candidates::source_candidates(
+            &self.pool,
+            sandbox_id,
+            restore_retry,
+            self.environment_placement.refuses(),
         )
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .bind(self.environment_placement.refuses())
-        .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct source restore candidate")?;
         self.record_environment_refusals(
@@ -2856,144 +2698,13 @@ impl DirectSubstrate {
                 .map(DirectRestoreCandidate::source_node),
         );
 
-        let no_newer = no_newer_full_snapshot("s", "sn");
-        let remote_source = if restore_retry {
-            retry_source.as_str()
-        } else {
-            no_newer.as_str()
-        };
-        let remote_query = format!(
-            "WITH latest_snapshot AS (
-                 SELECT sn.id AS snapshot_id,
-                        storage.storage_connection_string AS storage_uri,
-                        COALESCE(sn.source_node_id, s.target_node_id, s.active_node_id) AS source_node_id,
-                        sn.runtime,
-                        sn.guest_os,
-                        sn.guest_arch,
-                        sn.state_format_name,
-                        sn.state_format_version,
-                        sn.execution_metadata
-                 FROM sandboxes s
-                 JOIN snapshots sn ON sn.sandbox_id = s.id
-                 JOIN LATERAL (
-                     SELECT ssl.storage_connection_string
-                     FROM snapshot_storage_locations ssl
-                     WHERE ssl.snapshot_id = sn.id
-                     ORDER BY ssl.created_at DESC, ssl.id DESC
-                     LIMIT 1
-                 ) storage ON TRUE
-                 WHERE s.id = $1
-                   AND sn.type = 'full'
-                   AND sn.state = 'ready'
-                   AND {remote_source}
-                 ORDER BY sn.timestamp DESC, sn.id DESC
-                 LIMIT 1
-             )
-             SELECT n.id,
-                    nd.node_api_endpoint,
-                    latest_snapshot.storage_uri,
-                    latest_snapshot.source_node_id,
-                    environment_gate.refusal AS environment_refusal
-             FROM latest_snapshot
-             JOIN nodes n ON n.id IS DISTINCT FROM latest_snapshot.source_node_id
-             JOIN node_direct nd ON nd.node_id = n.id
-             JOIN node_status_snapshots nss ON nss.node_id = n.id
-             CROSS JOIN LATERAL (
-                 SELECT {refusal} AS refusal
-             ) environment_gate
-             WHERE n.managed_by = $3
-               AND n.role = 'worker'
-               AND nd.deleted_at IS NULL
-               AND COALESCE(n.state, 'registered') = 'registered'
-               AND nss.reachable IS TRUE
-               AND nss.stale_after > NOW()
-               AND nss.scheduling_status = 'ready'
-               AND (latest_snapshot.runtime = 'fc' OR (
-                    nss.execution_inventory_status = 'complete'
-                    AND nss.execution_inventory_received_at
-                        + (nss.stale_after - nss.observed_at) > NOW()
-                    AND latest_snapshot.execution_metadata IS NOT NULL
-               ))
-               AND latest_snapshot.runtime IS NOT NULL
-               AND latest_snapshot.guest_os IS NOT NULL
-               AND latest_snapshot.guest_arch IS NOT NULL
-               AND latest_snapshot.state_format_name IS NOT NULL
-               AND latest_snapshot.state_format_version IS NOT NULL
-               AND (($4::BOOLEAN IS TRUE AND latest_snapshot.execution_metadata->>'environment' IS NOT NULL)
-                    OR EXISTS (
-                    SELECT 1
-                    FROM node_runtime_installations runtime
-                    JOIN node_runtime_guests guest
-                      ON guest.node_id = runtime.node_id
-                     AND guest.runtime = runtime.runtime
-                     AND guest.runtime_version = runtime.runtime_version
-                    WHERE runtime.node_id = n.id
-                      AND runtime.runtime = latest_snapshot.runtime
-                      AND guest.guest_os = latest_snapshot.guest_os
-                      AND guest.guest_arch = latest_snapshot.guest_arch
-                      AND EXISTS (
-                              SELECT 1
-                              FROM node_runtime_state_formats state_format
-                              WHERE state_format.node_id = runtime.node_id
-                                AND state_format.runtime = runtime.runtime
-                                AND state_format.runtime_version = runtime.runtime_version
-                                AND state_format.state_format_name = latest_snapshot.state_format_name
-                                AND split_part(state_format.state_format_version, '.', 1)
-                                    = split_part(latest_snapshot.state_format_version, '.', 1)
-                                AND state_format.can_load IS TRUE
-                          )
-                   ))
-                   -- Component compatibility reads the components array of the
-                   -- execution_metadata document written by BeginArtifactBackup.
-                   -- Omitted optional keys surface as NULL
-                   -- columns: NULL digest/version/format arms are unconstrained,
-                   -- and an absent role maps to node_artifact_components'
-                   -- role_key ''. A NULL document (legacy rows) means no
-                   -- compatibility requirements. Malformed documents fail
-                   -- closed: a non-array components value errors the whole
-                   -- candidate query rather than silently passing, and a
-                   -- component with no kind can never match an installed
-                   -- component, so it excludes the node.
-                   AND NOT EXISTS (
-                    SELECT 1
-                    FROM jsonb_to_recordset(
-                             COALESCE(latest_snapshot.execution_metadata->'components',
-                                      '[]'::jsonb)
-                         ) AS requested(kind text, role text, digest text,
-                                        version text, format text)
-                    WHERE (latest_snapshot.runtime <> 'fc' OR requested.kind IS DISTINCT FROM 'kernel')
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM node_artifact_components installed
-                          WHERE installed.node_id = n.id
-                            AND installed.kind = requested.kind
-                            AND installed.role_key = COALESCE(requested.role, '')
-                            AND (
-                                (requested.digest IS NOT NULL AND installed.digest = requested.digest)
-                                OR (
-                                    requested.digest IS NULL
-                                    AND (requested.version IS NULL OR installed.version = requested.version)
-                                    AND (requested.format IS NULL OR installed.format = requested.format)
-                                )
-                            )
-                      )
-               )
-               AND (
-                    $4::BOOLEAN IS FALSE
-                    OR environment_gate.refusal IS NULL
-               )
-             ORDER BY random()
-             LIMIT $2",
-            refusal = environment_refusal("nss", "latest_snapshot.execution_metadata->>'environment'"),
-        );
-        let remote_candidates = sqlx::query_as::<_, DirectRestoreCandidateRow>(
-            sqlx::AssertSqlSafe(sql!(remote_query.as_str())),
+        let remote_candidates = sandbox_direct::restore_candidates::remote_candidates(
+            &self.pool,
+            sandbox_id,
+            restore_retry,
+            DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT,
+            self.environment_placement.refuses(),
         )
-        .bind(sandbox_id.as_uuid())
-        .bind(DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT)
-        .bind(SubstrateKind::Space)
-        .bind(self.environment_placement.refuses())
-        .fetch_all(&self.pool)
         .await
         .db_context("failed to select direct remote restore candidates")?;
         self.record_environment_refusals(
@@ -3549,30 +3260,15 @@ impl DirectSubstrate {
         ) else {
             return Ok(RouteCatchUp::NotNeeded);
         };
-        let trails = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT TRUE
-               FROM sandboxes s
-               JOIN sandbox_direct_route_identities route ON route.sandbox_id = s.id
-               JOIN sandbox_direct_route_provenance provenance
-                 ON provenance.sandbox_id = s.id
-              WHERE s.id = $1
-                AND s.managed_by = $4
-                AND s.active_node_id IS NULL
-                AND LOWER(TRIM(s.lifecycle)) = $5
-                AND s.restore_lease_token IS NULL
-                AND route.current_node_id = $2
-                AND route.execution_generation < $3
-                AND provenance.last_execution_generation >= $3"
-        ))
-        .bind(sandbox.id.as_uuid())
-        .bind(node.id.as_uuid())
-        .bind(record_generation)
-        .bind(SubstrateKind::Space)
-        .bind(read_lifecycle.as_str())
-        .fetch_optional(&self.pool)
+        let trails = sandbox_direct::adoption::route_identity_trails_record(
+            &self.pool,
+            sandbox.id,
+            node.id,
+            record_generation,
+            read_lifecycle,
+        )
         .await
-        .db_context("failed to read the unplaced sandbox's route identity")?
-        .is_some();
+        .db_context("failed to read the unplaced sandbox's route identity")?;
         if !trails {
             return Ok(RouteCatchUp::NotNeeded);
         }
@@ -3743,46 +3439,29 @@ impl DirectSubstrate {
             .begin()
             .await
             .db_context("failed to begin the live record's adoption")?;
-        // `NO KEY UPDATE` is the lock an update of the row takes. `FOR UPDATE`
-        // would also block the foreign-key check of an insert into the route
-        // tables, which a route writer can reach while holding its route row.
-        // A row that passes the guard after a wait is re-checked against its
-        // new version, as the joined `UPDATE` re-checked it.
-        let route = sqlx::query_as::<_, (i64, i64)>(sql!(
-            "SELECT route.execution_generation,
-                    provenance.last_execution_generation
-               FROM sandboxes s
-               JOIN sandbox_direct_route_identities route ON route.sandbox_id = s.id
-               JOIN sandbox_direct_route_provenance provenance ON provenance.sandbox_id = s.id
-              WHERE s.id = $1
-                AND s.managed_by = $2
-                AND s.active_node_id IS NULL
-                AND LOWER(TRIM(s.lifecycle)) = $3
-                AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at <= NOW())
-                AND route.current_node_id = $4
-                AND route.execution_generation <= $5
-                AND provenance.last_execution_generation >= $5
-                AND (
-                    s.restore_lease_token IS NULL
-                    OR (route.execution_generation = $5
-                        AND provenance.last_execution_generation = $5)
-                )
-              FOR NO KEY UPDATE OF s"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(SubstrateKind::Space)
-        .bind(read_lifecycle.as_str())
-        .bind(node.id)
-        .bind(execution_generation)
-        .fetch_optional(&mut *transaction)
+        // The candidate's row lock is the transaction's first statement; see
+        // the verb for what it locks and why.
+        let route = sandbox_direct::adoption::lock_live_adoption_candidate(
+            &mut transaction,
+            sandbox_id,
+            read_lifecycle,
+            node.id,
+            execution_generation,
+        )
         .await
         .db_context("failed to select the sandbox for the live record's adoption")?;
-        let adoptable = route.map(|(route_generation, last_generation)| {
-            (
-                route_generation == execution_generation && last_generation == execution_generation,
-                started && route_generation == execution_generation,
-            )
-        });
+        let adoptable = route.map(
+            |sandbox_direct::adoption::LiveAdoptionGenerations {
+                 execution_generation: route_generation,
+                 last_execution_generation: last_generation,
+             }| {
+                (
+                    route_generation == execution_generation
+                        && last_generation == execution_generation,
+                    started && route_generation == execution_generation,
+                )
+            },
+        );
         let adopted = match adoptable {
             Some((one_generation, started_now)) => sandbox_direct::adopt_live_execution(
                 &mut *transaction,

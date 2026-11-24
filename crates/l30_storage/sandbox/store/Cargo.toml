@@ -45,6 +45,8 @@ pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
 pplx-space-node-model = { workspace = true, features = ["sqlx"] }
+pplx-space-net-common = { workspace = true, features = ["serde"] }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-durations = { workspace = true, features = ["serde"] }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-k8s-ids = { workspace = true, features = ["serde", "sqlx"] }

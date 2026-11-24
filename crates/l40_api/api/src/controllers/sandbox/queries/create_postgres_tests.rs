@@ -10,6 +10,7 @@ use crate::federated_identity::{
     FederatedServiceGrant,
 };
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_sql_locator::sql;
 
 #[cfg(feature = "kubernetes")]
 mod kubernetes;

@@ -1,8 +1,9 @@
 //! `sandbox_observed_states`: the last state a node published for each
 //! sandbox it reports, overlaid on the row's lifecycle by status reads.
 //!
-//! Node publications write these rows, and not every writer is in this crate
-//! yet. [`crate::delete::delete_with_dependents`] removes them with the row.
+//! Node publications write these rows ([`crate::direct::observed_publication`]
+//! has the publication's inserts), and not every writer is in this crate yet.
+//! [`crate::delete::delete_with_dependents`] removes them with the row.
 //! [`delete`] is the unguarded delete, run on the executor its caller passes.
 //! [`clear_failed_observation`] is the narrower step the failed-row repair
 //! and the pod-less drain give-up run after their own guarded transition.

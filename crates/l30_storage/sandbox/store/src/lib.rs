@@ -143,6 +143,18 @@
 //!   [`observed_states::clear_failed_observation`]. A read of the
 //!   `sandboxes` row alone, such as [`runtime_access`], gets a module named
 //!   for the question it answers.
+//! * **Statements that join a Direct table live under [`direct`].** A
+//!   statement whose main table this crate declares, but which also joins
+//!   one of the Direct substrate's tables (the ones archcheck's
+//!   `pattern_ratchet.direct_tables` names), moves whole into a module
+//!   under [`direct`] named for the question it answers, not into the
+//!   table's module above: that rule lets a storage crate name those
+//!   tables only in its `direct` module. Their callers aren't only the
+//!   Direct substrate: [`direct::observed_reads`] serves the api's sandbox
+//!   responses and [`direct::observed_publication`] internal-api-server's
+//!   node publication. [`any_undescribed_artifact_owner`] and
+//!   [`auto_lifecycle_execution`], in this file, are the rule's baselined
+//!   exceptions.
 //!
 //! # Fact kinds
 //!
