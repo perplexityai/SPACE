@@ -1065,3 +1065,115 @@ fn reaper_evicts_artifacts_whose_names_are_long() {
         );
     }
 }
+
+#[test]
+fn orphan_scan_reopens_listings_across_pages_without_stale_enoent_warnings() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|err| std::io::Error::other(err.to_string()))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    for i in 0..80 {
+        let sbx = tmp.path().join(format!("sbx-{i:03}"));
+        fs::create_dir_all(sbx.join("instance")).unwrap();
+        fs::write(sbx.join("metadata.json"), b"{}").unwrap();
+    }
+    let surviving_orphan = tmp
+        .path()
+        .join(format!("sbx-079/.gc-pending-{}", LocalArtifactId::new()));
+    fs::create_dir_all(&surviving_orphan).unwrap();
+
+    let fork_root = crate::service::fork_artifact::copy_staging_root_under(tmp.path());
+    for i in 0..150 {
+        fs::create_dir_all(fork_root.join(format!("op-{i:03}"))).unwrap();
+    }
+
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let active = crate::service::fork_artifact::CopyOperationReservations::default();
+    let stale_now = now_secs().saturating_add(FORK_COPY_ORPHAN_MIN_AGE_SECS + 1);
+
+    let (gc_found, fork_found) = tracing::subscriber::with_default(subscriber, || {
+        let mut gc_scan = OrphanScan::default();
+        let mut gc_found = std::collections::HashSet::new();
+        gc_found.extend(
+            gc_scan
+                .next_page(tmp.path(), OrphanKind::GcPending, &active, stale_now)
+                .unwrap(),
+        );
+
+        let mut fork_scan = OrphanScan::default();
+        let mut fork_found = std::collections::HashSet::new();
+        fork_found.extend(
+            fork_scan
+                .next_page(&fork_root, OrphanKind::ForkCopy, &active, stale_now)
+                .unwrap(),
+        );
+
+        // Delete directories between pages and create new ones that sort after the cursor.
+        for i in 0..79 {
+            fs::remove_dir_all(tmp.path().join(format!("sbx-{i:03}"))).unwrap();
+        }
+        let added_orphan = tmp.path().join(format!(
+            "sbx-080/snapshots/.gc-pending-{}",
+            LocalArtifactId::new()
+        ));
+        fs::create_dir_all(&added_orphan).unwrap();
+
+        for i in 0..149 {
+            fs::remove_dir_all(fork_root.join(format!("op-{i:03}"))).unwrap();
+        }
+        let added_fork = fork_root.join("op-150");
+        fs::create_dir_all(&added_fork).unwrap();
+
+        for _ in 0..4 {
+            gc_found.extend(
+                gc_scan
+                    .next_page(tmp.path(), OrphanKind::GcPending, &active, stale_now)
+                    .unwrap(),
+            );
+            fork_found.extend(
+                fork_scan
+                    .next_page(&fork_root, OrphanKind::ForkCopy, &active, stale_now)
+                    .unwrap(),
+            );
+        }
+        assert!(gc_found.contains(&added_orphan));
+        assert!(fork_found.contains(&added_fork));
+        (gc_found, fork_found)
+    });
+
+    assert!(gc_found.contains(&surviving_orphan));
+    assert!(fork_found.contains(&fork_root.join("op-149")));
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.is_empty(),
+        "expected no WARN logs for entries removed between pages, got:\n{output}"
+    );
+}

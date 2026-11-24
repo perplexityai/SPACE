@@ -889,6 +889,9 @@ pub(crate) async fn run_loop(
 
         match tick_result {
             Ok(report) => {
+                if report.deleted > 0 {
+                    gc_orphans = OrphanScan::default();
+                }
                 info!(
                     engaged = report.engaged,
                     candidates = report.candidates_planned,
