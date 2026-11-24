@@ -22,6 +22,7 @@ use pplx_space_sandbox_model::{
 };
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
+use pplx_space_sandbox_store::observed_states;
 use pplx_space_sandbox_store::orphan::try_lock_orphan_observation;
 use pplx_space_sql_locator::sql;
 use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
@@ -463,6 +464,21 @@ async fn apply_receipt(
         return Ok(ReceiptOutcome::Deferred(
             AutoLifecycleDeleteCompletionReason::LockContended,
         ));
+    }
+    // Older publishers can remove observations without the advisory lock.
+    // Claim existing rows first so their deletes cannot race the sandbox lock.
+    match observed_states::lock_for_delete_nowait(tx, completion.sandbox_id).await {
+        Ok(()) => {}
+        Err(error) if is_lock_not_available(&error) => {
+            return Ok(ReceiptOutcome::Deferred(
+                AutoLifecycleDeleteCompletionReason::LockContended,
+            ));
+        }
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "lock auto-lifecycle delete observation rows: {error}"
+            )));
+        }
     }
 
     let row = sqlx::query_as::<_, CompletionAuthorityRow>(sql!(

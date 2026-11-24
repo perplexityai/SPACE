@@ -8,10 +8,25 @@
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
+use sqlx::{PgExecutor, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::SandboxStoreError;
+
+/// Lock existing observations before taking the sandbox row. This covers
+/// concurrent writers that do not take the per-sandbox advisory lock.
+pub async fn lock_for_delete_nowait(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox_id: SandboxId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT 1 FROM sandbox_observed_states WHERE sandbox_id = $1 FOR UPDATE NOWAIT"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// Drop the sandbox's observed state, whatever it says (an operation step):
 /// for a path that has just settled the row's lifecycle itself and must not

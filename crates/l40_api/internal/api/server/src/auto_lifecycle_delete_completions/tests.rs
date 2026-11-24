@@ -3,7 +3,9 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
 };
 use pplx_space_auto_lifecycle_receipt::AutoLifecyclePolicyFingerprint;
-use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_test_db};
+use pplx_space_db_test_fixtures::{
+    insert_ready_worker_node, pg_test_db, try_pg_test_db, try_pg_test_db_with_max_connections,
+};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxQuarantineSource};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use pplx_space_sql_locator::sql;
@@ -172,12 +174,12 @@ async fn sandbox_exists(pool: &sqlx::PgPool, sandbox_id: SandboxId) -> TestResul
 async fn receipt_defers_while_publication_holds_observation_then_retries() -> TestResult {
     use std::time::Duration;
 
-    use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
-
     use crate::proto::PublishedSandboxState;
     use crate::published_state::publish_sandbox_states;
 
-    let db = pg_test_db_with_max_connections(4).await?;
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
     let sandbox_id = SandboxId::new();
     let node_id = NodeId::new();
     let receipt_id = AutoLifecycleDeleteReceiptId::generate();
@@ -284,6 +286,135 @@ async fn receipt_defers_while_publication_holds_observation_then_retries() -> Te
         consume_auto_lifecycle_delete_completions(&mut retry, node_id, &[receipt]).await?;
     retry.commit().await?;
     assert_eq!(consumed.acknowledged_receipt_ids, vec![receipt_id]);
+    assert!(!sandbox_exists(&db.pool, sandbox_id).await?);
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::explicit_absent(false)]
+#[case::complete_inventory_omission(true)]
+#[tokio::test(flavor = "current_thread")]
+async fn receipt_serializes_with_nonpresent_publication(#[case] omitted: bool) -> TestResult {
+    use std::time::Duration;
+
+    use crate::proto::{
+        PublishNodeStateRequest, PublishedSandboxState, cluster_api_server::ClusterApi,
+    };
+    use crate::published_state::publish_sandbox_states;
+
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let (sandbox_id, node_id) = (SandboxId::new(), NodeId::new());
+    let receipt_id = AutoLifecycleDeleteReceiptId::generate();
+    let attempt = seed_active_sandbox(&db.pool, sandbox_id, node_id, 7).await?;
+    let receipt = completion(
+        receipt_id,
+        sandbox_id,
+        7,
+        attempt,
+        matching_policy_fingerprint(),
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'stopped', managed_by = 'space' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let mut state = PublishedSandboxState {
+        sandbox_id: sandbox_id.to_string(),
+        status: Some("stopped".to_owned()),
+        present: true,
+        ..Default::default()
+    };
+    let mut seed = db.pool.begin().await?;
+    publish_sandbox_states(&mut seed, node_id, std::slice::from_ref(&state)).await?;
+    if omitted {
+        // Make the prune visit its removed-observation CTE before marking the sandbox.
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_snapshot_inventory (sandbox_id, snapshot_id, type, state)
+                          VALUES ($1, 'observed-snapshot', 'disk', 'ready')"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut *seed)
+        .await?;
+    }
+    seed.commit().await?;
+
+    // The receipt has locked the sandbox when it reaches this evidence read.
+    // Park it there until the publisher hits one of the receipt's row locks.
+    let mut gate = db.pool.begin().await?;
+    let gate_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *gate)
+        .await?;
+    sqlx::query(sql!(
+        "LOCK TABLE sandbox_k8s_executions IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(&mut *gate)
+    .await?;
+    let monitor_pool = &db.pool;
+    let wait_for_blocked = |blocker| async move {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(pid) = sqlx::query_scalar::<_, i32>(sql!(
+                    "SELECT pid FROM pg_stat_activity
+                      WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))"
+                ))
+                .bind(blocker)
+                .fetch_optional(monitor_pool)
+                .await?
+                {
+                    return TestResult::Ok(pid);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?
+    };
+    let pool = db.pool.clone();
+    let deleting = tokio::spawn(async move {
+        let mut tx = pool.begin().await?;
+        sqlx::query(sql!("SET LOCAL deadlock_timeout = '1500ms'"))
+            .execute(&mut *tx)
+            .await?;
+        let consumed =
+            consume_auto_lifecycle_delete_completions(&mut tx, node_id, &[receipt]).await?;
+        tx.commit().await?;
+        TestResult::Ok(consumed.acknowledged_receipt_ids)
+    });
+    let receipt_pid = wait_for_blocked(gate_pid).await?;
+
+    state.present = false;
+    let pool = db.pool.clone();
+    let publishing = tokio::spawn(async move {
+        let mut request = tonic::Request::new(PublishNodeStateRequest {
+            node_id: node_id.to_string(),
+            sandboxes: if omitted { vec![] } else { vec![state] },
+            sandbox_inventory_complete: omitted,
+            ..Default::default()
+        });
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
+            });
+        ClusterApi::publish_node_state(&crate::ClusterApiService::new(pool), request).await
+    });
+    wait_for_blocked(receipt_pid).await?;
+    gate.commit().await?;
+
+    let (published, consumed) = tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(publishing, deleting)
+    })
+    .await?;
+    let published = published?;
+    let consumed = consumed?;
+    assert!(
+        published.is_ok(),
+        "publication failed: {published:?}; receipt: {consumed:?}"
+    );
+    assert_eq!(consumed?, vec![receipt_id]);
     assert!(!sandbox_exists(&db.pool, sandbox_id).await?);
     Ok(())
 }
@@ -738,8 +869,13 @@ async fn stale_receipt_does_not_acknowledge_current_same_sandbox_receipt() -> Te
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::sandbox(false)]
+#[case::observation(true)]
 #[tokio::test(flavor = "current_thread")]
-async fn contended_sandbox_lock_defers_without_stalling_publication() -> TestResult {
+async fn contended_row_lock_defers_without_stalling_publication(
+    #[case] observation: bool,
+) -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -755,10 +891,34 @@ async fn contended_sandbox_lock_defers_without_stalling_publication() -> TestRes
         matching_policy_fingerprint(),
     );
     let mut blocker = db.pool.begin().await?;
-    sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
+    if observation {
+        // Model an older publisher's bare row lock, without taking its
+        // advisory lock. Keep the initial observation visible to the receipt.
+        let mut seed = db.pool.begin().await?;
+        crate::published_state::publish_sandbox_states(
+            &mut seed,
+            node_id,
+            &[crate::proto::PublishedSandboxState {
+                sandbox_id: sandbox_id.to_string(),
+                status: Some("started".to_owned()),
+                present: true,
+                ..Default::default()
+            }],
+        )
+        .await?;
+        seed.commit().await?;
+        sqlx::query(sql!(
+            "SELECT 1 FROM sandbox_observed_states WHERE sandbox_id = $1 FOR UPDATE"
+        ))
         .bind(sandbox_id)
         .fetch_one(&mut *blocker)
         .await?;
+    } else {
+        sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox_id)
+            .fetch_one(&mut *blocker)
+            .await?;
+    }
 
     let mut tx = db.pool.begin().await?;
     let consumption = tokio::time::timeout(
@@ -766,7 +926,7 @@ async fn contended_sandbox_lock_defers_without_stalling_publication() -> TestRes
         consume_auto_lifecycle_delete_completions(&mut tx, node_id, &[receipt]),
     )
     .await
-    .expect("receipt consumption must not wait for a contended sandbox row")?;
+    .expect("receipt consumption must not wait for a contended row")?;
     tx.commit().await?;
 
     assert!(consumption.acknowledged_receipt_ids.is_empty());
