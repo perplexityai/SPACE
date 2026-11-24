@@ -64,8 +64,9 @@ impl SandboxController {
         // Serialize admission per sandbox so concurrent API and internal ECW
         // opens cannot both observe the last free slot. Existing desired-open
         // rows remain idempotent and do not consume another slot.
+        // Allow foreign-key checks while this transaction waits on reconciliation.
         let locked_sandbox = sqlx::query_scalar::<_, Uuid>(sql!(
-            "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
+            "SELECT id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
         ))
         .bind(sandbox.id)
         .fetch_optional(&mut *tx)
@@ -702,7 +703,7 @@ impl SandboxController {
         // reconcile enqueue below also locks this row, so updating the port
         // row first would permit an open/close deadlock.
         let locked_sandbox = sqlx::query_scalar::<_, Uuid>(sql!(
-            "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
+            "SELECT id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
         ))
         .bind(sandbox.id)
         .fetch_optional(&mut *tx)
