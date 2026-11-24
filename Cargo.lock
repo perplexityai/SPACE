@@ -5990,6 +5990,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-host-layout",
  "pplx-space-migration-checksums",
+ "pplx-space-node-runtime-manager-store",
  "pplx-space-sbx-mgr-store",
  "pplx-space-sql-locator",
  "pplx-space-sqlite",

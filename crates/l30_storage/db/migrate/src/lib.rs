@@ -12,8 +12,8 @@
 //! whatever crate holds the macro: only the job that applies them should
 //! carry that weight, and no long-running service links this.
 
+use pplx_space_node_runtime_manager_store::database::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use pplx_space_sql_locator::sql;
-use pplx_space_sqlite::runtime_manager::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -389,7 +389,7 @@ async fn run_sqlite(database: SqliteDatabase, args: SqliteArgs) -> Result<(), Ru
     let database = if database.name == "runtime-manager" && !matches!(args.command, Command::Reset)
     {
         SqliteDatabase {
-            migrator: sqlite::runtime_manager::catalog(&database_path)?,
+            migrator: pplx_space_node_runtime_manager_store::database::catalog(&database_path)?,
             ..database
         }
     } else {
