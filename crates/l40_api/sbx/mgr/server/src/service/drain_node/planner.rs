@@ -71,7 +71,7 @@ impl DrainAction {
 pub(super) type DrainFailures = BTreeMap<(String, DrainAction), String>;
 
 /// One row as the planner reads it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DrainRow {
     pub(super) sandbox_id: String,
     /// The lifecycle, and the cleanup that owns the row if one does.
@@ -125,6 +125,18 @@ impl SuspendFrom {
             Self::StartedOrPaused
         }
     }
+
+    /// Whether this suspend applies to a row in `state`.
+    pub(super) fn allows(self, state: Option<SandboxState>) -> bool {
+        matches!(
+            (self, state),
+            (Self::StartedOrPaused, Some(SandboxState::Started))
+                | (
+                    Self::StartedOrPaused | Self::Paused,
+                    Some(SandboxState::Paused)
+                )
+        )
+    }
 }
 
 /// What a pending sandbox waits for. A report gives its kind
@@ -137,6 +149,12 @@ pub(super) enum Wait {
     Queued(DrainAction),
     /// Cache disk room for its suspend's snapshot.
     Disk,
+    /// An activation admitted before the seal, still in flight.
+    Activation,
+    /// A row the plan found finished whose artifacts a writer holds, or
+    /// that changed while the drain read it: planned again on the next
+    /// call.
+    Recheck,
     /// The warm-pool reconciler's eviction of an unclaimed VM.
     WarmPoolEviction,
     /// A state or transition the drain doesn't drive.
@@ -154,9 +172,11 @@ impl Wait {
         match self {
             Self::Hold => crate::proto::DrainWait::Hold,
             Self::Work(_) | Self::Queued(_) | Self::Disk => crate::proto::DrainWait::Moving,
-            Self::WarmPoolEviction | Self::Settle(_) | Self::Stopped => {
-                crate::proto::DrainWait::External
-            }
+            Self::Activation
+            | Self::Recheck
+            | Self::WarmPoolEviction
+            | Self::Settle(_)
+            | Self::Stopped => crate::proto::DrainWait::External,
         }
     }
 
@@ -168,6 +188,8 @@ impl Wait {
                 format!("the drain's {}, waiting for a window slot", action.noun())
             }
             Self::Disk => "the drain's suspend, waiting for cache disk room".to_owned(),
+            Self::Activation => "an activation admitted before the seal is in flight".to_owned(),
+            Self::Recheck => "checked again on the next call".to_owned(),
             Self::WarmPoolEviction => {
                 "an unclaimed warm-pool VM, left to the warm-pool reconciler's eviction".to_owned()
             }
@@ -186,6 +208,8 @@ impl Wait {
             Self::Work(action) => action.as_str().to_owned(),
             Self::Queued(_) => "queued".to_owned(),
             Self::Disk => "disk".to_owned(),
+            Self::Activation => "activation".to_owned(),
+            Self::Recheck => "recheck".to_owned(),
             Self::WarmPoolEviction => "warm_pool_eviction".to_owned(),
             Self::Settle(status) => format!("settle:{}", status.legacy_label()),
             Self::Stopped => "stopped".to_owned(),
@@ -333,6 +357,13 @@ impl PlanInputs {
 }
 
 impl DrainPlan {
+    /// Leave `sandbox_id`, a row this plan found finished, pending to be
+    /// planned again, with why: it is no longer reported evacuated.
+    pub(super) fn recheck(&mut self, sandbox_id: &str, why: &str) {
+        self.evacuated.retain(|(id, _, _)| id != sandbox_id);
+        self.wait(sandbox_id, Wait::Recheck, Some(why.to_owned()));
+    }
+
     fn wait(&mut self, sandbox_id: &str, wait: Wait, reason: Option<String>) {
         self.pending.push(DrainWait {
             sandbox_id: sandbox_id.to_owned(),
@@ -622,6 +653,22 @@ pub(super) fn plan(rows: &[DrainRow], inputs: &PlanInputs) -> DrainPlan {
     }
     plan.start_in_window(rows, inputs, windowed);
     plan
+}
+
+/// What a drain call scans outside the rows: node-manager's orphan inventory
+/// and the cache disk's headroom.
+#[derive(Clone, Debug, Default)]
+pub(super) struct DrainScans {
+    /// Node-wide problems the scans found.
+    pub(super) blocked: Vec<String>,
+    /// node-manager's sandbox directory candidates, by the sandbox they're
+    /// named for. node-manager knows only its slots: a directory whose
+    /// sandbox has a row here is the row's, and the plan accounts for it.
+    pub(super) orphan_dirs: Vec<(String, String)>,
+    /// The bytes of cache disk the drain may commit to new snapshots
+    /// ([`drain_disk_headroom`]); `None` when the node admits cache
+    /// allocations without measuring.
+    pub(super) disk_headroom: Option<u64>,
 }
 
 /// node-manager's orphan inventory, read as the drain needs it.
