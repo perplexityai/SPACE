@@ -2,8 +2,9 @@
 //! SQLite database: what each install or uninstall job did on disk.
 //!
 //! [`database`] migrates and opens the database for
-//! `pplx-space-node-runtime-manager`; its shared `jobs` table is read and
-//! written through `pplx-space-common-jobs`.
+//! `pplx-space-node-runtime-manager`, and gives `pplx-space-db-migrate` its
+//! migration catalog; its shared `jobs` table is read and written through
+//! `pplx-space-common-jobs`.
 
 pub mod database;
 

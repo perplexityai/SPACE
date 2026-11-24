@@ -8,7 +8,6 @@
 //! baseline only shrinks.
 
 pub mod baselines;
-pub mod runtime_manager;
 
 use pplx_space_migration_checksums::AcceptedChecksums;
 use pplx_space_sql_locator::sql;
@@ -42,7 +41,11 @@ pub struct SqliteError {
 }
 
 impl SqliteError {
-    fn context(context: impl Into<String>, source: impl StdError + Send + Sync + 'static) -> Self {
+    /// Wraps `source` so the error displays as `{context}: {source}`.
+    pub fn context(
+        context: impl Into<String>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
         Self {
             context: format!("{}: ", context.into()),
             source: Box::new(source),
