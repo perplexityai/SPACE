@@ -252,3 +252,42 @@ fn firewall_setup_classifier_preserves_transient_and_permanent_sources() {
         .is_transient()
     );
 }
+
+/// In a CNI pod namespace the pod IP is the address on the default route's
+/// interface, not the first address in the namespace.
+#[cfg(target_os = "linux")]
+#[test]
+fn pod_ip_is_the_default_route_interface_address() {
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("requires root to create a network namespace");
+        return;
+    }
+    struct Namespace(String);
+    impl Drop for Namespace {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "delete", &self.0])
+                .status();
+        }
+    }
+    let ns = Namespace(format!("space-test-pod-ip-{}", std::process::id()));
+    let ip = |args: &str| {
+        let status = std::process::Command::new("ip")
+            .args(args.replace("NS", &ns.0).split_whitespace())
+            .status()
+            .unwrap();
+        assert!(status.success(), "ip {args}");
+    };
+    ip("netns add NS");
+    for (link, cidr) in [("other0", "192.0.2.9/24"), ("eth0", "10.244.3.7/24")] {
+        ip(&format!("-n NS link add {link} type dummy"));
+        ip(&format!("-n NS addr add {cidr} dev {link}"));
+        ip(&format!("-n NS link set {link} up"));
+    }
+    ip("-n NS route add default via 10.244.3.1 dev eth0");
+
+    assert_eq!(
+        super::pod_ipv4(&ns.0).unwrap(),
+        "10.244.3.7".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+}

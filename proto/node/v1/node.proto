@@ -595,6 +595,10 @@ message AllocateResponse {
   string slot_label = 9;
   // Slot-derived UID that owns lease-scoped host resources.
   uint32 sandbox_uid = 10;
+  // IPv4 address of the default-route interface in the request's netns_path:
+  // the address CNI assigned to the pod. Absent without a netns_path or when
+  // the node manager could not read it.
+  optional string pod_ip = 11;
 }
 
 message LaunchRequest {

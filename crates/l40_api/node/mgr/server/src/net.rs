@@ -831,6 +831,12 @@ fn get_default_iface_in_ns(ns: &str) -> Result<String, DefaultIfaceError> {
     native::default_iface(Some(ns))
 }
 
+/// The IPv4 address of `ns`'s default-route interface: in a CNI pod
+/// namespace, the address CNI assigned to the pod.
+pub fn pod_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
+    native::default_iface_ipv4(ns)
+}
+
 /// Return the ingress interface to bind host-port DNAT rules to.
 ///
 /// In Kubernetes/CNI mode the DNAT rule lives in the pod namespace, so the

@@ -13,6 +13,7 @@ use futures_util::stream::TryStreamExt;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, setns, unshare};
 use rtnetlink::packet_route::AddressFamily;
+use rtnetlink::packet_route::address::AddressAttribute;
 use rtnetlink::packet_route::link::LinkAttribute;
 use rtnetlink::packet_route::neighbour::NeighbourState;
 use rtnetlink::packet_route::route::{
@@ -485,23 +486,10 @@ pub fn default_iface(ns: Option<&str>) -> Result<String, DefaultIfaceError> {
     let read = || {
         block_on_netlink(async move {
             with_handle(|handle| async move {
-                let route = RouteMessageBuilder::<Ipv4Addr>::new().build();
-                let mut routes = handle.route().get(route).execute();
-                while let Some(route) = routes
-                    .try_next()
-                    .await
-                    .map_err(|e| format!("failed to dump routes: {e}"))?
-                {
-                    if route.header.destination_prefix_length != 0 {
-                        continue;
-                    }
-                    if let Some(index) = route.attributes.iter().find_map(route_oif) {
-                        return link_name_by_index(&handle, index).await?.ok_or_else(|| {
-                            format!("default route output interface {index} not found")
-                        });
-                    }
-                }
-                Err("default network interface not found".to_string())
+                let index = default_route_oif(&handle).await?;
+                link_name_by_index(&handle, index)
+                    .await?
+                    .ok_or_else(|| format!("default route output interface {index} not found"))
             })
             .await
         })
@@ -512,6 +500,56 @@ pub fn default_iface(ns: Option<&str>) -> Result<String, DefaultIfaceError> {
     } else {
         read().map_err(DefaultIfaceError::Other)
     }
+}
+
+pub fn default_iface_ipv4(ns: &str) -> Result<Ipv4Addr, DefaultIfaceError> {
+    run_in_netns(ns, || {
+        block_on_netlink(async move {
+            with_handle(|handle| async move {
+                let index = default_route_oif(&handle).await?;
+                let mut addresses = handle
+                    .address()
+                    .get()
+                    .set_link_index_filter(index)
+                    .execute();
+                while let Some(address) = addresses
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("failed to dump addresses of link {index}: {e}"))?
+                {
+                    if let Some(ip) = address.attributes.iter().find_map(|attr| match attr {
+                        AddressAttribute::Address(IpAddr::V4(ip)) => Some(*ip),
+                        _ => None,
+                    }) {
+                        return Ok(ip);
+                    }
+                }
+                Err(format!(
+                    "default route output interface {index} has no IPv4 address"
+                ))
+            })
+            .await
+        })
+        .map_err(DefaultIfaceError::Other)
+    })
+}
+
+async fn default_route_oif(handle: &Handle) -> Result<u32, String> {
+    let route = RouteMessageBuilder::<Ipv4Addr>::new().build();
+    let mut routes = handle.route().get(route).execute();
+    while let Some(route) = routes
+        .try_next()
+        .await
+        .map_err(|e| format!("failed to dump routes: {e}"))?
+    {
+        if route.header.destination_prefix_length != 0 {
+            continue;
+        }
+        if let Some(index) = route.attributes.iter().find_map(route_oif) {
+            return Ok(index);
+        }
+    }
+    Err("default network interface not found".to_string())
 }
 
 pub fn ns_exists(name: &str) -> bool {
