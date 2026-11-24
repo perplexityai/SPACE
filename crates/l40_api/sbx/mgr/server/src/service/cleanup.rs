@@ -1991,22 +1991,22 @@ impl SandboxManagerService {
             .update_network_counters(sandbox_id, network_tx_bytes, network_rx_bytes)
             .await;
 
-        {
-            let Ok(db) = self.db_conn() else {
-                return fallback;
-            };
-            if let Err(error) = crate::db::update_network_counters(
+        // Persisting the counters is best effort: they only rise, so a write
+        // skipped while the database is busy is made by a later poll. A
+        // stats poll never waits for the database lock here.
+        if let Ok(db) = self.db.try_lock()
+            && let Err(error) = crate::db::update_network_counters(
                 &db,
                 sandbox_id,
                 network_tx_bytes,
                 network_rx_bytes,
-            ) {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    %error,
-                    "failed to persist live net-gateway counters"
-                );
-            }
+            )
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %error,
+                "failed to persist live net-gateway counters"
+            );
         }
 
         NetGatewayStatsSnapshot {
