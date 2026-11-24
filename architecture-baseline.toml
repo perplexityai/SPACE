@@ -17,7 +17,7 @@
 "crates/l40_api/api/src/routes/admin/templates.rs" = 1
 "crates/l40_api/api/src/routes/public/sandboxes.rs" = 1
 "crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 1
-"crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
+"crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 3
 "crates/l40_api/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
 "crates/l40_api/internal/api/server/src/lib.rs" = 1
 "crates/l40_api/internal/api/server/src/published_state.rs" = 2

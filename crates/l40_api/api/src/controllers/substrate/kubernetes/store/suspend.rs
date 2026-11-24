@@ -11,30 +11,18 @@ impl K8sStore {
         expected_pod_uid: &PodUid,
         published_artifact: super::super::super::PublishedLocalArtifact,
     ) -> Result<(), SubstrateError> {
-        let artifact_id = published_artifact.id.as_uuid();
-        let artifact_kind = published_artifact.kind.as_str();
-        let artifact_origin = ArtifactOrigin::Suspend.as_str();
         let mut tx = self
             .pool
             .begin()
             .await
             .db_context("failed to start suspended pod transaction")?;
 
-        let lifecycle = sqlx::query_scalar::<_, String>(sql!(
-            "SELECT lifecycle
-              FROM sandboxes
-              WHERE id = $1
-                AND lifecycle IN ('suspending', 'suspended')
-                AND current_local_artifact_id = $2
-                AND current_local_artifact_kind = $3
-                AND current_local_artifact_origin = $4
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(artifact_id)
-        .bind(artifact_kind)
-        .bind(artifact_origin)
-        .fetch_optional(&mut *tx)
+        let lifecycle = pplx_space_sandbox_store::suspend::lock_committed_artifact(
+            &mut tx,
+            sandbox_id,
+            published_artifact.id,
+            published_artifact.kind,
+        )
         .await
         .db_context("failed to lock suspend artifact for pod retirement")?;
         let Some(lifecycle) = lifecycle else {
@@ -125,17 +113,10 @@ impl K8sStore {
             .begin()
             .await
             .db_context("failed to start Kubernetes suspend commit transaction")?;
-        let sandbox_exists = sqlx::query_scalar::<_, Uuid>(sql!(
-            "SELECT id
-               FROM sandboxes
-              WHERE id = $1
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(&mut *tx)
-        .await
-        .db_context("failed to lock sandbox for Kubernetes suspend commit")?
-        .is_some();
+        let sandbox_exists = pplx_space_sandbox_store::row_locks::lock_id(&mut tx, sandbox_id)
+            .await
+            .db_context("failed to lock sandbox for Kubernetes suspend commit")?
+            .is_some();
         if !sandbox_exists {
             return Err(SubstrateError::Unavailable {
                 message: "sandbox disappeared before its suspend commit was persisted".to_string(),

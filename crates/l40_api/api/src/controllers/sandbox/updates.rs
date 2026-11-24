@@ -5,7 +5,6 @@ use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, S
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
 use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
-use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::ReconcileReason;
 
 /// `UpdateSandboxRequest` has no spelling for "clear this override and
@@ -768,13 +767,9 @@ impl SandboxController {
                     .map_err(|error| db_contention_error("begin timeout intent", &error))?;
                 // Lock separately from the joined read: after waiting for an
                 // activation's row lock, READ COMMITTED must see its new claim.
-                let locked = sqlx::query_scalar::<_, SandboxId>(sql!(
-                    "SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"
-                ))
-                .bind(sandbox.id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|error| db_contention_error("lock timeout intent", &error))?;
+                let locked = sandbox_store::row_locks::lock_id(&mut tx, sandbox.id)
+                    .await
+                    .map_err(|error| db_contention_error("lock timeout intent", &error))?;
                 if locked.is_none() {
                     return Err(ControllerError::not_found("sandbox no longer exists"));
                 }

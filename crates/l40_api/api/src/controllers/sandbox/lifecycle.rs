@@ -184,22 +184,20 @@ async fn begin_delete_against_active_fork(
     if active_fork {
         return Err(fork_in_progress_conflict());
     }
-    let previous_lifecycle = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut *guard)
-    .await
-    .map_err(|error| db_contention_error("failed to read sandbox lifecycle before delete", &error))?
-    .map(|lifecycle| {
-        lifecycle
-            .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
-            .map_err(|error| {
-                tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
-                ControllerError::internal("sandbox has invalid lifecycle")
-            })
-    })
-    .transpose()?;
+    let previous_lifecycle = sandbox_store::row_locks::lock_lifecycle(&mut guard, sandbox_id)
+        .await
+        .map_err(|error| {
+            db_contention_error("failed to read sandbox lifecycle before delete", &error)
+        })?
+        .map(|lifecycle| {
+            lifecycle
+                .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
+                .map_err(|error| {
+                    tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
+                    ControllerError::internal("sandbox has invalid lifecycle")
+                })
+        })
+        .transpose()?;
     mark_deleting(&mut guard, sandbox_id)
         .await
         .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;

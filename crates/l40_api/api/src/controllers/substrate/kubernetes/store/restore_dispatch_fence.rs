@@ -114,16 +114,11 @@ impl K8sStore {
             .begin()
             .await
             .db_context("failed to start restore dispatch transaction")?;
-        let owned: Option<bool> = sqlx::query_scalar(sql!(
-            "SELECT LOWER(TRIM(lifecycle)) = 'restoring'
-                    AND restore_lease_token IS NOT DISTINCT FROM $2
-               FROM sandboxes
-              WHERE id = $1
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(restore_lease_token)
-        .fetch_optional(&mut *tx)
+        let owned = restore_dispatch_fence::lock_dispatch_ownership(
+            &mut tx,
+            sandbox_id,
+            restore_lease_token,
+        )
         .await
         .db_context("failed to lock sandbox for restore dispatch")?;
         if owned != Some(true) {

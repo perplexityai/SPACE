@@ -548,9 +548,7 @@ impl K8sStore {
     ) -> Result<bool, SubstrateError> {
         // Multi-row execution mutations lock the sandbox before execution
         // rows so concurrent creation and cleanup cannot cycle.
-        sqlx::query_scalar::<_, Uuid>(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
-            .bind(sandbox_id)
-            .fetch_optional(conn)
+        pplx_space_sandbox_store::row_locks::lock_id(conn, sandbox_id)
             .await
             .map(|row| row.is_some())
             .db_context("failed to lock sandbox row for Kubernetes execution")
@@ -560,13 +558,10 @@ impl K8sStore {
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
     ) -> Result<Option<SandboxLifecycle>, SubstrateError> {
-        let lifecycle: Option<String> = sqlx::query_scalar(sql!(
-            "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .fetch_optional(conn)
-        .await
-        .db_context("failed to lock sandbox for execution materialization")?;
+        let lifecycle: Option<String> =
+            pplx_space_sandbox_store::row_locks::lock_lifecycle(conn, sandbox_id)
+                .await
+                .db_context("failed to lock sandbox for execution materialization")?;
         lifecycle
             .map(|lifecycle| {
                 lifecycle
@@ -977,14 +972,11 @@ impl K8sStore {
         sandbox_id: SandboxId,
         restore_lease_token: Option<Uuid>,
     ) -> Result<bool, SubstrateError> {
-        let current_token = sqlx::query_scalar::<_, Option<Uuid>>(sql!(
-            "SELECT restore_lease_token FROM sandboxes WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .db_context("failed to lock sandbox for create claim cleanup")?
-        .flatten();
+        let current_token =
+            pplx_space_sandbox_store::restore_lease::lock_restore_lease_token(&mut *tx, sandbox_id)
+                .await
+                .db_context("failed to lock sandbox for create claim cleanup")?
+                .flatten();
         Ok(match restore_lease_token {
             Some(expected) => current_token == Some(expected),
             None => true,

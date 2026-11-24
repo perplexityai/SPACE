@@ -62,10 +62,14 @@
 //!   module named for that path (as [`fork_source_lifecycle`] is for its
 //!   advisory lock, [`snapshot_retention_claim`] for retention's claim,
 //!   [`snapshot_retention_finalize`] for its finalizer's row lock,
-//!   [`ready_suspend_projection`] for the published suspend projection, and
-//!   [`sweeper::lock_placement_changed_at`] for the sweeper's revert). The
-//!   caller keeps its transaction, its lock settings and errors, and the
-//!   re-checks it runs under the lock.
+//!   [`ready_suspend_projection`] for the published suspend projection,
+//!   [`sweeper::lock_placement_changed_at`] for the sweeper's revert,
+//!   [`restore_lease::lock_restore_claim`] for the restore revert,
+//!   [`restore_lease::lock_restore_lease_token`] for the create-claim
+//!   cleanup, [`restore_dispatch_fence::lock_dispatch_ownership`] for the
+//!   restore's Wake dispatch and [`suspend::lock_committed_artifact`] for
+//!   the suspend's pod retirement). The caller keeps its transaction, its
+//!   lock settings and errors, and the re-checks it runs under the lock.
 //! * **The node-local SQLite `sandboxes` table** (`crates/l30_storage/sbx/mgr/store`) is a
 //!   different database on a different machine and is out of scope.
 //!
