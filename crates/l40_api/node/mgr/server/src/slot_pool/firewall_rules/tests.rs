@@ -93,6 +93,21 @@ pub(crate) fn busy(pool: &Arc<NetworkPool>, slot_id: u32) -> impl Send {
     SlotGuard::try_acquire(pool, slot_id).unwrap()
 }
 
+/// Poisons the pool's store lock, so every read of it fails.
+pub(crate) fn poison(pool: &Arc<NetworkPool>) {
+    let pool = pool.clone();
+    std::thread::spawn(move || {
+        let _db = pool.db.lock().unwrap();
+        panic!("injected pool store poison");
+    })
+    .join()
+    .unwrap_err();
+}
+
+pub(crate) fn heal(pool: &NetworkPool) {
+    pool.db.clear_poison();
+}
+
 /// How the fake nft departs from a healthy one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Fault {
@@ -123,7 +138,8 @@ pub(crate) struct FakeHost {
     links: TempDir,
     fault: Option<Fault>,
     pub(crate) tables: Mutex<HashMap<NamespaceIdentity, Vec<Value>>>,
-    installs: Mutex<Vec<NamespaceIdentity>>,
+    /// Each install's namespace and the table it submitted.
+    installs: Mutex<Vec<(NamespaceIdentity, Vec<Value>)>>,
     calls: Mutex<Vec<NamespaceIdentity>>,
     /// Fired once, after the next lookup.
     pub(crate) looked_up: Hook,
@@ -157,6 +173,11 @@ impl FakeHost {
     }
 
     pub(crate) fn installs(&self) -> Vec<NamespaceIdentity> {
+        let installs = self.installs.lock().unwrap();
+        installs.iter().map(|(namespace, _)| *namespace).collect()
+    }
+
+    pub(crate) fn submissions(&self) -> Vec<(NamespaceIdentity, Vec<Value>)> {
         self.installs.lock().unwrap().clone()
     }
 
@@ -169,9 +190,13 @@ impl FakeHost {
         let namespace = identity(netns.metadata()).unwrap();
         self.calls.lock().unwrap().push(namespace);
         if args == ["-j", "-f", "-"] {
-            self.installs.lock().unwrap().push(namespace);
+            let table = added(stdin);
+            self.installs
+                .lock()
+                .unwrap()
+                .push((namespace, table.clone()));
             if self.fault != Some(Fault::Drops) {
-                self.tables.lock().unwrap().insert(namespace, added(stdin));
+                self.tables.lock().unwrap().insert(namespace, table);
             }
             fire(&self.installed);
             return match self.fault {
@@ -324,8 +349,8 @@ fn only_healthy_ready_or_leased_slots_are_eligible() {
     assert_eq!(passed, expected);
 }
 
-// Catches nft run, ownership skipped or kept, the assignment read early, or
-// work started during shutdown.
+// Catches nft run, ownership skipped or kept, the assignment read early or
+// after the target checks, or work started during shutdown.
 #[tokio::test]
 async fn refusals_never_run_nft() {
     let (pool, _jobs) = pool(1);
@@ -372,8 +397,17 @@ async fn refusals_never_run_nft() {
     let current = SlotTarget {
         slot_generation: 2,
         sandbox_id: Some("sandbox-0".into()),
-        namespace: host.name(0, "uts"),
+        namespace: Some(host.name(0, "uts")),
     };
+    // Superseded work reads not current, even for a target that changed since.
+    let replaced = SlotTarget {
+        slot_generation: 1,
+        ..current.clone()
+    };
+    assert!(matches!(
+        apply_expecting(&pool, &store, &host, 11, 0, Some(replaced)).await,
+        SlotFirewallReport::NotRun(NotRun::Assignment(NotRunnable::NotCurrent { accepted: 12 }))
+    ));
     for expected in [
         SlotTarget {
             slot_generation: 1,
@@ -384,7 +418,7 @@ async fn refusals_never_run_nft() {
             ..current.clone()
         },
         SlotTarget {
-            namespace: net,
+            namespace: Some(net),
             ..current
         },
     ] {
