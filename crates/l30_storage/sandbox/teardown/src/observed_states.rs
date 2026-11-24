@@ -1,9 +1,14 @@
 //! `sandbox_observed_states`: the last state a node published for each
 //! sandbox it reports, overlaid on the row's lifecycle by status reads.
 //!
-//! Node publications write these rows ([`crate::direct::observed_publication`]
-//! has the publication's inserts), and not every writer is in this crate yet.
-//! [`crate::delete::delete_with_dependents`] removes them with the row.
+//! Node publications write these rows ([`crate::direct`] has the
+//! publication's upserts), and not every writer is in this crate yet:
+//! sandbox-store's pause-failed recovery
+//! (`ingest::recover_published_pause_failed`) and census prune
+//! (`ingest::prune_census_absent_sandboxes`), whose single statements also
+//! write `sandboxes`, still write them where they are.
+//! `pplx_space_sandbox_store::delete::delete_with_dependents` removes them with
+//! the row through [`delete`].
 //! [`delete`] is the unguarded delete, run on the executor its caller passes.
 //! [`clear_failed_observation`] is the narrower step the failed-row repair
 //! and the pod-less drain give-up run after their own guarded transition.
@@ -26,7 +31,11 @@ use sqlx::types::{Json, JsonValue};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::SandboxStoreError;
+/// The nullable `spaced_version` column shared by sandbox observation queries.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ObservedSpacedVersion {
+    pub spaced_version: Option<pplx_space_semver::SemVer>,
+}
 
 /// One sandbox's observed state with the registration of the node that
 /// published it, as [`get_with_node`] reads it. `node_id` is the
@@ -108,7 +117,8 @@ pub async fn get_with_node(
 /// Drop the observed states `node_id` published for those of `sandbox_ids`
 /// (an observed projection): the sandboxes a node's publication lists as no
 /// longer present. A row another node published is kept. Returns the rows
-/// deleted.
+/// deleted. The deleted rows' `sandbox_snapshot_inventory` rows go with them,
+/// through that table's foreign-key cascade.
 pub async fn delete_absent_on_node(
     executor: impl PgExecutor<'_>,
     node_id: NodeId,
@@ -206,17 +216,15 @@ pub async fn record_network_policy_authority(
 }
 
 /// The newest observed-row id; `None` when the table is empty.
-pub async fn newest(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Option<Uuid>, SandboxStoreError> {
-    Ok(sqlx::query_scalar(sql!(
+pub async fn newest(executor: impl sqlx::PgExecutor<'_>) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
         "SELECT sandbox_id
              FROM sandbox_observed_states
              ORDER BY sandbox_id DESC
              LIMIT 1"
     ))
     .fetch_optional(executor)
-    .await?)
+    .await
 }
 
 /// Up to `limit` observed-row ids in `(after, through]`, ascending, from a
@@ -227,8 +235,8 @@ pub async fn window(
     after: Uuid,
     through: Uuid,
     limit: i64,
-) -> Result<Vec<Uuid>, SandboxStoreError> {
-    Ok(sqlx::query_scalar(sql!(
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
         "SELECT sandbox_id
              FROM sandbox_observed_states
              WHERE sandbox_id > $1
@@ -240,7 +248,7 @@ pub async fn window(
     .bind(through)
     .bind(limit)
     .fetch_all(executor)
-    .await?)
+    .await
 }
 
 /// The sandboxes nodes report that have no `sandboxes` row.
@@ -296,3 +304,6 @@ pub async fn last_published_execution(
     .fetch_optional(executor)
     .await
 }
+
+#[cfg(test)]
+mod tests;

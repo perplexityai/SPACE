@@ -7,7 +7,7 @@ use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 
-use crate::ObservedSpacedVersion;
+use pplx_space_sandbox_teardown::observed_states::ObservedSpacedVersion;
 
 const DELETED_LIFECYCLE: &str = "deleted";
 

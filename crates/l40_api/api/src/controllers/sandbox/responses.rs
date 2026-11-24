@@ -373,7 +373,7 @@ pub(super) async fn fetch_sandbox_observed_states(
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let rows = sandbox_store::direct::observed_reads::observed_states(
+    let rows = pplx_space_sandbox_teardown::direct::observed_reads::observed_states(
         pool,
         ids,
         ReconcileFacet::NetworkPolicy.as_str(),
@@ -390,7 +390,7 @@ pub(super) async fn fetch_observed_only_sandboxes(
     pool: &PgPool,
     known_ids: &[SandboxId],
 ) -> Result<Vec<SandboxObservedState>, ControllerError> {
-    sandbox_store::direct::observed_reads::observed_only(
+    pplx_space_sandbox_teardown::direct::observed_reads::observed_only(
         pool,
         known_ids,
         ReconcileFacet::NetworkPolicy.as_str(),

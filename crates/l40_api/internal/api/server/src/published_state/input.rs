@@ -1,7 +1,7 @@
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
-use pplx_space_sandbox_store::direct::observed_publication::PublishedObservedState;
+use pplx_space_sandbox_teardown::direct::observed_publication::PublishedObservedState;
 use uuid::Uuid;
 
 use super::ArtifactComponentProjection;

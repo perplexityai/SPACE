@@ -62,7 +62,7 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     )
     .await?;
     quarantine_recovery::retire_recovered_execution(&mut *tx, expected.execution_id).await?;
-    pplx_space_sandbox_store::observed_states::delete(&mut *tx, expected.sandbox_id).await?;
+    pplx_space_sandbox_teardown::observed_states::delete(&mut *tx, expected.sandbox_id).await?;
     pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
         &mut *tx,
         expected.sandbox_id,
