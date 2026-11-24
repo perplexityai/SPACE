@@ -131,19 +131,31 @@ async fn shutdown_cannot_release_while_cleanup_spawned_by_abort_is_pending() {
         }
     }
 
-    let mut tasks = ReconcilerTasks::default();
-    let (finish_cleanup, cleanup) = oneshot::channel();
-    let (started, ready) = oneshot::channel();
-    tasks.spawn(async move {
-        let _cleanup = SpawnCleanupOnDrop(Some(cleanup));
-        started.send(()).unwrap();
-        pending::<()>().await;
-    });
-    ready.await.unwrap();
+    for poll_before_abort in [true, false] {
+        let mut tasks = ReconcilerTasks::default();
+        let (finish_cleanup, cleanup) = oneshot::channel();
+        let cleanup = SpawnCleanupOnDrop(Some(cleanup));
+        let (started, ready) = oneshot::channel();
+        tasks.spawn(async move {
+            let _cleanup = cleanup;
+            started.send(()).unwrap();
+            pending::<()>().await;
+        });
+        if poll_before_abort {
+            ready.await.unwrap();
+        } else {
+            // This runtime has one thread: the spawned future cannot have been polled.
+            tasks.loops.abort_all();
+        }
 
-    assert_eq!(tasks.stop().await, ShutdownOutcome::StopUnconfirmed);
-    let _ = finish_cleanup.send(());
-    tasks.join().await;
+        assert_eq!(
+            tasks.stop().await,
+            ShutdownOutcome::StopUnconfirmed,
+            "parent polled before abort: {poll_before_abort}"
+        );
+        let _ = finish_cleanup.send(());
+        tasks.join().await;
+    }
 }
 
 #[test]

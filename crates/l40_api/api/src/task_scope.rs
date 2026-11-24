@@ -11,8 +11,9 @@ tokio::task_local! {
 }
 
 /// Scope a task so its background work is counted by the caller's tracker.
-pub async fn scope<T>(tracker: TaskTracker, future: impl Future<Output = T>) -> T {
-    TRACKER.scope(tracker, future).await
+/// Build the scope now so it is also active when an unpolled task is dropped.
+pub fn scope<T>(tracker: TaskTracker, future: impl Future<Output = T>) -> impl Future<Output = T> {
+    TRACKER.scope(tracker, future)
 }
 
 /// Count a child with the current tracker, including any background tasks the
