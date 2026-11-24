@@ -43,6 +43,27 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn port_enqueue_and_pending_backup_publication_do_not_deadlock() -> TestResult {
+        race_port_reconciliation_with_pending_backup(PortOperation::Enqueue).await
+    }
+
+    #[tokio::test]
+    async fn port_open_and_pending_backup_publication_do_not_deadlock() -> TestResult {
+        race_port_reconciliation_with_pending_backup(PortOperation::Open).await
+    }
+
+    #[tokio::test]
+    async fn port_close_and_pending_backup_publication_do_not_deadlock() -> TestResult {
+        race_port_reconciliation_with_pending_backup(PortOperation::Close).await
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PortOperation {
+        Enqueue,
+        Open,
+        Close,
+    }
+
+    async fn race_port_reconciliation_with_pending_backup(operation: PortOperation) -> TestResult {
         use pplx_space_internal_api_server::{
             ClusterApiService,
             proto::{
@@ -51,6 +72,11 @@ mod postgres_tests {
             },
         };
         use pplx_space_sbx_mgr_client::proto::{ArtifactKind, PendingLocalBackup};
+
+        use crate::controllers::{
+            sandbox::{SandboxController, fetch_sandbox},
+            substrate::{Substrate, direct::DirectSubstrate},
+        };
 
         async fn waiter(pool: &PgPool, blocker_pid: i32) -> TestResult<i32> {
             Ok(tokio::time::timeout(Duration::from_secs(5), async {
@@ -88,6 +114,12 @@ mod postgres_tests {
             .execute(pool)
             .await?;
         }
+        let sandbox = fetch_sandbox(pool, sandbox_id)
+            .await?
+            .ok_or("missing sandbox fixture")?;
+        // The port handlers only write database intent; the substrate is not called.
+        let controller =
+            SandboxController::new(Substrate::from_direct(DirectSubstrate::new(pool.clone())));
 
         let server = ClusterApiService::new(pool.clone());
         let census = |ids: &[SandboxId], pending_local_backups| {
@@ -151,13 +183,30 @@ mod postgres_tests {
         );
         let race = async {
             let publisher_pid = waiter(pool, gate_pid).await?;
-            let refs = [ReconcileRef::sandbox_desired_state(sandbox_id)];
-            let enqueue = enqueue_sandbox_reconcile_and_trigger(
-                pool,
-                sandbox_id,
-                &refs,
-                ReconcileReason::SandboxPortExposureUpdated,
-            );
+            let enqueue = async {
+                match operation {
+                    PortOperation::Enqueue => enqueue_sandbox_reconcile_and_trigger(
+                        pool,
+                        sandbox_id,
+                        &[ReconcileRef::sandbox_desired_state(sandbox_id)],
+                        ReconcileReason::SandboxPortExposureUpdated,
+                    )
+                    .await
+                    .map_err(|error| format!("{error:?}"))?
+                    .map(|_| ())
+                    .ok_or_else(|| "sandbox has no placement".to_owned()),
+                    PortOperation::Open => controller
+                        .open_sandbox_port(pool, &sandbox, 8080, None, None, "api")
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| format!("{error:?}")),
+                    PortOperation::Close => controller
+                        .close_sandbox_port(pool, &sandbox, 8080, None)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| format!("{error:?}")),
+                }
+            };
             let resume = async {
                 waiter(pool, publisher_pid).await?;
                 gate.rollback().await?;
@@ -173,8 +222,8 @@ mod postgres_tests {
         .await?;
         let enqueue = enqueue?;
         assert!(
-            publish.is_ok() && matches!(enqueue, Ok(Some(_))),
-            "publish={publish:?}, port enqueue={enqueue:?}"
+            publish.is_ok() && enqueue.is_ok(),
+            "publish={publish:?}, port {operation:?}={enqueue:?}"
         );
         let mirrored = sqlx::query_scalar::<_, Uuid>(sql!(
             "SELECT artifact_id FROM node_local_backup_pending WHERE sandbox_id = $1"
