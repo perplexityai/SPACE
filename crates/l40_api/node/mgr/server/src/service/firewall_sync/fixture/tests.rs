@@ -25,6 +25,7 @@ use crate::slot_pool::{
     SlotStoreError,
 };
 
+mod delivery;
 mod linux;
 mod observe;
 
