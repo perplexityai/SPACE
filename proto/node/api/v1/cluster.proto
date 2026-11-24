@@ -1568,13 +1568,15 @@ message ReportFirewallRulesRequest {
   string revision_id = 4;
   // The worker's node-manager incarnation.
   optional uint64 manager_epoch = 5;
+  // COMPLETE exactly when `census_gaps` is empty and `extra_namespaces` is 0.
   FirewallRulesCensus census = 6;
-  // At most 32768, in any order; empty exactly when `census` is COMPLETE. A
-  // worker with more gaps, which only stray namespaces can cause, lists the
-  // first 32767 it keeps and one TRUNCATED gap counting the rest.
+  // In any order, each at most once, and at most one per slot ID: no more
+  // than 3 past the number of `slots`.
   repeated FirewallRulesCensusGap census_gaps = 7;
   // At most 16384, each slot ID once, in any order.
   repeated FirewallRulesSlotEvidence slots = 8;
+  // How many managed namespaces no slot accounts for, at most 1048576.
+  optional uint64 extra_namespaces = 9;
 }
 
 // Whether the worker accounted for every managed namespace. INCOMPLETE with
@@ -1586,11 +1588,13 @@ enum FirewallRulesCensus {
 }
 
 message FirewallRulesCensusGap {
+  // Retired before any worker sent it; keep its number and name reserved.
+  reserved 3;
+  reserved "omitted";
+
   FirewallRulesCensusGapKind kind = 1;
   // Set exactly for MISSING and UNREAD.
   optional uint32 slot_id = 2;
-  // Set exactly for TRUNCATED: how many gaps the list omits, above 0.
-  optional uint64 omitted = 3;
 }
 
 enum FirewallRulesCensusGapKind {
@@ -1605,11 +1609,10 @@ enum FirewallRulesCensusGapKind {
   FIREWALL_RULES_CENSUS_GAP_KIND_MISSING = 4;
   // An eligible slot wasn't read at its final lifecycle.
   FIREWALL_RULES_CENSUS_GAP_KIND_UNREAD = 5;
-  // A managed namespace no slot accounts for; one gap per namespace.
-  FIREWALL_RULES_CENSUS_GAP_KIND_EXTRA = 6;
-  // The list omits `omitted` gaps. At most once, with no slot_id, and only in
-  // an INCOMPLETE census; its position in the list doesn't matter.
-  FIREWALL_RULES_CENSUS_GAP_KIND_TRUNCATED = 7;
+  // Retired before any worker sent them, EXTRA for the request's
+  // `extra_namespaces`; keep their numbers and names reserved.
+  reserved 6, 7;
+  reserved "FIREWALL_RULES_CENSUS_GAP_KIND_EXTRA", "FIREWALL_RULES_CENSUS_GAP_KIND_TRUNCATED";
 }
 
 message FirewallRulesSlotEvidence {

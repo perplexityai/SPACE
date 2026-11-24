@@ -381,8 +381,11 @@ async fn any_failure_rolls_back_the_whole_opening() -> TestResult {
 /// Catches a round numbered from only the pending or only the accepted round,
 /// which reissues a number a delayed answer may still carry; an accepted
 /// report a new round overwrites; a round returned as already open for
-/// another generation; and an unbound round, left from before rounds named
-/// their generation, that's returned or refused rather than replaced.
+/// another generation; a round for this generation that no report can answer
+/// any more returned, or replaced while it still can be, which the opener and
+/// acceptance must judge by one limit; and an unbound round, left from before
+/// rounds named their generation, that's returned or refused rather than
+/// replaced.
 #[tokio::test(flavor = "current_thread")]
 async fn each_new_question_takes_a_new_round() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -413,7 +416,42 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
         (2, Some(generation))
     );
 
-    // Round 2 is still pending when the next rollout assigns the node anew.
+    // Round 2 aged to just inside the report age limit, then to it, on the
+    // database clock. Once expired it's replaced, with a wakeup.
+    let age = |age: Duration| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(sql!(
+                "UPDATE firewall_rules_node_observations
+                 SET pending_round_issued_at = clock_timestamp() - make_interval(secs => $2)
+                 WHERE node_id = $1"
+            ))
+            .bind(node)
+            .bind(age.as_secs_f64())
+            .execute(&pool)
+            .await?;
+            TestResult::Ok(())
+        }
+    };
+    age(REPORT_MAX_AGE - Duration::from_secs(1)).await?;
+    let answerable = effects(&db.pool, first, node).await?;
+    assert!(matches!(
+        open_with(&db.pool, &target, Queue::Wake).await?,
+        Opening::AlreadyOpen(PendingRound { round: 2, .. })
+    ));
+    assert_eq!(effects(&db.pool, first, node).await?, answerable);
+    age(REPORT_MAX_AGE).await?;
+    let start = clock(&db.pool).await?;
+    let reopened = opened(&db.pool, &target).await?;
+    assert_eq!(asked(reopened), (3, Some(generation)));
+    assert!(reopened.issued_at >= start, "{reopened:?}");
+    let trigger = |effects: Effects| effects.trigger.map(|t| t.1);
+    assert_eq!(
+        trigger(effects(&db.pool, first, node).await?),
+        trigger(answerable).map(|generation| generation + 1)
+    );
+
+    // Round 3 is still pending when the next rollout assigns the node anew.
     assert!(requeue(&db.pool, &target, &RELEASE).await?);
     set_phase(&db.pool, first, "completed").await?;
     let next = rollout(&db.pool, "rolling").await?;
@@ -422,10 +460,10 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     let generation = issued(&db.pool, &target).await?.assignment_generation;
     assert_eq!(
         asked(opened(&db.pool, &target).await?),
-        (3, Some(generation))
+        (4, Some(generation))
     );
 
-    // Round 3 unbound, as 20261123200458's down and up leave a round. The
+    // Round 4 unbound, as 20261123200458's down and up leave a round. The
     // migration that then requires a generation won't apply over one, so its
     // check is dropped first where the schema has it.
     sqlx::query(sql!(
@@ -443,7 +481,7 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
     .await?;
     assert_eq!(
         asked(opened(&db.pool, &target).await?),
-        (4, Some(generation))
+        (5, Some(generation))
     );
 
     assert_eq!(accepted(effects(&db.pool, next, node).await?), evidence);

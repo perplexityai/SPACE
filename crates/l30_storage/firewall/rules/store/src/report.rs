@@ -11,20 +11,30 @@ use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sql_locator::sql;
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
 use sqlx::{Connection, PgConnection};
 
 use crate::{RevisionId, roll_back};
 
+/// How long after its round was issued, on the database clock, a report may
+/// be accepted. It covers wake delivery, fetch, observation and report. A
+/// round this old can't be answered, so [`open_round`](crate::open_round)
+/// replaces it rather than return it.
+pub const REPORT_MAX_AGE: Duration = Duration::from_secs(300);
+
 /// Most slots one report may describe: one past node-mgr's largest pool,
 /// `MAX_IPV4_NETWORK_SLOTS`.
 const MAX_REPORT_SLOTS: usize = 16_384;
-/// Most census gaps one report may list, a truncation marker included: a slot
-/// gap per slot, the listing's gap, and as many stray namespaces. A worker
-/// with more lists the first `MAX_CENSUS_GAPS - 1` and a marker.
-const MAX_CENSUS_GAPS: usize = 2 * MAX_REPORT_SLOTS;
+/// Census gaps one report may list beyond one per slot: each host-wide gap,
+/// `InventoryFailed`, `Unowned` and `ListingFailed`, once.
+const HOST_GAPS: usize = 3;
+/// Most managed namespaces no slot accounts for one report may count, 64
+/// times the largest pool. A larger count is malformed, not stored.
+const MAX_EXTRA_NAMESPACES: u64 = 64 * MAX_REPORT_SLOTS as u64;
 /// The accepted document's only schema version. Any change to the document
 /// needs a new one: a retained document would otherwise compare as a conflict.
+/// No caller stores a report yet, so version 1 may still change until one
+/// does.
 const DOCUMENT_VERSION: u64 = 1;
 
 /// Why a report isn't well formed.
@@ -34,53 +44,58 @@ pub enum InvalidReport {
     OutOfRange { field: &'static str, value: u64 },
     #[error("{0} slots is more than {MAX_REPORT_SLOTS}")]
     TooManySlots(usize),
-    #[error("{0} census gaps is more than {MAX_CENSUS_GAPS}")]
-    TooManyGaps(usize),
+    #[error("{gaps} census gaps is more than {HOST_GAPS} past the {slots} slots")]
+    TooManyGaps { gaps: usize, slots: usize },
+    #[error("{0} extra namespaces is more than {MAX_EXTRA_NAMESPACES}")]
+    TooManyExtraNamespaces(u64),
     #[error("slot {0} is reported more than once")]
     DuplicateSlot(u32),
-    #[error("an incomplete census lists no gap")]
+    #[error("slot {0} has more than one census gap")]
+    RepeatedSlotGap(u32),
+    #[error("census gap {0:?} is listed more than once")]
+    RepeatedGap(CensusGap),
+    #[error("an incomplete census lists no gap and counts no extra namespace")]
     NoGaps,
-    #[error("a census lists more than one truncation")]
-    RepeatedTruncation,
-    #[error("a truncation omits no gaps")]
-    EmptyTruncation,
 }
 
 /// Whether the worker accounted for every managed namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Census {
+    /// No gap and no extra namespace.
     Complete,
-    /// What couldn't be accounted for, whatever the slots say.
-    Incomplete(Vec<CensusGap>),
+    /// What couldn't be accounted for, whatever the slots say: at least one
+    /// gap or extra namespace.
+    Incomplete {
+        gaps: Vec<CensusGap>,
+        /// Managed namespaces no slot accounts for.
+        extra_namespaces: u64,
+    },
 }
 
-/// Why a census is incomplete. Ordered as the document lists them.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// Why a census is incomplete. Each slot has at most one gap, and each other
+/// gap appears at most once. Its serde form is the document's.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "gap", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CensusGap {
     InventoryFailed,
     /// The host names no directory only managed namespaces occupy.
     Unowned,
     ListingFailed,
     /// An eligible slot has no namespace.
-    Missing(u32),
+    Missing {
+        slot_id: u32,
+    },
     /// An eligible slot wasn't read at its final lifecycle.
-    Unread(u32),
-    /// A managed namespace no slot accounts for.
-    Extra,
-    /// The list omits this many gaps, more than 0. At most one per report.
-    Truncated(u64),
+    Unread {
+        slot_id: u32,
+    },
 }
 
 impl CensusGap {
-    const fn as_str(self) -> &'static str {
+    const fn slot_id(self) -> Option<u32> {
         match self {
-            Self::InventoryFailed => "inventory_failed",
-            Self::Unowned => "unowned",
-            Self::ListingFailed => "listing_failed",
-            Self::Missing(_) => "missing",
-            Self::Unread(_) => "unread",
-            Self::Extra => "extra",
-            Self::Truncated(_) => "truncated",
+            Self::Missing { slot_id } | Self::Unread { slot_id } => Some(slot_id),
+            Self::InventoryFailed | Self::Unowned | Self::ListingFailed => None,
         }
     }
 }
@@ -95,12 +110,16 @@ pub enum SlotOutcome {
     Unknown(UnknownReason),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Its serde form is the document's.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Failure {
     RulesMismatch,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Its serde form is the document's.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UnknownReason {
     /// Not a slot the apply takes.
     Ineligible,
@@ -111,33 +130,89 @@ pub enum UnknownReason {
     Unconfirmed,
 }
 
-impl SlotOutcome {
-    /// The outcome's name and its reason, if it has one.
-    const fn names(self) -> (&'static str, Option<&'static str>) {
-        match self {
-            Self::Verified => ("verified", None),
-            Self::Applying => ("applying", None),
-            Self::Failed(Failure::RulesMismatch) => ("failed", Some("rules_mismatch")),
-            Self::Unknown(reason) => (
-                "unknown",
-                Some(match reason {
-                    UnknownReason::Ineligible => "ineligible",
-                    UnknownReason::NamespaceMissing => "namespace_missing",
-                    UnknownReason::NamespaceUnreadable => "namespace_unreadable",
-                    UnknownReason::TableUnreadable => "table_unreadable",
-                    UnknownReason::Unconfirmed => "unconfirmed",
-                }),
-            ),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlotEvidence {
     pub slot_id: u32,
     /// The slot's lifecycle generation when observed.
     pub slot_generation: u64,
     pub outcome: SlotOutcome,
+}
+
+/// The accepted document, schema version 1. Derived field order is the
+/// canonical key order; [`Report::new`] sorts both lists.
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReportV1 {
+    pub(crate) schema_version: u64,
+    pub(crate) round: u64,
+    pub(crate) assignment_generation: u64,
+    pub(crate) revision_id: uuid::Uuid,
+    pub(crate) manager_epoch: u64,
+    pub(crate) census: CensusV1,
+    /// Empty, like `extra_namespaces` is 0, when the census is complete.
+    pub(crate) census_gaps: Vec<CensusGap>,
+    pub(crate) extra_namespaces: u64,
+    pub(crate) slots: Vec<SlotV1>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CensusV1 {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum SlotV1 {
+    Verified {
+        slot_id: u32,
+        slot_generation: u64,
+    },
+    Applying {
+        slot_id: u32,
+        slot_generation: u64,
+    },
+    Failed {
+        slot_id: u32,
+        slot_generation: u64,
+        reason: Failure,
+    },
+    Unknown {
+        slot_id: u32,
+        slot_generation: u64,
+        reason: UnknownReason,
+    },
+}
+
+impl From<SlotEvidence> for SlotV1 {
+    fn from(slot: SlotEvidence) -> Self {
+        let SlotEvidence {
+            slot_id,
+            slot_generation,
+            outcome,
+        } = slot;
+        match outcome {
+            SlotOutcome::Verified => Self::Verified {
+                slot_id,
+                slot_generation,
+            },
+            SlotOutcome::Applying => Self::Applying {
+                slot_id,
+                slot_generation,
+            },
+            SlotOutcome::Failed(reason) => Self::Failed {
+                slot_id,
+                slot_generation,
+                reason,
+            },
+            SlotOutcome::Unknown(reason) => Self::Unknown {
+                slot_id,
+                slot_generation,
+                reason,
+            },
+        }
+    }
 }
 
 /// A well-formed answer to one round, with its canonical document.
@@ -151,7 +226,8 @@ pub struct Report {
 }
 
 impl Report {
-    /// Slots and gaps may come in any order; the document sorts both.
+    /// Slots and gaps may come in any order; the document sorts both, slots
+    /// by ID and gaps host-wide first, then by slot.
     pub fn new(
         round: u64,
         assignment_generation: u64,
@@ -170,83 +246,75 @@ impl Report {
         }) {
             return Err(InvalidReport::DuplicateSlot(slot));
         }
-        let slots = slots
-            .iter()
-            .map(|slot| {
-                let (outcome, reason) = slot.outcome.names();
-                let mut entry = Map::new();
-                entry.insert("slot_id".into(), slot.slot_id.into());
-                entry.insert(
-                    "slot_generation".into(),
-                    stored("slot_generation", slot.slot_generation)?.into(),
-                );
-                entry.insert("outcome".into(), outcome.into());
-                if let Some(reason) = reason {
-                    entry.insert("reason".into(), reason.into());
-                }
-                Ok(Value::Object(entry))
-            })
-            .collect::<Result<Vec<_>, InvalidReport>>()?;
-        let (round, assignment_generation, manager_epoch) = (
+        for slot in &slots {
+            stored("slot_generation", slot.slot_generation)?;
+        }
+        let (stored_round, stored_generation, stored_epoch) = (
             stored("round", round)?,
             stored("assignment_generation", assignment_generation)?,
             stored("manager_epoch", manager_epoch)?,
         );
-        let mut document = Map::new();
-        document.insert("schema_version".into(), DOCUMENT_VERSION.into());
-        document.insert("round".into(), round.into());
-        document.insert("assignment_generation".into(), assignment_generation.into());
-        document.insert("revision_id".into(), revision_id.to_string().into());
-        document.insert("manager_epoch".into(), manager_epoch.into());
-        match census {
-            Census::Complete => {
-                document.insert("census".into(), "complete".into());
-            }
-            Census::Incomplete(mut gaps) => {
-                if gaps.is_empty() {
+        let (census, census_gaps, extra_namespaces) = match census {
+            Census::Complete => (CensusV1::Complete, Vec::new(), 0),
+            Census::Incomplete {
+                mut gaps,
+                extra_namespaces,
+            } => {
+                if gaps.is_empty() && extra_namespaces == 0 {
                     return Err(InvalidReport::NoGaps);
                 }
-                if gaps.len() > MAX_CENSUS_GAPS {
-                    return Err(InvalidReport::TooManyGaps(gaps.len()));
+                if extra_namespaces > MAX_EXTRA_NAMESPACES {
+                    return Err(InvalidReport::TooManyExtraNamespaces(extra_namespaces));
                 }
-                let mut truncations = gaps
-                    .iter()
-                    .filter(|gap| matches!(gap, CensusGap::Truncated(_)));
-                if truncations.nth(1).is_some() {
-                    return Err(InvalidReport::RepeatedTruncation);
+                if gaps.len() > slots.len() + HOST_GAPS {
+                    return Err(InvalidReport::TooManyGaps {
+                        gaps: gaps.len(),
+                        slots: slots.len(),
+                    });
                 }
-                if gaps.contains(&CensusGap::Truncated(0)) {
-                    return Err(InvalidReport::EmptyTruncation);
+                // A slot's gaps sort together, so a second one is adjacent.
+                gaps.sort_unstable_by_key(|&gap| (gap.slot_id(), gap));
+                if let Some(first) = gaps.windows(2).find_map(|pair| match pair {
+                    [first, second]
+                        if first == second
+                            || (first.slot_id().is_some()
+                                && first.slot_id() == second.slot_id()) =>
+                    {
+                        Some(*first)
+                    }
+                    _ => None,
+                }) {
+                    return Err(match first.slot_id() {
+                        Some(slot) => InvalidReport::RepeatedSlotGap(slot),
+                        None => InvalidReport::RepeatedGap(first),
+                    });
                 }
-                gaps.sort_unstable();
-                let gaps = gaps
-                    .into_iter()
-                    .map(|gap| {
-                        let mut entry = Map::new();
-                        entry.insert("gap".into(), gap.as_str().into());
-                        match gap {
-                            CensusGap::Missing(slot_id) | CensusGap::Unread(slot_id) => {
-                                entry.insert("slot_id".into(), slot_id.into());
-                            }
-                            CensusGap::Truncated(omitted) => {
-                                entry.insert("omitted".into(), stored("omitted", omitted)?.into());
-                            }
-                            _ => {}
-                        }
-                        Ok(Value::Object(entry))
-                    })
-                    .collect::<Result<Vec<_>, InvalidReport>>()?;
-                document.insert("census".into(), "incomplete".into());
-                document.insert("census_gaps".into(), gaps.into());
+                (CensusV1::Incomplete, gaps, extra_namespaces)
             }
-        }
-        document.insert("slots".into(), slots.into());
-        Ok(Self {
+        };
+        let document = ReportV1 {
+            schema_version: DOCUMENT_VERSION,
             round,
             assignment_generation,
-            revision_id,
+            revision_id: revision_id.0,
             manager_epoch,
-            document: Value::Object(document).to_string(),
+            census,
+            census_gaps,
+            extra_namespaces,
+            slots: slots.into_iter().map(SlotV1::from).collect(),
+        };
+        let document = match serde_json::to_string(&document) {
+            Ok(text) => text,
+            // Every map key is a string and no type here returns an error, so
+            // writing to a String cannot fail.
+            Err(error) => unreachable!("report serialization failed: {error}"),
+        };
+        Ok(Self {
+            round: stored_round,
+            assignment_generation: stored_generation,
+            revision_id,
+            manager_epoch: stored_epoch,
+            document,
         })
     }
 }
@@ -281,7 +349,7 @@ pub enum ReportRefusal {
     GenerationMismatch,
     /// The node's assignment is no longer the generation and revision reported.
     Superseded,
-    /// The round was issued `max_age` or longer ago.
+    /// The round was issued [`REPORT_MAX_AGE`] or longer ago.
     Expired,
 }
 
@@ -291,18 +359,17 @@ pub enum ReportRefusal {
 /// Accepted under the locks: the observations' manager epoch, pending round
 /// and the generation it asks about all match the report, and the node is
 /// still assigned the reported generation and revision. The round must have
-/// been issued less than `max_age` before the write's clock reading. A missing
-/// observation row is never created.
+/// been issued less than [`REPORT_MAX_AGE`] before the write's clock reading.
+/// A missing observation row is never created.
 pub async fn accept_report(
     conn: &mut PgConnection,
     node: NodeId,
     report: &Report,
-    max_age: Duration,
 ) -> Result<Acceptance, sqlx::Error> {
     let mut tx = conn
         .begin_with(sql!("BEGIN ISOLATION LEVEL READ COMMITTED"))
         .await?;
-    match accept(&mut tx, node, report, max_age).await {
+    match accept(&mut tx, node, report).await {
         Ok(Acceptance::Accepted) => {
             tx.commit().await?;
             Ok(Acceptance::Accepted)
@@ -318,7 +385,6 @@ async fn accept(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     node: NodeId,
     report: &Report,
-    max_age: Duration,
 ) -> Result<Acceptance, sqlx::Error> {
     // Shared, as the opener takes it: no supersede commits while this waits.
     let current = sqlx::query_scalar::<_, bool>(sql!(
@@ -381,7 +447,7 @@ async fn accept(
     ))
     .bind(node)
     .bind(&report.document)
-    .bind(max_age.as_secs_f64())
+    .bind(REPORT_MAX_AGE.as_secs_f64())
     .execute(&mut **tx)
     .await?;
     Ok(if written.rows_affected() == 1 {
@@ -390,3 +456,6 @@ async fn accept(
         Acceptance::Refused(ReportRefusal::Expired)
     })
 }
+
+#[cfg(test)]
+mod tests;

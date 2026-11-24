@@ -4,8 +4,9 @@
 
 use std::time::Duration;
 
+use pplx_space_firewall_rules_store::REPORT_MAX_AGE;
+
 use super::*;
-use crate::firewall_rules::REPORT_MAX_AGE;
 use crate::proto::{
     FirewallRulesCensus as Census, FirewallRulesCensusGap, FirewallRulesCensusGapKind as Gap,
     FirewallRulesReportOutcome as Outcome, FirewallRulesSlotEvidence,
@@ -13,7 +14,6 @@ use crate::proto::{
     ReportFirewallRulesRequest,
 };
 
-const MAX_AGE: Duration = REPORT_MAX_AGE;
 /// Bounds every wait on a lock or the clock.
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -51,22 +51,15 @@ fn gap(kind: Gap, slot_id: Option<u32>) -> FirewallRulesCensusGap {
     FirewallRulesCensusGap {
         kind: kind.into(),
         slot_id,
-        omitted: None,
     }
 }
 
-fn truncated(omitted: Option<u64>) -> FirewallRulesCensusGap {
-    FirewallRulesCensusGap {
-        omitted,
-        ..gap(Gap::Truncated, None)
-    }
-}
-
-/// `request` with an incomplete census: slot 4's namespace is missing, and
-/// the host names no managed-namespace directory.
+/// `request` with an incomplete census: slot 4's namespace is missing, the
+/// host names no managed-namespace directory, and two namespaces are extra.
 fn incomplete(mut request: ReportFirewallRulesRequest) -> ReportFirewallRulesRequest {
     request.census = Census::Incomplete.into();
     request.census_gaps = vec![gap(Gap::Missing, Some(4)), gap(Gap::Unowned, None)];
+    request.extra_namespaces = Some(2);
     request
 }
 
@@ -90,16 +83,17 @@ fn answer(
             slot(9, 2, Slot::Failed, Reason::RulesMismatch),
             slot(3, 5, Slot::Verified, Reason::Unspecified),
         ],
+        extra_namespaces: Some(0),
     }
 }
 
 /// `node`'s whole observation row, or `None` without one.
-async fn row(pool: &sqlx::PgPool, node: NodeId) -> TestResult<Option<String>> {
+async fn row(conn: impl sqlx::PgExecutor<'_>, node: NodeId) -> TestResult<Option<String>> {
     Ok(sqlx::query_scalar::<_, String>(sql!(
         "SELECT row_to_json(o)::text FROM firewall_rules_node_observations o WHERE node_id = $1"
     ))
     .bind(node)
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await?)
 }
 
@@ -220,8 +214,9 @@ async fn reporter(max_connections: u32) -> TestResult<Option<Reporter>> {
 /// with a mismatch and an incomplete census, is stored as reported with the
 /// round's original issue time, and Fetch no longer offers it. Catches a
 /// decoder that refuses unfavorable evidence, a write that stores another
-/// time, leaves part of the pending tuple, or drops a census gap or the slot
-/// order, and an acceptance that touches the rollout item.
+/// time, leaves part of the pending tuple, or drops a census gap, the extra
+/// namespace count or the slot order, and an acceptance that touches the
+/// rollout item.
 #[tokio::test(flavor = "current_thread")]
 async fn report_answers_the_round_its_opener_opened() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -305,6 +300,7 @@ async fn report_answers_the_round_its_opener_opened() -> TestResult {
             "manager_epoch": 1,
             "census": "incomplete",
             "census_gaps": [{"gap": "unowned"}, {"gap": "missing", "slot_id": 4}],
+            "extra_namespaces": 2,
             "slots": [
                 {"slot_id": 3, "slot_generation": 5, "outcome": "verified"},
                 {"slot_id": 9, "slot_generation": 2, "outcome": "failed", "reason": "rules_mismatch"},
@@ -363,9 +359,11 @@ async fn replayed_reports_after_a_newer_round_write_nothing() -> TestResult {
     Ok(())
 }
 
-/// A round bound to B/12 while the assignment moved to C/13: B's answer is
-/// stale and C's can't borrow B's round. Catches acceptance that skips the
-/// current-assignment check or matches the round to the current generation.
+/// A round bound to B/12: an answer naming C at generation 12 isn't about
+/// the node's assignment, and once the assignment moved to C/13, B's answer
+/// is stale and C's can't borrow B's round. Catches acceptance that skips the
+/// current-assignment check or its revision, or matches the round to the
+/// current generation.
 #[tokio::test(flavor = "current_thread")]
 async fn answers_for_another_assignment_than_the_round_write_nothing() -> TestResult {
     let Some(mut r) = reporter(2).await? else {
@@ -374,6 +372,13 @@ async fn answers_for_another_assignment_than_the_round_write_nothing() -> TestRe
     let (pool, client) = (&r.pool, &mut r.harness.client);
     let c = insert_revision(pool, ORDERED).await?;
     ask(pool, r.node, (12, r.revision), 7, 1, Duration::ZERO).await?;
+    let before = row(pool, r.node).await?;
+    let other_revision = answer(r.node, 7, (12, c), 1);
+    assert_eq!(
+        report(client, &r.token, other_revision).await?,
+        Ok(Outcome::Superseded)
+    );
+    assert_eq!(row(pool, r.node).await?, before);
     sqlx::query(sql!(
         "UPDATE firewall_rules_node_assignments
          SET assignment_generation = 13, revision_id = $2
@@ -442,10 +447,12 @@ async fn racing_reports_are_accepted_once() -> TestResult {
     Ok(())
 }
 
-/// Expired, wrong-epoch, wrong-round and unasked reports change nothing and
-/// create no row; a round just inside the limit is accepted. Catches a
-/// missing epoch, round or freshness check, freshness measured from
-/// `updated_at`, and a report that creates the observation row.
+/// Expired, wrong-epoch and unasked reports change nothing and create no row;
+/// a round just inside the limit is accepted. Catches a missing epoch or
+/// freshness check, freshness measured from `updated_at` or by another limit
+/// than the opener's, and a report that creates the observation row. A
+/// report for another round than the pending one is
+/// `delayed_answers_leave_a_newer_round_pending`'s.
 #[tokio::test(flavor = "current_thread")]
 async fn reports_outside_the_pending_round_write_nothing() -> TestResult {
     let Some(mut r) = reporter(2).await? else {
@@ -460,18 +467,17 @@ async fn reports_outside_the_pending_round_write_nothing() -> TestResult {
     );
     assert_eq!(row(pool, r.node).await?, None);
 
-    let inside = MAX_AGE - Duration::from_secs(60);
+    let inside = REPORT_MAX_AGE - Duration::from_secs(1);
     for (age, request, expected) in [
-        (MAX_AGE, answer(r.node, 7, current, 1), Outcome::Expired),
+        (
+            REPORT_MAX_AGE,
+            answer(r.node, 7, current, 1),
+            Outcome::Expired,
+        ),
         (
             Duration::ZERO,
             answer(r.node, 7, current, 2),
             Outcome::EpochMismatch,
-        ),
-        (
-            Duration::ZERO,
-            answer(r.node, 6, current, 1),
-            Outcome::NotPending,
         ),
         (inside, answer(r.node, 7, current, 1), Outcome::Accepted),
     ] {
@@ -482,24 +488,15 @@ async fn reports_outside_the_pending_round_write_nothing() -> TestResult {
             assert_eq!(row(pool, r.node).await?, before, "{expected:?}");
         }
     }
-    // Accepted: nothing is pending, so the same report for the next round
-    // number isn't either.
-    let before = row(pool, r.node).await?;
-    let next = answer(r.node, 8, current, 1);
-    assert_eq!(
-        report(client, &r.token, next).await?,
-        Ok(Outcome::NotPending)
-    );
-    assert_eq!(row(pool, r.node).await?, before);
     Ok(())
 }
 
 /// A report waiting on the observation row holds the assignment it checked,
-/// and judges freshness on a clock read after the wait: a round fresh when the
-/// report began but expired when its lock was granted is refused. A report
-/// waiting on a superseding assignment write sees the new assignment. Catches
-/// `now()` for the clock, an unlocked assignment read, and locking the
-/// observation before the assignment.
+/// and judges freshness on a clock read after the wait: a round fresh at the
+/// report's transaction start, `now()`, but expired when its lock is granted
+/// is refused. A report waiting on a superseding assignment write sees the new
+/// assignment. Catches `now()` for the clock, an unlocked assignment read, and
+/// locking the observation before the assignment.
 #[tokio::test(flavor = "current_thread")]
 async fn reports_are_judged_after_their_lock_waits() -> TestResult {
     let Some(r) = reporter(5).await? else {
@@ -513,18 +510,8 @@ async fn reports_are_judged_after_their_lock_waits() -> TestResult {
         tokio::spawn(async move { report(&mut client, &token, request).await.unwrap() })
     };
 
-    // Two seconds from expiry.
-    ask(
-        pool,
-        r.node,
-        (12, r.revision),
-        7,
-        1,
-        MAX_AGE - Duration::from_secs(2),
-    )
-    .await?;
-    let before = row(pool, r.node).await?;
-    let holder = hold_observation(pool, r.node).await?;
+    ask(pool, r.node, (12, r.revision), 7, 1, Duration::ZERO).await?;
+    let mut holder = hold_observation(pool, r.node).await?;
     let waiting = spawn_report();
     wait_for_lock_waiters(pool, 1).await?;
     let mut probe = pool.begin().await?;
@@ -540,7 +527,17 @@ async fn reports_are_judged_after_their_lock_waits() -> TestResult {
         Some("55P03".into())
     );
     probe.rollback().await?;
-    let started_fresh = sqlx::query_scalar::<_, bool>(sql!(
+    // The round expires now, after the waiting report's transaction began.
+    sqlx::query(sql!(
+        "UPDATE firewall_rules_node_observations
+         SET pending_round_issued_at = clock_timestamp() - make_interval(secs => $2)
+         WHERE node_id = $1"
+    ))
+    .bind(r.node)
+    .bind(REPORT_MAX_AGE.as_secs_f64())
+    .execute(&mut *holder)
+    .await?;
+    let started_fresh = sqlx::query_scalar::<_, Option<bool>>(sql!(
         "SELECT bool_and(a.xact_start < o.pending_round_issued_at + make_interval(secs => $2))
          FROM pg_stat_activity a, firewall_rules_node_observations o
          WHERE o.node_id = $1
@@ -548,24 +545,11 @@ async fn reports_are_judged_after_their_lock_waits() -> TestResult {
            AND a.wait_event_type = 'Lock'"
     ))
     .bind(r.node)
-    .bind(MAX_AGE.as_secs_f64())
-    .fetch_one(pool)
+    .bind(REPORT_MAX_AGE.as_secs_f64())
+    .fetch_one(&mut *holder)
     .await?;
-    assert!(started_fresh, "the report began after its round expired");
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while !sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT clock_timestamp() >= pending_round_issued_at + make_interval(secs => $2)
-         FROM firewall_rules_node_observations
-         WHERE node_id = $1"
-    ))
-    .bind(r.node)
-    .bind(MAX_AGE.as_secs_f64())
-    .fetch_one(pool)
-    .await?
-    {
-        assert!(tokio::time::Instant::now() < deadline, "never expired");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert_eq!(started_fresh, Some(true), "the report began after expiry");
+    let before = row(&mut *holder, r.node).await?;
     holder.commit().await?;
     assert_eq!(
         tokio::time::timeout(WAIT, waiting).await??,
@@ -665,8 +649,8 @@ async fn delayed_answers_leave_a_newer_round_pending() -> TestResult {
     .bind(a)
     .execute(&mut *holder)
     .await?;
+    let replaced = row(&mut *holder, a).await?;
     holder.commit().await?;
-    let replaced = row(pool, a).await?;
     assert_eq!(
         tokio::time::timeout(WAIT, waiting).await??,
         Ok(Outcome::NotPending)
@@ -676,12 +660,12 @@ async fn delayed_answers_leave_a_newer_round_pending() -> TestResult {
 }
 
 /// Only a report-authorized node-ctl reporting for its own resolved, enrolled
-/// worker writes: the fetch authority alone,
-/// another workload, a stale UID, an ambiguous name, missing claims, the static
-/// token and a report naming worker B all write nothing, and the report
-/// authority doesn't permit fetching. Catches report authorized by the fetch
-/// authority, a row chosen by the request's node ID, and acceptance without
-/// enrollment.
+/// worker writes: the fetch authority alone, another workload, a stale UID,
+/// an ambiguous name, missing claims naming the worker at the peer address,
+/// the static token and a report naming worker B all write nothing, and the
+/// report authority doesn't permit fetching. Catches report authorized by the
+/// fetch authority, a row chosen by the request's node ID or the address, and
+/// acceptance without enrollment.
 #[tokio::test(flavor = "current_thread")]
 async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -691,13 +675,20 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
     let pool = &pool;
     let revision = insert_revision(pool, SSH).await?;
     let a = register(pool, "worker", "ready", "192.0.2.10", "worker-a", "uid-a").await?;
-    let b = register(pool, "worker", "ready", "192.0.2.11", "worker-b", "uid-b").await?;
+    // B at the peer address, so a fallback to it would be caught.
+    let b = register(pool, "worker", "ready", "127.0.0.1", "worker-b", "uid-b").await?;
     let twin = register(pool, "worker", "ready", "192.0.2.14", "worker-t", "uid-t").await?;
     register(pool, "worker", "ready", "192.0.2.15", "worker-t", "uid-t2").await?;
     for node in [a, b, twin] {
         ask(pool, node, (12, revision), 7, 1, Duration::ZERO).await?;
     }
-    let rows = async || -> TestResult<_> { Ok((row(pool, a).await?, row(pool, b).await?)) };
+    let rows = async || -> TestResult<_> {
+        Ok((
+            row(pool, a).await?,
+            row(pool, b).await?,
+            row(pool, twin).await?,
+        ))
+    };
     let before = rows().await?;
 
     let enrolled = || {
@@ -742,7 +733,7 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
         (token(1), own.clone()),
         (token(2), own.clone()),
         (token(3), answer(twin, 7, (12, revision), 1)),
-        (token(4), own.clone()),
+        (token(4), for_b.clone()),
         (REVIEWED_STATIC_TOKEN.to_owned(), own.clone()),
         (token(0), for_b.clone()),
     ] {
@@ -780,19 +771,21 @@ async fn report_writes_only_for_an_authorized_callers_own_worker() -> TestResult
         report(client, &token(0), own).await?,
         Ok(Outcome::Duplicate)
     );
-    assert_eq!(row(pool, b).await?, before.1);
+    let (_, b_after, twin_after) = rows().await?;
+    assert_eq!((b_after, twin_after), (before.1, before.2));
     Ok(())
 }
 
 /// Each malformation of an otherwise acceptable report, whose integers are
-/// all 0, is INVALID_ARGUMENT and writes nothing, and the report itself is
-/// accepted: 0 is a value, and an unset field never reads as 0. Catches a
-/// decoder that defaults an unset field or enum, accepts an unknown enum
-/// value, a duplicate slot, a reason or gap slot that doesn't fit, an
-/// incomplete census without gaps, an out-of-range integer, an oversized
-/// report, a truncation that is repeated, empty, slotted or out of range, or
-/// a count on another gap, and a bare census standing in for evidence; a
-/// census of 32,767 gaps and a truncation is accepted wherever it lists it.
+/// all 0 and whose census lists as many gaps as its slots allow, is
+/// INVALID_ARGUMENT and writes nothing, and the report itself is accepted: 0
+/// is a value, and an unset field never reads as 0. Catches a decoder that
+/// defaults an unset field or enum, accepts an unknown or removed enum value,
+/// a duplicate slot, a slot with two gaps, a repeated gap, a reason or gap
+/// slot that doesn't fit, an incomplete census with neither gaps nor extra
+/// namespaces or a complete one with either, an out-of-range integer, too
+/// many extra namespaces, an oversized report, or a bare census standing in
+/// for evidence.
 #[tokio::test(flavor = "current_thread")]
 async fn malformed_reports_write_nothing() -> TestResult {
     let Some(mut r) = reporter(2).await? else {
@@ -802,7 +795,14 @@ async fn malformed_reports_write_nothing() -> TestResult {
     ask(pool, r.node, (0, r.revision), 0, 0, Duration::ZERO).await?;
     let mut base = answer(r.node, 0, (0, r.revision), 0);
     base.census = Census::Incomplete.into();
-    base.census_gaps = vec![gap(Gap::Missing, Some(0)), gap(Gap::Extra, None)];
+    // Three past the two slots.
+    base.census_gaps = vec![
+        gap(Gap::Missing, Some(0)),
+        gap(Gap::Unowned, None),
+        gap(Gap::Unread, Some(1)),
+        gap(Gap::InventoryFailed, None),
+        gap(Gap::ListingFailed, None),
+    ];
     base.slots = vec![
         slot(0, 0, Slot::Verified, Reason::Unspecified),
         slot(1, 0, Slot::Failed, Reason::RulesMismatch),
@@ -810,64 +810,51 @@ async fn malformed_reports_write_nothing() -> TestResult {
     let before = row(pool, r.node).await?;
     let too_large = u64::try_from(i64::MAX)? + 1;
     type Malform = fn(&mut ReportFirewallRulesRequest, u64);
-    let malformations: [(&str, Malform); 35] = [
+    let malformations: [(&str, Malform); 31] = [
         ("node_id unset", |q, _| q.node_id.clear()),
         ("round unset", |q, _| q.round = None),
         ("generation unset", |q, _| q.assignment_generation = None),
         ("epoch unset", |q, _| q.manager_epoch = None),
         ("revision not a UUID", |q, _| q.revision_id = "ssh".into()),
+        ("extra_namespaces unset", |q, _| q.extra_namespaces = None),
         ("bare census", |q, _| {
             q.census = 0;
             q.census_gaps.clear();
             q.slots.clear();
         }),
-        ("unknown census", |q, _| {
-            q.census = 3;
-            q.census_gaps.clear();
-        }),
         ("complete census with gaps", |q, _| {
             q.census = Census::Complete.into();
         }),
+        ("complete census with extras", |q, _| {
+            q.census = Census::Complete.into();
+            q.census_gaps.clear();
+            q.extra_namespaces = Some(1);
+        }),
         ("incomplete census without", |q, _| q.census_gaps.clear()),
-        ("gap kind unset", |q, _| q.census_gaps[1].kind = 0),
-        ("unknown gap kind", |q, _| q.census_gaps[1].kind = 8),
+        ("too many extras", |q, _| {
+            q.extra_namespaces = Some(1_048_577)
+        }),
+        ("removed gap kind", |q, _| q.census_gaps[1].kind = 6),
         ("slot gap without its slot", |q, _| {
-            q.census_gaps[0].slot_id = None
+            q.census_gaps[0].slot_id = None;
         }),
         ("slot on a gap without one", |q, _| {
             q.census_gaps[1].slot_id = Some(0);
         }),
-        ("truncation without a count", |q, _| {
-            q.census_gaps.push(truncated(None));
+        ("two gaps for a slot", |q, _| {
+            q.census_gaps[2].slot_id = Some(0);
         }),
-        ("truncation omitting none", |q, _| {
-            q.census_gaps.push(truncated(Some(0)));
-        }),
-        ("truncation with a slot", |q, _| {
-            q.census_gaps.push(FirewallRulesCensusGap {
-                slot_id: Some(0),
-                ..truncated(Some(1))
-            });
-        }),
-        ("two truncations", |q, _| {
-            q.census_gaps
-                .extend([truncated(Some(1)), truncated(Some(2))]);
-        }),
-        ("a count on another gap", |q, _| {
-            q.census_gaps[1].omitted = Some(1);
-        }),
-        ("truncation count out of range", |q, n| {
-            q.census_gaps.push(truncated(Some(n)));
+        ("repeated gap", |q, _| {
+            q.census_gaps[3] = gap(Gap::Unowned, None);
         }),
         ("too many gaps", |q, _| {
-            q.census_gaps = vec![gap(Gap::Extra, None); 32_769];
+            q.census_gaps.push(gap(Gap::Missing, Some(7)));
         }),
         ("slot_id unset", |q, _| q.slots[0].slot_id = None),
         ("slot generation unset", |q, _| {
             q.slots[0].slot_generation = None;
         }),
         ("slot outcome unset", |q, _| q.slots[0].outcome = 0),
-        ("unknown slot outcome", |q, _| q.slots[0].outcome = 5),
         ("verified with a reason", |q, _| {
             q.slots[0].reason = Reason::RulesMismatch.into();
         }),
@@ -904,29 +891,5 @@ async fn malformed_reports_write_nothing() -> TestResult {
         assert_eq!(row(pool, r.node).await?, before, "{label}");
     }
     assert_eq!(report(client, &r.token, base).await?, Ok(Outcome::Accepted));
-
-    // A census at the cap: 32,767 kept gaps and the marker, listed first.
-    ask(pool, r.node, (0, r.revision), 1, 0, Duration::ZERO).await?;
-    let mut overflow = answer(r.node, 1, (0, r.revision), 0);
-    overflow.census = Census::Incomplete.into();
-    overflow.census_gaps = vec![truncated(Some(5))];
-    overflow
-        .census_gaps
-        .extend(vec![gap(Gap::Extra, None); 32_767]);
-    assert_eq!(
-        report(client, &r.token, overflow).await?,
-        Ok(Outcome::Accepted)
-    );
-    let (gaps, last) = sqlx::query_as::<_, (i32, serde_json::Value)>(sql!(
-        "SELECT jsonb_array_length(accepted_report -> 'census_gaps'),
-                accepted_report -> 'census_gaps' -> 32767
-         FROM firewall_rules_node_observations
-         WHERE node_id = $1"
-    ))
-    .bind(r.node)
-    .fetch_one(pool)
-    .await?;
-    assert_eq!(gaps, 32_768);
-    assert_eq!(last, serde_json::json!({"gap": "truncated", "omitted": 5}));
     Ok(())
 }

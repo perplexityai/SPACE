@@ -2,8 +2,6 @@
 //! work, the worker is resolved as for a fetch, and the store accepts it at
 //! most once. The request's node ID is only compared with the resolved one.
 
-use std::time::Duration;
-
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_store::{
     Acceptance, Census, CensusGap, Failure, InvalidReport, Report, ReportRefusal, RevisionId,
@@ -19,11 +17,6 @@ use crate::proto::{
     FirewallRulesReportOutcome, FirewallRulesSlotEvidence, FirewallRulesSlotOutcome,
     FirewallRulesSlotReason, ReportFirewallRulesRequest, ReportFirewallRulesResponse,
 };
-
-/// How long after its round was issued a report may be accepted. It covers
-/// wake delivery, fetch, observation and report; the round scheduler must
-/// reopen a round less often than this.
-pub(crate) const REPORT_MAX_AGE: Duration = Duration::from_secs(300);
 
 fn malformed(what: impl std::fmt::Display) -> Status {
     Status::invalid_argument(format!("malformed firewall rules report: {what}"))
@@ -44,18 +37,26 @@ fn decode(request: ReportFirewallRulesRequest) -> Result<(NodeId, Report), Statu
         .revision_id
         .parse::<uuid::Uuid>()
         .map_err(|_| malformed("revision_id isn't a UUID"))?;
+    let extra_namespaces = required(request.extra_namespaces, "extra_namespaces")?;
     let census = match FirewallRulesCensus::try_from(request.census) {
-        Ok(FirewallRulesCensus::Complete) if request.census_gaps.is_empty() => Census::Complete,
-        Ok(FirewallRulesCensus::Complete) => {
-            return Err(malformed("a complete census lists gaps"));
+        Ok(FirewallRulesCensus::Complete)
+            if request.census_gaps.is_empty() && extra_namespaces == 0 =>
+        {
+            Census::Complete
         }
-        Ok(FirewallRulesCensus::Incomplete) => Census::Incomplete(
-            request
+        Ok(FirewallRulesCensus::Complete) => {
+            return Err(malformed(
+                "a complete census lists gaps or counts extra namespaces",
+            ));
+        }
+        Ok(FirewallRulesCensus::Incomplete) => Census::Incomplete {
+            gaps: request
                 .census_gaps
                 .iter()
                 .map(gap)
                 .collect::<Result<_, _>>()?,
-        ),
+            extra_namespaces,
+        },
         Ok(FirewallRulesCensus::Unspecified) | Err(_) => {
             return Err(malformed("census is unset or unknown"));
         }
@@ -79,16 +80,14 @@ fn decode(request: ReportFirewallRulesRequest) -> Result<(NodeId, Report), Statu
 
 fn gap(gap: &FirewallRulesCensusGap) -> Result<CensusGap, Status> {
     use FirewallRulesCensusGapKind as K;
-    match (K::try_from(gap.kind), gap.slot_id, gap.omitted) {
-        (Ok(K::InventoryFailed), None, None) => Ok(CensusGap::InventoryFailed),
-        (Ok(K::Unowned), None, None) => Ok(CensusGap::Unowned),
-        (Ok(K::ListingFailed), None, None) => Ok(CensusGap::ListingFailed),
-        (Ok(K::Missing), Some(slot), None) => Ok(CensusGap::Missing(slot)),
-        (Ok(K::Unread), Some(slot), None) => Ok(CensusGap::Unread(slot)),
-        (Ok(K::Extra), None, None) => Ok(CensusGap::Extra),
-        (Ok(K::Truncated), None, Some(omitted)) => Ok(CensusGap::Truncated(omitted)),
+    match (K::try_from(gap.kind), gap.slot_id) {
+        (Ok(K::InventoryFailed), None) => Ok(CensusGap::InventoryFailed),
+        (Ok(K::Unowned), None) => Ok(CensusGap::Unowned),
+        (Ok(K::ListingFailed), None) => Ok(CensusGap::ListingFailed),
+        (Ok(K::Missing), Some(slot_id)) => Ok(CensusGap::Missing { slot_id }),
+        (Ok(K::Unread), Some(slot_id)) => Ok(CensusGap::Unread { slot_id }),
         _ => Err(malformed(
-            "a census gap is unset or unknown, or its slot_id or omitted doesn't fit it",
+            "a census gap is unset or unknown, or its slot_id doesn't fit it",
         )),
     }
 }
@@ -166,7 +165,7 @@ impl ClusterApiService {
             return Err(call.denied("other_node"));
         }
         self.firewall_enrollment.admit(node, call)?;
-        let acceptance = accept_report(&mut conn, node, &report, REPORT_MAX_AGE)
+        let acceptance = accept_report(&mut conn, node, &report)
             .await
             .map_err(|error| Status::internal(format!("accept firewall rules report: {error}")))?;
         Ok(Response::new(ReportFirewallRulesResponse {

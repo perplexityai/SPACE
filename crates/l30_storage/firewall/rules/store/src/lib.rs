@@ -49,8 +49,8 @@ pub use lease::{
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
 pub use read::{StoredStateError, read_adopted};
 pub use report::{
-    Acceptance, Census, CensusGap, Failure, InvalidReport, Report, ReportRefusal, SlotEvidence,
-    SlotOutcome, UnknownReason, accept_report,
+    Acceptance, Census, CensusGap, Failure, InvalidReport, REPORT_MAX_AGE, Report, ReportRefusal,
+    SlotEvidence, SlotOutcome, UnknownReason, accept_report,
 };
 pub use round::{OpenRefusal, Opening, open_round};
 pub use start::{
