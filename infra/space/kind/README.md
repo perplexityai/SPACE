@@ -1870,8 +1870,8 @@ load-balanced entry, scaled on load.
   exercises outage recovery; `local.leader_election_refusal_does_not_restart`
   verifies that a contender refused Lease access remains unready without
   restarting. Both run by default and can occupy separate CI shards. Each
-  needs `otel` mode, lowers the controller's lease TTL to its 18 s floor and
-  the liveness budget to its 72 s floor, and restores the standing settings
+  needs `otel` mode, lowers the controller's lease TTL to its 19 s floor and
+  the liveness budget to its 76 s floor, and restores the standing settings
   afterward. These hooks require the `test-hooks` feature used by Kind.
   Both change the budget only while owning the mutation Lease and restore
   it before another scenario runs. Shards start with the standing chart

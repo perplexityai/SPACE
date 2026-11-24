@@ -114,8 +114,8 @@ if TYPE_CHECKING:
 # compile-time assert, and `the_lease_ttl_override_is_bounded_like_the_default`
 # pins the values at the TTL floor; change them here with it. This run
 # requests the floor, so every wait for a budget is bounded by the floor's
-# ceiling: 72 s and 90 s, where the default TTL's are 240 s and 300 s.
-LEASE_TTL_SECONDS = 18
+# ceiling: 76 s and 95 s, where the default TTL's are 240 s and 300 s.
+LEASE_TTL_SECONDS = 19
 RETRY_INTERVAL_SECONDS = 2.0
 LIVENESS_BUDGET_SECONDS = max(4 * LEASE_TTL_SECONDS, 30 * int(RETRY_INTERVAL_SECONDS))
 LIVENESS_BUDGET_SPREAD = 1 + 1 / 4
@@ -187,7 +187,7 @@ RECONCILER_TICKS = "space_cluster_reconciler_loop_latency_milliseconds"
 ACQUIRE_FAILED = "space_cluster_controller_leader_election_acquire_failed_total"
 LEASE_LOST = "space_cluster_controller_leader_election_lease_lost_total"
 LEASE_UNREACHABLE = "space_cluster_controller_leader_election_lease_unreachable_total"
-# Evidence only: at the 18 s TTL a renewal stalled past about 4 s resigns the
+# Evidence only: at the 19 s TTL a renewal stalled past about 4 s resigns the
 # holder, and a resignation inside a judged window fails the run. The counter
 # names that cause beside the window's own verdict.
 RENEW_FAILED = "space_cluster_controller_leader_election_renew_failed_total"
