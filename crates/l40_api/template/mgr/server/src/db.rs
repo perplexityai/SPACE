@@ -1,7 +1,5 @@
 use std::path::Path;
 
-use rusqlite::{Connection, Result};
-
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
@@ -9,6 +7,9 @@ use pplx_space_template_mgr_store::builds::{self, TemplateBuildRow};
 use pplx_space_template_mgr_store::database;
 use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
 use pplx_space_template_mgr_store::template_local_state;
+pub use pplx_space_template_mgr_store::{
+    Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction,
+};
 use pplx_space_template_mgr_store::{network_policy_notifications, pins};
 
 pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;
@@ -17,8 +18,8 @@ pub fn open() -> Result<Connection, database::SqliteError> {
     database::open(Path::new(DB_PATH))
 }
 
-fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
-    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+fn immediate_transaction(conn: &Connection) -> Result<Transaction<'_>> {
+    Transaction::immediate(conn)
 }
 
 #[cfg(test)]
@@ -28,24 +29,24 @@ pub fn init_in_memory(conn: &mut Connection) {
         .chain(database::MIGRATOR.iter())
         .filter(|migration| migration.migration_type.is_up_migration())
     {
-        conn.execute_batch(migration.sql.as_ref()).unwrap();
+        conn.raw().execute_batch(migration.sql.as_ref()).unwrap();
     }
 }
 
 /// In-memory SQLite connection with the template-manager schema applied, for tests.
 #[cfg(test)]
 pub(crate) fn test_conn() -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory();
     init_in_memory(&mut conn);
     conn
 }
 
 pub(crate) use pplx_space_template_mgr_store::now;
 
-pub(crate) fn mutex_poison_error(context: &'static str) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+pub(crate) fn mutex_poison_error(context: &'static str) -> Error {
+    Error::to_sql_conversion(std::io::Error::other(format!(
         "{context}: sqlite mutex poisoned"
-    ))))
+    )))
 }
 
 fn saturating_u64_to_i64(value: u64) -> i64 {
@@ -220,20 +221,19 @@ fn normalize_build_date(s: &str) -> String {
     s.to_string()
 }
 
-fn invalid_build_upsert(message: &'static str) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+fn invalid_build_upsert(message: &'static str) -> Error {
+    Error::to_sql_conversion(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         message,
-    )))
+    ))
 }
 
 pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     let manifest: pplx_space_template_manifest::TemplateManifest =
-        serde_json::from_str(b.manifest_json)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        serde_json::from_str(b.manifest_json).map_err(Error::to_sql_conversion)?;
     let execution = manifest
         .execution_metadata()
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        .map_err(Error::to_sql_conversion)?;
     if let Some(execution) = execution {
         let runtime_matches = pplx_space_execution_spec::RuntimeKind::parse(b.runtime)
             .is_ok_and(|runtime| runtime == execution.runtime().kind);
@@ -267,7 +267,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     let execution_json = execution
         .map(serde_json::to_string)
         .transpose()
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        .map_err(Error::to_sql_conversion)?;
     let runtime_version = execution.map(|value| value.runtime().version.as_str());
     let guest_os = execution.map(|value| value.guest().os.as_str());
     let state_format_name = execution
@@ -383,7 +383,7 @@ pub(crate) fn set_last_used_at_for_test(
     content_hash: &str,
     last_used_at_secs: u64,
 ) -> Result<()> {
-    conn.execute(
+    conn.raw().execute(
         "UPDATE template_builds SET last_used_at = ?3
          WHERE name = ?1 AND content_hash = ?2",
         rusqlite::params![name, content_hash, last_used_at_secs.to_string()],
@@ -648,7 +648,7 @@ pub fn update_template_settings_with_outbox(
 }
 
 fn enqueue_node_dirty_network_policy_template_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     template: &str,
 ) -> Result<bool> {
     let ts = now();
@@ -663,10 +663,7 @@ pub fn enqueue_node_dirty_template_inventory(conn: &Connection, template: &str) 
     Ok(queued)
 }
 
-fn enqueue_node_dirty_template_inventory_tx(
-    tx: &rusqlite::Transaction<'_>,
-    template: &str,
-) -> Result<bool> {
+fn enqueue_node_dirty_template_inventory_tx(tx: &Transaction<'_>, template: &str) -> Result<bool> {
     let ts = now();
     let changed = node_dirty_refs::enqueue_template_inventory(tx, template, &ts)?;
     Ok(changed != 0)
@@ -682,7 +679,7 @@ pub fn delete_node_dirty_refs(conn: &Connection, refs: &[NodeDirtyRefRow]) -> Re
 }
 
 fn enqueue_template_network_policy_notification_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     template: &str,
 ) -> Result<bool> {
     let ts = now();

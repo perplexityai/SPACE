@@ -1,60 +1,64 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 use pplx_space_template_model::TemplateCachePartition;
 
 use super::*;
-use crate::test_db;
+use crate::{Connection, test_db};
 
 const NAME: &str = "base";
 const HASH: &str = "sha256:aaaa";
 const PARTITION: TemplateCachePartition = TemplateCachePartition::Legacy;
 
 fn insert_build(conn: &Connection, state: &str, created_at: u64, last_used_at: u64) {
-    conn.execute(
-        "INSERT INTO template_builds
+    conn.0
+        .execute(
+            "INSERT INTO template_builds
              (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch,
               state, created_at, last_used_at)
          VALUES (?1, ?2, ?3, '0', '{}', 'firecracker', 'x86_64', ?4, ?5, ?6)",
-        params![
-            NAME,
-            HASH,
-            PARTITION.key(),
-            state,
-            created_at.to_string(),
-            last_used_at.to_string()
-        ],
-    )
-    .unwrap();
+            params![
+                NAME,
+                HASH,
+                PARTITION.key(),
+                state,
+                created_at.to_string(),
+                last_used_at.to_string()
+            ],
+        )
+        .unwrap();
 }
 
 fn insert_component(conn: &Connection) {
-    conn.execute(
-        "INSERT INTO template_build_components (name, content_hash, cache_partition, kind)
+    conn.0
+        .execute(
+            "INSERT INTO template_build_components (name, content_hash, cache_partition, kind)
          VALUES (?1, ?2, ?3, 'kernel')",
-        params![NAME, HASH, PARTITION.key()],
-    )
-    .unwrap();
+            params![NAME, HASH, PARTITION.key()],
+        )
+        .unwrap();
 }
 
 fn build_state(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT state FROM template_builds
+    conn.0
+        .query_row(
+            "SELECT state FROM template_builds
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![NAME, HASH, PARTITION.key()],
-        |row| row.get(0),
-    )
-    .optional()
-    .unwrap()
+            params![NAME, HASH, PARTITION.key()],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
 }
 
 fn component_count(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM template_build_components
+    conn.0
+        .query_row(
+            "SELECT COUNT(*) FROM template_build_components
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3",
-        params![NAME, HASH, PARTITION.key()],
-        |row| row.get(0),
-    )
-    .unwrap()
+            params![NAME, HASH, PARTITION.key()],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -93,7 +97,8 @@ fn resets_to_ready_leave_a_build_not_deleting() {
         assert!(!reset(&conn, NAME, HASH, PARTITION).unwrap());
         assert_eq!(build_state(&conn).as_deref(), Some("ready"));
 
-        conn.execute("UPDATE template_builds SET state = 'deleting'", [])
+        conn.0
+            .execute("UPDATE template_builds SET state = 'deleting'", [])
             .unwrap();
         assert!(reset(&conn, NAME, HASH, PARTITION).unwrap());
         assert_eq!(build_state(&conn).as_deref(), Some("ready"));
@@ -109,7 +114,8 @@ fn reaper_delete_leaves_a_build_not_deleting() {
     assert!(!reaper_delete_deleting_build(&conn, NAME, HASH, PARTITION).unwrap());
     assert_eq!(build_state(&conn).as_deref(), Some("ready"));
 
-    conn.execute("UPDATE template_builds SET state = 'deleting'", [])
+    conn.0
+        .execute("UPDATE template_builds SET state = 'deleting'", [])
         .unwrap();
     assert!(reaper_delete_deleting_build(&conn, NAME, HASH, PARTITION).unwrap());
     assert_eq!(build_state(&conn), None);
@@ -127,8 +133,8 @@ fn delete_components_of_absent_build_keeps_a_present_builds_components() {
     assert_eq!(component_count(&conn), 1);
 
     // Delete the build row without cascading, leaving its components behind.
-    conn.pragma_update(None, "foreign_keys", false).unwrap();
-    conn.execute("DELETE FROM template_builds", []).unwrap();
+    conn.0.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.0.execute("DELETE FROM template_builds", []).unwrap();
     assert_eq!(component_count(&conn), 1);
     assert_eq!(
         delete_components_of_absent_build(&conn, NAME, HASH, PARTITION).unwrap(),

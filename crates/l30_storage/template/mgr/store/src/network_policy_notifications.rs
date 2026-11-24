@@ -1,13 +1,14 @@
 //! The `template_network_policy_notifications` outbox: one row per template
 //! whose committed default network policy sandboxes have still to be told.
 
-use rusqlite::{Connection, Result, params, types::Type};
+use rusqlite::{params, types::Type};
 
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sql_locator::sql;
 
 use crate::{
+    Connection, Result,
     codec::{nonnegative_i64_to_u64, parse_policy_authority, saturating_u64_to_i64},
     limit_to_i64,
 };
@@ -30,7 +31,7 @@ pub struct TemplateNetworkPolicyNotificationRecord {
 pub fn enqueue(conn: &Connection, template: &str, requested_at: &str) -> Result<usize> {
     // Local generations are allocated by the owning schema. Publish the actual
     // committed witness, never the caller's requested (usually zero) generation.
-    conn.execute(
+    Ok(conn.0.execute(
         sql!("INSERT INTO template_network_policy_notifications
              (template, policy_json, generation, authority, requested_at, updated_at)
          SELECT settings.template, settings.default_network_policy_json,
@@ -45,7 +46,7 @@ pub fn enqueue(conn: &Connection, template: &str, requested_at: &str) -> Result<
              requested_at = excluded.requested_at,
              updated_at = excluded.updated_at"),
         params![template, requested_at],
-    )
+    )?)
 }
 
 /// The `limit` oldest queued notifications, oldest first.
@@ -53,7 +54,7 @@ pub fn list(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<TemplateNetworkPolicyNotificationRecord>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT template, policy_json, generation, authority
          FROM template_network_policy_notifications
          ORDER BY requested_at ASC
@@ -75,7 +76,7 @@ pub fn list(
             policy_json,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Acknowledge a sent notification: delete `template`'s row only while its
@@ -90,7 +91,7 @@ pub fn acknowledge(
     authority: PolicyAuthority,
     policy_json: &str,
 ) -> Result<usize> {
-    conn.execute(
+    Ok(conn.0.execute(
         sql!(
             "DELETE FROM template_network_policy_notifications
              WHERE template = ?1
@@ -104,7 +105,7 @@ pub fn acknowledge(
             authority.as_str(),
             policy_json
         ],
-    )
+    )?)
 }
 
 #[cfg(test)]

@@ -42,7 +42,6 @@
 //! itself is idempotent — re-stamping an already-stamped subvolume
 //! is a no-op on the kernel side.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use pplx_space_template_mgr_store::jobs::{Job, JobError, JobExecutor, JobWorker, WorkerConfig};
@@ -102,17 +101,15 @@ impl StampPayload {
 
 /// Build the shared `JobWorker` for tmplmgr's durable jobs.
 ///
-/// Caller owns the `rusqlite::Connection` (tmplmgr's local
-/// `template-manager.db`). The `db/common/` migrations install the required
+/// Caller owns the shared connection to tmplmgr's local
+/// `template-manager.db`. The `db/common/` migrations install the required
 /// `jobs` table before this worker starts. Call
 /// [`JobWorker::recover_and_log`] at startup and
 /// [`JobWorker::shutdown`] at exit.
-pub fn build_worker(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-) -> JobWorker<TemplateBackgroundExecutor> {
+pub fn build_worker(db: crate::db::SharedConnection) -> JobWorker<TemplateBackgroundExecutor> {
     let config = WorkerConfig::new(DEFAULT_CONCURRENCY, JOB_TIMEOUT, MAX_ATTEMPTS)
         .with_kind_concurrency(STAMP_JOB_KIND, DEFAULT_CONCURRENCY);
-    pplx_space_template_mgr_store::jobs::background_worker(db, TemplateBackgroundExecutor, config)
+    db.background_worker(TemplateBackgroundExecutor, config)
 }
 
 /// Dispatches durable jobs by `job.kind`. Stateless — all per-job

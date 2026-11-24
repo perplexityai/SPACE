@@ -114,7 +114,7 @@ pub(super) type ReleaseLookupKey = (String, EnvironmentReference);
 /// The tick state the pass reads and extends.
 pub(super) struct EnvironmentPass<'a> {
     pub(super) pins: &'a PinnedDigestsStore,
-    pub(super) db: &'a std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    pub(super) db: &'a crate::db::SharedConnection,
     pub(super) tag_tuples: &'a [(TemplateName, TemplateTag)],
     pub(super) templates: &'a [String],
     pub(super) latest_n: u32,
@@ -512,7 +512,7 @@ fn owns_tag_pin(partition: TemplateCachePartition) -> bool {
 /// lookup locks the SQLite connection, so it runs on the blocking pool: a
 /// pull or create holding that lock mustn't stall this async worker.
 async fn decide(
-    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     queued: &mut HashSet<(String, String, EnvironmentReference)>,
     template: &str,
     content_hash: &str,

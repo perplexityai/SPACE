@@ -81,7 +81,7 @@ impl TemplateManagerService {
                 },
                 async |spec, resolve_elapsed, release| {
                     self.volume_puller
-                        .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
+                        .materialize_release(self.db.clone(), spec, resolve_elapsed, release)
                         .await
                 },
             )
@@ -112,7 +112,7 @@ impl TemplateManagerService {
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         self.get_template_with(request, resolve, materialize, async |spec, scope| {
             self.volume_puller
-                .pull_in_scope(Arc::clone(&self.db), spec, scope)
+                .pull_in_scope(self.db.clone(), spec, scope)
                 .await
         })
         .await
@@ -218,7 +218,7 @@ impl TemplateManagerService {
             }
             let mut response = build_get_template_response(
                 self.artifact_store.root.clone(),
-                Arc::clone(&self.db),
+                self.db.clone(),
                 TemplateSelection {
                     name: template_id.clone(),
                     content_hash: req_hash,
@@ -296,7 +296,7 @@ impl TemplateManagerService {
         let snapshot_selector = optional_snapshot_dimensions(req.vcpu, req.memory_mib)?;
         let policy_snapshot_memory_mib = if snapshot_selector.is_none() {
             let desired_memory_mib = {
-                let db = Arc::clone(&self.db);
+                let db = self.db.clone();
                 let template_id = template_id.clone();
                 let req_hash = req_hash.clone();
                 tokio::task::spawn_blocking(move || {
@@ -384,7 +384,7 @@ impl TemplateManagerService {
         // First attempt: local-only lookup.
         match build_get_template_response(
             self.artifact_store.root.clone(),
-            Arc::clone(&self.db),
+            self.db.clone(),
             selection(req_hash.clone()),
             snapshot_selector,
             policy_snapshot_memory_mib,
@@ -450,7 +450,7 @@ impl TemplateManagerService {
                 let req_tag_for_err = req_tag.clone();
                 build_get_template_response(
                     self.artifact_store.root.clone(),
-                    Arc::clone(&self.db),
+                    self.db.clone(),
                     selection(req_hash),
                     snapshot_selector,
                     policy_snapshot_memory_mib,
@@ -574,7 +574,7 @@ impl TemplateManagerService {
             )?;
         }
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template = req.template.clone();
         let network_policy_generation = req.network_policy_generation;
         let update_outcome = tokio::task::spawn_blocking(move || {
@@ -660,7 +660,7 @@ impl TemplateManagerService {
             optional_positive_or_default("snapshot_memory_mib", req.snapshot_memory_mib, 1024)?;
 
         {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = template.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -725,7 +725,7 @@ impl TemplateManagerService {
 
         // Check that no pools or local sandboxes reference this build before
         // deleting its master rootfs.
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let root = self.artifact_store.root.clone();
         let n = name.clone();
         let h = content_hash.clone();
@@ -807,7 +807,7 @@ impl TemplateManagerService {
         name: &str,
         content_hash: &str,
     ) -> Result<(), Status> {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let root = self.artifact_store.root.clone();
         let n = name.to_string();
         let h = content_hash.to_string();
@@ -844,7 +844,7 @@ impl TemplateManagerService {
             )
             .await?;
 
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let n = name.to_string();
             let h = content_hash.to_string();
             tokio::task::spawn_blocking(move || {
@@ -1152,7 +1152,7 @@ fn cached_template_partitions_in(
 /// so a stalled disk holds up this delete and not every DB user. The
 /// caller's digest claim keeps a row from appearing in between.
 pub(super) fn cached_builds_to_delete(
-    db: &Mutex<rusqlite::Connection>,
+    db: &crate::db::SharedConnection,
     root: &Path,
     name: &str,
     content_hash: &str,

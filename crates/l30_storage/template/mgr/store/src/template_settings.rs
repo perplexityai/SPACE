@@ -9,12 +9,14 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{Connection, Result, Transaction, params};
+use rusqlite::params;
 
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sql_locator::sql;
+
+use crate::{Connection, Error, Result, Transaction};
 
 use crate::codec::{
     default_network_policy_json, network_policy_json, nonnegative_i64_to_u64,
@@ -51,7 +53,7 @@ pub fn upsert_template_settings_tx(
     let json = serde_json::to_string(default_auto_lifecycle)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let default_network_json = default_network_policy_json()?;
-    match tx.query_row(
+    match tx.0.query_row(
         sql!(
             "SELECT default_auto_lifecycle_json, default_auto_lifecycle_authority
          FROM template_settings
@@ -73,7 +75,7 @@ pub fn upsert_template_settings_tx(
             if existing_authority == authority && existing_json == json {
                 return Ok(false);
             }
-            tx.execute(
+            tx.0.execute(
                 sql!(
                     "UPDATE template_settings
                  SET default_auto_lifecycle_json = ?1,
@@ -86,7 +88,7 @@ pub fn upsert_template_settings_tx(
             Ok(true)
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            tx.execute(
+            tx.0.execute(
                 sql!("INSERT INTO template_settings
                      (template, default_auto_lifecycle_json, default_auto_lifecycle_authority,
                       default_network_policy_json, default_network_policy_authority, created_at, updated_at)
@@ -102,7 +104,7 @@ pub fn upsert_template_settings_tx(
             )?;
             Ok(true)
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -120,7 +122,7 @@ pub enum TemplateNetworkPolicyUpsertError {
     #[error("template network policy generation conflicts with existing policy")]
     GenerationConflict,
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
 }
 
 /// Write `default_network_policy` with `authority`, inserting the row if it
@@ -141,11 +143,11 @@ pub fn try_update_template_network_policy_tx(
 ) -> std::result::Result<TemplateNetworkPolicyUpdate, TemplateNetworkPolicyUpsertError> {
     let ts = now();
     let default_auto_json = serde_json::to_string(&AutoLifecyclePolicy::disabled())
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let network_json = network_policy_json(default_network_policy)?;
+        .map_err(|error| Error::from(rusqlite::Error::ToSqlConversionFailure(Box::new(error))))?;
+    let network_json = network_policy_json(default_network_policy).map_err(Error::from)?;
     let generation = saturating_u64_to_i64(default_network_policy_generation);
 
-    match tx.query_row(
+    match tx.0.query_row(
         sql!("SELECT default_network_policy_json, default_network_policy_generation, default_network_policy_authority
          FROM template_settings
          WHERE template = ?1"),
@@ -169,7 +171,7 @@ pub fn try_update_template_network_policy_tx(
                     // The owning schema derives the committed local generation
                     // from its retained counter, including this legacy
                     // write shape when an older binary runs on the new schema.
-                    tx.execute(
+                    tx.0.execute(
                         sql!(
                             "UPDATE template_settings
                          SET default_network_policy_json = ?1,
@@ -179,7 +181,8 @@ pub fn try_update_template_network_policy_tx(
                          WHERE template = ?4"
                         ),
                         params![network_json, authority.as_str(), ts, template],
-                    )?;
+                    )
+                    .map_err(Error::from)?;
                     Ok(TemplateNetworkPolicyUpdate::Apply)
                 }
             } else if generation < existing_generation {
@@ -191,7 +194,7 @@ pub fn try_update_template_network_policy_tx(
                     Err(TemplateNetworkPolicyUpsertError::GenerationConflict)
                 }
             } else {
-                tx.execute(
+                tx.0.execute(
                     sql!(
                         "UPDATE template_settings
                      SET default_network_policy_json = ?1,
@@ -201,12 +204,13 @@ pub fn try_update_template_network_policy_tx(
                      WHERE template = ?5"
                     ),
                     params![network_json, generation, authority.as_str(), ts, template],
-                )?;
+                )
+                .map_err(Error::from)?;
                 Ok(TemplateNetworkPolicyUpdate::Apply)
             }
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            tx.execute(
+            tx.0.execute(
                 sql!(
                     "INSERT INTO template_settings
                      (template, default_auto_lifecycle_json, default_network_policy_json,
@@ -223,16 +227,17 @@ pub fn try_update_template_network_policy_tx(
                     PolicyAuthority::Cluster.as_str(),
                     ts
                 ],
-            )?;
+            )
+            .map_err(Error::from)?;
             Ok(TemplateNetworkPolicyUpdate::Apply)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(Error::from(error).into()),
     }
 }
 
 /// Maps the column list [`get_template_settings`] and
 /// [`list_template_snapshot_policies`] both read.
-fn template_settings_row(row: &rusqlite::Row<'_>) -> Result<TemplateSettingsRow> {
+fn template_settings_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TemplateSettingsRow> {
     let json: String = row.get(1)?;
     let default_auto_lifecycle = serde_json::from_str(&json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
@@ -265,7 +270,7 @@ pub fn get_template_settings(
     conn: &Connection,
     template: &str,
 ) -> Result<Option<TemplateSettingsRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT template, default_auto_lifecycle_json, default_network_policy_json,
                 default_network_policy_generation, default_network_policy_authority,
                 default_auto_lifecycle_authority, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib,
@@ -276,7 +281,7 @@ pub fn get_template_settings(
     let mut rows = stmt.query_map(params![template], template_settings_row)?;
     match rows.next() {
         Some(Ok(row)) => Ok(Some(row)),
-        Some(Err(error)) => Err(error),
+        Some(Err(error)) => Err(error.into()),
         None => Ok(None),
     }
 }
@@ -294,7 +299,7 @@ pub fn update_template_snapshot_policy(
     let default_json = serde_json::to_string(&AutoLifecyclePolicy::disabled())
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let default_network_json = default_network_policy_json()?;
-    conn.execute(
+    conn.0.execute(
         sql!(
             "INSERT INTO template_settings
              (template, default_auto_lifecycle_json, default_network_policy_json,
@@ -322,7 +327,7 @@ pub fn update_template_snapshot_policy(
 }
 
 pub fn list_template_snapshot_policies(conn: &Connection) -> Result<Vec<TemplateSettingsRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT template, default_auto_lifecycle_json, default_network_policy_json,
                 default_network_policy_generation, default_network_policy_authority,
                 default_auto_lifecycle_authority, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib,
@@ -333,12 +338,12 @@ pub fn list_template_snapshot_policies(conn: &Connection) -> Result<Vec<Template
          ORDER BY template"
     ))?;
     let rows = stmt.query_map([], template_settings_row)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn record_snapshot_reconcile_started(conn: &Connection, template: &str) -> Result<()> {
     let ts = now();
-    conn.execute(
+    conn.0.execute(
         sql!(
             "UPDATE template_settings
          SET last_snapshot_reconcile_started_at = ?1,
@@ -357,7 +362,7 @@ pub fn record_snapshot_reconcile_completed(
     error: Option<&str>,
 ) -> Result<()> {
     let ts = now();
-    conn.execute(
+    conn.0.execute(
         sql!(
             "UPDATE template_settings
          SET last_snapshot_reconcile_completed_at = ?1,
@@ -384,7 +389,7 @@ pub struct TemplateSettingsPolicies {
 pub fn list_template_settings(
     conn: &Connection,
 ) -> Result<BTreeMap<String, TemplateSettingsPolicies>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT template, default_auto_lifecycle_json, default_network_policy_json,
                 default_network_policy_generation, default_network_policy_authority,
                 default_auto_lifecycle_authority, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib
@@ -424,5 +429,5 @@ pub fn list_template_settings(
             },
         ))
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

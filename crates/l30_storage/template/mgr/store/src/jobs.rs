@@ -1,36 +1,28 @@
 //! template-manager's job queue in this store's SQLite database.
 //!
 //! [`JobWorker`] is template-manager's only path to the common-jobs worker
-//! that runs its queue: [`background_worker`] builds one over the connection
-//! template-manager shares with it, and each of its methods forwards
-//! unchanged to the worker method of the same name, which runs the queue's
-//! SQL. A worker operation template-manager does not call yet is a new
-//! forwarding method here; `BackgroundWorker` is never re-exported.
+//! that runs its queue:
+//! [`SharedConnection::background_worker`](crate::SharedConnection::background_worker)
+//! builds one over the connection template-manager shares with it, and each
+//! of its methods forwards unchanged to the worker method of the same name,
+//! which runs the queue's SQL. As this crate's `AGENTS.md` says, a worker
+//! operation template-manager does not call yet is a new forwarding method
+//! here, and `BackgroundWorker` is never re-exported.
 //!
 //! The re-exported items are data and traits that run no SQL:
 //!
 //! - [`JobExecutor`] is the trait template-manager implements for the
-//!   executor it hands to [`background_worker`]. It receives each [`Job`],
+//!   executor it hands to `background_worker`. It receives each [`Job`],
 //!   and it and [`Job::payload_as`] fail with [`JobError`]. The worker's
 //!   fallible methods fail with `tonic::Status`.
 //! - [`WorkerConfig`] configures the worker.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pplx_space_common_jobs::{BackgroundWorker, JobId};
 pub use pplx_space_common_jobs::{Job, JobError, JobExecutor, WorkerConfig};
 use tonic::Status;
-
-/// A job worker over `db`, the connection template-manager shares with it.
-pub fn background_worker<E: JobExecutor>(
-    db: Arc<Mutex<rusqlite::Connection>>,
-    executor: E,
-    config: WorkerConfig,
-) -> JobWorker<E> {
-    JobWorker(BackgroundWorker::new(db, executor, config))
-}
 
 /// A job worker over template-manager's connection. Each method is the
 /// common-jobs worker method of the same name. The async ones return the
@@ -40,6 +32,10 @@ pub fn background_worker<E: JobExecutor>(
 pub struct JobWorker<E>(BackgroundWorker<E>);
 
 impl<E: JobExecutor> JobWorker<E> {
+    pub(crate) fn new(worker: BackgroundWorker<E>) -> Self {
+        Self(worker)
+    }
+
     /// Re-queue jobs a previous process left interrupted, logging under
     /// `worker_label` when any were.
     pub fn recover_and_log(&self, worker_label: &str) -> Vec<JobId> {

@@ -94,9 +94,6 @@ pplx-space-node-runtime-manager = [
 pplx-space-snapshot-retention = [
   "sqlx",
 ]
-pplx-space-template-mgr = [
-  "rusqlite",
-]
 pplx-space-template-publisher = [
   "pplx-space-object-store",
 ]

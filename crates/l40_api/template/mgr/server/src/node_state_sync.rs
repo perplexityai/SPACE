@@ -5,12 +5,13 @@ use pplx_space_node_api_client::proto::{
 use pplx_space_state_reconciliation::{FACET_NETWORK_POLICY, FACET_TEMPLATE_INVENTORY};
 use pplx_space_template_mgr_store::node_dirty_refs;
 use pplx_space_template_model::TemplateName;
-use rusqlite::Connection;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 use tokio::sync::Notify;
 use tonic::Request;
+
+use crate::db::{ConnectionGuard, SharedConnection};
 
 const SKIP_NODE_PUBLISH_METADATA: &str = "x-space-skip-cluster-sync";
 const DIRTY_MARK_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -27,7 +28,7 @@ pub(crate) fn should_skip_node_publish<T>(request: &Request<T>) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
 }
 
-pub(crate) fn mark_template_dirty(db: &Arc<Mutex<Connection>>, template: &str) {
+pub(crate) fn mark_template_dirty(db: &SharedConnection, template: &str) {
     if template.trim().is_empty() {
         return;
     }
@@ -36,7 +37,7 @@ pub(crate) fn mark_template_dirty(db: &Arc<Mutex<Connection>>, template: &str) {
     }
 }
 
-fn enqueue_template_inventory_dirty(db: &Arc<Mutex<Connection>>, template: &str) -> bool {
+fn enqueue_template_inventory_dirty(db: &SharedConnection, template: &str) -> bool {
     let Some(db) = lock_db(db, "enqueue template inventory dirty") else {
         return false;
     };
@@ -58,7 +59,7 @@ fn dirty_outbox_notify() -> &'static Notify {
     NOTIFY.get_or_init(Notify::new)
 }
 
-pub(crate) fn spawn_dirty_outbox_worker(db: Arc<Mutex<Connection>>) {
+pub(crate) fn spawn_dirty_outbox_worker(db: SharedConnection) {
     tokio::spawn(async move {
         let mut delay = std::time::Duration::ZERO;
         let poll_interval = DIRTY_OUTBOX_POLL_INTERVAL;
@@ -148,10 +149,7 @@ pub(crate) fn spawn_dirty_outbox_worker(db: Arc<Mutex<Connection>>) {
     });
 }
 
-fn lock_db<'a>(
-    db: &'a Arc<Mutex<Connection>>,
-    context: &'static str,
-) -> Option<MutexGuard<'a, Connection>> {
+fn lock_db<'a>(db: &'a SharedConnection, context: &'static str) -> Option<ConnectionGuard<'a>> {
     match db.lock() {
         Ok(guard) => Some(guard),
         Err(_) => {

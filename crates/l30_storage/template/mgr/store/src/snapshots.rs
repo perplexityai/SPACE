@@ -1,9 +1,11 @@
 //! `template_snapshots`: the base snapshots captured from a build, one per
 //! compute shape.
 
-use rusqlite::{Connection, Result, params};
+use rusqlite::params;
 
 use pplx_space_sql_locator::sql;
+
+use crate::{Connection, Result};
 use pplx_space_template_model::TemplateCachePartition;
 
 use crate::codec::parse_cache_partition;
@@ -19,7 +21,7 @@ pub struct SnapshotRow {
     pub built_at: String,
 }
 
-fn snapshot_row(row: &rusqlite::Row<'_>) -> Result<SnapshotRow> {
+fn snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRow> {
     Ok(SnapshotRow {
         name: row.get(0)?,
         content_hash: row.get(1)?,
@@ -42,7 +44,7 @@ pub struct SnapshotKey<'a> {
 }
 
 pub fn get_snapshot(conn: &Connection, key: SnapshotKey<'_>) -> Result<Option<SnapshotRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at
          FROM template_snapshots
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND vcpu = ?4 AND memory_mib = ?5"
@@ -65,7 +67,7 @@ pub fn get_snapshot(conn: &Connection, key: SnapshotKey<'_>) -> Result<Option<Sn
 
 pub fn upsert_snapshot(conn: &Connection, key: SnapshotKey<'_>, snapshot_hash: &str) -> Result<()> {
     let ts = now();
-    conn.execute(
+    conn.0.execute(
         sql!("INSERT INTO template_snapshots (name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(name, content_hash, cache_partition, vcpu, memory_mib) DO UPDATE SET snapshot_hash = ?6, built_at = ?7"),
@@ -88,7 +90,7 @@ pub fn list_snapshots(
     content_hash: &str,
     cache_partition: TemplateCachePartition,
 ) -> Result<Vec<SnapshotRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at
          FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
          ORDER BY vcpu ASC, memory_mib ASC"
@@ -97,7 +99,7 @@ pub fn list_snapshots(
         params![name, content_hash, cache_partition.key()],
         snapshot_row,
     )?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn delete_snapshots_for_build(
@@ -106,7 +108,7 @@ pub fn delete_snapshots_for_build(
     content_hash: &str,
     cache_partition: TemplateCachePartition,
 ) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!(
             "DELETE FROM template_snapshots
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3"
@@ -117,7 +119,7 @@ pub fn delete_snapshots_for_build(
 }
 
 pub fn delete_snapshot(conn: &Connection, key: SnapshotKey<'_>) -> Result<()> {
-    conn.execute(
+    conn.0.execute(
         sql!("DELETE FROM template_snapshots
          WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3 AND vcpu = ?4 AND memory_mib = ?5"),
         params![
