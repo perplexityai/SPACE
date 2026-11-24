@@ -5544,6 +5544,7 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
  "pplx-space-node-model",
+ "pplx-space-postgres-pool",
  "pplx-space-reconcile-metrics",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
@@ -5567,6 +5568,7 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-node-model",
  "pplx-space-observability",
+ "pplx-space-postgres-pool",
  "pplx-space-rpc-contracts",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
@@ -7671,8 +7673,10 @@ dependencies = [
 name = "pplx-space-postgres-pool"
 version = "0.8.2"
 dependencies = [
+ "futures-core",
  "log",
  "pplx-space-db-identity",
+ "pplx-space-db-test-fixtures",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "pplx-space-postgres-contention",

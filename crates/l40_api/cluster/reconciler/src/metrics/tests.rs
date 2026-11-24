@@ -3,9 +3,12 @@ use pplx_space_accounts::NodeId;
 use std::collections::BTreeMap;
 
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
+use pplx_space_sql_locator::sql;
 use pplx_space_state_reconciliation::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_INVENTORY,
+    NODE_RECONCILE_CLAIM_STALE_SECS, RECONCILE_FACETS,
 };
+use sqlx::PgPool;
 
 use super::*;
 
@@ -107,15 +110,17 @@ async fn node_queue_metrics_cover_depth_and_stale_claim_counts() -> TestResult {
         Some(&1)
     );
 
-    let stale_claims = node_queue_stale_claim_counts(&db.pool)
+    let stale_claims = pplx_space_cluster_trigger_queue::reconcile_queue_stale_claims(&db.pool)
         .await?
         .into_iter()
+        .map(|row| (row.facet, row.count))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(stale_claims.len(), 1);
     assert_eq!(stale_claims.get(FACET_NETWORK_POLICY), Some(&1));
 
-    emit_node_queue_depth(&db.pool).await;
-    emit_node_queue_stale_claims(&db.pool).await;
+    let queue_db = Db::from(db.pool.clone());
+    emit_node_queue_depth(&queue_db).await;
+    emit_node_queue_stale_claims(&queue_db).await;
     Ok(())
 }
 
@@ -442,13 +447,13 @@ async fn every_facet_emits_both_stages_when_queue_is_empty() -> TestResult {
 }
 
 async fn lag_for(pool: &PgPool, facet: &str, stage: QueueLagStage) -> TestResult<f64> {
-    let (_, claim_seconds, retry_seconds) = node_queue_lag_seconds(pool)
+    let lag = pplx_space_cluster_trigger_queue::reconcile_queue_lag(pool)
         .await?
         .into_iter()
-        .find(|(row_facet, _, _)| row_facet == facet)
+        .find(|row| row.facet == facet)
         .unwrap_or_else(|| panic!("known facet {facet} must emit a lag value"));
     Ok(match stage {
-        QueueLagStage::Claim => claim_seconds,
-        QueueLagStage::Retry => retry_seconds,
+        QueueLagStage::Claim => lag.claim_lag_seconds,
+        QueueLagStage::Retry => lag.retry_lag_seconds,
     })
 }
