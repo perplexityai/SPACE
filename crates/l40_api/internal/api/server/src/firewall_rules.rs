@@ -171,7 +171,7 @@ impl ClusterApiService {
                 .map(|pending| FirewallRulesPendingRound {
                     round: pending.round,
                     issued_at: Some(SystemTime::from(pending.issued_at).into()),
-                    assignment_generation: pending.assignment_generation,
+                    assignment_generation: Some(pending.assignment_generation),
                 }),
         }))
     }

@@ -21,7 +21,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
-use crate::fetch::{PendingRound, non_negative, pending_round};
+use crate::fetch::{PendingRound, bound_generation, pending_round};
 use crate::issue::wake_one;
 use crate::leased_item::{HeaderLock, lock_leased_item};
 use crate::{LeasedTarget, REPORT_MAX_AGE, Wakeup, Work, roll_back};
@@ -171,22 +171,21 @@ async fn open(
     if epoch != manager_epoch {
         return Ok(Opening::Refused(OpenRefusal::EpochMismatch));
     }
-    match (round, round_issued_at, bound.map(non_negative).transpose()?) {
-        (Some(round), Some(issued_at), Some(bound))
-            if bound == assignment_generation && !expired =>
-        {
-            return Ok(Opening::AlreadyOpen(pending_round(
-                round,
-                issued_at,
-                Some(assignment_generation),
-            )?));
+    let pending = match (round, round_issued_at) {
+        (Some(round), Some(issued_at)) => {
+            Some(pending_round(round, issued_at, bound_generation(bound)?)?)
         }
-        (_, _, Some(bound)) if bound > assignment_generation => {
+        _ => None,
+    };
+    match pending {
+        Some(open) if open.assignment_generation == assignment_generation && !expired => {
+            return Ok(Opening::AlreadyOpen(open));
+        }
+        Some(open) if open.assignment_generation > assignment_generation => {
             return Ok(Opening::Refused(OpenRefusal::LaterGeneration));
         }
-        // Replaced: no round, an expired one for this generation, one for an
-        // earlier generation, or an unbound one, left from before rounds
-        // named their generation.
+        // Replaced: no round, an expired one for this generation, or one for
+        // an earlier generation.
         _ => {}
     }
     wake_one(tx, wakeup, target.node_id).await?;
@@ -219,6 +218,6 @@ async fn open(
     Ok(Opening::Opened(pending_round(
         round,
         issued_at,
-        Some(assignment_generation),
+        assignment_generation,
     )?))
 }

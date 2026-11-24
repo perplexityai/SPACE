@@ -36,9 +36,8 @@ pub struct PendingRound {
     pub round: u64,
     pub issued_at: Timestamp,
     /// The assignment generation the round asks about, read from the round
-    /// rather than the assignment. `None` for a round that names none, which
-    /// can't be answered.
-    pub assignment_generation: Option<u64>,
+    /// rather than the assignment.
+    pub assignment_generation: u64,
 }
 
 /// Read `node`'s assignment and pending round.
@@ -82,7 +81,7 @@ pub async fn fetch_instructions(
         (Some(round), Some(issued_at)) => Some(pending_round(
             round,
             issued_at,
-            round_generation.map(non_negative).transpose()?,
+            bound_generation(round_generation)?,
         )?),
         _ => None,
     };
@@ -97,7 +96,7 @@ pub async fn fetch_instructions(
 pub(crate) fn pending_round(
     round: i64,
     issued_at: OffsetDateTime,
-    assignment_generation: Option<u64>,
+    assignment_generation: u64,
 ) -> Result<PendingRound, sqlx::Error> {
     Ok(PendingRound {
         round: non_negative(round)?,
@@ -107,8 +106,16 @@ pub(crate) fn pending_round(
     })
 }
 
+/// The generation a pending round names; the schema never stores one without.
+pub(crate) fn bound_generation(stored: Option<i64>) -> Result<u64, sqlx::Error> {
+    let stored = stored.ok_or_else(|| {
+        sqlx::Error::Decode("pending round names no assignment generation".into())
+    })?;
+    non_negative(stored)
+}
+
 /// The schema keeps every counter non-negative; report a violation rather
 /// than guess.
-pub(crate) fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
+fn non_negative(value: i64) -> Result<u64, sqlx::Error> {
     u64::try_from(value).map_err(|error| sqlx::Error::Decode(Box::new(error)))
 }
