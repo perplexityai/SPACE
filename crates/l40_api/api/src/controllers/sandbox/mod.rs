@@ -838,42 +838,16 @@ async fn mark_sandbox_port_exposure_applied(
     active_node_id: NodeId,
     observation: &SandboxPortExposureApplyObservation,
 ) -> Result<SandboxPortExposure, ControllerError> {
-    sqlx::query_as::<_, SandboxPortExposure>(sql!(
-        "UPDATE sandbox_port_exposures
-         SET apply_state = 'applied',
-             last_applied_node_id = $3,
-             last_error = NULL,
-             last_bridge_status = $4,
-             last_applied_bridge_generation = $5,
-             last_observed_at = NOW(),
-             updated_at = NOW()
-         WHERE sandbox_id = $1
-           AND protocol = 'tcp'
-           AND guest_port = $2
-           AND desired_state = 'open'
-         RETURNING sandbox_id,
-                   protocol,
-                   guest_port,
-                   visibility,
-                   source,
-                   desired_state,
-                   apply_state,
-                   last_applied_node_id,
-                   last_error,
-                   last_bridge_status,
-                   last_applied_bridge_generation,
-                   last_observed_at,
-                   created_at,
-                   updated_at"
-    ))
-    .bind(sandbox_id)
-    .bind(port as i32)
-    .bind(active_node_id)
-    .bind(observation.bridge_status)
-    .bind(observation.service_generation.as_deref())
-    .fetch_optional(pool)
+    pplx_space_sandbox_store::port_exposures::mark_applied(
+        pool,
+        sandbox_id,
+        port as i32,
+        active_node_id,
+        observation.as_bridge_observation(),
+    )
     .await
     .map_err(|err| db_contention_error("failed to mark sandbox port exposure applied", &err))?
+    .map(SandboxPortExposure::from)
     .ok_or_else(|| ControllerError::conflict("sandbox port exposure is no longer open"))
 }
 
@@ -886,38 +860,15 @@ async fn mark_sandbox_port_exposure_failed(
     observation: Option<&SandboxPortExposureApplyObservation>,
 ) {
     let error_message = error.to_string();
-    let bridge_status = observation.map(|observation| observation.bridge_status);
-    let service_generation =
-        observation.and_then(|observation| observation.service_generation.as_deref());
-    if let Err(update_error) = sqlx::query(sql!(
-        "UPDATE sandbox_port_exposures
-         SET apply_state = 'failed',
-             last_error = $4,
-             last_bridge_status = COALESCE($5::TEXT, last_bridge_status),
-             last_applied_bridge_generation =
-                 COALESCE($6::TEXT, last_applied_bridge_generation),
-             last_observed_at =
-                 CASE WHEN $5::TEXT IS NOT NULL THEN NOW() ELSE last_observed_at END,
-             updated_at = NOW()
-         WHERE sandbox_id = $1
-           AND protocol = 'tcp'
-           AND guest_port = $2
-           AND desired_state = 'open'
-           AND NOT (
-               apply_state = 'applied'
-               AND last_applied_node_id IS NOT DISTINCT FROM $3
-               AND last_bridge_status IN ('direct', 'loopback_forwarded')
-               AND last_observed_at >= NOW() - ($7::BIGINT * INTERVAL '1 second')
-           )"
-    ))
-    .bind(sandbox_id)
-    .bind(port as i32)
-    .bind(active_node_id)
-    .bind(error_message)
-    .bind(bridge_status)
-    .bind(service_generation)
-    .bind(SANDBOX_PORT_OBSERVATION_FRESHNESS_SECS)
-    .execute(pool)
+    if let Err(update_error) = pplx_space_sandbox_store::port_exposures::mark_failed(
+        pool,
+        sandbox_id,
+        port as i32,
+        active_node_id,
+        &error_message,
+        observation.map(SandboxPortExposureApplyObservation::as_bridge_observation),
+        SANDBOX_PORT_OBSERVATION_FRESHNESS_SECS,
+    )
     .await
     {
         tracing::warn!(
@@ -933,6 +884,17 @@ async fn mark_sandbox_port_exposure_failed(
 struct SandboxPortExposureApplyObservation {
     bridge_status: &'static str,
     service_generation: Option<String>,
+}
+
+impl SandboxPortExposureApplyObservation {
+    fn as_bridge_observation(
+        &self,
+    ) -> pplx_space_sandbox_store::port_exposures::BridgeObservation<'_> {
+        pplx_space_sandbox_store::port_exposures::BridgeObservation {
+            bridge_status: self.bridge_status,
+            service_generation: self.service_generation.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1219,27 +1181,24 @@ pub(crate) async fn fetch_sandbox_wake_signal(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> Result<Option<SandboxWakeSignal>, sqlx::Error> {
-    let row: Option<(String, bool)> = sqlx::query_as(sql!(
-        "SELECT lifecycle,
-                lifecycle_changed_at > NOW() - make_interval(secs => $2)
-           FROM sandboxes
-          WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .bind(POST_WAKE_LISTENER_REBIND_GRACE.as_secs_f64())
-    .fetch_optional(pool)
+    let row = pplx_space_sandbox_store::runtime_access::runtime_access(
+        pool,
+        sandbox_id,
+        POST_WAKE_LISTENER_REBIND_GRACE.as_secs_f64(),
+    )
     .await?;
-    Ok(row.map(|(lifecycle, lifecycle_changed_recently)| {
+    Ok(row.map(|row| {
         SandboxWakeSignal {
             // Normalize before parsing: the lifecycle column is fed from
             // substrate-reported status, so tolerate casing/whitespace
             // rather than silently treating `Restoring` as unknown.
-            lifecycle: lifecycle
+            lifecycle: row
+                .lifecycle
                 .trim()
                 .to_ascii_lowercase()
                 .parse::<SandboxLifecycle>()
                 .ok(),
-            lifecycle_changed_recently,
+            lifecycle_changed_recently: row.lifecycle_changed_recently,
         }
     }))
 }

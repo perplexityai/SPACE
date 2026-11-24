@@ -1,7 +1,14 @@
-//! Guarded writes the Direct substrate makes to `sandboxes`: the restore
-//! lease's claim, renewal, release and completion, the placement an owned
-//! restore receipt records, and the adoption of a live node record by a row
-//! with no active node.
+//! The Direct substrate's statements on `sandboxes`. This module holds its
+//! guarded writes: the restore lease's claim, renewal, release and
+//! completion, the placement an owned restore receipt records, and the
+//! adoption of a live node record by a row with no active node. Beside them
+//! are the lease owner's row lock ([`lock_restore_lease_owner`]) and the two
+//! unlocked reads of the lease's remaining time by the database clock that a
+//! restore takes before and after its claim ([`unexpired_restore_lease`],
+//! [`floored_restore_lease`]). Reads of the row that join the Direct-only
+//! tables go in child modules under `direct/`, each named for the question
+//! it answers; `pattern_ratchet.direct_tables` lets this module and its
+//! children name those tables.
 //!
 //! The adoption's guard also reads the Direct-only route-identity and
 //! provenance tables, which `pattern_ratchet.direct_tables` confines to the
@@ -9,14 +16,16 @@
 //! passes what it decided; [`adopt_live_execution`] guards on the row's own
 //! columns.
 //!
-//! The substrate keeps everything around them: the row locks
-//! (`SELECT ... FOR UPDATE` for restore ownership, `FOR NO KEY UPDATE` for
-//! the adoption), the route-identity writes beside the receipt placement and
-//! the reads the adoption decides from, the transactions, and the lease's
-//! duration. Each function runs on the executor its caller passes, so it
-//! composes into the caller's transaction when there is one. A guarded write
-//! that matches no row returns `false` (or `None`), whether another writer
-//! won or the row never met the guard; the caller decides what that means.
+//! The substrate keeps everything around them: the adoption's row lock
+//! (`FOR NO KEY UPDATE`), the route-identity writes beside the receipt
+//! placement and the reads the adoption decides from, the transactions, and
+//! the lease's duration. Each function runs on the executor its caller
+//! passes, so it composes into the caller's transaction when there is one;
+//! the lock verb takes the caller's connection, so its lock lasts until the
+//! caller's transaction ends. The two reads run on the pool, so `NOW()` is
+//! each read's own instant. A guarded write that matches no row returns
+//! `false` (or `None`), whether another writer won or the row never met the
+//! guard; the caller decides what that means.
 //!
 //! Lease tokens need no lifecycle re-check of their own, because a row that
 //! holds a token is `restoring`. The `sandboxes_clear_restore_lease` BEFORE
@@ -175,13 +184,40 @@ pub async fn complete_restore_lease<'e>(
     Ok(completed.rows_affected() == 1)
 }
 
+/// Returns whether the row still holds the Direct restore lease `token`,
+/// and when it does, holds the row's `FOR UPDATE` lock until the caller's
+/// transaction ends. The guard is inside the locking statement, so `false`
+/// means the row no longer holds the token or no longer exists.
+///
+/// The lease owner takes it before persisting a restore receipt's route
+/// identity and placement ([`place_owned_restore_receipt`]) in the same
+/// transaction.
+pub async fn lock_restore_lease_owner(
+    connection: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    token: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let owns_restore = sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT TRUE
+               FROM sandboxes
+              WHERE id = $1
+                AND restore_lease_token = $2
+              FOR UPDATE"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(token)
+    .fetch_optional(connection)
+    .await?;
+    Ok(owns_restore.is_some())
+}
+
 /// Observed projection: places the row on the node whose restore receipt the
 /// lease owner just persisted, as both its active and target node. Returns
 /// whether the row still held the lease.
 ///
 /// Guarded by `token` alone, with no lifecycle predicate: the caller holds
-/// the row lock it took while re-checking the same token, and persists the
-/// receipt's route identity in the same transaction.
+/// the row lock [`lock_restore_lease_owner`] took while re-checking the same
+/// token, and persists the receipt's route identity in the same transaction.
 pub async fn place_owned_restore_receipt<'e>(
     executor: impl PgExecutor<'e>,
     sandbox_id: SandboxId,
@@ -252,4 +288,87 @@ pub async fn adopt_live_execution<'e>(
     .execute(executor)
     .await?;
     Ok(adopted.rows_affected() == 1)
+}
+
+/// A row's lifecycle and the seconds its Direct restore lease has left
+/// while unexpired, as [`unexpired_restore_lease`] reads them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnexpiredRestoreLease {
+    /// Raw `sandboxes.lifecycle`; the caller parses it.
+    pub lifecycle: String,
+    /// Seconds left on the lease by the database clock; `None` once it
+    /// has expired or when the row holds no lease expiry.
+    pub remaining_seconds: Option<f64>,
+}
+
+/// A row's lifecycle and the seconds its Direct restore lease has left,
+/// floored at zero, as [`floored_restore_lease`] reads them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlooredRestoreLease {
+    /// Raw `sandboxes.lifecycle`; the caller parses it.
+    pub lifecycle: String,
+    /// Seconds left on the lease by the database clock, `0.0` once it
+    /// has expired; `None` only when the row holds no lease expiry.
+    pub remaining_seconds: Option<f64>,
+}
+
+/// The row's lifecycle, and the seconds its restore lease has left by the
+/// database clock while the lease is unexpired (`None` once it has expired
+/// or when the row holds no lease expiry). A plain read that takes no lock;
+/// `None` when no such sandbox exists.
+pub async fn unexpired_restore_lease<'e>(
+    executor: impl PgExecutor<'e>,
+    sandbox_id: SandboxId,
+) -> Result<Option<UnexpiredRestoreLease>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, Option<f64>)>(sql!(
+        "SELECT lifecycle,
+                    CASE
+                        WHEN restore_lease_expires_at > NOW() THEN
+                            EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW()))::float8
+                        ELSE NULL
+                    END
+               FROM sandboxes
+              WHERE id = $1"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .fetch_optional(executor)
+    .await?;
+    Ok(
+        row.map(|(lifecycle, remaining_seconds)| UnexpiredRestoreLease {
+            lifecycle,
+            remaining_seconds,
+        }),
+    )
+}
+
+/// The row's lifecycle, and the seconds its restore lease has left by the
+/// database clock, `0.0` once it has expired and `None` only when the row
+/// holds no lease expiry, as a caller reads them after
+/// [`claim_restore_lease`] claimed nothing. A plain read that takes no lock;
+/// `None` when no such sandbox exists.
+pub async fn floored_restore_lease<'e>(
+    executor: impl PgExecutor<'e>,
+    sandbox_id: SandboxId,
+) -> Result<Option<FlooredRestoreLease>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, Option<f64>)>(sql!(
+        "SELECT lifecycle,
+                    CASE
+                        WHEN restore_lease_expires_at IS NULL THEN NULL
+                        ELSE GREATEST(
+                            EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),
+                            0.0
+                        )::float8
+                    END
+               FROM sandboxes
+              WHERE id = $1"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .fetch_optional(executor)
+    .await?;
+    Ok(
+        row.map(|(lifecycle, remaining_seconds)| FlooredRestoreLease {
+            lifecycle,
+            remaining_seconds,
+        }),
+    )
 }

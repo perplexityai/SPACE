@@ -32,28 +32,18 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<(i64, Duration)>, SubstrateError> {
-        let row = sqlx::query_as::<_, (i64, i64)>(sql!(
-            "SELECT generation,
-                    GREATEST(
-                        CEIL(EXTRACT(EPOCH FROM (
-                            updated_at + make_interval(secs => $3) - NOW()
-                        )) * 1000)::BIGINT,
-                        0::BIGINT
-                    ) AS lease_remaining_millis
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1 AND active AND state = $2
-               AND updated_at > NOW() - make_interval(secs => $3)"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(ActiveExecutionState::Recovering.as_str())
-        .bind(recovery_lease_ttl_secs())
-        .fetch_optional(&self.pool)
+        let row = pplx_space_sandbox_store::k8s_executions::fresh_started_recovery(
+            &self.pool,
+            sandbox_id,
+            ActiveExecutionState::Recovering.as_str(),
+            recovery_lease_ttl_secs(),
+        )
         .await
         .db_context("failed to inspect started recovery lease")?;
 
-        row.map(|(generation, remaining_millis)| {
-            u64::try_from(remaining_millis)
-                .map(|remaining| (generation, Duration::from_millis(remaining)))
+        row.map(|recovery| {
+            u64::try_from(recovery.lease_remaining_millis)
+                .map(|remaining| (recovery.generation, Duration::from_millis(remaining)))
                 .map_err(|err| SubstrateError::Failed {
                     message: format!("invalid started recovery lease duration: {err}"),
                 })

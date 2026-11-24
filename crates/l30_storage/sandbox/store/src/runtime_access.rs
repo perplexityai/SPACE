@@ -1,5 +1,7 @@
 //! What the data plane reads off the `sandboxes` row to decide whether a
-//! sandbox's runtime may be reached now.
+//! sandbox's runtime may be reached now, and what api re-reads to decide
+//! whether a failed upstream connect happened while the sandbox was
+//! plausibly mid-wake.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;

@@ -94,6 +94,8 @@
 //!   and so does one that joins the row to what it references, as
 //!   [`row_reads::owner`] (its organization) and [`debug_reads::record`]
 //!   (its nodes) do.
+//!   The two restore-lease reads the Direct restore takes before and after
+//!   its claim stay beside that claim in [`direct`].
 //!   Some such modules also read tables another store owns. For example,
 //!   [`active_quarantines`] and [`quarantine_recovery_authority`] join
 //!   `sandbox_quarantine_state`, which belongs to
@@ -111,12 +113,15 @@
 //!   holds unlocked reads only: the table's writes, the generation
 //!   allocation and its `FOR UPDATE` reads stay with the execution-ownership
 //!   paths that issue them. A step that is part of a transition statement
-//!   stays in that transition's module. A sibling-table module also holds
-//!   guarded writes confined to its table, such as
-//!   [`port_exposures::record_apply_states`], and a step that more than one
-//!   transition runs, such as [`observed_states::clear_failed_observation`]. A read of the `sandboxes` row
-//!   alone, such as [`runtime_access`], gets a module named for the
-//!   question it answers.
+//!   stays in that transition's module. The other sibling-table modules
+//!   also hold the guarded writes confined to their table, each a statement
+//!   of its own with its guard whole, such as
+//!   [`port_exposures::record_apply_states`],
+//!   [`port_exposures::mark_applied`] and [`port_exposures::mark_failed`],
+//!   and a step that more than one transition runs, such as
+//!   [`observed_states::clear_failed_observation`]. A read of the
+//!   `sandboxes` row alone, such as [`runtime_access`], gets a module named
+//!   for the question it answers.
 //!
 //! # Fact kinds
 //!
