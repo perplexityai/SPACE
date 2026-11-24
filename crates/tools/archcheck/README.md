@@ -266,7 +266,7 @@ down the stack. The layers are directories under `crates/`, bottom-up:
 |---|---|
 | `l10_foundation` | generic building blocks that name nothing SPACE-specific |
 | `l20_domain` | models (types and the rules that keep them valid) and protocols (wire schemas and conversions), without I/O |
-| `l30_storage` | stores: the only crates that reach a database, private to the crates that own their state |
+| `l30_storage` | stores, the only crates that reach a database, private to the crates that own their state; and coordinators, which run one transaction across stores |
 | `l40_api` | use cases and their entry points (handlers, loops, sweepers, jobs), and each service's `*-client` |
 | `l50_app` | thin mains that compose API crates |
 | `test_support` | test doubles and fixtures, reachable only through `[dev-dependencies]` |
@@ -290,17 +290,20 @@ each finding means and how to fix it.
 |---|---|
 | Foundation | Foundation |
 | Domain | Domain, Foundation |
-| Storage | Domain, Foundation, and another store that lists it as a user |
-| API | API, Domain, Foundation, and the stores that list it as a user; a `*-client` only Domain, Foundation and other clients |
-| App | API, Domain, Foundation; never another app or a store |
+| Storage | Domain, Foundation, and another store that lists it as a user; never a coordinator |
+| API | API, Domain, Foundation, and the stores and coordinators that list it as a user; a `*-client` only Domain, Foundation and other clients |
+| App | API, Domain, Foundation; never another app or an `l30_storage` crate |
 | test_support, tools | anything but tools |
 
 ```toml
 [rules.layers.unmoved]                 # crates outside the layer directories
 l10_foundation = ["pplx-space-byte-size"]
 
-[rules.layers.store_users]             # store → the crates that own its state and use it
+[rules.layers.store_users]             # store → the crates that own its state and use it, and the coordinators that call it
 pplx-space-sandbox-store = ["pplx-space-api"]
+
+[rules.layers.coordinator_users]       # coordinator → the API crates that run its transaction
+pplx-space-sandbox-coordinator = ["pplx-space-api"]
 
 [rules.layers.allowed_edges]           # edges the matrix forbids, allowed by name
 pplx-space-db-migrator = ["pplx-space-db-migrate"]
@@ -321,7 +324,8 @@ http = ["hyper", "reqwest"]
 
 [rules.layers.placement]
 mode = "required"
-# ...and layout, test_only, clients, store_edges, stale_entries and
+# ...and layout, test_only, clients, store_edges, coordinators,
+# coordinator_edges, driver_reexports, stale_entries and
 # policy_changed, each with a mode, and direction, dev_direction,
 # storage_access, codec_features, domain_dependencies and model_protocol, each
 # with no_crossing, no_new_entries and stale_entries.
@@ -364,7 +368,8 @@ The checks, each with its own mode:
 - `test_only`: a normal or build dependency on a test_support crate from a
   layer crate, or any dependency on a tools crate. Tools may use test_support
   as a normal dependency. An `allowed_edges` entry, which exempts an edge
-  from `direction`, `clients` and `store_edges`, never exempts one from
+  from `direction`, `clients`, `store_edges`, `coordinators` and
+  `coordinator_edges`, never exempts one from
   `test_only`.
 - `clients`: a `*-client` crate in `l40_api` depending on anything but
   Domain, Foundation and other clients, such as its own service or a store.
@@ -372,7 +377,11 @@ The checks, each with its own mode:
 - `store_edges`: an API or Storage crate depending on a store whose
   `store_users` doesn't list it. The fix is the owner's API, or for a store,
   which can't depend on one, moving the read into the owning store; or, if
-  the crate owns the state, listing it.
+  the crate owns the state, listing it. A coordinator is listed as a user of
+  each store it has a normal or build dependency on,
+  `pplx-space-postgres-pool` included.
+- `coordinators`, `coordinator_edges` and `driver_reexports`: see
+  [Coordinators](#coordinators).
 - `stale_entries`: an `unmoved` entry for a crate that is gone or now in a
   layer directory; a `store_users` entry for something that isn't a store,
   or listing a crate that is gone, a client, or one outside API and Storage,
@@ -385,7 +394,11 @@ The checks, each with its own mode:
   `l10_foundation` or also a helper, and one of its exports that no file of the
   facade re-exports, an empty export list, or an export key for no driver
   it depends on; a `protocols` entry that is gone, outside `l20_domain` or a protocol by its
-  name already; a `[rules.layers.domain_fences]` package that is a driver or
+  name already; a `coordinator_users` entry for something that isn't a
+  coordinator, or listing a crate that is gone, a client, or one outside
+  API, which allows nothing, or a user with no normal or build dependency on
+  the coordinator; a `store_users` entry for a coordinator, whose users go
+  in `coordinator_users`; a `[rules.layers.domain_fences]` package that is a driver or
   a storage helper, which `storage_access` checks instead, or a Foundation
   crate that its own dependencies fence already; and, with the state
   checks, a `[rules.layers.state.co_writers]` grant that allows nothing (see
@@ -396,7 +409,8 @@ The checks, each with its own mode:
 - `policy_changed`: every difference in `[rules.layers]` from the base
   branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
   `unmoved` entry added or moved to another layer, a store user or allowed
-  edge added or removed, a protocol added or removed, a driver, helper or
+  edge added or removed, a coordinator user added or removed, a protocol
+  added or removed, a driver, helper or
   codec facade added to or removed from
   `[rules.layers.storage]`, a facade's export added or removed, a
   package added to, removed from or moved between
@@ -451,6 +465,60 @@ As for `crate_names`, it lists no TOML to paste. It always writes every
 layers table, `[layers.unowned]` with the state checks, after the tables of
 caps and before `[crate_names]`; `--write-baseline=layers.<check>` updates
 one, creating it if the file lacks it.
+
+### Coordinators
+
+`l30_storage` holds two kinds of crate. A **store** owns its tables or
+objects and holds all of their SQL; every statement it runs writes only its
+own tables, except where a `[rules.layers.state.co_writers]` grant allows
+another store's table. A **coordinator** is an `l30_storage` crate whose package name
+ends in `-coordinator`, at `<area>/coordinator` (`pplx-space-<area>-coordinator`):
+it runs one transaction across two or more stores, calling each store's
+verb for that store's own rows, and documents the lock order. Every other
+`l30_storage` crate is a store. A coordinator owns no tables, holds no SQL
+and depends on no driver, storage helper or codec facade
+(`[rules.layers.storage]` in `ARCHITECTURE.toml`): only Domain crates, other
+Foundation crates and the stores that list it as a user,
+`pplx-space-postgres-pool` among them. The checks:
+
+- `coordinators`: a coordinator with a `[package.metadata.space.state]`,
+  shown on the table's line, since it owns no tables; an `l30_storage` crate
+  whose path below the layer ends in `coordinator` but whose name doesn't
+  end in `-coordinator`, shown on its `name =` line, since archcheck would
+  check it as a store (`layout`'s leaf rule accepts `<area>/coordinator`
+  for `pplx-space-<area>`, so only this check makes name and path agree);
+  and a coordinator's normal or build dependency on another coordinator,
+  shown on the manifest line that declares it: coordinators don't nest, so
+  the outer one calls the stores' verbs itself, in the inner one's lock
+  order, or the two merge.
+- `coordinator_edges`: an API crate depending on a coordinator whose
+  `[rules.layers.coordinator_users]` entry doesn't list it, and a store
+  depending on any coordinator, listed or not: a coordinator's edges point at
+  stores, never from them. Only API crates are listed; `stale_entries`
+  reports any other user.
+- `driver_reexports`: a `pub use` or `pub extern crate` that starts with one
+  of a Storage crate's driver dependencies, by the name its code uses for
+  it, at the top level of the crate's library root or in a `pub mod` block
+  there, which would hand the crate's users the driver. The root is read
+  with syn, as a codec facade's source is (see [Storage
+  access](#storage-access)), so a finding is on line 1 of the file and names
+  the full path re-exported. Items only tests compile, under `cfg(test)`
+  or an `all(…)` that includes `test`, are skipped; `any(test, …)` is not.
+  A root syn can't parse is skipped, since rustc reports it, and so is a
+  root outside the crate's `src/`, which archcheck doesn't read; a driver
+  re-exported from another module, or through a type alias, is not seen.
+
+A coordinator is no store for the other checks either: `storage_access` and
+`codec_features` report its driver, helper and codec facade dependencies and
+the driver features it enables, as they do an API crate's, with a fix that
+moves the code into the store that owns the rows; `state.declarations` asks
+it for no state table, and its declaration makes no table owned;
+`state.writes` reports its write statement that names a store's table,
+whatever it declares or is granted, since a coordinator holds no SQL; and a
+co-writer grant to a coordinator allows nothing. Like `store_users`, a
+`coordinator_users` entry is a policy change that
+`policy_changed` reports, and an `allowed_edges` entry exempts an edge from
+`coordinators` and `coordinator_edges` as it does from `store_edges`.
 
 ### Storage access
 
@@ -515,7 +583,8 @@ Two checks, each with the three baselined behaviours above and a table
 keyed by package:
 
 - `storage_access`: only stores and helpers may have a normal or build
-  dependency on a driver, helper or codec facade. An optional dependency
+  dependency on a driver, helper or codec facade; a coordinator is no
+  store. An optional dependency
   counts too, since a feature turns it on, with two exceptions, each an
   optional normal dependency, under `[dependencies]` or a
   `[target.'cfg(…)'.dependencies]` table: an `l10_foundation` or `l20_domain`
@@ -559,8 +628,8 @@ keyed by package:
   `storage_access` checks that edge too. `[layers.storage_access]` maps each
   package to the drivers, helpers and codec facades it depends on, such as
   `pplx-space-api = ["sqlx"]`.
-- `codec_features`: a **driver feature** is a feature of a crate outside
-  Storage that turns on an optional dependency on a driver or helper, with
+- `codec_features`: a **driver feature** is a feature of a crate other
+  than a store that turns on an optional dependency on a driver or helper, with
   `dep:<name>`, `<name>/<feature>` or Cargo's implicit feature for the
   dependency, that turns on an optional dependency whose `features` or
   default features include another crate's driver feature, or that
@@ -752,7 +821,8 @@ a shared catalog listed as a database, and `[rules.layers.state]` without
 The checks, each with its own mode, shown on the manifest line they are
 about unless said otherwise:
 
-- `state.declarations`: a store (`l30_storage`) without a state table, shown
+- `state.declarations`: a store (`l30_storage`, other than a coordinator)
+  without a state table, shown
   on its `name =` line; a crate outside Storage with one, since only stores
   own or co-write tables; a namespace that is no database, such as a shared
   catalog's, whose tables are declared in each database instead.
@@ -897,6 +967,10 @@ so a new table is declared by its owner before its migration lands (see
   that uses it. `policy_changed` reports the change for review. A crate that
   only needs the data uses the owner's API instead, and one that stops using
   the store leaves the list, which `stale_entries` asks for.
+- **A coordinator user:** an API crate that runs a coordinator's
+  transaction goes in its list in `[rules.layers.coordinator_users]` with
+  the dependency that uses it, and the coordinator in the `store_users` list
+  of each store it calls; `policy_changed` reports both.
 - **An exception:** an edge the matrix forbids for good reason, such as the
   database migrator applying every store's migrations, goes in
   `[rules.layers.allowed_edges]` with a comment saying why; `policy_changed`
@@ -927,7 +1001,7 @@ Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check. Unknown keys, sections or modes, a missing file, bad TOML,
 an invalid regex, glob or instance name, an empty `patterns` or `include`
 list, a layer name that is not one of the seven, a package listed twice in
-`unmoved` or in one `store_users` or `allowed_edges` list or in a
+`unmoved` or in one `store_users`, `coordinator_users` or `allowed_edges` list or in a
 `[rules.layers.storage]` list, a package listed twice in `protocols` or in two
 `[rules.layers.domain_fences]` families, an empty `drivers`, a baseline table
 for an instance or layers check that is not configured, a state configuration

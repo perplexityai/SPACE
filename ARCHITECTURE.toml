@@ -366,7 +366,7 @@ mode = "advisory"
 # matrix and how to fix a finding: crates/tools/archcheck/README.md (Layers).
 
 # Each store's users: the l40_api and l30_storage crates that own its state
-# and use the store today.
+# and use the store today, and the coordinators that call it.
 [rules.layers.store_users]
 pplx-space-admin-audit-store = [
   "pplx-space-api",
@@ -528,6 +528,12 @@ pplx-space-template-store = [
   "pplx-space-internal-api-server",
 ]
 pplx-space-volmgr-store = ["pplx-space-volmgr"]
+
+# Each coordinator's users: the l40_api crates that run its transaction
+# today. A coordinator (l30_storage, named *-coordinator) runs one transaction
+# across the stores that list it in store_users, owns no tables and holds no
+# SQL. None exists yet.
+[rules.layers.coordinator_users]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]
@@ -790,6 +796,15 @@ mode = "required"
 mode = "required"
 
 [rules.layers.store_edges]        # API and Storage crates use only the stores that list them
+mode = "required"
+
+[rules.layers.coordinators]       # a coordinator declares no state and uses no other coordinator
+mode = "required"
+
+[rules.layers.coordinator_edges]  # API crates use only the coordinators that list them; stores none
+mode = "required"
+
+[rules.layers.driver_reexports]   # no l30_storage crate's library root re-exports a driver
 mode = "required"
 
 [rules.layers.stale_entries]      # [rules.layers] entries that no longer apply
