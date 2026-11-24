@@ -1,5 +1,5 @@
-//! Reads of releases for the api's creates, placement, pool configs and admin
-//! routes. None takes a lock.
+//! Reads of releases for the api's creates, placement, pool claims and
+//! configs, and admin routes. None takes a lock.
 
 use pplx_space_accounts::OrgId;
 use pplx_space_content_digest::HashAlg;
@@ -29,7 +29,8 @@ pub struct VisibleRelease {
     pub created_at: OffsetDateTime,
 }
 
-/// A release a caller named by id, with its stored hash.
+/// A release's id and stored hash, as [`named_release`] and
+/// [`pool_target_release`] read it.
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct NamedRelease {
     pub id: Uuid,
@@ -193,6 +194,53 @@ pub async fn named_release(
     .bind(content_hash)
     .fetch_optional(executor)
     .await
+}
+
+/// The release a Kubernetes pool claim or config upsert targets: the
+/// release matching `content_hash`, under either spelling, when one is
+/// pinned, otherwise the release of the digest tagged `latest` (the tag may
+/// sit on the other spelling's original when it predates the shared rule),
+/// otherwise the newest release of the template. Only digest originals are
+/// candidates (`pplx_space_template_release_original::digest_original`, the
+/// release the create path and the warm-pool store resolve the digest to): a
+/// twin bound to another environment is registered after its original and
+/// would otherwise be the newest, and the other spelling's original of a
+/// digest would hold slots no create claims. The hash comes back as stored.
+pub async fn pool_target_release(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    content_hash: Option<&str>,
+) -> Result<Option<NamedRelease>, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id, r.hash AS content_hash
+             FROM template_releases r
+             WHERE r.template_name = $1
+               AND ($2::TEXT IS NULL
+                    OR r.hash IN (replace($2, 'sha256:', ''),
+                                  'sha256:' || replace($2, 'sha256:', '')))
+               AND {digest_original}
+             ORDER BY EXISTS (
+                          SELECT 1
+                          FROM template_release_tags t
+                          JOIN template_releases tagged
+                            ON tagged.id = t.template_release_id
+                           AND tagged.template_name = t.template_name
+                          WHERE t.template_name = r.template_name
+                            AND t.tag = 'latest'
+                            AND replace(tagged.hash, 'sha256:', '')
+                              = replace(r.hash, 'sha256:', '')) DESC,
+                      r.created_at DESC
+             LIMIT 1",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_as::<_, NamedRelease>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name)
+        .bind(content_hash)
+        .fetch_optional(executor)
+        .await
 }
 
 /// Every environment a release is bound to, an unbound release counting as

@@ -24,6 +24,7 @@ aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-credential-types = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }

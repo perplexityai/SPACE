@@ -9,9 +9,7 @@ use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
-use pplx_space_template_release_original::digest_original;
 use sqlx::{PgPool, Postgres, Transaction};
-use std::sync::LazyLock;
 use uuid::Uuid;
 
 use crate::controllers::{
@@ -779,59 +777,34 @@ pub(super) async fn release_claimed_pool_slot(
     Ok(())
 }
 
-#[derive(sqlx::FromRow)]
 struct PoolTemplateReleaseRow {
     id: Uuid,
     content_hash: String,
 }
 
-/// Resolve the template release a pool claim or config upsert targets: the
-/// release matching the requested content hash, under either spelling, when
-/// one is pinned, otherwise the release of the digest tagged `latest` (the tag
-/// may sit on the other spelling's original when it predates the shared rule),
-/// otherwise the newest release of the template. Only digest originals are candidates
-/// (`pplx_space_template_release_original::digest_original`, the release the
-/// create path and the warm-pool store resolve the digest to): a twin bound to
-/// another environment is registered after its original and would otherwise
-/// be the newest, and the other spelling's original of a digest would hold
-/// slots no create claims.
-/// Template-domain logic; deliberately not part of the warm-pool store.
+/// Resolve the template release a pool claim or config upsert targets
+/// (`pplx_space_template_release_store::lookup::pool_target_release`): with
+/// a pinned content hash, that digest's original, if it has one; without
+/// one, the `latest`-tagged digest's original, else the template's newest
+/// digest original.
 async fn resolve_pool_template_release(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
-    /// Built once: every input is a literal or a bind placeholder.
-    static QUERY: LazyLock<String> = LazyLock::new(|| {
-        sql!(format!(
-            "SELECT r.id, r.hash AS content_hash
-             FROM template_releases r
-             WHERE r.template_name = $1
-               AND ($2::TEXT IS NULL
-                    OR r.hash IN (replace($2, 'sha256:', ''),
-                                  'sha256:' || replace($2, 'sha256:', '')))
-               AND {digest_original}
-             ORDER BY EXISTS (
-                          SELECT 1
-                          FROM template_release_tags t
-                          JOIN template_releases tagged
-                            ON tagged.id = t.template_release_id
-                           AND tagged.template_name = t.template_name
-                          WHERE t.template_name = r.template_name
-                            AND t.tag = 'latest'
-                            AND replace(tagged.hash, 'sha256:', '')
-                              = replace(r.hash, 'sha256:', '')) DESC,
-                      r.created_at DESC
-             LIMIT 1",
-            digest_original = digest_original("r"),
-        ))
-    });
-    sqlx::query_as::<_, PoolTemplateReleaseRow>(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(template_name)
-        .bind(content_hash)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
+    pplx_space_template_release_store::lookup::pool_target_release(
+        &mut **tx,
+        template_name,
+        content_hash,
+    )
+    .await
+    .map(|release| {
+        release.map(|release| PoolTemplateReleaseRow {
+            id: release.id,
+            content_hash: release.content_hash,
+        })
+    })
+    .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
 }
 
 /// The release `release_id` names, when it's a release of `template_name`

@@ -1017,22 +1017,6 @@ pub(super) async fn template_visibility(
     }
 }
 
-/// Flat row from the `find_template_release` LEFT JOIN. Storage fields are
-/// `NULL` when a release exists but has no storage locations yet.
-#[derive(Debug, FromRow)]
-pub(super) struct FindTemplateReleaseRow {
-    pub(super) generic_authorized: bool,
-    pub(super) release_id: Uuid,
-    pub(super) release_template_name: String,
-    pub(super) release_type: String,
-    pub(super) release_hash: String,
-    pub(super) release_created_at: OffsetDateTime,
-    pub(super) release_environment: Option<String>,
-    pub(super) storage_id: Option<Uuid>,
-    pub(super) storage_connection_string: Option<String>,
-    pub(super) storage_created_at: Option<OffsetDateTime>,
-}
-
 pub(super) fn trimmed_required(value: &str, field: &str) -> Result<String, Status> {
     let trimmed = value.trim();
     if trimmed.is_empty() {

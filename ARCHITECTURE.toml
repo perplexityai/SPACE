@@ -512,7 +512,9 @@ pplx-space-template-release-original = [
 # campaign's source releases, writes twins' metadata.json through its
 # objects, and inserts the twins; and the internal API's release
 # registration reads, inserts and fills releases and their storage
-# locations. The credential manager checks whether a release is published
+# locations, and its template catalog reads releases and their storage
+# locations for the nodes that pull them. The credential manager checks
+# whether a release is published
 # before it vends write credentials for its storage.
 pplx-space-template-release-store = [
   "pplx-space-api",
