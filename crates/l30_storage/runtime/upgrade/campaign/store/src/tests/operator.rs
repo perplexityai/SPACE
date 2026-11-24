@@ -512,6 +512,111 @@ async fn records_list_in_id_order_and_page() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn an_unknown_kind_is_skipped_by_campaign_reads_without_shrinking_pages() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let created = [
+        insert_campaign(&db.pool, CampaignSeed::default()).await?,
+        insert_campaign(
+            &db.pool,
+            CampaignSeed {
+                from: environment(10),
+                ..CampaignSeed::default()
+            },
+        )
+        .await?,
+        insert_campaign(
+            &db.pool,
+            CampaignSeed {
+                from: environment(11),
+                kind: CampaignKind::Templates,
+                ..CampaignSeed::default()
+            },
+        )
+        .await?,
+    ];
+    let mut by_id = created;
+    by_id.sort();
+    let [first, unknown_unfinished, last] = by_id;
+    sqlx::query(sql!(
+        "UPDATE runtime_upgrade_campaigns SET kind = 'kind_from_a_newer_build' WHERE id = $1"
+    ))
+    .bind(unknown_unfinished)
+    .execute(&db.pool)
+    .await?;
+    let unknown_finished = insert_campaign_with_kind(
+        &db.pool,
+        CampaignSeed {
+            from: environment(12),
+            phase: CampaignPhase::Completed,
+            ..CampaignSeed::default()
+        },
+        "kind_from_a_newer_build",
+    )
+    .await?;
+
+    let expected_unfinished: Vec<_> = created
+        .into_iter()
+        .filter(|&id| id != unknown_unfinished)
+        .collect();
+    let unfinished = list_unfinished(&db.pool).await?;
+    assert_eq!(
+        unfinished.iter().map(|c| c.id).collect::<Vec<_>>(),
+        expected_unfinished
+    );
+
+    assert_eq!(get_record(&db.pool, unknown_unfinished).await?, None);
+    assert_eq!(get_record(&db.pool, unknown_finished).await?, None);
+    assert!(get_record(&db.pool, first).await?.is_some());
+
+    let ids = |records: Vec<CampaignRecord>| -> Vec<CampaignId> {
+        records.into_iter().map(|r| r.campaign.id).collect()
+    };
+    assert_eq!(
+        ids(list_records(&db.pool, false, None, 0).await?),
+        Vec::<CampaignId>::new()
+    );
+    assert_eq!(
+        ids(list_records(&db.pool, false, None, 2).await?),
+        [first, last]
+    );
+    // `unknown_unfinished` sits immediately after `first` in id order; a
+    // one-record page past `first` must walk past it and still fill `limit`.
+    assert_eq!(
+        ids(list_records(&db.pool, false, Some(first), 1).await?),
+        [last]
+    );
+    assert_eq!(
+        ids(list_records(&db.pool, true, None, 10).await?),
+        [first, last]
+    );
+
+    // Known kinds still fail closed when another column is unreadable.
+    sqlx::query(sql!(
+        "UPDATE runtime_upgrade_campaigns SET phase = 'warming' WHERE id = $1"
+    ))
+    .bind(last)
+    .execute(&db.pool)
+    .await?;
+    let error = get_record(&db.pool, last)
+        .await
+        .expect_err("an unknown phase on a known kind must fail get_record");
+    assert!(
+        matches!(&error, ReadCampaignError::UnknownValue { campaign_id, .. } if *campaign_id == last),
+        "{error:?}"
+    );
+    let error = list_records(&db.pool, false, None, 10)
+        .await
+        .expect_err("an unknown phase on a known kind must fail list_records");
+    assert!(
+        matches!(&error, ReadCampaignError::UnknownValue { campaign_id, .. } if *campaign_id == last),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn an_abort_ends_the_campaign_and_fences_its_leases() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

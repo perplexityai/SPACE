@@ -3,7 +3,9 @@
 
 use axum::http::Method;
 use pplx_space_content_digest::Digest;
-use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+use pplx_space_runtime_upgrade_campaign_store::test_support::{
+    CampaignSeed, insert_campaign, insert_campaign_with_kind,
+};
 use pplx_space_runtime_upgrade_campaign_store::{CampaignPhase, ItemPhase, SubjectKind};
 use pplx_space_sql_locator::sql;
 use serde_json::{Value, json};
@@ -599,6 +601,48 @@ async fn a_full_page_names_the_cursor_for_the_next() -> TestResult {
     .await;
     assert_eq!(second, ids[PAGE_SIZE as usize..]);
     assert_eq!(next_after, Value::Null, "the last page");
+    Ok(())
+}
+
+// Store-level unknown-kind filtering and page sizing live in
+// `pplx-space-runtime-upgrade-campaign-store`.
+#[tokio::test(flavor = "current_thread")]
+async fn campaigns_of_an_unknown_kind_are_omitted_from_admin_reads() -> TestResult {
+    let Some(h) = driven().await? else {
+        return Ok(());
+    };
+    let known = insert_campaign(&h.db.pool, CampaignSeed::default()).await?;
+    let unknown = insert_campaign_with_kind(
+        &h.db.pool,
+        CampaignSeed {
+            from: environment(10),
+            ..CampaignSeed::default()
+        },
+        "kind_from_a_newer_build",
+    )
+    .await?;
+
+    let (status, list) = h
+        .as_operator(Method::GET, "/runtime-upgrade-campaigns", &[], None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed: Vec<&str> = list["campaigns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|campaign| campaign["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, [known.to_string()]);
+
+    let (status, _) = h
+        .as_operator(
+            Method::GET,
+            &format!("/runtime-upgrade-campaigns/{unknown}"),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     Ok(())
 }
 
