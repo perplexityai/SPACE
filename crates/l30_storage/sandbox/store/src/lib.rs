@@ -109,7 +109,10 @@
 //!   holds unlocked reads only: the table's writes, the generation
 //!   allocation and its `FOR UPDATE` reads stay with the execution-ownership
 //!   paths that issue them. A step that is part of a transition statement
-//!   stays in that transition's module. A read of the `sandboxes` row
+//!   stays in that transition's module. A sibling-table module also holds
+//!   guarded writes confined to its table, such as
+//!   [`port_exposures::record_apply_states`], and a step that more than one
+//!   transition runs, such as [`observed_states::clear_failed_observation`]. A read of the `sandboxes` row
 //!   alone, such as [`runtime_access`], gets a module named for the
 //!   question it answers.
 //!

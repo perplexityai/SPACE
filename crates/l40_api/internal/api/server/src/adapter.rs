@@ -1288,36 +1288,11 @@ impl ClusterApi for ClusterApiService {
         // still says applied/healthy on this node, the next re-apply
         // detects the generation change and recovers. 60 s is a reasonable
         // upper bound on how long a 502 could persist in that scenario.
-        let exposure_rows = sqlx::query_as::<_, SandboxPortExposureDesiredStateRow>(sql!(
-            "SELECT spe.sandbox_id,
-                    spe.protocol,
-                    spe.guest_port,
-                    spe.desired_state
-             FROM sandbox_port_exposures spe
-             JOIN sandboxes s ON s.id = spe.sandbox_id
-             WHERE spe.sandbox_id = ANY($1)
-               AND s.active_node_id = $2
-               AND spe.source <> 'ecw'
-               AND (
-                   spe.apply_state != 'applied'
-                   OR (
-                       spe.desired_state = 'open'
-                       AND (
-                           spe.last_bridge_status IS NULL
-                           OR spe.last_bridge_status NOT IN
-                               ('direct', 'loopback_forwarded')
-                           OR spe.last_observed_at IS NULL
-                           OR spe.last_observed_at <
-                               NOW() - INTERVAL '60 seconds'
-                           OR spe.last_applied_node_id IS DISTINCT FROM $2
-                       )
-                   )
-               )
-             ORDER BY spe.sandbox_id, spe.guest_port ASC, spe.protocol ASC"
-        ))
-        .bind(&sandbox_ids)
-        .bind(origin.id)
-        .fetch_all(&self.pool)
+        let exposure_rows = pplx_space_sandbox_store::port_exposures::to_apply_on_node(
+            &self.pool,
+            &sandbox_ids,
+            origin.id,
+        )
         .await
         .map_err(|err| Status::internal(format!("query sandbox port exposures: {err}")))?;
 
@@ -1809,94 +1784,24 @@ impl ClusterApi for ClusterApiService {
             }));
         }
 
-        let sandbox_ids = states
+        let reports = states
             .iter()
-            .map(|state| state.sandbox_id.as_uuid())
-            .collect::<Vec<_>>();
-        let protocols = states
-            .iter()
-            .map(|state| state.protocol.as_str())
-            .collect::<Vec<_>>();
-        let guest_ports = states
-            .iter()
-            .map(|state| i32::from(state.guest_port))
-            .collect::<Vec<_>>();
-        let apply_states = states
-            .iter()
-            .map(|state| state.apply_state.as_str())
-            .collect::<Vec<_>>();
-        let errors = states
-            .iter()
-            .map(|state| state.error.as_deref())
-            .collect::<Vec<_>>();
-        let bridge_statuses = states
-            .iter()
-            .map(|state| state.bridge_status.as_deref())
-            .collect::<Vec<_>>();
-        let service_generations = states
-            .iter()
-            .map(|state| state.service_generation.as_deref())
+            .map(
+                |state| pplx_space_sandbox_store::port_exposures::ApplyStateReport {
+                    sandbox_id: state.sandbox_id,
+                    protocol: state.protocol.as_str(),
+                    guest_port: i32::from(state.guest_port),
+                    apply_state: state.apply_state.as_str(),
+                    error: state.error.as_deref(),
+                    bridge_status: state.bridge_status.as_deref(),
+                    service_generation: state.service_generation.as_deref(),
+                },
+            )
             .collect::<Vec<_>>();
 
-        let missed = sqlx::query_as::<_, PortExposureApplyMissRow>(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM UNNEST(
-                     $1::UUID[],
-                     $2::TEXT[],
-                     $3::INT[],
-                     $4::TEXT[],
-                     $5::TEXT[],
-                     $7::TEXT[],
-                     $8::TEXT[]
-                 ) AS input(sandbox_id, protocol, guest_port, apply_state, error,
-                            bridge_status, service_generation)
-             ),
-             updated AS (
-                 UPDATE sandbox_port_exposures spe
-                 SET apply_state = input.apply_state,
-                     last_applied_node_id =
-                         CASE WHEN input.apply_state = 'applied'
-                              THEN $6
-                              ELSE spe.last_applied_node_id
-                         END,
-                     last_error =
-                         CASE WHEN input.apply_state = 'failed'
-                              THEN input.error
-                              ELSE NULL
-                         END,
-                     last_bridge_status =
-                         COALESCE(input.bridge_status, spe.last_bridge_status),
-                     last_applied_bridge_generation =
-                         COALESCE(input.service_generation, spe.last_applied_bridge_generation),
-                     last_observed_at = NOW(),
-                     updated_at = NOW()
-                 FROM input
-                 JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE spe.sandbox_id = input.sandbox_id
-                   AND spe.protocol = input.protocol
-                   AND spe.guest_port = input.guest_port
-                   AND spe.sandbox_id = s.id
-                   AND s.active_node_id = $6
-                 RETURNING spe.sandbox_id, spe.protocol, spe.guest_port
-             )
-             SELECT input.sandbox_id, input.protocol, input.guest_port
-             FROM input
-             LEFT JOIN updated
-               ON updated.sandbox_id = input.sandbox_id
-              AND updated.protocol = input.protocol
-              AND updated.guest_port = input.guest_port
-             WHERE updated.sandbox_id IS NULL"
-        ))
-        .bind(sandbox_ids)
-        .bind(protocols)
-        .bind(guest_ports)
-        .bind(apply_states)
-        .bind(errors)
-        .bind(origin.id)
-        .bind(bridge_statuses)
-        .bind(service_generations)
-        .fetch_all(&self.pool)
+        let missed = pplx_space_sandbox_store::port_exposures::record_apply_states(
+            &self.pool, origin.id, &reports,
+        )
         .await
         .map_err(|err| Status::internal(format!("update sandbox port exposure states: {err}")))?;
 

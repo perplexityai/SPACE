@@ -19,6 +19,7 @@ sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-to
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-node-model = { workspace = true, features = ["sqlx"] }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }

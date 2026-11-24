@@ -647,12 +647,10 @@ async fn recover_pod_less_sandbox_locked(
     // The observed guard tolerated a `failed`, pid-less record. Left behind,
     // it would keep a reverted row reading `failed` through the observed-state
     // overlay, and once the node is gone nothing would publish over it.
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_observed_states
-          WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
-    ))
-    .bind(candidate.sandbox_id)
-    .execute(&mut *tx)
+    pplx_space_sandbox_store::observed_states::clear_failed_observation(
+        &mut tx,
+        candidate.sandbox_id,
+    )
     .await?;
 
     tx.commit().await?;

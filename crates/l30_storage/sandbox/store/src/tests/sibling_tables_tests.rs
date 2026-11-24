@@ -1,9 +1,35 @@
 //! Characterization of the sibling-table verbs at the store layer: the
-//! port-exposure upserts and invalidations, the ECW credential epoch
-//! advance, the runtime-access read and the published snapshot upsert.
+//! port-exposure upserts, invalidations and node apply reports, the ECW
+//! credential epoch advance, the runtime-access read, the published snapshot
+//! upsert and the failed observed-state purge.
 
 use super::*;
-use crate::{ecw_credential_epochs, port_exposures, runtime_access, snapshot_inventory};
+use crate::{
+    ecw_credential_epochs, observed_states, port_exposures, runtime_access, snapshot_inventory,
+};
+
+async fn insert_node(pool: &PgPool) -> TestResult<NodeId> {
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.10', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(node_id)
+}
+
+async fn place_on(pool: &PgPool, id: Uuid, node_id: NodeId) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
 
 /// `apply_state`, `last_applied_node_id`, `last_error`, `last_bridge_status`,
 /// `last_observed_at IS NOT NULL`, as stored.
@@ -305,6 +331,137 @@ async fn published_snapshots_upsert_in_scope_and_skip_unchanged_rows() -> TestRe
     assert_eq!(
         read(in_scope).await?.map(|row| row.0),
         Some("deleting".to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apply_state_reports_update_only_sandboxes_active_on_the_reporting_node() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let reporter = insert_node(&db.pool).await?;
+    let other = insert_node(&db.pool).await?;
+    let here = insert_sandbox(&db.pool, None, "started").await?;
+    let elsewhere = insert_sandbox(&db.pool, None, "started").await?;
+    place_on(&db.pool, here, reporter).await?;
+    place_on(&db.pool, elsewhere, other).await?;
+    for id in [here, elsewhere] {
+        port_exposures::upsert_open(
+            &db.pool,
+            SandboxId::from_uuid(id),
+            "tcp",
+            8080,
+            "private",
+            "api",
+        )
+        .await?;
+    }
+    let report = |id: Uuid, guest_port: i32| port_exposures::ApplyStateReport {
+        sandbox_id: SandboxId::from_uuid(id),
+        protocol: "tcp",
+        guest_port,
+        apply_state: "applied",
+        error: None,
+        bridge_status: Some("direct"),
+        service_generation: Some("gen-1"),
+    };
+
+    let missed = port_exposures::record_apply_states(
+        &db.pool,
+        reporter,
+        &[
+            report(here, 8080),
+            report(elsewhere, 8080),
+            report(here, 9090),
+        ],
+    )
+    .await?;
+
+    let missed = missed
+        .into_iter()
+        .map(|row| (row.sandbox_id, row.protocol, row.guest_port))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        missed,
+        [
+            (SandboxId::from_uuid(elsewhere), "tcp".to_string(), 8080),
+            (SandboxId::from_uuid(here), "tcp".to_string(), 9090),
+        ]
+        .into_iter()
+        .collect(),
+        "a sandbox placed on another node and an exposure that doesn't exist come back missed"
+    );
+    assert_eq!(
+        read_observation(&db.pool, here, 8080).await?,
+        (
+            "applied".to_string(),
+            Some(reporter.as_uuid()),
+            None,
+            Some("direct".to_string()),
+            true
+        )
+    );
+    assert_eq!(
+        read_observation(&db.pool, elsewhere, 8080).await?,
+        ("pending".to_string(), None, None, None, false),
+        "the other node's exposure is left as it was"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn clear_failed_observation_keeps_a_live_record() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = insert_node(&db.pool).await?;
+    let observed = |status: &'static str, pid: Option<i32>| {
+        let pool = db.pool.clone();
+        async move {
+            let sandbox_id = SandboxId::new();
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status, pid)
+                 VALUES ($1, $2, $3, $4)"
+            ))
+            .bind(sandbox_id)
+            .bind(node_id)
+            .bind(status)
+            .bind(pid)
+            .execute(&pool)
+            .await?;
+            TestResult::<SandboxId>::Ok(sandbox_id)
+        }
+    };
+    let exists = |sandbox_id: SandboxId| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(sql!(
+                "SELECT EXISTS (SELECT 1 FROM sandbox_observed_states WHERE sandbox_id = $1)"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    let fossil = observed("failed", None).await?;
+    let running = observed("running", None).await?;
+    let failed_with_pid = observed("failed", Some(42)).await?;
+
+    let mut conn = db.pool.acquire().await?;
+    for sandbox_id in [fossil, running, failed_with_pid] {
+        observed_states::clear_failed_observation(&mut conn, sandbox_id).await?;
+    }
+    drop(conn);
+
+    assert!(
+        !exists(fossil).await?,
+        "a failed, pid-less record is purged"
+    );
+    assert!(exists(running).await?, "a non-failed record survives");
+    assert!(
+        exists(failed_with_pid).await?,
+        "a record with a pid survives"
     );
     Ok(())
 }
