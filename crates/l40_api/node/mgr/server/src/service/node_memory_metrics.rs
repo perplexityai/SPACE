@@ -84,16 +84,21 @@ impl Sampler {
         }
         node_memory::space_cgroup(&state);
         if let Some(previous) = self.previous_events.replace(state.events) {
-            emit_new_events(&previous, &state.events);
+            for (event, count) in new_events(&previous, &state.events) {
+                node_memory::space_cgroup_events(event, count);
+            }
         }
         node_memory::space_cgroup_read_success(true);
     }
 }
 
-/// Counts each event's growth since `previous`. A counter that went
-/// backwards belongs to a recreated cgroup; its new value is the next
-/// baseline, not a count.
-fn emit_new_events(previous: &CgroupMemoryEvents, current: &CgroupMemoryEvents) {
+/// Each event's growth since `previous`, skipping events that did not grow.
+/// A counter that went backwards belongs to a recreated cgroup; its new
+/// value is the next baseline, not a count.
+fn new_events(
+    previous: &CgroupMemoryEvents,
+    current: &CgroupMemoryEvents,
+) -> Vec<(&'static str, u64)> {
     let pairs = |events: &CgroupMemoryEvents| {
         [
             ("low", events.low),
@@ -104,11 +109,12 @@ fn emit_new_events(previous: &CgroupMemoryEvents, current: &CgroupMemoryEvents) 
             ("oom_group_kill", events.oom_group_kill),
         ]
     };
-    for ((event, before), (_, after)) in pairs(previous).into_iter().zip(pairs(current)) {
-        if after > before {
-            node_memory::space_cgroup_events(event, after - before);
-        }
-    }
+    pairs(previous)
+        .into_iter()
+        .zip(pairs(current))
+        .filter(|((_, before), (_, after))| after > before)
+        .map(|((event, before), (_, after))| (event, after - before))
+        .collect()
 }
 
 #[cfg(test)]
