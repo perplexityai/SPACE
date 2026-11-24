@@ -449,8 +449,14 @@ scenarios run unchanged. What isolates it
   one tree raced in Helm's chart vendoring.
 
 What is the same on every bench is done once on the host: the Rust artifact
-image is built once and handed to each bench as CI hands it to its shards
-(`rust-artifact-handoff.py record`/`load`, `SPACE_KIND_RUST_ARTIFACTS=prebuilt`);
+image is built once, or reused from main as a CI producer reuses it, and
+handed to each bench as CI hands it to its shards
+(`rust-artifact-handoff.py record`/`load`, `SPACE_KIND_RUST_ARTIFACTS=prebuilt`).
+Where the image package cannot be read directly, exporting
+`SPACE_KIND_REGISTRY_MIRROR` reuses main's image by digest through a
+pull-through mirror of ghcr.io (see [Smoke test](#smoke-test)); the
+summary's `Rust image` line says whether the image was built on the host or
+reused, and from where;
 the node images and build bases are saved once and loaded into each bench; the
 seed is built once and copied in; the host's loop-device pool and inotify
 limits are raised before any bench starts (loop devices are kernel-global, but
@@ -2622,13 +2628,31 @@ commit. A build from committed inputs, with every base from its mirrored
 digest, labels the image with its key and commit. A separate main-only job then
 pushes it to `ghcr.io/perplexityai/space-kind-rust-artifacts:<key>`, replacing
 the key's earlier image, and keeps the twenty newest versions. The shards
-never wait for that push.
+never wait for that push. That job also uploads a digest record of each push,
+`{"key", "digest", "repository", "commit"}`, as the Actions artifact
+`kind-rust-artifact-digest` (kept 30 days), for readers that can pull only by
+digest.
 
 Each PR first tries to pull its key's image. Any miss or failure builds as
 before, with a notice, including a fork, or any PR whose token cannot read the
 package. Setting the repository variable `SPACE_KIND_RUST_REUSE` to `off`
 turns PR reuse off without a code change. A reused image goes through the same
 handoff. The runtime images Tilt builds still record the checkout's commit.
+
+Outside CI, `rust-artifact-handoff.py reuse` can take main's image through a
+pull-through mirror of ghcr.io that serves content by digest, where the
+package itself cannot be read. Set `SPACE_KIND_REGISTRY_MIRROR` to the
+mirror's host and path prefix, under which it serves `ghcr.io/<owner>/<repo>`
+as `<mirror>/<owner>/<repo>`. Reuse then looks up the digest for the
+checkout's input key: in `SPACE_KIND_RUST_DIGESTS_FILE` when that names a JSON
+list of `{"key", "digest"}` records (tests and offline use), otherwise in the
+`kind-rust-artifact-digest` artifacts of the newest main CI push runs,
+read with `gh api` and the caller's GitHub token (`repo` scope), those from the
+checkout's own history first. It pulls the image by that digest, verifies its
+input-key and commit labels as it does a tagged pull, and tags it for the
+handoff. A main commit's record appears as soon as its publish job uploads
+it. With no record for the key, or any failure, it logs one line saying why
+and goes on as before: the tagged pull, then the build.
 
 A PR whose Rust inputs match no published image builds incrementally from
 main's build state instead. Main CI's `kind_rust_state` job builds each main

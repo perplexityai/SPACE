@@ -230,10 +230,29 @@ jobs:
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
       # Main builds on every push, so this replaces the key's earlier image.
+      # The record names the digest it pushed, for readers that can pull only
+      # by digest: a box behind a pull-through mirror of ghcr.io that serves
+      # content by digest (rust-artifact-handoff.py reuse).
       - name: Publish the artifact image under its Rust input key
+        id: publish
         if: steps.load.outcome == 'success'
         continue-on-error: true
-        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py publish ghcr.io/perplexityai/space-kind-rust-artifacts
+        run: >-
+          python3 infra/space/kind/scripts/rust-artifact-handoff.py publish
+          ghcr.io/perplexityai/space-kind-rust-artifacts
+          --record "${RUNNER_TEMP}/kind-rust-artifact-digest/kind-rust-artifact-digest.json"
+
+      # {key, digest, repository, commit}; publish writes it only after a push.
+      - name: Upload the published image's digest record
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-rust-artifact-digest
+          path: ${{ runner.temp }}/kind-rust-artifact-digest/kind-rust-artifact-digest.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 30
 
       # Only this dedicated cache package is pruned, never release images.
       # Fixed tagged heads stay intact; retain ten untagged versions for readers
