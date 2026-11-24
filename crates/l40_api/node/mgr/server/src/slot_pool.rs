@@ -191,7 +191,7 @@ pub enum PoolOpenError {
         source: std::io::Error,
     },
     #[error("cannot open network pool database: {0}")]
-    Open(#[from] pplx_space_sqlite::SqliteError),
+    Open(#[from] pplx_space_node_mgr_store::database::SqliteError),
     #[error(transparent)]
     Store(#[from] SlotStoreError),
     #[error("cannot install guest L2 ingress policy in namespace {namespace}: {source}")]
@@ -604,13 +604,7 @@ impl NetworkPool {
                 source,
             })?;
         }
-        let mut conn = pplx_space_sqlite::open_rusqlite(
-            Path::new(db_path),
-            pplx_space_sqlite::RusqliteOpenOptions {
-                foreign_keys: true,
-                ..Default::default()
-            },
-        )?;
+        let mut conn = pplx_space_node_mgr_store::database::open(Path::new(db_path))?;
         init_db(&mut conn, &config)?;
         // Before the runtime reconcile, which would dirty a young lease the
         // predecessor allocated moments ago.

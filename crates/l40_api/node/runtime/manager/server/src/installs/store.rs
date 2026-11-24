@@ -6,25 +6,22 @@
 use std::path::Path;
 
 use pplx_space_node_runtime_manager_store::JobResultError;
+use pplx_space_node_runtime_manager_store::database::{self, SqliteError};
 pub(crate) use pplx_space_node_runtime_manager_store::{
     JobOutcome, JobPhase, JobResult, get_job_result, put_job_result,
 };
 use rusqlite::Connection;
 
-static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator =
-    sqlx::migrate!("../../../../../../db/common");
-
 pub(crate) const DATABASE_FILE: &str = "runtime-manager.db";
-const DATABASE_NAME: &str = "runtime-manager";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("runtime-manager database")]
     Sqlite(#[from] rusqlite::Error),
     #[error("runtime-manager database migration")]
-    Migrate(#[source] pplx_space_sqlite::SqliteError),
+    Migrate(#[source] SqliteError),
     #[error("cannot open the runtime-manager database")]
-    Open(#[source] pplx_space_sqlite::SqliteError),
+    Open(#[source] SqliteError),
     #[error("runtime-manager database holds an unreadable {column} value '{value}'")]
     Corrupt { column: &'static str, value: String },
 }
@@ -42,19 +39,10 @@ impl From<JobResultError> for StoreError {
 /// The database is restricted to 0600 inside the already private directory.
 pub(crate) async fn open(state_dir: &Path) -> Result<Connection, StoreError> {
     let path = state_dir.join(DATABASE_FILE);
-    pplx_space_sqlite::migrate_embedded(
-        DATABASE_NAME,
-        &path,
-        pplx_space_sqlite::EmbeddedMigrators {
-            service: pplx_space_sqlite::runtime_manager::catalog(&path)
-                .map_err(StoreError::Migrate)?,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
-        },
-    )
-    .await
-    .map_err(StoreError::Migrate)?;
-    pplx_space_sqlite::open_rusqlite(&path, pplx_space_sqlite::RusqliteOpenOptions::default())
-        .map_err(StoreError::Open)
+    database::migrate(&path)
+        .await
+        .map_err(StoreError::Migrate)?;
+    database::open(&path).map_err(StoreError::Open)
 }
 
 /// Drop results once their terminal jobs have expired. A later request is

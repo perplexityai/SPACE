@@ -37,7 +37,7 @@ pub(super) fn init_in_memory_db(
 
 #[cfg(test)]
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    for migration in sqlx::migrate!("../../../../../db/node-manager")
+    for migration in pplx_space_node_mgr_store::database::MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {

@@ -40,7 +40,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
@@ -73,7 +72,6 @@ pplx-space-rpc-auth = { workspace = true }
 pplx-space-service-host = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
-pplx-space-sqlite = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-stopwatch = { workspace = true }
 pplx-space-execution-common = { workspace = true }
@@ -107,5 +105,7 @@ pplx-space-rpc-auth = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 rstest = { workspace = true }
+# `postgres` builds the unreachable visibility pool of the catalog tests.
+sqlx = { workspace = true, features = ["postgres"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

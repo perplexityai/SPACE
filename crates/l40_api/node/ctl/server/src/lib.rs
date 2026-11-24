@@ -162,7 +162,6 @@ const SPACE_NODE_ID_ENV: &str = "SPACE_NODE_ID";
 const SPACE_NODE_ROLE_ENV: &str = "SPACE_NODE_ROLE";
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 const SKIP_CLUSTER_SYNC_METADATA: &str = "x-space-skip-cluster-sync";
-static NODE_CTL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/node-ctl");
 static CLUSTER_NODE_API_ENDPOINT: OnceLock<Option<String>> = OnceLock::new();
 const ALLOW_NODE_CTL_OBSERVER: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
@@ -269,9 +268,9 @@ pub enum RunNodeCtlError {
     #[error("failed to acquire the node-ctl service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to migrate node-ctl's SQLite database: {0}")]
-    Migrate(#[source] pplx_space_sqlite::SqliteError),
+    Migrate(#[source] pplx_space_node_ctl_store::database::SqliteError),
     #[error("failed to open node-ctl's SQLite database: {0}")]
-    OpenDatabase(#[source] pplx_space_sqlite::SqliteError),
+    OpenDatabase(#[source] pplx_space_node_ctl_store::database::SqliteError),
     #[error("failed to seed reconciliation status rows: {0}")]
     InitReconciliationStatus(#[source] rusqlite::Error),
     #[error("failed to bind the node-ctl socket: {0}")]
@@ -634,14 +633,11 @@ pub async fn run(
     );
     health_server.mark_starting();
 
-    pplx_space_sqlite::migrate("node-ctl", &cli.db_path, &NODE_CTL_MIGRATOR)
+    pplx_space_node_ctl_store::database::migrate(&cli.db_path)
         .await
         .map_err(RunNodeCtlError::Migrate)?;
-    let db = pplx_space_sqlite::open_rusqlite(
-        &cli.db_path,
-        pplx_space_sqlite::RusqliteOpenOptions::default(),
-    )
-    .map_err(RunNodeCtlError::OpenDatabase)?;
+    let db = pplx_space_node_ctl_store::database::open(&cli.db_path)
+        .map_err(RunNodeCtlError::OpenDatabase)?;
     init_reconciliation_status(&db, poll_interval_secs)
         .map_err(RunNodeCtlError::InitReconciliationStatus)?;
     let db = Arc::new(Mutex::new(db));

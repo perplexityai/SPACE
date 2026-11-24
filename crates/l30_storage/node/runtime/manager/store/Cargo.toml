@@ -16,9 +16,11 @@ workspace = true
 [dependencies]
 jiff = { workspace = true }
 rusqlite = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
 
 # internal
 pplx-space-content-digest = { workspace = true }
 pplx-space-job-id = { workspace = true, features = ["rusqlite"] }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-sqlite = { workspace = true }

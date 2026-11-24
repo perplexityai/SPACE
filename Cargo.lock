@@ -7019,7 +7019,6 @@ dependencies = [
  "pplx-space-semver",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
- "pplx-space-sqlite",
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
@@ -7030,7 +7029,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -7188,7 +7186,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "socket2",
- "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -7261,6 +7258,7 @@ dependencies = [
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
  "rusqlite",
+ "sqlx",
  "thiserror 2.0.20",
 ]
 
@@ -7460,7 +7458,9 @@ dependencies = [
  "pplx-space-content-digest",
  "pplx-space-job-id",
  "pplx-space-sql-locator",
+ "pplx-space-sqlite",
  "rusqlite",
+ "sqlx",
  "thiserror 2.0.20",
 ]
 
@@ -8938,7 +8938,6 @@ dependencies = [
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
  "pplx-space-sql-locator",
- "pplx-space-sqlite",
  "pplx-space-state-reconciliation",
  "pplx-space-stopwatch",
  "pplx-space-subject-model",
@@ -9023,9 +9022,11 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-policy-authority",
  "pplx-space-sql-locator",
+ "pplx-space-sqlite",
  "pplx-space-template-model",
  "rusqlite",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.20",
 ]
 
@@ -9284,7 +9285,6 @@ dependencies = [
  "pplx-space-service-host",
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
- "pplx-space-sqlite",
  "pplx-space-subject-model",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
@@ -9296,7 +9296,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -9357,7 +9356,9 @@ dependencies = [
  "pplx-space-sandbox-model",
  "pplx-space-snapshot-model",
  "pplx-space-sql-locator",
+ "pplx-space-sqlite",
  "rusqlite",
+ "sqlx",
  "thiserror 2.0.20",
 ]
 

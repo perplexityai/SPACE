@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 rusqlite = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
 
 # internal
@@ -22,3 +23,4 @@ pplx-space-job-id = { workspace = true, features = ["rusqlite"] }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-sqlite = { workspace = true }

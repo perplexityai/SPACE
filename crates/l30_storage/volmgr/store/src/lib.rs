@@ -2,12 +2,14 @@
 //! volume-manager's reads of its shared `jobs` table that the job queue's
 //! paged listing cannot answer.
 //!
-//! The database's opening and migrations stay in `pplx-space-volmgr`; the job
-//! queue itself is read and written through `pplx-space-common-jobs`. Each
-//! function takes a `rusqlite::Connection`, so a caller can pass its own open
-//! transaction.
+//! [`database`] migrates and opens the database for `pplx-space-volmgr`; the
+//! job queue itself is read and written through `pplx-space-common-jobs`.
+//! Every other function takes a `rusqlite::Connection`, so a caller can pass
+//! its own open transaction.
 
 #![forbid(unsafe_code)]
+
+pub mod database;
 
 use pplx_space_job_id::JobId;
 use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};

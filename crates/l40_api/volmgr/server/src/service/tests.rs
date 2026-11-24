@@ -150,7 +150,7 @@ fn service_request<T>(
 
 async fn test_service(temp: &tempfile::TempDir) -> VolumeManagerService {
     let db_path = temp.path().join("volume-manager.db");
-    crate::run::migrate_volume_manager_db(&db_path)
+    pplx_space_volmgr_store::database::migrate(&db_path)
         .await
         .unwrap();
     VolumeManagerService::new(
@@ -1039,7 +1039,7 @@ fn test_worker_with_active_limit(
     BackgroundWorker<BlockingExecutor>,
 ) {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for migration in sqlx::migrate!("../../../../db/common")
+    for migration in pplx_space_volmgr_store::database::COMMON_MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
     {
