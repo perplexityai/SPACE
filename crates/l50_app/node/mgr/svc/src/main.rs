@@ -80,6 +80,11 @@ struct Cli {
     #[arg(long)]
     sandbox_cgroup_parent_memory_reserve_mib: Option<u64>,
 
+    /// Host CPUs reserved outside the parent sandbox cgroup.
+    /// Defaults to the host-size heuristic (2 on >=64 CPUs, 1 on >=8 CPUs, 0 otherwise).
+    #[arg(long)]
+    sandbox_cgroup_parent_cpu_reserved_count: Option<u32>,
+
     /// Node memory kept available in addition to a new sandbox cgroup demand, in MiB.
     #[arg(long)]
     memory_admission_reserve_mib: Option<u64>,
@@ -101,6 +106,7 @@ impl From<Cli> for NodeMgrRunConfig {
             sandbox_cgroup_memory_mib: cli.sandbox_cgroup_memory_mib,
             sandbox_cgroup_vcpu_count: cli.sandbox_cgroup_vcpu_count,
             sandbox_cgroup_parent_memory_reserve_mib: cli.sandbox_cgroup_parent_memory_reserve_mib,
+            sandbox_cgroup_parent_cpu_reserved_count: cli.sandbox_cgroup_parent_cpu_reserved_count,
             memory_admission_reserve_mib: cli.memory_admission_reserve_mib,
         }
     }

@@ -45,8 +45,59 @@ fn memory_cli_config(memory_mib: Option<u64>) -> NodeMgrRunConfig {
         sandbox_cgroup_memory_mib: memory_mib,
         sandbox_cgroup_vcpu_count: None,
         sandbox_cgroup_parent_memory_reserve_mib: None,
+        sandbox_cgroup_parent_cpu_reserved_count: None,
         memory_admission_reserve_mib: None,
     }
+}
+
+#[rstest::rstest]
+#[case(Some("6"), Some(4), Some(2), Some(4))]
+#[case(Some("invalid"), Some(4), Some(2), Some(4))]
+#[case(Some(" 6 "), None, Some(2), Some(6))]
+#[case(Some("6"), None, None, Some(6))]
+#[case(None, None, Some(2), Some(2))]
+#[case(Some(" "), None, Some(2), Some(2))]
+#[case(None, None, None, None)]
+fn parent_cpu_reserved_count_precedence(
+    #[case] env: Option<&str>,
+    #[case] cli: Option<u32>,
+    #[case] file: Option<u32>,
+    #[case] expected: Option<u32>,
+) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        ENV_SANDBOX_CGROUP_PARENT_CPU_RESERVED_COUNT[0],
+        env.map(std::ffi::OsStr::new),
+    )]) {
+        return;
+    }
+    let mut cli_config = memory_cli_config(None);
+    cli_config.sandbox_cgroup_parent_cpu_reserved_count = cli;
+    let resolved = resolve_parent_cpu_reserved_count(
+        &cli_config,
+        &SandboxCgroupFileConfig {
+            parent_cpu_reserved_count: file,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved, expected);
+}
+
+#[rstest::rstest]
+#[case("invalid")]
+#[case("-1")]
+#[case("4294967296")]
+fn parent_cpu_reserved_count_environment_rejects_invalid_values(#[case] value: &str) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        ENV_SANDBOX_CGROUP_PARENT_CPU_RESERVED_COUNT[0],
+        Some(std::ffi::OsStr::new(value)),
+    )]) {
+        return;
+    }
+    assert!(matches!(
+        resolve_parent_cpu_reserved_count(&memory_cli_config(None), &Default::default()),
+        Err(RunNodeMgrError::EnvNotU32 { .. })
+    ));
 }
 
 #[rstest::rstest]
@@ -140,12 +191,13 @@ fn configuration_precedence_and_owned_sections() {
     }
     // The shared file contains sections owned by other daemons.
     let config: NodeConfig = toml::from_str(
-        "[other_service]\nnew_setting = true\n[network_pool]\ntarget = 3\nretain_ready = 2\nmin_ready = 1\n[sandbox_cgroup]\nparent_memory_reserve_mib = 4096",
+        "[other_service]\nnew_setting = true\n[network_pool]\ntarget = 3\nretain_ready = 2\nmin_ready = 1\n[sandbox_cgroup]\nparent_memory_reserve_mib = 4096\nparent_cpu_reserved_count = 4",
     ).unwrap();
     assert_eq!(config.network_pool.target_ready_slots, Some(3));
     assert_eq!(config.network_pool.retained_ready_slots, Some(2));
     assert_eq!(config.network_pool.min_ready_slots, Some(1));
     assert_eq!(config.sandbox_cgroup.parent_memory_reserve_mib, Some(4096));
+    assert_eq!(config.sandbox_cgroup.parent_cpu_reserved_count, Some(4));
     toml::from_str::<NodeConfig>("[network_pool]\nmax_slots = -1").unwrap_err();
     toml::from_str::<NodeConfig>("[network_pool]\ntarget = 1\ntarget_ready_slots = 2").unwrap_err();
 }

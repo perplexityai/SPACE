@@ -18,6 +18,7 @@ pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 = 128;
 pub const DEFAULT_MEMORY_MAX_MIB: u64 =
     DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB + DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
 pub const MIN_PARENT_MEMORY_RESERVE_MIB: u64 = 1024;
+pub const MIN_PARENT_CPU_RESERVED_COUNT: u32 = 1;
 pub const DEFAULT_PARENT_CPU_RESERVED_COUNT: u32 = 2;
 const MIB_BYTES: u64 = 1024 * 1024;
 const CGROUP_CPU_PERIOD_US: u64 = 100_000;
@@ -176,6 +177,25 @@ pub struct ParentCpuLimit {
     pub cpu_max: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ParentCpuLimitError {
+    #[error("parent CPU reserved count {reserved_count} must be at least {min_count}")]
+    ReserveBelowMinimum { reserved_count: u32, min_count: u32 },
+    #[error(
+        "parent CPU reserved count {reserved_count} leaves no CPUs available out of {available_cpus}"
+    )]
+    ReserveExceedsAvailableCpus {
+        reserved_count: u32,
+        available_cpus: u32,
+    },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 pub struct ParentMemoryLimit {
     pub host_memory_bytes: u64,
     pub reserve_bytes: u64,
@@ -303,8 +323,7 @@ impl CgroupLimits {
     }
 }
 
-pub fn default_parent_cpu_reserved_count() -> u32 {
-    let available = parent_effective_cpu_count().unwrap_or(DEFAULT_PARENT_CPU_RESERVED_COUNT);
+fn default_parent_cpu_reserved_count_for(available: u32) -> u32 {
     if available >= 64 {
         DEFAULT_PARENT_CPU_RESERVED_COUNT
     } else if available >= 8 {
@@ -314,11 +333,76 @@ pub fn default_parent_cpu_reserved_count() -> u32 {
     }
 }
 
-pub fn apply_parent_cpu_reservation(reserved_count: u32) -> Result<ParentCpuLimit, String> {
-    let cpu_max = parent_cpu_max_value(reserved_count);
-    write_cgroup_file(CGROUP_BASE, "cpu.max", &cpu_max)?;
-    Ok(ParentCpuLimit {
+pub fn default_parent_cpu_reserved_count() -> u32 {
+    let available = parent_effective_cpu_count().unwrap_or(DEFAULT_PARENT_CPU_RESERVED_COUNT);
+    default_parent_cpu_reserved_count_for(available)
+}
+
+/// Cap aggregate sandbox CPU time below the host's effective CPU count.
+///
+/// When `reserved_count` is `None`, uses the host-size default (2 CPUs on
+/// `>= 64`-CPU hosts, 1 on `>= 8`-CPU hosts, and unthrottled on smaller hosts).
+/// When `Some`, reserves that exact CPU count after enforcing
+/// [`MIN_PARENT_CPU_RESERVED_COUNT`] and ensuring at least 1 CPU remains.
+pub fn apply_parent_cpu_reservation(
+    reserved_count: Option<u32>,
+) -> Result<ParentCpuLimit, ParentCpuLimitError> {
+    apply_parent_cpu_reservation_at(
+        Path::new(CGROUP_BASE),
+        parent_effective_cpu_count(),
         reserved_count,
+    )
+}
+
+fn apply_parent_cpu_reservation_at(
+    cgroup_path: &Path,
+    available_cpus: Option<u32>,
+    reserved_count: Option<u32>,
+) -> Result<ParentCpuLimit, ParentCpuLimitError> {
+    let (effective_reserved, cpu_max) = match reserved_count {
+        None => {
+            let available = available_cpus.unwrap_or(DEFAULT_PARENT_CPU_RESERVED_COUNT);
+            let effective_reserved = default_parent_cpu_reserved_count_for(available);
+            let cpu_max = if effective_reserved == 0 {
+                format!("max {CGROUP_CPU_PERIOD_US}")
+            } else {
+                let sandbox_cpu_count = available.saturating_sub(effective_reserved).max(1);
+                format!(
+                    "{} {CGROUP_CPU_PERIOD_US}",
+                    u64::from(sandbox_cpu_count) * CGROUP_CPU_PERIOD_US
+                )
+            };
+            (effective_reserved, cpu_max)
+        }
+        Some(reserved_count) => {
+            if reserved_count < MIN_PARENT_CPU_RESERVED_COUNT {
+                return Err(ParentCpuLimitError::ReserveBelowMinimum {
+                    reserved_count,
+                    min_count: MIN_PARENT_CPU_RESERVED_COUNT,
+                });
+            }
+            let sandbox_cpu_count = match available_cpus {
+                Some(available) => available
+                    .checked_sub(reserved_count)
+                    .filter(|remaining| *remaining > 0)
+                    .ok_or(ParentCpuLimitError::ReserveExceedsAvailableCpus {
+                        reserved_count,
+                        available_cpus: available,
+                    })?,
+                None => 1,
+            };
+            let cpu_max = format!(
+                "{} {CGROUP_CPU_PERIOD_US}",
+                u64::from(sandbox_cpu_count) * CGROUP_CPU_PERIOD_US
+            );
+            (reserved_count, cpu_max)
+        }
+    };
+
+    let path = cgroup_path.join("cpu.max");
+    fs::write(&path, &cpu_max).map_err(|source| ParentCpuLimitError::Write { path, source })?;
+    Ok(ParentCpuLimit {
+        reserved_count: effective_reserved,
         cpu_max,
     })
 }
@@ -420,18 +504,6 @@ fn apply_parent_memory_limit_at(
         memory_max,
         memory_swap_max,
     })
-}
-
-fn parent_cpu_max_value(reserved_count: u32) -> String {
-    if reserved_count == 0 {
-        return format!("max {CGROUP_CPU_PERIOD_US}");
-    }
-    let available = parent_effective_cpu_count().unwrap_or(reserved_count.saturating_add(1));
-    let sandbox_cpu_count = available.saturating_sub(reserved_count).max(1);
-    format!(
-        "{} {CGROUP_CPU_PERIOD_US}",
-        u64::from(sandbox_cpu_count) * CGROUP_CPU_PERIOD_US
-    )
 }
 
 fn parent_effective_cpu_count() -> Option<u32> {

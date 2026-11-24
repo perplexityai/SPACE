@@ -1,6 +1,88 @@
 use super::*;
 
 #[test]
+fn parent_cpu_default_reservation_scales_with_host_cpus() {
+    let root = tempfile::tempdir().unwrap();
+    for (available, expected_reserved, expected_cpu_max) in [
+        (None, 0, "max 100000"),
+        (Some(4), 0, "max 100000"),
+        (Some(7), 0, "max 100000"),
+        (Some(8), 1, "700000 100000"),
+        (Some(63), 1, "6200000 100000"),
+        (Some(64), 2, "6200000 100000"),
+        (Some(128), 2, "12600000 100000"),
+    ] {
+        let limit = apply_parent_cpu_reservation_at(root.path(), available, None).unwrap();
+        assert_eq!(limit.reserved_count, expected_reserved);
+        assert_eq!(limit.cpu_max, expected_cpu_max);
+        assert_eq!(
+            fs::read_to_string(root.path().join("cpu.max")).unwrap(),
+            expected_cpu_max
+        );
+    }
+}
+
+#[test]
+fn parent_cpu_explicit_reservation_applies_exact_count() {
+    let root = tempfile::tempdir().unwrap();
+    let limit = apply_parent_cpu_reservation_at(root.path(), Some(64), Some(4)).unwrap();
+    assert_eq!(limit.reserved_count, 4);
+    assert_eq!(limit.cpu_max, "6000000 100000");
+    assert_eq!(
+        fs::read_to_string(root.path().join("cpu.max")).unwrap(),
+        "6000000 100000"
+    );
+
+    let limit = apply_parent_cpu_reservation_at(root.path(), Some(2), Some(1)).unwrap();
+    assert_eq!(limit.reserved_count, 1);
+    assert_eq!(limit.cpu_max, "100000 100000");
+
+    // Unknown host CPU count falls back to 1 CPU for sandboxes.
+    let limit = apply_parent_cpu_reservation_at(root.path(), None, Some(4)).unwrap();
+    assert_eq!(limit.reserved_count, 4);
+    assert_eq!(limit.cpu_max, "100000 100000");
+}
+
+#[test]
+fn parent_cpu_reservation_guard_rejects_zero_or_excessive_values() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("cpu.max"), "original").unwrap();
+
+    assert!(matches!(
+        apply_parent_cpu_reservation_at(root.path(), Some(64), Some(0)),
+        Err(ParentCpuLimitError::ReserveBelowMinimum {
+            reserved_count: 0,
+            min_count: MIN_PARENT_CPU_RESERVED_COUNT,
+        })
+    ));
+
+    for (available, reserved) in [(8, 8), (8, 9), (1, 1), (64, u32::MAX)] {
+        assert!(matches!(
+            apply_parent_cpu_reservation_at(root.path(), Some(available), Some(reserved)),
+            Err(ParentCpuLimitError::ReserveExceedsAvailableCpus {
+                reserved_count,
+                available_cpus,
+            }) if reserved_count == reserved && available_cpus == available
+        ));
+    }
+
+    assert_eq!(
+        fs::read_to_string(root.path().join("cpu.max")).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn parent_cpu_write_failure_is_not_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("cpu.max")).unwrap();
+    assert!(matches!(
+        apply_parent_cpu_reservation_at(root.path(), Some(64), Some(2)),
+        Err(ParentCpuLimitError::Write { .. })
+    ));
+}
+
+#[test]
 fn parent_memory_cap_leaves_ten_percent_of_host_ram() {
     let root = tempfile::tempdir().unwrap();
     // 256 GiB host: the shared limit is not the sum of per-slot ceilings.

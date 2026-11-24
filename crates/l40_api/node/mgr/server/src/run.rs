@@ -79,6 +79,8 @@ const ENV_MIN_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_MIN_READY"];
 const ENV_SANDBOX_CGROUP_MEMORY_MIB: &str = "SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB";
 const ENV_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB: &str =
     "SPACE_NODEMGR_SANDBOX_CGROUP_PARENT_MEMORY_RESERVE_MIB";
+const ENV_SANDBOX_CGROUP_PARENT_CPU_RESERVED_COUNT: &[&str] =
+    &["SPACE_NODEMGR_SANDBOX_CGROUP_PARENT_CPU_RESERVED_COUNT"];
 const ENV_SERVICE_PORT_INGRESS_ISOLATION: &[&str] =
     &["SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION"];
 const ENV_DISK_IO_RESERVATION_ENABLED: &[&str] = &["SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED"];
@@ -131,6 +133,9 @@ pub struct NodeMgrRunConfig {
     /// Host memory reserved outside the parent sandbox cgroup, in MiB.
     /// `None` reserves 10% of host RAM.
     pub sandbox_cgroup_parent_memory_reserve_mib: Option<u64>,
+    /// Host CPUs reserved outside the parent sandbox cgroup.
+    /// `None` uses the host-size default (2 on >=64 CPUs, 1 on >=8 CPUs, 0 otherwise).
+    pub sandbox_cgroup_parent_cpu_reserved_count: Option<u32>,
     /// Node memory kept available in addition to a new sandbox cgroup demand,
     /// in MiB.
     pub memory_admission_reserve_mib: Option<u64>,
@@ -205,7 +210,7 @@ pub enum RunNodeMgrError {
     #[error("failed to acquire the node-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_service_mutex::AcquireError),
     #[error("failed to apply sandbox parent CPU limit: {0}")]
-    ApplyParentCpuLimit(String),
+    ApplyParentCpuLimit(#[source] crate::cgroup::ParentCpuLimitError),
     #[error("failed to apply sandbox parent memory limit: {0}")]
     ApplyParentMemoryLimit(#[source] crate::cgroup::ParentMemoryLimitError),
     #[error("sandbox cgroup memory {memory_mib} MiB must exceed its {headroom_mib} MiB headroom")]
@@ -268,6 +273,7 @@ struct SandboxCgroupFileConfig {
     vcpu_count: Option<u32>,
     memory_mib: Option<u64>,
     parent_memory_reserve_mib: Option<u64>,
+    parent_cpu_reserved_count: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -507,6 +513,24 @@ fn resolve_parent_memory_reserve_mib(
     ))
 }
 
+fn resolve_parent_cpu_reserved_count(
+    cli: &NodeMgrRunConfig,
+    file: &SandboxCgroupFileConfig,
+) -> Result<Option<u32>, RunNodeMgrError> {
+    let env = if cli.sandbox_cgroup_parent_cpu_reserved_count.is_some() {
+        None
+    } else {
+        env_u32(ENV_SANDBOX_CGROUP_PARENT_CPU_RESERVED_COUNT)?.map(Some)
+    };
+    Ok(setting(
+        "sandbox_cgroup.parent_cpu_reserved_count",
+        cli.sandbox_cgroup_parent_cpu_reserved_count.map(Some),
+        env,
+        file.parent_cpu_reserved_count.map(Some),
+        None,
+    ))
+}
+
 fn resolve_memory_admission_config(
     cli: &NodeMgrRunConfig,
     file: &MemoryAdmissionFileConfig,
@@ -640,6 +664,7 @@ pub async fn run(
     let pool_config = resolve_pool_config(&cli, &file.network_pool)?;
     let sandbox_cgroup_config = resolve_sandbox_cgroup_config(&cli, &file.sandbox_cgroup)?;
     let parent_memory_reserve_mib = resolve_parent_memory_reserve_mib(&cli, &file.sandbox_cgroup)?;
+    let parent_cpu_reserved_count = resolve_parent_cpu_reserved_count(&cli, &file.sandbox_cgroup)?;
     let memory_admission_config = resolve_memory_admission_config(&cli, &file.memory_admission)?;
     let mut disk_io_reservation_config =
         resolve_disk_io_reservation_config(file.disk_io_reservation)?;
@@ -724,7 +749,6 @@ pub async fn run(
             headroom_mib: sandbox_memory_headroom_mib,
         });
     }
-    let parent_cpu_reserved_count = crate::cgroup::default_parent_cpu_reserved_count();
     let sandbox_parent_cpu_limit =
         crate::cgroup::apply_parent_cpu_reservation(parent_cpu_reserved_count)
             .map_err(RunNodeMgrError::ApplyParentCpuLimit)?;
