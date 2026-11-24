@@ -8012,6 +8012,7 @@ name = "pplx-space-sandbox-teardown"
 version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
+ "pplx-space-node-model",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",

@@ -4,6 +4,10 @@
 //! Node publications write these rows, and not every writer is in this crate
 //! yet. [`crate::delete::delete_with_dependents`] removes them with the row.
 //! [`delete`] is the unguarded delete, run on the executor its caller passes.
+//! [`clear_failed_observation`] is the narrower step the failed-row repair
+//! and the pod-less drain give-up run after their own guarded transition.
+//! [`record_network_policy_authority`] copies a publishing node's applied
+//! network-policy authority onto the rows it reports.
 //! [`newest`] and [`window`] are unlocked reads of the rows' ids, as is
 //! [`rowless_sandbox_ids`]; [`last_published_execution`] is an unlocked read
 //! of one row's published execution.
@@ -134,6 +138,67 @@ pub async fn delete(
         "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
     ))
     .bind(sandbox_id)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Drop the sandbox's observed state only while it is a `failed`, pid-less
+/// record (an operation step), so a record that turned live survives. Run
+/// in the transaction whose own guarded statement already moved the row
+/// out of the lifecycle that record describes.
+/// When the record is purged, the sandbox's `sandbox_snapshot_inventory`
+/// rows go with it, through that table's foreign-key cascade.
+pub async fn clear_failed_observation(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "DELETE FROM sandbox_observed_states
+          WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
+    ))
+    .bind(sandbox_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Record the network-policy authority `node_id` published (an observed
+/// projection) on its observed row, for each record of `rows` (a JSON array
+/// of objects with `sandbox_id`, `observed_network_policy_generation` and
+/// `observed_network_policy_authority`) that carries a generation and names
+/// a sandbox with no `sandboxes` row or one active on `node_id`. A row
+/// already holding that authority is left as it is.
+pub async fn record_network_policy_authority(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+    rows: &JsonValue,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        sql!("WITH input AS (
+                 SELECT *
+                 FROM jsonb_to_recordset($2::jsonb) AS input(
+                     sandbox_id UUID,
+                     observed_network_policy_generation BIGINT,
+                     observed_network_policy_authority TEXT
+                 )
+             ),
+             publishable AS (
+                 SELECT input.*
+                 FROM input
+                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
+                 WHERE (s.id IS NULL OR s.active_node_id = $1)
+                   AND input.observed_network_policy_generation IS NOT NULL
+             )
+             UPDATE sandbox_observed_states sos
+             SET network_policy_authority = publishable.observed_network_policy_authority
+             FROM publishable
+             WHERE sos.sandbox_id = publishable.sandbox_id
+               AND sos.node_id = $1
+               AND sos.network_policy_authority IS DISTINCT FROM publishable.observed_network_policy_authority"),
+    )
+    .bind(node_id)
+    .bind(Json(rows))
     .execute(executor)
     .await?;
     Ok(())

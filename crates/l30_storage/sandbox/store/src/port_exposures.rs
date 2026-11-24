@@ -5,6 +5,10 @@
 //! inside a transaction that has already locked the `sandboxes` row; none
 //! begins or commits a transaction. An upsert that inserts a new row also
 //! takes the foreign key's `FOR KEY SHARE` lock on the `sandboxes` row.
+//!
+//! [`record_apply_states`] is the node's report of what it applied, fenced
+//! on the sandbox being active on that node; [`to_apply_on_node`] is the read
+//! that tells the node what to apply.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -349,5 +353,182 @@ pub async fn count_other_open(
     .bind(protocol)
     .bind(guest_port)
     .fetch_one(executor)
+    .await
+}
+
+/// One exposure a node is asked to apply: its port and desired state.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PortExposureToApply {
+    pub sandbox_id: SandboxId,
+    pub protocol: String,
+    pub guest_port: i32,
+    pub desired_state: String,
+}
+
+/// The non-ECW exposures of those `sandbox_ids` active on `node_id` that the
+/// node still has to apply, by sandbox, guest port, then protocol. A closed
+/// exposure is included until it is applied; an open one also while the
+/// node's last observation of it is missing, unhealthy, more than 60 seconds
+/// old on the database clock, or from another node.
+pub async fn to_apply_on_node(
+    executor: impl PgExecutor<'_>,
+    sandbox_ids: &[SandboxId],
+    node_id: NodeId,
+) -> Result<Vec<PortExposureToApply>, sqlx::Error> {
+    sqlx::query_as::<_, PortExposureToApply>(sql!(
+        "SELECT spe.sandbox_id,
+                    spe.protocol,
+                    spe.guest_port,
+                    spe.desired_state
+             FROM sandbox_port_exposures spe
+             JOIN sandboxes s ON s.id = spe.sandbox_id
+             WHERE spe.sandbox_id = ANY($1)
+               AND s.active_node_id = $2
+               AND spe.source <> 'ecw'
+               AND (
+                   spe.apply_state != 'applied'
+                   OR (
+                       spe.desired_state = 'open'
+                       AND (
+                           spe.last_bridge_status IS NULL
+                           OR spe.last_bridge_status NOT IN
+                               ('direct', 'loopback_forwarded')
+                           OR spe.last_observed_at IS NULL
+                           OR spe.last_observed_at <
+                               NOW() - INTERVAL '60 seconds'
+                           OR spe.last_applied_node_id IS DISTINCT FROM $2
+                       )
+                   )
+               )
+             ORDER BY spe.sandbox_id, spe.guest_port ASC, spe.protocol ASC"
+    ))
+    .bind(sandbox_ids)
+    .bind(node_id)
+    .fetch_all(executor)
+    .await
+}
+
+/// What a node reports it applied for one exposure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyStateReport<'a> {
+    pub sandbox_id: SandboxId,
+    pub protocol: &'a str,
+    pub guest_port: i32,
+    pub apply_state: &'a str,
+    /// Recorded as the exposure's error when `apply_state` is `failed`; any
+    /// other report clears the stored error.
+    pub error: Option<&'a str>,
+    pub bridge_status: Option<&'a str>,
+    pub service_generation: Option<&'a str>,
+}
+
+/// A reported exposure that [`record_apply_states`] did not update.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MissedApplyState {
+    pub sandbox_id: SandboxId,
+    pub protocol: String,
+    pub guest_port: i32,
+}
+
+/// Record what `node_id` reports it applied (an observed projection), for
+/// each report whose exposure exists on a sandbox active on `node_id`, and
+/// stamp each such exposure observed now on the database clock. An
+/// `applied` report makes `node_id` the exposure's last-applied node. A
+/// `failed` report records its error as the exposure's error, and any other
+/// report clears the stored error. A missing bridge status or generation
+/// keeps the stored one. Returns the reports that matched no such exposure,
+/// the ones naming a sandbox placed elsewhere included; none is an error.
+pub async fn record_apply_states(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+    reports: &[ApplyStateReport<'_>],
+) -> Result<Vec<MissedApplyState>, sqlx::Error> {
+    let sandbox_ids = reports
+        .iter()
+        .map(|report| report.sandbox_id.as_uuid())
+        .collect::<Vec<_>>();
+    let protocols = reports
+        .iter()
+        .map(|report| report.protocol)
+        .collect::<Vec<_>>();
+    let guest_ports = reports
+        .iter()
+        .map(|report| report.guest_port)
+        .collect::<Vec<_>>();
+    let apply_states = reports
+        .iter()
+        .map(|report| report.apply_state)
+        .collect::<Vec<_>>();
+    let errors = reports
+        .iter()
+        .map(|report| report.error)
+        .collect::<Vec<_>>();
+    let bridge_statuses = reports
+        .iter()
+        .map(|report| report.bridge_status)
+        .collect::<Vec<_>>();
+    let service_generations = reports
+        .iter()
+        .map(|report| report.service_generation)
+        .collect::<Vec<_>>();
+    sqlx::query_as::<_, MissedApplyState>(sql!(
+        "WITH input AS (
+                 SELECT *
+                 FROM UNNEST(
+                     $1::UUID[],
+                     $2::TEXT[],
+                     $3::INT[],
+                     $4::TEXT[],
+                     $5::TEXT[],
+                     $7::TEXT[],
+                     $8::TEXT[]
+                 ) AS input(sandbox_id, protocol, guest_port, apply_state, error,
+                            bridge_status, service_generation)
+             ),
+             updated AS (
+                 UPDATE sandbox_port_exposures spe
+                 SET apply_state = input.apply_state,
+                     last_applied_node_id =
+                         CASE WHEN input.apply_state = 'applied'
+                              THEN $6
+                              ELSE spe.last_applied_node_id
+                         END,
+                     last_error =
+                         CASE WHEN input.apply_state = 'failed'
+                              THEN input.error
+                              ELSE NULL
+                         END,
+                     last_bridge_status =
+                         COALESCE(input.bridge_status, spe.last_bridge_status),
+                     last_applied_bridge_generation =
+                         COALESCE(input.service_generation, spe.last_applied_bridge_generation),
+                     last_observed_at = NOW(),
+                     updated_at = NOW()
+                 FROM input
+                 JOIN sandboxes s ON s.id = input.sandbox_id
+                 WHERE spe.sandbox_id = input.sandbox_id
+                   AND spe.protocol = input.protocol
+                   AND spe.guest_port = input.guest_port
+                   AND spe.sandbox_id = s.id
+                   AND s.active_node_id = $6
+                 RETURNING spe.sandbox_id, spe.protocol, spe.guest_port
+             )
+             SELECT input.sandbox_id, input.protocol, input.guest_port
+             FROM input
+             LEFT JOIN updated
+               ON updated.sandbox_id = input.sandbox_id
+              AND updated.protocol = input.protocol
+              AND updated.guest_port = input.guest_port
+             WHERE updated.sandbox_id IS NULL"
+    ))
+    .bind(sandbox_ids)
+    .bind(protocols)
+    .bind(guest_ports)
+    .bind(apply_states)
+    .bind(errors)
+    .bind(node_id)
+    .bind(bridge_statuses)
+    .bind(service_generations)
+    .fetch_all(executor)
     .await
 }

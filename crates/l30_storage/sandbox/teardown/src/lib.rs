@@ -9,7 +9,11 @@
 //!
 //! The same rows' other verbs live alongside: [`observed_status`] for
 //! `node_facet_observed_status` and [`conditions`] for
-//! `node_facet_conditions`.
+//! `node_facet_conditions`. [`observed_status`]'s orphaned-facet sweep also
+//! deletes the swept rows' `node_facet_conditions` rows. Some verbs in both
+//! modules read, without locking and in the same statement, tables other
+//! stores own: `sandboxes`, `sandbox_k8s_executions`,
+//! `sandbox_observed_states` and `node_template_inventory`.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;

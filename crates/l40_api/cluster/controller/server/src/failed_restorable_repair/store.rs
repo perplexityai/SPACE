@@ -88,12 +88,10 @@ impl RepairDbStore {
         // unassigned sandboxes are unpublishable. The shape is re-pinned so
         // a projection that turned live since the guard ran survives (the
         // CAS would have refused the flip in that case anyway).
-        sqlx::query(sql!(
-            "DELETE FROM sandbox_observed_states
-              WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
-        ))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *tx)
+        pplx_space_sandbox_store::observed_states::clear_failed_observation(
+            &mut tx,
+            candidate.sandbox_id,
+        )
         .await?;
 
         pplx_space_sandbox_store::port_exposures::invalidate_open_observations(

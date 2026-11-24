@@ -111,21 +111,6 @@ pub(super) struct TemplateDesiredStateRow {
     pub(super) held_here: bool,
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SandboxPortExposureDesiredStateRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) protocol: String,
-    pub(super) guest_port: i32,
-    pub(super) desired_state: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct PortExposureApplyMissRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) protocol: String,
-    pub(super) guest_port: i32,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct ParsedPortExposureApplyState {
     pub(super) sandbox_id: SandboxId,
