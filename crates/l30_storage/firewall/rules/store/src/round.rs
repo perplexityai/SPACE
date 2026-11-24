@@ -9,6 +9,12 @@
 //! Rounds are numbered one past the node's larger pending or accepted round,
 //! so none is reused while only acceptance or a larger round replaces a
 //! pending one.
+//!
+//! `open_round` is not the authority for the node-manager epoch: it stamps
+//! whatever epoch its first caller passes, and a later mismatch is refused with
+//! no recovery. Wire it to a production caller only once a durable node-manager
+//! identity owns the observation row and its epoch; it should then refuse a
+//! missing row or a different epoch rather than create one.
 
 use jiff::Timestamp;
 use pplx_space_sql_locator::sql;
