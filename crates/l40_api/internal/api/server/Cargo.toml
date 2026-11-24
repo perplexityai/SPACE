@@ -18,6 +18,13 @@ kubernetes = [
     "dep:kube",
     "pplx-space-rpc-auth/k8s",
 ]
+# `test_support`, for another crate's end-to-end test.
+test-support = [
+    "kubernetes",
+    "dep:tokio-stream",
+    "pplx-space-ecw-credential/test-support",
+    "pplx-space-rpc-auth/test-support",
+]
 otel = ["pplx-space-template-mgr-client/otel"]
 datadog = ["otel", "pplx-space-template-mgr-client/datadog"]
 # Deprecated for one release; use otel and datadog.
@@ -40,6 +47,7 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true, features = ["net", "sync", "rt", "time"] }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }

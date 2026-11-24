@@ -1619,6 +1619,8 @@ mod template_releases_store;
 mod template_system_publication_grants;
 mod template_tenant_publication_grants;
 mod template_visibility_cache;
+#[cfg(any(all(test, feature = "kubernetes"), feature = "test-support"))]
+pub mod test_support;
 #[cfg(test)]
 mod tests;
 

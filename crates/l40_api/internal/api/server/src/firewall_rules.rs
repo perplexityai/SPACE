@@ -67,7 +67,7 @@ impl Call {
 #[derive(Clone, Debug)]
 pub(crate) enum Enrollment {
     Unapproved,
-    #[cfg(all(test, feature = "kubernetes"))]
+    #[cfg(any(all(test, feature = "kubernetes"), feature = "test-support"))]
     Fixture(Vec<NodeId>),
 }
 
@@ -79,9 +79,9 @@ impl Enrollment {
                 node,
                 "no enrollment predicate is approved",
             )),
-            #[cfg(all(test, feature = "kubernetes"))]
+            #[cfg(any(all(test, feature = "kubernetes"), feature = "test-support"))]
             Self::Fixture(enrolled) if enrolled.contains(&node) => Ok(()),
-            #[cfg(all(test, feature = "kubernetes"))]
+            #[cfg(any(all(test, feature = "kubernetes"), feature = "test-support"))]
             Self::Fixture(_) => Err(call.not_enabled("unenrolled", node, "it isn't enrolled")),
         }
     }
