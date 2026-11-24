@@ -13,6 +13,7 @@ use pplx_space_sandbox_portability::{
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+use pplx_space_sandbox_store::snapshot_retention_claim;
 use pplx_space_snapshot_model::SnapshotId;
 use pplx_space_snapshot_store::claimed::{self, ClaimedSnapshot};
 use pplx_space_snapshot_store::{delete_snapshot_catalog, snapshot_ids_after};
@@ -331,17 +332,11 @@ impl RetentionSink for SnapshotRetentionDbStore {
         // Serialize marker/restore writers and sibling claims. Revalidate in
         // a later statement so READ COMMITTED observes a writer that committed
         // while this transaction waited for the sandbox lock.
-        let locked: Option<(Uuid,)> = sqlx::query_as(sql!(
-            "SELECT sb.id
-               FROM sandboxes sb
-               JOIN snapshots cur ON cur.sandbox_id = sb.id
-              WHERE cur.id = $1
-                AND sb.id = $2
-              FOR UPDATE OF sb"
-        ))
-        .bind(candidate.snapshot_id)
-        .bind(candidate.sandbox_id)
-        .fetch_optional(&mut *tx)
+        let locked = snapshot_retention_claim::lock_snapshot_owner(
+            &mut tx,
+            candidate.snapshot_id,
+            candidate.sandbox_id,
+        )
         .await?;
         if locked.is_none() {
             tx.rollback().await?;

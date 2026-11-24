@@ -289,14 +289,6 @@ impl OrphanCandidate {
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct OrphanCandidateRow {
-    sandbox_id: SandboxId,
-    pod_name: Option<String>,
-    pod_uid: Option<PodUid>,
-    lifecycle: SandboxLifecycle,
-}
-
 /// How the candidate was identified, which determines the action path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanKind {
@@ -1192,7 +1184,7 @@ impl OrphanActionSink for SubstrateActionSink {
 
         rows.into_iter()
             .map(|row| {
-                let OrphanCandidateRow {
+                let orphan::OrphanCandidateRow {
                     sandbox_id,
                     pod_name,
                     pod_uid,
@@ -1688,7 +1680,7 @@ impl SubstrateActionSink {
         after_sandbox_id: Option<SandboxId>,
         upper_bound: SandboxId,
         limit: i64,
-    ) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
+    ) -> Result<Vec<orphan::OrphanCandidateRow>, sqlx::Error> {
         list_candidates_after(&self.pool, after_sandbox_id, upper_bound, limit).await
     }
 }
@@ -1698,109 +1690,21 @@ async fn list_candidates_after(
     after_sandbox_id: Option<SandboxId>,
     upper_bound: SandboxId,
     limit: i64,
-) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
-    // The second predicate branch picks up "forgotten" rows: a sandbox
-    // whose **most recent** execution is `state='forgotten'` (set by
-    // `finish_active_execution_in(..., "forgotten")` inside
-    // `forget_pod_tracking`). The "most recent" qualifier is critical:
-    // if an old `forgotten` execution exists but a later execution
-    // succeeded (e.g. a recovery + suspend with `state='suspended'`),
-    // that newer execution carries recoverable on-disk state. Looking
-    // only for *any* `forgotten` would quarantine that recoverable
-    // sandbox and orphan its snapshot. Looking at the *latest*
-    // execution's state is the precise orphan signal.
-    //
-    // The final branch picks up rows stranded in `lifecycle='deleting'` by
-    // the old orphan cleanup path so their durable delete claim can complete.
-    //
-    // `s.id <= $3` bounds the sweep against new sandboxes created after
-    // the high-water mark was captured; the next sweep picks them up.
-    sqlx::query_as(sql!(
-        r"
-            SELECT s.id AS sandbox_id,
-                   e.pod_name,
-                   NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-                   s.lifecycle
-            FROM sandboxes s
-            LEFT JOIN sandbox_k8s_executions e
-              ON e.sandbox_id = s.id AND e.active
-            WHERE s.managed_by = $9
-              AND s.lifecycle <> ALL($1)
-              AND (
-                  -- Normal: active execution observed.
-                  --   Live-pod lifecycles ($5) — pod must be alive unless
-                  --   a fresh materialization lease says creation/recovery
-                  --   is still in flight.
-                  --   Pending-pod lifecycles ($6) — pod creation may still
-                  --   be in flight, so require the execution row to be
-                  --   stale by $7 seconds (crashed-create signal) before
-                  --   acting; younger rows are presumed healthy.
-                  --   Dormant lifecycles (stopped/suspended/created) are
-                  --   excluded entirely — those are intentionally-dormant
-                  --   sandboxes the user can recover via `start`.
-                  (e.pod_name IS NOT NULL AND (
-                      (
-                          s.lifecycle = ANY($5)
-                          AND (
-                              e.state NOT IN ('creating', 'recovering')
-                              OR e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
-                          )
-                      )
-                      OR (
-                          s.lifecycle = ANY($6)
-                          AND e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
-                      )
-                  ))
-                  -- Forgotten: state='forgotten' is the precise orphan
-                  -- signal. Uses the broader active-required set ($8)
-                  -- because failed `creating`/`starting` rows must be
-                  -- reachable here.
-                  OR (
-                      s.lifecycle = ANY($8)
-                      AND EXISTS (
-                          SELECT 1 FROM sandbox_k8s_executions f
-                          WHERE f.sandbox_id = s.id
-                            AND f.state = 'forgotten'
-                            AND f.generation = (
-                                SELECT MAX(generation)
-                                FROM sandbox_k8s_executions
-                                WHERE sandbox_id = s.id
-                            )
-                      )
-                  )
-                  OR s.lifecycle = 'deleting'
-              )
-              -- A node-local observed state excludes the row from every
-              -- orphan path: the kube pod may be missing, but the sandbox
-              -- still exists in sbx-mgr and can converge through node publish
-              -- or a later wake. Deleting the stable row here would strand
-              -- external references to the sandbox id. The projection GC is
-              -- the authority that bounds stale observed-state rows.
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM sandbox_observed_states sos
-                  WHERE sos.sandbox_id = s.id
-                    AND (
-                        s.active_node_id IS NULL
-                        OR sos.node_id IS NOT DISTINCT FROM s.active_node_id
-                    )
-              )
-              AND ($2::uuid IS NULL OR s.id > $2)
-              AND s.id <= $3
-            ORDER BY s.id
-            LIMIT $4
-            "
-    ))
-    .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES)
-    .bind(after_sandbox_id)
-    .bind(upper_bound)
-    .bind(limit)
-    .bind(LIVE_POD_REQUIRED_LIFECYCLES)
-    .bind(PENDING_POD_LIFECYCLES)
-    .bind(CREATE_AGE_THRESHOLD_SECS)
-    .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(pool)
+) -> Result<Vec<orphan::OrphanCandidateRow>, sqlx::Error> {
+    orphan::list_candidates_after(
+        pool,
+        orphan::CandidateScan {
+            stop_lifecycles: ORPHAN_RECONCILER_STOP_LIFECYCLES,
+            after: after_sandbox_id,
+            upper_bound,
+            limit,
+            live_pod_required_lifecycles: LIVE_POD_REQUIRED_LIFECYCLES,
+            pending_pod_lifecycles: PENDING_POD_LIFECYCLES,
+            create_age_threshold_secs: CREATE_AGE_THRESHOLD_SECS,
+            active_execution_required_lifecycles: ACTIVE_EXECUTION_REQUIRED_LIFECYCLES,
+            managed_by: SubstrateKind::Kubernetes,
+        },
+    )
     .await
 }
 

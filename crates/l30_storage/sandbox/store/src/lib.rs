@@ -56,10 +56,14 @@
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. One moves here only as a lock verb: the statement verbatim, on
-//!   the caller's transaction, named and documented as a lock, in a module
-//!   named for the path that takes it (as [`fork_source_lifecycle`] is for
-//!   its advisory lock). The caller keeps its transaction and the re-checks
-//!   it runs under the lock.
+//!   the caller's transaction, named and documented as a lock. The plain
+//!   by-id row locks that several paths share live in [`row_locks`]; a lock
+//!   that carries a guard, joins another table or serves one path lives in a
+//!   module named for that path (as [`fork_source_lifecycle`] is for its
+//!   advisory lock, [`snapshot_retention_claim`] for retention's claim and
+//!   [`sweeper::lock_placement_changed_at`] for the sweeper's revert). The
+//!   caller keeps its transaction, its lock settings and errors, and the
+//!   re-checks it runs under the lock.
 //! * **The node-local SQLite `sandboxes` table** (`crates/l30_storage/sbx/mgr/store`) is a
 //!   different database on a different machine and is out of scope.
 //!
@@ -95,10 +99,13 @@
 //!   [`row_reads::owner`] (its organization) and [`debug_reads::record`]
 //!   (its nodes) do.
 //!   Some such modules also read tables another store owns. For example,
-//!   [`active_quarantines`] and [`quarantine_recovery_authority`] join
-//!   `sandbox_quarantine_state`, which belongs to
-//!   `pplx-space-sandbox-quarantine-store`, and [`debug_reads::record`] joins
-//!   `nodes` and `node_k8s`, which belong to
+//!   [`active_quarantines`], [`quarantine_recovery_authority`],
+//!   [`quarantine_recovery_candidates`] and the locks in
+//!   [`quarantine_publication`] join `sandbox_quarantine_state`, which
+//!   belongs to `pplx-space-sandbox-quarantine-store`, and
+//!   [`quarantine_publication::lock_pause_failed_recovery_candidates`] also
+//!   locks the joined episode rows (`FOR UPDATE OF s, qs`).
+//!   [`debug_reads::record`] joins `nodes` and `node_k8s`, which belong to
 //!   `pplx-space-node-registration-store`.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
@@ -156,6 +163,7 @@ pub mod active_quarantines;
 pub mod admin_occupancy;
 pub mod artifact_marker;
 pub mod attribute_runtime;
+pub mod auto_lifecycle_delete_completion;
 pub mod create;
 pub mod debug_reads;
 pub mod delete;
@@ -181,18 +189,22 @@ pub mod pod_tracking;
 pub mod port_exposures;
 pub mod published_quarantine_candidates;
 pub mod quarantine;
+pub mod quarantine_publication;
 pub mod quarantine_recovery_authority;
+pub mod quarantine_recovery_candidates;
 pub mod repair;
 pub mod restore_dispatch_fence;
 pub mod restore_lease;
 pub mod restore_pod_owners;
 pub mod restore_source;
+pub mod row_locks;
 pub mod row_reads;
 pub mod runtime_access;
 pub mod runtime_population;
 pub mod sandbox_id_bounds;
 pub mod snapshot_capture_fields;
 pub mod snapshot_inventory;
+pub mod snapshot_retention_claim;
 pub mod spaced_version_counts;
 pub mod stopped_replacement_claim;
 pub mod stopped_replacements;

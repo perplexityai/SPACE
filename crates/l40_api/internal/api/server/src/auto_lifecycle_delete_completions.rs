@@ -20,10 +20,12 @@ use pplx_space_sandbox_model::{
     SandboxActivationAttemptId, SandboxId, SandboxIdParseError, SandboxLifecycle,
     SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
+use pplx_space_sandbox_quarantine_store::locks::lock_orphan_quarantine_match;
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::auto_lifecycle_delete_completion;
 use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sql_locator::sql;
-use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
+use sqlx::{Acquire as _, FromRow, Postgres, Transaction};
 use tonic::Status;
 
 use crate::proto::AutoLifecycleDeleteCompletion;
@@ -91,14 +93,6 @@ impl TryFrom<&AutoLifecycleDeleteCompletion> for ParsedCompletion {
             policy_fingerprint,
         })
     }
-}
-
-#[derive(Debug, FromRow)]
-struct CompletionAuthorityRow {
-    lifecycle: String,
-    auto_lifecycle_json: Json<serde_json::Value>,
-    active_node_id: Option<NodeId>,
-    ownership_evidence_expired: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -448,19 +442,11 @@ async fn apply_receipt(
     origin_node_id: NodeId,
     completion: &ParsedCompletion,
 ) -> Result<ReceiptOutcome, Status> {
-    let row = sqlx::query_as::<_, CompletionAuthorityRow>(sql!(
-        "SELECT s.lifecycle,
-                s.auto_lifecycle_json,
-                s.active_node_id,
-                COALESCE(s.placement_changed_at, s.created_at)
-                    <= NOW() - make_interval(secs => $2) AS ownership_evidence_expired
-           FROM sandboxes s
-          WHERE s.id = $1
-          FOR UPDATE OF s NOWAIT"
-    ))
-    .bind(completion.sandbox_id)
-    .bind(AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE.as_secs_f64())
-    .fetch_optional(&mut **tx)
+    let row = auto_lifecycle_delete_completion::lock_completion_authority(
+        tx,
+        completion.sandbox_id,
+        AUTO_LIFECYCLE_DELETE_COMPLETION_OWNERSHIP_GRACE.as_secs_f64(),
+    )
     .await;
     let row = match row {
         Ok(row) => row,
@@ -620,22 +606,16 @@ async fn apply_receipt(
     }
 
     if from_lifecycle == SandboxLifecycle::Quarantined {
-        let matching_orphan_quarantine = sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT COALESCE(last_observed_node_id = $2, FALSE)
-                    AND source = $3
-                    AND reason_code = ANY($4::TEXT[])
-               FROM sandbox_quarantine_state
-              WHERE sandbox_id = $1
-              FOR UPDATE NOWAIT"
-        ))
-        .bind(completion.sandbox_id)
-        .bind(origin_node_id)
-        .bind(SandboxQuarantineSource::ClusterController)
-        .bind(vec![
-            SandboxQuarantineReasonCode::OrphanedExecutionMissingArtifact,
-            SandboxQuarantineReasonCode::OrphanedExecutionLegacyDeletingState,
-        ])
-        .fetch_optional(&mut **tx)
+        let matching_orphan_quarantine = lock_orphan_quarantine_match(
+            tx,
+            completion.sandbox_id,
+            origin_node_id,
+            SandboxQuarantineSource::ClusterController,
+            &[
+                SandboxQuarantineReasonCode::OrphanedExecutionMissingArtifact,
+                SandboxQuarantineReasonCode::OrphanedExecutionLegacyDeletingState,
+            ],
+        )
         .await;
         let matching_orphan_quarantine = match matching_orphan_quarantine {
             Ok(matching) => matching.unwrap_or(false),

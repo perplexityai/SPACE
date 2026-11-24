@@ -122,6 +122,7 @@ use pplx_space_sandbox_portability::{
     pod_less_drain_revert_loses_no_newer_bytes,
 };
 use pplx_space_sandbox_store::drain;
+use pplx_space_sandbox_store::row_locks;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
@@ -602,10 +603,7 @@ async fn recover_pod_less_sandbox_locked(
         .bind(candidate.source_node_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *tx)
-        .await?;
+    row_locks::lock_exists(&mut tx, candidate.sandbox_id).await?;
     sqlx::query(sql!(
         "SELECT 1
            FROM sandbox_k8s_executions

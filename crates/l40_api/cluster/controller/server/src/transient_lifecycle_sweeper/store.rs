@@ -17,7 +17,8 @@ use pplx_space_durations::PositiveDuration;
 use pplx_space_k8s_ids::{PodName, PodUid};
 use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
-use pplx_space_sandbox_store::sweeper::{self, unrestorable_restoring_guards};
+use pplx_space_sandbox_store::row_locks;
+use pplx_space_sandbox_store::sweeper;
 use sqlx::PgPool;
 
 use super::classify::{ExecutionRoutability, ProbeObservation};
@@ -35,39 +36,6 @@ use pplx_space_api::controllers::substrate::AbandonedRestoreRetirement;
 /// steady-state candidate count is tiny (only slow-create preserves no client
 /// ever retried), so this rarely binds.
 const COMMAND_READY_PENDING_BATCH: i64 = 50;
-
-/// Candidate query for the command-ready-pending reaper. Bind order: `$1` =
-/// `managed_by`, `$2` = age threshold seconds (`BIGINT`), `$3` = batch limit.
-/// `lifecycle_changed_at` is the age clock because the create preserve path
-/// sets the marker in the same write that flips the row to `started`.
-///
-/// Ordered by `random()`, not oldest-first: a probe outcome of `Unreachable`
-/// leaves the row unchanged, so a strict oldest-first `LIMIT` would re-select
-/// the same front rows every tick and let a batch of stuck/unreachable rows
-/// permanently starve the ready/wedged candidates behind them. Random sampling
-/// gives every candidate a fair shot each tick — healed/reaped rows leave the
-/// set, and no fixed front-of-queue can monopolize the batch. The matching set
-/// (aged, never-retried preserved creates) is small, so the random sort is
-/// cheap.
-pub(super) const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
-    "SELECT
-         s.id,
-         EXTRACT(EPOCH FROM (NOW() - s.lifecycle_changed_at))::BIGINT AS age_secs,
-         e.pod_name,
-         e.activation_attempt_id,
-         NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-         e.route_activation_id,
-         e.generation
-     FROM sandboxes s
-     LEFT JOIN sandbox_k8s_executions e
-       ON e.sandbox_id = s.id AND e.active
-     WHERE s.managed_by = $1
-       AND s.lifecycle = 'started'
-       AND s.command_ready_pending = true
-       AND s.lifecycle_changed_at < NOW() - make_interval(secs => $2)
-     ORDER BY random()
-     LIMIT $3"
-);
 
 /// Rotate a failed-cleanup candidate behind the others by bumping its active
 /// execution's `updated_at`. Bind order: `$1` = sandbox id, `$2` =
@@ -99,18 +67,6 @@ pub(super) fn failed_active_execution_scope(managed_by: &str) -> Option<Substrat
 /// cluster-wide incident wedges a large population at once; the remainder
 /// rolls to the next tick.
 const SWEEP_CANDIDATE_BATCH: i64 = 100;
-
-/// Raw row shape of [`LIST_COMMAND_READY_PENDING_SQL`].
-#[derive(sqlx::FromRow)]
-struct CommandReadyPendingRow {
-    id: SandboxId,
-    age_secs: i64,
-    pod_name: Option<String>,
-    activation_attempt_id: Option<SandboxActivationAttemptId>,
-    generation: Option<i64>,
-    pod_uid: Option<PodUid>,
-    route_activation_id: Option<SandboxActivationAttemptId>,
-}
 
 /// Build the retire fence for a candidate from its active execution row's
 /// `(pod_name, pod_uid)`.
@@ -249,8 +205,9 @@ async fn observe_candidate_pods(
     substrate.observe_pod_identities(&names).await
 }
 
-/// Lock an activation-owned row before a CAS re-checks its owner. Bind order:
-/// `$1` = sandbox id.
+/// Begin a transaction holding the sandbox row lock
+/// ([`row_locks::lock_id`]), for a CAS whose owner check must see any
+/// activation attempt claimed while it waited for the row.
 ///
 /// The fail, converge and revert CASes check the owner with a subquery on the
 /// execution ([`activation_owner_guard`](sweeper::activation_owner_guard)), and every activation-attempt
@@ -260,21 +217,12 @@ async fn observe_candidate_pods(
 /// released, so it would act on a row a new owner had just claimed. Taking the
 /// lock first, in the CAS's own transaction, makes the CAS read a snapshot
 /// that includes any such claim.
-pub(crate) const LOCK_SANDBOX_ROW_SQL: &str =
-    sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE");
-
-/// Begin a transaction holding the sandbox row lock, for a CAS whose owner
-/// check must see any activation attempt claimed while it waited for the row
-/// (see [`LOCK_SANDBOX_ROW_SQL`]).
 async fn begin_locked(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(LOCK_SANDBOX_ROW_SQL)
-        .bind(sandbox_id)
-        .execute(&mut *tx)
-        .await?;
+    row_locks::lock_id(&mut tx, sandbox_id).await?;
     Ok(tx)
 }
 
@@ -331,24 +279,6 @@ async fn retire_reverted_restore_execution(
         .await?;
     }
     Ok(retired)
-}
-
-/// Candidate select for the unrestorable-`restoring` sweep. Bind order:
-/// `$1` = `managed_by`, `$2` = min placement age seconds (`BIGINT`), `$3` =
-/// batch limit. Lists without flipping; the reported age is time since the
-/// last placement change (the stable clock — see
-/// [`unrestorable_restoring_guards`]).
-pub(crate) fn list_unrestorable_restoring_query() -> String {
-    let guards = unrestorable_restoring_guards();
-    format!(
-        "SELECT sandboxes.id,
-                EXTRACT(EPOCH FROM (NOW() - sandboxes.placement_changed_at))::BIGINT AS age_secs
-           FROM sandboxes
-          WHERE sandboxes.managed_by = $1
-            {guards}
-          ORDER BY random()
-          LIMIT $3"
-    )
 }
 
 pub struct SubstrateSweepSink {
@@ -458,12 +388,6 @@ impl SubstrateSweepSink {
 
     async fn evict_probe_client(&self, node_name: &str) {
         self.probe_clients.lock().await.remove(node_name);
-    }
-
-    /// Saturating seconds-as-`i64` for SQL binds; any value above `i64::MAX`
-    /// is "never" in human terms.
-    fn age_secs_bind(age: PositiveDuration) -> i64 {
-        i64::try_from(age.get().as_secs()).unwrap_or(i64::MAX)
     }
 }
 
@@ -739,17 +663,7 @@ impl SweepSink for SubstrateSweepSink {
         // the execution check below can't race a new claim, and read the
         // placement clock the CAS clears while holding it.
         let prior_placement_changed_at: Option<Option<time::OffsetDateTime>> =
-            sqlx::query_scalar(sql!(
-                "SELECT placement_changed_at
-                   FROM sandboxes
-                  WHERE id = $1
-                    AND managed_by = $2
-                    FOR UPDATE"
-            ))
-            .bind(sandbox_id)
-            .bind(managed_by)
-            .fetch_optional(&mut *tx)
-            .await?;
+            sweeper::lock_placement_changed_at(&mut tx, sandbox_id, managed_by).await?;
         let Some(prior_placement_changed_at) = prior_placement_changed_at else {
             tx.rollback().await?;
             return Ok(None);
@@ -867,17 +781,16 @@ impl SweepSink for SubstrateSweepSink {
         min_placement_age: PositiveDuration,
     ) -> Result<Vec<(SandboxId, Duration)>, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
-        let rows: Vec<(SandboxId, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(
-            list_unrestorable_restoring_query()
-        )))
-        .bind(managed_by)
-        .bind(Self::age_secs_bind(min_placement_age))
-        .bind(SWEEP_CANDIDATE_BATCH)
-        .fetch_all(&self.pool)
+        let rows = sweeper::list_unrestorable_restoring(
+            &self.pool,
+            managed_by,
+            min_placement_age,
+            SWEEP_CANDIDATE_BATCH,
+        )
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, age_secs)| {
+            .map(|sweeper::UnrestorableRestoringRow { id, age_secs }| {
                 // Negative only under clock skew; clamp defensively.
                 (id, Duration::from_secs(age_secs.max(0).cast_unsigned()))
             })
@@ -1032,14 +945,14 @@ impl SweepSink for SubstrateSweepSink {
         &self,
         age: PositiveDuration,
     ) -> Result<Vec<CommandReadyPendingCandidate>, sqlx::Error> {
-        let age_secs_i64 = i64::try_from(age.get().as_secs()).unwrap_or(i64::MAX);
         let managed_by = self.substrate.managed_by();
-        let rows: Vec<CommandReadyPendingRow> = sqlx::query_as(LIST_COMMAND_READY_PENDING_SQL)
-            .bind(managed_by)
-            .bind(age_secs_i64)
-            .bind(COMMAND_READY_PENDING_BATCH)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sweeper::list_command_ready_pending(
+            &self.pool,
+            managed_by,
+            age,
+            COMMAND_READY_PENDING_BATCH,
+        )
+        .await?;
         // `age_secs` is `NOW() - lifecycle_changed_at`, always positive given
         // the WHERE clause; clamp a negative (clock skew) to zero defensively.
         let observed = observe_candidate_pods(
