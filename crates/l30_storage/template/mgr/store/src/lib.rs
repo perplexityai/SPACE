@@ -17,13 +17,23 @@
 //! statements for those tables. [`database`] migrates and opens the
 //! database, which template-manager does once at startup.
 //!
-//! Every function outside [`database`] takes a `rusqlite::Connection`, so a
+//! Every function outside [`database`] and [`jobs`] that runs a statement
+//! takes a `rusqlite::Connection`, so a
 //! caller can pass its own open transaction, or a `rusqlite::Transaction`
 //! where its statements are only correct together. None of them opens a
 //! connection or a transaction: callers keep both, with their transaction
 //! behavior, and their checks between statements. Each returns rusqlite's
 //! error, except [`template_settings::try_update_template_network_policy_tx`],
 //! whose error also reports a generation conflict.
+//!
+//! [`jobs`] is the exception. [`jobs::background_worker`] builds
+//! template-manager's job worker over the `Arc<Mutex<rusqlite::Connection>>`
+//! template-manager shares with it. The worker locks that connection itself to
+//! run its statements, so a caller must not hold that mutex while it calls a
+//! [`jobs::JobWorker`] method or awaits one's future, and
+//! [`jobs::JobWorker::submit_json`] fails with `tonic::Status`.
+//! template-manager reaches the job worker only through [`jobs::JobWorker`];
+//! `BackgroundWorker` is never re-exported.
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +41,7 @@ pub mod builds;
 mod codec;
 pub mod database;
 pub mod eviction;
+pub mod jobs;
 pub mod network_policy_notifications;
 pub mod node_dirty_refs;
 pub mod pins;

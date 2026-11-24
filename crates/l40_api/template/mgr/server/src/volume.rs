@@ -364,7 +364,7 @@ pub struct VolumePuller {
     /// `None` (the test constructor), failures stay warn-and-continue —
     /// tests don't need a worker because they aren't asserting recovery.
     background_worker: Option<
-        pplx_space_common_jobs::BackgroundWorker<
+        pplx_space_template_mgr_store::jobs::JobWorker<
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     >,
@@ -379,7 +379,7 @@ impl VolumePuller {
     /// background worker. Used by `TemplateManagerService::new`; tests
     /// use [`Self::new`] and rely on the no-op fallback path.
     pub fn new_with_background_worker(
-        background_worker: pplx_space_common_jobs::BackgroundWorker<
+        background_worker: pplx_space_template_mgr_store::jobs::JobWorker<
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     ) -> Self {
@@ -1343,7 +1343,7 @@ async fn pull_resolved_owner(
     pull: OwnedPull<'_>,
     base_tags: &[String],
     background_worker: Option<
-        &pplx_space_common_jobs::BackgroundWorker<
+        &pplx_space_template_mgr_store::jobs::JobWorker<
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     >,
@@ -1977,7 +1977,7 @@ async fn do_pull(
     storage_uris: &[String],
     base_tags: &[String],
     background_worker: Option<
-        &pplx_space_common_jobs::BackgroundWorker<
+        &pplx_space_template_mgr_store::jobs::JobWorker<
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     >,
@@ -2524,7 +2524,7 @@ async fn try_pull_from(
     parts: &StorageUri,
     base_tags: &[String],
     background_worker: Option<
-        &pplx_space_common_jobs::BackgroundWorker<
+        &pplx_space_template_mgr_store::jobs::JobWorker<
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     >,
