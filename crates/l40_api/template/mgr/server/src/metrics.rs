@@ -292,8 +292,9 @@ pub fn digest_pins_pruned(count: u64) {
     counter("template.digest_pins.pruned", count, &[]);
 }
 
-/// The requested content hash uses the legacy `version` tag on DogStatsD and
-/// `version.requested` on OTLP, separate from the emitting process version.
+/// The requested content hash is the `hash` tag, as on
+/// `template.prefetch.release.candidates`; `version` is left to the emitting
+/// process.
 pub fn fetch_error(name: &str, req_hash: &str, req_tag: &str, reason: &str) {
     let tags = vec![
         tag("template", name),
@@ -306,7 +307,7 @@ pub fn fetch_error(name: &str, req_hash: &str, req_tag: &str, reason: &str) {
             },
         ),
         tag(
-            "version",
+            "hash",
             if req_hash.is_empty() {
                 "<unset>"
             } else {
