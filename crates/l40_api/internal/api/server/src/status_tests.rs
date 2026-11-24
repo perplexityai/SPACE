@@ -444,12 +444,12 @@ async fn sandbox_is_observed(pool: &sqlx::PgPool, sandbox_id: SandboxId) -> Test
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn complete_inventory_marks_missing_space_sandbox_deleted() -> TestResult {
+async fn complete_inventory_prunes_only_captured_missing_space_sandboxes() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let node_id = NodeId::new();
-    let sandbox_id = SandboxId::new();
+    let sandbox_id = SandboxId::new(); // Direct, but no observation yet.
     // Otherwise identical, but Kubernetes-managed: the census does not own it.
     let k8s_sandbox_id = SandboxId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
@@ -470,9 +470,26 @@ async fn complete_inventory_marks_missing_space_sandbox_deleted() -> TestResult 
     )
     .await?;
 
-    let mut conn = db.pool.acquire().await?;
-    prune_empty_census(&mut conn, node_id).await?;
-    drop(conn);
+    let mut tx = db.pool.begin().await?;
+    let ids =
+        pplx_space_sandbox_store::ingest::census_prune_candidates(&mut *tx, node_id, &[]).await?;
+    assert_eq!(ids, vec![sandbox_id]);
+    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(&mut tx, &ids).await?;
+
+    // A different connection commits a new placement and observation after
+    // capture. It matches the prune predicates but was not captured or locked.
+    let late_sandbox_id = SandboxId::new();
+    insert_placed_sandbox(
+        &db.pool,
+        late_sandbox_id,
+        node_id,
+        SandboxLifecycle::Started,
+        SubstrateKind::Space,
+    )
+    .await?;
+    observe_sandbox_on_node(&db.pool, late_sandbox_id, node_id).await?;
+    prune_absent_node_sandboxes(&mut tx, node_id, &ids).await?;
+    tx.commit().await?;
 
     assert_eq!(
         pruned_sandbox_row(&db.pool, sandbox_id).await?,
@@ -482,6 +499,11 @@ async fn complete_inventory_marks_missing_space_sandbox_deleted() -> TestResult 
         pruned_sandbox_row(&db.pool, k8s_sandbox_id).await?,
         PrunedSandboxRow::placed("started", node_id)
     );
+    assert_eq!(
+        pruned_sandbox_row(&db.pool, late_sandbox_id).await?,
+        PrunedSandboxRow::placed("started", node_id)
+    );
+    assert!(sandbox_is_observed(&db.pool, late_sandbox_id).await?);
     Ok(())
 }
 
