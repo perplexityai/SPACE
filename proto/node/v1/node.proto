@@ -174,10 +174,11 @@ service NodeManager {
   rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
 
   // Durably accept the node's firewall assignment, then apply it to one slot
-  // or to every eligible slot. Acceptance and a single slot's dispatch are
-  // reported separately; neither is node-wide, and node-wide work leaves the
-  // dispatch unset. A node that can't sync answers FAILED_PRECONDITION after
-  // authorization.
+  // or to every eligible slot; or answer a verification round's question from
+  // an observation of every slot; or both, in that order. Acceptance and a
+  // single slot's dispatch are reported separately; neither is node-wide, and
+  // node-wide work leaves the dispatch unset. A node that can't sync answers
+  // FAILED_PRECONDITION after authorization.
   rpc SyncFirewallRules(SyncFirewallRulesRequest) returns (SyncFirewallRulesResponse);
 
   // ─── Node artifact store ─────────────────────────────────────────────
@@ -445,10 +446,21 @@ message FirewallRulesAssignment {
   string revision = 3;
 }
 
+// An assignment, a question or both; neither is INVALID_ARGUMENT.
 message SyncFirewallRulesRequest {
-  // Canonical node ID the assignment names, checked against this node's own.
+  // Canonical node ID the request names, checked against this node's own.
   string node_id = 1;
   FirewallRulesAssignment assignment = 2;
+  // A manager that predates it ignores it, and refuses a request without an
+  // assignment.
+  FirewallRulesQuestion question = 3;
+}
+
+// A pending verification round, as FetchFirewallRules returned it.
+message FirewallRulesQuestion {
+  // Both required; 0 is a generation.
+  optional uint64 round = 1;
+  optional uint64 assignment_generation = 2;
 }
 
 enum FirewallAssignmentAcceptance {
@@ -488,11 +500,35 @@ message FirewallSlotDispatch {
 }
 
 message SyncFirewallRulesResponse {
-  // The request's generation, now durably accepted.
-  uint64 accepted_generation = 1;
+  // The request's generation, now durably accepted. Unset, and `acceptance`
+  // UNSPECIFIED, without an assignment. Key on `acceptance`: a manager that
+  // predates `optional` leaves an accepted generation 0 unset.
+  optional uint64 accepted_generation = 1;
   FirewallAssignmentAcceptance acceptance = 2;
-  // Unset when the work spans slots.
+  // Unset when the work spans slots or the request has no assignment.
   FirewallSlotDispatch dispatch = 3;
+  // The manager's answer to the question, unset unless it answered. With an
+  // assignment, only a question about its generation is answered.
+  FirewallRulesObservation observation = 4;
+  // Why a question got no observation; diagnostic only, empty otherwise.
+  string unanswered = 5;
+}
+
+// What every slot enforced when node-manager observed a round, in the fields
+// of ReportFirewallRulesRequest. Every scalar is set.
+message FirewallRulesObservation {
+  string node_id = 1;
+  // The round the observation answers.
+  optional uint64 round = 2;
+  optional uint64 assignment_generation = 3;
+  // The revision checked against.
+  string revision_id = 4;
+  // The incarnation the manager's binding trusts, never one the caller named.
+  optional uint64 manager_epoch = 5;
+  FirewallRulesCensus census = 6;
+  repeated FirewallRulesCensusGap census_gaps = 7;
+  repeated FirewallRulesSlotEvidence slots = 8;
+  optional uint64 extra_namespaces = 9;
 }
 
 // The firewall evidence vocabulary below is shared by node-manager's

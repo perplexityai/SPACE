@@ -4,7 +4,9 @@
 //! one supersedes older work. Each `All` pass targets the slot incarnations it
 //! lists, and never redirects work to another occupant; a `One` pass's first
 //! attempt to reach nft fixes its target for the binding. Per-slot results live
-//! in memory only; no node-wide receipt.
+//! in memory only; no node-wide receipt. A question about the accepted
+//! generation is answered from its round's one observation (`rounds`), after
+//! any assignment in the same request; a question about another is not.
 //!
 //! A result that may not describe what nft did ends the whole binding for this
 //! process: a slot job that ended without a result, an inconclusive readback,
@@ -47,8 +49,9 @@ use crate::firewall::assignment::{
 use crate::firewall::rules::Nft;
 use crate::firewall::rules::verify::Verification;
 use crate::proto::{
-    FirewallAssignmentAcceptance, FirewallSlotDispatch, FirewallSlotDispatchOutcome as Outcome,
-    SyncFirewallRulesRequest, SyncFirewallRulesResponse,
+    FirewallAssignmentAcceptance, FirewallRulesAssignment, FirewallRulesQuestion,
+    FirewallSlotDispatch, FirewallSlotDispatchOutcome as Outcome, SyncFirewallRulesRequest,
+    SyncFirewallRulesResponse,
 };
 use crate::slot_pool::firewall_rules::SlotHost;
 use crate::slot_pool::{
@@ -70,6 +73,8 @@ pub(crate) struct FirewallSyncFixture {
     /// How long a `One` delivery waits for its dispatch. No effect under `All`,
     /// whose reply carries none.
     pub wait: Duration,
+    /// The epoch the round opener stamped, trusted while this process lives.
+    pub manager_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -211,9 +216,50 @@ impl FirewallSync {
             ));
         }
         let node_id = NodeId::from_uuid(canonical_uuid("node_id", &request.node_id)?);
-        let assignment = request
-            .assignment
-            .ok_or_else(|| Status::invalid_argument("assignment is required"))?;
+        // Decoded and checked before anything is written.
+        let question = request.question.map(question).transpose()?;
+        if question.is_some() && node_id != self.fixture.node_id {
+            return Err(Status::failed_precondition(
+                "the question names another node",
+            ));
+        }
+        let mut reply = match request.assignment {
+            Some(assignment) => self.accept(service, node_id, assignment).await?,
+            None if question.is_some() => SyncFirewallRulesResponse::default(),
+            None => {
+                return Err(Status::invalid_argument(
+                    "an assignment or a question is required",
+                ));
+            }
+        };
+        let Some((round, generation)) = question else {
+            return Ok(reply);
+        };
+        let answer = match reply.accepted_generation {
+            Some(accepted) if accepted != generation => Err(format!(
+                "the question is about generation {generation}, not the delivered {accepted}"
+            )),
+            // No server-side bound: the sweep's budget or the round's eviction ends it,
+            // and a dropped call leaves the round to finish in the cache.
+            _ => match self.observe(&service.pool, node_id, generation, round) {
+                Ok(answer) => answer.await.evidence(self.fixture.manager_epoch),
+                Err(refused) => Err(refused.to_string()),
+            },
+        };
+        match answer {
+            Ok(observation) => reply.observation = Some(observation),
+            Err(unanswered) => reply.unanswered = unanswered,
+        }
+        Ok(reply)
+    }
+
+    /// Durably accepts `assignment` and arms its pass.
+    async fn accept(
+        self: &Arc<Self>,
+        service: &NodeManagerService,
+        node_id: NodeId,
+        assignment: FirewallRulesAssignment,
+    ) -> Result<SyncFirewallRulesResponse, Status> {
         let revision_id = canonical_uuid("revision_id", &assignment.revision_id)?;
         let generation = assignment.generation;
         let sync = self.clone();
@@ -240,13 +286,14 @@ impl FirewallSync {
             Acceptance::Replayed => FirewallAssignmentAcceptance::Replayed,
         };
         Ok(SyncFirewallRulesResponse {
-            accepted_generation: generation,
+            accepted_generation: Some(generation),
             acceptance: acceptance.into(),
             // A reply describes one slot at most, never the node.
             dispatch: match self.fixture.slots {
                 BoundSlots::One(_) => Some(self.settled(generation).await),
                 BoundSlots::All => None,
             },
+            ..SyncFirewallRulesResponse::default()
         })
     }
 
@@ -514,6 +561,16 @@ fn dispatch(report: &Result<SlotFirewallReport, JoinError>) -> (FirewallSlotDisp
         detail,
     };
     (dispatch, ends)
+}
+
+/// The question's round and generation, both required.
+fn question(question: FirewallRulesQuestion) -> Result<(u64, u64), Status> {
+    match (question.round, question.assignment_generation) {
+        (Some(round), Some(generation)) => Ok((round, generation)),
+        _ => Err(Status::invalid_argument(
+            "a question needs its round and assignment generation",
+        )),
+    }
 }
 
 /// Only the hyphenated lowercase form, so an ID has one spelling.

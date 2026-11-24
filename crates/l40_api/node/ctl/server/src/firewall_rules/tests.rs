@@ -170,6 +170,7 @@ fn assigned(
                 revision_id,
                 revision: revision.to_string(),
             }),
+            question: None,
         },
     )
 }

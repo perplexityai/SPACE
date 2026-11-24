@@ -132,6 +132,7 @@ async fn deliver(hops: &impl Hops) {
             revision_id,
             revision,
         }),
+        question: None,
     };
     // A lost reply proves neither outcome, so this claims neither.
     match tokio::time::timeout(SYNC_BUDGET + CONNECT_MARGIN, hops.sync(request)).await {

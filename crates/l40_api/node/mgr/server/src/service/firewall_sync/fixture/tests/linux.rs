@@ -37,6 +37,7 @@ fn a_delivery_applies_only_to_the_bound_namespace() {
                         ])),
                         nft: Arc::new(crate::firewall::rules::nft),
                         wait: WAIT,
+                        manager_epoch: EPOCH,
                     })
                     .unwrap();
                 reply(sync(&service, delivery(12)).await)
@@ -88,6 +89,7 @@ fn a_delivery_applies_to_every_eligible_namespace() {
                         host,
                         nft: Arc::new(crate::firewall::rules::nft),
                         wait: WAIT,
+                        manager_epoch: EPOCH,
                     })
                     .unwrap();
                 sync_all(&service, 12).await;

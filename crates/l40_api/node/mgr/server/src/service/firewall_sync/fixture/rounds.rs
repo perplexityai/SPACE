@@ -13,7 +13,15 @@ use pplx_space_accounts::NodeId;
 use tokio::sync::oneshot;
 
 use super::{BoundSlots, FirewallSync};
-use crate::slot_pool::firewall_rules::observe::{Refusal, SWEEP_BUDGET};
+use crate::net::MAX_IPV4_NETWORK_SLOTS;
+use crate::proto::{
+    FirewallRulesCensus, FirewallRulesCensusGap, FirewallRulesCensusGapKind,
+    FirewallRulesObservation, FirewallRulesSlotEvidence, FirewallRulesSlotOutcome,
+    FirewallRulesSlotReason,
+};
+use crate::slot_pool::firewall_rules::observe::{
+    CensusGap, Failure, MAX_CENSUS_GAPS, Refusal, SWEEP_BUDGET, SlotEvidence, SlotOutcome, Unknown,
+};
 use crate::slot_pool::{FirewallObservation, NetworkPool, SlotTarget};
 
 /// Rounds kept for replay.
@@ -24,6 +32,88 @@ const RETAINED: usize = 8;
 pub(crate) struct Observed {
     pub round: u64,
     pub answer: Result<FirewallObservation, Refusal>,
+}
+
+impl Observed {
+    /// The answer in the Report's terms under `manager_epoch`, or why there is
+    /// none. Host paths and sandbox IDs stay local.
+    pub(crate) fn evidence(&self, manager_epoch: u64) -> Result<FirewallRulesObservation, String> {
+        let observation = self.answer.as_ref().map_err(ToString::to_string)?;
+        let census = match observation.census.complete() {
+            true => FirewallRulesCensus::Complete,
+            false => FirewallRulesCensus::Incomplete,
+        };
+        let (census_gaps, extra_namespaces) = gaps(&observation.census.gaps);
+        Ok(FirewallRulesObservation {
+            node_id: observation.node_id.to_string(),
+            round: Some(self.round),
+            assignment_generation: Some(observation.generation),
+            revision_id: observation.revision_id.to_string(),
+            manager_epoch: Some(manager_epoch),
+            census: census.into(),
+            census_gaps,
+            slots: observation.slots.iter().map(slot).collect(),
+            extra_namespaces: Some(extra_namespaces),
+        })
+    }
+}
+
+// Only extras are ever truncated: every other gap fits under the bound.
+const _: () = assert!(MAX_IPV4_NETWORK_SLOTS as usize + 3 < MAX_CENSUS_GAPS);
+
+/// The Report's gaps, and its count of extra namespaces: each listed extra,
+/// plus each one a truncation left out.
+fn gaps(gaps: &[CensusGap]) -> (Vec<FirewallRulesCensusGap>, u64) {
+    use FirewallRulesCensusGapKind as Kind;
+    let (mut listed, mut extra) = (Vec::new(), 0);
+    for gap in gaps {
+        let (kind, slot_id) = match *gap {
+            CensusGap::InventoryFailed => (Kind::InventoryFailed, None),
+            CensusGap::Unowned => (Kind::Unowned, None),
+            CensusGap::ListingFailed => (Kind::ListingFailed, None),
+            CensusGap::Missing { slot_id } => (Kind::Missing, Some(slot_id)),
+            CensusGap::Unread { slot_id } => (Kind::Unread, Some(slot_id)),
+            CensusGap::Extra { .. } => {
+                extra += 1;
+                continue;
+            }
+            CensusGap::Truncated { omitted } => {
+                extra += omitted;
+                continue;
+            }
+        };
+        listed.push(FirewallRulesCensusGap {
+            kind: kind.into(),
+            slot_id,
+        });
+    }
+    (listed, extra)
+}
+
+fn slot(slot: &SlotEvidence) -> FirewallRulesSlotEvidence {
+    use FirewallRulesSlotOutcome as Outcome;
+    use FirewallRulesSlotReason as Reason;
+    let (outcome, reason) = match slot.outcome {
+        SlotOutcome::Verified => (Outcome::Verified, Reason::Unspecified),
+        SlotOutcome::Applying => (Outcome::Applying, Reason::Unspecified),
+        SlotOutcome::Failed(Failure::RulesMismatch) => (Outcome::Failed, Reason::RulesMismatch),
+        SlotOutcome::Unknown(unknown) => (
+            Outcome::Unknown,
+            match unknown {
+                Unknown::Ineligible => Reason::Ineligible,
+                Unknown::NamespaceMissing => Reason::NamespaceMissing,
+                Unknown::NamespaceUnreadable => Reason::NamespaceUnreadable,
+                Unknown::TableUnreadable => Reason::TableUnreadable,
+                Unknown::Unconfirmed => Reason::Unconfirmed,
+            },
+        ),
+    };
+    FirewallRulesSlotEvidence {
+        slot_id: Some(slot.slot_id),
+        slot_generation: Some(slot.target.slot_generation),
+        outcome: outcome.into(),
+        reason: reason.into(),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

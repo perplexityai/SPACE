@@ -1,8 +1,8 @@
 //! `SyncFirewallRules`: node-ctl delivers this node's firewall assignment,
 //! which is durably accepted and then applied to one slot or every eligible
-//! slot. Only a test fixture binds the node, slots and record (`fixture`);
-//! without one, as on every production node, the RPC refuses after
-//! authorization.
+//! slot, or asks a verification round's question, or both. Only a test
+//! fixture binds the node, slots and record (`fixture`); without one, as on
+//! every production node, the RPC refuses after authorization.
 
 use pplx_space_host_layout::identities::user_names;
 use pplx_space_uds_peer_auth::UdsPeerPrincipal;

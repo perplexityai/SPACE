@@ -31,6 +31,8 @@ mod observe;
 const SLOT: u32 = 1;
 /// Within `BOUND`, so a reply always comes before the test gives up.
 const WAIT: Duration = Duration::from_secs(5);
+/// The binding's agreed manager epoch.
+const EPOCH: u64 = 1;
 
 struct Bound {
     _dir: TempDir,
@@ -94,6 +96,7 @@ async fn bind_slots(
             host: host.clone(),
             nft,
             wait,
+            manager_epoch: EPOCH,
         })
         .unwrap();
     Bound {
@@ -122,7 +125,16 @@ fn delivery(generation: u64) -> SyncFirewallRulesRequest {
             revision_id: Uuid::from_u128(generation.into()).to_string(),
             revision: document(generation),
         }),
+        question: None,
     }
+}
+
+/// Asks `round` about `generation`.
+fn ask(round: u64, generation: u64) -> Option<FirewallRulesQuestion> {
+    Some(FirewallRulesQuestion {
+        round: Some(round),
+        assignment_generation: Some(generation),
+    })
 }
 
 fn node_ctl() -> PeerIdentity {
@@ -146,8 +158,13 @@ fn reply(
     result: Result<SyncFirewallRulesResponse, Status>,
 ) -> (u64, FirewallAssignmentAcceptance, Outcome) {
     let reply = result.unwrap();
+    assert_eq!(reply.observation, None, "nothing asked a question");
     let outcome = reply.dispatch.as_ref().unwrap().outcome();
-    (reply.accepted_generation, reply.acceptance(), outcome)
+    (
+        reply.accepted_generation.unwrap(),
+        reply.acceptance(),
+        outcome,
+    )
 }
 
 /// One gate on `hook`: fires `entered`, then waits until `release` is sent or dropped.
@@ -226,7 +243,7 @@ async fn only_node_ctl_reaches_the_binding() {
 }
 
 // Catches an invalid, foreign, stale, conflicting or unwritten delivery
-// written or applied.
+// written or applied, or a malformed question let its assignment through.
 #[tokio::test]
 async fn refused_deliveries_neither_write_nor_apply() {
     let bound = bind(None, None, WAIT).await;
@@ -243,8 +260,22 @@ async fn refused_deliveries_neither_write_nor_apply() {
         assignment: None,
         ..delivery(12)
     };
+    let malformed = SyncFirewallRulesRequest {
+        question: Some(FirewallRulesQuestion {
+            round: None,
+            assignment_generation: Some(12),
+        }),
+        ..delivery(12)
+    };
+    let foreign_question = SyncFirewallRulesRequest {
+        node_id: Uuid::from_u128(2).to_string(),
+        assignment: None,
+        question: ask(7, 12),
+    };
     let refused = [
         (missing, Code::InvalidArgument),
+        (malformed, Code::InvalidArgument),
+        (foreign_question, Code::FailedPrecondition),
         (
             node(NODE.as_uuid().simple().to_string()),
             Code::InvalidArgument,
@@ -612,7 +643,7 @@ async fn passed(
 /// A node-wide delivery's acceptance; its reply never carries a dispatch.
 async fn sync_all(service: &NodeManagerService, generation: u64) -> FirewallAssignmentAcceptance {
     let reply = sync(service, delivery(generation)).await.unwrap();
-    assert_eq!(reply.accepted_generation, generation);
+    assert_eq!(reply.accepted_generation, Some(generation));
     assert_eq!(reply.dispatch, None);
     reply.acceptance()
 }
