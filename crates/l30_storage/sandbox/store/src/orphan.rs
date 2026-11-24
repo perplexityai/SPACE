@@ -27,11 +27,12 @@ use sqlx::{PgConnection, Postgres, Transaction};
 /// revert, and delete finalization (`EXCLUSIVE`).
 pub const ORPHAN_OBSERVATION_LOCK_SEED: i64 = 847_291_653;
 
-/// Acquire shared per-sandbox advisory transaction locks for explicitly
-/// reported sandboxes, present or absent, in ascending [`SandboxId`] order.
+/// Acquire shared per-sandbox advisory transaction locks for explicit
+/// reports and complete-census prune candidates in ascending [`SandboxId`]
+/// order.
 ///
 /// Node-state publication runs this in its own statement inside an open
-/// transaction before reading `sandboxes` or writing `sandbox_observed_states`
+/// transaction before locking or writing sandbox or observation rows
 /// (outside a transaction, `pg_advisory_xact_lock_shared` releases as soon as
 /// this statement finishes). Shared mode keeps concurrent publications
 /// non-blocking and doesn't lock `sandboxes` rows against ordinary lifecycle

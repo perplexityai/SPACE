@@ -854,6 +854,28 @@ pub async fn recover_published_pause_failed(
     Ok(recovered == Some(sandbox_id.as_uuid()))
 }
 
+/// List the omitted IDs a complete census can mutate. Include active Direct
+/// sandboxes without an observation: the census can still tombstone them.
+/// The caller locks these IDs along with its explicit reports before writing.
+pub async fn census_prune_candidates(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    present_sandbox_ids: &[SandboxId],
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT sandbox_id FROM sandbox_observed_states
+          WHERE node_id = $1 AND NOT (sandbox_id = ANY($2))
+         UNION
+         SELECT id FROM sandboxes
+          WHERE active_node_id = $1 AND managed_by = $3 AND NOT (id = ANY($2))"
+    ))
+    .bind(node_id)
+    .bind(present_sandbox_ids)
+    .bind(SubstrateKind::Space)
+    .fetch_all(executor)
+    .await
+}
+
 /// Built once: every input is bound, so the text is the same on every publish.
 /// Mirrors the composed statement in [`crate::lost`].
 ///
@@ -869,7 +891,7 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
             "WITH removed AS (
              DELETE FROM sandbox_observed_states sos
              WHERE sos.node_id = $1
-               AND NOT (sos.sandbox_id = ANY($2))
+               AND sos.sandbox_id = ANY($2)
              RETURNING sos.sandbox_id
          ),
          removed_elements AS (
@@ -906,7 +928,7 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
                AND s.managed_by = $4
                AND s.lifecycle NOT IN ('deleted', 'deleting')
                AND NOT {released_with_durable_artifact}
-               AND NOT (s.id = ANY($2))
+               AND s.id = ANY($2)
              RETURNING s.id AS sandbox_id
          )
          DELETE FROM sandbox_snapshot_inventory
@@ -927,19 +949,21 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// rows whose artifact is durable
 /// ([`pplx_space_sandbox_portability::stopped_artifact_durable`]). The caller
 /// decides the census is complete and documents why the absence is sound.
+/// Mutate only the captured, advisory-locked candidates. A row that became
+/// visible later may be newer than this census and was not locked by it.
 /// `network_policy_facet` is the facet name of the per-sandbox network-policy
 /// rows it forgets.
 pub async fn prune_census_absent_sandboxes(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
-    present_sandbox_ids: &[SandboxId],
+    locked_candidate_ids: &[SandboxId],
     network_policy_facet: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(sqlx::AssertSqlSafe(
         PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
     ))
     .bind(node_id)
-    .bind(present_sandbox_ids)
+    .bind(locked_candidate_ids)
     .bind(network_policy_facet)
     .bind(SubstrateKind::Space)
     .execute(executor)

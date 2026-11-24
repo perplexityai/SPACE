@@ -1103,6 +1103,19 @@ pub async fn publish_sandbox_states_with_retirement(
     states: &[PublishedSandboxState],
     retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<SandboxPublicationOutcome, Status> {
+    publish_sandbox_states_with_census(conn, node_id, states, retirement, &[]).await
+}
+
+/// Publish explicit reports and lock the candidates that the caller will
+/// prune later in the same transaction. Take one sorted lock batch before
+/// writing either set, including when there are no explicit reports.
+pub(super) async fn publish_sandbox_states_with_census(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    states: &[PublishedSandboxState],
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
+    census_prune_ids: &[SandboxId],
+) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
         let sandbox_id = match parse_sandbox_id(&state.sandbox_id) {
@@ -1128,7 +1141,7 @@ pub async fn publish_sandbox_states_with_retirement(
     }
 
     let mut absent_ids = Vec::new();
-    let mut published_ids = Vec::new();
+    let mut observation_lock_ids = census_prune_ids.to_vec();
     let mut rows = Vec::new();
     // Keyed rather than two parallel collections: the ids are reported to
     // callers and the payloads are written to `sandbox_observed_states`, and a
@@ -1158,7 +1171,7 @@ pub async fn publish_sandbox_states_with_retirement(
 
     for (sandbox_id, state) in states_by_id {
         let sandbox_uuid = sandbox_id;
-        published_ids.push(sandbox_uuid);
+        observation_lock_ids.push(sandbox_uuid);
         if !state.present {
             absent_ids.push(sandbox_uuid);
             continue;
@@ -1511,7 +1524,7 @@ pub async fn publish_sandbox_states_with_retirement(
 
     pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(
         &mut *conn,
-        &published_ids,
+        &observation_lock_ids,
     )
     .await
     .map_err(|err| {
