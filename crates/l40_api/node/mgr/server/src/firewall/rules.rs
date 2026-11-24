@@ -56,6 +56,14 @@ impl TableConstruction {
     }
 }
 
+/// Removes the owned table from the namespace named `ns`, where an absent
+/// table is success. The add makes the delete valid, and one batch leaves
+/// no window between them.
+pub fn delete_in_namespace(ns: &str) -> super::FirewallResult<()> {
+    let script = format!("add table {FAMILY} {TABLE}\ndelete table {FAMILY} {TABLE}\n");
+    super::apply_nft_script(&script, Some(ns))
+}
+
 /// Renders every rule once, in revision order, from its borrowed comparisons.
 pub fn render(revision: &FirewallRuleRevision) -> TableConstruction {
     let table = json!({"add": {"table": {"family": FAMILY, "name": TABLE}}});
