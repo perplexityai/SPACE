@@ -12,8 +12,9 @@
 //! Release registration (`RegisterTemplateRelease`, in internal-api) reads
 //! and inserts releases and their storage locations through
 //! [`registration`]'s verbs, the api's lookups and admin routes read them
-//! through [`lookup`]'s, and the template and admin release deletes remove
-//! rows through [`removal`]'s. The credential manager asks
+//! through [`lookup`]'s, internal-api's template catalog reads them through
+//! [`catalog`]'s, and the template and admin release deletes remove rows
+//! through [`removal`]'s. The credential manager asks
 //! [`release_published`] before it vends write credentials for a release's
 //! storage, and refuses them for a published release. Other statements
 //! against these tables still run in api and internal-api:
@@ -24,10 +25,10 @@
 //!   metadata and of a found storage location's owner are
 //!   [`registration`]'s, run under those locks;
 //! * statements that interpolate `digest_original` or `spelling_original`
-//!   in the api's pool configs and admin release routes, and in
-//!   internal-api's original lookup and `TemplateReleasesStore`, haven't
-//!   moved yet; the api's create, base and placement resolvers and the
-//!   admin release population are [`lookup`]'s;
+//!   in the api's admin release routes and in internal-api's original
+//!   lookup haven't moved yet; the api's create, base, placement and pool
+//!   target resolvers and the admin release population are [`lookup`]'s,
+//!   and internal-api's catalog lookups are [`catalog`]'s;
 //! * other reads of other tables that join a release, and test fixtures,
 //!   stay where they are; the create's tag lookup, which reads the tags,
 //!   is [`lookup::resolve_by_tag`].
@@ -75,6 +76,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, Postgres};
 use uuid::Uuid;
 
+pub mod catalog;
 pub mod lookup;
 mod objects;
 pub mod registration;
