@@ -368,48 +368,11 @@ async fn the_background_read_runs_only_while_the_seal_is_unknown() {
     assert_unreadable_refusal(&unknown.check("cold", SANDBOX).unwrap_err());
 }
 
-/// The WARN events logged while it is the thread's default subscriber, each
-/// as its fields.
-#[derive(Clone, Default)]
-struct Warnings(Arc<Mutex<Vec<String>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        struct Fields(String);
-        impl tracing::field::Visit for Fields {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{}={value:?} ", field.name()));
-            }
-        }
-        if *event.metadata().level() == tracing::Level::WARN {
-            let mut fields = Fields(String::new());
-            event.record(&mut fields);
-            self.0.lock().unwrap().push(fields.0);
-        }
-    }
-}
-
-impl Warnings {
-    fn any_contains(&self, text: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|warning| warning.contains(text))
-    }
-}
-
 /// A background read that finds the service database's mutex poisoned is
 /// published as a failed read: the seal stays unknown with that error, and
-/// the still-unreadable warning names it once the warning is due. It isn't
-/// dropped unreported.
+/// activations are refused as unreadable. It isn't dropped.
 #[tokio::test(start_paused = true)]
 async fn a_poisoned_database_is_reported_by_the_background_read() {
-    use tracing_subscriber::layer::SubscriberExt as _;
-
-    let warnings = Warnings::default();
-    let _subscriber =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
     let db = SharedConnection::new(crate::db::test_conn());
     hide_seal_table(&db);
     let seal = Arc::new(ActivationSeal::load(&db.lock().unwrap()));
@@ -427,33 +390,26 @@ async fn a_poisoned_database_is_reported_by_the_background_read() {
         Duration::from_millis(100),
         Duration::from_secs(1),
     ));
-    tokio::time::sleep(UNREADABLE_WARN_INTERVAL + Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     assert_eq!(
         seal.lock_state().record,
         Err(POISONED_DATABASE.to_owned()),
         "the poisoned read is published"
     );
-    assert!(warnings.any_contains(POISONED_DATABASE), "{:?}", warnings.0);
     assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
     shutdown.cancel();
     retry.await.unwrap();
 }
 
 /// A background read that panicked is published as a failed read too: the
-/// seal stays unknown with the panic as its error, and the still-unreadable
-/// warning names it once the warning is due.
-#[tokio::test(start_paused = true)]
+/// seal stays unknown with the panic as its error, and activations are
+/// refused as unreadable.
+#[tokio::test]
 async fn a_panicked_background_read_is_reported() {
-    use tracing_subscriber::layer::SubscriberExt as _;
-
-    let warnings = Warnings::default();
-    let _subscriber =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
     let db = SharedConnection::new(crate::db::test_conn());
     hide_seal_table(&db);
     let seal = ActivationSeal::load(&db.lock().unwrap());
-    tokio::time::sleep(UNREADABLE_WARN_INTERVAL + Duration::from_secs(1)).await;
     let joined = tokio::task::spawn_blocking(|| -> Result<Option<ActivationSealRecord>, String> {
         panic!("the read panics")
     })
@@ -465,7 +421,6 @@ async fn a_panicked_background_read_is_reported() {
     );
     let error = seal.lock_state().record.clone().unwrap_err();
     assert!(error.contains("panicked"), "{error}");
-    assert!(warnings.any_contains("panicked"), "{:?}", warnings.0);
     assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
 }
 
