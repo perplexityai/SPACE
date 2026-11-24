@@ -761,6 +761,62 @@ fn template_balloon_is_validated_against_effective_memory() {
 // a template hash would otherwise continue to template-manager, which every
 // test service fails to reach; only the hash-less row is meant to reach
 // template resolution.
+/// On a sealed node, a warm start of a stopped sandbox is refused with the
+/// sealed refusal under its artifact lock, before anything is staged: the
+/// row stays stopped with its pinned disk. Its checkpoint is staged already,
+/// so a warm start the seal didn't refuse there would restage the row at
+/// once, before its activation's own admission.
+#[tokio::test]
+async fn a_sealed_node_refuses_a_warm_start_before_it_restages_the_row() {
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        crate::service::SandboxManagerServiceOptions::for_test_in(scratch.path()),
+    );
+    let pin = LocalArtifactId::new();
+    let execution = service.lookup_sandbox(&id).unwrap().node_execution_id;
+    service
+        .local_artifacts()
+        .publish_stopped(&id, execution, pin, "/tmp/stopped-disk")
+        .unwrap();
+    let snapshot_dir = crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+        &service.cache_root().join(&id),
+    );
+    std::fs::create_dir_all(&snapshot_dir).unwrap();
+    std::fs::write(snapshot_dir.join("vmstate"), b"vmstate").unwrap();
+    service.activation_seal.seal(&service.db, 3).unwrap();
+
+    let refused = service
+        .start_sandbox(
+            StartRequest {
+                sandbox_id: id.clone(),
+                from_warm: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .message()
+            .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{refused:?}"
+    );
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(row.state, SandboxStatus::from(SandboxState::Stopped));
+    assert_eq!(row.current_local_artifact_id, Some(pin));
+}
+
 #[tokio::test(start_paused = true)]
 async fn start_refusals_before_activation_leave_the_row_state_unchanged() {
     use crate::service::tests::service_tests::insert_test_sandbox;
@@ -1779,9 +1835,10 @@ async fn the_second_stopped_boundary_fences_the_request_too() {
 }
 
 /// A cold boot of a `created` row passes the VM launch-time admission as a
-/// cold activation. The row's local owner holds no route identity, so the
-/// start is refused at the route-identity check that follows admission,
-/// before it claims the row.
+/// cold activation. While the node is sealed the admission refuses it, and
+/// the row stays `created`. After the unseal the row's local owner holds no
+/// route identity, so the start is refused at the route-identity check that
+/// follows admission, before it claims the row.
 #[tokio::test]
 async fn cold_boot_is_admitted_as_a_cold_activation() {
     use crate::service::start_support::REQUESTED_VM_ACTIVATIONS;
@@ -1824,8 +1881,8 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
     );
 
     let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let error = REQUESTED_VM_ACTIVATIONS
-        .scope(
+    let start = || {
+        REQUESTED_VM_ACTIVATIONS.scope(
             Arc::clone(&admitted),
             service.start_sandbox(
                 StartRequest {
@@ -1835,6 +1892,29 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
                 false,
             ),
         )
+    };
+    service.activation_seal.seal(&service.db, 1).unwrap();
+    let sealed = start()
+        .await
+        .expect_err("a sealed node refuses the cold boot");
+    assert_eq!(sealed.code(), tonic::Code::FailedPrecondition, "{sealed:?}");
+    assert!(
+        sealed
+            .message()
+            .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{sealed:?}"
+    );
+    assert_eq!(
+        service.lookup_sandbox(&sandbox_id).unwrap().state,
+        SandboxStatus::from(SandboxState::Created)
+    );
+    assert_eq!(
+        std::mem::take(&mut *admitted.lock().unwrap()),
+        vec![ActivationAdmissionKind::Cold]
+    );
+
+    service.activation_seal.unseal(&service.db, 1).unwrap();
+    let error = start()
         .await
         .expect_err("a local owner's start has no route identity to activate with");
 
@@ -1852,4 +1932,5 @@ async fn cold_boot_is_admitted_as_a_cold_activation() {
         service.lookup_sandbox(&sandbox_id).unwrap().state,
         SandboxStatus::from(SandboxState::Created)
     );
+    service.activation_seal.assert_quiesced();
 }

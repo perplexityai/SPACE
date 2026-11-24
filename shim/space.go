@@ -598,7 +598,9 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 			case materializeStopped || (sandboxCheckpoint != nil && *sandboxCheckpoint == "stopped" && startRequest.Checkpoint != nil):
 				startResp, err = startStoppedCheckpoint(startCtx, client, startRequest)
 			default:
-				startResp, err = client.Start(startCtx, startRequest)
+				startResp, err = callPastUnreadableSeal(startCtx, func(ctx context.Context) (*pb.StartResponse, error) {
+					return client.Start(ctx, startRequest)
+				})
 			}
 		}
 		startSpanSbxmgr.End(err)
@@ -763,7 +765,7 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		attribute.String("template", sandboxTemplate),
 		attribute.String("sandbox_id", sbxID),
 	)
-	_, err = client.Wake(wakeCtx, &pb.WakeRequest{
+	wakeRequest := &pb.WakeRequest{
 		SandboxId: sbxID,
 		Blocking:  false,
 		StartContext: &pb.WakeStartContext{
@@ -778,6 +780,9 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 				sandboxActivationAttemptID,
 			),
 		},
+	}
+	_, err = callPastUnreadableSeal(wakeCtx, func(ctx context.Context) (*pb.WakeResponse, error) {
+		return client.Wake(ctx, wakeRequest)
 	})
 	wakeSpanSbxmgr.End(err)
 	redirect := <-redirectCh
@@ -1288,6 +1293,43 @@ func startStoppedCheckpoint(ctx context.Context, client pb.SandboxManagerClient,
 		if err := sleepContext(waitCtx, sandboxStateRetryDelay); err != nil {
 			return nil, status.FromContextError(err).Err()
 		}
+	}
+}
+
+// sandbox-manager refuses every VM activation with this marker, as
+// Unavailable, while it can't read its activation seal, and reads the seal
+// again within seconds.
+const activationSealUnreadableMarker = "activation seal unreadable; retrying"
+
+const (
+	// The longest a call waits for sandbox-manager to read its activation
+	// seal again before it answers the refusal.
+	activationSealUnreadableWait = 30 * time.Second
+	// The first and the longest wait between two calls.
+	activationSealRetryInitial = 100 * time.Millisecond
+	activationSealRetryMax     = 2 * time.Second
+)
+
+// callPastUnreadableSeal makes call, and makes it again, with the same
+// request, while sandbox-manager refuses the activation because it can't
+// read its activation seal: after 100 ms, then twice as long each time up to
+// 2 s, for at most activationSealUnreadableWait and never past ctx's
+// deadline. Each call keeps ctx's own deadline. Any other answer, a sealed
+// node's FailedPrecondition or another Unavailable included, is returned at
+// once.
+func callPastUnreadableSeal[T any](ctx context.Context, call func(context.Context) (T, error)) (T, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, activationSealUnreadableWait)
+	defer cancel()
+	delay := activationSealRetryInitial
+	for {
+		response, err := call(ctx)
+		if status.Code(err) != codes.Unavailable || !strings.Contains(status.Convert(err).Message(), activationSealUnreadableMarker) {
+			return response, err
+		}
+		if sleepContext(waitCtx, delay) != nil {
+			return response, err
+		}
+		delay = min(2*delay, activationSealRetryMax)
 	}
 }
 
