@@ -180,7 +180,9 @@ pub(super) struct QueuedFacetRefRow {
 /// claim picked the refs: longest queued first, by `requested_at`, then facet
 /// and element. A traceparent shared by several refs takes its first ref's
 /// place.
-pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<String> {
+pub(super) fn claimed_origin_traceparents(
+    rows: &[pplx_space_cluster_trigger_queue::ref_claims::ClaimedReconcileRef],
+) -> Vec<String> {
     let mut picked = rows.iter().collect::<Vec<_>>();
     picked.sort_by(|left, right| {
         (left.requested_at, &left.facet, &left.element).cmp(&(
@@ -197,16 +199,6 @@ pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<St
         .filter(|traceparent| seen.insert(*traceparent))
         .map(str::to_string)
         .collect()
-}
-
-/// A claimed ref, its saved trace context, and when it was first queued:
-/// the claim's own ordering key.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct ClaimedFacetRefRow {
-    pub(super) facet: String,
-    pub(super) element: Option<String>,
-    pub(super) traceparent: Option<String>,
-    pub(super) requested_at: time::OffsetDateTime,
 }
 
 pub(super) fn proto_facet(value: ReconcileFacet) -> ProtoReconcileFacet {

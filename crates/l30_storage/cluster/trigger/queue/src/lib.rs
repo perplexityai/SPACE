@@ -12,7 +12,9 @@ use time::OffsetDateTime;
 
 mod depth;
 pub mod metrics;
+pub mod queue_gc;
 mod reconcile_refs;
+pub mod ref_claims;
 pub mod signal;
 pub use depth::{
     ReconcileQueueDepth, TriggerQueueDepth, reconcile_queue_depth, trigger_queue_depth,

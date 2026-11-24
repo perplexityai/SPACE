@@ -1,4 +1,5 @@
 use pplx_space_accounts::OrgId;
+use pplx_space_cluster_trigger_queue::ref_claims;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 use super::metadata::*;
@@ -1534,40 +1535,13 @@ impl ClusterApi for ClusterApiService {
         };
 
         let claim_token = format!("{}-{}", origin.id, Uuid::now_v7());
-        let rows = sqlx::query_as::<_, ClaimedFacetRefRow>(sql!(
-            "WITH picked AS (
-                 SELECT node_id, facet, element, requested_at
-                 FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND next_attempt_at <= NOW()
-                   AND dead_at IS NULL
-                   AND (
-                       claim_token = ''
-                       OR claimed_at <= NOW() - ($3 * INTERVAL '1 second')
-                   )
-                 ORDER BY requested_at ASC, facet ASC, element ASC
-                 LIMIT $2
-                 FOR UPDATE SKIP LOCKED
-             )
-             UPDATE node_reconcile_queue q
-             SET claim_token = $4,
-                 claim_generation = q.generation,
-                 claimed_at = NOW(),
-                 updated_at = NOW()
-             FROM picked
-             WHERE q.node_id = picked.node_id
-               AND q.facet = picked.facet
-               AND q.element = picked.element
-             RETURNING q.facet,
-                       NULLIF(q.element, '') AS element,
-                       q.traceparent,
-                       picked.requested_at"
-        ))
-        .bind(origin.id)
-        .bind(limit)
-        .bind(NODE_RECONCILE_CLAIM_STALE_SECS)
-        .bind(&claim_token)
-        .fetch_all(&self.pool)
+        let rows = ref_claims::claim_node_refs(
+            &self.pool,
+            origin.id,
+            limit,
+            NODE_RECONCILE_CLAIM_STALE_SECS,
+            &claim_token,
+        )
         .await
         .map_err(|err| Status::internal(format!("claim node reconcile refs: {err}")))?;
 
@@ -1609,43 +1583,27 @@ impl ClusterApi for ClusterApiService {
         let mut succeeded = 0_u64;
         for reference in request.succeeded {
             let reference = proto_facet_ref_to_storage(reference)?;
-            let result = sqlx::query(sql!(
-                "DELETE FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4
-                   AND generation = claim_generation"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            let completed = ref_claims::complete_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("complete reconcile success: {err}")))?;
-            succeeded = succeeded.saturating_add(result.rows_affected());
-            if result.rows_affected() != 0 {
+            succeeded = succeeded.saturating_add(completed);
+            if completed != 0 {
                 clear_facet_apply_failed_condition(&mut tx, origin.id, &reference).await?;
             }
 
-            sqlx::query(sql!(
-                "UPDATE node_reconcile_queue
-                 SET claim_token = '',
-                     claim_generation = 0,
-                     claimed_at = NULL,
-                     next_attempt_at = NOW(),
-                     updated_at = NOW()
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            ref_claims::release_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("release refreshed reconcile ref: {err}")))?;
         }
@@ -1671,82 +1629,45 @@ impl ClusterApi for ClusterApiService {
             .map_err(|err| Status::internal(format!("read reconcile retry count: {err}")))?
             .unwrap_or(0);
             let next_attempt = attempts.saturating_add(1);
-            let result = if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS {
-                sqlx::query(sql!(
-                    "UPDATE node_reconcile_queue
-                     SET attempts = attempts + 1,
-                         last_error = $5,
-                         dead_at = NOW(),
-                         dead_reason = $5,
-                         claim_token = '',
-                         claim_generation = 0,
-                         claimed_at = NULL,
-                         updated_at = NOW()
-                     WHERE node_id = $1
-                       AND facet = $2
-                       AND element = COALESCE($3, '')
-                       AND claim_token = $4
-                       AND generation = claim_generation"
-                ))
-                .bind(origin.id)
-                .bind(&reference.facet)
-                .bind(reference.element.as_deref())
-                .bind(&claim_token)
-                .bind(&error)
-                .execute(&mut *tx)
+            let transitioned = if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS {
+                ref_claims::dead_letter_claimed_ref(
+                    &mut *tx,
+                    origin.id,
+                    &reference.facet,
+                    reference.element.as_deref(),
+                    &claim_token,
+                    &error,
+                )
                 .await
             } else {
                 let delay_secs = reconcile_retry_delay_secs(attempts);
-                sqlx::query(sql!(
-                    "UPDATE node_reconcile_queue
-                     SET attempts = attempts + 1,
-                         last_error = $5,
-                         claim_token = '',
-                         claim_generation = 0,
-                         claimed_at = NULL,
-                         next_attempt_at = NOW() + ($6 * INTERVAL '1 second'),
-                         updated_at = NOW()
-                     WHERE node_id = $1
-                       AND facet = $2
-                       AND element = COALESCE($3, '')
-                       AND claim_token = $4
-                       AND generation = claim_generation"
-                ))
-                .bind(origin.id)
-                .bind(&reference.facet)
-                .bind(reference.element.as_deref())
-                .bind(&claim_token)
-                .bind(&error)
-                .bind(delay_secs)
-                .execute(&mut *tx)
+                ref_claims::retry_claimed_ref(
+                    &mut *tx,
+                    origin.id,
+                    &reference.facet,
+                    reference.element.as_deref(),
+                    &claim_token,
+                    &error,
+                    delay_secs,
+                )
                 .await
             }
             .map_err(|err| Status::internal(format!("complete reconcile failure: {err}")))?;
-            if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS && result.rows_affected() != 0 {
+            if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS && transitioned != 0 {
                 pplx_space_reconcile_metrics::queue_dead_letter(&facet_for_metrics);
             }
-            if result.rows_affected() != 0 {
+            if transitioned != 0 {
                 record_facet_apply_failed_condition(&mut tx, origin.id, &reference, &error).await?;
             }
-            failed = failed.saturating_add(result.rows_affected());
+            failed = failed.saturating_add(transitioned);
 
-            sqlx::query(sql!(
-                "UPDATE node_reconcile_queue
-                 SET claim_token = '',
-                     claim_generation = 0,
-                     claimed_at = NULL,
-                     next_attempt_at = NOW(),
-                     updated_at = NOW()
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            ref_claims::release_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("release refreshed failed ref: {err}")))?;
         }

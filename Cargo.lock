@@ -5415,6 +5415,7 @@ dependencies = [
  "pplx-space-cluster-id",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-reconciler",
+ "pplx-space-cluster-trigger-queue",
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
