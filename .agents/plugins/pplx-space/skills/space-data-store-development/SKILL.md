@@ -101,23 +101,42 @@ where a guarded statement moves, and the lock and clock items say what any
 move must keep.
 
 - **Guarded state transitions**, where the `WHERE` re-checks a precondition
-  (a lifecycle CAS, a lease-token or generation guard). The guard is the
-  correctness mechanism; flattening one into a plain `update` re-opens the
-  drift class where a pooled wake resurrected torn-down sandboxes. The
-  `sandboxes` row is the exception to leaving them in place: its guarded
-  transitions move into `pplx-space-sandbox-store`, in modules named for the
-  transition or for the path that issues them (as `lost` and `delete` are),
-  and its canonical hard delete is that crate's
+  (a lifecycle CAS, a lease-, claim-token or generation guard). The guard is
+  the correctness mechanism; flattening one into a plain `update` re-opens
+  the drift class where a pooled wake resurrected torn-down sandboxes. A
+  guarded transition moves into the store that owns its table only in this
+  form:
+  - the statement verbatim, with its guard whole and bound to the values
+    the caller decided on, never values the verb reads for itself;
+  - a verb named for the transition (`release_claim`, not `update_row`);
+  - the outcome returned (`bool`, `Option`, the affected count, or the rows
+    its `RETURNING` lists): matching no row is a normal outcome, such as
+    another writer winning or nothing left to do, never an error;
+  - a store test that pins the losing case, where the guard matches no row
+    and nothing changes.
+
+  The caller keeps its transaction, its locks, and the decision of what to do
+  with each outcome. Two kinds stay with the paths that issue them: the
+  execution-ownership writes of `sandbox_k8s_executions`, as
+  `pplx-space-sandbox-store`'s `k8s_executions` docs say, and node drain's
+  phase compare-and-sets, as `pplx-space-node-registration-store`'s docs say.
+  Other store docs that say a guarded write stays at its call site do not
+  override this item; the change that moves the write updates them. The
+  `sandboxes` row's guarded transitions live in `pplx-space-sandbox-store`,
+  in modules named for the transition or for the path that issues them (as
+  `lost` and `delete` are), and its canonical hard delete is that crate's
   `delete::delete_with_dependents`. A write that is one step of such a
   transition stays in its module even when its own `WHERE` checks only the
   id, because the caller's locks and re-checks guard it (as with
   `delete::mark_deleting`). A step that writes a table another store owns can
   instead be a verb of that store, run in the caller's transaction with its
   guard whole, as `pplx-space-snapshot-store`'s
-  `lost::fail_quiet_full_uploads_from_node` is for the lost give-ups. Other
-  unguarded writes of the row, such as its desired-configuration columns,
-  belong in ordinary verbs like `update_desired_state`. The caller keeps its
-  locks and transaction (see the crate docs).
+  `lost::fail_quiet_full_uploads_from_node` is for the lost give-ups. Such a
+  step, run in the transaction whose own guarded statement already decided
+  the transition, may return nothing, as that verb does. Other unguarded
+  writes of the row, such as its desired-configuration columns, belong in
+  ordinary verbs like `update_desired_state`. The caller keeps its locks and
+  transaction (see the crate docs).
 - **Locks the caller relies on after the statement.** A lock taken by a
   standalone `SELECT ... FOR UPDATE` (or `FOR NO KEY UPDATE`, `FOR SHARE`,
   `FOR KEY SHARE`), a `LOCK TABLE`, or a transaction-level advisory lock
