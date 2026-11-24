@@ -239,7 +239,7 @@ variable "vpc_cni_node_agent_log_level" {
 }
 
 variable "vpc_cni_node_agent_enable_policy_event_logs" {
-  description = "Optional toggle for VPC CNI network-policy decision logs (nodeAgent.enablePolicyEventLogs). Null leaves the key unset and preserves the addon default."
+  description = "Optional toggle for VPC CNI network-policy decision logs (nodeAgent.enablePolicyEventLogs). Null leaves the key unset and preserves the addon default. ACCEPT decisions are logged only when vpc_cni_node_agent_log_level is \"debug\" (the addon default when unset)."
   type        = bool
   default     = null
 }
