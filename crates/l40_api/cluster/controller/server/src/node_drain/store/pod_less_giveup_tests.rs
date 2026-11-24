@@ -21,7 +21,7 @@ use super::pod_less_giveup::{
 use super::*;
 use crate::lifecycle_writer_test_support::{
     SandboxSeed, bounded, insert_node, insert_sandbox, insert_snapshot, pin_local_artifact,
-    pod_name, single_backend_pool, wait_until_blocked,
+    pod_name, publish_present_with_activity, single_backend_pool, wait_until_blocked,
 };
 use crate::orphaned_sandboxes::PodPresenceStatus;
 
@@ -986,6 +986,55 @@ async fn failed_pid_less_observed_record_is_purged_not_blocking() -> TestResult 
         PodLessRecovery::RevertedToSuspended
     );
     assert_eq!(observed_rows(&pool, sandbox_id).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pod_less_give_up_serializes_with_present_publication() -> TestResult {
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let (node_id, sandbox_id) = wedged_resident(pool).await?;
+    insert_snapshot(pool, sandbox_id, "ready", -60).await?;
+    insert_observed(pool, sandbox_id, node_id, "failed", None).await?;
+    let candidate = candidate(sandbox_id, node_id);
+    let Ok(generation) = precheck(pool, candidate).await? else {
+        panic!("the wedged resident passes the pre-check");
+    };
+
+    // Hold an execution row to pause give-up after it locks the sandbox.
+    let mut gate = pool.begin().await?;
+    let gate_pid = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *gate)
+        .await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut *gate)
+    .await?;
+    let (controller_pool, controller_pid) = single_backend_pool(&db).await?;
+    let give_up = tokio::spawn(async move {
+        recover_pod_less_sandbox_tx(
+            &controller_pool,
+            candidate,
+            generation,
+            DRAIN_COMPLETION_LOCK_TIMEOUT,
+        )
+        .await
+    });
+    bounded(wait_until_blocked(pool, controller_pid, gate_pid)).await?;
+    let (publisher_pool, publisher_pid) = single_backend_pool(&db).await?;
+    let publication = tokio::spawn(async move {
+        publish_present_with_activity(&publisher_pool, node_id, sandbox_id, "failed").await
+    });
+    bounded(wait_until_blocked(pool, publisher_pid, controller_pid)).await?;
+    gate.commit().await?;
+
+    bounded(async { publication.await? }).await?;
+    assert_eq!(
+        bounded(async { Ok(give_up.await??) }).await?,
+        PodLessRecovery::RevertedToSuspended
+    );
     Ok(())
 }
 

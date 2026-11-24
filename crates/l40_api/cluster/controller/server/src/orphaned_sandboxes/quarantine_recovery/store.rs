@@ -97,6 +97,9 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     sqlx::query(sql!("SET LOCAL lock_timeout = '2s'"))
         .execute(&mut *tx)
         .await?;
+    // Serialize with publication before locking the sandbox this recovery
+    // will update and clearing the observation it owns.
+    pplx_space_sandbox_store::orphan::lock_orphan_observation(&mut tx, expected.sandbox_id).await?;
     sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
         .bind(expected.sandbox_id)
         .execute(&mut *tx)

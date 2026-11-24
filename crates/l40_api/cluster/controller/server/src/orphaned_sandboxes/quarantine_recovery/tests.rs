@@ -7,7 +7,10 @@ use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use uuid::Uuid;
 
-use crate::lifecycle_writer_test_support::relabel_keeping_lifecycle_age;
+use crate::lifecycle_writer_test_support::{
+    bounded, publish_present_with_activity, relabel_keeping_lifecycle_age, single_backend_pool,
+    wait_until_blocked,
+};
 
 async fn fixture(pool: &PgPool) -> TestResult<store::Candidate> {
     let id = SandboxId::new();
@@ -89,6 +92,46 @@ async fn publication_quarantine_repair_preserves_identity_and_retires_stale_owne
         "SELECT COUNT(*) FROM sandbox_quarantine_history WHERE sandbox_id=$1 AND quarantine_id=$2 AND action='recovered_to_suspended'"
     )).bind(c.sandbox_id).bind(c.quarantine_id).fetch_one(&db.pool).await?;
     assert_eq!(archived, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn publication_quarantine_repair_serializes_with_present_publication() -> TestResult {
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let candidate = fixture(pool).await?;
+    let (sandbox_id, node_id) = (candidate.sandbox_id, candidate.node_id);
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status) VALUES ($1, $2, 'started')"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+
+    // Hold the quarantine row to pause recovery after it locks the sandbox.
+    let mut gate = pool.begin().await?;
+    let gate_pid = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+        .fetch_one(&mut *gate)
+        .await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM sandbox_quarantine_state WHERE sandbox_id = $1 FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut *gate)
+    .await?;
+    let (controller_pool, controller_pid) = single_backend_pool(&db).await?;
+    let recovery = tokio::spawn(async move { store::recover(&controller_pool, &candidate).await });
+    bounded(wait_until_blocked(pool, controller_pid, gate_pid)).await?;
+    let (publisher_pool, publisher_pid) = single_backend_pool(&db).await?;
+    let publication = tokio::spawn(async move {
+        publish_present_with_activity(&publisher_pool, node_id, sandbox_id, "started").await
+    });
+    bounded(wait_until_blocked(pool, publisher_pid, controller_pid)).await?;
+    gate.commit().await?;
+
+    bounded(async { publication.await? }).await?;
+    assert!(bounded(async { Ok(recovery.await??) }).await?);
     Ok(())
 }
 

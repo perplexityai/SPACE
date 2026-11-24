@@ -562,12 +562,8 @@ pub(crate) async fn recover_pod_less_sandbox_tx(
     lock_timeout: Duration,
 ) -> Result<PodLessRecovery, sqlx::Error> {
     match recover_pod_less_sandbox_locked(pool, candidate, expected, lock_timeout).await {
-        // A lock wait past the bound is contention, not a fault: the next tick
-        // retries without a warning.
-        // So is losing a deadlock. A node's publish can lock the observed row
-        // before the sandbox row, the reverse of this order; Postgres aborts
-        // whichever side it picks, and when that's the publish, the node
-        // republishes on its next cycle.
+        // A lock timeout or deadlock abort is contention, not a fault: the
+        // next tick retries without a warning.
         Err(error) if is_lock_timeout(&error) || is_deadlock(&error) => {
             Ok(PodLessRecovery::NotEligible(PodLessHold::LockContended))
         }
@@ -601,6 +597,10 @@ async fn recover_pod_less_sandbox_locked(
     sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR SHARE"))
         .bind(candidate.source_node_id)
         .execute(&mut *tx)
+        .await?;
+    // Publication can lock the node before its shared observation advisory
+    // lock. Match that order and serialize before touching the sandbox row.
+    pplx_space_sandbox_store::orphan::lock_orphan_observation(&mut tx, candidate.sandbox_id)
         .await?;
     sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
         .bind(candidate.sandbox_id)

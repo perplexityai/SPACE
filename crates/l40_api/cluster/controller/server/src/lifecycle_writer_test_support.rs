@@ -21,6 +21,7 @@ use pplx_space_bearer_token::{
 };
 use pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV;
 use pplx_space_db_test_fixtures::TestDb;
+use pplx_space_internal_api_server::{proto::PublishedSandboxState, publish_sandbox_states};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
@@ -306,6 +307,41 @@ pub(crate) async fn wait_until_blocked(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A real present publication that writes observed state and advances the
+/// sandbox's activity. Use a short deadlock check so a broken lock order
+/// surfaces on this writer instead of the controller's lock-timeout path.
+pub(crate) async fn publish_present_with_activity(
+    pool: &PgPool,
+    node_id: NodeId,
+    sandbox_id: SandboxId,
+    status: &str,
+) -> TestResult {
+    let mut tx = pool.begin().await?;
+    sqlx::query(sql!("SET LOCAL deadlock_timeout = '100ms'"))
+        .execute(&mut *tx)
+        .await?;
+    publish_sandbox_states(
+        &mut tx,
+        node_id,
+        &[PublishedSandboxState {
+            sandbox_id: sandbox_id.to_string(),
+            status: Some(status.to_owned()),
+            present: true,
+            // Activity is written to the sandbox. Change the observation
+            // itself too, so the publisher cannot skip that row's upsert.
+            uptime: Some("1m".to_owned()),
+            last_access_at: Some(prost_types::Timestamp {
+                seconds: 1_900_000_000,
+                nanos: 0,
+            }),
+            ..Default::default()
+        }],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

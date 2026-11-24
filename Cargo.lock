@@ -5427,6 +5427,7 @@ dependencies = [
  "pplx-space-firewall-rules-store",
  "pplx-space-grpc-server",
  "pplx-space-guest-process",
+ "pplx-space-internal-api-server",
  "pplx-space-k8s-ids",
  "pplx-space-k8s-node-id",
  "pplx-space-kube-client",
