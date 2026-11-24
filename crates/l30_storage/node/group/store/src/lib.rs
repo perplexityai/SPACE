@@ -3,13 +3,14 @@
 //!
 //! The admin node-group routes, the placement catalog read and the
 //! cluster-controller's node-group mirror and labeler run their statements
-//! through these verbs. Each takes any executor, so a caller's guarded write
-//! keeps its transaction and the `FOR UPDATE` locks it took first: the
-//! group-row locks, the get and list reads that share their
-//! `NODE_GROUP_SELECT` fragment, and the template `FOR SHARE` read stay with
-//! the admin routes, and so do the decisions about which verbs a request runs.
-//! The labeler's default-group seed keeps its table lock and `lock_timeout`
-//! too, and runs the re-reads and the insert here inside that transaction.
+//! through these verbs. [`groups`] reads group rows with their worker counts,
+//! and locks one for an admin route's guarded write; [`locks`] holds the
+//! default-row lock `:set-default` takes first and the table lock the
+//! labeler's default-group seed takes. The locking verbs take the caller's
+//! transaction and their locks hold until it ends; every other verb takes any
+//! executor, so it composes into that transaction. The callers keep their
+//! `lock_timeout` settings, the template `FOR SHARE` read stays with the admin
+//! routes, and so do the decisions about which verbs a request runs.
 //!
 //! What nodes cache is `pplx-space-node-template-inventory-store`'s; the
 //! `nodes.node_group_id` membership the mirror writes stays with the mirror.
@@ -21,6 +22,8 @@ use sqlx::{FromRow, PgExecutor};
 
 mod catalog;
 mod compat;
+pub mod groups;
+pub mod locks;
 
 pub use catalog::{TemplateCatalogRow, template_catalog};
 pub use compat::{

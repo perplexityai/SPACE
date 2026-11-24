@@ -11,11 +11,10 @@
 //! [`pplx_space_sandbox_store::lost::write_off_lost_sandboxes`].
 
 use pplx_space_accounts::NodeId;
-use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
 
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
-use pplx_space_sql_locator::sql;
+use pplx_space_node_registration_store::locks;
 use sqlx::{Postgres, Transaction};
 
 /// Whether the Kubernetes node row is still in `drain_phase` (`None` = outside
@@ -32,29 +31,10 @@ pub(crate) async fn node_identity_holds(
     drain_phase: Option<&str>,
     expected_uid: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    let node: Option<i32> = sqlx::query_scalar(sql!(
-        "SELECT 1 FROM nodes
-          WHERE id = $1 AND drain_phase IS NOT DISTINCT FROM $2 AND managed_by = $3
-          FOR SHARE"
-    ))
-    .bind(node_id)
-    .bind(drain_phase)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if node.is_none() {
+    if !locks::share_lock_k8s_node_in_drain_phase(tx, node_id, drain_phase).await? {
         return Ok(false);
     }
-    let uid: Option<i32> = sqlx::query_scalar(sql!(
-        "SELECT 1 FROM node_k8s
-          WHERE node_id = $1 AND k8s_node_uid IS NOT DISTINCT FROM $2
-          FOR SHARE"
-    ))
-    .bind(node_id)
-    .bind(expected_uid)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(uid.is_some())
+    locks::share_lock_k8s_registration_with_uid(tx, node_id, expected_uid).await
 }
 
 /// Emit the `sandbox_lost` and `sandbox_failed` pair for a committed flip. The

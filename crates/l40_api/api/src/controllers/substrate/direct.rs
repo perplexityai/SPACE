@@ -3972,58 +3972,14 @@ impl DirectSubstrate {
     ) {
         let scheduling_status = failure.scheduling_status();
         let reachable = failure.reachable();
-        if let Err(error) = sqlx::query(sql!(
-            "INSERT INTO node_status_snapshots (
-                 node_id,
-                 observed_at,
-                 stale_after,
-                 reachable,
-                 error,
-                 role,
-                 scheduling_status,
-                 scheduling_reason,
-                 health_healthy,
-                 services,
-                 updated_at
-             )
-             SELECT n.id,
-                    NOW(),
-                    NOW() + ($4::TEXT || ' seconds')::INTERVAL,
-                    $2,
-                    CASE WHEN $2 THEN NULL ELSE $3 END,
-                    n.role,
-                    $5,
-                    $3,
-                    CASE WHEN $2 THEN NULL ELSE FALSE END,
-                    '[]'::JSONB,
-                    NOW()
-             FROM nodes n
-             WHERE n.id = $1
-             ON CONFLICT (node_id) DO UPDATE
-             SET observed_at = EXCLUDED.observed_at,
-                 stale_after = EXCLUDED.stale_after,
-                 reachable = EXCLUDED.reachable,
-                 error = EXCLUDED.error,
-                 role = EXCLUDED.role,
-                 scheduling_status = EXCLUDED.scheduling_status,
-                 scheduling_reason = EXCLUDED.scheduling_reason,
-                 network_slots_ready = CASE
-                     WHEN EXCLUDED.scheduling_status IN ('full', 'draining', 'unavailable')
-                     THEN 0
-                     ELSE node_status_snapshots.network_slots_ready
-                 END,
-                 health_healthy = CASE
-                     WHEN EXCLUDED.reachable THEN node_status_snapshots.health_healthy
-                     ELSE FALSE
-                 END,
-                 updated_at = NOW()"
-        ))
-        .bind(node.id)
-        .bind(reachable)
-        .bind(&reason)
-        .bind(DIRECT_NODE_CREATE_FAILURE_TTL_SECS)
-        .bind(scheduling_status)
-        .execute(&self.pool)
+        if let Err(error) = pplx_space_node_status_store::create_failure::record_create_failure(
+            &self.pool,
+            node.id,
+            reachable,
+            &reason,
+            DIRECT_NODE_CREATE_FAILURE_TTL_SECS,
+            scheduling_status,
+        )
         .await
         {
             tracing::warn!(

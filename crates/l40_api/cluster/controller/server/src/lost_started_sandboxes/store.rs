@@ -8,6 +8,7 @@ use pplx_space_snapshot_model::SnapshotId;
 use std::sync::LazyLock;
 
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
+use pplx_space_node_registration_store::locks;
 use pplx_space_sandbox_portability::started_restore_source_absent;
 use pplx_space_sandbox_store::lost::{
     DEAD_UPLOAD_SETTLE, mark_started_lost, write_off_lost_sandboxes,
@@ -129,14 +130,7 @@ impl LostStartedSink for LostStartedDbStore {
             // can't make the flip wrong. `nodes.id` is derived from the node
             // name and role, so the row is a new instance under the old name,
             // and the sandbox's runtime and local disk went with the old one.
-            SourceNode::RowDeleted => {
-                let row: Option<i32> =
-                    sqlx::query_scalar(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR SHARE"))
-                        .bind(node_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                row.is_none()
-            }
+            SourceNode::RowDeleted => !locks::share_lock_node(&mut tx, node_id).await?,
             // Reached only after the tick found the node absent from
             // Kubernetes with no live EC2 instance. The row must still be
             // outside any drain and carry the uid the scan observed, so a

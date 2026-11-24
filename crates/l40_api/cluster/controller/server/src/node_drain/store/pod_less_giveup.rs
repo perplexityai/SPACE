@@ -116,6 +116,7 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 use pplx_space_cluster_pool::{PoolError, WarmPoolStore};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::{NodeDrainMode, SubstrateKind};
+use pplx_space_node_registration_store::locks;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_full_snapshot_unambiguous,
@@ -599,10 +600,7 @@ async fn recover_pod_less_sandbox_locked(
     // arm's `UPDATE` would go unseen. The shared lock makes the undrain wait
     // for this commit, or, if it committed first, the guard read below sees
     // it. The drained-node terminator's flip fences the same way.
-    sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR SHARE"))
-        .bind(candidate.source_node_id)
-        .execute(&mut *tx)
-        .await?;
+    locks::share_lock_node(&mut tx, candidate.source_node_id).await?;
     row_locks::lock_exists(&mut tx, candidate.sandbox_id).await?;
     sqlx::query(sql!(
         "SELECT 1

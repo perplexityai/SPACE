@@ -25,6 +25,7 @@ use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, SubstrateKind};
 use pplx_space_node_registration_store::drain_reads::{
     self, DrainPhaseCount, NodeInDrainPhase, TerminatingK8sNode,
 };
+use pplx_space_node_registration_store::locks;
 use pplx_space_node_registration_store::lookup::{
     self as node_lookup, K8sNodeIdentity, NodeApiTargetRow,
 };
@@ -4909,10 +4910,7 @@ impl NodeDrainSink for SubstrateSink {
                 .bind(DRAIN_COMPLETION_LOCK_TIMEOUT.as_millis().to_string())
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
-                .bind(node_id)
-                .execute(&mut *tx)
-                .await?;
+            locks::lock_node_for_update(&mut tx, node_id).await?;
             let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
                 .bind(node_id)
                 .bind(new_phase)

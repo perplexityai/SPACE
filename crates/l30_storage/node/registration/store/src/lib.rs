@@ -9,26 +9,30 @@
 //! nodes through their registration, [`drain_reads`] reads the drain columns
 //! without writing them, [`drain_write`] writes them checking only the node
 //! id, [`tombstone`] records terminated nodes, [`inventory`] lists the
-//! Kubernetes nodes, and [`node_group`] mirrors their node-group labels.
+//! Kubernetes nodes, [`demotion`] demotes ready ones missing from the
+//! cluster, and [`node_group`] mirrors their node-group labels.
 //! [`direct`] reads the admin node row, which joins the node's Direct
 //! registration. [`stale_reconcile_work`] finds the Kubernetes nodes the
 //! reconcile queue GC may treat as gone.
 //!
 //! Every verb runs on the caller's executor, so it composes into the
-//! caller's transaction; [`direct::lock_admin_node`] takes that transaction,
-//! whose end releases its row lock. The drain-phase compare-and-sets, whose
-//! `WHERE` re-checks the current phase, stay with their callers.
+//! caller's transaction. The row locks in [`locks`] and
+//! [`direct::lock_admin_node`] take the caller's transaction instead, and
+//! hold until it ends. The drain-phase compare-and-sets, whose `WHERE`
+//! re-checks the current phase, stay with their callers.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
 use pplx_space_node_model::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 
+pub mod demotion;
 pub mod direct;
 pub mod drain_reads;
 pub mod drain_v2;
 pub mod drain_write;
 pub mod inventory;
+pub mod locks;
 pub mod lookup;
 pub mod node_group;
 mod register;

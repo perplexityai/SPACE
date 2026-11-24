@@ -587,54 +587,6 @@ async fn compat_validation_serializes_against_concurrent_narrowing() -> TestResu
     Ok(())
 }
 
-/// `nodes_count` must include NULL-membership nodes for the singleton
-/// default group: unlabeled (or unknown-label) nodes mirror as NULL,
-/// which everywhere else resolves to the default generic group. Other
-/// groups count only explicit membership.
-#[tokio::test(flavor = "current_thread")]
-async fn default_group_nodes_count_includes_null_membership() -> TestResult {
-    let Some(fixture) = postgres_fixture().await? else {
-        return Ok(());
-    };
-    let pool = &fixture.pool;
-    let default_group = insert_node_group(
-        pool,
-        &group_name("workers-shared"),
-        None,
-        NodeGroupTemplatePolicy::Default,
-        true,
-    )
-    .await?;
-    let dedicated = insert_node_group(
-        pool,
-        &group_name("org-a-dedicated"),
-        Some(OrgId::from_uuid(ORG_A)),
-        NodeGroupTemplatePolicy::Default,
-        false,
-    )
-    .await?;
-    insert_node_in_group(pool, default_group).await?;
-    insert_node_in_group(pool, None).await?; // unlabeled worker — resolves to default
-    insert_node_in_group(pool, dedicated).await?;
-    // Non-worker rows always sit at NULL (the mirror stamps workers
-    // only); they are not members of the default *worker* pool.
-    insert_node_with_role(pool, None, "builder").await?;
-    insert_node_with_role(pool, None, "cluster").await?;
-
-    let store = AdminNodeGroupStore::new(pool.clone());
-    assert_eq!(
-        store.fetch(default_group).await?.expect("row").nodes_count,
-        2,
-        "default group counts explicit + NULL worker membership, not builder/cluster rows"
-    );
-    assert_eq!(
-        store.fetch(dedicated).await?.expect("row").nodes_count,
-        1,
-        "non-default groups count only explicit membership"
-    );
-    Ok(())
-}
-
 /// `nodes_count` in the row select reflects mirrored membership, and the
 /// `nodes.node_group_id` FK blocks deleting a group that still has
 /// nodes.
