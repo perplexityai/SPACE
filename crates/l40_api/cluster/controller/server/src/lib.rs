@@ -231,15 +231,12 @@ pub async fn run(
     )
     .await;
 
-    // Only *release* the lease (fast standby takeover) when the reconcilers
-    // drained cleanly — otherwise a wedged tick may still be detached and
-    // running, so the lease is abandoned and left to expire at its TTL, by which
-    // point this process has exited and that task is dead. A reconciler panic is
-    // treated the same way (conservative). `relinquish` owns that choice so it
-    // can be tested; this only reports which outcome happened.
+    // Release only after all reconciler work has been confirmed stopped.
+    // If shutdown cannot confirm this, or a reconciler panicked, let the Lease
+    // expire rather than making it immediately available.
     if let Some(leadership) = leadership {
-        let drained_cleanly = matches!(&result, Ok(reconcilers::ShutdownOutcome::Drained));
-        leadership.relinquish(drained_cleanly).await;
+        let stopped = matches!(&result, Ok(reconcilers::ShutdownOutcome::Stopped));
+        leadership.relinquish(stopped).await;
     }
 
     // A reconciler panic is fatal — exit non-zero so Kubernetes restarts us.

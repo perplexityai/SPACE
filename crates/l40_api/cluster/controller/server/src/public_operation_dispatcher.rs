@@ -516,7 +516,7 @@ pub async fn run<E>(
                                 } else {
                                     BUSY_KEY_RETRY_AFTER
                                 };
-                                hand_backs.spawn(hand_back_busy_key(
+                                crate::reconcilers::spawn_reconciler_child(&mut hand_backs, hand_back_busy_key(
                                     store.clone(),
                                     claim.claim_token.clone(),
                                     operation,
@@ -539,7 +539,7 @@ pub async fn run<E>(
                                 operation,
                             )
                             .instrument(span);
-                            let task = in_flight.spawn(execution);
+                            let task = crate::reconcilers::spawn_reconciler_child(&mut in_flight, execution);
                             claims.insert(task.id(), claimed);
                             if !is_teardown {
                                 other_tasks.insert(task.id());
@@ -610,7 +610,10 @@ pub async fn run<E>(
                 &mut other_tasks,
                 &mut claims,
             ) {
-                hand_backs.spawn(hand_back_stopped(store.clone(), claim_token, operation));
+                crate::reconcilers::spawn_reconciler_child(
+                    &mut hand_backs,
+                    hand_back_stopped(store.clone(), claim_token, operation),
+                );
             }
         }
     }

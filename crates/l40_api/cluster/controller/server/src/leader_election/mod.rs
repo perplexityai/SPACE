@@ -158,12 +158,12 @@
 //! Mutual exclusion is *cooperative*, like Kubernetes' own client-go
 //! leader election: the holder voluntarily stops acting before the lease
 //! expires, using a renew deadline (`lease_ttl - RENEW_DEADLINE_MARGIN`) whose
-//! margin exceeds the reconciler drain window, so its ticks finish before any
-//! standby can acquire. One documented exception, accepted because the write
-//! is idempotent: `node_group_mirror`'s bulk UPDATE can still commit after the
-//! lease changes hands on a slow connection (see its `WRITE_BACKSTOP`). It
-//! does **not** hard-fence: if a holder's process is
-//! frozen past the TTL (e.g. `SIGSTOP`, VM suspension, total runtime
+//! margin covers the reconciler drain and abort windows. On graceful shutdown
+//! the holder confirms its reconciler tasks have stopped before releasing the
+//! lease. An operation already sent to another service may still finish, as
+//! with a crash (for example, `node_group_mirror`'s idempotent bulk UPDATE,
+//! bounded by its `WRITE_BACKSTOP`). The lease does **not** hard-fence: if a
+//! holder's process is frozen past the TTL (e.g. `SIGSTOP`, VM suspension, total runtime
 //! starvation) a standby will acquire and, when the frozen process resumes, an
 //! already-in-flight reconciler tick could run once more before the renewal
 //! task is next polled and cancels the reconciler token. True fencing would
@@ -339,11 +339,14 @@ const _: () = assert!(DEFAULT_RETRY_INTERVAL.as_secs() == 8);
 const _: () = assert!(DEFAULT_LEASE_FAILURE_GRACE.as_secs() == 600);
 const _: () = assert!(MAX_RETRY_INTERVAL.as_secs() == 30);
 const _: () = assert!(MAX_LEASE_FAILURE_GRACE.as_secs() == 3600);
-// The renew-deadline margin must *exceed* the drain window, not merely equal it:
+// The renew-deadline margin must *exceed* the drain and abort windows:
 // at equality the old leader's last tick finishes exactly as a standby may
 // acquire, with no room for scheduling or clock skew.
-const _: () =
-    assert!(RENEW_DEADLINE_MARGIN.as_secs() > crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_secs());
+const _: () = assert!(
+    RENEW_DEADLINE_MARGIN.as_secs()
+        > crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+            + crate::reconcilers::SHUTDOWN_ABORT_TIMEOUT.as_secs()
+);
 // The TTL clamps must not cross, or `clamp` panics.
 const _: () = assert!(MIN_LEASE_TTL.as_secs() <= MAX_LEASE_TTL.as_secs());
 // `lease_ttl - RENEW_DEADLINE_MARGIN` would underflow and panic below this.
@@ -385,11 +388,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Safety margin between when the holder **stops acting** (its renew deadline)
 /// and when the lease actually **expires** (and a standby may acquire). It must
-/// exceed the reconciler drain window
-/// ([`crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT`]) so the old leader's
-/// in-flight reconciler ticks finish before any standby starts its own — the
-/// no-two-concurrent-runners guarantee, with the one documented exception
-/// the module doc names. The extra buffer covers scheduling and clock skew.
+/// exceed the drain and abort windows so the old leader's reconciler tasks
+/// stop before any standby starts its own. The extra buffer covers scheduling
+/// and clock skew. See the module's safety model for the limits of this margin.
 /// `renew_deadline = lease_ttl - RENEW_DEADLINE_MARGIN`.
 const RENEW_DEADLINE_MARGIN: Duration =
     Duration::from_secs(crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_secs() + 2);
@@ -1338,18 +1339,9 @@ impl<S: LeaseStore + Send + Sync + 'static> Leadership<S> {
         self.leader_token.clone()
     }
 
-    /// Give up the lease the way the reconcilers' outcome requires: release it
-    /// when they drained cleanly, abandon it otherwise.
-    ///
-    /// The choice is here rather than at the call site because getting it
-    /// backwards is silent and severe. [`Self::resign`] makes the lease
-    /// immediately acquirable, so taking it after a *timed-out* drain lets a
-    /// standby start its reconciler set while a wedged tick of ours may still be
-    /// detached and running — the two-concurrent-runners failure this module
-    /// exists to prevent. `main` has no tests, so the decision lives where one
-    /// can reach it.
-    pub async fn relinquish(self, drained_cleanly: bool) {
-        if drained_cleanly {
+    /// Release the lease only after confirming all reconciler work has stopped.
+    pub async fn relinquish(self, stopped: bool) {
+        if stopped {
             self.resign().await;
         } else {
             self.abandon().await;
@@ -1357,10 +1349,8 @@ impl<S: LeaseStore + Send + Sync + 'static> Leadership<S> {
     }
 
     /// Stop renewing and **release** the lease so a standby can take over
-    /// promptly. Call this only after the reconciler set has *fully* drained
-    /// (a clean shutdown), because release makes the lease immediately
-    /// acquirable — if any reconciler tick were still running we'd let a
-    /// standby overlap it.
+    /// promptly. Call this only after the reconciler work has *fully* stopped,
+    /// because release makes the lease immediately acquirable.
     pub async fn resign(mut self) {
         // Cancelling the leader token stops the renewal task; the reconcilers it
         // also drives have already drained by the time resign is called.
@@ -1393,11 +1383,9 @@ impl<S: LeaseStore + Send + Sync + 'static> Leadership<S> {
     }
 
     /// Stop renewing but do **not** release the lease. Use this when the
-    /// reconcilers could *not* be confirmed fully stopped (drain timed out on a
-    /// wedged tick, or a reconciler panicked): leaving the lease to expire at
-    /// its TTL means a standby only takes over after this process has exited and
-    /// any detached/wedged task is dead, so no standby overlaps a still-running
-    /// tick.
+    /// reconcilers could *not* be confirmed fully stopped, or a reconciler
+    /// panicked. The remaining TTL gives the process time to exit before a
+    /// standby can take over.
     pub async fn abandon(mut self) {
         self.leader_token.cancel();
         if let Some(renew_task) = self.renew_task.take() {
@@ -1422,8 +1410,8 @@ impl<S: LeaseStore + Send + Sync + 'static> Leadership<S> {
 /// TTL.** That margin (larger than the reconciler drain window) is what
 /// guarantees no two replicas run reconcilers at once: when this loop hits the
 /// deadline and cancels `leader_token`, the reconcilers drain for up to
-/// `SHUTDOWN_DRAIN_TIMEOUT`, and the margin ensures they finish *before* the
-/// lease expires and any standby can acquire it.
+/// `SHUTDOWN_DRAIN_TIMEOUT`, then have a bounded wait for cancellation. The
+/// margin covers both before the lease expires and any standby can acquire it.
 ///
 /// Two layers stop us on time even if a renewal call misbehaves:
 /// * The outer `sleep_until(deadline)` fires if the deadline passes between

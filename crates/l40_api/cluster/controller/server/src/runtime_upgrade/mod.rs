@@ -564,12 +564,15 @@ impl Reconciler {
         report.leased += leased.len() as u64;
         let mut running = self.lock_in_flight();
         for item in leased {
-            running.spawn(self.worker.clone().drive_item(
-                Arc::clone(driver),
-                campaign.clone(),
-                item,
-                leased_at,
-            ));
+            crate::reconcilers::spawn_reconciler_child(
+                &mut running,
+                self.worker.clone().drive_item(
+                    Arc::clone(driver),
+                    campaign.clone(),
+                    item,
+                    leased_at,
+                ),
+            );
         }
     }
 

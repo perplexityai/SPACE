@@ -2142,7 +2142,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             let placement = self.config.drain_evacuation_placement.clone();
             let sandbox = *sandbox_id;
             let target_lifecycle = *target_lifecycle;
-            evacuations.spawn(async move {
+            crate::reconcilers::spawn_reconciler_child(&mut evacuations, async move {
                 let started = Instant::now();
                 let result = sink
                     .restore_evacuated_sandbox(
@@ -3460,7 +3460,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             let task = make_task(self.sink.clone(), *sandbox_id, *lifecycle);
             let sandbox = *sandbox_id;
             let node = node_id;
-            evacuations.spawn(async move {
+            crate::reconcilers::spawn_reconciler_child(&mut evacuations, async move {
                 task.await;
                 let mut guard = in_flight.lock().await;
                 if let Some(set) = guard.get_mut(&node) {

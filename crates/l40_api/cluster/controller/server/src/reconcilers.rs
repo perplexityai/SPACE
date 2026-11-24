@@ -1,13 +1,14 @@
 //! Cluster-singleton reconciler chassis.
 //!
-//! Each reconciler runs as its own `tokio::spawn` task driven by a
+//! Each reconciler runs as a supervised Tokio task driven by a
 //! `tokio::time::interval` (with `MissedTickBehavior::Delay`) and listens on a
 //! child `CancellationToken` for graceful shutdown. To add a reconciler:
 //!
 //! 1. Implement the loop (in the API crate that owns it) with a `Config::from_env()`
 //!    helper for deploy-time knobs and a `run(pool, substrate, shutdown)` entry.
-//! 2. Spawn it from `run_reconcilers` below as a `tokio::spawn(...)` line.
-//! 3. Wire its env vars into the owning deployment configuration.
+//! 2. Spawn it from `run_reconcilers` with `ReconcilerTasks::spawn`.
+//! 3. Track any spawned reconciliation work with `spawn_reconciler_child`.
+//! 4. Wire its env vars into the owning deployment configuration.
 //!
 //! # Kubernetes-only loops
 //!
@@ -85,6 +86,7 @@
 //! - `node_group_mirror`: copies each Node's node-group label into
 //!   `nodes.node_group_id`.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,7 +98,8 @@ use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
 use sqlx::PgPool;
-use tokio_util::sync::CancellationToken;
+use tokio::task::{AbortHandle, JoinSet};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::admin_audit_retention;
 use crate::data_plane_session_retention;
@@ -126,12 +129,10 @@ use crate::transient_lifecycle_census;
 use crate::transient_lifecycle_sweeper;
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 
-/// Bounded grace period for in-flight reconciler ticks to drain after the
-/// shutdown token fires. Keeps the cluster-controller pod from getting stuck
-/// past Kubernetes' termination grace period if a reconciler is wedged on a
-/// hung kube/DB call — runtime drop will abort outstanding tasks once we
-/// return.
+/// Time to finish in-flight reconciler ticks cooperatively before aborting them.
 pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time to confirm aborted tasks have stopped before giving up on Lease release.
+pub(crate) const SHUTDOWN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A fatal runtime condition that ends [`run_reconcilers`] before a requested
 /// shutdown, so the controller process exits non-zero and Kubernetes restarts
@@ -153,18 +154,13 @@ pub enum ReconcilerRuntimeError {
     RouteSigningConfiguration(#[from] pplx_space_api_route::ed25519::SpaceApiRouteEd25519Error),
 }
 
-/// How [`run_reconcilers`] wound down on a requested shutdown — whether every
-/// reconciler tick actually finished. The leader-election caller uses this to
-/// decide whether it is safe to *release* the lease (only after a clean drain)
-/// or must let it expire at its TTL (a wedged tick may still be detached and
-/// running).
+/// Whether all reconciler work was confirmed stopped on shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownOutcome {
-    /// Every reconciler task stopped within the drain grace period.
-    Drained,
-    /// The drain grace period elapsed with tasks still running; they are now
-    /// detached and will be aborted at process exit.
-    DrainTimedOut,
+    /// Every task drained or was aborted and joined. The Lease can be released.
+    Stopped,
+    /// Cancellation has not been confirmed; only Lease expiry is safe.
+    StopUnconfirmed,
 }
 
 /// Selects the [`node_drain::InstanceTerminator`] implementation for
@@ -294,84 +290,83 @@ pub async fn run_reconcilers(
             )
             .map_err(ReconcilerRuntimeError::from)
         })?;
-    let mut handles = vec![
-        tokio::spawn(trigger_fanout::run(
+    let mut tasks = ReconcilerTasks::default();
+    tasks.spawn(trigger_fanout::run(
+        pool.clone(),
+        trigger_substrate,
+        TriggerFanoutConfig::default(),
+        shutdown_token.child_token(),
+    ));
+    tasks.spawn(metrics::run_queue_metrics(
+        pool.clone(),
+        metrics::QueueMetricsConfig::default(),
+        shutdown_token.child_token(),
+    ));
+    tasks.spawn(public_operation_retention::run_with_pool(
+        public_operation_retention::ReconcilerConfig::from_env(),
+        pool.clone(),
+        shutdown_token.child_token(),
+    ));
+    tasks.spawn(data_plane_session_retention::run_with_pool(
+        data_plane_session_retention::ReconcilerConfig::from_env(),
+        pool.clone(),
+        shutdown_token.child_token(),
+    ));
+    tasks.spawn(admin_audit_retention::run_with_pool(
+        admin_audit_retention::ReconcilerConfig::from_env(),
+        pool.clone(),
+        shutdown_token.child_token(),
+    ));
+    tasks.spawn(observed_projection_gc::run_with_pool(
+        observed_projection_gc::ReconcilerConfig::from_env(),
+        pool.clone(),
+        shutdown_token.child_token(),
+    ));
+    tasks.spawn(tombstone_retention::run_with_pool(
+        tombstone_retention::ReconcilerConfig::from_env(),
+        pool.clone(),
+        shutdown_token.child_token(),
+    ));
+    tasks.spawn(environment_edge_recompute::run_with_pool(
+        pool.clone(),
+        shutdown_token.child_token(),
+    ));
+    // Runtime upgrade campaigns. Off unless
+    // `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on. Template
+    // campaigns are driven; the template driver reads the credential-fenced
+    // storage-location sidecar on the credentials pool. On, the loop also
+    // returns an aborted campaign's in-flight items whose leases lapsed to
+    // pending.
+    tasks.spawn({
+        let mut config = crate::runtime_upgrade::ReconcilerConfig::from_env();
+        let origins = crate::runtime_upgrade::template_storage_origins(
+            &mut config,
+            &pplx_space_env_vars::ProcessEnvironment,
+        );
+        crate::runtime_upgrade::run(
+            config,
             pool.clone(),
-            trigger_substrate,
-            TriggerFanoutConfig::default(),
-            shutdown_token.child_token(),
-        )),
-        tokio::spawn(metrics::run_queue_metrics(
-            pool.clone(),
-            metrics::QueueMetricsConfig::default(),
-            shutdown_token.child_token(),
-        )),
-        tokio::spawn(public_operation_retention::run_with_pool(
-            public_operation_retention::ReconcilerConfig::from_env(),
-            pool.clone(),
-            shutdown_token.child_token(),
-        )),
-        tokio::spawn(data_plane_session_retention::run_with_pool(
-            data_plane_session_retention::ReconcilerConfig::from_env(),
-            pool.clone(),
-            shutdown_token.child_token(),
-        )),
-        tokio::spawn(admin_audit_retention::run_with_pool(
-            admin_audit_retention::ReconcilerConfig::from_env(),
-            pool.clone(),
-            shutdown_token.child_token(),
-        )),
-        tokio::spawn(observed_projection_gc::run_with_pool(
-            observed_projection_gc::ReconcilerConfig::from_env(),
-            pool.clone(),
-            shutdown_token.child_token(),
-        )),
-        tokio::spawn(tombstone_retention::run_with_pool(
-            tombstone_retention::ReconcilerConfig::from_env(),
-            pool.clone(),
-            shutdown_token.child_token(),
-        )),
-        tokio::spawn(environment_edge_recompute::run_with_pool(
-            pool.clone(),
-            shutdown_token.child_token(),
-        )),
-        // Runtime upgrade campaigns. Off unless
-        // `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on. Template
-        // campaigns are driven; the template driver reads the credential-fenced
-        // storage-location sidecar on the credentials pool. On, the loop also
-        // returns an aborted campaign's in-flight items whose leases lapsed to
-        // pending.
-        tokio::spawn({
-            let mut config = crate::runtime_upgrade::ReconcilerConfig::from_env();
-            let origins = crate::runtime_upgrade::template_storage_origins(
-                &mut config,
-                &pplx_space_env_vars::ProcessEnvironment,
-            );
-            crate::runtime_upgrade::run(
-                config,
+            crate::runtime_upgrade::cluster_drivers(
                 pool.clone(),
-                crate::runtime_upgrade::cluster_drivers(
-                    pool.clone(),
-                    credentials_pool.pool().clone(),
-                    // Only where the worker boots a create's required
-                    // environment, with the placement gate on, does a create
-                    // resolved to a template twin boot the twin's.
-                    substrate.boots_template_twins(),
-                    pplx_space_api::controllers::substrate::SubstrateAdapter::managed_by(
-                        substrate.as_ref(),
-                    ),
-                    origins,
+                credentials_pool.pool().clone(),
+                // Only where the worker boots a create's required
+                // environment, with the placement gate on, does a create
+                // resolved to a template twin boot the twin's.
+                substrate.boots_template_twins(),
+                pplx_space_api::controllers::substrate::SubstrateAdapter::managed_by(
+                    substrate.as_ref(),
                 ),
-                shutdown_token.child_token(),
-            )
-        }),
-        // Firewall rules canary issuance. Off: nothing configures it yet.
-        tokio::spawn(crate::firewall_rules_issue::run(
-            None,
-            pool.clone(),
+                origins,
+            ),
             shutdown_token.child_token(),
-        )),
-    ];
+        )
+    });
+    // Firewall rules canary issuance. Off: nothing configures it yet.
+    tasks.spawn(crate::firewall_rules_issue::run(
+        None,
+        pool.clone(),
+        shutdown_token.child_token(),
+    ));
     if let Some(native_public_operation_executor) = native_public_operation_executor {
         // The cluster activation limiter exists in this process only while the
         // dispatcher does, so its heartbeat takes a sibling of the same token
@@ -393,17 +388,17 @@ pub async fn run_reconcilers(
         // space-api runs the other copy of this limiter and heartbeats it from
         // its own `AppState`, so its own service group is unaffected by causes
         // 1-3.
-        handles.push(tokio::spawn(
+        tasks.spawn(
             native_public_operation_executor
                 .cluster_admission()
                 .liveness_heartbeat(shutdown_token.child_token()),
-        ));
-        handles.push(tokio::spawn(public_operation_dispatcher::run(
+        );
+        tasks.spawn(public_operation_dispatcher::run(
             public_operation_dispatcher_config,
             pplx_space_api::public_operations::PublicOperationStore::new(pool.clone()),
             native_public_operation_executor,
             shutdown_token.child_token(),
-        )));
+        ));
     }
 
     // Snapshot-storage S3 sweeper. Substrate-agnostic — needs only
@@ -431,12 +426,12 @@ pub async fn run_reconcilers(
         // runs on the credentials lane rather than the rollout-default pool.
         let sink =
             snapshot_storage_sweeper::SnapshotStorageDbStore::new(credentials_pool.pool().clone());
-        handles.push(tokio::spawn(snapshot_storage_sweeper::run(
+        tasks.spawn(snapshot_storage_sweeper::run(
             sweeper_config,
             sink,
             backend,
             shutdown_token.child_token(),
-        )));
+        ));
     }
 
     // Snapshot-retention sweeper: cluster-singleton that enforces a
@@ -469,13 +464,13 @@ pub async fn run_reconcilers(
         let sink = snapshot_retention_sweeper::SnapshotRetentionDbStore::new(
             credentials_pool.pool().clone(),
         );
-        handles.push(tokio::spawn(snapshot_retention_sweeper::run(
+        tasks.spawn(snapshot_retention_sweeper::run(
             retention_config,
             sink,
             registry,
             feature_flags.clone(),
             shutdown_token.child_token(),
-        )));
+        ));
     } else {
         tracing::info!(
             "snapshot-retention-sweeper reconciler is disabled \
@@ -494,23 +489,21 @@ pub async fn run_reconcilers(
     // uniformly. Transient lifecycle aging remains default-disabled,
     // while failed-sandbox cleanup runs unless
     // `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED=false`.
-    handles.push(tokio::spawn(
-        transient_lifecycle_sweeper::run_with_substrate(
-            transient_lifecycle_sweeper::ReconcilerConfig::from_env(),
-            pool.clone(),
-            substrate.clone(),
-            shutdown_token.child_token(),
-        ),
+    tasks.spawn(transient_lifecycle_sweeper::run_with_substrate(
+        transient_lifecycle_sweeper::ReconcilerConfig::from_env(),
+        pool.clone(),
+        substrate.clone(),
+        shutdown_token.child_token(),
     ));
 
     // Transient-lifecycle census: gauges of how many sandboxes sit in each
     // transient lifecycle, by age, and the oldest one's age. Read-only and
     // always on, for both substrates and whatever the sweeper above is set
     // to, so a wedged lifecycle stays visible with every repair loop off.
-    handles.push(tokio::spawn(transient_lifecycle_census::run(
+    tasks.spawn(transient_lifecycle_census::run(
         pool.clone(),
         shutdown_token.child_token(),
-    )));
+    ));
 
     match substrate.as_kubernetes() {
         None => {
@@ -529,7 +522,7 @@ pub async fn run_reconcilers(
                 },
                 nodes: kube.k8s.caches.nodes.clone(),
             };
-            handles.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 if let Err(err) = crate::warm_pool::run(
                     warm_pool_kube,
                     warm_pool_cache,
@@ -541,7 +534,7 @@ pub async fn run_reconcilers(
                 {
                     tracing::warn!(error = %err, "warm pool reconciler exited");
                 }
-            }));
+            });
 
             // Environment placement census: how many running bound pods sit
             // on nodes the environment placement gate, on, would refuse. Off
@@ -551,18 +544,18 @@ pub async fn run_reconcilers(
                 pods_ready: kube.readiness(),
                 nodes: kube.k8s.caches.clone(),
             };
-            handles.push(tokio::spawn(crate::environment_placement_census::run(
+            tasks.spawn(crate::environment_placement_census::run(
                 environment_placement,
                 census_caches,
                 shutdown_token.child_token(),
-            )));
+            ));
 
-            handles.push(tokio::spawn(orphaned_sandboxes::run(
+            tasks.spawn(orphaned_sandboxes::run(
                 pool.clone(),
                 kube.clone(),
                 orphaned_sandboxes::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Suspended-execution reaper: retires stale `active = TRUE`
             // execution rows on `lifecycle = 'suspended'` sandboxes whose
@@ -572,12 +565,12 @@ pub async fn run_reconcilers(
             // bookkeeping. Default-disabled per environment via
             // `SPACE_SUSPENDED_EXECUTION_REAPER_ENABLED=true`; when
             // enabled, defaults to dry-run.
-            handles.push(tokio::spawn(suspended_execution_reaper::run(
+            tasks.spawn(suspended_execution_reaper::run(
                 pool.clone(),
                 kube.clone(),
                 suspended_execution_reaper::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Failed-restorable repair: moves `lifecycle = 'failed'`
             // Kubernetes sandboxes back to `suspended` only when there is no
@@ -589,11 +582,11 @@ pub async fn run_reconcilers(
             // Enabled by default and applies its fenced write directly;
             // `SPACE_FAILED_RESTORABLE_REPAIR_ENABLED=false` disables it, and any
             // other non-truthy value disables it too.
-            handles.push(tokio::spawn(failed_restorable_repair::run(
+            tasks.spawn(failed_restorable_repair::run(
                 pool.clone(),
                 failed_restorable_repair::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Stuck-ContainerCreating pod GC: deletes sandbox pods wedged in
             // `ContainerCreating` past a threshold on an otherwise-healthy
@@ -601,11 +594,11 @@ pub async fn run_reconcilers(
             // storm a large backlog of stuck creates sustains. Pure
             // reflector-cache + apiserver work, no Postgres. Default-disabled;
             // starts in dry-run.
-            handles.push(tokio::spawn(stuck_container_creating_gc::run(
+            tasks.spawn(stuck_container_creating_gc::run(
                 kube.clone(),
                 stuck_container_creating_gc::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Node-local service readiness: publishes whether each worker's
             // node-ctl/volume-manager DaemonSet pods are Ready onto the kube
@@ -613,11 +606,11 @@ pub async fn run_reconcilers(
             // during a worker DaemonSet rollout instead of stalling creates on
             // them. Soft signal only — nothing here makes a node
             // unschedulable. Default-disabled; starts in dry-run.
-            handles.push(tokio::spawn(node_service_readiness::run(
+            tasks.spawn(node_service_readiness::run(
                 kube.clone(),
                 node_service_readiness::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Orphaned-restore-pod GC: reaps restore pods that are provably
             // superseded by their owning `sandboxes` row (row deleted, active
@@ -628,22 +621,22 @@ pub async fn run_reconcilers(
             // a batched Postgres classification; needs no DB-convergence
             // companion (the row already reflects the desired state).
             // Default-disabled; starts in dry-run.
-            handles.push(tokio::spawn(orphaned_restore_pod_gc::run(
+            tasks.spawn(orphaned_restore_pod_gc::run(
                 pool.clone(),
                 kube.clone(),
                 orphaned_restore_pod_gc::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Kube node sync: reconciles labeled kube Nodes into the SPACE DB.
             // It repairs missing registrations and demotes stale ready rows
             // after their kube Node disappears, while preserving the node row
             // and sandbox placements for normal recovery paths.
-            handles.push(tokio::spawn(kube_node_sync::run(
+            tasks.spawn(kube_node_sync::run(
                 kube_node_sync::ReconcilerConfig::from_env(),
                 kube.clone(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Node-group label mirror: copies each kube Node's
             // `node-restriction.kubernetes.io/space-node-group` label into
@@ -652,12 +645,12 @@ pub async fn run_reconcilers(
             // source of truth; the column is never set by hand.
             // Default-disabled until the org-scoped node-group rollout
             // labels the shared worker pool.
-            handles.push(tokio::spawn(node_group_mirror::run(
+            tasks.spawn(node_group_mirror::run(
                 node_group_mirror::ReconcilerConfig::from_env(),
                 pool.clone(),
                 kube.clone(),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Node-group labeler: the migration-era rollout of org-scoped
             // node groups — not open-ended self-healing. It labels only while
@@ -679,7 +672,7 @@ pub async fn run_reconcilers(
             // Default-disabled via `SPACE_NODE_GROUP_LABELER_ENABLED`;
             // requires the node-groups schema — until that migration is
             // applied, each tick fails loudly and retries.
-            handles.push(tokio::spawn(node_group_labeler::run(
+            tasks.spawn(node_group_labeler::run(
                 node_group_labeler::ReconcilerConfig::from_env(),
                 node_group_labeler::NodeGroupDbStore::new(pool.clone()),
                 node_group_labeler::KubeWorkerNodes::new(
@@ -688,7 +681,7 @@ pub async fn run_reconcilers(
                     &kube.k8s.sandbox_pod_config,
                 ),
                 shutdown_token.child_token(),
-            )));
+            ));
 
             // Node-drain reconciler. Default-disabled; flips on via
             // `SPACE_NODE_DRAIN_ENABLED=true` per environment.
@@ -803,36 +796,36 @@ pub async fn run_reconcilers(
                                 pool.clone(),
                                 Arc::new(ec2_client),
                             ));
-                        handles.push(tokio::spawn(node_drain::run(
+                        tasks.spawn(node_drain::run(
                             node_drain_config,
                             node_drain_sink,
                             terminator,
                             Some(instance_lookup),
                             node_drain_token,
-                        )));
+                        ));
                     }
                     TerminatorKind::KubeDelete => {
                         let terminator = node_drain::KubeNodeDeleteTerminator::new(
                             pool.clone(),
                             kube.k8s.client.clone(),
                         );
-                        handles.push(tokio::spawn(node_drain::run(
+                        tasks.spawn(node_drain::run(
                             node_drain_config,
                             node_drain_sink,
                             terminator,
                             None,
                             node_drain_token,
-                        )));
+                        ));
                     }
                     TerminatorKind::Noop => {
                         let terminator = node_drain::NoopInstanceTerminator::new();
-                        handles.push(tokio::spawn(node_drain::run(
+                        tasks.spawn(node_drain::run(
                             node_drain_config,
                             node_drain_sink,
                             terminator,
                             None,
                             node_drain_token,
-                        )));
+                        ));
                     }
                 }
             } else {
@@ -883,12 +876,12 @@ pub async fn run_reconcilers(
                 let ec2_client = pplx_space_aws_client::ec2::Client::from_config(&aws_config);
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
                 let sink = orphaned_nodes::NodeDbStore::new(pool.clone());
-                handles.push(tokio::spawn(orphaned_nodes::run(
+                tasks.spawn(orphaned_nodes::run(
                     orphaned_nodes_config,
                     sink,
                     lookup,
                     shutdown_token.child_token(),
-                )));
+                ));
             } else {
                 tracing::info!(
                     "orphaned-nodes reconciler is disabled \
@@ -909,13 +902,13 @@ pub async fn run_reconcilers(
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
                 let sink = lost_started_sandboxes::LostStartedDbStore::new(pool.clone());
                 let presence = reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone());
-                handles.push(tokio::spawn(lost_started_sandboxes::run(
+                tasks.spawn(lost_started_sandboxes::run(
                     lost_started_config,
                     sink,
                     lookup,
                     presence,
                     shutdown_token.child_token(),
-                )));
+                ));
             } else {
                 tracing::info!(
                     "lost_started_sandboxes is disabled \
@@ -936,12 +929,12 @@ pub async fn run_reconcilers(
                 let lookup = orphaned_nodes::Ec2InstanceLookup::new(Arc::new(ec2_client));
                 let detector = reconcile_queue_gc::Ec2Detector::new(lookup);
                 let sink = reconcile_queue_gc::QueueDbStore::new(pool.clone());
-                handles.push(tokio::spawn(reconcile_queue_gc::run(
+                tasks.spawn(reconcile_queue_gc::run(
                     ec2_gc_config,
                     sink,
                     detector,
                     shutdown_token.child_token(),
-                )));
+                ));
             } else {
                 tracing::info!(
                     "reconcile-queue GC (ec2 detector) is disabled; skipping its AWS SDK init"
@@ -960,12 +953,12 @@ pub async fn run_reconcilers(
                 let presence = reconcile_queue_gc::SubstrateKubeNodePresence::new(kube.clone());
                 let detector = reconcile_queue_gc::KubePresenceDetector::new(presence);
                 let sink = reconcile_queue_gc::QueueDbStore::new(pool.clone());
-                handles.push(tokio::spawn(reconcile_queue_gc::run(
+                tasks.spawn(reconcile_queue_gc::run(
                     kube_gc_config,
                     sink,
                     detector,
                     shutdown_token.child_token(),
-                )));
+                ));
             } else {
                 tracing::info!(
                     "reconcile-queue GC (kube-presence detector) is disabled \
@@ -1004,13 +997,13 @@ pub async fn run_reconcilers(
             } else {
                 None
             };
-            handles.push(tokio::spawn(drained_node_terminator::run(
+            tasks.spawn(drained_node_terminator::run(
                 drained_terminator_config,
                 drained_terminator_sink,
                 drained_annotation_lookup,
                 drained_instance_lookup,
                 shutdown_token.child_token(),
-            )));
+            ));
         }
     }
 
@@ -1023,66 +1016,90 @@ pub async fn run_reconcilers(
     // a pure Postgres CAS plus telemetry, no node interaction — so it runs in
     // both Direct and Kubernetes modes. Default-disabled per environment via
     // `SPACE_STUCK_SNAPSHOT_REAPER_ENABLED=true`.
-    handles.push(tokio::spawn(stuck_snapshot_reaper::run_with_pool(
+    tasks.spawn(stuck_snapshot_reaper::run_with_pool(
         stuck_snapshot_reaper::ReconcilerConfig::from_env(),
         pool.clone(),
         shutdown_token.child_token(),
-    )));
+    ));
 
-    // Add future reconcilers above this line (snapshot retention, ...).
-
-    // Supervise the spawned tasks. A reconciler loop runs until its shutdown
-    // token fires; a *disabled* reconciler returns cleanly at startup (expected
-    // — Helm defaults disable several of them). A task that *panics* while the
-    // controller is still running is a dead cluster-singleton loop: fail fast so
-    // Kubernetes restarts the pod and the startup gates re-evaluate (e.g. the
-    // stuck-ContainerCreating GC's live-mode prerequisite, which trusts the
-    // orphaned-sandbox / transient-lifecycle reconcilers to be running) rather
-    // than limping with a crashed loop. A clean early return is NOT fatal — it's
-    // how a disabled reconciler exits.
-    //
-    // Move each handle into a JoinSet preserving its join result, so a panic
-    // (a `JoinError`) is distinguishable from a clean return, and a completion
-    // can be awaited alongside the shutdown token while draining the rest.
-    // Aborting a wrapper doesn't hard-abort its reconciler, but on exit we cancel
-    // the shutdown token first, which stops every loop cooperatively.
-    // A `JoinHandle` is itself a future resolving to the task's join result, so
-    // spawning it into the set makes that result observable.
-    let mut supervised: tokio::task::JoinSet<Result<(), tokio::task::JoinError>> =
-        tokio::task::JoinSet::new();
-    for handle in handles {
-        supervised.spawn(handle);
-    }
-
-    let outcome = supervise_reconcilers(&mut supervised, &shutdown_token).await;
-
-    // Cancel first so remaining loops stop cooperatively, then drain within the
-    // grace budget (awaiting the wrappers, not aborting, so an in-flight tick
-    // finishes before the process exits).
+    let outcome = supervise_reconcilers(&mut tasks.loops, &shutdown_token).await;
     shutdown_token.cancel();
-    let drain = async { while supervised.join_next().await.is_some() {} };
-    let drained_cleanly = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain)
-        .await
-        .is_ok();
-    if !drained_cleanly {
-        tracing::warn!(
-            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
-            "reconcilers did not drain within timeout; exiting"
-        );
-    }
+    let stopped = tasks.stop().await;
 
     match outcome {
-        Supervision::Shutdown => Ok(if drained_cleanly {
-            ShutdownOutcome::Drained
-        } else {
-            ShutdownOutcome::DrainTimedOut
-        }),
+        Supervision::Shutdown => Ok(stopped),
         Supervision::TaskExited => {
             tracing::error!(
                 "a reconciler task exited before shutdown was requested; \
                  failing the controller so it restarts with a fresh reconciler set"
             );
             Err(ReconcilerRuntimeError::TaskExited)
+        }
+    }
+}
+
+tokio::task_local! {
+    static RECONCILER_CHILDREN: TaskTracker;
+}
+
+/// Spawn a child that can drive reconciliation. Its local JoinSet owns
+/// cancellation; the tracker confirms its future was dropped even if that set
+/// is dropped without joining (for example when aborting its parent).
+pub(super) fn spawn_reconciler_child<F, T>(set: &mut JoinSet<T>, future: F) -> AbortHandle
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match RECONCILER_CHILDREN.try_with(Clone::clone) {
+        Ok(tracker) => {
+            set.spawn(tracker.track_future(RECONCILER_CHILDREN.scope(tracker.clone(), future)))
+        }
+        Err(_) => set.spawn(future),
+    }
+}
+
+#[derive(Default)]
+struct ReconcilerTasks {
+    loops: JoinSet<()>,
+    children: TaskTracker,
+}
+
+impl ReconcilerTasks {
+    fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
+        self.loops
+            .spawn(RECONCILER_CHILDREN.scope(self.children.clone(), future));
+    }
+
+    async fn join(&mut self) {
+        while self.loops.join_next().await.is_some() {}
+        // With all parent loops joined, there can be no new children except
+        // from an existing child that is itself still tracked.
+        self.children.close();
+        self.children.wait().await;
+    }
+
+    /// The caller has cancelled the shutdown token. Finish cooperative
+    /// shutdown first, then try to abort and join everything that remains.
+    async fn stop(&mut self) -> ShutdownOutcome {
+        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, self.join())
+            .await
+            .is_ok()
+        {
+            return ShutdownOutcome::Stopped;
+        }
+        tracing::warn!(
+            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            "reconcilers did not drain within timeout; aborting remaining tasks"
+        );
+        self.loops.abort_all();
+        if tokio::time::timeout(SHUTDOWN_ABORT_TIMEOUT, self.join())
+            .await
+            .is_ok()
+        {
+            ShutdownOutcome::Stopped
+        } else {
+            tracing::warn!("could not confirm all reconciler tasks stopped after abort");
+            ShutdownOutcome::StopUnconfirmed
         }
     }
 }
@@ -1105,7 +1122,7 @@ enum Supervision {
 /// loop) is fatal. If every task cleanly exits (e.g. all disabled), the
 /// controller waits for real shutdown rather than exiting.
 async fn supervise_reconcilers(
-    set: &mut tokio::task::JoinSet<Result<(), tokio::task::JoinError>>,
+    set: &mut JoinSet<()>,
     shutdown_token: &CancellationToken,
 ) -> Supervision {
     loop {
@@ -1118,12 +1135,11 @@ async fn supervise_reconcilers(
                     shutdown_token.cancelled().await;
                     return Supervision::Shutdown;
                 }
-                // A reconciler panicked — a dead loop. Fail fast. (Outer `Ok` is
-                // the wrapper's own join; inner `Err` is the reconciler's.) Log
+                // A reconciler panicked — a dead loop. Fail fast. Log
                 // the `JoinError` — it carries the panicked task's id — to pair
                 // with the panic the runtime's hook already logged, so operators
                 // can identify which reconciler died.
-                Some(Ok(Err(join_err))) if join_err.is_panic() => {
+                Some(Err(join_err)) if join_err.is_panic() => {
                     tracing::error!(error = %join_err, "a reconciler task panicked");
                     return Supervision::TaskExited;
                 }

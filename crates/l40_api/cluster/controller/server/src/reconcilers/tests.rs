@@ -1,11 +1,10 @@
 use super::{
-    ReconcilerRuntimeError, Supervision, TerminatorKind, build_if_enabled, supervise_reconcilers,
+    ReconcilerRuntimeError, ReconcilerTasks, SHUTDOWN_DRAIN_TIMEOUT, ShutdownOutcome, Supervision,
+    TerminatorKind, build_if_enabled, spawn_reconciler_child, supervise_reconcilers,
 };
-use std::future::Future;
-use tokio::task::JoinError;
+use std::future::pending;
+use tokio::{sync::oneshot, task::JoinSet, time::Instant};
 use tokio_util::sync::CancellationToken;
-
-type SupervisedSet = tokio::task::JoinSet<Result<(), JoinError>>;
 
 #[test]
 fn disabled_reconciler_does_not_initialize_optional_dependencies() {
@@ -15,21 +14,11 @@ fn disabled_reconciler_does_not_initialize_optional_dependencies() {
     assert_eq!(result, Ok(None));
 }
 
-/// Spawn `fut` as its own task and wrap it into `set` the same way
-/// `run_reconcilers` does — preserving the task's join result so a panic is
-/// distinguishable from a clean return.
-fn spawn_wrapped<F>(set: &mut SupervisedSet, fut: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    set.spawn(tokio::spawn(fut));
-}
-
 /// The shutdown token firing is a normal stop even while tasks run.
 #[tokio::test]
 async fn supervise_returns_shutdown_when_token_cancelled() {
-    let mut set = SupervisedSet::new();
-    spawn_wrapped(&mut set, std::future::pending::<()>());
+    let mut set = JoinSet::new();
+    set.spawn(pending());
     let token = CancellationToken::new();
     token.cancel();
     assert_eq!(
@@ -45,7 +34,7 @@ async fn supervise_returns_shutdown_when_token_cancelled() {
 /// return regressed to fatal, that poll would resolve to `TaskExited`.
 #[tokio::test]
 async fn supervise_ignores_clean_task_return() {
-    let mut set = SupervisedSet::new();
+    let mut set = JoinSet::new();
     // Disabled reconciler: signals on `done_tx` as its final statement, then
     // returns. `yield_now()` is not a completion guarantee (the scheduler may
     // repoll the yielding task without running the spawned one to the end), so
@@ -54,7 +43,7 @@ async fn supervise_ignores_clean_task_return() {
     // resolves on the current-thread test runtime the task is complete and
     // `join_next` observes it on the first poll.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-    spawn_wrapped(&mut set, async move {
+    set.spawn(async move {
         let _ = done_tx.send(());
     });
     done_rx
@@ -75,8 +64,8 @@ async fn supervise_ignores_clean_task_return() {
 /// A panicking task is fatal.
 #[tokio::test]
 async fn supervise_returns_task_exited_when_a_task_panics() {
-    let mut set = SupervisedSet::new();
-    spawn_wrapped(&mut set, async { panic!("reconciler blew up") });
+    let mut set = JoinSet::new();
+    set.spawn(async { panic!("reconciler blew up") });
     let token = CancellationToken::new();
     assert_eq!(
         supervise_reconcilers(&mut set, &token).await,
@@ -87,13 +76,45 @@ async fn supervise_returns_task_exited_when_a_task_panics() {
 /// An empty set has nothing to supervise — a normal stop once shutdown fires.
 #[tokio::test]
 async fn supervise_returns_shutdown_when_set_empty() {
-    let mut set = SupervisedSet::new();
+    let mut set = JoinSet::new();
     let token = CancellationToken::new();
     token.cancel();
     assert_eq!(
         supervise_reconcilers(&mut set, &token).await,
         Supervision::Shutdown
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconciler_and_its_child_stop_before_release_after_the_drain_deadline() {
+    let mut tasks = ReconcilerTasks::default();
+    let (started, ready) = oneshot::channel();
+    let (parent, mut parent_stopped) = oneshot::channel::<()>();
+    let (child, mut child_stopped) = oneshot::channel::<()>();
+    tasks.spawn(async move {
+        let mut children = JoinSet::new();
+        spawn_reconciler_child(&mut children, async move {
+            started.send(()).unwrap();
+            pending::<()>().await;
+            drop(child);
+        });
+        // Neither task observes the cooperative shutdown token.
+        pending::<()>().await;
+        drop((children, parent));
+    });
+    ready.await.unwrap();
+
+    let shutdown_at = Instant::now();
+    assert_eq!(tasks.stop().await, ShutdownOutcome::Stopped);
+    assert!(shutdown_at.elapsed() >= SHUTDOWN_DRAIN_TIMEOUT);
+    assert!(matches!(
+        parent_stopped.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed)
+    ));
+    assert!(matches!(
+        child_stopped.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed)
+    ));
 }
 
 #[test]
