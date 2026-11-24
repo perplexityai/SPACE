@@ -6,8 +6,10 @@ Tables named here are in volume-manager's own SQLite database.
 
 - `pplx-space-common-jobs` owns every `jobs` (`db/common`) status
   transition, including cancellation and restart recovery. New transfers
-  submit through the `BackgroundWorker` and run in `JobExecutor`; they never
-  write `jobs` themselves.
+  submit through `pplx-space-volmgr-store`'s `JobWorker` and run in
+  `JobExecutor`; they never write `jobs` themselves. Outside its tests, this
+  crate reaches its database and job queue only through that store, whose
+  `AGENTS.md` has the rules.
 - An exit path that leaves transfer or recovery tasks running calls
   `hard_exit` while holding `service.mutex` (`src/run.rs`); never release it
   by normal unwind. Startup cleans orphaned staging files before recovering

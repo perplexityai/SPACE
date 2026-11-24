@@ -3,19 +3,26 @@
 //! paged listing cannot answer.
 //!
 //! [`database`] migrates and opens the database for `pplx-space-volmgr`; the
-//! job queue itself is read and written through `pplx-space-common-jobs`.
-//! Every other function takes a `rusqlite::Connection`, so a caller can pass
-//! its own open transaction.
+//! service shares the one [`Connection`] it opens through a
+//! [`SharedConnection`]. The job queue runs through [`jobs::JobWorker`], which
+//! [`SharedConnection::background_worker`] builds over that same connection.
+//! Every other function takes a [`Connection`], so it runs under the
+//! caller's held lock. `AGENTS.md` lists the rules for this crate's public
+//! surface.
 
 #![forbid(unsafe_code)]
 
 pub mod database;
+mod handle;
+pub mod jobs;
+
+pub use handle::{Connection, ConnectionGuard, Error, Result, SharedConnection};
 
 use pplx_space_job_id::JobId;
 use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 use pplx_space_snapshot_model::TransferScopeId;
 use pplx_space_sql_locator::sql;
-use rusqlite::{Connection, params};
+use rusqlite::params;
 use std::{fmt, str::FromStr};
 
 /// Validated UUID spelling used as an attachment table key.
@@ -61,8 +68,8 @@ pub fn upsert_attachment(
     conn: &Connection,
     sandbox_id: &AttachmentSandboxKey,
     a: &VolumeAttachment,
-) -> rusqlite::Result<()> {
-    conn.execute(
+) -> Result<()> {
+    conn.0.execute(
         sql!(
             "INSERT INTO volume_attachments
              (sandbox_id, name, s3_bucket, s3_prefix, s3_region, read_only, byok_key_id)
@@ -91,8 +98,8 @@ pub fn delete_attachment(
     conn: &Connection,
     sandbox_id: &AttachmentSandboxKey,
     volume_name: &str,
-) -> rusqlite::Result<()> {
-    conn.execute(
+) -> Result<()> {
+    conn.0.execute(
         sql!("DELETE FROM volume_attachments WHERE sandbox_id = ?1 AND name = ?2"),
         params![sandbox_id.0.as_ref(), volume_name],
     )?;
@@ -102,8 +109,8 @@ pub fn delete_attachment(
 pub fn list_attachments(
     conn: &Connection,
     sandbox_id: &AttachmentSandboxKey,
-) -> rusqlite::Result<Vec<VolumeAttachment>> {
-    let mut stmt = conn.prepare(sql!(
+) -> Result<Vec<VolumeAttachment>> {
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, s3_bucket, s3_prefix, s3_region, read_only, byok_key_id
          FROM volume_attachments
          WHERE sandbox_id = ?1
@@ -119,15 +126,15 @@ pub fn list_attachments(
             byok_key_id: row.get(5)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn get_attachment(
     conn: &Connection,
     sandbox_id: &AttachmentSandboxKey,
     volume_name: &str,
-) -> rusqlite::Result<Option<VolumeAttachment>> {
-    let mut stmt = conn.prepare(sql!(
+) -> Result<Option<VolumeAttachment>> {
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT name, s3_bucket, s3_prefix, s3_region, read_only, byok_key_id
          FROM volume_attachments
          WHERE sandbox_id = ?1 AND name = ?2
@@ -143,7 +150,7 @@ pub fn get_attachment(
             byok_key_id: row.get(5)?,
         })
     })?;
-    rows.next().transpose()
+    Ok(rows.next().transpose()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,17 +159,22 @@ pub fn get_attachment(
 
 /// Complete keep-set for the node's privileged send leases. Cancelling work
 /// retains ownership until the executor's cleanup barrier has completed.
-pub fn active_btrfs_upload_payloads(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut query = conn.prepare(sql!("SELECT payload FROM jobs WHERE kind = 'push_btrfs_send' AND status IN ('pending', 'running', 'cancelling')"))?;
-    query.query_map([], |row| row.get(0))?.collect()
+pub fn active_btrfs_upload_payloads(conn: &Connection) -> Result<Vec<String>> {
+    let mut query = conn.0.prepare(sql!("SELECT payload FROM jobs WHERE kind = 'push_btrfs_send' AND status IN ('pending', 'running', 'cancelling')"))?;
+    Ok(query
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Jobs that have not reached a terminal state: the job queue's own count,
+/// under the caller's held connection.
+pub fn count_active_jobs(conn: &Connection) -> Result<u64> {
+    Ok(pplx_space_common_jobs::db::count_active_jobs(&conn.0)?)
 }
 
 /// Unfinished pull jobs submitted under `scope`, newest first.
-pub fn transfer_scope_job_ids(
-    conn: &Connection,
-    scope: TransferScopeId,
-) -> rusqlite::Result<Vec<JobId>> {
-    let mut stmt = conn.prepare(sql!(
+pub fn transfer_scope_job_ids(conn: &Connection, scope: TransferScopeId) -> Result<Vec<JobId>> {
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT job_id
            FROM jobs
           WHERE kind = 'pull'
@@ -170,8 +182,9 @@ pub fn transfer_scope_job_ids(
             AND json_extract(payload, '$.transfer_scope_id') = ?1
           ORDER BY created_at DESC, job_id DESC"
     ))?;
-    stmt.query_map([scope.to_string()], |row| row.get(0))?
-        .collect()
+    Ok(stmt
+        .query_map([scope.to_string()], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// A pending or running job's kind and raw payload.
@@ -185,11 +198,11 @@ pub struct JobPayloadRow {
 #[derive(Debug, thiserror::Error)]
 pub enum JobPayloadsError {
     #[error("prepare: {0}")]
-    Prepare(#[source] rusqlite::Error),
+    Prepare(#[source] Error),
     #[error("execute: {0}")]
-    Execute(#[source] rusqlite::Error),
+    Execute(#[source] Error),
     #[error("read row: {0}")]
-    Row(#[source] rusqlite::Error),
+    Row(#[source] Error),
 }
 
 /// Every pending or running job of either kind, unbounded: unlike the job
@@ -199,11 +212,12 @@ pub fn pending_or_running_job_payloads(
     kinds: [&str; 2],
 ) -> Result<Vec<JobPayloadRow>, JobPayloadsError> {
     let mut stmt = conn
+        .0
         .prepare(sql!(
             "SELECT kind, payload FROM jobs
                  WHERE kind IN (?1, ?2) AND status IN ('pending', 'running')"
         ))
-        .map_err(JobPayloadsError::Prepare)?;
+        .map_err(|error| JobPayloadsError::Prepare(error.into()))?;
     let rows = stmt
         .query_map(kinds, |row| {
             Ok(JobPayloadRow {
@@ -211,6 +225,7 @@ pub fn pending_or_running_job_payloads(
                 payload: row.get::<_, String>(1)?,
             })
         })
-        .map_err(JobPayloadsError::Execute)?;
-    rows.map(|row| row.map_err(JobPayloadsError::Row)).collect()
+        .map_err(|error| JobPayloadsError::Execute(error.into()))?;
+    rows.map(|row| row.map_err(|error| JobPayloadsError::Row(error.into())))
+        .collect()
 }

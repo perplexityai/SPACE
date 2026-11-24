@@ -311,7 +311,7 @@ mode = "required"
 # Without this ratchet, pplx-space-db-migrate, a store that depends on sqlx
 # and rusqlite, could name sbx-mgr's migrator or a default-path helper for its
 # database again, and a node service with a baselined `rusqlite` edge
-# (node-ctl-server, node-mgr, node-runtime-manager, template-mgr, volmgr,
+# (node-ctl-server, node-mgr, node-runtime-manager, template-mgr,
 # build-mgr-server) could open `SANDBOX_MANAGER_DB`.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema]
 patterns = [

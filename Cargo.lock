@@ -9370,14 +9370,18 @@ dependencies = [
 name = "pplx-space-volmgr-store"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-common-jobs",
  "pplx-space-job-id",
  "pplx-space-sandbox-model",
  "pplx-space-snapshot-model",
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
+ "ref-cast",
  "rusqlite",
  "sqlx",
  "thiserror 2.0.20",
+ "tokio-util",
+ "tonic",
 ]
 
 [[package]]
