@@ -24,18 +24,9 @@ pub use run::{
     VolmgrRunConfig, run,
 };
 
-pub use pplx_space_common_jobs::{JobPriority, PriorityBand};
 pub use pplx_space_object_store::ObjectCredentials;
 pub use pplx_space_volmgr_client::VOLMGR_SOCKET;
 pub use pplx_space_volmgr_client::proto;
+pub use pplx_space_volmgr_store::jobs::{JobPriority, PriorityBand};
 
-/// In-memory representation of a volume attachment row.
-#[derive(Debug, Clone)]
-pub struct VolumeAttachment {
-    pub name: String,
-    pub s3_bucket: String,
-    pub s3_prefix: String,
-    pub s3_region: String,
-    pub read_only: bool,
-    pub byok_key_id: Option<String>,
-}
+pub use pplx_space_volmgr_store::VolumeAttachment;

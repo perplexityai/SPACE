@@ -1,4 +1,5 @@
 use pplx_space_accounts::OrgId;
+use pplx_space_cluster_trigger_queue::ref_claims;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 use super::metadata::*;
@@ -487,7 +488,7 @@ impl ClusterApi for ClusterApiService {
         // A selected lookup answers with one release: where it matches a
         // release under each spelling of the digest, only the first one's
         // storage locations go with it. An unselected lookup gets only the
-        // tagged release's rows from the store.
+        // digest original's rows from the store.
         let release_id = rows.first().map(|first| first.release_id);
         let storage_locations = rows
             .into_iter()
@@ -680,7 +681,7 @@ impl ClusterApi for ClusterApiService {
                     id: release.id.to_string(),
                     template_name: release.template_name,
                     runtime: release.runtime,
-                    hash: release.hash,
+                    hash: cached_build_hash(release.hash),
                     created_at: format_time(release.created_at),
                     environment: release.environment,
                 }),
@@ -736,7 +737,7 @@ impl ClusterApi for ClusterApiService {
                 .into_iter()
                 .map(|release| WarmPoolTemplateRelease {
                     template_name: release.template_name,
-                    hash: release.content_hash,
+                    hash: cached_build_hash(release.content_hash),
                 })
                 .collect(),
         }))
@@ -1259,19 +1260,11 @@ impl ClusterApi for ClusterApiService {
         // payload columns are projected only for assigned-here rows; other
         // rows contribute 17 bytes to the partition instead of their
         // jsonb policy.
-        let rows = sqlx::query_as::<_, SandboxDesiredStateRow>(sql!(
-            "SELECT id AS sandbox_id,
-                    (active_node_id = $2) IS TRUE AS assigned_here,
-                    CASE WHEN active_node_id = $2
-                         THEN snapshots_enabled_desired END AS snapshots_enabled_desired,
-                    CASE WHEN active_node_id = $2
-                         THEN auto_lifecycle_json END AS auto_lifecycle_json
-             FROM sandboxes
-             WHERE id = ANY($1)"
-        ))
-        .bind(&sandbox_ids)
-        .bind(origin.id)
-        .fetch_all(&self.pool)
+        let rows = pplx_space_sandbox_store::node_desired_state::partition(
+            &self.pool,
+            &sandbox_ids,
+            origin.id,
+        )
         .await
         .map_err(|err| Status::internal(format!("query sandbox desired state: {err}")))?;
 
@@ -1296,36 +1289,11 @@ impl ClusterApi for ClusterApiService {
         // still says applied/healthy on this node, the next re-apply
         // detects the generation change and recovers. 60 s is a reasonable
         // upper bound on how long a 502 could persist in that scenario.
-        let exposure_rows = sqlx::query_as::<_, SandboxPortExposureDesiredStateRow>(sql!(
-            "SELECT spe.sandbox_id,
-                    spe.protocol,
-                    spe.guest_port,
-                    spe.desired_state
-             FROM sandbox_port_exposures spe
-             JOIN sandboxes s ON s.id = spe.sandbox_id
-             WHERE spe.sandbox_id = ANY($1)
-               AND s.active_node_id = $2
-               AND spe.source <> 'ecw'
-               AND (
-                   spe.apply_state != 'applied'
-                   OR (
-                       spe.desired_state = 'open'
-                       AND (
-                           spe.last_bridge_status IS NULL
-                           OR spe.last_bridge_status NOT IN
-                               ('direct', 'loopback_forwarded')
-                           OR spe.last_observed_at IS NULL
-                           OR spe.last_observed_at <
-                               NOW() - INTERVAL '60 seconds'
-                           OR spe.last_applied_node_id IS DISTINCT FROM $2
-                       )
-                   )
-               )
-             ORDER BY spe.sandbox_id, spe.guest_port ASC, spe.protocol ASC"
-        ))
-        .bind(&sandbox_ids)
-        .bind(origin.id)
-        .fetch_all(&self.pool)
+        let exposure_rows = pplx_space_sandbox_store::port_exposures::to_apply_on_node(
+            &self.pool,
+            &sandbox_ids,
+            origin.id,
+        )
         .await
         .map_err(|err| Status::internal(format!("query sandbox port exposures: {err}")))?;
 
@@ -1567,40 +1535,13 @@ impl ClusterApi for ClusterApiService {
         };
 
         let claim_token = format!("{}-{}", origin.id, Uuid::now_v7());
-        let rows = sqlx::query_as::<_, ClaimedFacetRefRow>(sql!(
-            "WITH picked AS (
-                 SELECT node_id, facet, element, requested_at
-                 FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND next_attempt_at <= NOW()
-                   AND dead_at IS NULL
-                   AND (
-                       claim_token = ''
-                       OR claimed_at <= NOW() - ($3 * INTERVAL '1 second')
-                   )
-                 ORDER BY requested_at ASC, facet ASC, element ASC
-                 LIMIT $2
-                 FOR UPDATE SKIP LOCKED
-             )
-             UPDATE node_reconcile_queue q
-             SET claim_token = $4,
-                 claim_generation = q.generation,
-                 claimed_at = NOW(),
-                 updated_at = NOW()
-             FROM picked
-             WHERE q.node_id = picked.node_id
-               AND q.facet = picked.facet
-               AND q.element = picked.element
-             RETURNING q.facet,
-                       NULLIF(q.element, '') AS element,
-                       q.traceparent,
-                       picked.requested_at"
-        ))
-        .bind(origin.id)
-        .bind(limit)
-        .bind(NODE_RECONCILE_CLAIM_STALE_SECS)
-        .bind(&claim_token)
-        .fetch_all(&self.pool)
+        let rows = ref_claims::claim_node_refs(
+            &self.pool,
+            origin.id,
+            limit,
+            NODE_RECONCILE_CLAIM_STALE_SECS,
+            &claim_token,
+        )
         .await
         .map_err(|err| Status::internal(format!("claim node reconcile refs: {err}")))?;
 
@@ -1642,43 +1583,27 @@ impl ClusterApi for ClusterApiService {
         let mut succeeded = 0_u64;
         for reference in request.succeeded {
             let reference = proto_facet_ref_to_storage(reference)?;
-            let result = sqlx::query(sql!(
-                "DELETE FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4
-                   AND generation = claim_generation"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            let completed = ref_claims::complete_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("complete reconcile success: {err}")))?;
-            succeeded = succeeded.saturating_add(result.rows_affected());
-            if result.rows_affected() != 0 {
+            succeeded = succeeded.saturating_add(completed);
+            if completed != 0 {
                 clear_facet_apply_failed_condition(&mut tx, origin.id, &reference).await?;
             }
 
-            sqlx::query(sql!(
-                "UPDATE node_reconcile_queue
-                 SET claim_token = '',
-                     claim_generation = 0,
-                     claimed_at = NULL,
-                     next_attempt_at = NOW(),
-                     updated_at = NOW()
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            ref_claims::release_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("release refreshed reconcile ref: {err}")))?;
         }
@@ -1693,99 +1618,56 @@ impl ClusterApi for ClusterApiService {
                 "node-ctl reconciliation failed without an error message".to_string()
             });
             let facet_for_metrics = reference.facet.clone();
-            let attempts = sqlx::query_scalar::<_, i32>(sql!(
-                "SELECT attempts
-                 FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .fetch_optional(&mut *tx)
+            let attempts = pplx_space_cluster_trigger_queue::claimed_ref_attempts(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("read reconcile retry count: {err}")))?
             .unwrap_or(0);
             let next_attempt = attempts.saturating_add(1);
-            let result = if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS {
-                sqlx::query(sql!(
-                    "UPDATE node_reconcile_queue
-                     SET attempts = attempts + 1,
-                         last_error = $5,
-                         dead_at = NOW(),
-                         dead_reason = $5,
-                         claim_token = '',
-                         claim_generation = 0,
-                         claimed_at = NULL,
-                         updated_at = NOW()
-                     WHERE node_id = $1
-                       AND facet = $2
-                       AND element = COALESCE($3, '')
-                       AND claim_token = $4
-                       AND generation = claim_generation"
-                ))
-                .bind(origin.id)
-                .bind(&reference.facet)
-                .bind(reference.element.as_deref())
-                .bind(&claim_token)
-                .bind(&error)
-                .execute(&mut *tx)
+            let transitioned = if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS {
+                ref_claims::dead_letter_claimed_ref(
+                    &mut *tx,
+                    origin.id,
+                    &reference.facet,
+                    reference.element.as_deref(),
+                    &claim_token,
+                    &error,
+                )
                 .await
             } else {
                 let delay_secs = reconcile_retry_delay_secs(attempts);
-                sqlx::query(sql!(
-                    "UPDATE node_reconcile_queue
-                     SET attempts = attempts + 1,
-                         last_error = $5,
-                         claim_token = '',
-                         claim_generation = 0,
-                         claimed_at = NULL,
-                         next_attempt_at = NOW() + ($6 * INTERVAL '1 second'),
-                         updated_at = NOW()
-                     WHERE node_id = $1
-                       AND facet = $2
-                       AND element = COALESCE($3, '')
-                       AND claim_token = $4
-                       AND generation = claim_generation"
-                ))
-                .bind(origin.id)
-                .bind(&reference.facet)
-                .bind(reference.element.as_deref())
-                .bind(&claim_token)
-                .bind(&error)
-                .bind(delay_secs)
-                .execute(&mut *tx)
+                ref_claims::retry_claimed_ref(
+                    &mut *tx,
+                    origin.id,
+                    &reference.facet,
+                    reference.element.as_deref(),
+                    &claim_token,
+                    &error,
+                    delay_secs,
+                )
                 .await
             }
             .map_err(|err| Status::internal(format!("complete reconcile failure: {err}")))?;
-            if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS && result.rows_affected() != 0 {
+            if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS && transitioned != 0 {
                 pplx_space_reconcile_metrics::queue_dead_letter(&facet_for_metrics);
             }
-            if result.rows_affected() != 0 {
+            if transitioned != 0 {
                 record_facet_apply_failed_condition(&mut tx, origin.id, &reference, &error).await?;
             }
-            failed = failed.saturating_add(result.rows_affected());
+            failed = failed.saturating_add(transitioned);
 
-            sqlx::query(sql!(
-                "UPDATE node_reconcile_queue
-                 SET claim_token = '',
-                     claim_generation = 0,
-                     claimed_at = NULL,
-                     next_attempt_at = NOW(),
-                     updated_at = NOW()
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            ref_claims::release_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("release refreshed failed ref: {err}")))?;
         }
@@ -1823,94 +1705,24 @@ impl ClusterApi for ClusterApiService {
             }));
         }
 
-        let sandbox_ids = states
+        let reports = states
             .iter()
-            .map(|state| state.sandbox_id.as_uuid())
-            .collect::<Vec<_>>();
-        let protocols = states
-            .iter()
-            .map(|state| state.protocol.as_str())
-            .collect::<Vec<_>>();
-        let guest_ports = states
-            .iter()
-            .map(|state| i32::from(state.guest_port))
-            .collect::<Vec<_>>();
-        let apply_states = states
-            .iter()
-            .map(|state| state.apply_state.as_str())
-            .collect::<Vec<_>>();
-        let errors = states
-            .iter()
-            .map(|state| state.error.as_deref())
-            .collect::<Vec<_>>();
-        let bridge_statuses = states
-            .iter()
-            .map(|state| state.bridge_status.as_deref())
-            .collect::<Vec<_>>();
-        let service_generations = states
-            .iter()
-            .map(|state| state.service_generation.as_deref())
+            .map(
+                |state| pplx_space_sandbox_store::port_exposures::ApplyStateReport {
+                    sandbox_id: state.sandbox_id,
+                    protocol: state.protocol.as_str(),
+                    guest_port: i32::from(state.guest_port),
+                    apply_state: state.apply_state.as_str(),
+                    error: state.error.as_deref(),
+                    bridge_status: state.bridge_status.as_deref(),
+                    service_generation: state.service_generation.as_deref(),
+                },
+            )
             .collect::<Vec<_>>();
 
-        let missed = sqlx::query_as::<_, PortExposureApplyMissRow>(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM UNNEST(
-                     $1::UUID[],
-                     $2::TEXT[],
-                     $3::INT[],
-                     $4::TEXT[],
-                     $5::TEXT[],
-                     $7::TEXT[],
-                     $8::TEXT[]
-                 ) AS input(sandbox_id, protocol, guest_port, apply_state, error,
-                            bridge_status, service_generation)
-             ),
-             updated AS (
-                 UPDATE sandbox_port_exposures spe
-                 SET apply_state = input.apply_state,
-                     last_applied_node_id =
-                         CASE WHEN input.apply_state = 'applied'
-                              THEN $6
-                              ELSE spe.last_applied_node_id
-                         END,
-                     last_error =
-                         CASE WHEN input.apply_state = 'failed'
-                              THEN input.error
-                              ELSE NULL
-                         END,
-                     last_bridge_status =
-                         COALESCE(input.bridge_status, spe.last_bridge_status),
-                     last_applied_bridge_generation =
-                         COALESCE(input.service_generation, spe.last_applied_bridge_generation),
-                     last_observed_at = NOW(),
-                     updated_at = NOW()
-                 FROM input
-                 JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE spe.sandbox_id = input.sandbox_id
-                   AND spe.protocol = input.protocol
-                   AND spe.guest_port = input.guest_port
-                   AND spe.sandbox_id = s.id
-                   AND s.active_node_id = $6
-                 RETURNING spe.sandbox_id, spe.protocol, spe.guest_port
-             )
-             SELECT input.sandbox_id, input.protocol, input.guest_port
-             FROM input
-             LEFT JOIN updated
-               ON updated.sandbox_id = input.sandbox_id
-              AND updated.protocol = input.protocol
-              AND updated.guest_port = input.guest_port
-             WHERE updated.sandbox_id IS NULL"
-        ))
-        .bind(sandbox_ids)
-        .bind(protocols)
-        .bind(guest_ports)
-        .bind(apply_states)
-        .bind(errors)
-        .bind(origin.id)
-        .bind(bridge_statuses)
-        .bind(service_generations)
-        .fetch_all(&self.pool)
+        let missed = pplx_space_sandbox_store::port_exposures::record_apply_states(
+            &self.pool, origin.id, &reports,
+        )
         .await
         .map_err(|err| Status::internal(format!("update sandbox port exposure states: {err}")))?;
 
@@ -1993,6 +1805,13 @@ impl ClusterApi for ClusterApiService {
     ) -> Result<Response<crate::proto::GetExecutionCurrencyResponse>, Status> {
         ClusterApiService::get_execution_currency(self, request).await
     }
+
+    async fn fetch_firewall_rules(
+        &self,
+        request: Request<crate::proto::FetchFirewallRulesRequest>,
+    ) -> Result<Response<crate::proto::FetchFirewallRulesResponse>, Status> {
+        ClusterApiService::fetch_firewall_rules(self, request).await
+    }
 }
 
 /// The node cache partition a release's stored binding puts its build in:
@@ -2004,4 +1823,15 @@ fn release_cache_partition(environment: Option<&str>) -> Option<&str> {
         *environment
             != pplx_space_execution_catalog::catalog::initial_environment_reference().to_string()
     })
+}
+
+/// The spelling template-manager keys its cached builds, release pins and GC
+/// protections on: a bare digest gains its `sha256:` prefix, as the
+/// manager's pull records it. The latest listing and the warm-pool set name
+/// one release per digest, which can be the bare spelling's, so returning
+/// `template_releases.hash` as stored would leave that build unpinned and
+/// unprotected on the node. A value that doesn't parse goes out as stored.
+fn cached_build_hash(hash: String) -> String {
+    hash.parse::<pplx_space_content_digest::ContentHash>()
+        .map_or(hash, |parsed| parsed.to_string())
 }

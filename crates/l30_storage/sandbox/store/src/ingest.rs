@@ -19,8 +19,10 @@
 //! tables (`sandbox_k8s_executions`, `sandbox_port_exposures`,
 //! `sandbox_observed_states`, the quarantine and node-facet tables,
 //! `sandbox_snapshot_inventory`, `snapshot_storage_locations`): splitting one
-//! would change what it does. The caller owns the transaction, the locking reads that select candidates,
-//! the other tables' own statements, and the events it emits.
+//! would change what it does. The caller owns the transaction, the other
+//! tables' own statements and the events it emits, and takes the locking
+//! reads that select candidates, some of them through
+//! [`crate::quarantine_publication`].
 //!
 //! A new lifecycle write here from a node report follows the rule for such
 //! writes in `crates/l40_api/internal/api/server/AGENTS.md`, which also lists
@@ -46,10 +48,11 @@ use sqlx::types::{Json, JsonValue};
 use uuid::Uuid;
 
 /// The `jsonb_to_recordset` column list of one published sandbox row with
-/// its transition receipt, as the publish path serializes it. Two statements
-/// still in the internal API splice it as well, and its names must match the
-/// fields that path serializes: `jsonb_to_recordset` reads a missing field as
-/// NULL.
+/// its transition receipt, as the publish path serializes it.
+/// [`lock_suspended_projection_candidates`](crate::quarantine_publication::lock_suspended_projection_candidates)
+/// and a statement still in the internal API splice it as well, and its names
+/// must match the fields that path serializes: `jsonb_to_recordset` reads a
+/// missing field as NULL.
 pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
     published_lifecycle TEXT,
@@ -671,13 +674,12 @@ pub async fn converge_published_stopped(
 /// published lifecycle equals its target state, naming the active execution's
 /// generation, activation attempt and target state; a route activation to be
 /// present; and either a `created` lifecycle (for a `created` target) or a
-/// running execution with a pod IP (for `started` and `paused`). It checks
-/// `active_node_id` only through an unlocked join, as of the statement's
-/// snapshot, and the `sandboxes` update does not re-check it, so a change to
-/// `active_node_id` committed after that snapshot is not seen. The lifecycle
-/// projection re-checks only that the row is outside the suspend, hold and
-/// delete lifecycles: if a newer suspend owns the row, the attempt is still
-/// released but its stale target is not projected.
+/// running execution with a pod IP (for `started` and `paused`). Only matching
+/// receipts lock sandboxes still on `node_id`, before updating their executions
+/// to match teardown's lock order. The lifecycle projection also requires
+/// that the row is outside the suspend, hold and delete lifecycles: if a newer
+/// suspend owns the row, the attempt is still released but its stale target
+/// is not projected.
 ///
 /// A projected `started` target also clears `command_ready_pending`. The node
 /// writes an activation-completed receipt only once the guest has passed its
@@ -693,23 +695,23 @@ pub async fn release_completed_activations(
         "WITH input AS (
              SELECT *
                FROM jsonb_to_recordset($2::jsonb) AS published({TRANSITION_RECEIPT_RECORD_COLUMNS})
-         ), released AS (
-             UPDATE sandbox_k8s_executions execution
-                SET activation_attempt_id = NULL,
-                    activation_attempt_expires_at = NULL,
-                    activation_attempt_target_state = NULL,
-                    updated_at = NOW()
-               FROM sandboxes sandbox, input
-              WHERE sandbox.id = execution.sandbox_id
-                AND input.sandbox_id = sandbox.id
-                AND sandbox.active_node_id = $1
+         ), locked AS MATERIALIZED (
+             SELECT execution.id AS execution_id,
+                    input.transition_receipt_execution_generation,
+                    input.transition_receipt_activation_attempt_id,
+                    input.transition_receipt_target_state
+               FROM input
+               JOIN sandboxes sandbox ON sandbox.id = input.sandbox_id
+               JOIN sandbox_k8s_executions execution ON execution.sandbox_id = sandbox.id
+              WHERE sandbox.active_node_id = $1
+                AND input.transition_receipt_kind = $3
+                AND input.published_lifecycle = input.transition_receipt_target_state
+                -- Retained receipts that no longer match need no sandbox lock.
                 AND execution.active
                 AND execution.generation = input.transition_receipt_execution_generation
                 AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
                 AND execution.route_activation_id IS NOT NULL
                 AND execution.activation_attempt_target_state = input.transition_receipt_target_state
-                AND input.transition_receipt_kind = $3
-                AND input.published_lifecycle = input.transition_receipt_target_state
                 AND (
                     (
                         input.transition_receipt_target_state = 'created'
@@ -721,7 +723,27 @@ pub async fn release_completed_activations(
                         AND execution.pod_ip IS NOT NULL
                     )
                 )
-              RETURNING execution.sandbox_id, input.transition_receipt_target_state
+              ORDER BY sandbox.id
+              FOR NO KEY UPDATE OF sandbox
+         ), released AS (
+             UPDATE sandbox_k8s_executions execution
+                SET activation_attempt_id = NULL,
+                    activation_attempt_expires_at = NULL,
+                    activation_attempt_target_state = NULL,
+                    updated_at = NOW()
+               FROM locked
+              WHERE execution.id = locked.execution_id
+                -- Execution-only writers can change these without the sandbox lock.
+                AND execution.active
+                AND execution.generation = locked.transition_receipt_execution_generation
+                AND execution.activation_attempt_id = locked.transition_receipt_activation_attempt_id
+                AND execution.route_activation_id IS NOT NULL
+                AND execution.activation_attempt_target_state = locked.transition_receipt_target_state
+                AND (
+                    locked.transition_receipt_target_state = 'created'
+                    OR (execution.state = 'running' AND execution.pod_ip IS NOT NULL)
+                )
+              RETURNING execution.sandbox_id, locked.transition_receipt_target_state
          )
          UPDATE sandboxes sandbox
             SET lifecycle = released.transition_receipt_target_state,
@@ -854,6 +876,28 @@ pub async fn recover_published_pause_failed(
     Ok(recovered == Some(sandbox_id.as_uuid()))
 }
 
+/// List the omitted IDs a complete census can mutate. Include active Direct
+/// sandboxes without an observation: the census can still tombstone them.
+/// The caller locks these IDs along with its explicit reports before writing.
+pub async fn census_prune_candidates(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    present_sandbox_ids: &[SandboxId],
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT sandbox_id FROM sandbox_observed_states
+          WHERE node_id = $1 AND NOT (sandbox_id = ANY($2))
+         UNION
+         SELECT id FROM sandboxes
+          WHERE active_node_id = $1 AND managed_by = $3 AND NOT (id = ANY($2))"
+    ))
+    .bind(node_id)
+    .bind(present_sandbox_ids)
+    .bind(SubstrateKind::Space)
+    .fetch_all(executor)
+    .await
+}
+
 /// Built once: every input is bound, so the text is the same on every publish.
 /// Mirrors the composed statement in [`crate::lost`].
 ///
@@ -869,7 +913,7 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
             "WITH removed AS (
              DELETE FROM sandbox_observed_states sos
              WHERE sos.node_id = $1
-               AND NOT (sos.sandbox_id = ANY($2))
+               AND sos.sandbox_id = ANY($2)
              RETURNING sos.sandbox_id
          ),
          removed_elements AS (
@@ -906,7 +950,7 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
                AND s.managed_by = $4
                AND s.lifecycle NOT IN ('deleted', 'deleting')
                AND NOT {released_with_durable_artifact}
-               AND NOT (s.id = ANY($2))
+               AND s.id = ANY($2)
              RETURNING s.id AS sandbox_id
          )
          DELETE FROM sandbox_snapshot_inventory
@@ -927,19 +971,21 @@ static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// rows whose artifact is durable
 /// ([`pplx_space_sandbox_portability::stopped_artifact_durable`]). The caller
 /// decides the census is complete and documents why the absence is sound.
+/// Mutate only the captured, advisory-locked candidates. A row that became
+/// visible later may be newer than this census and was not locked by it.
 /// `network_policy_facet` is the facet name of the per-sandbox network-policy
 /// rows it forgets.
 pub async fn prune_census_absent_sandboxes(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
-    present_sandbox_ids: &[SandboxId],
+    locked_candidate_ids: &[SandboxId],
     network_policy_facet: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(sqlx::AssertSqlSafe(
         PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
     ))
     .bind(node_id)
-    .bind(present_sandbox_ids)
+    .bind(locked_candidate_ids)
     .bind(network_policy_facet)
     .bind(SubstrateKind::Space)
     .execute(executor)

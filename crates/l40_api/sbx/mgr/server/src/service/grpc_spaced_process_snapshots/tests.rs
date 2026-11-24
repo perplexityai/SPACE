@@ -942,3 +942,172 @@ async fn snapshot_rpcs_refuse_gc_staging() {
         .collect();
     assert_eq!(*deletions.lock().unwrap(), by_name_then_all);
 }
+
+/// A root-owned sandbox in `state`, which a root caller may restart without
+/// a route identity.
+fn root_owned_sandbox(conn: &crate::db::Connection, state: SandboxState) -> String {
+    let sandbox = SandboxId::new().to_string();
+    crate::db::fixture::insert_test_sandbox(conn, &sandbox, state);
+    conn.execute(
+        "UPDATE sandboxes SET user = ?1 WHERE id = ?2",
+        crate::db::fixture::params![pplx_space_accounts::ROOT_SANDBOX_OWNER.as_str(), sandbox],
+    )
+    .unwrap();
+    sandbox
+}
+
+/// On a sealed node, a rollback that would restart the sandbox is refused
+/// before anything is stopped or rewritten, under the seal's marker; one that
+/// doesn't restart goes ahead to its input checks, as on a node never sealed.
+#[tokio::test]
+async fn a_sealed_node_refuses_a_restarting_rollback_before_it_stops_anything() {
+    let conn = crate::db::test_conn();
+    let sandbox = root_owned_sandbox(&conn, SandboxState::Started);
+    let service = SandboxManagerService::for_test(conn);
+    let rollback = |auto_restart: bool, snapshot_name: &str| {
+        service.rollback(crate::service::activation_support::internal_request(
+            RollbackRequest {
+                sandbox_id: sandbox.clone(),
+                snapshot_name: snapshot_name.to_owned(),
+                auto_restart,
+                ..Default::default()
+            },
+        ))
+    };
+    let missing_inputs = |status: Status| {
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+        assert!(status.message().contains("rootfs.ext4"), "{status}");
+    };
+    missing_inputs(rollback(true, "d-unsealed").await.unwrap_err());
+
+    service.activation_seal.seal(&service.db, 3).unwrap();
+    for snapshot_name in ["d-sealed", "f-sealed"] {
+        let refused = rollback(true, snapshot_name).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{refused}");
+        assert!(
+            refused
+                .message()
+                .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+            "{snapshot_name}: {refused}"
+        );
+        assert_eq!(
+            service.lookup_sandbox(&sandbox).unwrap().state,
+            SandboxStatus::from(SandboxState::Started)
+        );
+    }
+    missing_inputs(rollback(false, "d-sealed").await.unwrap_err());
+}
+
+/// A restart the seal refused after the rollback was applied, its row left
+/// stopped, says the rollback was applied and the sandbox needs starting,
+/// without the seal's marker, so a caller that retries on the marker doesn't
+/// roll back again; any other failure, a node not sealed or a row not
+/// stopped keeps the restart's own error.
+#[tokio::test]
+async fn a_late_seal_refusal_says_the_rollback_was_applied() {
+    let conn = crate::db::test_conn();
+    let stopped = root_owned_sandbox(&conn, SandboxState::Stopped);
+    let started = root_owned_sandbox(&conn, SandboxState::Started);
+    let service = SandboxManagerService::for_test(conn);
+    let refusal = || Status::failed_precondition("node activations are sealed (generation 3)");
+    let failure = |sandbox: &str, status: Status| {
+        service.rollback_restart_failure(sandbox, "d-snap", ActivationAdmissionKind::Cold, status)
+    };
+
+    let unsealed = failure(&stopped, refusal());
+    assert_eq!(unsealed.message(), refusal().message());
+
+    service.activation_seal.seal(&service.db, 3).unwrap();
+    let applied = failure(&stopped, refusal());
+    assert_eq!(applied.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        applied.message(),
+        format!(
+            "the rollback of sandbox {stopped} to d-snap was applied; the sandbox is stopped \
+             because the node was sealed during the rollback: start it"
+        )
+    );
+    assert!(
+        !applied
+            .message()
+            .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{applied:?}"
+    );
+    assert_eq!(
+        failure(&started, refusal()).message(),
+        refusal().message(),
+        "a row the restart moved on"
+    );
+    let other = failure(&stopped, Status::internal("launch failed"));
+    assert_eq!(
+        (other.code(), other.message()),
+        (tonic::Code::Internal, "launch failed")
+    );
+}
+
+/// On a node known sealed, a rollback that doesn't restart a stopped sandbox,
+/// which has no VM, is refused with the sealed refusal before it stops or
+/// rewrites anything: the row stays stopped with its pinned disk, and
+/// node-manager isn't asked. On a node never sealed, or one whose seal row
+/// couldn't be read, the same rollback goes ahead to its input checks, which
+/// the fixture's missing snapshot files fail before anything is rewritten.
+#[tokio::test]
+async fn a_sealed_node_refuses_a_rollback_without_restart_of_a_sandbox_without_a_vm() {
+    for (sealed, unknown) in [(false, false), (true, false), (false, true)] {
+        let conn = crate::db::test_conn();
+        let sandbox = root_owned_sandbox(&conn, SandboxState::Stopped);
+        if unknown {
+            conn.execute_batch("ALTER TABLE activation_seal RENAME TO activation_seal_hidden")
+                .unwrap();
+        }
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            crate::service::SandboxManagerServiceOptions {
+                node_manager: node_manager.connector(),
+                ..crate::service::SandboxManagerServiceOptions::for_test()
+            },
+        );
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
+        let execution = service.lookup_sandbox(&sandbox).unwrap().node_execution_id;
+        service
+            .local_artifacts()
+            .publish_stopped(&sandbox, execution, pin, "/tmp/stopped-disk")
+            .unwrap();
+        if sealed {
+            service.activation_seal.seal(&service.db, 3).unwrap();
+        }
+        assert_eq!(service.activation_seal.read_error().is_some(), unknown);
+        let answer = service
+            .rollback(crate::service::activation_support::internal_request(
+                RollbackRequest {
+                    sandbox_id: sandbox.clone(),
+                    snapshot_name: "d-snap".to_owned(),
+                    auto_restart: false,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap_err();
+        let case = format!("sealed: {sealed}, unknown: {unknown}: {answer:?}");
+        assert_eq!(answer.code(), tonic::Code::FailedPrecondition, "{case}");
+        if sealed {
+            assert!(
+                answer
+                    .message()
+                    .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+                "{case}"
+            );
+        } else {
+            assert!(answer.message().contains("rootfs.ext4"), "{case}");
+        }
+        let row = service.lookup_sandbox(&sandbox).unwrap();
+        assert_eq!(
+            row.state,
+            SandboxStatus::from(SandboxState::Stopped),
+            "{case}"
+        );
+        assert_eq!(row.current_local_artifact_id, Some(pin), "{case}");
+        assert_eq!(node_manager.calls(), Vec::<String>::new(), "{case}");
+    }
+}

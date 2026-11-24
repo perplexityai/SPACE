@@ -151,7 +151,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
-use std::sync::LazyLock;
 
 use crate::metrics::internal_api::{
     LocalBackupQueueOutcome, LocalBackupQueueRemoval, local_backup_queue_absent_not_durable,
@@ -160,11 +159,8 @@ use crate::metrics::internal_api::{
 };
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
-use pplx_space_sandbox_portability::{
-    artifact_has_durable_copy, queued_artifact_recoverable_without_node,
-};
+use pplx_space_sandbox_store::node_local_backup_pending::PendingBackupDepth;
 use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, LocalArtifactIdParseError};
-use pplx_space_sql_locator::sql;
 use tonic::Status;
 
 use crate::metadata::artifact_kind_from_proto;
@@ -258,12 +254,10 @@ impl ParsedPendingLocalBackups {
     /// The three parallel arrays the set-replace's `UNNEST` takes, built in one
     /// pass so "these stay index-aligned" is a property of one expression
     /// rather than of three separate walks staying in step.
-    fn unnest_columns(&self) -> (Vec<SandboxId>, Vec<LocalArtifactId>, Vec<&'static str>) {
+    fn unnest_columns(&self) -> (Vec<SandboxId>, Vec<LocalArtifactId>, Vec<ArtifactKind>) {
         self.entries
             .iter()
-            .map(|(sandbox_id, entry)| {
-                (*sandbox_id, entry.artifact_id, entry.artifact_kind.as_str())
-            })
+            .map(|(sandbox_id, entry)| (*sandbox_id, entry.artifact_id, entry.artifact_kind))
             .collect()
     }
 }
@@ -573,41 +567,29 @@ pub(super) async fn reconcile(
     let upserted = if reported_sandbox_ids.is_empty() {
         0
     } else {
-        sqlx::query(sql!(
-        "INSERT INTO node_local_backup_pending (node_id, sandbox_id, artifact_id, artifact_kind)
-         SELECT $1, reported.sandbox_id, reported.artifact_id, reported.artifact_kind
-           FROM UNNEST($2::UUID[], $3::UUID[], $4::TEXT[])
-                AS reported(sandbox_id, artifact_id, artifact_kind)
-          WHERE EXISTS (
-                    SELECT 1 FROM sandboxes WHERE sandboxes.id = reported.sandbox_id
-                )
-         ON CONFLICT (node_id, sandbox_id) DO UPDATE
-            SET artifact_id = EXCLUDED.artifact_id,
-                artifact_kind = EXCLUDED.artifact_kind"
-    ))
-        .bind(node_id.as_uuid())
-        .bind(&reported_sandbox_ids)
-        .bind(&reported_artifact_ids)
-        .bind(&reported_artifact_kinds)
-        .execute(&mut *conn)
+        pplx_space_sandbox_store::node_local_backup_pending::upsert_reported(
+            &mut *conn,
+            node_id,
+            &reported_sandbox_ids,
+            &reported_artifact_ids,
+            &reported_artifact_kinds,
+        )
         .await
         .map_err(|err| Status::internal(format!("mirror reported pending local backups: {err}")))?
-        .rows_affected()
     };
 
     let deleted_durable = delete_durable_absent(conn, node_id, &reported_sandbox_ids).await?;
 
     // Counted after the delete, so what remains absent is exactly the
     // population that could not be confirmed durable.
-    let (depth, retained_absent): (i64, i64) = sqlx::query_as(sql!(
-        "SELECT COUNT(*),
-                COUNT(*) FILTER (WHERE NOT (sandbox_id = ANY($2)))
-           FROM node_local_backup_pending
-          WHERE node_id = $1"
-    ))
-    .bind(node_id.as_uuid())
-    .bind(&reported_sandbox_ids)
-    .fetch_one(&mut *conn)
+    let PendingBackupDepth {
+        depth,
+        retained_absent,
+    } = pplx_space_sandbox_store::node_local_backup_pending::depth(
+        &mut *conn,
+        node_id,
+        &reported_sandbox_ids,
+    )
     .await
     .map_err(|err| Status::internal(format!("count mirrored pending local backups: {err}")))?;
 
@@ -623,43 +605,15 @@ pub(super) async fn reconcile(
     })
 }
 
-/// Built once: every input is a literal, so the composed text is identical
-/// on every census, and this runs for each node each minute. Same shape as
-/// `sandbox_quarantine_store`'s recovery queries, and the `line!()` the
-/// `sql!` locator captures is fixed either way.
-///
-/// At module scope rather than inside [`delete_durable_absent`] so
-/// `tests::the_delete_guard_resolves_through_indexes_not_a_history_scan` can
-/// EXPLAIN the statement this function executes instead of a copy of it: a
-/// copy pins the shared predicate but not the `USING`/`WHERE` scaffolding
-/// around it.
-static DELETE_DURABLE_ABSENT: LazyLock<String> = LazyLock::new(|| {
-    let recoverable = queued_artifact_recoverable_without_node(
-        "sandbox",
-        "queued.artifact_id",
-        "queued.artifact_kind",
-        "queued.node_id",
-    );
-    sql!(
-        format!(
-            "DELETE FROM node_local_backup_pending queued
-              USING sandboxes sandbox
-              WHERE queued.node_id = $1
-                AND sandbox.id = queued.sandbox_id
-                AND NOT (queued.sandbox_id = ANY($2))
-                AND {recoverable}"
-        )
-        .as_str()
-    )
-});
-
 /// Remove the rows this node no longer reports **and** which the control plane
 /// can prove are recoverable without that node's disk.
 ///
-/// The proof is [`queued_artifact_recoverable_without_node`], which lives in
-/// `pplx-space-sandbox-portability` rather than here because the drain that
-/// will read this queue has to agree with the census that wrote it about what
-/// "recoverable" means, and a second spelling is how the two drift. Its two
+/// The proof is
+/// [`queued_artifact_recoverable_without_node`](pplx_space_sandbox_portability::queued_artifact_recoverable_without_node),
+/// which lives in `pplx-space-sandbox-portability` rather than here because
+/// the drain that will read this queue has to agree with the census that
+/// wrote it about what "recoverable" means, and a second spelling is how the
+/// two drift. Its two
 /// durability arms are identity-tied and neither is timestamped: whether the
 /// queue row's own artifact has a durable copy, and whether the sandbox's
 /// *current* artifact does once it has left this node. There is deliberately
@@ -675,17 +629,13 @@ async fn delete_durable_absent(
     node_id: NodeId,
     reported_sandbox_ids: &[SandboxId],
 ) -> Result<u64, Status> {
-    Ok(
-        sqlx::query(sqlx::AssertSqlSafe(DELETE_DURABLE_ABSENT.as_str()))
-            .bind(node_id.as_uuid())
-            .bind(reported_sandbox_ids)
-            .execute(conn)
-            .await
-            .map_err(|err| {
-                Status::internal(format!("prune durable absent pending local backups: {err}"))
-            })?
-            .rows_affected(),
+    pplx_space_sandbox_store::node_local_backup_pending::delete_durable_absent(
+        conn,
+        node_id,
+        reported_sandbox_ids,
     )
+    .await
+    .map_err(|err| Status::internal(format!("prune durable absent pending local backups: {err}")))
 }
 
 /// The artifact identity a finalize just made durable.
@@ -716,9 +666,10 @@ pub(super) struct FinalizedArtifact {
 /// finalize alone, because a `ready` state is not by itself proof that a live
 /// copy exists: the snapshot's only storage location can already have been
 /// orphaned when the finalize flips the row. Requiring
-/// [`artifact_has_durable_copy`] makes the two exits agree on what "durable"
-/// means, which is why that proof lives in `pplx-space-sandbox-portability`
-/// rather than being spelled out twice.
+/// [`artifact_has_durable_copy`](pplx_space_sandbox_portability::artifact_has_durable_copy)
+/// makes the two exits agree on what "durable" means, which is why that
+/// proof lives in `pplx-space-sandbox-portability` rather than being spelled
+/// out twice.
 ///
 /// For the common class there is no census backstop, which is what makes the
 /// conjunct load-bearing rather than defensive. When the artifact has a
@@ -745,33 +696,15 @@ pub(super) async fn clear_finalized(
     conn: &mut sqlx::PgConnection,
     finalized: FinalizedArtifact,
 ) -> Result<bool, Status> {
-    /// Built once: every input is a bind placeholder, so the composed text is
-    /// identical on every finalize. Same shape as `DELETE_DURABLE_ABSENT`.
-    static DELETE_FINALIZED: LazyLock<String> = LazyLock::new(|| {
-        let durable = artifact_has_durable_copy("$2", "$3", "$4");
-        sql!(
-            format!(
-                "DELETE FROM node_local_backup_pending
-                  WHERE node_id = $1
-                    AND sandbox_id = $2
-                    AND artifact_id = $3
-                    AND artifact_kind = $4
-                    AND {durable}"
-            )
-            .as_str()
-        )
-    });
-    let removed = sqlx::query(sqlx::AssertSqlSafe(DELETE_FINALIZED.as_str()))
-        .bind(finalized.source_node_id.as_uuid())
-        .bind(finalized.sandbox_id.as_uuid())
-        .bind(finalized.artifact_id.as_uuid())
-        .bind(finalized.artifact_kind.as_str())
-        .execute(conn)
-        .await
-        .map_err(|err| Status::internal(format!("clear finalized pending local backup: {err}")))?
-        .rows_affected()
-        > 0;
-    Ok(removed)
+    pplx_space_sandbox_store::node_local_backup_pending::delete_finalized(
+        conn,
+        finalized.source_node_id,
+        finalized.sandbox_id,
+        finalized.artifact_id,
+        finalized.artifact_kind,
+    )
+    .await
+    .map_err(|err| Status::internal(format!("clear finalized pending local backup: {err}")))
 }
 
 #[cfg(test)]

@@ -2289,9 +2289,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -4828,8 +4828,23 @@ dependencies = [
  "pplx-space-job-id",
  "pplx-space-k8s-ids",
  "pplx-space-sql-codec",
+ "pplx-space-uuid-id",
  "serde",
  "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-admin-audit-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "sqlx",
+ "time",
+ "tokio",
  "uuid",
 ]
 
@@ -4863,6 +4878,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-execution-spec",
+ "pplx-space-node-drain",
  "pplx-space-node-model",
  "pplx-space-sandbox-model",
  "pplx-space-template-model",
@@ -4896,6 +4912,7 @@ dependencies = [
  "oci-spec",
  "percent-encoding",
  "pplx-space-accounts",
+ "pplx-space-admin-audit-store",
  "pplx-space-admin-protocol",
  "pplx-space-api-route",
  "pplx-space-artifact-model",
@@ -4904,7 +4921,9 @@ dependencies = [
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
  "pplx-space-byok-model",
+ "pplx-space-byok-store",
  "pplx-space-byte-size",
+ "pplx-space-cluster-id",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-grpc",
@@ -4913,7 +4932,9 @@ dependencies = [
  "pplx-space-credential-injection",
  "pplx-space-credential-injection-store",
  "pplx-space-credmgr-client",
+ "pplx-space-data-plane-session-store",
  "pplx-space-db-test-fixtures",
+ "pplx-space-direct-store",
  "pplx-space-durations",
  "pplx-space-ecw-credential",
  "pplx-space-env-vars",
@@ -4923,6 +4944,9 @@ dependencies = [
  "pplx-space-feature-flags",
  "pplx-space-federated-grant-store",
  "pplx-space-federated-identity",
+ "pplx-space-firewall-rules-model",
+ "pplx-space-firewall-rules-protocol",
+ "pplx-space-firewall-rules-store",
  "pplx-space-grpc-metrics",
  "pplx-space-grpc-server",
  "pplx-space-guest-process",
@@ -4937,15 +4961,19 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-execution-inventory-store",
+ "pplx-space-node-group-store",
  "pplx-space-node-mgr-client",
  "pplx-space-node-model",
  "pplx-space-node-registration-store",
  "pplx-space-node-status-store",
+ "pplx-space-node-template-inventory-store",
  "pplx-space-observability",
  "pplx-space-policy-authority",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-public-api-http",
+ "pplx-space-public-operation-store",
  "pplx-space-rpc-auth",
  "pplx-space-rpc-contracts",
  "pplx-space-runtime-environment-catalog-store",
@@ -4970,8 +4998,10 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
  "pplx-space-template-release-store",
  "pplx-space-template-runtime",
+ "pplx-space-template-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-work-coalescer",
@@ -5116,6 +5146,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
  "form_urlencoded",
@@ -5123,6 +5154,7 @@ dependencies = [
  "reqwest 0.13.5",
  "thiserror 2.0.20",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -5268,10 +5300,11 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "futures-util",
+ "pplx-space-accounts",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
+ "pplx-space-build-mgr-store",
  "pplx-space-common-grpc",
- "pplx-space-common-jobs",
  "pplx-space-content-digest",
  "pplx-space-execution-spec",
  "pplx-space-grpc-server",
@@ -5294,6 +5327,22 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-build-mgr-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-common-jobs",
+ "pplx-space-job-id",
+ "pplx-space-sql-locator",
+ "ref-cast",
+ "rusqlite",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio-util",
+ "tonic",
 ]
 
 [[package]]
@@ -5321,6 +5370,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-byok-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-byok-model",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-byte-size"
 version = "0.8.2"
 dependencies = [
@@ -5345,6 +5409,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "pplx-space-accounts",
+ "pplx-space-admin-audit-store",
  "pplx-space-api",
  "pplx-space-api-route",
  "pplx-space-artifact-model",
@@ -5355,8 +5420,10 @@ dependencies = [
  "pplx-space-cluster-id",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-reconciler",
+ "pplx-space-cluster-trigger-queue",
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
+ "pplx-space-cpu-arch",
  "pplx-space-db-test-fixtures",
  "pplx-space-durations",
  "pplx-space-env-vars",
@@ -5365,6 +5432,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-feature-flags",
  "pplx-space-federated-identity",
+ "pplx-space-firewall-rules-store",
  "pplx-space-grpc-server",
  "pplx-space-guest-process",
  "pplx-space-k8s-ids",
@@ -5373,13 +5441,17 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-group-store",
  "pplx-space-node-model",
+ "pplx-space-node-registration-store",
+ "pplx-space-node-status-store",
  "pplx-space-observability",
  "pplx-space-policy-authority",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-rpc-contracts",
  "pplx-space-runtime-environment-catalog-store",
+ "pplx-space-runtime-environment-policy-store",
  "pplx-space-runtime-upgrade-campaign-store",
  "pplx-space-sandbox-model",
  "pplx-space-sandbox-pod",
@@ -5395,7 +5467,10 @@ dependencies = [
  "pplx-space-snapshot-store",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
+ "pplx-space-template-manifest",
  "pplx-space-template-model",
+ "pplx-space-template-release-store",
+ "pplx-space-template-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "prost-types",
@@ -5452,7 +5527,10 @@ dependencies = [
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
  "pplx-space-template-release-store",
+ "pplx-space-template-store",
+ "rstest",
  "serde",
  "sqlx",
  "thiserror 2.0.20",
@@ -5473,6 +5551,7 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-node-api-client",
  "pplx-space-node-model",
+ "pplx-space-postgres-pool",
  "pplx-space-reconcile-metrics",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
@@ -5496,6 +5575,9 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-node-model",
  "pplx-space-observability",
+ "pplx-space-postgres-pool",
+ "pplx-space-rpc-contracts",
+ "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
  "sqlx",
@@ -5700,6 +5782,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-artifact-model",
  "pplx-space-byok-model",
+ "pplx-space-byok-store",
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
  "pplx-space-credential-injection",
@@ -5725,12 +5808,17 @@ dependencies = [
  "pplx-space-postgres-pool",
  "pplx-space-rpc-auth",
  "pplx-space-sandbox-model",
+ "pplx-space-sandbox-store",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
+ "pplx-space-snapshot-store",
  "pplx-space-sql-locator",
+ "pplx-space-storage-vend-store",
  "pplx-space-subject-model",
  "pplx-space-template-model",
+ "pplx-space-template-release-store",
+ "pplx-space-template-store",
  "pplx-space-test-env",
  "pplx-space-test-hooks",
  "pplx-space-uds-peer-auth",
@@ -5870,6 +5958,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-data-plane-session-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "pplx-space-data-plane-svc"
 version = "0.8.2"
 dependencies = [
@@ -5899,6 +6002,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-host-layout",
  "pplx-space-migration-checksums",
+ "pplx-space-node-runtime-manager-store",
  "pplx-space-sbx-mgr-store",
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
@@ -5952,6 +6056,20 @@ dependencies = [
  "nix 0.31.3",
  "tempfile",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-direct-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-node-model",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -6125,12 +6243,14 @@ version = "0.8.2"
 dependencies = [
  "jiff",
  "pplx-space-accounts",
+ "pplx-space-cluster-trigger-queue",
  "pplx-space-db-test-fixtures",
  "pplx-space-firewall-rules-model",
  "pplx-space-firewall-rules-protocol",
  "pplx-space-node-status-store",
  "pplx-space-rollout-queue",
  "pplx-space-sql-locator",
+ "pplx-space-state-reconciliation",
  "pplx-space-test-env",
  "sqlx",
  "thiserror 2.0.20",
@@ -6288,6 +6408,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
+ "pplx-space-data-plane-session-store",
  "pplx-space-db-test-fixtures",
  "pplx-space-durations",
  "pplx-space-ecw-credential",
@@ -6296,6 +6417,8 @@ dependencies = [
  "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-execution-spec",
+ "pplx-space-firewall-rules-protocol",
+ "pplx-space-firewall-rules-store",
  "pplx-space-grpc-server",
  "pplx-space-ingress-admission",
  "pplx-space-k8s-ids",
@@ -6304,15 +6427,18 @@ dependencies = [
  "pplx-space-network-roles",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
+ "pplx-space-node-execution-inventory-store",
  "pplx-space-node-mgr-client",
  "pplx-space-node-model",
+ "pplx-space-node-registration-store",
+ "pplx-space-node-status-store",
+ "pplx-space-node-template-inventory-store",
  "pplx-space-observability",
  "pplx-space-policy-authority",
  "pplx-space-postgres-pool",
  "pplx-space-public-api",
  "pplx-space-reconcile-metrics",
  "pplx-space-rpc-auth",
- "pplx-space-rpc-contracts",
  "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-grpc",
@@ -6322,6 +6448,7 @@ dependencies = [
  "pplx-space-sandbox-quarantine-store",
  "pplx-space-sandbox-residency",
  "pplx-space-sandbox-store",
+ "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
  "pplx-space-semver",
  "pplx-space-snapshot-model",
@@ -6330,6 +6457,9 @@ dependencies = [
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
+ "pplx-space-template-release-original",
+ "pplx-space-template-release-store",
+ "pplx-space-template-store",
  "pplx-space-test-env",
  "prost",
  "prost-types",
@@ -6369,9 +6499,9 @@ name = "pplx-space-job-id"
 version = "0.8.2"
 dependencies = [
  "pplx-space-sql-codec",
+ "pplx-space-uuid-id",
  "rusqlite",
  "serde",
- "thiserror 2.0.20",
  "uuid",
 ]
 
@@ -6901,6 +7031,7 @@ dependencies = [
  "pplx-space-metrics-emit",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
+ "pplx-space-node-ctl-store",
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
@@ -6914,7 +7045,6 @@ dependencies = [
  "pplx-space-semver",
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
- "pplx-space-sqlite",
  "pplx-space-state-reconciliation",
  "pplx-space-template-mgr-client",
  "pplx-space-template-model",
@@ -6925,7 +7055,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -6935,6 +7064,20 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-node-ctl-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-locator",
+ "pplx-space-sqlite",
+ "ref-cast",
+ "rusqlite",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -6966,6 +7109,45 @@ dependencies = [
  "pplx-space-host-linux",
  "pplx-space-test-hooks",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-node-drain"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-codec",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-node-execution-inventory-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde",
+ "sqlx",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "pplx-space-node-group-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-node-model",
+ "pplx-space-sql-locator",
+ "pplx-space-template-model",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -7010,6 +7192,7 @@ dependencies = [
  "pplx-space-node-ctl-client",
  "pplx-space-node-disk-admission",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-mgr-store",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-rpc-contracts",
@@ -7032,7 +7215,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "socket2",
- "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -7097,6 +7279,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-node-mgr-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-node-mgr-protocol",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "pplx-space-sqlite",
+ "ref-cast",
+ "rusqlite",
+ "sqlx",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-node-mgr-svc"
 version = "0.8.2"
 dependencies = [
@@ -7114,8 +7310,10 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-k8s-ids",
+ "pplx-space-node-drain",
  "pplx-space-sql-codec",
  "pplx-space-template-model",
+ "pplx-space-uuid-id",
  "serde",
  "thiserror 2.0.20",
  "uuid",
@@ -7129,10 +7327,15 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-k8s-ids",
  "pplx-space-k8s-node-id",
+ "pplx-space-node-drain",
  "pplx-space-node-model",
+ "pplx-space-sandbox-residency",
  "pplx-space-sql-locator",
+ "serde",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.20",
+ "time",
  "tokio",
 ]
 
@@ -7214,9 +7417,9 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
+ "pplx-space-node-runtime-manager-store",
  "pplx-space-observability",
  "pplx-space-s3-http-client",
- "pplx-space-sql-locator",
  "pplx-space-sqlite",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
@@ -7275,6 +7478,25 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+]
+
+[[package]]
+name = "pplx-space-node-runtime-manager-store"
+version = "0.8.2"
+dependencies = [
+ "jiff",
+ "pplx-space-common-jobs",
+ "pplx-space-content-digest",
+ "pplx-space-job-id",
+ "pplx-space-sql-locator",
+ "pplx-space-sqlite",
+ "ref-cast",
+ "rusqlite",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio-util",
+ "tonic",
 ]
 
 [[package]]
@@ -7347,11 +7569,31 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-spec",
  "pplx-space-sql-locator",
  "pplx-space-test-env",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.20",
+ "time",
  "tokio",
+]
+
+[[package]]
+name = "pplx-space-node-template-inventory-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-execution-spec",
+ "pplx-space-node-model",
+ "pplx-space-sql-locator",
+ "pplx-space-template-model",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -7447,8 +7689,10 @@ dependencies = [
 name = "pplx-space-postgres-pool"
 version = "0.8.2"
 dependencies = [
+ "futures-core",
  "log",
  "pplx-space-db-identity",
+ "pplx-space-db-test-fixtures",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "pplx-space-postgres-contention",
@@ -7499,6 +7743,24 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-public-operation-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-public-api",
+ "pplx-space-sandbox-model",
+ "pplx-space-sql-locator",
+ "pplx-space-test-env",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
  "uuid",
 ]
 
@@ -7675,6 +7937,7 @@ dependencies = [
  "pplx-space-linux-ids",
  "pplx-space-node-model",
  "pplx-space-sql-codec",
+ "pplx-space-uuid-id",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -7693,6 +7956,7 @@ dependencies = [
  "pplx-space-byte-size",
  "pplx-space-content-digest",
  "pplx-space-env-vars",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-spec",
  "pplx-space-guest-process",
  "pplx-space-net-common",
@@ -7730,6 +7994,7 @@ dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
  "pplx-space-sandbox-model",
+ "pplx-space-snapshot-model",
  "pplx-space-sql-locator",
  "pplx-space-test-env",
  "sqlx",
@@ -7769,6 +8034,7 @@ dependencies = [
  "pplx-space-semver",
  "pplx-space-snapshot-model",
  "pplx-space-sql-locator",
+ "pplx-space-state-reconciliation",
  "pplx-space-test-env",
  "serde",
  "serde_json",
@@ -7783,9 +8049,12 @@ dependencies = [
 name = "pplx-space-sandbox-teardown"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-node-model",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
+ "serde_json",
  "sqlx",
 ]
 
@@ -8119,6 +8388,7 @@ dependencies = [
  "pplx-space-execution-spec",
  "pplx-space-sql-codec",
  "pplx-space-template-model",
+ "pplx-space-uuid-id",
  "serde",
  "thiserror 2.0.20",
  "uuid",
@@ -8602,14 +8872,23 @@ name = "pplx-space-state-reconciliation"
 version = "0.8.2"
 dependencies = [
  "pplx-space-sandbox-model",
+ "pplx-space-sql-codec",
  "pplx-space-template-model",
- "sqlx",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "pplx-space-stopwatch"
 version = "0.8.2"
+
+[[package]]
+name = "pplx-space-storage-vend-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-sql-locator",
+ "sqlx",
+]
 
 [[package]]
 name = "pplx-space-subject-model"
@@ -8656,6 +8935,7 @@ dependencies = [
  "blake3",
  "futures-util",
  "hex",
+ "http-body-util",
  "jiff",
  "nix 0.31.3",
  "pplx-space-accounts",
@@ -8663,7 +8943,6 @@ dependencies = [
  "pplx-space-auto-lifecycle",
  "pplx-space-btrfs",
  "pplx-space-common-grpc",
- "pplx-space-common-jobs",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
  "pplx-space-db-test-fixtures",
@@ -8696,8 +8975,6 @@ dependencies = [
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
- "pplx-space-sql-locator",
- "pplx-space-sqlite",
  "pplx-space-state-reconciliation",
  "pplx-space-stopwatch",
  "pplx-space-subject-model",
@@ -8711,6 +8988,7 @@ dependencies = [
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
  "pplx-space-volmgr-client",
+ "prost",
  "prost-types",
  "rand 0.10.2",
  "rstest",
@@ -8777,8 +9055,20 @@ dependencies = [
 name = "pplx-space-template-mgr-store"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-auto-lifecycle",
+ "pplx-space-common-jobs",
+ "pplx-space-net-common",
+ "pplx-space-policy-authority",
  "pplx-space-sql-locator",
+ "pplx-space-sqlite",
+ "pplx-space-template-model",
+ "ref-cast",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tonic",
 ]
 
 [[package]]
@@ -8840,6 +9130,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-template-release-original"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "pplx-space-template-release-store",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-template-release-store"
 version = "0.8.2"
 dependencies = [
@@ -8848,16 +9151,23 @@ dependencies = [
  "aws-credential-types",
  "bytes",
  "http 1.5.0",
+ "pplx-space-accounts",
  "pplx-space-artifact-model",
  "pplx-space-content-digest",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-spec",
  "pplx-space-object-store",
  "pplx-space-sql-locator",
+ "pplx-space-template-model",
+ "pplx-space-template-release-original",
+ "pplx-space-template-store",
  "pplx-space-test-env",
+ "rstest",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "uuid",
 ]
@@ -8871,6 +9181,26 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "toml",
+]
+
+[[package]]
+name = "pplx-space-template-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-accounts",
+ "pplx-space-auto-lifecycle",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-net-common",
+ "pplx-space-sql-locator",
+ "pplx-space-state-reconciliation",
+ "pplx-space-template-model",
+ "pplx-space-test-env",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -8946,6 +9276,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-uuid-id"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-sql-codec",
+ "rusqlite",
+ "serde",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-valkey"
 version = "0.8.2"
 dependencies = [
@@ -8986,19 +9327,17 @@ dependencies = [
  "pplx-space-service-host",
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
- "pplx-space-sql-locator",
- "pplx-space-sqlite",
  "pplx-space-subject-model",
  "pplx-space-test-env",
  "pplx-space-uds-peer-auth",
  "pplx-space-unix-socket-bind",
  "pplx-space-volmgr-client",
+ "pplx-space-volmgr-store",
  "rstest",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -9049,6 +9388,24 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+]
+
+[[package]]
+name = "pplx-space-volmgr-store"
+version = "0.8.2"
+dependencies = [
+ "pplx-space-common-jobs",
+ "pplx-space-job-id",
+ "pplx-space-sandbox-model",
+ "pplx-space-snapshot-model",
+ "pplx-space-sql-locator",
+ "pplx-space-sqlite",
+ "ref-cast",
+ "rusqlite",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio-util",
+ "tonic",
 ]
 
 [[package]]
@@ -11578,9 +11935,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",

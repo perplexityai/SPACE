@@ -1,17 +1,25 @@
 # Repository structure rules, checked by `cargo arch` (crates/tools/archcheck).
 
-# Direct-only control-plane Postgres tables belong to the Direct substrate;
-# existing users outside it are baselined until moved behind it. Postgres folds
-# unquoted identifiers, so the names match in any case.
+# Direct-only control-plane Postgres tables belong to the Direct substrate and
+# its store, pplx-space-direct-store; existing users outside them are baselined
+# until moved behind them. Postgres folds unquoted identifiers, so the names
+# match in any case. Naming the store's crate counts as a use, so its verbs
+# stay behind the Direct substrate too. A store's `direct` module may also name
+# these tables: a statement whose main table that store owns, but which joins a
+# Direct table, moves there verbatim.
 [rules.pattern_ratchet.direct_tables]
 patterns = [
   '(?i)\bnode_direct\b',
   '(?i)\bsandbox_direct_route_identities\b',
   '(?i)\bsandbox_direct_route_provenance\b',
+  '\bpplx_space_direct_store\b',
 ]
 allow = [
   "crates/l40_api/api/src/controllers/substrate/direct.rs",
   "crates/l40_api/api/src/controllers/substrate/direct/**",
+  "crates/l30_storage/direct/store/**",
+  "crates/l30_storage/**/src/direct.rs",
+  "crates/l30_storage/**/src/direct/**",
 ]
 
 [rules.pattern_ratchet.direct_tables.no_crossing]       # only allowed and listed files may match
@@ -302,9 +310,8 @@ mode = "required"
 # edges, and `state.writes` scans only stores' and helpers' write statements.
 # Without this ratchet, pplx-space-db-migrate, a store that depends on sqlx
 # and rusqlite, could name sbx-mgr's migrator or a default-path helper for its
-# database again, and a node service with a baselined driver edge
-# (node-ctl-server, node-mgr, node-runtime-manager, template-mgr, volmgr,
-# build-mgr-server) could open `SANDBOX_MANAGER_DB`.
+# database again, and a node service with a baselined `rusqlite` edge could open
+# `SANDBOX_MANAGER_DB`.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema]
 patterns = [
   '\bpplx_space_sbx_mgr_migrations\b',
@@ -358,8 +365,12 @@ mode = "advisory"
 # matrix and how to fix a finding: crates/tools/archcheck/README.md (Layers).
 
 # Each store's users: the l40_api and l30_storage crates that own its state
-# and use the store today.
+# and use the store today, and the coordinators that call it.
 [rules.layers.store_users]
+pplx-space-admin-audit-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+]
 pplx-space-cluster-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
@@ -368,22 +379,62 @@ pplx-space-cluster-pool = [
 ]
 pplx-space-cluster-trigger-queue = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-cluster-reconciler",
   "pplx-space-internal-api-server",
 ]
+pplx-space-build-mgr-store = ["pplx-space-build-mgr-server"]
+pplx-space-byok-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
-pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
-pplx-space-node-registration-store = ["pplx-space-api", "pplx-space-credmgr"]
-pplx-space-node-status-store = [
+pplx-space-data-plane-session-store = [
   "pplx-space-api",
-  "pplx-space-runtime-upgrade-campaign-store",
+  "pplx-space-internal-api-server",
 ]
-pplx-space-postgres-pool = [
+pplx-space-direct-store = ["pplx-space-api"]
+pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-firewall-rules-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+]
+pplx-space-node-ctl-store = ["pplx-space-node-ctl-server"]
+pplx-space-node-execution-inventory-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
+]
+pplx-space-node-group-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+]
+pplx-space-node-registration-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-credmgr",
   "pplx-space-internal-api-server",
 ]
+pplx-space-node-mgr-store = ["pplx-space-node-mgr"]
+pplx-space-node-runtime-manager-store = [
+  "pplx-space-db-migrate",
+  "pplx-space-node-runtime-manager",
+]
+pplx-space-node-status-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
+  "pplx-space-runtime-upgrade-campaign-store",
+]
+pplx-space-node-template-inventory-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
+]
+pplx-space-postgres-pool = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-cluster-reconciler",
+  "pplx-space-cluster-trigger-queue",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
+pplx-space-public-operation-store = ["pplx-space-api"]
 pplx-space-runtime-environment-catalog-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
@@ -391,6 +442,7 @@ pplx-space-runtime-environment-catalog-store = [
 ]
 pplx-space-runtime-environment-policy-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
 pplx-space-runtime-upgrade-campaign-store = [
@@ -413,6 +465,7 @@ pplx-space-sandbox-quarantine-store = [
 pplx-space-sandbox-residency = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-node-registration-store",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sandbox-routability = [
@@ -421,12 +474,14 @@ pplx-space-sandbox-routability = [
 pplx-space-sandbox-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
 pplx-space-sandbox-teardown = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sbx-mgr-migrations = ["pplx-space-sbx-mgr-store"]
@@ -438,14 +493,51 @@ pplx-space-snapshot-storage = [
 pplx-space-snapshot-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
   "pplx-space-internal-api-server",
   "pplx-space-snapshot-retention",
 ]
+pplx-space-storage-vend-store = ["pplx-space-credmgr"]
 pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
+pplx-space-template-release-original = [
+  "pplx-space-api",
+  "pplx-space-cluster-pool",
+  "pplx-space-internal-api-server",
+  "pplx-space-template-release-store",
+]
 # The API resolves creates, placement and pool claims to a release's twin
-# through the store, and the cluster pool's autoscaler embeds its resolution
-# SQL so demand follows the release creates run.
-pplx-space-template-release-store = ["pplx-space-api", "pplx-space-cluster-pool"]
+# through the store, reads releases for its lookups and admin routes,
+# deletes them with their template or one at a time, and checks a
+# template's encryption sidecars before a visibility widen; the cluster
+# pool's autoscaler embeds its resolution SQL so demand follows the release
+# creates run; the cluster controller's template campaign driver pages a
+# campaign's source releases, writes twins' metadata.json through its
+# objects, and inserts the twins; and the internal API's release
+# registration reads, inserts and fills releases and their storage
+# locations, and its template catalog reads releases and their storage
+# locations for the nodes that pull them. The credential manager checks
+# whether a release is published
+# before it vends write credentials for its storage.
+pplx-space-template-release-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-cluster-pool",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
+pplx-space-template-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-credmgr",
+  "pplx-space-internal-api-server",
+]
+pplx-space-volmgr-store = ["pplx-space-volmgr"]
+
+# Each coordinator's users: the l40_api crates that run its transaction
+# today. A coordinator (l30_storage, named *-coordinator) runs one transaction
+# across the stores that list it in store_users, owns no tables and holds no
+# SQL. None exists yet.
+[rules.layers.coordinator_users]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]
@@ -549,9 +641,9 @@ protocols = [
 # l20_domain dependency on a database driver, aws-sdk-s3 or a storage helper
 # is storage_access's ([rules.layers.storage]), so no family lists them.
 # aws-lc-rs and aws-lc-sys are cryptography, not cloud SDKs. The workspace's
-# own I/O crates need no entry: an l10_foundation crate, legacy or not, with
-# a required dependency on a fenced package is fenced under that package's
-# family, such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
+# own I/O crates need no entry: an l10_foundation crate with a required
+# dependency on a fenced package is fenced under that package's family,
+# such as common-grpc (hyper-util) or tokio-runtime (tokio). Only
 # declared dependencies are seen: tonic's transport brings tokio and hyper
 # into every tonic user's build regardless. Features are not followed, so observability, which brings
 # tokio in only behind its otel feature, is listed; feature-flags, whose
@@ -708,6 +800,15 @@ mode = "required"
 mode = "required"
 
 [rules.layers.store_edges]        # API and Storage crates use only the stores that list them
+mode = "required"
+
+[rules.layers.coordinators]       # a coordinator declares no state and uses no other coordinator
+mode = "required"
+
+[rules.layers.coordinator_edges]  # API crates use only the coordinators that list them; stores none
+mode = "required"
+
+[rules.layers.driver_reexports]   # no l30_storage crate's library root re-exports a driver
 mode = "required"
 
 [rules.layers.stale_entries]      # [rules.layers] entries that no longer apply

@@ -1,8 +1,10 @@
+use rusqlite::params;
+
 use super::*;
 
 fn store_with_in_memory_db() -> PinnedDigestsStore {
     let conn = crate::db::test_conn();
-    PinnedDigestsStore::new(Arc::new(Mutex::new(conn)))
+    PinnedDigestsStore::new(crate::db::SharedConnection::new(conn))
 }
 
 #[test]
@@ -18,13 +20,14 @@ fn upsert_release_replaces_metadata_on_conflict() {
 
     let (release_id, release_created_at): (String, String) = {
         let conn = store.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT release_id, release_created_at FROM template_pinned_releases
+        conn.raw()
+            .query_row(
+                "SELECT release_id, release_created_at FROM template_pinned_releases
              WHERE name = ?1 AND content_hash = ?2",
-            params!["seed", "sha256:aa"],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
+                params!["seed", "sha256:aa"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
     };
     assert_eq!(release_id, "rel-2");
     assert_eq!(release_created_at, "2026-02-01T00:00:00Z");
@@ -300,4 +303,56 @@ fn prune_tags_outside_drops_only_removed_tuples() {
     let mut hashes = store.list_pinned_hashes_for_template("seed").unwrap();
     hashes.sort();
     assert_eq!(hashes, vec!["sha256:aa".to_string()]);
+}
+
+#[test]
+fn tag_pins_of_partitions_the_node_no_longer_runs_are_pruned() {
+    use crate::db::TemplateCachePartition;
+    let store = store_with_in_memory_db();
+    let runnable = TemplateCachePartition::from_key(&format!("sha256:{}", "1".repeat(64))).unwrap();
+    let retired = TemplateCachePartition::from_key(&format!("sha256:{}", "2".repeat(64))).unwrap();
+    for partition in [TemplateCachePartition::Legacy, runnable, retired] {
+        store
+            .upsert_tag("seed", "latest", partition, "sha256:aa")
+            .unwrap();
+    }
+
+    // The legacy partition is kept even when the list omits it.
+    assert_eq!(store.prune_tag_partitions_outside(&[runnable]).unwrap(), 1);
+
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn
+        .raw()
+        .prepare("SELECT cache_partition FROM template_pinned_tags ORDER BY cache_partition")
+        .unwrap();
+    let left: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(left, vec![String::new(), runnable.key()]);
+}
+
+#[test]
+fn deleting_a_tag_pin_drops_only_that_partition_s() {
+    use crate::db::TemplateCachePartition;
+    let store = store_with_in_memory_db();
+    let twin = TemplateCachePartition::from_key(&format!("sha256:{}", "1".repeat(64))).unwrap();
+    for partition in [TemplateCachePartition::Legacy, twin] {
+        store
+            .upsert_tag("seed", "latest", partition, "sha256:aa")
+            .unwrap();
+    }
+    store.delete_tag("seed", "latest", twin).unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let left: Vec<String> = conn
+        .raw()
+        .prepare("SELECT cache_partition FROM template_pinned_tags")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(left, vec![String::new()]);
 }

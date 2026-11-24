@@ -57,14 +57,12 @@ impl K8sStore {
             .map_err(|error| SubstrateError::Failed {
                 message: format!("fork source snapshot id {snapshot_id:?} isn't a UUID: {error}"),
             })?;
-        Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT execution_metadata->>'environment' FROM snapshots WHERE id = $1"
-        ))
-        .bind(snapshot_id)
-        .fetch_optional(&self.pool)
+        pplx_space_snapshot_store::environment::of_snapshot(
+            &self.pool,
+            pplx_space_snapshot_model::SnapshotId::from_uuid(snapshot_id),
+        )
         .await
-        .db_context("failed to read the fork source snapshot's environment")?
-        .flatten())
+        .db_context("failed to read the fork source snapshot's environment")
     }
 
     /// The environment the ready disk snapshot of `sandbox_id`'s local
@@ -75,22 +73,13 @@ impl K8sStore {
         sandbox_id: SandboxId,
         artifact_id: LocalArtifactId,
     ) -> Result<Option<String>, SubstrateError> {
-        Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT execution_metadata->>'environment'
-               FROM snapshots
-              WHERE sandbox_id = $1
-                AND local_artifact_id = $2
-                AND type = 'disk'
-                AND state = 'ready'
-              ORDER BY timestamp DESC
-              LIMIT 1"
-        ))
-        .bind(sandbox_id)
-        .bind(artifact_id.as_uuid())
-        .fetch_optional(&self.pool)
+        pplx_space_snapshot_store::environment::of_ready_disk_artifact(
+            &self.pool,
+            sandbox_id,
+            artifact_id,
+        )
         .await
-        .db_context("failed to read the pinned disk artifact's environment")?
-        .flatten())
+        .db_context("failed to read the pinned disk artifact's environment")
     }
 
     /// [`Self::disk_artifact_environment`] for `sandbox_id`'s current local
@@ -99,22 +88,10 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<String>, SubstrateError> {
-        Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT sn.execution_metadata->>'environment'
-               FROM sandboxes s
-               JOIN snapshots sn
-                 ON sn.sandbox_id = s.id
-                AND sn.local_artifact_id = s.current_local_artifact_id
-              WHERE s.id = $1
-                AND sn.type = 'disk'
-                AND sn.state = 'ready'
-              ORDER BY sn.timestamp DESC
-              LIMIT 1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
+        pplx_space_snapshot_store::environment::of_current_ready_disk_artifact(
+            &self.pool, sandbox_id,
+        )
         .await
-        .db_context("failed to read the stopped disk artifact's environment")?
-        .flatten())
+        .db_context("failed to read the stopped disk artifact's environment")
     }
 }

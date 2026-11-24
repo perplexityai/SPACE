@@ -7,7 +7,6 @@
 //! Every read here is observational. Nothing takes a lock, and a count can be
 //! stale by the time the caller acts on it.
 
-use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 
 /// Sandboxes grouped by their environment binding and lifecycle.
@@ -84,10 +83,19 @@ pub(super) struct TemplateReleasePopulationRow {
     /// Whether creates by tag run these releases, or an enabled pool config
     /// pins them, which keeps creating warm slots. Any other release is
     /// reachable only by pinning its exact hash. A create by tag runs the
-    /// tagged build's resolved release
+    /// tagged digest's original
+    /// (`pplx_space_template_release_original::digest_original`), whichever
+    /// spelling the tag sits on, or, where creates boot the twin they resolve
+    /// to, the build's resolved release
     /// (`pplx_space_template_release_store::resolved_release_sql`), which may
-    /// be a twin, where creates boot the twin they resolve to; anywhere else,
-    /// and when no release of the build qualifies, the tagged release itself.
+    /// be a twin; the original when no release of the build qualifies.
+    /// Where that falls back to the original, the tagged release itself
+    /// counts too, because an API image that predates the shared
+    /// original-release rule falls back to it; drop that once no such image
+    /// can serve or be rolled back to. Such an image's own resolved twin
+    /// isn't counted: its resolver can break a spelling tie the other way,
+    /// but both exclude the same blocked environments, so a block moves its
+    /// creates rather than refusing them.
     pub(super) in_use: bool,
     /// As [`SandboxPopulationRow::malformed`].
     pub(super) malformed: bool,
@@ -101,48 +109,34 @@ pub(super) async fn template_release_population(
     executor: impl sqlx::PgExecutor<'_>,
     boots_template_twins: bool,
 ) -> Result<Vec<TemplateReleasePopulationRow>, sqlx::Error> {
-    static STATEMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        sql!(format!(
-            "SELECT tr.execution_metadata ->> 'environment' AS environment_ref,
-                    (EXISTS (
-                         SELECT 1
-                         FROM template_release_tags tag
-                         JOIN template_releases tagged ON tagged.id = tag.template_release_id
-                         WHERE tagged.template_name = tr.template_name
-                           -- Either spelling of the build's hash, as the
-                           -- resolver matches it, in a form the
-                           -- (template_name, hash, ...) index serves.
-                           AND tagged.hash IN (
-                               tr.hash,
-                               replace(tr.hash, 'sha256:', ''),
-                               'sha256:' || replace(tr.hash, 'sha256:', ''))
-                           AND CASE
-                                   WHEN $1 THEN COALESCE({resolved}, tagged.id) = tr.id
-                                   ELSE tagged.id = tr.id
-                               END
-                     )
-                     OR EXISTS (
-                         SELECT 1 FROM kubernetes_pool_configs pool
-                         WHERE pool.template_release_id = tr.id AND pool.enabled
-                     )) AS in_use,
-                    (tr.execution_metadata IS NOT NULL
-                     AND (jsonb_typeof(tr.execution_metadata) <> 'object'
-                          OR (tr.execution_metadata ? 'environment'
-                              AND jsonb_typeof(tr.execution_metadata -> 'environment') NOT IN ('string', 'null'))))
-                        AS malformed,
-                    COUNT(*) AS template_releases
-             FROM template_releases tr
-             GROUP BY 1, 2, 3",
-            resolved = pplx_space_template_release_store::resolved_release_sql(
-                "tagged.template_name",
-                "tagged.hash",
-                "$2",
-            ),
-        ))
-    });
-    sqlx::query_as(sqlx::AssertSqlSafe(STATEMENT.as_str()))
-        .bind(boots_template_twins)
-        .bind(pplx_space_execution_catalog::catalog::initial_environment_reference().to_string())
-        .fetch_all(executor)
-        .await
+    Ok(
+        pplx_space_template_release_store::lookup::release_population(
+            executor,
+            boots_template_twins,
+            pplx_space_execution_catalog::catalog::initial_environment_reference(),
+        )
+        .await?
+        .into_iter()
+        .map(TemplateReleasePopulationRow::from)
+        .collect(),
+    )
+}
+
+impl From<pplx_space_template_release_store::lookup::ReleasePopulationRow>
+    for TemplateReleasePopulationRow
+{
+    fn from(row: pplx_space_template_release_store::lookup::ReleasePopulationRow) -> Self {
+        let pplx_space_template_release_store::lookup::ReleasePopulationRow {
+            environment_ref,
+            in_use,
+            malformed,
+            template_releases,
+        } = row;
+        Self {
+            environment_ref,
+            in_use,
+            malformed,
+            template_releases,
+        }
+    }
 }

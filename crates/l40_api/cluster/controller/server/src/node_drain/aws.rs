@@ -1,9 +1,9 @@
 use pplx_space_accounts::NodeId;
 
-use pplx_space_sql_locator::sql;
+use pplx_space_node_registration_store::drain_reads::{self, TerminateTarget};
 use std::future::Future;
 
-use sqlx::{FromRow, PgPool};
+use sqlx::PgPool;
 
 use super::InstanceTerminator;
 
@@ -65,18 +65,6 @@ impl AsgTerminateClient for pplx_space_aws_client::autoscaling::Client {
     }
 }
 
-/// Row shape produced by [`Ec2InstanceTerminator::load_node_row`]. Held in
-/// one struct so the AWS-call helper takes a single typed argument and the
-/// row decode is named — clippy flagged the previous tuple decode as too
-/// complex to read at a glance.
-#[derive(Debug, Clone, FromRow)]
-struct TerminateNodeRow {
-    phase: Option<String>,
-    node_name: Option<String>,
-    stored_uid: Option<String>,
-    decrement_capacity: bool,
-}
-
 /// Production [`InstanceTerminator`] that calls AWS EC2 Auto Scaling
 /// `TerminateInstanceInAutoScalingGroup`. The `should_decrement_desired_capacity`
 /// flag is read from the per-node `nodes.terminate_decrement_capacity` column
@@ -113,20 +101,10 @@ impl<C: AsgTerminateClient> Ec2InstanceTerminator<C> {
         }
     }
 
-    async fn load_node_row(&self, node_id: NodeId) -> Result<TerminateNodeRow, TerminateError> {
-        let row: Option<TerminateNodeRow> = sqlx::query_as(sql!(
-            "SELECT n.drain_phase AS phase,
-                    k.k8s_node_name AS node_name,
-                    k.k8s_node_uid  AS stored_uid,
-                    n.terminate_decrement_capacity AS decrement_capacity
-             FROM nodes n
-             LEFT JOIN node_k8s k ON k.node_id = n.id
-             WHERE n.id = $1"
-        ))
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| TerminateError::KubeLookup(err.to_string()))?;
+    async fn load_node_row(&self, node_id: NodeId) -> Result<TerminateTarget, TerminateError> {
+        let row = drain_reads::terminate_target(&self.pool, node_id)
+            .await
+            .map_err(|err| TerminateError::KubeLookup(err.to_string()))?;
 
         row.ok_or_else(|| {
             TerminateError::KubeLookup(format!("node {node_id} row vanished before terminate"))

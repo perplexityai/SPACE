@@ -2,14 +2,19 @@
 //! sandbox ID string helpers, the rootfs entitlement and the abandoned-restore
 //! retirement switch.
 
-#[cfg(feature = "sqlx")]
-mod postgres;
 mod restore_retirement;
 mod sandbox;
 pub mod sandbox_storage;
 
 pub use restore_retirement::*;
 pub use sandbox::*;
+
+#[cfg(feature = "sqlx")]
+pplx_space_uuid_id::postgres_uuid!(
+    SandboxActivationAttemptId,
+    SandboxCleanupEpisodeId,
+    SandboxId
+);
 
 /// Legacy sandbox ID string helpers.
 ///

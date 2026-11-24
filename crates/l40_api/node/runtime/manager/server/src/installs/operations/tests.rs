@@ -6,8 +6,10 @@ use crate::installs::publisher::{ArtifactPublisher, NodeArtifactRef, Published, 
 use crate::installs::release::ReleaseContext;
 use crate::installs::store::JobPhase;
 use crate::installs::test_support::*;
-use pplx_space_common_jobs::JobExecutor as _;
 use pplx_space_node_runtime_core::artifact_store::{StagedName, release_directory};
+use pplx_space_node_runtime_manager_store::database::SharedConnection;
+use pplx_space_node_runtime_manager_store::jobs::{JobError, JobExecutor as _};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const LIMITS: InstallLimits = InstallLimits {
@@ -179,7 +181,7 @@ impl Fixture {
         let job_id = JobId::new();
         let db = self.installer.executor.db();
         pplx_space_common_jobs::db::insert_job(
-            &db,
+            db.raw(),
             pplx_space_common_jobs::db::InsertJob {
                 job_id: &job_id,
                 kind: INSTALL_JOB_KIND,
@@ -192,7 +194,7 @@ impl Fixture {
             },
         )
         .unwrap();
-        pplx_space_common_jobs::db::get_job(&db, &job_id)
+        pplx_space_common_jobs::db::get_job(db.raw(), &job_id)
             .unwrap()
             .unwrap()
     }
@@ -325,11 +327,11 @@ async fn lost_mutation_responses_are_recoverable_for_both_kinds() {
                     fixture.pins.clone(),
                     fixture.publisher.clone(),
                 ),
-                Arc::new(Mutex::new(
+                SharedConnection::new(
                     store::open(&fixture.dir.path().join("state"))
                         .await
                         .unwrap(),
-                )),
+                ),
             );
             restarted
                 .execute(&job, CancellationToken::new())
@@ -536,10 +538,7 @@ async fn changed_release_pins_fail_before_downloading() {
             .executor
             .execute(&fixture.job(&request), CancellationToken::new())
             .await;
-        assert!(
-            matches!(result, Err(pplx_space_common_jobs::JobError::Permanent(_))),
-            "{result:?}"
-        );
+        assert!(matches!(result, Err(JobError::Permanent(_))), "{result:?}");
         assert_eq!(
             fixture.downloads(),
             0,

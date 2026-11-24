@@ -92,7 +92,13 @@ async fn enqueue_claim_and_complete_coalesces_reasons() -> TestResult {
         "sandbox_network_policy_updated,sandbox_desired_state_updated"
     );
 
-    complete_claim(&db.pool, &claim.claim_token, &[node_id], &[]).await?;
+    complete_claim(
+        &Db::from(db.pool.clone()),
+        &claim.claim_token,
+        &[node_id],
+        &[],
+    )
+    .await?;
     let count: i64 = sqlx::query_scalar(sql!(
         "SELECT COUNT(*)::BIGINT FROM node_reconcile_triggers WHERE node_id = $1"
     ))
@@ -168,7 +174,7 @@ async fn repeated_failures_dead_letter_trigger() -> TestResult {
         let claim = claim_triggers(&db.pool, 10).await?;
         assert_eq!(claim.triggers.len(), 1, "attempt {attempt}");
         complete_claim(
-            &db.pool,
+            &Db::from(db.pool.clone()),
             &claim.claim_token,
             &[],
             &[(node_id, format!("failure-{attempt}"))],
@@ -201,7 +207,7 @@ async fn permanent_failure_dead_letters_immediately() -> TestResult {
     enqueue_triggers(&db.pool, [node_id], ReconcileReason::ManualNodeReconcile).await?;
     let claim = claim_triggers(&db.pool, 10).await?;
     dead_letter_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[(node_id, "invalid endpoint".to_string())],
     )
@@ -235,7 +241,7 @@ async fn failed_trigger_can_recover_on_next_claim() -> TestResult {
     enqueue_triggers(&db.pool, [node_id], ReconcileReason::ManualNodeReconcile).await?;
     let claim = claim_triggers(&db.pool, 10).await?;
     complete_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[],
         &[(node_id, "temporary failure".to_string())],
@@ -250,7 +256,13 @@ async fn failed_trigger_can_recover_on_next_claim() -> TestResult {
 
     let retry_claim = claim_triggers(&db.pool, 10).await?;
     assert_eq!(retry_claim.triggers.len(), 1);
-    complete_claim(&db.pool, &retry_claim.claim_token, &[node_id], &[]).await?;
+    complete_claim(
+        &Db::from(db.pool.clone()),
+        &retry_claim.claim_token,
+        &[node_id],
+        &[],
+    )
+    .await?;
 
     let count: i64 = sqlx::query_scalar(sql!(
         "SELECT COUNT(*)::BIGINT FROM node_reconcile_triggers WHERE node_id = $1"
@@ -470,7 +482,7 @@ async fn queued_triggers_reports_each_node_until_its_trigger_drains() -> TestRes
     assert!(claimed.claimed_at.is_some());
 
     complete_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[],
         &[(queued_node, "node unreachable".to_string())],
@@ -489,14 +501,20 @@ async fn queued_triggers_reports_each_node_until_its_trigger_drains() -> TestRes
     .execute(&db.pool)
     .await?;
     let claim = claim_triggers(&db.pool, 10).await?;
-    complete_claim(&db.pool, &claim.claim_token, &[queued_node], &[]).await?;
+    complete_claim(
+        &Db::from(db.pool.clone()),
+        &claim.claim_token,
+        &[queued_node],
+        &[],
+    )
+    .await?;
     assert!(queued_triggers(&db.pool, &nodes).await?.is_empty());
 
     // Dead-lettered at once, as for a node whose Kubernetes Node is gone.
     enqueue_triggers(&db.pool, [queued_node], ReconcileReason::NodeUpdated).await?;
     let claim = claim_triggers(&db.pool, 10).await?;
     dead_letter_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[(queued_node, "node is gone".to_string())],
     )
@@ -666,7 +684,7 @@ async fn a_claim_skips_reasons_this_build_does_not_know() -> TestResult {
     // A failure is recorded against the row, so it backs off and
     // dead-letters like any other instead of being claimed again unchanged.
     complete_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         &claim.claim_token,
         &[mixed, firewall_rules_beside_unknown, known],
         &[(unknown_only, "node unreachable".to_string())],
@@ -741,11 +759,14 @@ async fn the_firewall_rules_reason_enqueues_and_claims() -> TestResult {
 }
 
 /// Every [`ReconcileReason`] has a `state_reconciliation_reason` label, spelled
-/// the same whichever way the reason crosses: the derived sqlx encoding the
-/// enqueue binds, the derived decoding, and the text a claim parses. A Rust
+/// the same whichever way the reason crosses: the sqlx encoding the enqueue
+/// binds, the decoding, and the text a claim parses. A Rust
 /// reason without a label would fail its enqueue with 22P02. A label without a
 /// Rust reason is not checked: a new label ships in a migration of its own
 /// before the build that adds its reason, and a claim skips it until then.
+/// An array of every reason binds as `state_reconciliation_reason[]` and
+/// decodes back; that is the type postgres-pool's per-connection warm-up
+/// decodes.
 #[tokio::test(flavor = "current_thread")]
 async fn every_rust_reason_has_a_postgres_label() -> TestResult {
     let db = pg_test_db().await?;
@@ -779,5 +800,21 @@ async fn every_rust_reason_has_a_postgres_label() -> TestResult {
                 .await?;
         assert_eq!(decoded, reason);
     }
+
+    let reasons = ReconcileReason::ALL.to_vec();
+    let (decoded, labels, pg_type): (Vec<ReconcileReason>, Vec<String>, String) =
+        sqlx::query_as(sql!("SELECT $1, $1::TEXT[], pg_typeof($1)::TEXT"))
+            .bind(&reasons)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(decoded, reasons);
+    assert_eq!(
+        labels,
+        reasons
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(pg_type, "state_reconciliation_reason[]");
     Ok(())
 }

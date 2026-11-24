@@ -428,7 +428,7 @@ pub fn non_resident_lifecycle_exclusion(sandbox_alias: &str) -> String {
 ///   node to preserve either way.
 ///
 /// **Which phase the node is held in decides whether those exits are reachable.**
-/// `NodeDrainState::blocks_placement` 409s a `start` on a node in `drained` or
+/// `NodeDrain::blocks_placement` 409s a `start` on a node in `drained` or
 /// `terminating` in either mode, and on a `draining` node only in forced mode. A
 /// `stopped` or `created` resident whose node parked in `drained` is therefore
 /// unreachable to its owner for as long as the node parks — which, since this

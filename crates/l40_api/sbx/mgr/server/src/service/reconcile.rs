@@ -519,6 +519,26 @@ impl SandboxManagerService {
             self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
             return Ok(());
         }
+        // A v2 drain doesn't move a stopped sandbox, so a node known sealed
+        // doesn't stop a suspended one on its idle policy: held like the
+        // stages above, the row stays suspended, and the first pass after the
+        // node is unsealed stops it. A sandbox with a VM is stopped through
+        // Stop, which the node doesn't refuse.
+        if action == AutoLifecycleIdleAction::Stop
+            && sandbox.state.is_unowned(SandboxState::Suspended)
+            && let Err(sealed) = self
+                .activation_seal
+                .check_without_vm("idle auto-stop", &sandbox.id)
+        {
+            tracing::debug!(
+                sandbox_id = %sandbox.id,
+                reason = sealed.message(),
+                "holding a due auto-stop of a suspended sandbox while the node is sealed; \
+                 nothing recorded"
+            );
+            self.defer_gated_auto_lifecycle_row(&sandbox.id, now)?;
+            return Ok(());
+        }
         // Join the writer set only after wake arbitration and due-policy
         // revalidation; keep the supervisor pinned through the transition.
         let _state_writer = self.state_writer_lease("AutoLifecycle")?;

@@ -5,12 +5,15 @@
 //! suspended-execution reaper's row is already `suspended`; that verb only
 //! unplaces it).
 //!
-//! Each verb is one `UPDATE sandboxes` statement, and all but
+//! Each write is one `UPDATE sandboxes` statement, and all but
 //! [`recover_quarantined_publication_to_suspended`] re-check part of the
 //! repair's preconditions in their `WHERE`. The caller owns everything
 //! around it: the transaction, any `SELECT ... FOR UPDATE` it takes first,
 //! and the writes to the other tables the same repair touches (executions,
 //! port exposures, observed states, quarantine state).
+//!
+//! [`failed_restorable_candidates`] is the failed-restorable repair's
+//! candidate scan, beside the revert it feeds.
 
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::SubstrateKind;
@@ -27,15 +30,16 @@ use sqlx::{Postgres, Transaction};
 
 /// `make_interval(secs => $n::BIGINT)` needs an i64 bind. Saturate rather
 /// than wrap: any value above i64::MAX means "never act" in human terms.
-fn duration_secs_i64(duration: PositiveDuration) -> i64 {
+pub(crate) fn duration_secs_i64(duration: PositiveDuration) -> i64 {
     i64::try_from(duration.get().as_secs()).unwrap_or(i64::MAX)
 }
 
-/// The row-state guards shared by the failed-restorable scan and
-/// [`revert_failed_to_suspended`]. The snapshot eligibility is composed in
+/// The row-state guards of [`revert_failed_to_suspended`], which the
+/// failed-restorable scan ([`failed_restorable_candidates`]) spells out
+/// whole. The snapshot eligibility is composed in
 /// separately (`failed_repair_revert_eligibility`); everything here is the
 /// "provably inactive and safe to touch" half of the predicate.
-/// The authoritative execution guards below remain shared by scan and apply.
+/// The authoritative execution guards below are the same in scan and apply.
 ///
 /// Deferring on an observed row is the live-VM guard: a cleanup failure can
 /// retire the execution row and drop pod tracking while the pod's VM
@@ -60,9 +64,10 @@ fn duration_secs_i64(duration: PositiveDuration) -> i64 {
 /// lease has expired — previously implied by the repair minimum age exceeding
 /// the lease TTL.
 ///
-/// `managed_by_param` is bound to [`SubstrateKind::Kubernetes`]. Public only
-/// because the caller's candidate scan composes the same guards.
-pub fn failed_repair_row_state_guards(managed_by_param: &str, min_age_param: &str) -> String {
+/// `managed_by_param` is bound to [`SubstrateKind::Kubernetes`].
+/// [`failed_restorable_candidates`] spells the same guards out in its scan,
+/// so a change here must be made there too.
+fn failed_repair_row_state_guards(managed_by_param: &str, min_age_param: &str) -> String {
     format!(
         "s.managed_by = {managed_by_param}
          AND s.lifecycle = 'failed'
@@ -82,13 +87,77 @@ pub fn failed_repair_row_state_guards(managed_by_param: &str, min_age_param: &st
     )
 }
 
+/// A `failed` Kubernetes sandbox the failed-restorable repair may revert to
+/// `suspended`, from [`failed_restorable_candidates`].
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct FailedRestorableCandidate {
+    #[sqlx(rename = "id")]
+    pub sandbox_id: SandboxId,
+    pub current_local_artifact_id: Option<LocalArtifactId>,
+    /// Whether the revert would clear the current local artifact marker.
+    pub clear_marker: bool,
+}
+
+/// One keyset page, ordered by id, of the `failed` Kubernetes sandboxes
+/// older than `min_age` that [`revert_failed_to_suspended`] would revert:
+/// at most `batch_size` rows strictly after `after_sandbox_id` (`None`
+/// starts a sweep). The `WHERE` spells out `failed_repair_row_state_guards`,
+/// the guard [`revert_failed_to_suspended`] re-checks when it writes, so a
+/// change to either must be made in both.
+///
+/// A plain read; its age and lease checks compare with `NOW()`, so it reads
+/// the clock of the executor's transaction.
+pub async fn failed_restorable_candidates(
+    executor: impl sqlx::PgExecutor<'_>,
+    batch_size: u32,
+    after_sandbox_id: Option<SandboxId>,
+    min_age: PositiveDuration,
+) -> Result<Vec<FailedRestorableCandidate>, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let eligibility = failed_repair_revert_eligibility("s");
+        sql!(format!(
+            "SELECT s.id, s.current_local_artifact_id, {clear} AS clear_marker
+               FROM sandboxes s
+              WHERE s.managed_by = $4
+                AND s.lifecycle = 'failed'
+                AND s.lifecycle_changed_at <= NOW() - make_interval(secs => $1::BIGINT)
+                AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at < NOW())
+                AND NOT EXISTS (
+                    SELECT 1 FROM sandbox_k8s_executions e
+                     WHERE e.sandbox_id = s.id AND (e.active OR e.pod_ip IS NOT NULL)
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM sandbox_observed_states o
+                     WHERE o.sandbox_id = s.id
+                       AND (o.status IS DISTINCT FROM 'failed'
+                            OR o.pid IS NOT NULL
+                            OR s.active_node_id IS NOT NULL)
+                )
+                AND {eligible}
+                AND ($2::uuid IS NULL OR s.id > $2)
+              ORDER BY s.id
+              LIMIT $3",
+            clear = eligibility.clear_marker,
+            eligible = eligibility.eligible,
+        ))
+    });
+    sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(duration_secs_i64(min_age))
+        .bind(after_sandbox_id)
+        .bind(i64::from(batch_size))
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_all(executor)
+        .await
+}
+
 /// **Inference.** Revert a `failed` Kubernetes sandbox with a restorable
 /// suspend snapshot to `suspended`, clearing a stale current local artifact
 /// marker and the expired restore lease. Returns `Some(cleared_marker)` when
 /// the row flipped and `None` when a guard refused it.
 ///
 /// One atomic statement: every scan guard
-/// ([`failed_repair_row_state_guards`] and
+/// (`failed_repair_row_state_guards` and
 /// [`failed_repair_revert_eligibility`]) is re-verified in the `WHERE`, so a
 /// row that changed since the scan matches zero rows. The `pre` CTE
 /// re-derives the marker-clear decision under the same snapshot. Clearing
@@ -97,7 +166,7 @@ pub fn failed_repair_row_state_guards(managed_by_param: &str, min_age_param: &st
 /// first wake after repair.
 ///
 /// The guards admit a row that still has a `failed`, pid-less
-/// `sandbox_observed_states` record (see [`failed_repair_row_state_guards`]).
+/// `sandbox_observed_states` record (see `failed_repair_row_state_guards`).
 /// This statement leaves it in place: the caller deletes it in the same
 /// transaction, after the flip, or the API keeps reporting the sandbox as
 /// failed.

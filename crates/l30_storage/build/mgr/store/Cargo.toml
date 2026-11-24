@@ -1,0 +1,37 @@
+[package]
+name = "pplx-space-build-mgr-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+sqlite.build-manager = ["build_job_results", "jobs"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes the raw connection and the worker's test-only methods to
+# build-manager's test suites, which enable it as a dev-dependency to seed and
+# inspect the database directly.
+test-support = []
+
+[dependencies]
+ref-cast = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+
+# internal
+pplx-space-common-jobs = { workspace = true }
+pplx-space-job-id = { workspace = true, features = ["rusqlite"] }
+pplx-space-sql-locator = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true, features = ["macros", "migrate"] }

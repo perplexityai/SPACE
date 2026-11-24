@@ -11,6 +11,7 @@ use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+use pplx_space_sandbox_store::orphan::lock_orphan_observation;
 
 pub use pplx_space_sandbox_teardown::{
     delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
@@ -58,7 +59,8 @@ pub enum FinalizeSandboxDbDeleteError {
     /// this to a 409 Conflict; user retries after the upload finishes.
     ///
     /// `idle_for` is how long the stalest such upload has gone without
-    /// activity, as [`in_flight_snapshot_upload_idle_for`] reports it.
+    /// activity, as [`pplx_space_snapshot_store::upload::in_flight_idle_for`]
+    /// reports it.
     #[error(
         "sandbox has a suspend-snapshot upload in flight; \
          retry the DELETE after the snapshot finalizes"
@@ -70,46 +72,6 @@ pub enum FinalizeSandboxDbDeleteError {
     Db(#[from] sqlx::Error),
 }
 
-/// The gate a user DELETE applies for in-flight snapshot uploads: how long
-/// the stalest `creating` snapshot of this sandbox has gone without upload
-/// activity, or `None` when none is in flight. Fork snapshots don't count;
-/// suspend, stop, and named-snapshot backups all do.
-///
-/// Activity is `COALESCE(last_attempt_at, "timestamp")`, the anchor the
-/// stuck-snapshot reaper ages on. The upload worker reuses one row across
-/// its retries and heartbeats `last_attempt_at` at the start of each attempt,
-/// so a slow but live upload reads as recent. Nothing refreshes it during an
-/// attempt, so one long attempt reads as idle for as long as it runs.
-///
-/// HTTP DELETE handlers run it without a lock as a pre-flight gate, so a 409
-/// can be returned **before** the runtime (pod/VM) is torn down. The
-/// authoritative race-safe gate is the same query inside
-/// [`finalize_sandbox_db_delete_user_initiated`] — that one holds a
-/// `FOR UPDATE` lock on the parent `sandboxes` row to serialize
-/// against `BeginArtifactBackup`'s INSERT (which takes the implicit
-/// `FOR KEY SHARE` lock on the same row via the snapshots → sandboxes
-/// foreign key). The pre-flight just catches the common case where the
-/// upload was already in flight when the DELETE arrived; the narrow
-/// window between it and the locked finalize is covered by the locked
-/// finalize's own check.
-pub async fn in_flight_snapshot_upload_idle_for<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    sandbox_id: SandboxId,
-) -> Result<Option<Duration>, sqlx::Error> {
-    let idle_secs: Option<f64> = sqlx::query_scalar(sql!(
-        "SELECT EXTRACT(EPOCH FROM NOW() - MIN(COALESCE(last_attempt_at, \"timestamp\")))
-                    ::DOUBLE PRECISION
-         FROM snapshots
-         WHERE sandbox_id = $1
-           AND state = 'creating'
-           AND artifact_origin IS DISTINCT FROM 'fork'"
-    ))
-    .bind(sandbox_id)
-    .fetch_one(executor)
-    .await?;
-    Ok(idle_secs.map(|secs| Duration::from_secs_f64(secs.max(0.0))))
-}
-
 /// Variant of [`finalize_sandbox_db_delete`] safe for user-facing
 /// DELETEs: refuses to orphan storage-location rows while any
 /// `snapshots` row for the sandbox is in `state='creating'`. See
@@ -117,7 +79,13 @@ pub async fn in_flight_snapshot_upload_idle_for<'e>(
 ///
 /// ## Concurrency
 ///
-/// Takes a `FOR UPDATE` lock on the parent `sandboxes` row first.
+/// Serializes with node-state publication before taking any row locks:
+/// publication can write observed state before it updates the sandbox row,
+/// or remove observed state before locking an absent stopped Direct sandbox.
+/// Finalization locks the sandbox row before deleting observed state and does
+/// not require the caller to have marked the sandbox `deleting`.
+///
+/// Takes a `FOR UPDATE` lock on the parent `sandboxes` row before checking uploads.
 /// PostgreSQL's foreign-key enforcement makes a concurrent
 /// `INSERT INTO snapshots (sandbox_id, …)` take an implicit
 /// `FOR KEY SHARE` lock on the same row; `FOR UPDATE` conflicts with
@@ -141,6 +109,7 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     sandbox_id: SandboxId,
 ) -> Result<(), FinalizeSandboxDbDeleteError> {
     let mut tx = pool.begin().await?;
+    lock_orphan_observation(&mut tx, sandbox_id).await?;
     lock_fork_source_lifecycle(&mut tx, sandbox_id).await?;
     // Lock the parent sandbox row to serialize against any
     // concurrent BeginArtifactBackup INSERT (which acquires the
@@ -156,7 +125,9 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     // appear between this SELECT and the orphan UPDATE inside
     // `delete_with_dependents`. A plain SELECT (no row lock)
     // is enough.
-    if let Some(idle_for) = in_flight_snapshot_upload_idle_for(&mut *tx, sandbox_id).await? {
+    if let Some(idle_for) =
+        pplx_space_snapshot_store::upload::in_flight_idle_for(&mut *tx, sandbox_id).await?
+    {
         // Drop tx without commit; abandoning the transaction
         // releases the FOR UPDATE lock immediately. Don't issue
         // ROLLBACK explicitly — sqlx will roll back on drop.
@@ -368,8 +339,10 @@ pub async fn enqueue_sandbox_reconcile_tx(
     sandbox_id: SandboxId,
     refs: &[ReconcileRef],
 ) -> Result<Option<EnqueuedNodeReconcile>, sqlx::Error> {
+    // Keep placement stable through enqueue without blocking foreign-key
+    // checks in a node publication that already holds its reconcile trigger.
     let node_id: Option<NodeId> = sqlx::query_scalar(sql!(
-        "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR UPDATE"
+        "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
     ))
     .bind(sandbox_id)
     .fetch_optional(&mut **tx)

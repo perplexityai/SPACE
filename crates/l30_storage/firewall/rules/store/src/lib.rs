@@ -7,28 +7,54 @@
 //! * `firewall_rules_revisions`: immutable rulesets.
 //! * `firewall_rules_control`: the default revision for newly enrolled nodes.
 //! * `firewall_rules_node_assignments`: each node's current intent.
-//! * `firewall_rules_node_observations`: each node's accepted observations.
+//! * `firewall_rules_node_observations`: each node's pending round and
+//!   accepted observations.
 //!
+//! [`read_adopted`] reads the default a candidate is reviewed against, and
 //! [`start_rollout`] saves a reviewed revision and the nodes it targets
 //! without adopting it.
 //!
 //! [`lease_targets`] leases a rollout's saved targets to a controller under
 //! the shared queue's rules ([`pplx_space_rollout_queue`]); [`renew_lease`],
 //! [`requeue`] and [`redrive_expired`] keep or end the lease.
+//! [`issue_first_assignment`] issues a leased target's first assignment with
+//! its node's wakeup. [`lease_first_canary`] and [`issue_canary_and_release`]
+//! do both for a canary's one target, leaving it pending once issued.
+//!
+//! [`open_round`] asks an issued target's node to verify that assignment,
+//! with its wakeup. [`fetch_instructions`] reads one node's assignment and
+//! pending round.
 
 use std::fmt;
 
 use pplx_space_rollout_queue::HeaderPhase;
 
+mod fetch;
+mod issue;
 mod lease;
+mod leased_item;
+mod read;
+mod round;
 mod start;
 
+pub use fetch::{Assignment, NodeInstructions, PendingRound, fetch_instructions};
+pub use issue::{
+    Issuance, Refusal, Stamp, Wakeup, issue_canary_and_release, issue_first_assignment,
+};
 pub use lease::{
-    LeasedTarget, Requeue, Work, lease_targets, redrive_expired, renew_lease, requeue,
+    LeasedTarget, Requeue, Work, lease_first_canary, lease_targets, redrive_expired, renew_lease,
+    requeue,
 };
 pub use pplx_space_rollout_queue::{MAX_LEASE, RedriveReport, clamp_lease};
-pub use start::{AdoptedRevision, Review, StartError, StartRollout, StartedRollout, start_rollout};
+pub use read::{StoredStateError, read_adopted};
+pub use round::{OpenRefusal, Opening, open_round};
+pub use start::{
+    AdoptedRevision, REASON_MAX_CHARS, Review, StartError, StartRollout, StartedRollout,
+    start_rollout,
+};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -86,6 +112,14 @@ impl ItemPhase {
     }
 }
 
+/// Which verbs a statement serves: all of them, or only
+/// [`lease_first_canary`] and [`issue_canary_and_release`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scope {
+    Any,
+    FirstCanary,
+}
+
 /// Commit on `Ok`, roll back otherwise, so a verb's locks end with it rather
 /// than when the connection is next used.
 async fn end_transaction<T, E: From<sqlx::Error>>(
@@ -98,13 +132,17 @@ async fn end_transaction<T, E: From<sqlx::Error>>(
             Ok(value)
         }
         Err(error) => {
-            if let Err(rollback) = tx.rollback().await {
-                tracing::warn!(
-                    error = %rollback,
-                    "couldn't roll back a firewall rules store verb's transaction"
-                );
-            }
+            roll_back(tx).await;
             Err(error)
         }
+    }
+}
+
+async fn roll_back(tx: sqlx::Transaction<'_, sqlx::Postgres>) {
+    if let Err(rollback) = tx.rollback().await {
+        tracing::warn!(
+            error = %rollback,
+            "couldn't roll back a firewall rules store verb's transaction"
+        );
     }
 }

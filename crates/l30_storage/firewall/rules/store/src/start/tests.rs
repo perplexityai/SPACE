@@ -338,7 +338,10 @@ async fn a_start_matches_exactly_the_expected_default() -> TestResult {
         .await?;
     let refused = start(pool, a, &candidate).await;
     assert!(
-        matches!(refused, Err(StartError::MissingControlRow)),
+        matches!(
+            refused,
+            Err(StartError::Stored(StoredStateError::MissingControlRow))
+        ),
         "{refused:?}"
     );
     Ok(())
@@ -548,7 +551,7 @@ async fn the_whole_candidate_is_validated_and_stored_exactly() -> TestResult {
     .await?;
     let unreadable = start(pool, AdoptedRevision::Revision(newer), &reordered).await;
     assert!(
-        matches!(unreadable, Err(StartError::StoredRevision { id, .. }) if id == newer),
+        matches!(unreadable, Err(StartError::Stored(StoredStateError::StoredRevision { id, .. })) if id == newer),
         "{unreadable:?}"
     );
     Ok(())
@@ -585,7 +588,13 @@ async fn a_failed_write_leaves_nothing_behind() -> TestResult {
     ] {
         sqlx::raw_sql(table).execute(pool).await?;
         let failed = start(pool, AdoptedRevision::NoRevision, &candidate).await;
-        assert!(matches!(failed, Err(StartError::Database(_))), "{failed:?}");
+        assert!(
+            matches!(
+                failed,
+                Err(StartError::Stored(StoredStateError::Database(_)))
+            ),
+            "{failed:?}"
+        );
         assert_eq!(state(pool).await?, before);
         sqlx::raw_sql(sql!(
             "DROP TRIGGER IF EXISTS fail_insert ON firewall_rules_rollouts;
@@ -595,5 +604,34 @@ async fn a_failed_write_leaves_nothing_behind() -> TestResult {
         .await?;
     }
     start(pool, AdoptedRevision::NoRevision, &candidate).await?;
+    Ok(())
+}
+
+/// Catches a reason the schema refuses reaching the write as a database
+/// error, or checked after the production gate, which would report a bad
+/// request as disabled; and a bound counted in bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reason_the_schema_refuses_is_invalid_before_anything_else() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let mut conn = pool.acquire().await?;
+    let start = |reason: String| StartRollout {
+        actor: UserId::from_uuid(SEED_USER_ID),
+        reason,
+        revision: revision(&[dns()]),
+        expected_adopted: AdoptedRevision::NoRevision,
+    };
+    let longest = "é".repeat(REASON_MAX_CHARS);
+    for reason in [String::new(), format!("{longest}é"), "a\0b".to_owned()] {
+        let refused = start_rollout(&mut conn, &start(reason)).await;
+        assert!(
+            matches!(refused, Err(StartError::InvalidReason)),
+            "{refused:?}"
+        );
+    }
+    // The schema stores the longest reason.
+    start_with(&mut conn, &start(longest), &mut Fixture::default()).await?;
     Ok(())
 }

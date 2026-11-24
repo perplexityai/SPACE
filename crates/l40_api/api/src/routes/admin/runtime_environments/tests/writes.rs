@@ -687,11 +687,16 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     let Some(h) = harness().await? else {
         return Ok(());
     };
-    let (e0, e1) = (environment(0), environment(1));
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
     h.set_default(e1).await;
     let allow_e0 = || h.set_state(e0, json!({"state": "allowed", "reason": "back"}));
     let block_e0 = || h.set_state(e0, json!({"state": "blocked", "reason": "0-day"}));
+    let block_e2 = || h.set_state(e2, json!({"state": "blocked", "reason": "0-day"}));
     let (status, _) = allow_e0().await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .set_state(e2, json!({"state": "allowed", "reason": "new"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
 
     // Superseded: untagged and unpooled, so reachable only by its exact hash.
@@ -719,6 +724,44 @@ async fn only_releases_still_in_use_gate_a_block() -> TestResult {
     .await?;
     let (status, body) = block_e0().await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    allow_e0().await;
+
+    // Tagged through the other spelling: a tag written before the shared
+    // original-release rule names the canonical release, and creates by tag
+    // resolve to the digest's original, the older bare one bound to e0.
+    let bare = insert_template_release(&h.db.pool, "spelled", Some(metadata(Some(e0)))).await?;
+    let hash: String = sqlx::query_scalar(sql!(
+        "UPDATE template_releases
+         SET hash = replace(hash, 'sha256:', ''), created_at = NOW() - INTERVAL '1 hour'
+         WHERE id = $1
+         RETURNING 'sha256:' || hash"
+    ))
+    .bind(bare)
+    .fetch_one(&h.db.pool)
+    .await?;
+    let canonical: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, execution_metadata)
+         VALUES ('spelled', 'fc', $1, $2)
+         RETURNING id"
+    ))
+    .bind(&hash)
+    .bind(sqlx::types::Json(metadata(Some(e2))))
+    .fetch_one(&h.db.pool)
+    .await?;
+    tag_release(&h.db.pool, canonical, "spelled", "latest").await?;
+    let (status, body) = block_e0().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    // An API image that predates the rule creates from the tagged release
+    // itself, so its environment can't be blocked either while one may serve.
+    let (status, body) = block_e2().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    sqlx::query(sql!(
+        "DELETE FROM template_release_tags WHERE template_name = 'spelled'"
+    ))
+    .execute(&h.db.pool)
+    .await?;
     allow_e0().await;
 
     // Tagged: creates by tag resolve to it.
@@ -1035,6 +1078,180 @@ fn a_block_uses_the_recheck_when_the_policy_moved() {
         block_at_risk(BlockCheck::AlreadyStopped { generation: 3 }, None, 5),
         Err(PolicyMovedDuringRecheck)
     );
+}
+
+/// The cluster's first default stops every environment with no state, so it's
+/// refused while an unfinished template campaign moves one of them, and the
+/// refusal also reports the work it would stop. `strand: true` sets it anyway.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_default_is_refused_while_a_template_campaign_moves_an_environment_it_stops()
+-> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, CampaignPhase};
+
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1, e2) = (environment(0), environment(1), environment(2));
+    let campaign = |from, to| CampaignSeed {
+        from,
+        to,
+        kind: CampaignKind::Templates,
+        phase: CampaignPhase::Paused,
+        ..CampaignSeed::default()
+    };
+    // A campaign from the new default doesn't hold it: the default executes.
+    insert_campaign(&h.db.pool, campaign(e1, e2)).await?;
+    // One from E0, which has no state, does.
+    let holding = insert_campaign(&h.db.pool, campaign(e0, e1)).await?;
+
+    let (status, body) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(
+        &body,
+        &format!(
+            "template runtime upgrade campaign {holding} still moves environment {e0}'s \
+             releases, which the cluster's first default stops"
+        ),
+    );
+    // The campaign waits for E1 to be the default, so the refusal names the
+    // way through that doesn't stop E0.
+    assert_error_contains(&body, &format!("record a state for {e0} first"));
+    assert!(body.get("at_risk").is_none(), "nothing else stops: {body}");
+    assert_eq!(h.generation().await?, 0, "nothing changed");
+
+    // With work bound to E0 too, the refusal reports it, since strand: true
+    // waives both.
+    let tagged = insert_template_release(&h.db.pool, "tagged", Some(metadata(Some(e0)))).await?;
+    tag_release(&h.db.pool, tagged, "tagged", "latest").await?;
+    let (status, body) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, &format!("campaign {holding}"));
+    assert_eq!(body["at_risk"]["environments"], json!([e0.to_string()]));
+    assert_eq!(body["at_risk"]["bound"]["template_releases_in_use"], 1);
+    assert_eq!(h.generation().await?, 0, "nothing changed");
+
+    let (status, body) = h
+        .put(
+            "/admin/api/v1/runtime-environments/default",
+            json!({"environment_ref": e1.to_string(), "reason": "move on", "strand": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        policy_store::get(&h.db.pool).await?.default_environment,
+        Some(e1)
+    );
+    Ok(())
+}
+
+/// A template campaign whose source keeps executing doesn't hold the first
+/// default.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_default_passes_a_template_campaign_whose_source_keeps_executing() -> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{CampaignKind, CampaignPhase};
+
+    let Some(h) = harness().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    insert_template_release(&h.db.pool, "seed", Some(metadata(Some(e0)))).await?;
+    insert_campaign(
+        &h.db.pool,
+        CampaignSeed {
+            from: e0,
+            to: e1,
+            kind: CampaignKind::Templates,
+            phase: CampaignPhase::Rolling,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+    let (status, body) = h
+        .set_state(
+            e0,
+            json!({"state": "deprecated", "reason": "keep E0 running"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h.set_default(e1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+/// A template campaign starting while the first default is written can't slip
+/// past it: the default takes the start lock of each environment with
+/// template releases that it stops, so it waits for the start to commit and
+/// then sees the campaign.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_default_waits_for_a_template_campaign_starting_on_an_environment_it_stops()
+-> TestResult {
+    use pplx_space_runtime_upgrade_campaign_store::test_support::{CampaignSeed, insert_campaign};
+    use pplx_space_runtime_upgrade_campaign_store::{
+        self as campaign_store, CampaignKind, CampaignPhase,
+    };
+
+    // The start's transaction, the default's and the lock poll's.
+    let Some(h) = harness_with_connections(4).await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    insert_template_release(&h.db.pool, "seed", Some(metadata(Some(e0)))).await?;
+    // A start in flight, as `create_campaign` makes one: E0's start lock
+    // held, the campaign written but not committed.
+    let mut start = h.db.pool.begin().await?;
+    assert_eq!(
+        campaign_store::unfinished_from_locked(&mut start, CampaignKind::Templates, e0).await?,
+        None
+    );
+    let starting = insert_campaign(
+        &mut *start,
+        CampaignSeed {
+            from: e0,
+            to: e1,
+            kind: CampaignKind::Templates,
+            phase: CampaignPhase::Canary,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
+
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *start)
+        .await?;
+    // Commit the start only once the default waits on its lock, so the
+    // default can't have read past the start before it committed.
+    let ((status, body), committed) = tokio::join!(h.set_default(e1), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // Something waits on the start's backend: the default, on its
+            // start lock.
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE $1 = ANY(pg_blocking_pids(pid))
+                 )",
+            )
+            .bind(holder)
+            .fetch_one(&h.db.pool)
+            .await?;
+            if waiting {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err("the default never waited on the start lock".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        start.commit().await?;
+        TestResult::Ok(())
+    });
+    committed?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error_contains(&body, &format!("campaign {starting}"));
+    assert_eq!(h.generation().await?, 0, "nothing changed");
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

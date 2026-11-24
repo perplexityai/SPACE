@@ -32,11 +32,11 @@ jiff = { workspace = true }
 libc = { workspace = true }
 pplx-space-artifact-model = { workspace = true, features = ["serde"] }
 pplx-space-firewall-rules-model = { workspace = true }
+pplx-space-firewall-rules-protocol = { workspace = true }
 pplx-space-snapshot-model = { workspace = true, features = ["serde"] }
 pplx-space-template-model = { workspace = true }
 rustix = { workspace = true, features = ["fs", "mount", "process"] }
 nix = { workspace = true, features = ["dir", "fs", "mount", "sched", "process", "resource", "signal", "user"] }
-rusqlite = { workspace = true }
 socket2 = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -57,6 +57,7 @@ zeroize = { workspace = true }
 # internal
 pplx-space-accounts = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
+pplx-space-node-mgr-store = { workspace = true }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-host-linux = { workspace = true }
@@ -74,7 +75,6 @@ pplx-space-local-health = { workspace = true }
 pplx-space-rpc-contracts = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
-pplx-space-sqlite = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
 pplx-space-execution-common = { workspace = true }
@@ -88,7 +88,6 @@ pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-test-hooks = { workspace = true }
 pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -102,7 +101,11 @@ rstest = { workspace = true }
 # reviewed.
 pplx-space-metrics-emit = { workspace = true, features = ["test-capture"] }
 hyper-util = { workspace = true, features = ["tokio"] }
-pplx-space-firewall-rules-protocol = { workspace = true }
+# The slot pool tests seed and inspect rows through the store's raw
+# connection with rusqlite, binding u64 values as SqliteU64.
+pplx-space-node-mgr-store = { workspace = true, features = ["test-support"] }
+pplx-space-sqlite = { workspace = true }
+rusqlite = { workspace = true }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }

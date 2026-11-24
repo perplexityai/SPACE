@@ -1,7 +1,7 @@
 //! Bounded streaming shared by kernel images and release archives.
 use super::{describe, staging::StagingError};
 use futures_util::{Stream, StreamExt as _};
-use pplx_space_common_jobs::JobError;
+use pplx_space_node_runtime_manager_store::jobs::JobError;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;

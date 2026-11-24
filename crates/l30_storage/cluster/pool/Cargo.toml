@@ -27,6 +27,7 @@ kubernetes = [
     "dep:pplx-space-sql-locator",
     "dep:pplx-space-template-model",
     "dep:pplx-space-template-release-store",
+    "dep:pplx-space-template-release-original",
     "dep:serde",
     "dep:sqlx",
     "dep:thiserror",
@@ -42,6 +43,7 @@ pplx-space-execution-spec = { workspace = true, features = ["serde"], optional =
 pplx-space-sql-locator = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true, optional = true }
 pplx-space-template-release-store = { workspace = true, optional = true }
+pplx-space-template-release-original = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 sqlx = { workspace = true, features = ["derive", "migrate", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"], optional = true }
 thiserror = { workspace = true, optional = true }
@@ -49,6 +51,9 @@ time = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"], optional = true }
 
 [dev-dependencies]
+pplx-space-template-release-store = { workspace = true, features = ["test-support"] }
+pplx-space-template-store = { workspace = true, features = ["test-support"] }
 pplx-space-accounts = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-db-test-fixtures = { workspace = true }
+rstest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

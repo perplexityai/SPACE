@@ -622,13 +622,8 @@ async fn active_kek_provider(
     credentials_pool: &pplx_space_postgres_pool::CredentialsPool,
     org_id: OrgId,
 ) -> Result<Option<KekProvider>, IdentityAdminError> {
-    let provider: Option<String> = sqlx::query_scalar(sql!(
-        "SELECT provider FROM org_master_keys WHERE org_id = $1 AND retired_at IS NULL"
-    ))
-    .bind(org_id)
-    .fetch_optional(credentials_pool.pool())
-    .await?;
-    parse_active_kek_provider(provider)
+    let key = pplx_space_byok_store::active_master_key(credentials_pool.pool(), org_id).await?;
+    parse_active_kek_provider(key.map(|key| key.provider))
 }
 
 fn parse_active_kek_provider(
@@ -656,13 +651,9 @@ pub(super) async fn get_org_master_key(
 ) -> Result<Json<Option<OrgMasterKey>>, IdentityAdminError> {
     require_org_visible(&state, &actor, org_id).await?;
     require_org_exists(&state, org_id).await?;
-    let key = sqlx::query_as::<_, OrgMasterKey>(sql!(
-        "SELECT * FROM org_master_keys WHERE org_id = $1 AND retired_at IS NULL"
-    ))
-    .bind(org_id)
-    .fetch_optional(state.credentials_pool.pool())
-    .await?;
-    Ok(Json(key))
+    let key =
+        pplx_space_byok_store::active_master_key(state.credentials_pool.pool(), org_id).await?;
+    Ok(Json(key.map(OrgMasterKey::from)))
 }
 
 pub(super) async fn delete_org(

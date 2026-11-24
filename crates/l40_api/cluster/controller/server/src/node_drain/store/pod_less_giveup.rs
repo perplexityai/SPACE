@@ -116,12 +116,14 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 use pplx_space_cluster_pool::{PoolError, WarmPoolStore};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::{NodeDrainMode, SubstrateKind};
+use pplx_space_node_registration_store::locks;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_full_snapshot_unambiguous,
     pod_less_drain_revert_loses_no_newer_bytes,
 };
 use pplx_space_sandbox_store::drain;
+use pplx_space_sandbox_store::row_locks;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
@@ -269,14 +271,7 @@ impl PodLessHold {
 
 /// One pod name the sandbox has had, with the namespace and generation its
 /// execution row recorded for it.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub(crate) struct PodRef {
-    /// Decoded as [`ExecutionGeneration`], so a stored value that isn't one
-    /// fails the database read rather than reaching the node.
-    pub(crate) generation: ExecutionGeneration,
-    pub(crate) pod_namespace: String,
-    pub(crate) pod_name: String,
-}
+pub(crate) use pplx_space_sandbox_store::k8s_executions::ExecutionPodRef as PodRef;
 
 /// Uncached pod reads, behind a seam so the absence decision can be tested
 /// without a cluster.
@@ -357,15 +352,7 @@ pub(crate) async fn pod_refs(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> Result<Vec<PodRef>, sqlx::Error> {
-    sqlx::query_as(sql!(
-        "SELECT generation, pod_namespace, pod_name
-           FROM sandbox_k8s_executions
-          WHERE sandbox_id = $1
-          ORDER BY generation DESC"
-    ))
-    .bind(sandbox_id)
-    .fetch_all(pool)
-    .await
+    Ok(pplx_space_sandbox_store::k8s_executions::newest_first(pool, sandbox_id).await?)
 }
 
 /// The row-state guards, read once before the pod reads and again under the
@@ -613,14 +600,8 @@ async fn recover_pod_less_sandbox_locked(
     // arm's `UPDATE` would go unseen. The shared lock makes the undrain wait
     // for this commit, or, if it committed first, the guard read below sees
     // it. The drained-node terminator's flip fences the same way.
-    sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR SHARE"))
-        .bind(candidate.source_node_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *tx)
-        .await?;
+    locks::share_lock_node(&mut tx, candidate.source_node_id).await?;
+    row_locks::lock_exists(&mut tx, candidate.sandbox_id).await?;
     sqlx::query(sql!(
         "SELECT 1
            FROM sandbox_k8s_executions
@@ -662,12 +643,10 @@ async fn recover_pod_less_sandbox_locked(
     // The observed guard tolerated a `failed`, pid-less record. Left behind,
     // it would keep a reverted row reading `failed` through the observed-state
     // overlay, and once the node is gone nothing would publish over it.
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_observed_states
-          WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
-    ))
-    .bind(candidate.sandbox_id)
-    .execute(&mut *tx)
+    pplx_space_sandbox_store::observed_states::clear_failed_observation(
+        &mut tx,
+        candidate.sandbox_id,
+    )
     .await?;
 
     tx.commit().await?;
@@ -706,20 +685,7 @@ async fn reset_open_port_exposures(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE sandbox_port_exposures
-            SET apply_state = 'pending',\n\
-                last_applied_node_id = NULL,\n\
-                last_error = NULL,\n\
-                last_bridge_status = NULL,\n\
-                last_applied_bridge_generation = NULL,\n\
-                last_observed_at = NULL,\n\
-                updated_at = NOW()
-          WHERE sandbox_id = $1
-            AND desired_state = 'open'"
-    ))
-    .bind(sandbox_id)
-    .execute(&mut **tx)
-    .await?;
+    pplx_space_sandbox_store::port_exposures::invalidate_open_observations(&mut **tx, sandbox_id)
+        .await?;
     Ok(())
 }

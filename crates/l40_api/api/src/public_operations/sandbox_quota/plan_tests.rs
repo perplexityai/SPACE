@@ -1,4 +1,6 @@
-//! Plan-cost regression for [`SANDBOXES_HELD`].
+//! Plan-cost regression for [`SANDBOXES_HELD`], which
+//! `pplx-space-public-operation-store` runs; the plan helpers it reads rows
+//! with are this crate's.
 //!
 //! The count's behaviour is covered in `tests`; this covers how much it
 //! reads. A cached statement can switch to a generic plan, which knows no
@@ -31,7 +33,7 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::super::plan_explain::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
-use super::SANDBOXES_HELD;
+use pplx_space_public_operation_store::quota::SANDBOXES_HELD;
 
 /// How many plan nodes may handle each input row. The count's linear plans
 /// handle an org row in its scan (the bitmap index entry and the heap row),

@@ -83,6 +83,16 @@ const ALLOW_NODE_STATUS: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
+/// Node-status readers, plus template-manager, which reads the environments
+/// the node can run to warm and pool their template builds.
+const ALLOW_EXECUTION_INVENTORY: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Observer),
+    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
+    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
+];
 const ALLOW_NODE_ADMIN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
@@ -233,6 +243,8 @@ pub struct NodeManagerService {
     snapshot_inventory: snapshot_inventory::SnapshotInventory,
     #[cfg(test)]
     encrypted_capture_io: Option<snapshots::EncryptedCaptureTestIo>,
+    #[cfg(all(test, target_os = "linux"))]
+    firewall_sync: Option<std::sync::Arc<firewall_sync::FirewallSync>>,
 }
 
 type SandboxCgroupGateLock = std::sync::Arc<tokio::sync::RwLock<()>>;
@@ -318,7 +330,7 @@ impl NodeManagerService {
         &self,
         request: Request<GetExecutionInventoryRequest>,
     ) -> Result<Response<pplx_space_execution_common::proto::NodeExecutionInventory>, Status> {
-        self.authorize_peer(&request, "GetExecutionInventory", ALLOW_NODE_STATUS)?;
+        self.authorize_peer(&request, "GetExecutionInventory", ALLOW_EXECUTION_INVENTORY)?;
         // Before discovery, so a node that can't report inventory still reports this.
         crate::metrics::node_manager::execution_policy_record_unreadable(
             self.execution_policy().cluster_policy_unreadable(),
@@ -457,6 +469,8 @@ impl NodeManagerService {
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
             #[cfg(test)]
             encrypted_capture_io: None,
+            #[cfg(all(test, target_os = "linux"))]
+            firewall_sync: None,
         })
     }
 
@@ -743,7 +757,7 @@ impl NodeManagerService {
 
 /// Validate sandbox_id is a safe UUID-like string (prevents path traversal).
 mod adapter;
-mod artifact_fs;
+pub(crate) mod artifact_fs;
 pub mod btrfs_balance;
 mod btrfs_delegation;
 mod btrfs_send_source;
@@ -761,6 +775,7 @@ mod encrypted_volumes;
 mod endpoint_attestation;
 mod execution_fence;
 mod execution_policy;
+mod firewall_sync;
 mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;

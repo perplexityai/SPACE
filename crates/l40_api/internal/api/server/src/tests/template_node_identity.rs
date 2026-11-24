@@ -1,17 +1,11 @@
 use super::*;
-use crate::proto::{cluster_api_client::ClusterApiClient, cluster_api_server::ClusterApiServer};
-use pplx_space_rpc_auth::{
-    NodeApiAuthConfig, NodeApiAuthLayer, NodeRole,
-    test_support::{
-        pod_bound_service_account_status, projected_token, serve_token_reviews,
-        service_account_status,
-    },
+use pplx_space_rpc_auth::test_support::{
+    pod_bound_service_account_status, projected_token, service_account_status,
 };
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use tokio_stream::wrappers::TcpListenerStream;
 
 /// A pod's reviewed node binding, rather than its transport address, determines
 /// which placed private templates it can pull. Cached reviews retain the binding.
@@ -63,89 +57,56 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
     let reviewed_tokens = tokens.clone();
     let reviews = Arc::new(AtomicUsize::new(0));
     let review_count = reviews.clone();
-    let review_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let kube_config =
-        kube::Config::new(format!("http://{}", review_listener.local_addr()?).parse()?);
-    let reviewer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(serve_token_reviews(
-        review_listener,
-        move |spec| {
-            review_count.fetch_add(1, Ordering::SeqCst);
-            let index = reviewed_tokens
-                .iter()
-                .position(|token| Some(token) == spec.token.as_ref())
-                .unwrap();
-            let username = "system:serviceaccount:space:workers";
-            if index == 2 {
-                service_account_status("space-cluster-api", username)
+    let mut harness = serve_reviewed(fixture.service, "workers", None, move |spec| {
+        review_count.fetch_add(1, Ordering::SeqCst);
+        let index = reviewed_tokens
+            .iter()
+            .position(|token| Some(token) == spec.token.as_ref())
+            .unwrap();
+        let username = "system:serviceaccount:space:workers";
+        if index == 2 {
+            service_account_status("space-cluster-api", username)
+        } else {
+            let uid = if index == 0 {
+                node_uid.as_str()
             } else {
-                let uid = if index == 0 {
-                    node_uid.as_str()
-                } else {
-                    "stale-node-uid"
-                };
-                let mut status = pod_bound_service_account_status(
-                    "space-cluster-api",
-                    username,
-                    "catalog-worker",
-                    uid,
-                );
-                let extra = status.user.as_mut().unwrap().extra.as_mut().unwrap();
-                match index {
-                    3 => {
-                        extra.remove("authentication.kubernetes.io/node-name");
-                        extra.remove("authentication.kubernetes.io/node-uid");
-                    }
-                    4 => {
-                        extra.remove("authentication.kubernetes.io/node-uid");
-                    }
-                    5 => {
-                        extra.insert(
-                            "authentication.kubernetes.io/node-uid".into(),
-                            vec![uid.into(), uid.into()],
-                        );
-                    }
-                    6 => {
-                        extra.remove("authentication.kubernetes.io/node-uid");
-                        extra.insert(
-                            "authentication.kubernetes.io/pod-name".into(),
-                            vec!["invalid/name".into()],
-                        );
-                    }
-                    _ => {}
+                "stale-node-uid"
+            };
+            let mut status = pod_bound_service_account_status(
+                "space-cluster-api",
+                username,
+                "catalog-worker",
+                uid,
+            );
+            let extra = status.user.as_mut().unwrap().extra.as_mut().unwrap();
+            match index {
+                3 => {
+                    extra.remove("authentication.kubernetes.io/node-name");
+                    extra.remove("authentication.kubernetes.io/node-uid");
                 }
-                status
+                4 => {
+                    extra.remove("authentication.kubernetes.io/node-uid");
+                }
+                5 => {
+                    extra.insert(
+                        "authentication.kubernetes.io/node-uid".into(),
+                        vec![uid.into(), uid.into()],
+                    );
+                }
+                6 => {
+                    extra.remove("authentication.kubernetes.io/node-uid");
+                    extra.insert(
+                        "authentication.kubernetes.io/pod-name".into(),
+                        vec!["invalid/name".into()],
+                    );
+                }
+                _ => {}
             }
-        },
-        tokio_util::sync::CancellationToken::new(),
-    )));
-    let mut env = pplx_space_test_env::TestEnv::default();
-    for (key, value) in [
-        ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
-        ("SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED", "true"),
-        ("SPACE_K8S_TOKEN_AUTH_NAMESPACE", "space"),
-        ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
-        ("SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS", "workers"),
-    ] {
-        env.set(key, value);
-    }
-    let config = NodeApiAuthConfig::from_environment(
-        &env,
-        NodeRole::Cluster,
-        "synthetic-static-token".into(),
-        None,
-    )?;
-    let auth =
-        NodeApiAuthLayer::with_k8s_client_for_test(config, kube::Client::try_from(kube_config)?);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let endpoint = format!("http://{}", listener.local_addr()?);
-    let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .layer(auth)
-            .add_service(ClusterApiServer::new(fixture.service))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    }));
-    let mut client = ClusterApiClient::connect(endpoint).await?;
+            status
+        }
+    })
+    .await?;
+    let client = &mut harness.client;
     for (token, expected) in [
         (tokens[0].as_str(), [true, false]),
         (tokens[1].as_str(), [false, false]),
@@ -154,7 +115,7 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
         (tokens[4].as_str(), [false, true]),
         (tokens[5].as_str(), [false, false]),
         (tokens[6].as_str(), [false, false]),
-        ("synthetic-static-token", [false, true]),
+        (REVIEWED_STATIC_TOKEN, [false, true]),
     ] {
         for _ in 0..2 {
             for ((template, hash), expected) in
@@ -185,7 +146,6 @@ async fn pod_template_reads_follow_reviewed_node_identity() -> TestResult {
         tokens.len(),
         "each projected token is reviewed once"
     );
-    drop(server);
-    drop(reviewer);
+    drop(harness);
     Ok(())
 }

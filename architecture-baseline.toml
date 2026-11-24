@@ -13,15 +13,14 @@
 "crates/l40_api/api/src/controllers/sandbox/responses.rs" = 4
 "crates/l40_api/api/src/controllers/sandbox/spaced.rs" = 1
 "crates/l40_api/api/src/public_template_operations.rs" = 1
-"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 7
-"crates/l40_api/api/src/routes/admin/node_store.rs" = 1
+"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 6
 "crates/l40_api/api/src/routes/admin/templates.rs" = 1
 "crates/l40_api/api/src/routes/public/sandboxes.rs" = 1
-"crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 2
+"crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 1
 "crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
 "crates/l40_api/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
 "crates/l40_api/internal/api/server/src/lib.rs" = 1
-"crates/l40_api/internal/api/server/src/published_state.rs" = 4
+"crates/l40_api/internal/api/server/src/published_state.rs" = 2
 
 [pattern_ratchet.kubernetes_access]
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
@@ -76,14 +75,7 @@ pplx-space-api = [
 pplx-space-build-mgr = [
   "pplx-space-object-store",
 ]
-pplx-space-build-mgr-server = [
-  "pplx-space-common-jobs",
-  "rusqlite",
-]
 pplx-space-cluster-controller-server = [
-  "sqlx",
-]
-pplx-space-cluster-reconciler = [
   "sqlx",
 ]
 pplx-space-credmgr = [
@@ -92,117 +84,34 @@ pplx-space-credmgr = [
 pplx-space-internal-api-server = [
   "sqlx",
 ]
-pplx-space-node-ctl-server = [
-  "pplx-space-sqlite",
-  "rusqlite",
-  "sqlx",
-]
-pplx-space-node-mgr = [
-  "pplx-space-sqlite",
-  "rusqlite",
-  "sqlx",
-]
 pplx-space-node-runtime-manager = [
   "aws-sdk-s3",
-  "pplx-space-common-jobs",
   "pplx-space-s3-http-client",
-  "pplx-space-sqlite",
-  "rusqlite",
-  "sqlx",
 ]
 pplx-space-snapshot-retention = [
-  "sqlx",
-]
-pplx-space-state-reconciliation = [
-  "sqlx",
-]
-pplx-space-template-mgr = [
-  "pplx-space-common-jobs",
-  "pplx-space-sqlite",
-  "rusqlite",
   "sqlx",
 ]
 pplx-space-template-publisher = [
   "pplx-space-object-store",
 ]
 pplx-space-volmgr = [
-  "pplx-space-common-jobs",
   "pplx-space-object-store",
-  "pplx-space-sqlite",
-  "rusqlite",
-  "sqlx",
 ]
 
 [layers.unowned]
 postgres = [
-  "admin_audit_events",
   "api_keys",
   "clusters",
-  "data_plane_org_revocation_epochs",
   "data_plane_session_output_events",
-  "data_plane_sessions",
-  "node_artifact_components",
-  "node_direct",
-  "node_group_template_compat",
-  "node_groups",
-  "node_k8s_tombstones",
-  "node_runtime_guests",
-  "node_runtime_installations",
-  "node_runtime_state_formats",
-  "node_template_components",
-  "node_template_inventory",
-  "org_branching_keys",
   "org_credentials",
-  "org_master_keys",
-  "org_storage_vend_identities",
   "organizations",
-  "public_idempotency_records",
-  "public_operation_events",
-  "public_operations",
   "sandbox_archives",
-  "sandbox_direct_route_identities",
-  "sandbox_direct_route_provenance",
-  "sandbox_ecw_credential_epochs",
   "sandbox_encrypted_fields",
-  "sandbox_volume_encryption",
   "sessions",
-  "template_base_snapshot_policies",
-  "template_build_base_grants",
-  "template_build_blobs",
-  "template_build_jobs",
-  "template_default_auto_lifecycle_policies",
   "template_encrypted_fields",
-  "template_pool_policies",
   "template_release_storage_location_encrypted_fields",
-  "template_release_tags",
-  "template_system_publication_grants",
-  "template_tenant_publication_grants",
-  "templates",
   "user_credentials",
   "users",
-]
-"sqlite.build-manager" = [
-  "build_job_results",
-  "jobs",
-]
-"sqlite.node-ctl" = [
-  "dirty_facets",
-  "dirty_node_state",
-  "facet_sync_overrides",
-  "reconciliation_status",
-]
-"sqlite.node-manager" = [
-  "network_pool_meta",
-  "network_slots",
-  "sandbox_executions",
-]
-"sqlite.runtime-manager" = [
-  "jobs",
-  "operation_results",
-]
-"sqlite.volume-manager" = [
-  "jobs",
-  "volume_attachments",
 ]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such

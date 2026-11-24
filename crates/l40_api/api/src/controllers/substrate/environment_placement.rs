@@ -29,7 +29,8 @@
 //! On Kubernetes, kube-scheduler picks the node, so the gate reaches placement
 //! through the pod instead: `pod_environment` records the work's environment
 //! on the pod in shadow and on, and on adds a required node affinity on the
-//! label node-ctl writes for it. Kubernetes refuses on at startup for now
+//! label node-ctl writes for it. Kubernetes refuses on at startup while
+//! resume-time runtime upgrades are on
 //! ([`EnvironmentPlacementGate::check_kubernetes_support`]).
 //!
 //! The gate reads only what nodes publish. It doesn't apply the cluster's
@@ -101,20 +102,30 @@ impl EnvironmentPlacementGate {
         matches!(self, Self::Shadow)
     }
 
-    /// Whether the Kubernetes substrate supports this mode (the gap table in
-    /// `kubernetes/mod.rs`). `off` and `shadow` are, since shadow places as
-    /// off. `on` is refused at startup until its gap-table row closes: a
-    /// runtime-upgrade activation's pod requires the recorded environment
-    /// rather than the upgrade's target, so the requirement would claim
-    /// enforcement the worker doesn't yet provide.
-    pub fn check_kubernetes_support(self) -> Result<(), super::SubstrateError> {
+    /// Whether the Kubernetes substrate supports this mode alongside
+    /// `runtime_upgrade` (the gap table in `kubernetes/mod.rs`). `off` and
+    /// `shadow` always are, since shadow places as off. `on` is, unless
+    /// resume-time runtime upgrades are on too: a runtime-upgrade
+    /// activation's pod requires the recorded environment rather than the
+    /// upgrade's target, so the requirement would claim enforcement the
+    /// worker doesn't provide. With upgrades off no activation upgrades, so
+    /// every pod's requirement is the environment it boots. That's the only
+    /// path this check knows: a later one that boots a pod in an environment
+    /// other than the one it requires has to refuse `on` here too.
+    pub fn check_kubernetes_support(
+        self,
+        runtime_upgrade: super::runtime_upgrade::RuntimeUpgradeAtActivation,
+    ) -> Result<(), super::SubstrateError> {
         match self {
             Self::Off | Self::Shadow => Ok(()),
+            Self::On if !runtime_upgrade.is_enabled() => Ok(()),
             Self::On => Err(super::SubstrateError::Unsupported {
                 message: format!(
-                    "{}=on isn't supported on the Kubernetes substrate yet: runtime-upgrade pods \
-                     don't yet require the upgrade's target environment; use shadow",
-                    Self::ENV
+                    "{}=on isn't supported on the Kubernetes substrate while {} is on: \
+                     runtime-upgrade pods don't yet require the upgrade's target environment; \
+                     turn resume-time upgrades off or use shadow",
+                    Self::ENV,
+                    super::runtime_upgrade::RuntimeUpgradeAtActivation::ENV,
                 ),
             }),
         }
@@ -359,8 +370,12 @@ async fn build_binding(
 ) -> Result<Option<String>, sqlx::Error> {
     let release = match release {
         BuildRelease::Original => {
-            crate::template_releases_store::release_environment(pool, template, content_hash)
-                .await?
+            pplx_space_template_release_store::lookup::original_release_environment(
+                pool,
+                template,
+                content_hash,
+            )
+            .await?
         }
         #[cfg(feature = "kubernetes")]
         BuildRelease::Resolved => {
@@ -374,7 +389,7 @@ async fn build_binding(
             {
                 Some((_, environment)) => environment,
                 None => {
-                    crate::template_releases_store::release_environment(
+                    pplx_space_template_release_store::lookup::original_release_environment(
                         pool,
                         template,
                         content_hash,
@@ -385,7 +400,8 @@ async fn build_binding(
         }
         #[cfg(feature = "kubernetes")]
         BuildRelease::Id(release_id) => {
-            crate::template_releases_store::release_environment_by_id(pool, release_id).await?
+            pplx_space_template_release_store::lookup::release_environment_by_id(pool, release_id)
+                .await?
         }
     };
     match (release, scope) {
@@ -394,10 +410,11 @@ async fn build_binding(
         (None, BindingScope::ReleaseOrHolders) => {
             // A twin's build shares the template and hash, so its holders'
             // binding is the twin's, not this release's.
-            let twins = crate::template_releases_store::bound_release_environments(
+            let twins = pplx_space_template_release_store::lookup::bound_release_environments(
                 pool,
                 template,
                 content_hash,
+                pplx_space_execution_catalog::catalog::initial_environment_reference(),
             )
             .await?;
             crate::template_inventory_store::agreed_build_environment(

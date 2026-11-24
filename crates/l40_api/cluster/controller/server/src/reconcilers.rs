@@ -95,6 +95,7 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
+use pplx_space_postgres_pool::Db;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -296,13 +297,13 @@ pub async fn run_reconcilers(
         })?;
     let mut handles = vec![
         tokio::spawn(trigger_fanout::run(
-            pool.clone(),
+            Db::from(pool.clone()),
             trigger_substrate,
             TriggerFanoutConfig::default(),
             shutdown_token.child_token(),
         )),
         tokio::spawn(metrics::run_queue_metrics(
-            pool.clone(),
+            Db::from(pool.clone()),
             metrics::QueueMetricsConfig::default(),
             shutdown_token.child_token(),
         )),
@@ -336,14 +337,39 @@ pub async fn run_reconcilers(
             shutdown_token.child_token(),
         )),
         // Runtime upgrade campaigns. Off unless
-        // `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on; no campaign
-        // kind has a driver yet, so on it only reports campaigns and their
-        // items, and returns an aborted campaign's in-flight items whose
-        // leases lapsed to pending.
-        tokio::spawn(crate::runtime_upgrade::run(
-            crate::runtime_upgrade::ReconcilerConfig::from_env(),
+        // `SPACE_RUNTIME_UPGRADE_RECONCILER_ENABLED` turns it on. Template
+        // campaigns are driven; the template driver reads the credential-fenced
+        // storage-location sidecar on the credentials pool. On, the loop also
+        // returns an aborted campaign's in-flight items whose leases lapsed to
+        // pending.
+        tokio::spawn({
+            let mut config = crate::runtime_upgrade::ReconcilerConfig::from_env();
+            let origins = crate::runtime_upgrade::template_storage_origins(
+                &mut config,
+                &pplx_space_env_vars::ProcessEnvironment,
+            );
+            crate::runtime_upgrade::run(
+                config,
+                pool.clone(),
+                crate::runtime_upgrade::cluster_drivers(
+                    pool.clone(),
+                    credentials_pool.pool().clone(),
+                    // Only where the worker boots a create's required
+                    // environment, with the placement gate on, does a create
+                    // resolved to a template twin boot the twin's.
+                    substrate.boots_template_twins(),
+                    pplx_space_api::controllers::substrate::SubstrateAdapter::managed_by(
+                        substrate.as_ref(),
+                    ),
+                    origins,
+                ),
+                shutdown_token.child_token(),
+            )
+        }),
+        // Firewall rules canary issuance. Off: nothing configures it yet.
+        tokio::spawn(crate::firewall_rules_issue::run(
+            None,
             pool.clone(),
-            crate::runtime_upgrade::cluster_drivers(),
             shutdown_token.child_token(),
         )),
     ];

@@ -1,5 +1,6 @@
 //! `[rules.layers]`: the layer of each workspace member that is not yet in its
-//! layer's directory, which crates may use each store, the declared
+//! layer's directory, which crates may use each store and each coordinator,
+//! the declared
 //! exceptions to the layer order, and the mode of each of the layers rule's
 //! checks.
 
@@ -110,19 +111,16 @@ pub struct LayersConfig {
     /// Each store's package name to the packages that may depend on it.
     #[serde(default)]
     pub store_users: BTreeMap<String, PackageSet>,
+    /// Each coordinator's package name to the packages that may depend on
+    /// it.
+    #[serde(default)]
+    pub coordinator_users: BTreeMap<String, PackageSet>,
     /// Package name to the packages it may depend on although the layer
     /// order forbids it.
     #[serde(default)]
     pub allowed_edges: BTreeMap<String, PackageSet>,
     /// What `storage_access` and `codec_features` treat as storage.
     pub storage: StorageConfig,
-    /// Crates that predate the layers and are being dissolved. Every check
-    /// covers legacy crates, with today's edges baselined; a store user that
-    /// reaches a store only through one, as through a re-export, still uses
-    /// it. A legacy Foundation crate is no storage helper even with a
-    /// required driver dependency.
-    #[serde(default)]
-    pub legacy: PackageSet,
     /// Domain crates that are protocols although their names don't end in
     /// `-protocol` or `-proto`; every other Domain crate is a model.
     #[serde(default)]
@@ -141,6 +139,9 @@ pub struct LayersConfig {
     pub test_only: BehaviourConfig,
     pub clients: BehaviourConfig,
     pub store_edges: BehaviourConfig,
+    pub coordinators: BehaviourConfig,
+    pub coordinator_edges: BehaviourConfig,
+    pub driver_reexports: BehaviourConfig,
     pub stale_entries: BehaviourConfig,
     pub policy_changed: BehaviourConfig,
     /// `[rules.layers.state]`, which store owns each table; the state checks
@@ -470,13 +471,9 @@ pub struct LayersPolicy {
     /// Package name to its layer as written.
     pub unmoved: Entries<String>,
     pub store_users: Entries<BTreeMap<String, usize>>,
+    pub coordinator_users: Entries<BTreeMap<String, usize>>,
     pub allowed_edges: Entries<BTreeMap<String, usize>>,
     pub storage: StoragePolicy,
-    /// `legacy`, each package with the line it is written on.
-    pub legacy: BTreeMap<String, usize>,
-    /// The line of the `legacy` key, or without one, of the
-    /// `[rules.layers]` header, if there is one.
-    pub legacy_line: Option<usize>,
     /// `protocols`, each package with the line it is written on.
     pub protocols: BTreeMap<String, usize>,
     /// The line of the `protocols` key, or without one, of the
@@ -544,9 +541,9 @@ struct PolicyRules {
 struct PolicyTable {
     unmoved: Option<BTreeMap<String, Vec<Spanned<String>>>>,
     store_users: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
+    coordinator_users: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     allowed_edges: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     storage: Option<PolicyStorage>,
-    legacy: Option<Spanned<Vec<Spanned<String>>>>,
     protocols: Option<Spanned<Vec<Spanned<String>>>>,
     domain_fences: Option<BTreeMap<String, Vec<Spanned<String>>>>,
     placement: Option<PolicyBehaviour>,
@@ -560,6 +557,9 @@ struct PolicyTable {
     test_only: Option<PolicyBehaviour>,
     clients: Option<PolicyBehaviour>,
     store_edges: Option<PolicyBehaviour>,
+    coordinators: Option<PolicyBehaviour>,
+    coordinator_edges: Option<PolicyBehaviour>,
+    driver_reexports: Option<PolicyBehaviour>,
     stale_entries: Option<PolicyBehaviour>,
     policy_changed: Option<PolicyBehaviour>,
     state: Option<PolicyState>,
@@ -655,6 +655,7 @@ impl LayersPolicy {
                     .collect(),
             };
         let store_users = lists("store_users", table.store_users);
+        let coordinator_users = lists("coordinator_users", table.coordinator_users);
         let allowed_edges = lists("allowed_edges", table.allowed_edges);
         let packages = |list: Option<Vec<Spanned<String>>>| {
             list.unwrap_or_default()
@@ -702,11 +703,6 @@ impl LayersPolicy {
                 },
             },
         };
-        let legacy_line = match &table.legacy {
-            Some(legacy) => Some(line(legacy.span())),
-            None => header_line(text, "[rules.layers]"),
-        };
-        let legacy = packages(table.legacy.map(Spanned::into_inner));
         let protocols_line = match &table.protocols {
             Some(protocols) => Some(line(protocols.span())),
             None => header_line(text, "[rules.layers]"),
@@ -741,6 +737,9 @@ impl LayersPolicy {
             ("test_only", table.test_only),
             ("clients", table.clients),
             ("store_edges", table.store_edges),
+            ("coordinators", table.coordinators),
+            ("coordinator_edges", table.coordinator_edges),
+            ("driver_reexports", table.driver_reexports),
             ("stale_entries", table.stale_entries),
             ("policy_changed", table.policy_changed),
         ] {
@@ -778,10 +777,9 @@ impl LayersPolicy {
             line,
             unmoved,
             store_users,
+            coordinator_users,
             allowed_edges,
             storage,
-            legacy,
-            legacy_line,
             protocols,
             protocols_line,
             domain_fences,

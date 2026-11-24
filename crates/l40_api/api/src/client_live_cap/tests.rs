@@ -768,3 +768,51 @@ async fn a_kept_entry_lapses_on_its_own_while_another_owner_renews() -> TestResu
     assert!(freed.is_ok(), "the kept entry lapsed on its own TTL");
     Ok(())
 }
+
+/// A `cluster_id` rule on the quotas flag sets a live cap in the cluster it
+/// names and no other, and a process with no cluster id is never matched.
+/// With no rule, every cluster reads what it read before the attribute
+/// existed.
+#[tokio::test]
+async fn a_cluster_id_rule_retunes_only_the_cluster_it_names() {
+    use crate::limiter_flags::tests::{cluster, targeting_one_cluster, without_a_rule};
+
+    let cap_in = |flags: &FeatureFlagClient, cluster_id: Option<&str>| {
+        let substrate = Substrate::from_direct(
+            crate::controllers::substrate::direct::DirectSubstrate::new(lazy_pool()),
+        );
+        ClientLiveCap::with_config(substrate, config(cap(10), None), flags.clone())
+            .with_flag_cluster_id(cluster_id.map(cluster).as_ref())
+            .check_for(&id("alpha"))
+            .map(|check| check.cap.get())
+    };
+    let quotas = SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG.key();
+    let shared = serde_json::json!({"live": {"alpha": 5}});
+
+    let tight_in_a = targeting_one_cluster(
+        quotas,
+        "cluster-a",
+        serde_json::json!({"live": {"alpha": 2}}),
+        Some(shared.clone()),
+    );
+    assert_eq!(cap_in(&tight_in_a, Some("cluster-a")), Some(2));
+    assert_eq!(cap_in(&tight_in_a, Some("cluster-b")), Some(5));
+    assert_eq!(cap_in(&tight_in_a, None), Some(5));
+
+    // No rule: each cluster gets the answer the attribute-free read gives.
+    for default in [Some(shared), None] {
+        let today = match &default {
+            Some(value) => FeatureFlagClient::fixed_json([(quotas, value.clone())]),
+            None => FeatureFlagClient::fixed_json([("other", serde_json::json!({}))]),
+        };
+        let expected = cap_in(&today, None);
+        let untargeted = without_a_rule(quotas, default.clone());
+        for cluster_id in [Some("cluster-a"), Some("cluster-b"), None] {
+            assert_eq!(
+                cap_in(&untargeted, cluster_id),
+                expected,
+                "quotas default {default:?} in {cluster_id:?}"
+            );
+        }
+    }
+}

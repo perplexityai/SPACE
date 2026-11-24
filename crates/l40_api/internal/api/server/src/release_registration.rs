@@ -8,6 +8,8 @@
 
 use pplx_space_accounts::OrgId;
 use pplx_space_sql_locator::sql;
+use pplx_space_template_release_original::digest_original;
+use std::sync::LazyLock;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -111,7 +113,7 @@ pub(super) async fn ensure_template_release(
         check_release_identity(original, runtime, org_id)?;
     }
 
-    if let Some(inserted) = super::template_releases_store::insert_release(
+    if let Some(inserted) = pplx_space_template_release_store::registration::insert_release(
         &mut **tx,
         template_name,
         runtime,
@@ -123,7 +125,7 @@ pub(super) async fn ensure_template_release(
     .map_err(|error| {
         crate::template_publication::storage_status("insert template release", &error)
     })? {
-        return Ok(inserted);
+        return Ok(TemplateReleaseRow::from(inserted));
     }
 
     // The insert conflicted: with a concurrent registration of the same
@@ -225,15 +227,11 @@ async fn first_registered_release_id(
     template_name: &str,
     hash: &str,
 ) -> Result<Option<Uuid>, Status> {
-    sqlx::query_scalar(sql!(
-        "SELECT id FROM template_releases
-         WHERE template_name = $1 AND hash = $2
-         ORDER BY created_at ASC, id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(hash)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::registration::first_registered_release_id(
+        &mut **tx,
+        template_name,
+        hash,
+    )
     .await
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
@@ -337,44 +335,36 @@ pub(super) async fn accept_existing_release(
 /// republication of one of those must attach its tags to that row rather than
 /// create a second, artifact-less release beside it.
 ///
-/// Where both spellings already exist, the row that owns a recorded storage
-/// location wins regardless of age: tags attached to an artifact-less
-/// duplicate would resolve to a release nothing can pull. Age breaks ties.
-/// Each spelling's candidate is its original (no older release of the same
-/// template and hash), so a twin, registered after its original, never wins,
-/// even with a storage location its original lacks.
+/// The choice is `pplx_space_template_release_original::digest_original`, the
+/// rule the API and the warm pool resolve the digest with too: where both
+/// spellings exist, the original that owns a recorded storage location wins,
+/// then the older. A twin never wins.
 async fn find_original_release_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     template_name: &str,
     hash: &str,
 ) -> Result<Option<TemplateReleaseRow>, Status> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
+                    r.execution_metadata->>'environment' AS environment
+             FROM template_releases r
+             WHERE r.template_name = $1
+               AND r.hash IN ($2, $3)
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
     let bare_hash = hash.trim_prefix("sha256:");
     let canonical_hash = format!("sha256:{bare_hash}");
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
-                r.execution_metadata->>'environment' AS environment
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash IN ($2, $3)
-           AND NOT EXISTS (
-                SELECT 1 FROM template_releases o
-                WHERE o.template_name = r.template_name
-                  AND o.hash = r.hash
-                  AND (o.created_at, o.id) < (r.created_at, r.id))
-         ORDER BY EXISTS (
-                      SELECT 1
-                      FROM template_release_storage_locations l
-                      WHERE l.template_release_id = r.id) DESC,
-                  r.created_at ASC,
-                  r.id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(&canonical_hash)
-    .bind(bare_hash)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
+    sqlx::query_as::<_, TemplateReleaseRow>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name)
+        .bind(&canonical_hash)
+        .bind(bare_hash)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
 /// The release of `template_name` stored under exactly `hash` in `partition`
@@ -397,37 +387,21 @@ async fn find_partition_release_row(
 ) -> Result<Option<TemplateReleaseRow>, Status> {
     // The legacy partition matches an unbound release or one bound to the
     // initial environment.
-    let legacy = partition.environment().is_none();
-    let environment = partition
-        .environment()
-        .unwrap_or_else(pplx_space_execution_catalog::catalog::initial_environment_reference)
-        .to_string();
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "SELECT r.id, r.template_name, r.type, r.hash, r.org_id, r.created_at,
-                r.execution_metadata->>'environment' AS environment
-         FROM template_releases r
-         WHERE r.template_name = $1
-           AND r.hash = $2
-           AND ((r.execution_metadata IS NULL AND $5 AND $3)
-                OR (r.execution_metadata IS NOT NULL
-                    AND (r.execution_metadata->>'environment' = $4
-                         OR ($3 AND r.execution_metadata->>'environment' IS NULL))))
-         ORDER BY EXISTS (
-                      SELECT 1
-                      FROM template_release_storage_locations l
-                      WHERE l.template_release_id = r.id) DESC,
-                  (r.execution_metadata IS NOT NULL) DESC,
-                  r.created_at ASC,
-                  r.id ASC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(hash)
-    .bind(legacy)
-    .bind(&environment)
-    .bind(evidence == Evidence::Any)
-    .fetch_optional(&mut **tx)
+    let selector = pplx_space_template_release_store::PartitionSelector {
+        environment: partition
+            .environment()
+            .unwrap_or_else(pplx_space_execution_catalog::catalog::initial_environment_reference),
+        includes_unbound: partition.environment().is_none(),
+    };
+    pplx_space_template_release_store::registration::partition_release(
+        &mut **tx,
+        template_name,
+        hash,
+        selector,
+        evidence == Evidence::Any,
+    )
     .await
+    .map(|release| release.map(TemplateReleaseRow::from))
     .map_err(|err| crate::template_publication::storage_status("query template_release", &err))
 }
 
@@ -475,14 +449,14 @@ async fn fill_release_execution_metadata(
     let mut savepoint = sqlx::Acquire::begin(&mut **tx)
         .await
         .map_err(|error| storage(&error))?;
-    match super::template_releases_store::fill_execution_metadata(
+    match pplx_space_template_release_store::registration::fill_execution_metadata(
         &mut *savepoint,
         release_id,
         execution,
     )
     .await
     {
-        Ok(()) => {
+        Ok(_) => {
             savepoint.commit().await.map_err(|error| storage(&error))?;
             Ok(MetadataCheck::Accepted)
         }

@@ -307,7 +307,7 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
 /// `/space/cache/<id>/snapshot/` directory and a concurrent wake plus re-suspend
 /// would let it register a torn snapshot.
 ///
-/// The handler expresses that as `NodeDrainState::blocks_placement`, the same
+/// The handler expresses that as `NodeDrain::blocks_placement`, the same
 /// predicate the gate itself uses — sharing it is the point, since the hazard is
 /// precisely a reader that believes wakes are blocked when they are not. This
 /// test pins the truth table that makes the sharing correct: a **gentle**
@@ -328,11 +328,11 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
 /// on the source is what gives this an oracle.
 #[test]
 fn force_upload_refusal_text_has_no_embedded_indentation() {
-    use pplx_space_node_model::{NodeDrainPhase, NodeDrainState};
+    use pplx_space_node_model::{NodeDrain, NodeDrainPhase};
 
     let states = [
         None,
-        NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), Some("gentle")),
+        NodeDrain::from_v1_columns(Some(NodeDrainPhase::Draining), Some("gentle")),
     ];
     for state in states {
         let (error, detail) = super::force_upload_gate_open_message(state);
@@ -347,23 +347,21 @@ fn force_upload_refusal_text_has_no_embedded_indentation() {
 
 #[test]
 fn force_upload_requires_a_closed_wake_gate() {
-    use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, NodeDrainState};
+    use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase};
 
     // No drain at all: the gate is open, so the action is refused.
-    assert!(
-        !NodeDrainState::from_columns(None, None).is_some_and(NodeDrainState::blocks_placement)
-    );
+    assert!(!NodeDrain::from_v1_columns(None, None).is_some_and(NodeDrain::blocks_placement));
 
     // Gentle + draining: non-NULL phase, but the gate is deliberately open.
     let gentle_draining =
-        NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), Some("gentle"))
+        NodeDrain::from_v1_columns(Some(NodeDrainPhase::Draining), Some("gentle"))
             .expect("a phase was supplied");
     assert!(
         !gentle_draining.blocks_placement(),
         "a gentle drain must not satisfy the force-upload precondition"
     );
     // ...and the same is true when nobody set a mode, since that reads as gentle.
-    let unset_mode = NodeDrainState::from_columns(Some(NodeDrainPhase::Draining), None)
+    let unset_mode = NodeDrain::from_v1_columns(Some(NodeDrainPhase::Draining), None)
         .expect("a phase was supplied");
     assert!(!unset_mode.blocks_placement());
 
@@ -376,7 +374,7 @@ fn force_upload_requires_a_closed_wake_gate() {
         (NodeDrainPhase::Terminating, NodeDrainMode::Forced),
         (NodeDrainPhase::Terminating, NodeDrainMode::Gentle),
     ] {
-        let state = NodeDrainState::from_columns(Some(phase), Some(mode.as_str()))
+        let state = NodeDrain::from_v1_columns(Some(phase), Some(mode.as_str()))
             .expect("a phase was supplied");
         assert!(
             state.blocks_placement(),
@@ -1747,8 +1745,8 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
     sqlx::query(sql!("SET LOCAL lock_timeout = '20ms'"))
         .execute(&mut *guard_tx)
         .await?;
-    let error = node_store::sandbox_occupancy_for_node_in_tx(
-        &mut guard_tx,
+    let error = pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+        &mut *guard_tx,
         node_id,
         ResidencyEvidence::LifecycleOnly,
     )
@@ -2669,11 +2667,8 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
         assert_eq!(observation.policy.is_some(), expected);
         assert_eq!(observation.policy_received_at.is_some(), expected);
         let mut tx = db.pool.begin().await?;
-        assert!(
-            node_store::lock_node_for_update(&mut tx, node_id)
-                .await?
-                .is_some()
-        );
+        let row: Option<AdminNodeRow> = direct::lock_admin_node(&mut tx, node_id).await?;
+        assert!(row.is_some());
         tx.rollback().await?;
     }
     Ok(())

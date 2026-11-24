@@ -12,6 +12,8 @@ workspace = true
 
 [features]
 default = []
+# `serve_firewall_wake_for_test`, for another crate's end-to-end test.
+test-support = ["pplx-space-node-ctl-store/test-support"]
 otel = [
     "pplx-space-observability/otel",
     "pplx-space-template-mgr-client/otel",
@@ -57,13 +59,13 @@ pplx-space-observability = { workspace = true }
 pplx-space-semver = { workspace = true }
 pplx-space-service-lifecycle = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
-pplx-space-sqlite = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-grpc-metrics = { workspace = true }
 pplx-space-metrics-emit = { workspace = true }
 pplx-space-reconcile-metrics = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
+pplx-space-node-ctl-store = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true }
 pplx-space-node-runtime-manager-client = { workspace = true }
@@ -76,10 +78,8 @@ pplx-space-uds-peer-auth = { workspace = true }
 pplx-space-unix-socket-bind = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
@@ -96,7 +96,11 @@ http-body = { workspace = true }
 insta = { workspace = true }
 # `serde` reads the E0 fixture document the environment-label tests build on.
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
+# `test-support` lets the tests seed and inspect node-ctl's database through
+# the store's raw connection, and serve on an in-memory one.
+pplx-space-node-ctl-store = { workspace = true, features = ["test-support"] }
 pplx-space-sbx-mgr-client = { workspace = true, features = ["test-support"] }
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the facet
 # stall-watchdog tests run on virtual time.

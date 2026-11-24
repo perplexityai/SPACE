@@ -238,7 +238,7 @@ pub struct Sandbox {
 /// active key for new wraps.
 ///
 /// `updated_at` is trigger-maintained; do not set manually.
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrgMasterKey {
     pub id: Uuid,
     pub org_id: OrgId,
@@ -250,6 +250,20 @@ pub struct OrgMasterKey {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+impl From<pplx_space_byok_store::MasterKeyRecord> for OrgMasterKey {
+    fn from(record: pplx_space_byok_store::MasterKeyRecord) -> Self {
+        Self {
+            id: record.id,
+            org_id: record.org_id,
+            provider: record.provider,
+            key_identifier: record.key_identifier,
+            retired_at: record.retired_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
 }
 
 /// Per-sandbox encryption sidecar. Presence-of-row IS the encryption
@@ -459,7 +473,7 @@ impl SandboxResponse {
     }
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxPortExposure {
     pub sandbox_id: SandboxId,
     pub protocol: String,
@@ -485,6 +499,43 @@ pub struct SandboxPortExposure {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+impl From<pplx_space_sandbox_store::port_exposures::PortExposureRecord> for SandboxPortExposure {
+    fn from(record: pplx_space_sandbox_store::port_exposures::PortExposureRecord) -> Self {
+        let pplx_space_sandbox_store::port_exposures::PortExposureRecord {
+            sandbox_id,
+            protocol,
+            guest_port,
+            visibility,
+            source,
+            desired_state,
+            apply_state,
+            last_applied_node_id,
+            last_error,
+            last_bridge_status,
+            last_applied_bridge_generation,
+            last_observed_at,
+            created_at,
+            updated_at,
+        } = record;
+        Self {
+            sandbox_id,
+            protocol,
+            guest_port,
+            visibility,
+            source,
+            desired_state,
+            apply_state,
+            last_applied_node_id,
+            last_error,
+            last_bridge_status,
+            last_applied_bridge_generation,
+            last_observed_at,
+            created_at,
+            updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

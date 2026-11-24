@@ -14,19 +14,6 @@ pub(super) struct NodeTemplateSnapshotResponse {
     pub(super) snapshot_hash: String,
 }
 
-#[derive(Debug, FromRow)]
-pub(super) struct NodeTemplateInventoryRow {
-    pub(super) name: String,
-    pub(super) content_hash: Option<String>,
-    pub(super) build_date: Option<String>,
-    pub(super) artifact_size_bytes: Option<i64>,
-    pub(super) cache_size_bytes: Option<i64>,
-    pub(super) disk_size_mb: Option<i32>,
-    pub(super) runtime: Option<String>,
-    pub(super) arch: Option<String>,
-    pub(super) snapshots: sqlx::types::Json<Vec<NodeTemplateSnapshotResponse>>,
-}
-
 #[derive(Debug, Serialize)]
 pub(super) struct NodeTemplateBuildResponse {
     pub(super) name: String,
@@ -126,51 +113,30 @@ pub(super) async fn delete_cached_node_template_inventory(
     content_hash: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     if let Some(content_hash) = content_hash {
-        sqlx::query(sql!(
-            "DELETE FROM node_template_inventory
-             WHERE node_id = $1
-               AND template_name = $2
-               AND content_hash = $3"
-        ))
-        .bind(node_id)
-        .bind(template)
-        .bind(content_hash)
-        .execute(pool)
+        pplx_space_node_template_inventory_store::delete_node_template_build(
+            pool,
+            node_id,
+            template,
+            content_hash,
+        )
         .await?;
     } else {
-        sqlx::query(sql!(
-            "DELETE FROM node_template_inventory
-             WHERE node_id = $1
-               AND template_name = $2"
-        ))
-        .bind(node_id)
-        .bind(template)
-        .execute(pool)
-        .await?;
+        pplx_space_node_template_inventory_store::delete_node_template(pool, node_id, template)
+            .await?;
     }
 
-    let remaining: i64 = sqlx::query_scalar(sql!(
-        "SELECT COUNT(*)::BIGINT
-         FROM node_template_inventory
-         WHERE node_id = $1
-           AND template_name = $2"
-    ))
-    .bind(node_id)
-    .bind(template)
-    .fetch_one(pool)
+    let remaining = pplx_space_node_template_inventory_store::node_template_build_count(
+        pool, node_id, template,
+    )
     .await?;
 
     if remaining == 0 {
-        sqlx::query(sql!(
-            "DELETE FROM node_facet_observed_status
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = $3"
-        ))
-        .bind(node_id)
-        .bind(FACET_NETWORK_POLICY)
-        .bind(format!("template:{template}"))
-        .execute(pool)
+        pplx_space_sandbox_teardown::observed_status::delete_for_element(
+            pool,
+            node_id,
+            FACET_NETWORK_POLICY,
+            &format!("template:{template}"),
+        )
         .await?;
     }
 
@@ -460,22 +426,9 @@ pub(super) async fn list_templates_for_node(
         };
     }
 
-    match sqlx::query_as::<_, NodeTemplateInventoryRow>(sql!(
-        "SELECT template_name AS name,
-                NULLIF(content_hash, '') AS content_hash,
-                built_at AS build_date,
-                artifact_size_bytes,
-                cache_size_bytes,
-                disk_size_mb,
-                runtime,
-                arch,
-                snapshots
-         FROM node_template_inventory
-         WHERE node_id = $1
-         ORDER BY template_name ASC, content_hash ASC"
-    ))
-    .bind(node.id)
-    .fetch_all(pool)
+    match pplx_space_node_template_inventory_store::node_template_builds::<
+        Vec<NodeTemplateSnapshotResponse>,
+    >(pool, node.id)
     .await
     {
         Ok(rows) => NodeTemplateInventoryResponse {

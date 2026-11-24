@@ -20,6 +20,7 @@ use super::*;
 
 mod kinds;
 mod operator;
+mod twin_readers;
 
 fn environment(byte: u8) -> EnvironmentReference {
     EnvironmentReference::new(Digest::sha256([byte; 32]))

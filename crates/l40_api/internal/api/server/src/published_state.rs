@@ -1,5 +1,4 @@
 use pplx_space_accounts::NodeId;
-use pplx_space_node_model::SubstrateKind;
 use pplx_space_snapshot_model::SnapshotId;
 
 use pplx_space_sql_locator::sql;
@@ -30,13 +29,6 @@ use pplx_space_sandbox_model::{
     SandboxQuarantineSource, SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError,
     SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
-use pplx_space_sandbox_portability::{
-    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
-};
-use pplx_space_sandbox_quarantine_store::{
-    quarantine_history_insert_columns, quarantine_state_conflict_assignments,
-    quarantine_state_insert_columns,
-};
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
 };
@@ -53,6 +45,10 @@ use pplx_space_template_mgr_client::proto::SnapshotInfo;
 
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
 use pplx_space_sandbox_store::ingest::SuspendedFinalizationCandidate;
+use pplx_space_sandbox_store::published_quarantine_candidates::{
+    self, PublishedQuarantineCandidate,
+};
+use pplx_space_sandbox_teardown::{conditions, direct, observed_status};
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
 
@@ -792,36 +788,25 @@ pub async fn publish_template_states(
 
     let mut accepted = 0_u64;
     if !absent_templates.is_empty() {
-        let result = sqlx::query(sql!(
-            "DELETE FROM node_template_inventory
-             WHERE node_id = $1 AND template_name = ANY($2)"
-        ))
-        .bind(node_id)
-        .bind(&absent_templates)
-        .execute(&mut *conn)
+        let deleted = pplx_space_node_template_inventory_store::delete_node_templates(
+            &mut *conn,
+            node_id,
+            &absent_templates,
+        )
         .await
         .map_err(|err| Status::internal(format!("delete absent published template: {err}")))?;
-        accepted = accepted.saturating_add(result.rows_affected());
+        accepted = accepted.saturating_add(deleted);
         let elements = absent_templates
             .iter()
             .map(|template| format!("template:{template}"))
             .collect::<Vec<_>>();
-        sqlx::query(sql!(
-            "DELETE FROM node_facet_observed_status
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = ANY($3)"
-        ))
-        .bind(node_id)
-        .bind(FACET_NETWORK_POLICY)
-        .bind(&elements)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            Status::internal(format!(
-                "delete absent template network policy facet status: {err}"
-            ))
-        })?;
+        observed_status::delete_for_elements(&mut *conn, node_id, FACET_NETWORK_POLICY, &elements)
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "delete absent template network policy facet status: {err}"
+                ))
+            })?;
     }
 
     if rows.is_empty() {
@@ -829,315 +814,26 @@ pub async fn publish_template_states(
     }
 
     let rows_json = Json(serde_json::Value::Array(rows));
-    let accepted_rows = sqlx::query_as::<_, (String, String, bool, bool, String)>(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 runtime TEXT,
-                 arch TEXT,
-                 runtime_version TEXT,
-                 guest_os TEXT,
-                 state_format_name TEXT,
-                 state_format_version TEXT,
-                 execution_metadata JSONB,
-                 execution_components JSONB,
-                 built_at TEXT,
-                 artifact_size_bytes BIGINT,
-                 cache_size_bytes BIGINT,
-                 has_base_snapshot BOOLEAN,
-                 base_snapshot_size_bytes BIGINT,
-                 pool_target INTEGER,
-                 pool_current INTEGER,
-                 pool_pending INTEGER,
-                 pool_sandbox_ids JSONB,
-                 snapshots JSONB,
-                 default_auto_lifecycle_json JSONB,
-                 default_auto_lifecycle_authority TEXT,
-                 network_policy_authority TEXT,
-                 ensure_base_snapshot BOOLEAN,
-                 snapshot_vcpu INTEGER,
-                 snapshot_memory_mib INTEGER,
-                 vcpu INTEGER,
-                 memory_mib INTEGER,
-                 disk_size_mb INTEGER
-             )
-         ),
-         known_templates AS (
-             SELECT name, desired_state
-             FROM templates
-             WHERE name IN (SELECT template_name FROM input)
-         ),
-         existing AS (
-             SELECT DISTINCT nti.template_name, nti.content_hash
-             FROM node_template_inventory nti
-             JOIN input
-               ON input.template_name = nti.template_name
-              AND COALESCE(input.content_hash, '') = nti.content_hash
-             WHERE nti.node_id = $1
-         ),
-         accepted AS (
-             SELECT DISTINCT input.template_name,
-                             COALESCE(input.content_hash, '') AS content_hash,
-                             kt.desired_state
-             FROM input
-             JOIN known_templates kt ON kt.name = input.template_name
-         ),
-         upserted AS (
-             INSERT INTO node_template_inventory (
-                 node_id, template_name, content_hash, runtime, arch, runtime_version, guest_os,
-                 state_format_name, state_format_version, execution_metadata, built_at,
-                 artifact_size_bytes, cache_size_bytes, has_base_snapshot, base_snapshot_size_bytes,
-                 pool_target, pool_current, pool_pending, pool_sandbox_ids, snapshots,
-                 default_auto_lifecycle_json, default_auto_lifecycle_authority,
-                 network_policy_authority, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib,
-                 vcpu, memory_mib, disk_size_mb,
-                 missing_publish_count, observed_at, updated_at
-             )
-             SELECT
-                 $1,
-                 template_name,
-                 COALESCE(content_hash, ''),
-                 runtime,
-                 arch,
-                 runtime_version,
-                 guest_os,
-                 state_format_name,
-                 state_format_version,
-                 execution_metadata,
-                 built_at,
-                 artifact_size_bytes,
-                 cache_size_bytes,
-                 COALESCE(has_base_snapshot, FALSE),
-                 base_snapshot_size_bytes,
-                 pool_target,
-                 COALESCE(pool_current, 0),
-                 COALESCE(pool_pending, 0),
-                 COALESCE(pool_sandbox_ids, '[]'::jsonb),
-                 COALESCE(snapshots, '[]'::jsonb),
-                 default_auto_lifecycle_json,
-                 default_auto_lifecycle_authority,
-                 network_policy_authority,
-                 ensure_base_snapshot,
-                 snapshot_vcpu,
-                 snapshot_memory_mib,
-                 vcpu,
-                 memory_mib,
-                 disk_size_mb,
-                 0,
-                 NOW(),
-                 NOW()
-             FROM input
-             JOIN known_templates kt ON kt.name = input.template_name
-             ON CONFLICT (node_id, template_name, content_hash) DO UPDATE
-             SET runtime = EXCLUDED.runtime,
-                 arch = EXCLUDED.arch,
-                 runtime_version = EXCLUDED.runtime_version,
-                 guest_os = EXCLUDED.guest_os,
-                 state_format_name = EXCLUDED.state_format_name,
-                 state_format_version = EXCLUDED.state_format_version,
-                 execution_metadata = EXCLUDED.execution_metadata,
-                 built_at = EXCLUDED.built_at,
-                 artifact_size_bytes = EXCLUDED.artifact_size_bytes,
-                 cache_size_bytes = EXCLUDED.cache_size_bytes,
-                 has_base_snapshot = EXCLUDED.has_base_snapshot,
-                 base_snapshot_size_bytes = EXCLUDED.base_snapshot_size_bytes,
-                 pool_target = EXCLUDED.pool_target,
-                 pool_current = EXCLUDED.pool_current,
-                 pool_pending = EXCLUDED.pool_pending,
-                 pool_sandbox_ids = EXCLUDED.pool_sandbox_ids,
-                 snapshots = EXCLUDED.snapshots,
-                 default_auto_lifecycle_json = EXCLUDED.default_auto_lifecycle_json,
-                 default_auto_lifecycle_authority = EXCLUDED.default_auto_lifecycle_authority,
-                 network_policy_authority = EXCLUDED.network_policy_authority,
-                 ensure_base_snapshot = EXCLUDED.ensure_base_snapshot,
-                 snapshot_vcpu = EXCLUDED.snapshot_vcpu,
-                 snapshot_memory_mib = EXCLUDED.snapshot_memory_mib,
-                 vcpu = EXCLUDED.vcpu,
-                 memory_mib = EXCLUDED.memory_mib,
-                 disk_size_mb = EXCLUDED.disk_size_mb,
-                 missing_publish_count = 0,
-                 observed_at = EXCLUDED.observed_at,
-                 updated_at = NOW()
-             WHERE (
-                 node_template_inventory.runtime,
-                 node_template_inventory.arch,
-                 node_template_inventory.runtime_version,
-                 node_template_inventory.guest_os,
-                 node_template_inventory.state_format_name,
-                 node_template_inventory.state_format_version,
-                 node_template_inventory.execution_metadata,
-                 node_template_inventory.built_at,
-                 node_template_inventory.artifact_size_bytes,
-                 node_template_inventory.cache_size_bytes,
-                 node_template_inventory.has_base_snapshot,
-                 node_template_inventory.base_snapshot_size_bytes,
-                 node_template_inventory.pool_target,
-                 node_template_inventory.pool_current,
-                 node_template_inventory.pool_pending,
-                 node_template_inventory.pool_sandbox_ids,
-                 node_template_inventory.snapshots,
-                 node_template_inventory.default_auto_lifecycle_json,
-                 node_template_inventory.default_auto_lifecycle_authority,
-                 node_template_inventory.network_policy_authority,
-                 node_template_inventory.ensure_base_snapshot,
-                 node_template_inventory.snapshot_vcpu,
-                 node_template_inventory.snapshot_memory_mib,
-                 node_template_inventory.vcpu,
-                 node_template_inventory.memory_mib,
-                 node_template_inventory.disk_size_mb,
-                 node_template_inventory.missing_publish_count
-             ) IS DISTINCT FROM (
-                 EXCLUDED.runtime,
-                 EXCLUDED.arch,
-                 EXCLUDED.runtime_version,
-                 EXCLUDED.guest_os,
-                 EXCLUDED.state_format_name,
-                 EXCLUDED.state_format_version,
-                 EXCLUDED.execution_metadata,
-                 EXCLUDED.built_at,
-                 EXCLUDED.artifact_size_bytes,
-                 EXCLUDED.cache_size_bytes,
-                 EXCLUDED.has_base_snapshot,
-                 EXCLUDED.base_snapshot_size_bytes,
-                 EXCLUDED.pool_target,
-                 EXCLUDED.pool_current,
-                 EXCLUDED.pool_pending,
-                 EXCLUDED.pool_sandbox_ids,
-                 EXCLUDED.snapshots,
-                 EXCLUDED.default_auto_lifecycle_json,
-                 EXCLUDED.default_auto_lifecycle_authority,
-                 EXCLUDED.network_policy_authority,
-                 EXCLUDED.ensure_base_snapshot,
-                 EXCLUDED.snapshot_vcpu,
-                 EXCLUDED.snapshot_memory_mib,
-                 EXCLUDED.vcpu,
-                 EXCLUDED.memory_mib,
-                 EXCLUDED.disk_size_mb,
-                 0
-             )
-             RETURNING template_name, content_hash
-         )
-         SELECT accepted.template_name,
-                accepted.content_hash,
-                EXISTS (
-                    SELECT 1
-                    FROM upserted
-                    WHERE upserted.template_name = accepted.template_name
-                      AND upserted.content_hash = accepted.content_hash
-                ) AS changed,
-                NOT EXISTS (
-                    SELECT 1
-                    FROM existing
-                    WHERE existing.template_name = accepted.template_name
-                      AND existing.content_hash = accepted.content_hash
-                ) AS first_seen,
-                accepted.desired_state
-         FROM accepted"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .fetch_all(&mut *conn)
+    let accepted_rows = pplx_space_node_template_inventory_store::upsert_published_templates(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
+    )
     .await
     .map_err(|err| Status::internal(format!("upsert published node template inventory: {err}")))?;
 
-    sqlx::query(sql!(
-        "WITH scope AS (
-             SELECT DISTINCT input.template_name, COALESCE(input.content_hash, '') AS content_hash
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT
-             )
-         ),
-         input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 execution_components JSONB
-             )
-         ),
-         incoming AS (
-             SELECT input.template_name, COALESCE(input.content_hash, '') AS content_hash,
-                    component.kind, component.role_key, component.version,
-                    component.digest, component.format
-             FROM input
-             JOIN node_template_inventory inventory
-               ON inventory.node_id = $1
-              AND inventory.template_name = input.template_name
-              AND inventory.content_hash = COALESCE(input.content_hash, '')
-             CROSS JOIN LATERAL jsonb_to_recordset(
-                 COALESCE(input.execution_components, '[]'::jsonb)
-             ) AS component(
-                 kind TEXT, role_key TEXT, version TEXT, digest TEXT, format TEXT
-             )
-         )
-         DELETE FROM node_template_components component
-         USING scope
-         WHERE component.node_id = $1
-           AND component.template_name = scope.template_name
-           AND component.content_hash = scope.content_hash
-           AND NOT EXISTS (
-               SELECT 1
-               FROM incoming
-               WHERE incoming.template_name = component.template_name
-                 AND incoming.content_hash = component.content_hash
-                 AND incoming.kind = component.kind
-                 AND incoming.role_key = component.role_key
-           )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .execute(&mut *conn)
+    pplx_space_node_template_inventory_store::delete_unpublished_template_components(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
+    )
     .await
     .map_err(|err| Status::internal(format!("replace node template components: {err}")))?;
-    sqlx::query(
-        sql!("WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 content_hash TEXT,
-                 execution_components JSONB
-             )
-         ),
-         incoming AS (
-             SELECT $1 AS node_id, input.template_name, COALESCE(input.content_hash, '') AS content_hash,
-                    component.kind, component.role_key, component.version,
-                    component.digest, component.format
-             FROM input
-             JOIN node_template_inventory inventory
-               ON inventory.node_id = $1
-              AND inventory.template_name = input.template_name
-              AND inventory.content_hash = COALESCE(input.content_hash, '')
-             CROSS JOIN LATERAL jsonb_to_recordset(
-                 COALESCE(input.execution_components, '[]'::jsonb)
-             ) AS component(
-                 kind TEXT, role_key TEXT, version TEXT, digest TEXT, format TEXT
-             )
-         )
-         INSERT INTO node_template_components (
-             node_id, template_name, content_hash, kind, role_key, version, digest, format
-         )
-         SELECT node_id, template_name, content_hash, kind, role_key, version, digest, format
-         FROM incoming
-         ON CONFLICT (node_id, template_name, content_hash, kind, role_key) DO UPDATE
-         SET version = EXCLUDED.version,
-             digest = EXCLUDED.digest,
-             format = EXCLUDED.format
-         WHERE (
-             node_template_components.version,
-             node_template_components.digest,
-             node_template_components.format
-         ) IS DISTINCT FROM (
-             EXCLUDED.version,
-             EXCLUDED.digest,
-             EXCLUDED.format
-         )"),
+    pplx_space_node_template_inventory_store::upsert_published_template_components(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
     )
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .execute(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("insert node template components: {err}")))?;
 
@@ -1150,13 +846,13 @@ pub async fn publish_template_states(
 
     let first_seen_templates = accepted_rows
         .iter()
-        .filter(|(_, _, _, first_seen, _)| *first_seen)
-        .map(|(template, _, _, _, _)| template.clone())
+        .filter(|row| row.first_seen)
+        .map(|row| row.template_name.clone())
         .collect::<Vec<_>>();
     let first_seen_present_templates = accepted_rows
         .iter()
-        .filter(|(_, _, _, first_seen, desired_state)| *first_seen && desired_state == "present")
-        .map(|(template, _, _, _, _)| template.clone())
+        .filter(|row| row.first_seen && row.desired_state == "present")
+        .map(|row| row.template_name.clone())
         .collect::<Vec<_>>();
     let first_seen_absent_desired_refs = first_seen_templates
         .iter()
@@ -1174,59 +870,12 @@ pub async fn publish_template_states(
     )
     .await?;
 
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_json JSONB,
-                 network_policy_generation BIGINT,
-                 network_policy_authority TEXT
-             )
-         )
-         INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_generation, observed_payload,
-             applied_source, applied_authority, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             'template:' || template_name,
-             network_policy_generation,
-             network_policy_json,
-             NULL,
-             network_policy_authority,
-             NOW(),
-             NOW()
-         FROM input
-         WHERE network_policy_generation IS NOT NULL
-           AND EXISTS (
-               SELECT 1 FROM node_template_inventory inventory
-               WHERE inventory.node_id = $1 AND inventory.template_name = input.template_name
-           )
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_generation = EXCLUDED.observed_generation,
-             observed_payload = EXCLUDED.observed_payload,
-             applied_source = EXCLUDED.applied_source,
-             applied_authority = EXCLUDED.applied_authority,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE (
-             node_facet_observed_status.observed_generation,
-             node_facet_observed_status.observed_payload,
-             node_facet_observed_status.applied_source,
-             node_facet_observed_status.applied_authority
-         ) IS DISTINCT FROM (
-             EXCLUDED.observed_generation,
-             EXCLUDED.observed_payload,
-             EXCLUDED.applied_source,
-             EXCLUDED.applied_authority
-         )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
+    observed_status::upsert_template_network_policies(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
+        FACET_NETWORK_POLICY,
+    )
     .await
     .map_err(|err| {
         Status::internal(format!(
@@ -1234,30 +883,12 @@ pub async fn publish_template_states(
         ))
     })?;
 
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 template_name TEXT,
-                 network_policy_generation BIGINT
-             )
-         )
-         DELETE FROM node_facet_conditions nfc
-         USING input
-         WHERE nfc.node_id = $1
-           AND nfc.facet = $3
-           AND nfc.element = 'template:' || input.template_name
-           AND input.network_policy_generation IS NOT NULL
-           AND nfc.condition_type = 'ApplyFailed'
-           AND EXISTS (
-               SELECT 1 FROM node_template_inventory inventory
-               WHERE inventory.node_id = $1 AND inventory.template_name = input.template_name
-           )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
+    conditions::clear_template_apply_failed(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
+        FACET_NETWORK_POLICY,
+    )
     .await
     .map_err(|err| {
         Status::internal(format!(
@@ -1464,6 +1095,19 @@ pub async fn publish_sandbox_states_with_retirement(
     states: &[PublishedSandboxState],
     retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
 ) -> Result<SandboxPublicationOutcome, Status> {
+    publish_sandbox_states_with_census(conn, node_id, states, retirement, &[]).await
+}
+
+/// Publish explicit reports and lock the candidates that the caller will
+/// prune later in the same transaction. Take one sorted lock batch before
+/// writing either set, including when there are no explicit reports.
+pub(super) async fn publish_sandbox_states_with_census(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    states: &[PublishedSandboxState],
+    retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
+    census_prune_ids: &[SandboxId],
+) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
         let sandbox_id = match parse_sandbox_id(&state.sandbox_id) {
@@ -1489,6 +1133,7 @@ pub async fn publish_sandbox_states_with_retirement(
     }
 
     let mut absent_ids = Vec::new();
+    let mut observation_lock_ids = census_prune_ids.to_vec();
     let mut rows = Vec::new();
     // Keyed rather than two parallel collections: the ids are reported to
     // callers and the payloads are written to `sandbox_observed_states`, and a
@@ -1518,6 +1163,7 @@ pub async fn publish_sandbox_states_with_retirement(
 
     for (sandbox_id, state) in states_by_id {
         let sandbox_uuid = sandbox_id;
+        observation_lock_ids.push(sandbox_uuid);
         if !state.present {
             absent_ids.push(sandbox_uuid);
             continue;
@@ -1868,67 +1514,53 @@ pub async fn publish_sandbox_states_with_retirement(
         }
     }
 
+    pplx_space_sandbox_store::orphan::lock_published_sandbox_observations(
+        &mut *conn,
+        &observation_lock_ids,
+    )
+    .await
+    .map_err(|err| {
+        Status::internal(format!(
+            "lock published sandbox observation advisory locks: {err}"
+        ))
+    })?;
+
     let mut accepted = 0_u64;
     if !absent_ids.is_empty() {
-        let result = sqlx::query(sql!(
-            "DELETE FROM sandbox_observed_states sos
-             WHERE sos.node_id = $1
-               AND sos.sandbox_id = ANY($2)"
-        ))
-        .bind(node_id)
-        .bind(&absent_ids)
-        .execute(&mut *conn)
+        let deleted = pplx_space_sandbox_store::observed_states::delete_absent_on_node(
+            &mut *conn,
+            node_id,
+            &absent_ids,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!(
                 "delete absent published sandbox observed state: {err}"
             ))
         })?;
-        accepted = accepted.saturating_add(result.rows_affected());
+        accepted = accepted.saturating_add(deleted);
 
         let elements = absent_ids
             .iter()
             .map(|id| NetworkPolicyTarget::sandbox(*id).as_element_string())
             .collect::<Vec<_>>();
-        sqlx::query(sql!(
-            "DELETE FROM node_facet_observed_status
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = ANY($3)"
-        ))
-        .bind(node_id)
-        .bind(FACET_NETWORK_POLICY)
-        .bind(&elements)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            Status::internal(format!("delete absent network policy facet status: {err}"))
-        })?;
+        observed_status::delete_for_elements(&mut *conn, node_id, FACET_NETWORK_POLICY, &elements)
+            .await
+            .map_err(|err| {
+                Status::internal(format!("delete absent network policy facet status: {err}"))
+            })?;
 
         let sandbox_elements = absent_ids
             .iter()
             .map(SandboxId::to_string)
             .collect::<Vec<_>>();
-        sqlx::query(sql!(
-            "UPDATE node_facet_observed_status
-             SET observed_payload = COALESCE(observed_payload, '{}'::JSONB)
-                                        - 'quarantine_recovery'
-                                        - $4::TEXT,
-                 observed_at = NOW(),
-                 updated_at = NOW()
-             WHERE node_id = $1
-               AND facet = $2
-               AND element = ANY($3)
-               AND (
-                   observed_payload ? 'quarantine_recovery'
-                   OR observed_payload ? $4::TEXT
-               )"
-        ))
-        .bind(node_id)
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .bind(&sandbox_elements)
-        .bind(SANDBOX_FAILURE_EPISODE_KEY)
-        .execute(&mut *conn)
+        observed_status::clear_quarantine_recovery_and_key(
+            &mut *conn,
+            node_id,
+            FACET_SANDBOX_DESIRED_STATE,
+            &sandbox_elements,
+            SANDBOX_FAILURE_EPISODE_KEY,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!("clear absent sandbox facet observations: {err}"))
@@ -2008,98 +1640,29 @@ pub async fn publish_sandbox_states_with_retirement(
         accepted = accepted.saturating_add(usize_to_u64(result.len()));
     }
 
-    let failure_episode_rows_json = Json(serde_json::Value::Array(failure_episode_rows));
-    sqlx::query(sql!(
-        "INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_payload, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             input.sandbox_id::TEXT,
-             jsonb_build_object(
-                 $4::TEXT,
-                 jsonb_strip_nulls(jsonb_build_object(
-                     $5::TEXT, input.execution_generation,
-                     $6::TEXT, input.pod_uid,
-                     $7::TEXT, input.activation_attempt_id
-                 ))
-             ),
-             NOW(),
-             NOW()
-         FROM jsonb_to_recordset($2::JSONB) AS input(
-             sandbox_id UUID,
-             published_lifecycle TEXT,
-             state_degraded BOOLEAN,
-             execution_generation BIGINT,
-             pod_uid TEXT,
-             activation_attempt_id TEXT
-         )
-         JOIN sandboxes s
-           ON s.id = input.sandbox_id
-         LEFT JOIN sandbox_direct_route_identities direct_route
-           ON direct_route.sandbox_id = s.id
-         WHERE COALESCE(direct_route.current_node_id, s.active_node_id) = $1
-           AND input.published_lifecycle = 'failed'
-           AND NOT input.state_degraded
-           AND input.execution_generation IS NOT NULL
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_payload =
-                 (COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
-                     - $4::TEXT)
-                 || EXCLUDED.observed_payload,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE node_facet_observed_status.observed_payload -> $4::TEXT
-               IS DISTINCT FROM EXCLUDED.observed_payload -> $4::TEXT"
-    ))
-    .bind(node_id)
-    .bind(failure_episode_rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(SANDBOX_FAILURE_EPISODE_KEY)
-    .bind(SANDBOX_FAILURE_EXECUTION_GENERATION_KEY)
-    .bind(SANDBOX_FAILURE_POD_UID_KEY)
-    .bind(SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY)
-    .execute(&mut *conn)
+    let failure_episode_rows = serde_json::Value::Array(failure_episode_rows);
+    direct::record_failure_episodes(
+        &mut *conn,
+        node_id,
+        &failure_episode_rows,
+        FACET_SANDBOX_DESIRED_STATE,
+        direct::FailureEpisodeKeys {
+            episode: SANDBOX_FAILURE_EPISODE_KEY,
+            execution_generation: SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
+            pod_uid: SANDBOX_FAILURE_POD_UID_KEY,
+            activation_attempt_id: SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
+        },
+    )
     .await
     .map_err(|err| Status::internal(format!("write sandbox failure episode: {err}")))?;
 
-    sqlx::query(sql!(
-        "UPDATE node_facet_observed_status observed
-         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
-                                    - $4::TEXT,
-             observed_at = NOW(),
-             updated_at = NOW()
-         FROM jsonb_to_recordset($2::JSONB) AS input(
-             sandbox_id UUID,
-             published_lifecycle TEXT,
-             state_degraded BOOLEAN,
-             execution_generation BIGINT,
-             pod_uid TEXT,
-             activation_attempt_id TEXT
-         )
-         JOIN sandboxes s
-           ON s.id = input.sandbox_id
-         LEFT JOIN sandbox_direct_route_identities direct_route
-           ON direct_route.sandbox_id = s.id
-         WHERE COALESCE(direct_route.current_node_id, s.active_node_id) = $1
-           AND observed.node_id = $1
-           AND observed.facet = $3
-           AND observed.element = input.sandbox_id::TEXT
-           AND (
-               input.published_lifecycle IS DISTINCT FROM 'failed'
-               OR (
-                   NOT input.state_degraded
-                   AND input.execution_generation IS NULL
-               )
-           )
-           AND observed.observed_payload ? $4::TEXT"
-    ))
-    .bind(node_id)
-    .bind(failure_episode_rows_json)
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(SANDBOX_FAILURE_EPISODE_KEY)
-    .execute(&mut *conn)
+    direct::clear_failure_episodes(
+        &mut *conn,
+        node_id,
+        &failure_episode_rows,
+        FACET_SANDBOX_DESIRED_STATE,
+        SANDBOX_FAILURE_EPISODE_KEY,
+    )
     .await
     .map_err(|err| Status::internal(format!("clear sandbox failure episode: {err}")))?;
 
@@ -2124,66 +1687,13 @@ pub async fn publish_sandbox_states_with_retirement(
     // Preserve the node's exact local handoff before its backup is durable.
     // This observation authorizes only a bounded wait; the ready-snapshot
     // finalizer below remains the sole publisher of the committed artifact.
-    sqlx::query(sql!(
-        "WITH input AS MATERIALIZED (
-             SELECT input.sandbox_id, input.execution_generation, input.pod_uid,
-                    CASE WHEN input.published_lifecycle = 'suspended'
-                               AND input.current_local_artifact_id IS NOT NULL
-                               AND input.current_local_artifact_kind = 'full'
-                               AND input.current_local_artifact_origin = 'suspend'
-                         THEN jsonb_build_object($4::TEXT, jsonb_build_object(
-                             'execution_generation', input.execution_generation,
-                             'pod_uid', input.pod_uid,
-                             'local_artifact_id', input.current_local_artifact_id
-                         ))
-                         ELSE '{}'::JSONB END AS payload
-               FROM jsonb_to_recordset($2::JSONB) AS input(
-                   sandbox_id UUID, status TEXT, published_lifecycle TEXT,
-                   execution_generation BIGINT,
-                   pod_uid TEXT, current_local_artifact_id UUID,
-                   current_local_artifact_kind TEXT, current_local_artifact_origin TEXT
-               )
-              WHERE input.status IS NOT NULL
-         ), candidate AS MATERIALIZED (
-             -- Only rows that record or clear a handoff reach the joins.
-             SELECT input.* FROM input
-              WHERE input.payload ? $4::TEXT
-                 OR input.sandbox_id::TEXT IN (
-                     SELECT prior.element FROM node_facet_observed_status prior
-                      WHERE prior.node_id = $1 AND prior.facet = $3
-                        AND prior.observed_payload ? $4::TEXT
-                 )
-         ), observation AS (
-             SELECT candidate.sandbox_id, candidate.payload
-               FROM candidate
-               JOIN sandboxes s ON s.id = candidate.sandbox_id
-               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-              WHERE s.active_node_id = $1
-                AND s.managed_by = $5
-                AND s.lifecycle = 'started'
-                AND e.active AND e.state IN ('running', 'recovering')
-                AND e.generation = candidate.execution_generation
-                AND e.pod_uid = candidate.pod_uid
-         )
-         INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_payload, observed_at, updated_at
-         )
-         SELECT $1, $3, observation.sandbox_id::TEXT, observation.payload, NOW(), NOW()
-           FROM observation
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_payload = (COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
-                                    - $4::TEXT) || EXCLUDED.observed_payload,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE node_facet_observed_status.observed_payload -> $4::TEXT
-               IS DISTINCT FROM EXCLUDED.observed_payload -> $4::TEXT"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(SANDBOX_LOCAL_SUSPEND_KEY)
-    .bind(SubstrateKind::Kubernetes)
-    .execute(&mut *conn)
+    observed_status::record_local_suspend_handoffs(
+        &mut *conn,
+        node_id,
+        &rows_json.0,
+        FACET_SANDBOX_DESIRED_STATE,
+        SANDBOX_LOCAL_SUSPEND_KEY,
+    )
     .await
     .map_err(|err| Status::internal(format!("publish local suspend handoff observation: {err}")))?;
 
@@ -2288,49 +1798,29 @@ pub async fn publish_sandbox_states_with_retirement(
         // automated cleanup until a healer or operator decides the next step.
         // Deleted still wins, but direct-managed rows are allowed to publish
         // the same hold state as Kubernetes-managed rows.
-        let claimed_rows =
-            sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, Uuid, Uuid)>(sql!(
-                "SELECT
-                     s.id,
-                     s.lifecycle,
-                     input.failure_reason,
-                     input.source,
-                     input.reason_code,
-                     input.quarantine_id,
-                     input.history_id
-                 FROM sandboxes s
-                 JOIN jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     failure_reason TEXT,
-                     source TEXT,
-                     reason_code TEXT,
-                     quarantine_id UUID,
-                     history_id UUID
-                 ) ON input.sandbox_id = s.id
-                 WHERE s.active_node_id = $1
-                   AND LOWER(TRIM(s.lifecycle)) NOT IN ('quarantined', 'deleted')"
-            ))
-            .bind(node_id)
-            .bind(quarantine_rows_json.clone())
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|err| Status::internal(format!("claim quarantined sandboxes: {err}")))?;
+        let claimed_rows = published_quarantine_candidates::list(
+            &mut *conn,
+            node_id,
+            quarantine_rows_json.clone(),
+        )
+        .await
+        .map_err(|err| Status::internal(format!("claim quarantined sandboxes: {err}")))?;
         let claimed = claimed_rows
             .into_iter()
             .map(
-                |(
-                    sandbox_id,
-                    from_lifecycle,
-                    failure_reason,
-                    source,
-                    reason_code,
-                    quarantine_id,
-                    history_id,
-                )|
+                |PublishedQuarantineCandidate {
+                     id,
+                     lifecycle,
+                     failure_reason,
+                     source,
+                     reason_code,
+                     quarantine_id,
+                     history_id,
+                 }|
                  -> Result<_, Status> {
                     Ok(ClaimedQuarantineProjection {
-                        sandbox_id: SandboxId::from_uuid(sandbox_id),
-                        from_lifecycle,
+                        sandbox_id: SandboxId::from_uuid(id),
+                        from_lifecycle: lifecycle,
                         failure_reason,
                         source: source.parse().map_err(|error| {
                             Status::internal(format!("parse claimed quarantine source: {error}"))
@@ -2376,71 +1866,23 @@ pub async fn publish_sandbox_states_with_retirement(
                 let updated_json = Json(serde_json::to_value(&updated_sql).map_err(|err| {
                     Status::internal(format!("serialize updated quarantine input: {err}"))
                 })?);
-                let state_columns = quarantine_state_insert_columns();
-                let state_conflict_assignments = quarantine_state_conflict_assignments();
-                let query = format!(
-                    "INSERT INTO sandbox_quarantine_state ({state_columns})
-                     SELECT
-                         input.sandbox_id,
-                         input.quarantine_id,
-                         NOW(),
-                         NOW(),
-                         input.from_lifecycle,
-                         input.source,
-                         input.reason_code,
-                         NULLIF(BTRIM(input.failure_reason), ''),
-                         jsonb_build_object('node_id', $3::TEXT),
-                         $2,
-                         $1
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         from_lifecycle TEXT,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID
-                     )
-                     ON CONFLICT (sandbox_id) DO UPDATE SET {state_conflict_assignments}",
-                );
-                sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id)
-                    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                    .bind(node_id.to_string())
-                    .bind(updated_json.clone())
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|err| Status::internal(format!("record quarantine state: {err}")))?;
-                let history_columns = quarantine_history_insert_columns();
-                let query = format!(
-                    "INSERT INTO sandbox_quarantine_history ({history_columns})
-                     SELECT
-                         input.history_id,
-                         input.quarantine_id,
-                         input.sandbox_id,
-                         NOW(),
-                         input.source,
-                         $2,
-                         input.reason_code,
-                         NULLIF(BTRIM(input.failure_reason), ''),
-                         $3,
-                         jsonb_build_object('node_id', $1::TEXT)
-                     FROM jsonb_to_recordset($4::jsonb) AS input(
-                         sandbox_id UUID,
-                         failure_reason TEXT,
-                         source TEXT,
-                         reason_code TEXT,
-                         quarantine_id UUID,
-                         history_id UUID
-                     )",
-                );
-                sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                    .bind(node_id.to_string())
-                    .bind(SandboxQuarantineHistoryAction::EnteredQuarantine.as_str())
-                    .bind(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-                    .bind(updated_json)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|err| Status::internal(format!("record quarantine history: {err}")))?;
+                pplx_space_sandbox_quarantine_store::published_quarantine::upsert_states(
+                    &mut *conn,
+                    node_id,
+                    SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    updated_json.clone(),
+                )
+                .await
+                .map_err(|err| Status::internal(format!("record quarantine state: {err}")))?;
+                pplx_space_sandbox_quarantine_store::published_quarantine::insert_history(
+                    &mut *conn,
+                    node_id,
+                    SandboxQuarantineHistoryAction::EnteredQuarantine,
+                    SandboxQuarantineNextAction::RequiresOperatorAttention,
+                    updated_json,
+                )
+                .await
+                .map_err(|err| Status::internal(format!("record quarantine history: {err}")))?;
                 quarantined_sandboxes = updated
                     .iter()
                     .map(|row| (row.sandbox_id, row.from_lifecycle.clone()))
@@ -2474,123 +1916,33 @@ pub async fn publish_sandbox_states_with_retirement(
     .await?;
 
     if publishes_network_policy {
-        sqlx::query(
-            sql!("WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_generation BIGINT,
-                     observed_network_policy_authority TEXT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE (s.id IS NULL OR s.active_node_id = $1)
-                   AND input.observed_network_policy_generation IS NOT NULL
-             )
-             UPDATE sandbox_observed_states sos
-             SET network_policy_authority = publishable.observed_network_policy_authority
-             FROM publishable
-             WHERE sos.sandbox_id = publishable.sandbox_id
-               AND sos.node_id = $1
-               AND sos.network_policy_authority IS DISTINCT FROM publishable.observed_network_policy_authority"),
+        pplx_space_sandbox_store::observed_states::record_network_policy_authority(
+            &mut *conn,
+            node_id,
+            &rows_json.0,
         )
-        .bind(node_id)
-        .bind(rows_json.clone())
-        .execute(&mut *conn)
         .await
         .map_err(|err| {
-            Status::internal(format!("update sandbox observed network policy authority: {err}"))
+            Status::internal(format!(
+                "update sandbox observed network policy authority: {err}"
+            ))
         })?;
 
-        sqlx::query(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_json JSONB,
-                     observed_network_policy_generation BIGINT,
-                     observed_network_policy_source TEXT,
-                     observed_network_policy_authority TEXT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE s.id IS NULL
-                    OR s.active_node_id = $1
-             )
-             INSERT INTO node_facet_observed_status (
-                 node_id, facet, element, observed_generation, observed_payload,
-                 applied_source, applied_authority, observed_at, updated_at
-             )
-             SELECT
-                 $1,
-                 $3,
-                 'sandbox:' || sandbox_id::text,
-                 observed_network_policy_generation,
-                 observed_network_policy_json,
-                 observed_network_policy_source,
-                 observed_network_policy_authority,
-                 NOW(),
-                 NOW()
-             FROM publishable
-             WHERE observed_network_policy_generation IS NOT NULL
-             ON CONFLICT (node_id, facet, element) DO UPDATE
-             SET observed_generation = EXCLUDED.observed_generation,
-                 observed_payload = EXCLUDED.observed_payload,
-                 applied_source = EXCLUDED.applied_source,
-                 applied_authority = EXCLUDED.applied_authority,
-                 observed_at = EXCLUDED.observed_at,
-                 updated_at = NOW()
-             WHERE (
-                 node_facet_observed_status.observed_generation,
-                 node_facet_observed_status.observed_payload,
-                 node_facet_observed_status.applied_source,
-                 node_facet_observed_status.applied_authority
-             ) IS DISTINCT FROM (
-                 EXCLUDED.observed_generation,
-                 EXCLUDED.observed_payload,
-                 EXCLUDED.applied_source,
-                 EXCLUDED.applied_authority
-             )"
-        ))
-        .bind(node_id)
-        .bind(rows_json.clone())
-        .bind(FACET_NETWORK_POLICY)
-        .execute(&mut *conn)
+        observed_status::upsert_sandbox_network_policies(
+            &mut *conn,
+            node_id,
+            &rows_json.0,
+            FACET_NETWORK_POLICY,
+        )
         .await
         .map_err(|err| Status::internal(format!("upsert network policy facet status: {err}")))?;
 
-        sqlx::query(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM jsonb_to_recordset($2::jsonb) AS input(
-                     sandbox_id UUID,
-                     observed_network_policy_generation BIGINT
-                 )
-             ),
-             publishable AS (
-                 SELECT input.*
-                 FROM input
-                 LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE (s.id IS NULL OR s.active_node_id = $1)
-                   AND input.observed_network_policy_generation IS NOT NULL
-             )
-             DELETE FROM node_facet_conditions nfc
-             USING publishable
-             WHERE nfc.node_id = $1
-               AND nfc.facet = $3
-               AND nfc.element = 'sandbox:' || publishable.sandbox_id::text
-               AND nfc.condition_type = 'ApplyFailed'"
-        ))
-        .bind(node_id)
-        .bind(rows_json.clone())
-        .bind(FACET_NETWORK_POLICY)
-        .execute(&mut *conn)
+        conditions::clear_sandbox_apply_failed(
+            &mut *conn,
+            node_id,
+            &rows_json.0,
+            FACET_NETWORK_POLICY,
+        )
         .await
         .map_err(|err| Status::internal(format!("clear network policy apply condition: {err}")))?;
     }
@@ -2702,49 +2054,17 @@ pub(crate) async fn project_ready_suspend_snapshot(
     conn: &mut sqlx::PgConnection,
     snapshot_id: SnapshotId,
 ) -> Result<Option<(SandboxId, NodeId, String)>, Status> {
-    let eligibility = started_suspend_revert_eligibility("s");
-    let clear_marker = eligibility.clear_marker;
-    let eligible = eligibility.eligible;
-    let committed_suspend_evidence = "
-        s.current_local_artifact_id = sn.local_artifact_id
-        AND s.current_local_artifact_kind = sn.artifact_kind
-        AND s.current_local_artifact_origin = 'suspend'
-    ";
-    let lifecycle_eligible =
-        suspended_projection_lifecycle_eligible("s", committed_suspend_evidence);
-    let candidate_query = format!(
-        "SELECT s.id,
-                {clear_marker} AS clear_marker,
-                sn.source_node_id,
-                s.lifecycle
-           FROM snapshots sn
-           JOIN sandboxes s ON s.id = sn.sandbox_id
-          WHERE sn.id = $1
-            AND sn.state = 'ready'
-            AND sn.type = 'full'
-            AND (sn.artifact_origin IS NULL OR sn.artifact_origin = 'suspend')
-            AND sn.source_node_id IS NOT NULL
-            AND s.active_node_id = sn.source_node_id
-            AND {lifecycle_eligible}
-            AND EXISTS (
-                SELECT 1
-                  FROM snapshot_storage_locations ssl
-                 WHERE ssl.snapshot_id = sn.id
-            )
-            AND {eligible}
-          FOR UPDATE OF s",
-    );
-    let candidates: Vec<(SandboxId, bool, NodeId, String)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(sql!(candidate_query.as_str())))
-            .bind(snapshot_id)
-            .fetch_all(&mut *conn)
+    let candidates =
+        pplx_space_sandbox_store::ready_suspend_projection::lock_candidates(conn, snapshot_id)
             .await
             .map_err(|err| Status::internal(format!("select ready suspend projection: {err}")))?;
-    let Some((sandbox_id, clear_marker, source_node_id, from_lifecycle)) =
-        candidates.first().cloned()
-    else {
+    let Some(candidate) = candidates.first().cloned() else {
         return Ok(None);
     };
+    let sandbox_id = candidate.sandbox_id;
+    let clear_marker = candidate.clear_marker;
+    let source_node_id = candidate.source_node_id;
+    let from_lifecycle = candidate.lifecycle;
 
     let projected = apply_suspended_k8s_finalization(
         conn,
@@ -2902,30 +2222,11 @@ async fn publish_sandbox_snapshots_batch(
             })
         })
         .collect::<Vec<_>>();
-    sqlx::query(sql!(
-        "WITH scope AS (
-             SELECT UNNEST($1::UUID[]) AS sandbox_id
-         ),
-         incoming AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS incoming(
-                 sandbox_id UUID,
-                 snapshot_id TEXT
-             )
-         )
-         DELETE FROM sandbox_snapshot_inventory ssi
-         USING scope
-         WHERE ssi.sandbox_id = scope.sandbox_id
-           AND NOT EXISTS (
-               SELECT 1
-               FROM incoming
-               WHERE incoming.sandbox_id = ssi.sandbox_id
-                 AND incoming.snapshot_id = ssi.snapshot_id
-           )"
-    ))
-    .bind(sandbox_ids)
-    .bind(Json(serde_json::Value::Array(snapshot_ids_payload)))
-    .execute(&mut *conn)
+    pplx_space_sandbox_store::snapshot_inventory::prune_unpublished(
+        &mut *conn,
+        sandbox_ids,
+        serde_json::Value::Array(snapshot_ids_payload),
+    )
     .await
     .map_err(|err| Status::internal(format!("prune absent published sandbox snapshots: {err}")))?;
 
@@ -2933,99 +2234,11 @@ async fn publish_sandbox_snapshots_batch(
         return Ok(());
     }
 
-    sqlx::query(sql!(
-        "WITH scope AS (
-             SELECT UNNEST($1::UUID[]) AS sandbox_id
-         ),
-         input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 snapshot_id TEXT,
-                 type TEXT,
-                 state TEXT,
-                 timestamp TEXT,
-                 source_node_id TEXT,
-                 label TEXT,
-                 retention_tier TEXT,
-                 vcpu INTEGER,
-                 memory_mib INTEGER,
-                 size_bytes BIGINT,
-                 template_id TEXT,
-                 content_hash TEXT,
-                 locations JSONB
-             )
-         )
-         INSERT INTO sandbox_snapshot_inventory (
-                 sandbox_id, snapshot_id, type, state, timestamp, source_node_id,
-                 label, retention_tier, vcpu, memory_mib, size_bytes, template_id,
-                 content_hash, locations, observed_at, updated_at
-             )
-         SELECT
-             input.sandbox_id,
-             input.snapshot_id,
-             input.type,
-             input.state,
-             input.timestamp,
-             input.source_node_id,
-             input.label,
-             input.retention_tier,
-             input.vcpu,
-             input.memory_mib,
-             COALESCE(input.size_bytes, 0),
-             input.template_id,
-             input.content_hash,
-             COALESCE(input.locations, '[]'::jsonb),
-             NOW(),
-             NOW()
-         FROM input
-         JOIN scope ON scope.sandbox_id = input.sandbox_id
-         ON CONFLICT (sandbox_id, snapshot_id) DO UPDATE
-         SET type = EXCLUDED.type,
-             state = EXCLUDED.state,
-             timestamp = EXCLUDED.timestamp,
-             source_node_id = EXCLUDED.source_node_id,
-             label = EXCLUDED.label,
-             retention_tier = EXCLUDED.retention_tier,
-             vcpu = EXCLUDED.vcpu,
-             memory_mib = EXCLUDED.memory_mib,
-             size_bytes = EXCLUDED.size_bytes,
-             template_id = EXCLUDED.template_id,
-             content_hash = EXCLUDED.content_hash,
-             locations = EXCLUDED.locations,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE (
-             sandbox_snapshot_inventory.type,
-             sandbox_snapshot_inventory.state,
-             sandbox_snapshot_inventory.timestamp,
-             sandbox_snapshot_inventory.source_node_id,
-             sandbox_snapshot_inventory.label,
-             sandbox_snapshot_inventory.retention_tier,
-             sandbox_snapshot_inventory.vcpu,
-             sandbox_snapshot_inventory.memory_mib,
-             sandbox_snapshot_inventory.size_bytes,
-             sandbox_snapshot_inventory.template_id,
-             sandbox_snapshot_inventory.content_hash,
-             sandbox_snapshot_inventory.locations
-         ) IS DISTINCT FROM (
-             EXCLUDED.type,
-             EXCLUDED.state,
-             EXCLUDED.timestamp,
-             EXCLUDED.source_node_id,
-             EXCLUDED.label,
-             EXCLUDED.retention_tier,
-             EXCLUDED.vcpu,
-             EXCLUDED.memory_mib,
-             EXCLUDED.size_bytes,
-             EXCLUDED.template_id,
-             EXCLUDED.content_hash,
-             EXCLUDED.locations
-         )"
-    ))
-    .bind(sandbox_ids)
-    .bind(Json(serde_json::Value::Array(snapshot_rows)))
-    .execute(&mut *conn)
+    pplx_space_sandbox_store::snapshot_inventory::upsert_published(
+        &mut *conn,
+        sandbox_ids,
+        serde_json::Value::Array(snapshot_rows),
+    )
     .await
     .map_err(|err| Status::internal(format!("upsert published sandbox snapshot: {err}")))?;
     Ok(())
@@ -3672,51 +2885,13 @@ async fn reconcile_recovery_observations(
         let recovery_rows = Json(serde_json::to_value(recovery_rows).map_err(|error| {
             Status::internal(format!("serialize recovery observations: {error}"))
         })?);
-        sqlx::query(sql!(
-            "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         publishable AS (
-             SELECT input.*
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NOT NULL
-         )
-         INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_payload, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             publishable.sandbox_id::TEXT,
-             jsonb_build_object(
-                 'quarantine_recovery',
-                 publishable.quarantine_recovery_payload
-             ),
-             NOW(),
-             NOW()
-         FROM publishable
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_payload =
-                 COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
-                 || EXCLUDED.observed_payload,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE node_facet_observed_status.observed_payload -> 'quarantine_recovery'
-               IS DISTINCT FROM EXCLUDED.observed_payload -> 'quarantine_recovery'
-            OR node_facet_observed_status.observed_at
-               < NOW() - make_interval(secs => $4::BIGINT)"
-        ))
-        .bind(node_id)
-        .bind(recovery_rows)
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
-        .execute(&mut *conn)
+        observed_status::upsert_quarantine_recovery(
+            &mut *conn,
+            node_id,
+            &recovery_rows.0,
+            FACET_SANDBOX_DESIRED_STATE,
+            QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!(
@@ -3738,36 +2913,12 @@ async fn reconcile_recovery_observations(
                     "serialize recovery observation withdrawals: {error}"
                 ))
             })?);
-        sqlx::query(sql!(
-            "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         clearable AS (
-             SELECT input.sandbox_id
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NULL
-         )
-         UPDATE node_facet_observed_status observed
-         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
-                                    - 'quarantine_recovery',
-             observed_at = NOW(),
-             updated_at = NOW()
-         FROM clearable
-         WHERE observed.node_id = $1
-           AND observed.facet = $3
-           AND observed.element = clearable.sandbox_id::TEXT
-           AND observed.observed_payload ? 'quarantine_recovery'"
-        ))
-        .bind(node_id)
-        .bind(clear_recovery_rows)
-        .bind(FACET_SANDBOX_DESIRED_STATE)
-        .execute(&mut *conn)
+        observed_status::clear_quarantine_recovery(
+            &mut *conn,
+            node_id,
+            &clear_recovery_rows.0,
+            FACET_SANDBOX_DESIRED_STATE,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!(

@@ -11,6 +11,7 @@ use super::cleanup_support::{
 use super::create::StartFromCheckpointLaunch;
 use super::create_support::*;
 use super::spaced_bridge::*;
+use super::start_support::ActivationAdmissionKind;
 use super::tail_support::*;
 use super::*;
 use futures_util::StreamExt;
@@ -1305,6 +1306,32 @@ impl SandboxManagerService {
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock().await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
+        // A rollback that doesn't restart rewrites the sandbox's disk, which a
+        // drain may already have reported durable, and leaves it stopped. It
+        // is a producer like any other: a node known sealed refuses it for a
+        // sandbox without a VM before it stops or rewrites anything, and it
+        // holds its token until it returns, so a drain that seals the node
+        // meanwhile reports the sandbox pending until it ends. A running or
+        // paused sandbox's rollback is admitted; the stopped sandbox it leaves
+        // keeps a v2 drain pending, since the drain doesn't move one. A
+        // restarting rollback is refused below by the seal's check of its
+        // restart.
+        let _producer = if auto_restart {
+            None
+        } else {
+            Some(self.activation_seal.admit_producer(
+                "rollback",
+                &sandbox.id,
+                crate::activation_seal::has_vm(sandbox.state),
+            )?)
+        };
+        #[cfg(test)]
+        if !auto_restart {
+            crate::auto_lifecycle::AutoLifecycleCoordinator::rendezvous(
+                &self.auto_lifecycle.rollback_admission_barrier,
+            )
+            .await;
+        }
         self.require_snapshot_mutation_ownership(&sandbox.id)?;
         // A full rollback restages the canonical checkpoint, which a verified
         // upgrade still owes the retirement of the old runtime's checkpoint at.
@@ -1383,9 +1410,25 @@ impl SandboxManagerService {
             ));
         }
 
+        // A full snapshot restarts by restoring it, a disk snapshot by a cold
+        // boot.
+        let is_full = snapshot_name.starts_with("f-");
+        let restart_activation = if is_full {
+            ActivationAdmissionKind::Restore
+        } else {
+            ActivationAdmissionKind::Cold
+        };
+        // A sealed node refuses the restart's activation: refuse the rollback
+        // before it stops or rewrites anything, rather than leave a
+        // rolled-back sandbox stopped. A seal that lands after this check
+        // still refuses the restart ([`Self::rollback_restart_failure`]).
+        if auto_restart {
+            self.activation_seal
+                .check(restart_activation.as_str(), &sandbox.id)?;
+        }
+
         // Check every required input before stopping the VM. A published full
         // transfer may intentionally omit rootfs and is not disk-rollbackable.
-        let is_full = snapshot_name.starts_with("f-");
         if is_full {
             self.ensure_snapshot_restore_supported("rollback_full_snapshot")?;
         }
@@ -1645,13 +1688,24 @@ impl SandboxManagerService {
                     restored_snapshot: RestoredSnapshotProvenance::default(),
                     expected_node_execution: None,
                 })
-                .await?;
+                .await
+                .map_err(|status| {
+                    self.rollback_restart_failure(&id, snapshot_name, restart_activation, status)
+                })?;
             } else {
                 // Disk-only snapshot: fresh boot
                 let mut start = disk_snapshot_rollback_start_request(id.clone(), netns_path);
                 start.route_identity = space_api_route_identity_to_wire(&route_identity);
                 self.start_sandbox_with_authority(start, false, restart_authority)
-                    .await?;
+                    .await
+                    .map_err(|status| {
+                        self.rollback_restart_failure(
+                            &id,
+                            snapshot_name,
+                            restart_activation,
+                            status,
+                        )
+                    })?;
             }
         }
 
@@ -1660,6 +1714,38 @@ impl SandboxManagerService {
             rolled_back_to: snapshot_name.clone(),
             route_identity: applied_route_identity,
         }))
+    }
+
+    /// The error of a rollback whose restart failed after the disk was
+    /// rewritten. When the seal refuses the restart's `activation` (a seal
+    /// that landed after [`Self::rollback`] checked it) and the row is
+    /// stopped, the error says the rollback was applied and the sandbox is
+    /// stopped, so the caller starts it rather than rolling back again. It
+    /// carries neither the seal's refusal nor its marker, which callers retry
+    /// on: a retry would roll back again. Any other failure is the restart's
+    /// own.
+    pub(super) fn rollback_restart_failure(
+        &self,
+        sandbox_id: &str,
+        snapshot_name: &str,
+        activation: ActivationAdmissionKind,
+        status: Status,
+    ) -> Status {
+        let sealed = status.code() == tonic::Code::FailedPrecondition
+            && self
+                .activation_seal
+                .check(activation.as_str(), sandbox_id)
+                .is_err();
+        let stopped = self
+            .lookup_sandbox(sandbox_id)
+            .is_ok_and(|row| row.state.is_unowned(SandboxState::Stopped));
+        if !(sealed && stopped) {
+            return status;
+        }
+        Status::failed_precondition(format!(
+            "the rollback of sandbox {sandbox_id} to {snapshot_name} was applied; the sandbox is \
+             stopped because the node was sealed during the rollback: start it"
+        ))
     }
 }
 

@@ -2,6 +2,7 @@
 //! artifact storage URI a restore reads.
 
 use super::*;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_store::restore_source;
 
 /// Which suspend snapshot a restore selects when no existing restore pod
@@ -26,13 +27,9 @@ impl K8sStore {
         sandbox: &Sandbox,
     ) -> Result<Option<String>, SubstrateError> {
         if let Some(node_id) = sandbox.target_node_id.or(sandbox.active_node_id) {
-            if let Some(node_name) = sqlx::query_scalar::<_, String>(sql!(
-                "SELECT k8s_node_name FROM node_k8s WHERE node_id = $1"
-            ))
-            .bind(node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .db_context("failed to query Kubernetes restore node preference")?
+            if let Some(node_name) = node_lookup::k8s_node_name(&self.pool, node_id)
+                .await
+                .db_context("failed to query Kubernetes restore node preference")?
             {
                 return Ok(Some(node_name));
             }
@@ -46,17 +43,7 @@ impl K8sStore {
 
         // Preserve the node that held the suspended bytes after placement
         // pointers have been cleared.
-        let executions_query = sql!(
-            "SELECT ske.k8s_node_name
-               FROM sandbox_k8s_executions ske
-              WHERE ske.sandbox_id = $1
-                AND ske.k8s_node_name IS NOT NULL
-              ORDER BY ske.generation DESC
-              LIMIT 1"
-        );
-        sqlx::query_scalar::<_, String>(executions_query)
-            .bind(sandbox.id)
-            .fetch_optional(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::latest_k8s_node_name(&self.pool, sandbox.id)
             .await
             .db_context("failed to query Kubernetes restore node preference")
     }
@@ -418,17 +405,8 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Vec<String>, SubstrateError> {
-        sqlx::query_scalar(sql!(
-            "SELECT DISTINCT BTRIM(k8s_node_name)
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND NOT active
-                AND NULLIF(BTRIM(k8s_node_name), '') IS NOT NULL
-              ORDER BY 1"
-        ))
-        .bind(sandbox_id)
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to read the nodes earlier executions of the sandbox ran on")
+        pplx_space_sandbox_store::k8s_executions::inactive_k8s_node_names(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to read the nodes earlier executions of the sandbox ran on")
     }
 }

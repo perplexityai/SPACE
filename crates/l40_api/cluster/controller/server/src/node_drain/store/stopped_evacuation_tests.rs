@@ -876,9 +876,7 @@ async fn the_pending_count_sees_sandboxes_the_retry_backoff_hides() -> TestResul
          the shape that makes deriving the gauge from it wrong"
     );
 
-    let pending: i64 = sqlx::query_scalar(stopped_replacements_pending_query())
-        .fetch_one(&db.pool)
-        .await?;
+    let pending = pplx_space_sandbox_store::stopped_replacements::pending(&db.pool).await?;
     assert_eq!(
         pending, 4,
         "every sandbox that can't serve a start must count — the eligible one, the one waiting \

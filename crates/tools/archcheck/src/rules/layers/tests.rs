@@ -21,7 +21,7 @@ use crate::{
 /// `LayersConfig` requires each, but the state checks' (`state.*` and
 /// `unowned.*`), which come together, and denies others, so this list is
 /// its list.
-const BEHAVIOURS: [&str; 32] = [
+const BEHAVIOURS: [&str; 35] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -52,6 +52,9 @@ const BEHAVIOURS: [&str; 32] = [
     "test_only",
     "clients",
     "store_edges",
+    "coordinators",
+    "coordinator_edges",
+    "driver_reexports",
     "stale_entries",
     "policy_changed",
 ];

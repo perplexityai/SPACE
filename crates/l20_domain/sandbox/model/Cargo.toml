@@ -18,6 +18,7 @@ pplx-space-k8s-ids = { workspace = true }
 pplx-space-linux-ids = { workspace = true }
 pplx-space-node-model = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
+pplx-space-uuid-id = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
@@ -35,5 +36,6 @@ serde = [
 ]
 sqlx = [
     "dep:pplx-space-sql-codec",
+    "dep:pplx-space-uuid-id",
     "pplx-space-sql-codec/postgres",
 ]

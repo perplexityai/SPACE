@@ -15,18 +15,20 @@ workspace = true
 
 [features]
 # Snapshot seeding for other crates' tests; enable only from [dev-dependencies].
-test-support = ["dep:pplx-space-accounts", "dep:pplx-space-sql-locator", "dep:sqlx"]
+test-support = []
 
 [dependencies]
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
 thiserror = { workspace = true }
-pplx-space-accounts = { workspace = true, features = ["sqlx"], optional = true }
-pplx-space-sql-locator = { workspace = true, optional = true }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"], optional = true }
+time = { workspace = true }
+
+# internal
+pplx-space-accounts = { workspace = true, features = ["sqlx"] }
+pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]
-pplx-space-accounts = { workspace = true, features = ["sqlx"] }
 pplx-space-db-test-fixtures = { workspace = true }
-pplx-space-sql-locator = { workspace = true }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 pplx-space-test-env = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

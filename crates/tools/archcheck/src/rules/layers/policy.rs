@@ -17,10 +17,10 @@ use crate::{
 };
 
 /// `unmoved` entries for crates that are gone or in their layer directory,
-/// `legacy` entries for crates that are gone, `store_users` entries that
-/// allow nothing or whose user doesn't use the store, and `allowed_edges`
-/// entries for edges that don't exist or need no exception. An entry naming
-/// a crate without a layer is left to that crate's `placement` finding.
+/// `store_users` and `coordinator_users` entries that allow nothing or whose
+/// user doesn't use the store or coordinator, and `allowed_edges` entries
+/// for edges that don't exist or need no exception. An entry naming a crate
+/// without a layer is left to that crate's `placement` finding.
 pub(super) fn stale_entries(
     ctx: &Context,
     config: &LayersConfig,
@@ -59,19 +59,6 @@ pub(super) fn stale_entries(
             ),
         ));
     }
-    for package in config.legacy.iter() {
-        if graph.member(package).is_some() {
-            continue;
-        }
-        findings.push(finding(
-            package,
-            policy.legacy.get(package).copied().or(policy.legacy_line),
-            format!(
-                ": is in [rules.{RULE}] legacy in {CONFIG_FILE}, but no workspace member has \
-                 this name. Remove it."
-            ),
-        ));
-    }
     for (store, users) in &config.store_users {
         let (store_line, user_lines) = lines_of(&policy.store_users, store);
         let store_layer = graph.member(store).and_then(|member| member.layer);
@@ -80,6 +67,16 @@ pub(super) fn stale_entries(
             Some(Some(layer)) if layer != Layer::Storage => Some(format!(
                 "it is not a store: its layer is {layer}, not l30_storage"
             )),
+            Some(Some(_))
+                if graph
+                    .member(store)
+                    .is_some_and(|member| member.is_coordinator()) =>
+            {
+                Some(format!(
+                    "it is a coordinator, not a store, and [rules.{RULE}] coordinator_users lists \
+                     a coordinator's users"
+                ))
+            }
             Some(_) => None,
         };
         if let Some(reason) = reason {
@@ -105,14 +102,13 @@ pub(super) fn stale_entries(
                     // A store without a layer is left to its placement
                     // finding.
                     Some(Layer::Api | Layer::Storage)
-                        if store_layer.is_none() || uses(config, graph, user, store) =>
+                        if store_layer.is_none() || graph.depends_on(user, store) =>
                     {
                         continue;
                     }
                     Some(Layer::Api | Layer::Storage) => format!(
-                        "{user} has no normal or build dependency on {store}, directly or \
-                         through a [rules.{RULE}] legacy crate that depends on it, and the list \
-                         says who uses the store today"
+                        "{user} has no normal or build dependency on {store}, and the list says \
+                         who uses the store today"
                     ),
                     Some(layer) => allows_nothing(format!(
                         "only l40_api and l30_storage crates use stores by their users lists, \
@@ -126,6 +122,62 @@ pub(super) fn stale_entries(
                 format!(
                     ": lists {user} in [rules.{RULE}] store_users in {CONFIG_FILE}, but {reason}. \
                      Remove it from the list."
+                ),
+            ));
+        }
+    }
+    for (coordinator, users) in &config.coordinator_users {
+        let (coordinator_line, user_lines) = lines_of(&policy.coordinator_users, coordinator);
+        let reason = match graph.member(coordinator) {
+            None => Some("no workspace member has this name".to_owned()),
+            Some(member) if member.layer.is_none() => None,
+            Some(member) if !member.is_coordinator() => {
+                Some("it is not a coordinator, an l30_storage crate named *-coordinator".to_owned())
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            findings.push(finding(
+                coordinator,
+                coordinator_line,
+                format!(
+                    ": is in [rules.{RULE}] coordinator_users in {CONFIG_FILE}, but {reason}. \
+                     Remove the entry."
+                ),
+            ));
+            continue;
+        }
+        let known = graph
+            .member(coordinator)
+            .is_some_and(|member| member.is_coordinator());
+        for user in users.iter() {
+            let allows_nothing = |reason: String| format!("{reason}, so the entry allows nothing");
+            let reason = match graph.member(user) {
+                None => allows_nothing("no workspace member has this name".to_owned()),
+                Some(member) if member.is_client() => allows_nothing(
+                    "it is a client, which never depends on a coordinator".to_owned(),
+                ),
+                Some(member) => match member.layer {
+                    None => continue,
+                    // A coordinator without a layer is left to its
+                    // placement finding.
+                    Some(Layer::Api) if !known || graph.depends_on(user, coordinator) => continue,
+                    Some(Layer::Api) => format!(
+                        "{user} has no normal or build dependency on {coordinator}, and the list \
+                         says who uses the coordinator today"
+                    ),
+                    Some(layer) => allows_nothing(format!(
+                        "only l40_api crates use coordinators by their users lists, and its \
+                         layer is {layer}"
+                    )),
+                },
+            };
+            findings.push(finding(
+                coordinator,
+                user_lines.get(user.as_str()).copied().or(coordinator_line),
+                format!(
+                    ": lists {user} in [rules.{RULE}] coordinator_users in {CONFIG_FILE}, but \
+                     {reason}. Remove it from the list."
                 ),
             ));
         }
@@ -161,18 +213,6 @@ pub(super) fn stale_entries(
         }
     }
     findings
-}
-
-/// Whether `user` uses `store`: a normal or build dependency on it, or on a
-/// legacy crate that has one, as a legacy crate may re-export a store. The list
-/// says who uses the store today, so an entry without such an edge is
-/// stale.
-fn uses(config: &LayersConfig, graph: &Graph<'_>, user: &str, store: &str) -> bool {
-    graph.depends_on(user, store)
-        || config
-            .legacy
-            .iter()
-            .any(|legacy| graph.depends_on(user, legacy) && graph.depends_on(legacy, store))
 }
 
 /// The line of `key`'s entry in `entries`, and the line of each item it
@@ -310,6 +350,7 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
     }
     for (key, what) in [
         ("store_users", "users"),
+        ("coordinator_users", "users"),
         ("allowed_edges", "allowed edges"),
         ("state.shared_catalogs", "databases"),
         ("state.co_writers", "co-writers"),
@@ -317,6 +358,7 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
     ] {
         let (old, new) = match key {
             "store_users" => (&base.store_users, &policy.store_users),
+            "coordinator_users" => (&base.coordinator_users, &policy.coordinator_users),
             "allowed_edges" => (&base.allowed_edges, &policy.allowed_edges),
             "state.shared_catalogs" => (&base.shared_catalogs, &policy.shared_catalogs),
             "storage.codec_facades" => (&base.storage.codec_facades, &policy.storage.codec_facades),
@@ -406,21 +448,6 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
                 format!(": `{package}` was removed from {storage} {key}."),
             ));
         }
-    }
-    for (package, line) in &policy.legacy {
-        if !base.legacy.contains_key(package) {
-            changes.push((*line, format!(": `{package}` was added to {table} legacy.")));
-        }
-    }
-    for package in base
-        .legacy
-        .keys()
-        .filter(|package| !policy.legacy.contains_key(*package))
-    {
-        changes.push((
-            policy.legacy_line.unwrap_or(policy.line),
-            format!(": `{package}` was removed from {table} legacy."),
-        ));
     }
     for (package, line) in &policy.protocols {
         if !base.protocols.contains_key(package) {

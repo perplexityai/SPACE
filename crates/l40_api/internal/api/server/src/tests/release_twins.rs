@@ -875,7 +875,7 @@ async fn the_original_is_the_first_inserted_not_the_first_begun() -> TestResult 
         .release
         .expect("release");
     let twin_metadata = serde_json::to_value(bound(2))?;
-    let twin = crate::template_releases_store::insert_release(
+    let twin = pplx_space_template_release_store::registration::insert_release(
         &mut *early,
         TEMPLATE,
         "fc",
@@ -2128,9 +2128,10 @@ async fn a_selected_tag_lookup_reaches_a_twin_under_the_other_spelling() -> Test
 }
 
 /// Where both spellings of the tagged digest have a storage-owning release
-/// bound to the selected environment, the tagged release answers, as it does
-/// with no selector, even when the other one's storage location is older,
-/// under every read scope.
+/// bound to the selected environment, the tagged release answers, even when
+/// the other one's storage location is older, under every read scope. With no
+/// selector the digest original answers, the older of the two, as every
+/// lookup without an environment does.
 #[tokio::test(flavor = "current_thread")]
 async fn a_selected_tag_lookup_prefers_the_tagged_release() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -2176,16 +2177,25 @@ async fn a_selected_tag_lookup_prefers_the_tagged_release() -> TestResult {
 
     for scope in SCOPES {
         for environment in [None, Some(environment(1))] {
+            let (expected, storage) = if environment.is_some() {
+                (ids[1], "s3://bucket/prefixed?region=us-east-1")
+            } else {
+                (ids[0], "s3://bucket/bare?region=us-east-1")
+            };
             let found = by_tag_as(service, scope, environment).await?;
             let release = found.release.expect("release");
-            assert_eq!(release.id, ids[1].to_string(), "{scope:?} {environment:?}");
+            assert_eq!(
+                release.id,
+                expected.to_string(),
+                "{scope:?} {environment:?}"
+            );
             assert_eq!(
                 found
                     .storage_locations
                     .iter()
                     .map(|location| location.connection_string.as_str())
                     .collect::<Vec<_>>(),
-                vec!["s3://bucket/prefixed?region=us-east-1"],
+                vec![storage],
                 "{scope:?} {environment:?}"
             );
         }

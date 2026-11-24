@@ -89,7 +89,7 @@ use std::time::Duration;
 use crate::metrics::sandbox::api::ClientIdTag;
 use crate::metrics::sandbox::api::client_limit::{self, Decision, Operation, Reason};
 use pplx_space_feature_flags::{
-    FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
+    Attributes, FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
     SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
 };
 use pplx_space_k8s_ids::LabelValue;
@@ -108,10 +108,6 @@ const KNOWN_CLIENTS_ENV: &str = "SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS";
 /// The shared counter store, injected from the same `api.redis` secret contract
 /// as the cluster activation limiter (rendered once for the process).
 const REDIS_URL_ENV: &str = "SPACE_REDIS_URL";
-
-/// Both Eppo flags are single cluster-wide config, so every replica evaluates
-/// them against one constant subject — not a per-sandbox or per-org rollout.
-const FLAG_SUBJECT: &str = "space-cluster";
 
 /// Redis key prefix for the per-client concurrency ZSETs. Namespaced (and
 /// versioned) so it never collides with other SPACE keys in a shared Redis and
@@ -698,6 +694,9 @@ struct Inner {
     /// interned.
     known: KnownClients,
     feature_flags: FeatureFlagClient,
+    /// What both flags are evaluated with besides their constant subject: this
+    /// process's cluster id (see [`crate::limiter_flags`]).
+    flag_attributes: Attributes,
     /// The shared ZSET store. `None` when no usable `SPACE_REDIS_URL` is
     /// configured — the limiter then fails open (`misconfigured`).
     store: Option<RedisConcurrencyStore>,
@@ -722,9 +721,23 @@ impl ClientConcurrencyLimiter {
                 config,
                 known,
                 feature_flags,
+                flag_attributes: crate::limiter_flags::process_attributes(),
                 store,
             }),
         }
+    }
+
+    /// This limiter with its flags evaluated as if this process ran in
+    /// `cluster_id`.
+    #[cfg(test)]
+    pub(crate) fn with_flag_cluster_id(
+        mut self,
+        cluster_id: Option<&pplx_space_cluster_id::ClusterId>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("flag cluster id set before the limiter is shared")
+            .flag_attributes = crate::limiter_flags::attributes(cluster_id);
+        self
     }
 
     pub fn config(&self) -> &ClientConcurrencyConfig {
@@ -738,10 +751,11 @@ impl ClientConcurrencyLimiter {
     /// whose provider is installed and cannot answer falls back to the flag's
     /// declaration, which is on.
     fn limiter_active(&self) -> bool {
-        self.inner.feature_flags.gate_enabled(
+        self.inner.feature_flags.gate_enabled_with_attributes(
             self.inner.config.mode != Mode::Off,
             SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
-            FLAG_SUBJECT,
+            crate::limiter_flags::SUBJECT,
+            self.inner.flag_attributes.clone(),
         )
     }
 
@@ -762,10 +776,11 @@ impl ClientConcurrencyLimiter {
         let value = self
             .inner
             .feature_flags
-            .json_override(
+            .json_override_with_attributes(
                 self.inner.config.mode != Mode::Off,
                 SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
-                FLAG_SUBJECT,
+                crate::limiter_flags::SUBJECT,
+                self.inner.flag_attributes.clone(),
             )
             .resolved()?;
         match serde_json::from_value::<QuotaOverrides>(value) {

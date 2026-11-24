@@ -18,6 +18,26 @@ pub mod wake_signals {
     /// launch state without the pod network namespace required to boot it.
     pub const MISSING_RUNTIME_CONTEXT_MARKER: &str =
         "wake start context has no network namespace; re-place via restore";
+
+    /// `FailedPrecondition` message marker a node returns when it refuses a
+    /// VM activation (a cold boot, a restore from a snapshot, or a resume)
+    /// because a node drain has sealed it. The refusal comes before any VM
+    /// work, and the same activation lands on another node once the drain
+    /// has made the sandbox durable, so a caller answers it as retryable.
+    pub const ACTIVATIONS_SEALED_MARKER: &str = "node activations are sealed";
+}
+
+/// Markers of sandbox-manager's node drain calls, `DrainNode` and
+/// `PreviewDrainNode`. The node attaches them and its callers classify on
+/// them; both name these constants.
+pub mod drain_node_signals {
+    /// `Aborted` message marker of a drain call that arrived while another
+    /// was in progress on the node: a `DrainNode` call (a drain or a cancel)
+    /// while another `DrainNode` call runs, or a preview while another
+    /// preview runs. It changed nothing, and the caller retries later. The
+    /// literal names neither call, since both put it in their answer.
+    pub const DRAIN_CALL_IN_PROGRESS_MARKER: &str =
+        "another drain call is in progress on this node";
 }
 
 /// Machine-readable markers node-manager attaches to `ExposePort` failures and

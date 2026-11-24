@@ -3,29 +3,35 @@
 //! abandoned restore, repairing a stale `failed` row, and the compensations
 //! that put a sweep's own write back. Also its aged-transient candidate
 //! select ([`list_aged_transient`]), which reads the node drain's
-//! [`EvacuationRestoreTarget`] marker.
+//! [`EvacuationRestoreTarget`] marker, its command-ready-pending and
+//! unrestorable-`restoring` candidate selects ([`list_command_ready_pending`],
+//! [`list_unrestorable_restoring`]), and the revert's guarded row lock
+//! ([`lock_placement_changed_at`]).
 //!
-//! The sweeper keeps everything around them: its other candidate selects, the
-//! sandbox and execution row locks (`SELECT ... FOR UPDATE`), the
-//! transactions, every decision about a listed row, and the execution and
-//! port-exposure writes beside the revert. Every function runs on the
-//! executor its caller passes, so it composes into the caller's transaction
-//! when there is one; [`unplace_reverted_restore`] requires that transaction,
-//! since its predicate is the id alone.
+//! The sweeper keeps everything around them: the execution row locks, the
+//! plain sandbox row lock it takes through [`row_locks`](crate::row_locks),
+//! the transactions, every decision about a listed row, and the execution and
+//! port-exposure writes beside the revert.
+//! Every function runs on the executor its caller passes, so it composes into
+//! the caller's transaction when there is one; [`unplace_reverted_restore`]
+//! requires that transaction, since its predicate is the id alone, and
+//! [`lock_placement_changed_at`] takes it, since its lock has to outlive the
+//! statement.
 //!
 //! A sweep write that returns a write token (`RETURNING`
 //! [`LIFECYCLE_WRITE_TOKEN`]) is undone only by the compensation bound to that
 //! token, so an undo never reaches past its own transition.
 //!
-//! One guard fragment, [`unrestorable_restoring_guards`], is also
-//! interpolated by a statement that stays with the sweeper: its
-//! unrestorable-`restoring` candidate select. It is public so that the guard
-//! keeps one definition while that statement lives elsewhere. The others,
-//! [`evacuation_guards`] among them, are interpolated only here.
+//! One guard fragment, `unrestorable_restoring_guards`, is interpolated by
+//! two statements: the unrestorable-`restoring` candidate select
+//! ([`list_unrestorable_restoring`]) and the fail CAS that re-checks it
+//! ([`fail_unrestorable_restoring`]). The others, [`evacuation_guards`]
+//! among them, are interpolated only here too.
 //!
-//! [`HEAL_COMMAND_READY_PENDING_SQL`], [`REAP_COMMAND_READY_PENDING_SQL`],
-//! [`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`] and the
-//! [`list_aged_transient_query`], [`fail_candidate_query`],
+//! [`LIST_COMMAND_READY_PENDING_SQL`], [`HEAL_COMMAND_READY_PENDING_SQL`],
+//! [`REAP_COMMAND_READY_PENDING_SQL`], [`REPAIR_FAILED_ACTIVE_EXECUTION_SQL`]
+//! and the [`list_aged_transient_query`],
+//! [`list_unrestorable_restoring_query`], [`fail_candidate_query`],
 //! [`converge_restoring_query`], [`revert_to_suspended_query`],
 //! [`undo_revert_to_suspended_query`] and
 //! [`fail_unrestorable_restoring_query`] builders are public only because
@@ -38,6 +44,7 @@ use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxLifecycleParseError};
@@ -220,9 +227,9 @@ pub fn restoring_unowned(age_param: &str) -> String {
 /// execution with neither an attempt nor an expiry (one whose activation
 /// finished, or that never took an attempt) has nothing to wait for.
 ///
-/// Every CAS that applies this takes the sandbox row lock first (the
-/// sweeper's `LOCK_SANDBOX_ROW_SQL`); the candidate select only lists, so it
-/// needn't.
+/// Every CAS that applies this takes the sandbox row lock first
+/// ([`row_locks::lock_id`](crate::row_locks::lock_id)); the candidate select
+/// only lists, so it needn't.
 ///
 /// It renders a conjunct that starts with a newline and `AND`, on the row
 /// named `sandboxes`, so the calling statement must not alias that table.
@@ -560,6 +567,95 @@ pub async fn list_aged_transient(
         .bind(restoring_episode_deadline.map(secs_bind))
         .fetch_all(executor)
         .await
+}
+
+/// Candidate query for the command-ready-pending reaper. Bind order: `$1` =
+/// `managed_by`, `$2` = age threshold seconds (`BIGINT`), `$3` = batch limit.
+/// `lifecycle_changed_at` is the age clock because the create preserve path
+/// sets the marker in the same write that flips the row to `started`.
+///
+/// Ordered by `random()`, not oldest-first: a probe outcome of `Unreachable`
+/// leaves the row unchanged, so a strict oldest-first `LIMIT` would re-select
+/// the same front rows every tick and let a batch of stuck/unreachable rows
+/// permanently starve the ready/wedged candidates behind them. Random sampling
+/// gives every candidate a fair shot each tick — healed/reaped rows leave the
+/// set, and no fixed front-of-queue can monopolize the batch. The matching set
+/// (aged, never-retried preserved creates) is small, so the random sort is
+/// cheap.
+pub const LIST_COMMAND_READY_PENDING_SQL: &str = sql!(
+    "SELECT
+         s.id,
+         EXTRACT(EPOCH FROM (NOW() - s.lifecycle_changed_at))::BIGINT AS age_secs,
+         e.pod_name,
+         e.activation_attempt_id,
+         NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
+         e.route_activation_id,
+         e.generation
+     FROM sandboxes s
+     LEFT JOIN sandbox_k8s_executions e
+       ON e.sandbox_id = s.id AND e.active
+     WHERE s.managed_by = $1
+       AND s.lifecycle = 'started'
+       AND s.command_ready_pending = true
+       AND s.lifecycle_changed_at < NOW() - make_interval(secs => $2)
+     ORDER BY random()
+     LIMIT $3"
+);
+
+/// One row of [`LIST_COMMAND_READY_PENDING_SQL`]: a `started` row whose
+/// `command_ready_pending` marker outlived the age, with its active
+/// execution's pod identity when it has one.
+#[derive(sqlx::FromRow)]
+pub struct CommandReadyPendingRow {
+    pub id: SandboxId,
+    pub age_secs: i64,
+    pub pod_name: Option<String>,
+    pub activation_attempt_id: Option<SandboxActivationAttemptId>,
+    pub generation: Option<i64>,
+    pub pod_uid: Option<PodUid>,
+    pub route_activation_id: Option<SandboxActivationAttemptId>,
+}
+
+/// List up to `limit` `started` rows of the `managed_by` substrate whose
+/// `command_ready_pending` marker is older than `age` on the database clock
+/// ([`LIST_COMMAND_READY_PENDING_SQL`]), changing nothing.
+pub async fn list_command_ready_pending(
+    executor: impl sqlx::PgExecutor<'_>,
+    managed_by: &str,
+    age: PositiveDuration,
+    limit: i64,
+) -> Result<Vec<CommandReadyPendingRow>, sqlx::Error> {
+    sqlx::query_as(LIST_COMMAND_READY_PENDING_SQL)
+        .bind(managed_by)
+        .bind(secs_bind(age))
+        .bind(limit)
+        .fetch_all(executor)
+        .await
+}
+
+/// Lock the sandbox's row `FOR UPDATE` when it belongs to the `managed_by`
+/// substrate, and return its `placement_changed_at`: the outer `None` when no
+/// such row exists. The lock lasts until the caller's transaction ends.
+///
+/// The revert to `suspended` takes it before the active execution's lock, so
+/// its execution check can't race a new claim, and reads the placement clock
+/// the revert's CAS clears while holding it.
+pub async fn lock_placement_changed_at(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    managed_by: &str,
+) -> Result<Option<Option<OffsetDateTime>>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT placement_changed_at
+           FROM sandboxes
+          WHERE id = $1
+            AND managed_by = $2
+            FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .bind(managed_by)
+    .fetch_optional(conn)
+    .await
 }
 
 /// Heal query: clear the marker on a probe-confirmed-ready row. Bind order:
@@ -1149,7 +1245,7 @@ pub async fn undo_revert_to_suspended(
 /// (so the calling statement must not alias that table), and reads `$2` as
 /// the minimum placement age in seconds (`BIGINT`), which the calling
 /// statement must bind there.
-pub fn unrestorable_restoring_guards() -> String {
+fn unrestorable_restoring_guards() -> String {
     let source_snapshot = restore_retry_source_snapshot_exists("sandboxes");
     let inflight_upload = inflight_suspend_upload_exists("sandboxes");
     format!(
@@ -1176,6 +1272,53 @@ pub fn unrestorable_restoring_guards() -> String {
     )
 }
 
+/// Candidate select for the unrestorable-`restoring` sweep. Bind order:
+/// `$1` = `managed_by`, `$2` = min placement age seconds (`BIGINT`), `$3` =
+/// batch limit. Lists without flipping; the reported age is time since the
+/// last placement change (the stable clock — see
+/// `unrestorable_restoring_guards`).
+pub fn list_unrestorable_restoring_query() -> String {
+    let guards = unrestorable_restoring_guards();
+    format!(
+        "SELECT sandboxes.id,
+                EXTRACT(EPOCH FROM (NOW() - sandboxes.placement_changed_at))::BIGINT AS age_secs
+           FROM sandboxes
+          WHERE sandboxes.managed_by = $1
+            {guards}
+          ORDER BY random()
+          LIMIT $3"
+    )
+}
+
+/// One row of [`list_unrestorable_restoring_query`].
+#[derive(Debug, sqlx::FromRow)]
+pub struct UnrestorableRestoringRow {
+    pub id: SandboxId,
+    /// Seconds since the row's last placement change, on the database clock.
+    pub age_secs: i64,
+}
+
+/// List up to `limit` `restoring` rows of the `managed_by` substrate that no
+/// restore can ever succeed for and whose placement last changed more than
+/// `min_placement_age` ago ([`list_unrestorable_restoring_query`]), changing
+/// nothing. It applies no restore-lease guard, on purpose; see
+/// `unrestorable_restoring_guards`, which [`fail_unrestorable_restoring`]
+/// re-checks whole.
+pub async fn list_unrestorable_restoring(
+    executor: impl sqlx::PgExecutor<'_>,
+    managed_by: &str,
+    min_placement_age: PositiveDuration,
+    limit: i64,
+) -> Result<Vec<UnrestorableRestoringRow>, sqlx::Error> {
+    static QUERY: LazyLock<String> = LazyLock::new(|| sql!(list_unrestorable_restoring_query()));
+    sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(managed_by)
+        .bind(secs_bind(min_placement_age))
+        .bind(limit)
+        .fetch_all(executor)
+        .await
+}
+
 /// Per-row fail CAS for the unrestorable-`restoring` sweep. Bind order:
 /// `$1` = `managed_by`, `$2` = min placement age seconds (`BIGINT`), `$3` =
 /// sandbox id. Repeats every guard the select applied — atomically, in the
@@ -1199,7 +1342,7 @@ pub fn fail_unrestorable_restoring_query() -> String {
 ///
 /// Writes an **inference**: the sweeper concluding, from the absence of any
 /// restore source, that the row is unrestorable. It has no restore-lease
-/// guard, on purpose ([`unrestorable_restoring_guards`]).
+/// guard, on purpose (`unrestorable_restoring_guards`).
 pub async fn fail_unrestorable_restoring(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,
@@ -1224,7 +1367,7 @@ pub async fn fail_unrestorable_restoring(
 /// It never repairs a sandbox whose first activation never finished (the
 /// execution never reached `running` and still holds an activation attempt,
 /// or was given up by its last owner: no attempt, but a give-up expiry; see
-/// the sweeper's `LIST_FAILED_ACTIVE_EXECUTIONS_SQL`). The sweep fails a create in that
+/// [`crate::k8s_executions::list_failed_active_executions`]). The sweep fails a create in that
 /// state on purpose when it never became routable; putting it back to
 /// `started` would hand out a sandbox its create request never returned, and
 /// for any activation a `started` row with no pod IP to reach it at. This

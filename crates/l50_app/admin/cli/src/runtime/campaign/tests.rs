@@ -358,8 +358,25 @@ fn show_leaves_out_stranded_for_a_kind_without_it_and_adds_when_it_finished() {
     value["finished_at"] = "2026-11-02T00:00:00Z".into();
     let rendered = render_campaign(&serde_json::from_value(value).unwrap());
     assert!(!rendered.contains("Stranded"), "{rendered}");
+    assert!(!rendered.contains("Held"), "{rendered}");
     assert!(
         rendered.ends_with("Finished: 2026-11-02T00:00:00Z"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn show_reports_why_a_campaign_is_held() {
+    let mut value = campaign_json(C1, "canary", None);
+    value["kind"] = "templates".into();
+    value["held"] = json!({
+        "reason": "twins_not_booted",
+        "detail": "creates here don't boot a twin's environment",
+    });
+    let rendered = render_campaign(&serde_json::from_value(value).unwrap());
+    assert!(
+        rendered
+            .contains("Held: twins_not_booted (creates here don't boot a twin's environment)\n"),
         "{rendered}"
     );
 }

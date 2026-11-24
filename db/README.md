@@ -484,6 +484,28 @@ SELECT COUNT(*) FROM sandbox_runtime_upgrade_outcomes
  WHERE outcome NOT IN ('rolled_back', 'already_on_target');
 ```
 
+`20261120180000_sandbox_runtime_upgrade_attempt_identity` adds nullable
+`target_environment`, `target_state` and `authorization_id` columns to
+`sandbox_runtime_upgrade_attempt_outcomes`: what the operation an attempt
+outcome belongs to asked for, kept after the sandbox's row is deleted. A row
+that has them is final for its attempt; one without them is final for no
+attempt. Its down refuses, before it changes the schema, while any row has
+them, since dropping the columns would leave every final outcome final for no
+attempt and let a retry of an attempt its caller gave up run again. It goes
+through over rows without them, and keeps those. This read-only query counts
+the rows that hold it back:
+
+```sql
+SELECT COUNT(*) FROM sandbox_runtime_upgrade_attempt_outcomes
+ WHERE target_environment IS NOT NULL;
+```
+
+Those rows also need `20261114030002`'s down to wait, which it does while the
+table holds any row. An image-only rollback runs no down, so once that count
+is nonzero, roll the binary back only to a release that honors recorded
+finality (see "Upgrading a sandbox's runtime" in
+`docs/execution-environments.md`).
+
 ## Console password provisioning
 
 The password hash marker `!` locks console password login and rejects existing
@@ -607,6 +629,14 @@ which is safe because SQLx rolls the file and its `_sqlx_migrations` row back
 together. A `-- no-transaction` migration is not retried at all, because a
 failed `CREATE INDEX CONCURRENTLY` can leave an INVALID index behind with no
 history row, and recovering that needs a `DROP INDEX CONCURRENTLY` and a rerun.
+A failed `DROP INDEX CONCURRENTLY` can leave one too, and so can a
+`-- no-transaction` down, whose failure keeps the up's history row. When the
+statement of a `-- no-transaction` file fails under `control-plane up`,
+`reset` or `down`, the migrator logs one error per INVALID index in the
+database before it exits, with the `failed_version`, the `index`, its `table`,
+and `ready` (whether writes still maintain it). The list is not capped or
+filtered to the failed file, so it can name an index from an earlier failure
+or another session's build; check which file names it before recovering.
 
 [The migration lint guard](../scripts/check-postgres-migrations-squawk.sh)
 checks changed `db/postgres/*.up.sql` files with Squawk. Squawk catches generic
@@ -629,8 +659,13 @@ semantics; only its exact reviewed content is exempt from the new-migration lint
 The same guard lane also rejects PRs that combine `db/postgres/*.sql`
 migrations with runtime/deployable app changes. Land Postgres migrations in a
 separate PR from application behavior changes so lock risk, rollout, and
-rollback are reviewed independently. Docs, tests, and migration-guard
-maintenance can travel with migration-only PRs.
+rollback are reviewed independently. Docs, tests under `scripts/tests/`, the
+SQL files directly in `crates/test_support/db/test/fixtures/schema-variants/`,
+and the migration guards under `scripts/` with their tests can travel with
+migration-only PRs. Apart from the bootstrap-role exceptions below, every other
+file under `crates/`, Rust tests included, counts as a runtime change, so a
+migration must keep every existing Rust test passing: tighten a constraint
+they violate only after a separate PR updates them.
 
 The sole production-code exception is the credential fence required by a
 credential-table migration. That PR may change the canonical table-name entries

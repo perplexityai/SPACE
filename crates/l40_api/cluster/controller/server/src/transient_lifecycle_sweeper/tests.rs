@@ -2864,11 +2864,7 @@ mod failed_cleanup_stop_route;
 
 mod postgres_backed {
 
-    use super::super::store::{
-        LIST_COMMAND_READY_PENDING_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL,
-        NOTE_FAILED_CLEANUP_ATTEMPT_SQL, failed_active_execution_scope,
-        list_unrestorable_restoring_query,
-    };
+    use super::super::store::{NOTE_FAILED_CLEANUP_ATTEMPT_SQL, failed_active_execution_scope};
     use super::*;
     use pplx_space_accounts::NodeId;
     use pplx_space_db_test_fixtures::try_pg_test_db;
@@ -2876,9 +2872,10 @@ mod postgres_backed {
     use pplx_space_sandbox_model::SandboxId;
     use pplx_space_sandbox_model::SandboxLifecycle;
     use pplx_space_sandbox_store::sweeper::{
-        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL,
-        REPAIR_FAILED_ACTIVE_EXECUTION_SQL, converge_restoring_query, fail_candidate_query,
-        fail_unrestorable_restoring_query, list_aged_transient_query, revert_to_suspended_query,
+        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
+        REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
+        converge_restoring_query, fail_candidate_query, fail_unrestorable_restoring_query,
+        list_aged_transient_query, list_unrestorable_restoring_query, revert_to_suspended_query,
         undo_revert_to_suspended_query,
     };
     use pplx_space_snapshot_model::SnapshotId;
@@ -5427,12 +5424,15 @@ mod postgres_backed {
         }
         let kubernetes = SubstrateKind::Kubernetes;
 
-        let listed: Vec<(SandboxId,)> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
-            .bind(kubernetes)
-            .bind(10_i64)
-            .fetch_all(pool)
-            .await?;
-        assert_eq!(listed, vec![(k8s,)]);
+        let listed: Vec<SandboxId> =
+            pplx_space_sandbox_store::k8s_executions::list_failed_active_executions(
+                pool, kubernetes, 10,
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(listed, vec![k8s]);
 
         let rotated = |sandbox_id: SandboxId| async move {
             sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)

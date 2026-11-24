@@ -49,7 +49,7 @@ use sqlx::types::Json;
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 
-use pplx_space_accounts::{NodeId, OrgId};
+use pplx_space_accounts::NodeId;
 use pplx_space_artifact_model::{ExactStorageUri, SnapshotArtifact as SnapshotArtifactFile};
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_content_digest::Digest;
@@ -58,8 +58,9 @@ use pplx_space_events::{
 };
 use pplx_space_execution_spec::RuntimeKind;
 use pplx_space_node_model::{NodeRole as SpaceNodeRole, SubstrateKind};
-use pplx_space_rpc_contracts::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId};
+use pplx_space_sandbox_store::snapshot_capture_fields::{self, SnapshotSandboxRow};
 use pplx_space_snapshot_model::{
     ArtifactKind, ArtifactOrigin, BackupAttemptId, LocalArtifactId, SnapshotContentHash,
     SnapshotId, SnapshotKind, SnapshotName, SnapshotState,
@@ -232,10 +233,15 @@ fn scheduling_status_label(status: i32) -> &'static str {
     }
 }
 
+/// The `node_status_snapshots.node_ctl` document. A field a publication
+/// leaves out is written as `null`, so a publication from a node that no
+/// longer reports one clears it. `reads_twin_metadata` is read by
+/// `pplx_space_node_status_store::reads_twin_metadata`.
 fn node_ctl_status_json(status: NodeCtlStatus) -> serde_json::Value {
     serde_json::json!({
         "reachable": status.reachable,
         "error": status.error,
+        "reads_twin_metadata": status.reads_twin_metadata,
         "reconciliations": status
             .reconciliations
             .into_iter()
@@ -358,6 +364,8 @@ pub struct ClusterApiService {
     /// its execution as `replaced`. Off unless `from_env_with_security_state`
     /// reads it on, for the same reason.
     abandoned_restore_retirement: pplx_space_sandbox_model::AbandonedRestoreRetirement,
+    /// Which workers `FetchFirewallRules` serves: none outside tests.
+    firewall_enrollment: firewall_rules::Enrollment,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -376,13 +384,6 @@ struct NodeRow {
     metadata_json: String,
 }
 
-#[derive(Debug, Clone, FromRow)]
-struct OriginNodeRow {
-    id: NodeId,
-    address: Option<String>,
-    role: String,
-}
-
 #[derive(Debug, Clone)]
 struct OriginNode {
     id: NodeId,
@@ -391,60 +392,48 @@ struct OriginNode {
     role: SpaceNodeRole,
 }
 
-/// Capture-time fields the `snapshots` row inherits from the source sandbox.
-#[derive(FromRow)]
-struct SnapshotSandboxRow {
-    org_id: OrgId,
-    active_node_id: Option<NodeId>,
-    target_node_id: Option<NodeId>,
-    vcpu: Option<i32>,
-    memory_mib: Option<i32>,
-    template_id: Option<String>,
-    content_hash: Option<String>,
+/// The node the snapshot is physically uploading **from**, recorded as
+/// `snapshots.source_node_id`. For a fresh suspend the VM is still placed,
+/// so `active_node_id` is the source. For a **reupload** of an
+/// already-suspended sandbox, `active_node_id` is NULL (cleared at
+/// suspend), but the on-disk artifacts and the reupload worker live on
+/// `target_node_id` (preserved across suspend) — so fall back to it.
+/// Without this, reupload snapshots get a NULL `source_node_id` and the
+/// node-scoped in-flight-upload drain guard can't attribute them to the
+/// node actually running the upload, letting that node be terminated
+/// mid-reupload.
+fn snapshot_source_node_id(sandbox: &SnapshotSandboxRow) -> Option<NodeId> {
+    sandbox.active_node_id.or(sandbox.target_node_id)
 }
 
-impl SnapshotSandboxRow {
-    /// The node the snapshot is physically uploading **from**, recorded as
-    /// `snapshots.source_node_id`. For a fresh suspend the VM is still placed,
-    /// so `active_node_id` is the source. For a **reupload** of an
-    /// already-suspended sandbox, `active_node_id` is NULL (cleared at
-    /// suspend), but the on-disk artifacts and the reupload worker live on
-    /// `target_node_id` (preserved across suspend) — so fall back to it.
-    /// Without this, reupload snapshots get a NULL `source_node_id` and the
-    /// node-scoped in-flight-upload drain guard can't attribute them to the
-    /// node actually running the upload, letting that node be terminated
-    /// mid-reupload.
-    fn source_node_id(&self) -> Option<NodeId> {
-        self.active_node_id.or(self.target_node_id)
-    }
-
-    fn new_snapshot(
-        &self,
-        id: SnapshotId,
-        sandbox_id: SandboxId,
-        kind: SnapshotKind,
-        state: SnapshotState,
-        storage_uri: ExactStorageUri,
-    ) -> Result<snapshot_store::NewSnapshot, Status> {
-        let template_id = self
-            .template_id
-            .as_deref()
-            .map(TemplateName::parse)
-            .transpose()
-            .map_err(|error| {
-                Status::failed_precondition(format!("sandbox has invalid template_id: {error}"))
-            })?;
-        let content_hash = self
-            .content_hash
-            .clone()
-            .map(SnapshotContentHash::from_stored);
-        Ok(
-            snapshot_store::NewSnapshot::new(id, sandbox_id, kind, state, self.org_id, storage_uri)
-                .with_source_node_id(self.source_node_id())
-                .with_resources(self.vcpu, self.memory_mib)
-                .with_template(template_id, content_hash),
-        )
-    }
+/// The `snapshots` row a backup of `sandbox` registers, carrying the
+/// capture-time fields it inherits.
+fn new_snapshot_from_sandbox(
+    sandbox: &SnapshotSandboxRow,
+    id: SnapshotId,
+    sandbox_id: SandboxId,
+    kind: SnapshotKind,
+    state: SnapshotState,
+    storage_uri: ExactStorageUri,
+) -> Result<snapshot_store::NewSnapshot, Status> {
+    let template_id = sandbox
+        .template_id
+        .as_deref()
+        .map(TemplateName::parse)
+        .transpose()
+        .map_err(|error| {
+            Status::failed_precondition(format!("sandbox has invalid template_id: {error}"))
+        })?;
+    let content_hash = sandbox
+        .content_hash
+        .clone()
+        .map(SnapshotContentHash::from_stored);
+    Ok(
+        snapshot_store::NewSnapshot::new(id, sandbox_id, kind, state, sandbox.org_id, storage_uri)
+            .with_source_node_id(snapshot_source_node_id(sandbox))
+            .with_resources(sandbox.vcpu, sandbox.memory_mib)
+            .with_template(template_id, content_hash),
+    )
 }
 
 /// What a `GetArtifactBackupLocation` request asks. The two wire shapes are
@@ -606,7 +595,7 @@ impl ClusterApiService {
             pplx_space_ecw_credential::EcwCredentialKeyring::load_from_env()
                 .expect("ClusterApiService ECW credential configuration must be valid"),
         );
-        let trusted_template_storage = trusted_storage::TrustedTemplateStorageBuckets::from_env()
+        let trusted_template_storage = trusted_storage::from_env()
             .expect("ClusterApiService template storage configuration must be valid");
         Self {
             trusted_template_storage,
@@ -643,6 +632,7 @@ impl ClusterApiService {
                 runtime_provisioning_cohort::RuntimeProvisioningCohort::Disabled,
             abandoned_restore_retirement:
                 pplx_space_sandbox_model::AbandonedRestoreRetirement::Disabled,
+            firewall_enrollment: firewall_rules::Enrollment::Unapproved,
         }
     }
 
@@ -705,9 +695,8 @@ impl ClusterApiService {
         let mut service =
             Self::with_security_state(pool, route_ed25519_authority, ecw_credential_keyring);
         service.reserved_template_names = template_publication::ReservedTemplateNames::from_env()?;
-        service.trusted_template_storage =
-            trusted_storage::TrustedTemplateStorageBuckets::from_env()
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        service.trusted_template_storage = trusted_storage::from_env()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         service.runtime_desired_state = runtime_desired_state::RuntimeDesiredState::from_env();
         service.runtime_provisioning_cohort =
             runtime_provisioning_cohort::RuntimeProvisioningCohort::from_env()
@@ -812,12 +801,9 @@ impl ClusterApiService {
             // terminal state. Disambiguate so the caller gets the right
             // gRPC code: NOT_FOUND for missing, FAILED_PRECONDITION for
             // crossed terminal states.
-            let current_state: Option<String> =
-                sqlx::query_scalar(sql!("SELECT state FROM snapshots WHERE id = $1"))
-                    .bind(snapshot_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| Status::internal(format!("snapshot state lookup: {e}")))?;
+            let current_state = snapshot_store::attempt::state(&mut *tx, snapshot_id)
+                .await
+                .map_err(|e| Status::internal(format!("snapshot state lookup: {e}")))?;
             return match current_state {
                 None => Err(Status::not_found(format!(
                     "snapshot {snapshot_id} not found"
@@ -1014,21 +1000,19 @@ impl ClusterApiService {
             .transpose()
             .map_err(|e| Status::invalid_argument(format!("invalid execution_generation: {e}")))?;
         let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
-        let snapshot = sandbox
-            .new_snapshot(
-                snapshot_id,
-                sandbox_id,
-                snapshot_kind,
-                SnapshotState::Creating,
-                storage_uri,
-            )?
-            .with_artifact(artifact)
-            .with_execution_metadata(execution_metadata)
-            // Orders captures only when the node vouches that the generation
-            // is the capturing execution's; it fences either way.
-            .with_generation(
-                execution_generation.filter(|_| req.execution_generation_names_capture),
-            );
+        let snapshot = new_snapshot_from_sandbox(
+            &sandbox,
+            snapshot_id,
+            sandbox_id,
+            snapshot_kind,
+            SnapshotState::Creating,
+            storage_uri,
+        )?
+        .with_artifact(artifact)
+        .with_execution_metadata(execution_metadata)
+        // Orders captures only when the node vouches that the generation
+        // is the capturing execution's; it fences either way.
+        .with_generation(execution_generation.filter(|_| req.execution_generation_names_capture));
         let mut tx = self
             .pool
             .begin()
@@ -1284,11 +1268,10 @@ impl ClusterApiService {
     /// restored), and the periodic sweep is the correctness fallback, so a
     /// failed or spurious NOTIFY only affects latency.
     async fn notify_evacuation_restore_ready(&self, sandbox_id: SandboxId) {
-        if let Err(err) = sqlx::query(sql!("SELECT pg_notify($1, $2)"))
-            .bind(EVACUATION_RESTORE_READY_CHANNEL)
-            .bind(sandbox_id.to_string())
-            .execute(&self.pool)
-            .await
+        if let Err(err) = pplx_space_cluster_trigger_queue::signal::notify_evacuation_restore_ready(
+            &self.pool, sandbox_id,
+        )
+        .await
         {
             tracing::warn!(
                 error = %err,
@@ -1307,20 +1290,10 @@ impl ClusterApiService {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<SnapshotSandboxRow, Status> {
-        sqlx::query_as::<_, SnapshotSandboxRow>(sql!(
-            // A primary-key fetch is sufficient: `snapshot_execution_metadata`
-            // requires caller-supplied execution metadata, so no template or
-            // runtime-guest lookup is needed here.
-            "SELECT org_id, active_node_id, target_node_id, vcpu, memory_mib,
-                    template_id, content_hash
-             FROM sandboxes
-             WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Status::internal(format!("sandbox lookup: {e}")))?
-        .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))
+        snapshot_capture_fields::get(&self.pool, sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("sandbox lookup: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))
     }
 
     pub(crate) async fn get_sandbox_snapshot_storage_uri(
@@ -1490,26 +1463,9 @@ impl ClusterApiService {
                 "node role is required when origin_node_id is a Kubernetes node name",
             ));
         };
-        let role_hint_str = role_hint.as_str();
-        let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-            "SELECT n.id,
-                    host(n.address) AS address,
-                    n.role
-             FROM nodes n
-             JOIN node_k8s nk ON nk.node_id = n.id
-             WHERE nk.k8s_node_name = $1
-               AND n.managed_by = $3
-               AND n.role = $2
-               AND COALESCE(n.state, 'registered') != 'deleted'
-             ORDER BY nk.updated_at DESC, n.created_at DESC
-             LIMIT 1"
-        ))
-        .bind(&value)
-        .bind(role_hint_str)
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| Status::internal(format!("resolve Kubernetes origin node: {err}")))?;
+        let row = node_lookup::live_k8s_node_by_name(&self.pool, &value, role_hint)
+            .await
+            .map_err(|err| Status::internal(format!("resolve Kubernetes origin node: {err}")))?;
         let Some(row) = row else {
             return Err(Status::not_found(format!(
                 "origin_node_id {value} is not registered"
@@ -1578,24 +1534,9 @@ async fn registered_origin_node(
     node_id: NodeId,
     role_hint: Option<SpaceNodeRole>,
 ) -> Result<OriginNode, Status> {
-    let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-        "SELECT n.id,
-                host(n.address) AS address,
-                n.role
-         FROM nodes n
-         WHERE n.id = $1
-           AND ($2::TEXT IS NULL OR n.role = $2)
-           AND n.managed_by IN ($3, $4)
-           AND COALESCE(n.state, 'registered') != 'deleted'
-         LIMIT 1"
-    ))
-    .bind(node_id.as_uuid())
-    .bind(role_hint.map(SpaceNodeRole::as_str))
-    .bind(SubstrateKind::Space)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_optional(executor)
-    .await
-    .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
+    let row = node_lookup::live_node(executor, node_id, role_hint)
+        .await
+        .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
     let Some(row) = row else {
         return Err(Status::not_found(format!(
             "origin_node_id {display_id} is not registered"
@@ -1665,6 +1606,7 @@ mod backup_generation_fence;
 mod environment_observation;
 mod execution_currency;
 mod execution_observation;
+mod firewall_rules;
 mod metadata;
 mod node_local_backup_pending;
 mod publish;

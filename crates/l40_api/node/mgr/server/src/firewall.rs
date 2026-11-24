@@ -10,6 +10,7 @@ use crate::host_command::Command;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
+pub mod assignment;
 pub mod config_version;
 mod host_cache;
 pub mod rules;
@@ -512,6 +513,19 @@ pub fn teardown_proxy_rules(ns: &str) {
     if let Err(error) = nft_status(Some(ns), &["delete", "table", "ip", PROXY_TABLE]) {
         tracing::debug!(ns, %error, "proxy nft table cleanup failed");
     }
+}
+
+/// Remove every nft table SPACE owns in a reusable slot's namespace, ahead of
+/// the in-place reset's rebuild. The next occupant starts like a fresh slot,
+/// which has no firewall-rules table: the next apply installs the current
+/// assignment. Failing to delete the firewall-rules table
+/// leaves an unverified one, so that is an error and the caller rebuilds the
+/// slot; the sandbox table's teardown is best effort because its rebuild
+/// refuses to run over a leftover.
+pub fn scrub_namespace_tables(ns: &str) -> FirewallResult<()> {
+    teardown_proxy_rules(ns);
+    teardown_namespace_rules(ns);
+    rules::delete_in_namespace(ns)
 }
 
 /// Check if the "space" table has wildcard forward rules — in a specific namespace, or root if None.

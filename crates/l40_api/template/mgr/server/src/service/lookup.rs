@@ -4,25 +4,43 @@ use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 use super::support::PartitionChoice;
 use super::*;
 
+/// The environment a request's `TemplateRef.environment` names; `None` when
+/// it names none.
+pub(super) fn requested_environment(
+    environment: Option<&str>,
+) -> Result<Option<pplx_space_execution_spec::EnvironmentReference>, Status> {
+    environment
+        .map(|environment| {
+            environment.parse().map_err(|error| {
+                Status::invalid_argument(format!("invalid template environment: {error}"))
+            })
+        })
+        .transpose()
+}
+
 /// Cache partition a request's `TemplateRef.environment` selects; `None`
 /// when the request names no environment.
 pub(super) fn requested_cache_partition(
     environment: Option<&str>,
 ) -> Result<Option<crate::db::TemplateCachePartition>, Status> {
-    environment
-        .map(|environment| {
-            environment
-                .parse::<pplx_space_execution_spec::EnvironmentReference>()
-                .map(|environment| {
-                    pplx_space_node_runtime_core::catalog::template_cache_partition(Some(
-                        environment,
-                    ))
-                })
-                .map_err(|error| {
-                    Status::invalid_argument(format!("invalid template environment: {error}"))
-                })
-        })
-        .transpose()
+    Ok(requested_environment(environment)?.map(|environment| {
+        pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
+    }))
+}
+
+/// The environment a lookup that requires its environment's build names. Its
+/// authorized resolution names it too, so it resolves the release bound to
+/// it. One that doesn't parse, or a combination `environment_required`
+/// refuses, fails in `get_template_resolving` before anything resolves.
+pub(super) fn required_lookup_environment(
+    request: &crate::proto::GetTemplateRequest,
+) -> Option<pplx_space_execution_spec::EnvironmentReference> {
+    request
+        .environment_required
+        .then_some(request.template.as_ref())
+        .flatten()
+        .and_then(|template| template.environment.as_deref())
+        .and_then(|environment| environment.parse().ok())
 }
 
 pub(super) const fn pull_failure_code(failure: crate::volume::PullFailure) -> tonic::Code {
@@ -46,15 +64,24 @@ impl TemplateManagerService {
                 "missing_scope",
             );
         }
+        let required_environment = required_lookup_environment(request.get_ref());
         let mut response = self
             .get_template_resolving(
                 request,
                 async |name, hash, tag, org| {
-                    crate::volume::find_release_in_scope(name, hash, tag, org, scope).await
+                    crate::volume::find_release_in_environment(
+                        name,
+                        hash,
+                        tag,
+                        org,
+                        scope,
+                        required_environment,
+                    )
+                    .await
                 },
                 async |spec, resolve_elapsed, release| {
                     self.volume_puller
-                        .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
+                        .materialize_release(self.db.clone(), spec, resolve_elapsed, release)
                         .await
                 },
             )
@@ -85,7 +112,7 @@ impl TemplateManagerService {
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         self.get_template_with(request, resolve, materialize, async |spec, scope| {
             self.volume_puller
-                .pull_in_scope(Arc::clone(&self.db), spec, scope)
+                .pull_in_scope(self.db.clone(), spec, scope)
                 .await
         })
         .await
@@ -133,7 +160,10 @@ impl TemplateManagerService {
             validate_content_hash(&req_hash)?;
         }
         let req_tag = tmpl_ref.tag.clone().unwrap_or_default();
-        let requested_partition = requested_cache_partition(tmpl_ref.environment.as_deref())?;
+        let requested = requested_environment(tmpl_ref.environment.as_deref())?;
+        let requested_partition = requested.map(|environment| {
+            pplx_space_node_runtime_core::catalog::template_cache_partition(Some(environment))
+        });
         // Which partition the lookup answers from, and a required one pulls
         // for.
         let choice = match (requested_partition, req.environment_required) {
@@ -148,6 +178,15 @@ impl TemplateManagerService {
                      and excludes cached_only",
                 ));
             }
+        };
+        // A lookup that requires its environment's build pulls, on a miss, the
+        // release bound to that environment: a twin of the digest, or the
+        // release itself. One that only prefers it pulls the release a lookup
+        // without an environment resolves, as before twins; prefetch warms
+        // the twins.
+        let required_environment = match choice {
+            PartitionChoice::Require(_) => requested,
+            PartitionChoice::Any | PartitionChoice::Prefer(_) => None,
         };
         let caller_org = req
             .caller_org_id
@@ -179,7 +218,7 @@ impl TemplateManagerService {
             }
             let mut response = build_get_template_response(
                 self.artifact_store.root.clone(),
-                Arc::clone(&self.db),
+                self.db.clone(),
                 TemplateSelection {
                     name: template_id.clone(),
                     content_hash: req_hash,
@@ -233,10 +272,12 @@ impl TemplateManagerService {
                         crate::volume::FindReleaseError::NotFound => {
                             Status::not_found("template release not found")
                         }
-                        crate::volume::FindReleaseError::Unavailable => {
+                        crate::volume::FindReleaseError::Unavailable
+                        | crate::volume::FindReleaseError::SelectorIgnored { .. } => {
                             Status::unavailable("cluster metadata unavailable")
                         }
-                        crate::volume::FindReleaseError::InvalidResponse => {
+                        crate::volume::FindReleaseError::InvalidResponse
+                        | crate::volume::FindReleaseError::InvalidBinding { .. } => {
                             Status::failed_precondition(
                                 "cluster did not return an authorized exact release",
                             )
@@ -255,7 +296,7 @@ impl TemplateManagerService {
         let snapshot_selector = optional_snapshot_dimensions(req.vcpu, req.memory_mib)?;
         let policy_snapshot_memory_mib = if snapshot_selector.is_none() {
             let desired_memory_mib = {
-                let db = Arc::clone(&self.db);
+                let db = self.db.clone();
                 let template_id = template_id.clone();
                 let req_hash = req_hash.clone();
                 tokio::task::spawn_blocking(move || {
@@ -343,7 +384,7 @@ impl TemplateManagerService {
         // First attempt: local-only lookup.
         match build_get_template_response(
             self.artifact_store.root.clone(),
-            Arc::clone(&self.db),
+            self.db.clone(),
             selection(req_hash.clone()),
             snapshot_selector,
             policy_snapshot_memory_mib,
@@ -383,6 +424,7 @@ impl TemplateManagerService {
                     req_tag: &req_tag,
                     trigger: crate::volume::PullTrigger::OnDemand,
                     required: choice.required(),
+                    environment: required_environment,
                 };
                 materialize(spec, resolve_elapsed, release).await
             }
@@ -394,6 +436,7 @@ impl TemplateManagerService {
                         req_tag: &req_tag,
                         trigger: crate::volume::PullTrigger::OnDemand,
                         required: choice.required(),
+                        environment: required_environment,
                     },
                     scope,
                 )
@@ -407,7 +450,7 @@ impl TemplateManagerService {
                 let req_tag_for_err = req_tag.clone();
                 build_get_template_response(
                     self.artifact_store.root.clone(),
-                    Arc::clone(&self.db),
+                    self.db.clone(),
                     selection(req_hash),
                     snapshot_selector,
                     policy_snapshot_memory_mib,
@@ -531,7 +574,7 @@ impl TemplateManagerService {
             )?;
         }
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template = req.template.clone();
         let network_policy_generation = req.network_policy_generation;
         let update_outcome = tokio::task::spawn_blocking(move || {
@@ -617,7 +660,7 @@ impl TemplateManagerService {
             optional_positive_or_default("snapshot_memory_mib", req.snapshot_memory_mib, 1024)?;
 
         {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = template.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -682,7 +725,7 @@ impl TemplateManagerService {
 
         // Check that no pools or local sandboxes reference this build before
         // deleting its master rootfs.
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let root = self.artifact_store.root.clone();
         let n = name.clone();
         let h = content_hash.clone();
@@ -764,7 +807,7 @@ impl TemplateManagerService {
         name: &str,
         content_hash: &str,
     ) -> Result<(), Status> {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let root = self.artifact_store.root.clone();
         let n = name.to_string();
         let h = content_hash.to_string();
@@ -801,7 +844,7 @@ impl TemplateManagerService {
             )
             .await?;
 
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let n = name.to_string();
             let h = content_hash.to_string();
             tokio::task::spawn_blocking(move || {
@@ -1109,7 +1152,7 @@ fn cached_template_partitions_in(
 /// so a stalled disk holds up this delete and not every DB user. The
 /// caller's digest claim keeps a row from appearing in between.
 pub(super) fn cached_builds_to_delete(
-    db: &Mutex<rusqlite::Connection>,
+    db: &crate::db::SharedConnection,
     root: &Path,
     name: &str,
     content_hash: &str,

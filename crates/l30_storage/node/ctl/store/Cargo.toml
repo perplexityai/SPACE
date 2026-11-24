@@ -1,0 +1,40 @@
+[package]
+name = "pplx-space-node-ctl-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.space.state]
+sqlite.node-ctl = [
+  "dirty_facets",
+  "dirty_node_state",
+  "facet_sync_overrides",
+  "reconciliation_status",
+]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes the raw connection to node-ctl's test suites, which enable it as a
+# dev-dependency to seed and inspect the database directly, and an in-memory
+# connection to node-ctl's own `test-support` serving helper.
+test-support = []
+
+[dependencies]
+ref-cast = { workspace = true }
+rusqlite = { workspace = true }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
+thiserror = { workspace = true }
+
+# internal
+pplx-space-sql-locator = { workspace = true }
+pplx-space-sqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -2017,7 +2017,7 @@ impl Substrate {
                 .await
             {
                 Ok(Some(substrate)) => {
-                    environment_placement.check_kubernetes_support()?;
+                    substrate.k8s.check_environment_placement_support()?;
                     return Ok(Self::from_kubernetes(substrate));
                 }
                 Ok(None) => {}
@@ -2703,6 +2703,8 @@ fn backup_source_to_proto(
     }
 }
 
+// A forwarding impl that omits a defaulted method silently gives both substrates the default.
+#[deny(clippy::missing_trait_methods)]
 impl SubstrateAdapter for Substrate {
     fn managed_by(&self) -> &'static str {
         match &self.inner {

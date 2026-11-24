@@ -79,13 +79,15 @@ For new work:
   `run_reconcilers` (`cluster/controller/server/src/reconcilers.rs`) starts
   only for Kubernetes, classified in its module doc, are debt, not
   precedent or a Direct retry path.
-- Make a new `SubstrateAdapter` operation a required method, so the compiler
-  demands each implementation and its arm in `impl SubstrateAdapter for
-  Substrate`: with a default, a forgotten forwarding arm silently gives both
-  substrates the default instead of their implementations. Keep this rule
-  until that dispatch is generated. Only a hook shared code calls on every
-  path may default to "nothing to do", as `retire_fence_mismatch` does, and
-  it still needs its arm.
+- Every `SubstrateAdapter` operation needs its arm in `impl SubstrateAdapter
+  for Substrate`, even one with a default: that impl denies
+  `clippy::missing_trait_methods`. A default is one choice made for every
+  substrate that does not override it, so give an operation one only when it
+  is right for each of them, like the "nothing to do" hook
+  `retire_fence_mismatch`; otherwise make it required so each substrate
+  decides. Never default an operation to `Unsupported`: a substrate that
+  cannot support it returns `Unsupported` from its own implementation and
+  adds the gap row.
 - `Substrate`'s variants (`Inner` in `mod.rs`) stay private; shared code
   builds one with `Substrate::from_direct` or `Substrate::from_kubernetes`.
   For a static fact about the substrate, add a `SubstrateCapabilities` field
@@ -120,15 +122,19 @@ For new work:
   instead of ANDing the running value. Never choose a runtime endpoint from
   a row's label.
 - `node_direct`, `sandbox_direct_route_identities` and
-  `sandbox_direct_route_provenance` are Direct's tables. Outside tests, write
-  them only from `direct.rs` and the Direct node registry, and read them
-  through an existing query that joins them (archcheck's
-  `pattern_ratchet.direct_tables` fails a new use outside `direct.rs` and
-  `direct/`; its baseline lists today's).
+  `sandbox_direct_route_provenance` are Direct's tables, owned by
+  `pplx-space-direct-store`. Outside tests, write the route-identity and
+  provenance tables only from `direct.rs`, through that store's verbs,
+  and `node_direct` only from the Direct node registry
+  (`routes/admin/node_maintenance.rs`), whose statements write it
+  together with `nodes`. Elsewhere, read them only through an existing
+  query that joins them (archcheck's `pattern_ratchet.direct_tables`
+  fails a new use, or a new mention of the store's crate, outside
+  `direct.rs`, `direct/` and the store; its baseline lists today's).
 - Direct-table joins in shared code, `Unsupported` trait defaults
-  (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) and
-  `supports_node_drain`, a capability for a missing feature, are debt, not
-  precedent.
+  (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`,
+  `select_ready_worker_node_api_target`) and `supports_node_drain`, a
+  capability for a missing feature, are debt, not precedent.
 
 ## Tests
 

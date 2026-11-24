@@ -314,6 +314,25 @@ pub async fn get_default(
     default.as_deref().map(parse_environment).transpose()
 }
 
+/// [`get_default`] under a share lock on the policy row, held until the
+/// caller's transaction ends. Every write here takes the row `FOR UPDATE`
+/// first, so no write changes the default between this read and the
+/// caller's commit; two callers holding the share lock don't block each
+/// other.
+pub async fn share_lock_default(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Option<EnvironmentReference>, GetPolicyError> {
+    let row = sqlx::query_as::<_, (Option<String>,)>(sql!(
+        "SELECT default_environment_ref FROM runtime_environment_policy WHERE singleton FOR SHARE"
+    ))
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((default,)) = row else {
+        return Err(GetPolicyError::PolicyRowMissing);
+    };
+    default.as_deref().map(parse_environment).transpose()
+}
+
 /// Read only the policy generation, for a caller deciding whether a write
 /// conditional on one could still apply. Like [`get_default`], an unreadable
 /// state row doesn't fail it. Takes no lock.

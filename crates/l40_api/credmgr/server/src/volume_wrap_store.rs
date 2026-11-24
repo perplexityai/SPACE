@@ -10,9 +10,8 @@
 //! never see a KEK or a wrap, only the resolved plaintext.
 
 use pplx_space_accounts::OrgId;
+use pplx_space_byok_store::VolumeWrapRecord;
 use pplx_space_sandbox_model::SandboxId;
-
-use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 /// A resolved `sandbox_volume_encryption` row, narrowed to what the unwrap
@@ -73,18 +72,9 @@ impl PgVolumeWrapStore {
 #[tonic::async_trait]
 impl VolumeWrapStore for PgVolumeWrapStore {
     async fn get(&self, sandbox_id: SandboxId) -> Result<Option<VolumeWrap>, VolumeWrapStoreError> {
-        let row: Option<(OrgId, Uuid, Vec<u8>)> = sqlx::query_as(sql!(
-            "SELECT org_id, master_key_id, wrapped_dek \
-             FROM sandbox_volume_encryption WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(org_id, cmk_id, wrapped_dek)| VolumeWrap {
-            org_id,
-            cmk_id,
-            wrapped_dek,
-        }))
+        Ok(pplx_space_byok_store::volume_wrap(&self.pool, sandbox_id)
+            .await?
+            .map(VolumeWrap::from))
     }
 
     async fn insert_if_absent(
@@ -100,28 +90,28 @@ impl VolumeWrapStore for PgVolumeWrapStore {
         // the read cannot observe a state between a different writer's insert
         // and its commit.
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            sql!("INSERT INTO sandbox_volume_encryption (sandbox_id, org_id, master_key_id, wrapped_dek) \
-             VALUES ($1, $2, $3, $4) ON CONFLICT (sandbox_id) DO NOTHING"),
-        )
-        .bind(sandbox_id)
-        .bind(org_id)
-        .bind(cmk_id)
-        .bind(wrapped_dek)
-        .execute(&mut *tx)
-        .await?;
-        let (org_id, cmk_id, wrapped_dek): (OrgId, Uuid, Vec<u8>) = sqlx::query_as(sql!(
-            "SELECT org_id, master_key_id, wrapped_dek \
-             FROM sandbox_volume_encryption WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(VolumeWrap {
+        pplx_space_byok_store::insert_volume_wrap(
+            &mut *tx,
+            sandbox_id,
             org_id,
             cmk_id,
             wrapped_dek,
-        })
+        )
+        .await?;
+        let stored = pplx_space_byok_store::volume_wrap(&mut *tx, sandbox_id)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+        tx.commit().await?;
+        Ok(stored.into())
+    }
+}
+
+impl From<VolumeWrapRecord> for VolumeWrap {
+    fn from(record: VolumeWrapRecord) -> Self {
+        Self {
+            org_id: record.org_id,
+            cmk_id: record.master_key_id,
+            wrapped_dek: record.wrapped_dek,
+        }
     }
 }

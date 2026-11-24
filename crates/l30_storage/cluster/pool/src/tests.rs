@@ -4668,7 +4668,6 @@ struct ResolverReleases {
     blake3: Uuid,
     latest_holder: Uuid,
     dual_bare: Uuid,
-    dual_prefixed: Uuid,
 }
 
 const RESOLVER_TEMPLATE: &str = "resolver-fixture";
@@ -4717,8 +4716,9 @@ async fn seed_resolver_releases(pool: &PgPool) -> TestResult<ResolverReleases> {
         blake3: release(pool, format!("blake3:{}", hex('c')), "3 days").await?,
         latest_holder: release(pool, format!("sha256:{}", hex('d')), "6 days").await?,
         dual_bare: release(pool, hex('9'), "8 days").await?,
-        dual_prefixed: release(pool, format!("sha256:{}", hex('9')), "7 days").await?,
     };
+    // `dual_bare`'s other spelling: never the digest's original.
+    release(pool, format!("sha256:{}", hex('9')), "7 days").await?;
     tag(pool, releases.bare, "legacy", "0 seconds").await?;
     tag(pool, releases.bare, "legacy", "2 days").await?;
     tag(pool, releases.bare, "archived", "0 seconds").await?;
@@ -4775,8 +4775,8 @@ async fn retained_policy_release_ranking_characterization() -> TestResult {
 }
 
 /// Characterization of observed-demand matching: a recent sandbox's
-/// `content_hash` names the release stored in the same form first, else the
-/// one stored in the other of the bare and `sha256:` forms. Each case records
+/// `content_hash` names its digest's original, stored in either of the bare
+/// and `sha256:` forms. Each case records
 /// enough demand for one unretained release and reports every release the
 /// autoscaler gave a pool beside the retained `latest_holder`. Matching never
 /// reads `templates`, so demand for a template being deleted still gets a pool.
@@ -4789,14 +4789,14 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
         (hex('a'), "present", Some(|w| w.bare)),
         (sha('a'), "present", Some(|w| w.bare)),
         (sha('b'), "present", Some(|w| w.prefixed)),
-        // The pool config upsert answers not found for this bare request.
         (hex('b'), "present", Some(|w| w.prefixed)),
         (blake('c'), "present", Some(|w| w.blake3)),
         (hex('c'), "present", None),
         (blake('a'), "present", None),
-        // The exact form wins over the newer `dual_prefixed`.
+        // Both forms stored, neither with a storage location: the older
+        // `dual_bare` is the digest's original whichever form names it.
         (hex('9'), "present", Some(|w| w.dual_bare)),
-        (sha('9'), "present", Some(|w| w.dual_prefixed)),
+        (sha('9'), "present", Some(|w| w.dual_bare)),
         // A template being deleted still gets a pool. Pinned as today's
         // behaviour, not a contract: consolidating the resolvers is expected
         // to stop that.
@@ -5030,6 +5030,300 @@ async fn autoscaling_follows_the_release_creates_resolve_to() -> TestResult {
         twin_targets,
         vec![3],
         "the twin takes the original's demand"
+    );
+    Ok(())
+}
+
+/// A digest stored under both spellings: retention protects only its
+/// original, ranked by a tag on either spelling, and demand under either
+/// spelling goes to its original, the
+/// release creates resolve and the pool config upsert targets, with twins and
+/// without.
+#[rstest::rstest]
+#[case::without_twins(false)]
+#[case::with_twins(true)]
+#[tokio::test(flavor = "current_thread")]
+async fn retention_and_demand_pick_the_digest_original(#[case] twins: bool) -> TestResult {
+    use pplx_space_template_release_store::spelling_pairs::{OLD_INDEX, seed_spelling_pairs};
+    use pplx_space_template_store::test_support::tag_release;
+    const TEMPLATE: &str = "spelling-pairs";
+    let fixture = postgres_fixture().await?;
+    let pool = &fixture.pool;
+    insert_template(pool, TEMPLATE).await?;
+    if twins {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX IF EXISTS {OLD_INDEX}"
+        )))
+        .execute(pool)
+        .await?;
+    }
+    let twin_metadata = twins.then_some(r#"{"environment": "fixture-twin"}"#);
+    let pairs = seed_spelling_pairs(pool, TEMPLATE, twin_metadata).await?;
+
+    upsert_warm_pool_policy(pool, TEMPLATE, 1, 10, 20).await?;
+    let mut protected = fixture
+        .store
+        .protected_template_releases()
+        .await?
+        .into_iter()
+        .map(|release| release.content_hash)
+        .collect::<Vec<_>>();
+    protected.sort();
+    let mut expected = pairs
+        .iter()
+        .map(|pair| pair.original_hash().to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(protected, expected, "one retained release per digest");
+
+    // With one retain slot, a `latest` tag left on the other spelling's
+    // original, as one written before the shared rule can be, publishes its
+    // digest: the slot goes to that digest's original.
+    upsert_warm_pool_policy(pool, TEMPLATE, 1, 10, 1).await?;
+    for pair in &pairs {
+        tag_release(pool, TEMPLATE, pair.other(), "latest").await?;
+        let protected = fixture
+            .store
+            .protected_template_releases()
+            .await?
+            .into_iter()
+            .map(|release| release.content_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            protected,
+            vec![pair.original_hash().to_owned()],
+            "latest on {}",
+            pair.other()
+        );
+    }
+
+    // The newest release holds the one retain slot, so demand alone decides
+    // which of the pairs' releases gets a pool.
+    let retained = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, $2, 'fc', $3)",
+    )
+    .bind(retained)
+    .bind(TEMPLATE)
+    .bind(format!("sha256:{}", hex('e')))
+    .execute(pool)
+    .await?;
+    upsert_warm_pool_policy(pool, TEMPLATE, 2, 10, 1).await?;
+    for pair in &pairs {
+        for hash in [&pair.canonical_hash, &pair.bare_hash] {
+            sqlx::query("DELETE FROM sandboxes WHERE template_id = $1")
+                .bind(TEMPLATE)
+                .execute(pool)
+                .await?;
+            sqlx::query("DELETE FROM kubernetes_pool_configs")
+                .execute(pool)
+                .await?;
+            for _ in 0..10 {
+                insert_sandbox_for_template(pool, TEMPLATE, "k8s", hash, None, None).await?;
+            }
+            fixture.store.autoscale_configs("sandboxes", None).await?;
+            let demanded = sqlx::query_scalar::<_, Uuid>(
+                "SELECT template_release_id
+                 FROM kubernetes_pool_configs
+                 WHERE template_release_id <> $1",
+            )
+            .bind(retained)
+            .fetch_all(pool)
+            .await?;
+            assert_eq!(demanded, vec![pair.original], "demand={hash}");
+        }
+    }
+    Ok(())
+}
+
+/// A campaign hands a release's operator-managed pools to its twin: each
+/// plaintext manual config is copied with its shape, targets and `enabled`,
+/// once, and autoscaler-owned configs are left for the autoscaler.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_gets_copies_of_its_originals_manual_configs() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, _) = seed_release(&fixture.pool, "seed", 0x71).await?;
+    let spec = ManualPoolConfigSpec {
+        vcpu: 4,
+        memory_mib: 2048,
+        disk_mib: Some(8192),
+        reset_disk_to_template_default: false,
+        target_ready_slots: 3,
+        refill_per_tick: 2,
+        max_warming_slots: 2,
+        namespace: "space",
+        enabled: true,
+        encryptable: false,
+    };
+    let mut tx = fixture.pool.begin().await?;
+    WarmPoolStore::upsert_manual_config(&mut tx, original, &spec).await?;
+    tx.commit().await?;
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots, refill_per_tick,
+             max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 2, 1024, 1, 1, 1, 'space', TRUE, 'autoscaler')",
+    )
+    .bind(original)
+    .execute(&fixture.pool)
+    .await?;
+    let twin = insert_twin_of(
+        &fixture.pool,
+        original,
+        &format!("sha256:{}", "7".repeat(64)),
+    )
+    .await?;
+
+    assert_eq!(
+        WarmPoolStore::copy_manual_configs_to_release(
+            &mut *fixture.pool.acquire().await?,
+            original,
+            twin
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        WarmPoolStore::copy_manual_configs_to_release(
+            &mut *fixture.pool.acquire().await?,
+            original,
+            twin
+        )
+        .await?,
+        0,
+        "a retry copies nothing twice"
+    );
+    let configs = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            i32,
+            i32,
+            Option<i32>,
+            i32,
+            i32,
+            i32,
+            String,
+            bool,
+            String,
+        ),
+    >(
+        "SELECT template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+                refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         FROM kubernetes_pool_configs
+         WHERE managed_by = 'manual'
+         ORDER BY created_at",
+    )
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[1].0, twin);
+    assert_eq!(
+        (
+            &configs[0].1,
+            &configs[0].2,
+            &configs[0].3,
+            &configs[0].4,
+            &configs[0].5,
+            &configs[0].6,
+            &configs[0].7,
+            &configs[0].8
+        ),
+        (
+            &configs[1].1,
+            &configs[1].2,
+            &configs[1].3,
+            &configs[1].4,
+            &configs[1].5,
+            &configs[1].6,
+            &configs[1].7,
+            &configs[1].8
+        ),
+    );
+    let autoscaled_on_twin: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kubernetes_pool_configs
+         WHERE template_release_id = $1 AND managed_by = 'autoscaler'",
+    )
+    .bind(twin)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(autoscaled_on_twin, 0);
+    Ok(())
+}
+
+/// The autoscaler can make a twin's config as soon as the twin exists, before
+/// the campaign copies the original's manual configs. A shape the autoscaler
+/// took first is handed to the original's manual settings, since the
+/// autoscaler never overwrites a manual config; one the operator already set
+/// on the twin is kept.
+#[tokio::test(flavor = "current_thread")]
+async fn a_twin_copy_takes_over_the_autoscalers_config_of_a_manual_shape() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (original, _) = seed_release(&fixture.pool, "seed", 0x73).await?;
+    let mut tx = fixture.pool.begin().await?;
+    for (vcpu, memory_mib, target_ready_slots) in [(4, 2048, 3), (8, 4096, 5)] {
+        WarmPoolStore::upsert_manual_config(
+            &mut tx,
+            original,
+            &ManualPoolConfigSpec {
+                vcpu,
+                memory_mib,
+                disk_mib: Some(8192),
+                reset_disk_to_template_default: false,
+                target_ready_slots,
+                refill_per_tick: 2,
+                max_warming_slots: 2,
+                namespace: "space",
+                enabled: true,
+                encryptable: false,
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    let twin = insert_twin_of(
+        &fixture.pool,
+        original,
+        &format!("sha256:{}", "7".repeat(64)),
+    )
+    .await?;
+    // The autoscaler got to the 4x2048 shape first; the operator set 8x4096
+    // on the twin.
+    sqlx::query(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots, refill_per_tick,
+             max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 4, 2048, 1, 1, 1, 'space', TRUE, 'autoscaler'),
+                ($1, 8, 4096, 9, 1, 1, 'space', FALSE, 'manual')",
+    )
+    .bind(twin)
+    .execute(&fixture.pool)
+    .await?;
+
+    WarmPoolStore::copy_manual_configs_to_release(
+        &mut *fixture.pool.acquire().await?,
+        original,
+        twin,
+    )
+    .await?;
+    let configs = sqlx::query_as::<_, (i32, i32, Option<i32>, i32, bool, String)>(
+        "SELECT vcpu, memory_mib, disk_mib, target_ready_slots, enabled, managed_by
+         FROM kubernetes_pool_configs
+         WHERE template_release_id = $1
+         ORDER BY vcpu",
+    )
+    .bind(twin)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(
+        configs,
+        vec![
+            (4, 2048, Some(8192), 3, true, "manual".to_owned()),
+            (8, 4096, None, 9, false, "manual".to_owned()),
+        ]
     );
     Ok(())
 }

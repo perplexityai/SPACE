@@ -21,8 +21,10 @@ fn keys(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
 /// A component row for a build. Leaves foreign keys unenforced, as on
 /// template-manager's runtime connection, so nothing cascades to it.
 fn seed_component(conn: &Connection, name: &str, hash: &str) {
-    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-    conn.execute(
+    conn.raw()
+        .execute_batch("PRAGMA foreign_keys = OFF")
+        .unwrap();
+    conn.raw().execute(
         "INSERT INTO template_build_components (name, content_hash, cache_partition, kind, role_key)
          VALUES (?1, ?2, '', 'kernel', '')",
         params![name, hash],
@@ -31,12 +33,13 @@ fn seed_component(conn: &Connection, name: &str, hash: &str) {
 }
 
 fn components(conn: &Connection, hash: &str) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM template_build_components WHERE content_hash = ?1",
-        [hash],
-        |row| row.get(0),
-    )
-    .unwrap()
+    conn.raw()
+        .query_row(
+            "SELECT COUNT(*) FROM template_build_components WHERE content_hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 fn cfg(budget: u64, headroom: f64, grace_secs: u64, now: u64) -> EvictionConfig {
@@ -87,8 +90,9 @@ fn wrapper_round_trip_preserves_name_and_hash() {
 // exercised end-to-end. They still avoid disk / network / sbxmgr
 // by injecting the disk-size and active-set inputs directly.
 
-use crate::db::{BuildUpsert, now, upsert_build};
-use rusqlite::{Connection, params};
+use crate::db::{BuildUpsert, Connection, now, upsert_build};
+use rusqlite::params;
+use std::sync::Mutex;
 
 fn seed_build(conn: &Connection, name: &str, content_hash: &str, size: u64) {
     let upsert = BuildUpsert {
@@ -106,12 +110,13 @@ fn seed_build(conn: &Connection, name: &str, content_hash: &str, size: u64) {
 }
 
 fn plant_pin(conn: &Connection, name: &str, content_hash: &str) {
-    conn.execute(
-        "INSERT INTO template_pinned_tags (name, tag, content_hash, updated_at)
+    conn.raw()
+        .execute(
+            "INSERT INTO template_pinned_tags (name, tag, content_hash, updated_at)
          VALUES (?1, 'latest', ?2, ?3)",
-        params![name, content_hash, now()],
-    )
-    .unwrap();
+            params![name, content_hash, now()],
+        )
+        .unwrap();
 }
 
 /// `plan_from_db` returns an empty candidate list when the
@@ -192,6 +197,7 @@ fn execute_one_deletes_when_no_race() {
         Some(("seed".to_string(), "h1".to_string()))
     );
     let remaining: i64 = conn
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
         .unwrap();
     assert_eq!(remaining, 0);
@@ -226,6 +232,7 @@ fn execute_one_skips_pin_added_between_plan_and_execute() {
     assert_eq!(outcome, EvictionOutcome::SkippedPinnedAtExecute);
     assert!(!disk_called.get(), "disk delete must not run when pinned");
     let row_exists: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "h1"],
@@ -284,11 +291,12 @@ fn execute_one_keeps_db_row_when_disk_delete_fails() {
     let outcome = execute_one(&conn, &HashSet::new(), &HashSet::new(), &cand, |_, _, _| {
         // Surface a synthetic SQLite error to model an I/O failure
         // bubbling through the disk-delete closure.
-        Err(rusqlite::Error::ExecuteReturnedResults)
+        Err(rusqlite::Error::ExecuteReturnedResults.into())
     });
     assert!(outcome.is_err(), "disk error must bubble to caller");
 
     let row_exists: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "h1"],
@@ -322,7 +330,7 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
     // 1 second to keep grace math obvious.
     crate::db::set_last_used_at_for_test(&raw, "seed", "old", 1).unwrap();
     crate::db::set_last_used_at_for_test(&raw, "seed", "new", 100).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: true,
@@ -348,7 +356,7 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
     let disk_size: DiskSizeFn = Arc::new(|_, _, _, fallback, _| fallback);
 
     let report = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         HashSet::new(),
         HashSet::new(),
@@ -374,6 +382,7 @@ async fn gc_tick_evicts_oldest_candidate_end_to_end() {
     // DB state matches: only the newer build survives.
     let conn = db.lock().unwrap();
     let remaining: Vec<String> = conn
+        .raw()
         .prepare("SELECT content_hash FROM template_builds ORDER BY content_hash")
         .unwrap()
         .query_map([], |r| r.get(0))
@@ -428,7 +437,7 @@ async fn a_cancelled_tick_keeps_the_claim_until_its_eviction_finishes() {
     seed_build(&raw, "seed", "new", 500);
     crate::db::set_last_used_at_for_test(&raw, "seed", "old", 1).unwrap();
     crate::db::set_last_used_at_for_test(&raw, "seed", "new", 100).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
     let cfg = GcConfig {
         enabled: true,
         budget_bytes: 800,
@@ -455,7 +464,7 @@ async fn a_cancelled_tick_keeps_the_claim_until_its_eviction_finishes() {
     let key = ("seed".to_string(), "old".to_string());
 
     let tick = tokio::spawn({
-        let db = Arc::clone(&db);
+        let db = db.clone();
         async move {
             gc_tick(
                 db,
@@ -500,7 +509,7 @@ async fn eviction_skips_a_digest_someone_holds() {
     seed_build(&raw, "seed", "new", 500);
     crate::db::set_last_used_at_for_test(&raw, "seed", "old", 1).unwrap();
     crate::db::set_last_used_at_for_test(&raw, "seed", "new", 100).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
     let cfg = GcConfig {
         enabled: true,
         budget_bytes: 800,
@@ -531,7 +540,7 @@ async fn eviction_skips_a_digest_someone_holds() {
     };
 
     let held_tick = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         HashSet::new(),
         HashSet::new(),
@@ -562,7 +571,7 @@ async fn eviction_skips_a_digest_someone_holds() {
 
     held.lock().unwrap().clear();
     let released_tick = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         HashSet::new(),
         HashSet::new(),
@@ -587,9 +596,9 @@ async fn eviction_skips_a_digest_someone_holds() {
 async fn idle_template_eviction_skips_a_digest_someone_holds() {
     let conn = crate::db::test_conn();
     seed_build_touched_at(&conn, "doomed", "h1", 1);
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let outcome = evict_idle_template(
-        Arc::clone(&db),
+        db.clone(),
         &EvictionGate::default(),
         "doomed",
         1_000,
@@ -629,9 +638,8 @@ async fn idle_template_eviction_skips_a_digest_someone_holds() {
 /// loudly. Closures are stubbed: no DB, no sbx-mgr.
 #[tokio::test]
 async fn run_loop_exits_cooperatively_on_shutdown() {
-    use std::sync::Mutex;
     let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let cfg = GcConfig {
         enabled: true,
@@ -647,7 +655,7 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
     let delete_disk: DeleteDiskFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
 
     let loop_handle = tokio::spawn(run_loop(
-        Arc::clone(&db),
+        db.clone(),
         cfg,
         shutdown.clone(),
         GcHooks {
@@ -677,7 +685,7 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
 
 /// Regression test: `execute_one_async` must release the DB lock around
 /// the disk delete. Before the 3-phase restructure the IMMEDIATE
-/// txn + `Arc<Mutex<Connection>>` lock were both held for the
+/// txn + `SharedConnection` lock were both held for the
 /// duration of the disk delete, blocking every other DB
 /// consumer (prefetch writes, `resolve_template_build` on the sandbox-
 /// create hot path) for seconds on a multi-GB rootfs delete.
@@ -689,10 +697,9 @@ async fn run_loop_exits_cooperatively_on_shutdown() {
 /// before the fix it would block until disk-delete finished.
 #[tokio::test]
 async fn execute_one_async_releases_db_lock_during_disk_delete() {
-    use std::sync::Mutex;
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cand = EvictionCandidate {
         name: "seed".to_string(),
@@ -711,7 +718,7 @@ async fn execute_one_async_releases_db_lock_during_disk_delete() {
     });
 
     // Kick off the eviction. It will block on the slow delete.
-    let db_for_eviction = Arc::clone(&db);
+    let db_for_eviction = db.clone();
     let eviction = tokio::spawn(async move {
         execute_one_async(
             db_for_eviction,
@@ -732,11 +739,12 @@ async fn execute_one_async_releases_db_lock_during_disk_delete() {
     // this would block until the disk delete finishes (450ms+).
     // After the fix the lock is released, so the read completes
     // in microseconds.
-    let db_for_read = Arc::clone(&db);
+    let db_for_read = db.clone();
     let read_started = std::time::Instant::now();
     let read_count: i64 = tokio::task::spawn_blocking(move || {
         let conn = db_for_read.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM template_builds", [], |row| row.get(0))
+        conn.raw()
+            .query_row("SELECT COUNT(*) FROM template_builds", [], |row| row.get(0))
             .unwrap()
     })
     .await
@@ -773,7 +781,7 @@ async fn execute_one_async_marks_deleting_before_disk_delete() {
 
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cand = EvictionCandidate {
         name: "seed".to_string(),
@@ -799,7 +807,7 @@ async fn execute_one_async_marks_deleting_before_disk_delete() {
         })
     });
 
-    let db_for_eviction = Arc::clone(&db);
+    let db_for_eviction = db.clone();
     let cand_for_eviction = cand.clone();
     let eviction = tokio::spawn(async move {
         execute_one_async(
@@ -820,6 +828,7 @@ async fn execute_one_async_marks_deleting_before_disk_delete() {
     let state: String = db
         .lock()
         .unwrap()
+        .raw()
         .query_row(
             "SELECT state FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "h1"],
@@ -841,6 +850,7 @@ async fn execute_one_async_marks_deleting_before_disk_delete() {
     let count: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
@@ -858,13 +868,14 @@ async fn execute_one_async_second_eviction_skips_deleting_row() {
     seed_build(&raw, "seed", "h1", 1_000);
     // Plant `state='deleting'` directly to simulate a row
     // already mid-eviction.
-    raw.execute(
-        "UPDATE template_builds SET state = 'deleting'
+    raw.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting'
          WHERE name = ?1 AND content_hash = ?2",
-        params!["seed", "h1"],
-    )
-    .unwrap();
-    let db = Arc::new(Mutex::new(raw));
+            params!["seed", "h1"],
+        )
+        .unwrap();
+    let db = crate::db::SharedConnection::new(raw);
 
     let cand = EvictionCandidate {
         name: "seed".to_string(),
@@ -893,7 +904,7 @@ async fn execute_one_async_second_eviction_skips_deleting_row() {
 }
 
 /// Regression test: the production `disk_size_for` closure must not
-/// re-acquire the `Arc<Mutex<Connection>>` that `gc_tick` already
+/// re-acquire the `SharedConnection` that `gc_tick` already
 /// holds via `spawn_blocking`. `std::sync::Mutex` is non-reentrant,
 /// so the second `lock()` deadlocks the spawn_blocking worker
 /// permanently on the first tick that finds an eviction
@@ -908,11 +919,10 @@ async fn execute_one_async_second_eviction_skips_deleting_row() {
 /// itself without contention.
 #[tokio::test]
 async fn gc_tick_does_not_deadlock_when_disk_size_fn_relocks_db() {
-    use std::sync::Mutex;
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
     crate::db::set_last_used_at_for_test(&raw, "seed", "h1", 1).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: true,
@@ -928,7 +938,7 @@ async fn gc_tick_does_not_deadlock_when_disk_size_fn_relocks_db() {
     // build's snapshot pairs). On the buggy code path,
     // plan_from_db is invoked from inside a spawn_blocking that
     // already holds db.lock(), so this inner lock() deadlocks.
-    let db_for_closure = Arc::clone(&db);
+    let db_for_closure = db.clone();
     let disk_size: DiskSizeFn = Arc::new(
         move |_n: &str,
               _h: &str,
@@ -944,7 +954,7 @@ async fn gc_tick_does_not_deadlock_when_disk_size_fn_relocks_db() {
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         gc_tick(
-            Arc::clone(&db),
+            db.clone(),
             &cfg,
             HashSet::new(),
             HashSet::new(),
@@ -972,9 +982,8 @@ async fn gc_tick_does_not_deadlock_when_disk_size_fn_relocks_db() {
 /// returns immediately.
 #[tokio::test]
 async fn run_loop_exits_when_active_fetch_is_stuck() {
-    use std::sync::Mutex;
     let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let cfg = GcConfig {
         enabled: true,
@@ -996,7 +1005,7 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
 
     let shutdown = CancellationToken::new();
     let loop_handle = tokio::spawn(run_loop(
-        Arc::clone(&db),
+        db.clone(),
         cfg,
         shutdown.clone(),
         GcHooks {
@@ -1030,11 +1039,10 @@ async fn run_loop_exits_when_active_fetch_is_stuck() {
 /// It runs as a spawned task, so it doesn't hold up startup.
 #[tokio::test]
 async fn run_loop_with_eviction_disabled_never_evicts_and_stops_on_shutdown() {
-    use std::sync::Mutex;
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
     crate::db::set_last_used_at_for_test(&raw, "seed", "h1", 1).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: false,
@@ -1045,7 +1053,7 @@ async fn run_loop_with_eviction_disabled_never_evicts_and_stops_on_shutdown() {
     };
     let shutdown = CancellationToken::new();
     let gc = tokio::spawn(run_loop(
-        Arc::clone(&db),
+        db.clone(),
         cfg,
         shutdown.clone(),
         GcHooks {
@@ -1085,7 +1093,7 @@ async fn gc_tick_skips_active_builds_passed_in_by_caller() {
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
     crate::db::set_last_used_at_for_test(&raw, "seed", "h1", 1).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: true,
@@ -1108,7 +1116,7 @@ async fn gc_tick_skips_active_builds_passed_in_by_caller() {
 
     let active = keys(&[("seed", "h1")]);
     let report = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         active,
         HashSet::new(),
@@ -1129,6 +1137,7 @@ async fn gc_tick_skips_active_builds_passed_in_by_caller() {
     let remaining: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
         .unwrap();
     assert_eq!(remaining, 1);
@@ -1147,7 +1156,7 @@ async fn gc_tick_skips_warm_pool_protected_builds() {
     let raw = crate::db::test_conn();
     seed_build(&raw, "web-runtime", "sha256:pool", 1_000);
     crate::db::set_last_used_at_for_test(&raw, "web-runtime", "sha256:pool", 1).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: true,
@@ -1170,7 +1179,7 @@ async fn gc_tick_skips_warm_pool_protected_builds() {
 
     let warm_pool = keys(&[("web-runtime", "sha256:pool")]);
     let report = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         HashSet::new(), // no resident warm slot => empty active set
         warm_pool,
@@ -1188,6 +1197,7 @@ async fn gc_tick_skips_warm_pool_protected_builds() {
     let remaining: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
         .unwrap();
     assert_eq!(remaining, 1);
@@ -1222,6 +1232,7 @@ fn execute_one_skips_warm_pool_added_between_plan_and_execute() {
         "disk delete must not run for a warm-pool protected build"
     );
     let row_exists: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_builds WHERE name = 'web-runtime'",
             [],
@@ -1230,6 +1241,7 @@ fn execute_one_skips_warm_pool_added_between_plan_and_execute() {
         .unwrap();
     assert_eq!(row_exists, 1);
     let state: String = conn
+        .raw()
         .query_row(
             "SELECT state FROM template_builds WHERE name = 'web-runtime'",
             [],
@@ -1371,10 +1383,9 @@ fn pin_key_is_template_plus_hash_not_just_hash() {
 /// reaper tests below can document the way OUT.
 #[tokio::test]
 async fn execute_one_async_leaves_row_in_deleting_after_phase2_error() {
-    use std::sync::Mutex;
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cand = EvictionCandidate {
         name: "seed".to_string(),
@@ -1387,12 +1398,13 @@ async fn execute_one_async_leaves_row_in_deleting_after_phase2_error() {
             Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
                 Some("nodemgr unreachable; fallback rmdir refused subvol root".into()),
-            ))
+            )
+            .into())
         })
     });
 
     let outcome = execute_one_async(
-        Arc::clone(&db),
+        db.clone(),
         HashSet::new(),
         HashSet::new(),
         cand,
@@ -1404,6 +1416,7 @@ async fn execute_one_async_leaves_row_in_deleting_after_phase2_error() {
     let state: String = db
         .lock()
         .unwrap()
+        .raw()
         .query_row(
             "SELECT state FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "h1"],
@@ -1433,13 +1446,14 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
     seed_build(&raw, "seed", "h1", 1_000);
     // Plant the stuck-deleting state directly (models a prior
     // tick whose Phase 2 errored after Phase 1 committed).
-    raw.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        params!["seed", "h1"],
-    )
-    .unwrap();
+    raw.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            params!["seed", "h1"],
+        )
+        .unwrap();
     crate::db::set_last_used_at_for_test(&raw, "seed", "h1", 1).unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: true,
@@ -1469,7 +1483,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
         Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Intact }));
 
     let report = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         HashSet::new(),
         HashSet::new(),
@@ -1493,6 +1507,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_intact() {
     let remaining: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
@@ -1518,12 +1533,13 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
     seed_component(&raw, "seed", "h1");
-    raw.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        params!["seed", "h1"],
-    )
-    .unwrap();
-    let db = Arc::new(Mutex::new(raw));
+    raw.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            params!["seed", "h1"],
+        )
+        .unwrap();
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: true,
@@ -1553,7 +1569,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
         Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Missing }));
 
     let _ = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         HashSet::new(),
         HashSet::new(),
@@ -1572,6 +1588,7 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
     let remaining: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
@@ -1593,16 +1610,16 @@ async fn gc_tick_recovers_stuck_deleting_row_when_disk_missing_by_dropping_row()
 /// updating state.
 #[tokio::test]
 async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
-    use std::sync::Mutex;
     let raw = crate::db::test_conn();
     seed_build(&raw, "seed", "h1", 1_000);
-    raw.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        params!["seed", "h1"],
-    )
-    .unwrap();
+    raw.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            params!["seed", "h1"],
+        )
+        .unwrap();
     plant_pin(&raw, "seed", "h1");
-    let db = Arc::new(Mutex::new(raw));
+    let db = crate::db::SharedConnection::new(raw);
 
     let cfg = GcConfig {
         enabled: true,
@@ -1621,7 +1638,7 @@ async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
         Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Intact }));
 
     let _ = gc_tick(
-        Arc::clone(&db),
+        db.clone(),
         &cfg,
         HashSet::new(),
         HashSet::new(),
@@ -1636,6 +1653,7 @@ async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
     let state: String = db
         .lock()
         .unwrap()
+        .raw()
         .query_row(
             "SELECT state FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "h1"],
@@ -1652,12 +1670,13 @@ async fn gc_tick_releases_stuck_deleting_row_when_pin_lands() {
 /// side of an idle bound it falls on.
 fn seed_build_touched_at(conn: &Connection, name: &str, hash: &str, secs: u64) {
     seed_build(conn, name, hash, 100);
-    conn.execute(
-        "UPDATE template_builds SET created_at = ?3, last_used_at = ?3
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET created_at = ?3, last_used_at = ?3
          WHERE name = ?1 AND content_hash = ?2",
-        params![name, hash, secs.to_string()],
-    )
-    .unwrap();
+            params![name, hash, secs.to_string()],
+        )
+        .unwrap();
 }
 
 /// One row of `idle_template_eviction_takes_every_build_only_when_none_is_protected`.
@@ -1756,7 +1775,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
             &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let deleted = Arc::new(Mutex::new(Vec::new()));
         let delete_disk: DeleteDiskFn = {
             let deleted = Arc::clone(&deleted);
@@ -1773,7 +1792,7 @@ async fn idle_template_eviction_takes_every_build_only_when_none_is_protected() 
         };
 
         let outcome = evict_idle_template(
-            Arc::clone(&db),
+            db.clone(),
             &EvictionGate::default(),
             "doomed",
             bound,
@@ -1820,19 +1839,19 @@ async fn idle_template_eviction_takes_each_partition_of_a_digest() {
     let conn = crate::db::test_conn();
     seed_build_touched_at(&conn, "doomed", "h1", 500);
     let twin = twin_build("h1", 0, 0).cache_partition;
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, created_at, last_used_at)
          VALUES ('doomed', 'h1', ?1, 'd', '{}', 'fc', 'x86_64', '500', '500')",
         [twin.key()],
     )
     .unwrap();
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO template_snapshots (name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at)
          VALUES ('doomed', 'h1', ?1, 2, 1024, 'twin', '0')",
         [twin.key()],
     )
     .unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let deleted = Arc::new(Mutex::new(Vec::new()));
     let delete_disk: DeleteDiskFn = {
         let deleted = Arc::clone(&deleted);
@@ -1843,7 +1862,7 @@ async fn idle_template_eviction_takes_each_partition_of_a_digest() {
     };
 
     let outcome = evict_idle_template(
-        Arc::clone(&db),
+        db.clone(),
         &EvictionGate::default(),
         "doomed",
         1_000,
@@ -1867,6 +1886,7 @@ async fn idle_template_eviction_takes_each_partition_of_a_digest() {
     let conn = db.lock().unwrap();
     for table in ["template_builds", "template_snapshots"] {
         let left: i64 = conn
+            .raw()
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "{table}");
@@ -1898,10 +1918,10 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
             &pplx_space_auto_lifecycle::AutoLifecyclePolicy::disabled(),
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let delete_disk: DeleteDiskFn = {
-            let db = Arc::clone(&db);
+            let db = db.clone();
             Arc::new(move |name, hash, _partition| {
                 let first = first.swap(false, std::sync::atomic::Ordering::SeqCst);
                 let fail = first && matches!(during, During::DiskDeleteFails);
@@ -1924,7 +1944,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
                 }
                 Box::pin(async move {
                     if fail {
-                        Err(rusqlite::Error::InvalidQuery)
+                        Err(rusqlite::Error::InvalidQuery.into())
                     } else {
                         Ok(())
                     }
@@ -1935,7 +1955,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
             Arc::new(|_, _, _| Box::pin(async { ReaperDiskState::Intact }));
 
         let outcome = evict_idle_template(
-            Arc::clone(&db),
+            db.clone(),
             &EvictionGate::default(),
             "doomed",
             1_000,
@@ -2005,7 +2025,7 @@ async fn idle_template_eviction_rechecks_what_changes_during_a_delete() {
 async fn gc_repair_waits_for_a_live_idle_eviction() {
     let conn = crate::db::test_conn();
     seed_build_touched_at(&conn, "doomed", "h1", 500);
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let gate = EvictionGate::default();
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -2021,7 +2041,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
         })
     };
     let eviction = tokio::spawn({
-        let (db, gate) = (Arc::clone(&db), gate.clone());
+        let (db, gate) = (db.clone(), gate.clone());
         async move {
             evict_idle_template(
                 db,
@@ -2042,7 +2062,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
     entered.notified().await;
     assert_eq!(
         evict_idle_template(
-            Arc::clone(&db),
+            db.clone(),
             &gate,
             "doomed",
             1_000,
@@ -2070,7 +2090,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
     };
     let shutdown = CancellationToken::new();
     let gc = tokio::spawn(run_loop(
-        Arc::clone(&db),
+        db.clone(),
         GcConfig {
             enabled: true,
             budget_bytes: u64::MAX,
@@ -2124,7 +2144,7 @@ async fn gc_repair_waits_for_a_live_idle_eviction() {
 #[case::eviction_disabled(false)]
 #[tokio::test]
 async fn gc_loop_checks_rowless_dirs_on_every_tick(#[case] enabled: bool) {
-    let db = Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let shutdown = CancellationToken::new();
     let gc = tokio::spawn(run_loop(
@@ -2177,7 +2197,7 @@ async fn gc_loop_checks_rowless_dirs_without_holding_the_eviction_gate(#[case] e
     let free = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
     let shutdown = CancellationToken::new();
     let gc = tokio::spawn(run_loop(
-        Arc::new(std::sync::Mutex::new(crate::db::test_conn())),
+        crate::db::SharedConnection::new(crate::db::test_conn()),
         GcConfig {
             enabled,
             budget_bytes: u64::MAX,
@@ -2279,20 +2299,20 @@ fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
     let conn = crate::db::test_conn();
     seed_build(&conn, "seed", "h1", 1_000);
     seed_component(&conn, "seed", "h1");
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO template_snapshots (name, content_hash, vcpu, memory_mib, snapshot_hash, built_at)
          VALUES ('seed', 'h1', 2, 1024, 'legacy', '0')",
         [],
     )
     .unwrap();
     let partition = twin_build("h1", 0, 0).cache_partition;
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, created_at)
          VALUES ('seed', 'h1', ?1, 'd', '{}', 'fc', 'x86_64', '0')",
         [partition.key()],
     )
     .unwrap();
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO template_snapshots (name, content_hash, cache_partition, vcpu, memory_mib, snapshot_hash, built_at)
          VALUES ('seed', 'h1', ?1, 2, 1024, 'twin', '0')",
         [partition.key()],
@@ -2315,6 +2335,7 @@ fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
     assert_eq!(outcome, EvictionOutcome::Deleted);
     assert_eq!(observed.get(), Some(partition));
     let rows: Vec<(String, String)> = conn
+        .raw()
         .prepare("SELECT cache_partition, state FROM template_builds")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -2323,6 +2344,7 @@ fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
         .unwrap();
     assert_eq!(rows, [(String::new(), "ready".to_string())]);
     let snapshots: Vec<String> = conn
+        .raw()
         .prepare("SELECT snapshot_hash FROM template_snapshots")
         .unwrap()
         .query_map([], |r| r.get(0))
@@ -2331,6 +2353,7 @@ fn execute_one_on_a_twin_leaves_its_legacy_sibling() {
         .unwrap();
     assert_eq!(snapshots, ["legacy"]);
     let components: i64 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_build_components WHERE cache_partition = ''",
             [],

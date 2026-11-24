@@ -25,7 +25,7 @@ fn twin() -> TemplateCachePartition {
     TemplateCachePartition::Environment(twin_environment())
 }
 
-fn insert_bound_build(conn: &rusqlite::Connection, environment: EnvironmentReference) {
+fn insert_bound_build(conn: &crate::db::Connection, environment: EnvironmentReference) {
     let mut manifest = TemplateManifest {
         runtime: "fc".to_string(),
         arch: "x86_64".to_string(),
@@ -146,6 +146,7 @@ async fn a_lookup_touches_only_the_build_it_serves() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT last_used_at FROM template_builds WHERE cache_partition = ?1",
                 [partition.key()],
@@ -157,6 +158,7 @@ async fn a_lookup_touches_only_the_build_it_serves() {
         .db
         .lock()
         .unwrap()
+        .raw()
         .execute("UPDATE template_builds SET last_used_at = '0'", [])
         .unwrap();
     let mut request = lookup(Some(twin_environment()));
@@ -219,6 +221,7 @@ async fn an_uncached_digest_pulls_without_a_partition_selector() {
                     hash: hash(),
                     storage_uris: vec![],
                     visibility: pplx_space_node_api_client::proto::TemplateVisibility::Generic,
+                    environment: None,
                 })
             },
             async |_, _, _| {
@@ -655,13 +658,15 @@ async fn base_snapshot_reconcile_resolves_an_adopted_legacy_build() {
     {
         let conn = service.db.lock().unwrap();
         crate::db::delete_build(&conn, NAME, &hash(), TemplateCachePartition::Legacy).unwrap();
-        conn.execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
+        conn.raw()
+            .execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
             .unwrap();
-        conn.execute(
-            "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
-            [NAME],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
+                [NAME],
+            )
+            .unwrap();
     }
     let service = service.without_sbx_connect_retries();
 
@@ -755,6 +760,7 @@ async fn a_deferred_partition_reconcile_leaves_the_build_s_lru_clock_alone() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .execute("UPDATE template_builds SET last_used_at = '0'", [])
             .unwrap();
     };
@@ -763,6 +769,7 @@ async fn a_deferred_partition_reconcile_leaves_the_build_s_lru_clock_alone() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT last_used_at FROM template_builds WHERE cache_partition = ?1",
                 [twin().key()],
@@ -904,6 +911,7 @@ fn generic_release() -> crate::volume::ResolvedRelease {
         hash: hash(),
         storage_uris: vec![],
         visibility: pplx_space_node_api_client::proto::TemplateVisibility::Generic,
+        environment: None,
     }
 }
 
@@ -962,6 +970,11 @@ async fn a_required_lookup_pulls_the_environment_s_build_of_a_digest_held_under_
             async |_, _, _, _| Ok(generic_release()),
             async |spec, _, _| {
                 assert_eq!(spec.required, Some(twin()), "the pull knows the partition");
+                assert_eq!(
+                    spec.environment,
+                    Some(twin_environment()),
+                    "the pull resolves the release bound to the required environment"
+                );
                 insert_bound_build(&service.db.lock().unwrap(), twin_environment());
                 materialized.set(true);
                 crate::volume::PullOutcome::Materialized
@@ -1011,6 +1024,11 @@ async fn a_required_lookup_on_the_default_path_pulls_rather_than_answer_with_the
             async |_, _, _| panic!("the default path pulls through the puller"),
             async |spec, _| {
                 assert_eq!(spec.required, Some(twin()), "the pull knows the partition");
+                assert_eq!(
+                    spec.environment,
+                    Some(twin_environment()),
+                    "the pull resolves the release bound to the required environment"
+                );
                 insert_bound_build(&service.db.lock().unwrap(), twin_environment());
                 pulled.set(true);
                 crate::volume::PullOutcome::Materialized
@@ -1037,13 +1055,15 @@ async fn a_required_lookup_answers_with_an_adopted_legacy_build_bound_to_it() {
     {
         let conn = service.db.lock().unwrap();
         crate::db::delete_build(&conn, NAME, &hash(), TemplateCachePartition::Legacy).unwrap();
-        conn.execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
+        conn.raw()
+            .execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
             .unwrap();
-        conn.execute(
-            "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
-            [NAME],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
+                [NAME],
+            )
+            .unwrap();
     }
     let mut request = required_lookup(twin_environment());
     request.get_mut().vcpu = None;
@@ -1120,6 +1140,7 @@ async fn a_required_lookup_touches_no_other_environment_s_build() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT last_used_at FROM template_builds WHERE cache_partition = ''",
                 [],
@@ -1131,6 +1152,7 @@ async fn a_required_lookup_touches_no_other_environment_s_build() {
         .db
         .lock()
         .unwrap()
+        .raw()
         .execute("UPDATE template_builds SET last_used_at = '0'", [])
         .unwrap();
     let mut request = required_lookup(twin_environment());
@@ -1151,4 +1173,33 @@ async fn a_required_lookup_touches_no_other_environment_s_build() {
         .await
         .unwrap();
     assert_eq!(legacy_last_used(), "0");
+}
+
+/// An authorized lookup that requires its environment's build resolves the
+/// release bound to it, so its resolution names the environment; one that
+/// only prefers it, or names none, resolves as before twins.
+#[test]
+fn a_required_lookup_resolves_with_its_environment() {
+    use super::lookup::required_lookup_environment;
+    let request =
+        |environment: Option<String>, environment_required| crate::proto::GetTemplateRequest {
+            template: Some(crate::proto::TemplateRef {
+                name: "base".into(),
+                content_hash: Some(hash()),
+                tag: None,
+                environment,
+            }),
+            environment_required,
+            ..Default::default()
+        };
+    let twin = twin_environment();
+    assert_eq!(
+        required_lookup_environment(&request(Some(twin.to_string()), true)),
+        Some(twin)
+    );
+    assert_eq!(
+        required_lookup_environment(&request(Some(twin.to_string()), false)),
+        None
+    );
+    assert_eq!(required_lookup_environment(&request(None, true)), None);
 }

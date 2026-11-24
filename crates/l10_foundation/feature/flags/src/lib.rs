@@ -182,9 +182,10 @@ pub const SPACE_TEMPLATE_SPARSE_AWARE_READS_FLAG: BoolFlag =
 /// Redis-backed sandbox activation rate limiter. Layered under the static
 /// `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` env master by [`policy`].
 /// Evaluated by space-api and space-cluster-controller on a single static
-/// cluster subject (cluster-wide on/off, not a per-sandbox percentage rollout);
-/// falls back on so an unreachable provider preserves the on-by-default
-/// guardrail.
+/// cluster subject (cluster-wide on/off, not a per-sandbox percentage rollout)
+/// with the process's cluster id as the `cluster_id` attribute, so a rule can
+/// switch off one cluster. Falls back on so an unreachable provider preserves
+/// the on-by-default guardrail.
 pub const SPACE_CLUSTER_RATE_LIMITER_FLAG: BoolFlag =
     BoolFlag::new("space-cluster-rate-limiter", true);
 
@@ -192,8 +193,9 @@ pub const SPACE_CLUSTER_RATE_LIMITER_FLAG: BoolFlag =
 /// per-client concurrency limiter. Layered under the static
 /// `SPACE_API_CLIENT_CONCURRENCY_MODE` (`off` is the hard off) by [`policy`]. Evaluated
 /// on a single static cluster subject (cluster-wide on/off, not a per-sandbox
-/// percentage rollout); falls back on so an unreachable provider preserves the
-/// on-by-default guardrail.
+/// percentage rollout) with the process's cluster id as the `cluster_id`
+/// attribute, so a rule can switch off one cluster. Falls back on so an
+/// unreachable provider preserves the on-by-default guardrail.
 pub const SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG: BoolFlag =
     BoolFlag::new("space-api-client-concurrency-limiter", true);
 
@@ -210,9 +212,10 @@ pub const SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG: BoolFlag =
 /// — all fields optional; an absent field falls back to the env/Helm-configured
 /// cap, and an `overrides` key also allowlists that client id. Evaluated on the
 /// constant cluster subject (the quota map is cluster-wide, not a per-subject
-/// rollout). Layered under `SPACE_API_CLIENT_CONCURRENCY_MODE` by
-/// [`policy::override_allowed`]: the flag can only retune caps, never enable a
-/// limiter the env var turned off.
+/// rollout) with the process's cluster id as the `cluster_id` attribute, so a
+/// rule can give one cluster its own caps. Layered under
+/// `SPACE_API_CLIENT_CONCURRENCY_MODE` by [`policy::override_allowed`]: the
+/// flag can only retune caps, never enable a limiter the env var turned off.
 pub const SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG: JsonFlag =
     JsonFlag::new("space-api-client-concurrency-quotas");
 

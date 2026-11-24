@@ -34,7 +34,6 @@ use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxLifecycle, SandboxTransitionTargetState,
 };
 use pplx_space_snapshot_model::{ArtifactKind, BackupSource};
-use pplx_space_sql_locator::sql;
 use rand::RngExt;
 use sqlx::{Postgres, Transaction};
 

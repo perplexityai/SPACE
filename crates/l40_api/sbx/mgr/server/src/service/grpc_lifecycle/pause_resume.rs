@@ -37,7 +37,7 @@ fn roll_back_pause_best_effort(
 }
 
 #[cfg(test)]
-pub(super) type GuestPreparation = Arc<
+pub(in crate::service) type GuestPreparation = Arc<
     dyn Fn(
             String,
         ) -> futures_util::future::BoxFuture<
@@ -52,7 +52,7 @@ tokio::task_local! {
     /// Replaces the guest snapshot preparation of pause and the suspend
     /// auto-pause, which dials the host's per-sandbox spaced-host socket, and
     /// lets a test act between their state writes.
-    pub(super) static GUEST_PREPARATION: GuestPreparation;
+    pub(in crate::service) static GUEST_PREPARATION: GuestPreparation;
 }
 
 #[cfg(test)]
@@ -569,8 +569,9 @@ impl SandboxManagerService {
             }
             // A Kubernetes sandbox launches in its pod's shim at container
             // create, which never sees this Wake, and the Wake has no pod
-            // namespace to boot in. Its upgrade is the pod's own
-            // `runtime-upgrade` checkpoint, so here it is refused before
+            // namespace to boot in. Reading pod hosting from the substrate
+            // relies on substrate == hosting today. Its upgrade is the pod's
+            // own `runtime-upgrade` checkpoint, so here it is refused before
             // anything is staged, fenced or booted. Whether the sandbox is a
             // Kubernetes one is the request's identity or, for a sandbox the
             // node holds, its row's, so for a sandbox here a request that

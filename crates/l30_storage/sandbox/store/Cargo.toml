@@ -10,6 +10,7 @@ publish.workspace = true
 [package.metadata.space.state]
 postgres = [
   "node_local_backup_pending",
+  "sandbox_ecw_credential_epochs",
   "sandbox_k8s_executions",
   "sandbox_observed_states",
   "sandbox_port_exposures",
@@ -51,6 +52,7 @@ pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-semver = { workspace = true, features = ["sqlx"] }
 pplx-space-snapshot-model = { workspace = true, features = ["sqlx"] }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -3,8 +3,9 @@
 
 mod node;
 mod node_group;
-#[cfg(feature = "sqlx")]
-mod postgres;
 
 pub use node::*;
 pub use node_group::*;
+
+#[cfg(feature = "sqlx")]
+pplx_space_uuid_id::postgres_uuid!(NodeGroupId);

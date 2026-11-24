@@ -34,6 +34,7 @@ tracing = { workspace = true }
 pplx-space-accounts = { workspace = true }
 pplx-space-host-layout = { workspace = true }
 pplx-space-migration-checksums = { workspace = true }
+pplx-space-node-runtime-manager-store = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-sqlite = { workspace = true }
 pplx-space-sbx-mgr-store = { workspace = true }

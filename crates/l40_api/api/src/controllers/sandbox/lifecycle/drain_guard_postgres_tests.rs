@@ -234,7 +234,7 @@ async fn gentle_primary_does_not_mask_a_forced_fallback() -> TestResult {
 
     let state = fetch_active_node_drain_state(&db.pool, sandbox_id).await?;
     assert_eq!(
-        state.map(|state| state.mode),
+        state.and_then(NodeDrain::mode),
         Some(NodeDrainMode::Forced),
         "the blocking fallback must win over the non-blocking primary"
     );
@@ -314,7 +314,7 @@ async fn mapped_gentle_primary_ignores_a_stale_blocking_execution() -> TestResul
 
     let state = fetch_active_node_drain_state(&db.pool, sandbox_id).await?;
     assert_eq!(
-        state.map(|state| state.mode),
+        state.and_then(NodeDrain::mode),
         Some(NodeDrainMode::Gentle),
         "the mapped primary is the answer; the stale execution must not win"
     );
@@ -404,7 +404,7 @@ async fn gentle_drain_does_not_block_access_or_placement_while_draining() -> Tes
     let state = fetch_active_node_drain_state(&db.pool, sandbox_id).await?;
     assert_eq!(
         state,
-        Some(NodeDrainState {
+        Some(NodeDrain::V1 {
             phase: NodeDrainPhase::Draining,
             mode: NodeDrainMode::Gentle,
         }),
@@ -583,7 +583,7 @@ async fn drain_gate_blocks_when_primary_node_lacks_k8s_mapping_and_fallback_is_d
 
     let state = fetch_active_node_drain_state(&db.pool, sandbox_id).await?;
     assert_eq!(
-        state.map(|state| state.phase),
+        state.and_then(NodeDrain::phase),
         Some(NodeDrainPhase::Draining),
         "fallback executions node must surface the drain when primary's node_k8s mapping is missing"
     );
@@ -642,7 +642,7 @@ async fn drain_gate_fallback_finds_draining_row_among_multi_role_node_k8s_siblin
 
     let state = fetch_active_node_drain_state(&db.pool, sandbox_id).await?;
     assert_eq!(
-        state.map(|state| state.phase),
+        state.and_then(NodeDrain::phase),
         Some(NodeDrainPhase::Draining),
         "fallback must surface the draining sibling even when a healthy sibling shares the k8s node name"
     );
@@ -690,7 +690,7 @@ async fn drain_gate_blocks_via_sandbox_k8s_executions_fallback() -> TestResult {
 
     let state = fetch_active_node_drain_state(&db.pool, sandbox_id).await?;
     assert_eq!(
-        state.map(|state| state.phase),
+        state.and_then(NodeDrain::phase),
         Some(NodeDrainPhase::Draining),
         "executions fallback must surface the draining node when both placement columns are NULL"
     );
@@ -744,7 +744,7 @@ fn keep_query_events_enabled() {
 async fn drain_gate_statements(
     pool: &PgPool,
     sandbox_id: SandboxId,
-) -> TestResult<(Option<NodeDrainState>, Vec<String>)> {
+) -> TestResult<(Option<NodeDrain>, Vec<String>)> {
     use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -825,7 +825,7 @@ async fn mapped_primary_drain_state_is_one_read() -> TestResult {
     insert_node(&db.pool, node_id, Some("drained")).await?;
     let (state, statements) = drain_gate_statements(&db.pool, sandbox_id).await?;
     assert_eq!(
-        state.map(|state| state.phase),
+        state.and_then(NodeDrain::phase),
         Some(NodeDrainPhase::Drained)
     );
     assert_eq!(statements.len(), 1, "{statements:#?}");

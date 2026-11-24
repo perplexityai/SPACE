@@ -1,10 +1,17 @@
-//! The `node_dirty_refs` outbox: the references template-manager's worker
-//! lists and sends to node-ctl, and the revision-guarded delete that
-//! acknowledges them.
+//! The `node_dirty_refs` outbox: the references template-manager enqueues,
+//! its worker lists and sends to node-ctl, and the revision-guarded delete
+//! that acknowledges them.
 
-use rusqlite::{Connection, Result, params};
+use rusqlite::params;
 
 use pplx_space_sql_locator::sql;
+
+use crate::{Connection, Result};
+
+use crate::limit_to_i64;
+
+const RECONCILE_FACET_NETWORK_POLICY: i32 = 1;
+const RECONCILE_FACET_TEMPLATE_INVENTORY: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDirtyRefRow {
@@ -15,9 +22,49 @@ pub struct NodeDirtyRefRow {
     pub revision: i64,
 }
 
+/// Enqueue `template`'s network-policy reference, or move its pending one to
+/// `requested_at`. Returns the number of rows changed.
+pub fn enqueue_network_policy_template(
+    conn: &Connection,
+    template: &str,
+    requested_at: &str,
+) -> Result<usize> {
+    Ok(conn.0.execute(
+        sql!(
+            "INSERT INTO node_dirty_refs
+                 (facet, element_kind, element_value, requested_at, updated_at)
+             VALUES (?1, 'network_policy_template', ?2, ?3, ?3)
+             ON CONFLICT(facet, element_kind, element_value) DO UPDATE SET
+                 requested_at = excluded.requested_at,
+                 updated_at = excluded.updated_at"
+        ),
+        params![RECONCILE_FACET_NETWORK_POLICY, template, requested_at],
+    )?)
+}
+
+/// Enqueue `template`'s template-inventory reference, or move its pending one
+/// to `requested_at`. Returns the number of rows changed.
+pub fn enqueue_template_inventory(
+    conn: &Connection,
+    template: &str,
+    requested_at: &str,
+) -> Result<usize> {
+    Ok(conn.0.execute(
+        sql!(
+            "INSERT INTO node_dirty_refs
+                 (facet, element_kind, element_value, requested_at, updated_at)
+             VALUES (?1, 'template_inventory', ?2, ?3, ?3)
+             ON CONFLICT(facet, element_kind, element_value) DO UPDATE SET
+                 requested_at = excluded.requested_at,
+                 updated_at = excluded.updated_at"
+        ),
+        params![RECONCILE_FACET_TEMPLATE_INVENTORY, template, requested_at],
+    )?)
+}
+
 /// The `limit` oldest dirty references, oldest first.
 pub fn list_node_dirty_refs(conn: &Connection, limit: usize) -> Result<Vec<NodeDirtyRefRow>> {
-    let mut stmt = conn.prepare(sql!(
+    let mut stmt = conn.0.prepare(sql!(
         "SELECT facet, element_kind, element_value, revision
          FROM node_dirty_refs
          ORDER BY requested_at ASC
@@ -31,7 +78,7 @@ pub fn list_node_dirty_refs(conn: &Connection, limit: usize) -> Result<Vec<NodeD
             revision: row.get(3)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Delete each listed reference whose revision is still the one listed, and
@@ -44,7 +91,7 @@ pub fn delete_node_dirty_refs_at_revision(
 ) -> Result<usize> {
     let mut deleted = 0;
     for reference in refs {
-        deleted += conn.execute(
+        deleted += conn.0.execute(
             sql!(
                 "DELETE FROM node_dirty_refs
              WHERE facet = ?1
@@ -61,8 +108,4 @@ pub fn delete_node_dirty_refs_at_revision(
         )?;
     }
     Ok(deleted)
-}
-
-fn limit_to_i64(limit: usize) -> i64 {
-    i64::try_from(limit).unwrap_or(i64::MAX)
 }

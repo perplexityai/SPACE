@@ -6,11 +6,27 @@
 //! `pplx_space_sandbox_store::delete::delete_with_dependents` or a create
 //! rollback, a template delete) and when no node owns it any more (a sandbox
 //! recovered to suspended, quarantined, or recovered from quarantine).
+//!
+//! The same rows' other verbs live alongside: [`observed_status`] for
+//! `node_facet_observed_status`, [`conditions`] for
+//! `node_facet_conditions`, and [`direct`] for the
+//! `node_facet_observed_status` writes that resolve a sandbox's node through
+//! the Direct route table. [`observed_status`]'s orphaned-facet sweep also
+//! deletes the swept rows' `node_facet_conditions` rows. Some verbs in
+//! [`observed_status`] and [`conditions`] read, without locking and in the
+//! same statement, tables other stores own: `sandboxes`,
+//! `sandbox_k8s_executions`, `sandbox_observed_states` and
+//! `node_template_inventory`. [`direct`]'s verbs read `sandboxes` and the
+//! Direct route table the same way.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
 use pplx_space_state_reconciliation::{NetworkPolicyTarget, ReconcileElementRef};
+
+pub mod conditions;
+pub mod direct;
+pub mod observed_status;
 
 pub fn sandbox_reconcile_cleanup_refs(sandbox_id: SandboxId) -> Vec<ReconcileElementRef> {
     vec![

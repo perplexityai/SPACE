@@ -93,6 +93,10 @@ mod template_apps;
 
 /// Enables the network-credential authority path (off by default).
 const NETWORK_CREDENTIALS_ENABLED_ENV: &str = "SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED";
+/// Lets a start of a suspended encrypted sandbox lay its pinned suspend
+/// checkpoint's COW, and a runtime upgrade finish the disk of a checkpoint
+/// staged without a launch. Off by default; see `docs/configuration.md`.
+pub(crate) const STAGED_CHECKPOINT_DISK_ENV: &str = "SPACE_SBXMGR_STAGED_CHECKPOINT_DISK";
 
 use self::drain::DrainState;
 pub use self::drain::{
@@ -307,6 +311,14 @@ const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
 ];
+// A drain seals the node and evacuates every resident, and its cancel
+// unseals it. A preview changes nothing but answers what a drain would find
+// on the whole node. node-api relays both for the control plane and
+// authorizes that caller first; root may drive them by hand.
+const ALLOW_NODE_DRAIN: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
+];
 const ALLOW_SANDBOX_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
@@ -415,6 +427,11 @@ pub struct SandboxManagerService {
     /// Node-wide admission for Firecracker process launches. Cold starts and
     /// restores share one capacity bucket.
     activation_admission_limiter: Arc<ActivationAdmissionLimiter>,
+    /// Refuses every VM activation while the node is sealed, and tracks the
+    /// activation work in flight, which a drain reports as pending.
+    activation_seal: Arc<crate::activation_seal::ActivationSeal>,
+    /// The node drain's work in flight in this process.
+    drain_actions: Arc<drain_node::DrainActions>,
     /// At most one in-process driver may advance a persisted teardown suspend
     /// for a sandbox. The durable operation itself lives in SQLite; this map
     /// only bounds concurrent reattachment attempts from shim polling.
@@ -443,6 +460,11 @@ pub struct SandboxManagerService {
     credential_manager_client:
         Arc<tokio::sync::OnceCell<pplx_space_credmgr_client::CredentialManagerGrpcClient>>,
     network_credentials_enabled: bool,
+    /// [`STAGED_CHECKPOINT_DISK_ENV`], read once at startup.
+    staged_checkpoint_disk: bool,
+    /// Whether runtime upgrade attempts are final
+    /// ([`runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV`], off by default).
+    runtime_upgrade_attempt_finality: bool,
     node_manager: NodeManagerConnector,
     /// See [`SandboxManagerServiceOptions::volume_manager_socket_path`].
     volume_manager_socket_path: PathBuf,
@@ -1777,7 +1799,15 @@ impl SandboxManagerService {
                 ),
             }
         }
+        // Read before anything is spawned that could admit an activation.
+        let activation_seal = Arc::new(crate::activation_seal::ActivationSeal::load(&conn));
         let db = crate::db::SharedConnection::new(conn);
+        // A startup read that failed refuses activations until this reads it.
+        activation_seal.spawn_recovery(
+            db.clone(),
+            options.shutdown_token.clone(),
+            &options.task_tracker,
+        );
         let auto_lifecycle = AutoLifecycleCoordinator::default();
         let network_policy_reconcile_queue = NetworkPolicyReconcileQueue::default();
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
@@ -1792,6 +1822,7 @@ impl SandboxManagerService {
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: health_lifecycle.clone(),
             node_manager: options.node_manager.clone(),
+            activation_seal: Arc::clone(&activation_seal),
         });
         let snapshot_scheduler = Arc::new(
             crate::snapshot_scheduler::SnapshotScheduler::new_with_ownership(
@@ -1876,6 +1907,10 @@ impl SandboxManagerService {
                 recovery::QUARANTINE_RECOVERY_ORPHAN_RESTORE_PERMITS,
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
+            activation_seal,
+            drain_actions: Arc::new(drain_node::DrainActions::with_window(
+                drain_node::drain_node_window_from_env(),
+            )),
             teardown_suspend_drivers: Arc::new(dashmap::DashMap::new()),
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
@@ -1903,6 +1938,14 @@ impl SandboxManagerService {
                 std::env::var(NETWORK_CREDENTIALS_ENABLED_ENV)
                     .ok()
                     .as_deref(),
+                false,
+            ),
+            staged_checkpoint_disk: pplx_space_env_vars::env_flag_var(
+                STAGED_CHECKPOINT_DISK_ENV,
+                false,
+            ),
+            runtime_upgrade_attempt_finality: pplx_space_env_vars::env_flag_var(
+                runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV,
                 false,
             ),
             gateway_caller_client: options.node_manager.lazy(),
@@ -2145,6 +2188,7 @@ pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
 pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
+mod drain_node;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;
 mod grpc_lifecycle;

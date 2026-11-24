@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pplx_space_durations::PositiveDuration;
+use pplx_space_sandbox_teardown::observed_status::{self, ObservedStatusKey};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -157,23 +158,16 @@ struct FacetLap {
     high_water: FacetKey,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FacetKey {
-    node_id: NodeId,
-    facet: String,
-    element: String,
-}
+type FacetKey = ObservedStatusKey;
 
-impl FacetKey {
-    /// Sorts at or before every real key: `node_id` is a FK to `nodes`, so a
-    /// live row with the nil UUID (let alone empty facet and element) cannot
-    /// exist.
-    fn origin() -> Self {
-        Self {
-            node_id: NodeId::from_uuid(Uuid::nil()),
-            facet: String::new(),
-            element: String::new(),
-        }
+/// Sorts at or before every real key: `node_id` is a FK to `nodes`, so a
+/// live row with the nil UUID (let alone empty facet and element) cannot
+/// exist.
+fn facet_key_origin() -> FacetKey {
+    FacetKey {
+        node_id: NodeId::from_uuid(Uuid::nil()),
+        facet: String::new(),
+        element: String::new(),
     }
 }
 
@@ -213,14 +207,7 @@ impl ObservedProjectionDbStore {
     /// The newest observed-row id, used as a lap's high-water bound. `None`
     /// means the table is empty and there is nothing to sweep.
     async fn newest_observed_sandbox_id(&self) -> Result<Option<Uuid>, sqlx::Error> {
-        sqlx::query_scalar(sql!(
-            "SELECT sandbox_id
-             FROM sandbox_observed_states
-             ORDER BY sandbox_id DESC
-             LIMIT 1"
-        ))
-        .fetch_optional(&self.pool)
-        .await
+        Ok(pplx_space_sandbox_store::observed_states::newest(&self.pool).await?)
     }
 
     /// Measure the next sweep window over `sandbox_observed_states`: the id
@@ -235,18 +222,12 @@ impl ObservedProjectionDbStore {
         through: Uuid,
         window: i64,
     ) -> Result<Option<WindowRange<Uuid>>, sqlx::Error> {
-        let ids: Vec<Uuid> = sqlx::query_scalar(sql!(
-            "SELECT sandbox_id
-             FROM sandbox_observed_states
-             WHERE sandbox_id > $1
-               AND sandbox_id <= $2
-             ORDER BY sandbox_id
-             LIMIT $3"
-        ))
-        .bind(cursor)
-        .bind(through)
-        .bind(window.max(0))
-        .fetch_all(&self.pool)
+        let ids = pplx_space_sandbox_store::observed_states::window(
+            &self.pool,
+            cursor,
+            through,
+            window.max(0),
+        )
         .await?;
 
         let Some(last) = ids.last().copied() else {
@@ -259,19 +240,7 @@ impl ObservedProjectionDbStore {
     }
 
     async fn newest_facet_key(&self) -> Result<Option<FacetKey>, sqlx::Error> {
-        let row: Option<(NodeId, String, String)> = sqlx::query_as(sql!(
-            "SELECT node_id, facet, element
-             FROM node_facet_observed_status
-             ORDER BY node_id DESC, facet DESC, element DESC
-             LIMIT 1"
-        ))
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(node_id, facet, element)| FacetKey {
-            node_id,
-            facet,
-            element,
-        }))
+        observed_status::greatest_key(&self.pool).await
     }
 
     /// Facet-table counterpart of [`Self::observed_window_range`], row-wise
@@ -282,36 +251,14 @@ impl ObservedProjectionDbStore {
         through: &FacetKey,
         window: i64,
     ) -> Result<Option<WindowRange<FacetKey>>, sqlx::Error> {
-        let rows: Vec<(NodeId, String, String)> = sqlx::query_as(sql!(
-            "SELECT node_id, facet, element
-             FROM node_facet_observed_status
-             WHERE (node_id, facet, element) > ROW($1, $2, $3)
-               AND (node_id, facet, element) <= ROW($4, $5, $6)
-             ORDER BY node_id, facet, element
-             LIMIT $7"
-        ))
-        .bind(cursor.node_id)
-        .bind(&cursor.facet)
-        .bind(&cursor.element)
-        .bind(through.node_id)
-        .bind(&through.facet)
-        .bind(&through.element)
-        .bind(window.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            observed_status::keys_in_window(&self.pool, cursor, through, window.max(0)).await?;
 
         let exhausted = (rows.len() as i64) < window;
-        let Some((node_id, facet, element)) = rows.into_iter().last() else {
+        let Some(last) = rows.into_iter().last() else {
             return Ok(None);
         };
-        Ok(Some(WindowRange {
-            last: FacetKey {
-                node_id,
-                facet,
-                element,
-            },
-            exhausted,
-        }))
+        Ok(Some(WindowRange { last, exhausted }))
     }
 }
 
@@ -412,7 +359,7 @@ impl ProjectionGcSink for ObservedProjectionDbStore {
                 None => match self.newest_facet_key().await? {
                     Some(high_water) => {
                         let lap = FacetLap {
-                            cursor: FacetKey::origin(),
+                            cursor: facet_key_origin(),
                             high_water,
                         };
                         self.store_facet_lap(Some(lap.clone()));
@@ -645,90 +592,8 @@ async fn delete_orphaned_facets(
     from: &FacetKey,
     to: &FacetKey,
 ) -> Result<DeleteReportRow, sqlx::Error> {
-    sqlx::query_as(sql!(
-        "WITH stale AS MATERIALIZED (
-             SELECT nfos.node_id, nfos.facet, nfos.element
-             FROM node_facet_observed_status nfos
-             WHERE (nfos.node_id, nfos.facet, nfos.element) > ROW($3, $4, $5)
-               AND (nfos.node_id, nfos.facet, nfos.element) <= ROW($6, $7, $8)
-               AND nfos.updated_at < NOW() - make_interval(secs => $1::BIGINT)
-               AND (
-                   (
-                       nfos.facet = 'network-policy'
-                       AND nfos.element LIKE 'sandbox:%'
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM sandbox_observed_states sos
-                           WHERE sos.node_id = nfos.node_id
-                             AND nfos.element = 'sandbox:' || sos.sandbox_id::TEXT
-                       )
-                   )
-                   OR (
-                       nfos.facet = 'network-policy'
-                       AND nfos.element LIKE 'template:%'
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM node_template_inventory nti
-                           WHERE nti.node_id = nfos.node_id
-                             AND nfos.element = 'template:' || nti.template_name
-                       )
-                   )
-                   OR (
-                       nfos.facet IN ('sandbox-inventory', 'sandbox-desired-state')
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM sandbox_observed_states sos
-                           WHERE sos.node_id = nfos.node_id
-                             AND nfos.element = sos.sandbox_id::TEXT
-                       )
-                   )
-                   OR (
-                       nfos.facet IN (
-                           'template-inventory',
-                           'template-desired-state',
-                           'template-base-snapshot-policy'
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM node_template_inventory nti
-                           WHERE nti.node_id = nfos.node_id
-                             AND nfos.element = nti.template_name
-                       )
-                   )
-               )
-             LIMIT $2
-         ),
-         deleted_conditions AS (
-             DELETE FROM node_facet_conditions nfc
-             USING stale
-             WHERE nfc.node_id = stale.node_id
-               AND nfc.facet = stale.facet
-               AND nfc.element = stale.element
-             RETURNING 1
-         ),
-         deleted_status AS (
-             DELETE FROM node_facet_observed_status nfos
-             USING stale
-             WHERE nfos.node_id = stale.node_id
-               AND nfos.facet = stale.facet
-               AND nfos.element = stale.element
-             RETURNING 1
-         )
-         SELECT
-             0::BIGINT,
-             (SELECT COUNT(*)::BIGINT FROM deleted_status),
-             (SELECT COUNT(*)::BIGINT FROM deleted_conditions)"
-    ))
-    .bind(secs_i64(request.orphan_age))
-    .bind(limit)
-    .bind(from.node_id)
-    .bind(&from.facet)
-    .bind(&from.element)
-    .bind(to.node_id)
-    .bind(&to.facet)
-    .bind(&to.element)
-    .fetch_one(pool)
-    .await
+    observed_status::delete_orphaned_in_window(pool, secs_i64(request.orphan_age), limit, from, to)
+        .await
 }
 
 pub struct Reconciler<S: ProjectionGcSink> {

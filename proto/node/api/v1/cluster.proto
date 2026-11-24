@@ -57,7 +57,9 @@ service ClusterApi {
   // to warm the latest N artifacts per template without going through
   // the tag indirection. An empty `runtime` is rejected; `limit` must
   // be in `[1, 50]`. Returns an empty `releases` list (NOT NOT_FOUND)
-  // when the template exists but has no releases yet.
+  // when the template exists but has no releases yet. Each release's
+  // `hash` is in its `sha256:<hex>` spelling, the one the node keys its
+  // builds and release pins on, even for a release stored bare.
   rpc ListLatestTemplateReleases(ListLatestTemplateReleasesRequest) returns (ListLatestTemplateReleasesResponse);
 
   // Return every `(template_name, hash)` release that warm pools
@@ -68,7 +70,8 @@ service ClusterApi {
   // prefetch pins (and has no live warm slot on the node at tick time)
   // is never evicted — eviction would otherwise turn the next pool
   // refill into a full re-pull under disk pressure. Callers treat any
-  // error as "do not evict this tick" (fail closed).
+  // error as "do not evict this tick" (fail closed). Each `hash` is in
+  // its `sha256:<hex>` spelling, as the node's builds are keyed.
   rpc ListWarmPoolTemplateReleases(ListWarmPoolTemplateReleasesRequest) returns (ListWarmPoolTemplateReleasesResponse);
 
   // Return the control-plane desired network policy state for the node-local
@@ -222,6 +225,17 @@ service ClusterApi {
   // on; for any other caller, and for an execution with no recorded node, the
   // answer is `EXECUTION_CURRENCY_UNSPECIFIED`.
   rpc GetExecutionCurrency(GetExecutionCurrencyRequest) returns (GetExecutionCurrencyResponse);
+
+  // The calling worker's firewall assignment and pending verification round,
+  // read from one snapshot. The server resolves the worker from the caller's
+  // reviewed node identity; the request names nothing. Read-only: fetching
+  // twice changes nothing. After the auth layer's UNAUTHENTICATED and
+  // UNAVAILABLE: PERMISSION_DENIED unless the caller holds the fetch authority
+  // and its reviewed node name maps to exactly one live worker registration
+  // whose UID matches; FAILED_PRECONDITION when that worker isn't enrolled or
+  // no enrollment predicate is approved; INTERNAL when the stored assignment
+  // can't be read.
+  rpc FetchFirewallRules(FetchFirewallRulesRequest) returns (FetchFirewallRulesResponse);
 
   // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
   // storage) is owned end to end by the credential manager
@@ -407,8 +421,12 @@ message FindTemplateReleaseRequest {
   // the tagged release. Selecting the initial environment also selects an
   // unbound release: nodes cache both in the legacy partition. NotFound when
   // no release of that hash is bound to it.
-  // Absent resolves the tagged release, as servers that predate the field
-  // always do: require `environment_applied` on the response.
+  // Absent resolves the tagged digest's original release: the tagged release,
+  // unless the tag sits on the other spelling's original (one written before
+  // the shared original-release rule), which resolves to the digest original.
+  // Servers that predate the field ignore a selector and answer with the
+  // tagged release: a caller that sends one must require
+  // `environment_applied` on the response.
   optional string environment = 6;
 }
 
@@ -446,11 +464,13 @@ message FindTemplateReleaseByHashRequest {
   bool generic_only = 4;
   // Resolve the release of this hash bound to this execution environment;
   // selecting the initial environment also selects an unbound release.
-  // NotFound when none is. Absent resolves the original release of each
-  // spelling of the digest (bare and `sha256:`), the first registered under
-  // it, as before twins. Servers that predate the field ignore it and,
-  // once twins exist, can answer with or merge any release of the hash:
-  // require `environment_applied` on the response.
+  // NotFound when none is. Absent returns one release, the digest's
+  // original, with the storage locations of each spelling's original (bare
+  // and `sha256:`, the first registered under it, as before twins), whichever
+  // spelling the request names. Servers that predate the field ignore it and,
+  // once twins exist, can answer with or merge any release of the hash: a
+  // caller that sends a selector must require `environment_applied` on the
+  // response.
   optional string environment = 5;
 }
 
@@ -462,9 +482,10 @@ message ListLatestTemplateReleasesRequest {
   // List the latest releases bound to this execution environment (for the
   // initial environment, unbound releases too), one per digest whichever
   // spellings it's stored under, preferring one with a storage location.
-  // Absent lists the original release of each hash spelling, the first
-  // registered under it, and never its twins. Servers that predate the
-  // field ignore it and, once twins exist, list them too: require
+  // Absent lists each digest's original release once, never its twins or the
+  // other spelling's original (servers that predate the shared rule list each
+  // spelling's original). Servers that predate the field ignore it and, once
+  // twins exist, list them too: a caller that sends a selector must require
   // `environment_applied` on the response.
   optional string environment = 4;
 }
@@ -483,11 +504,13 @@ message ListLatestTemplateReleasesEntry {
 }
 
 message ListLatestTemplateReleasesResponse {
-  // Ordered newest version first: by the `created_at` of each hash's
-  // earliest release (with a selector, under either spelling of the
-  // digest), then the release's own `created_at`, DESC. A twin registered
-  // for an older version after a newer one ranks by that earliest release. Without a selector every entry is an original, so this is
-  // `template_releases.created_at`, as before twins.
+  // Ordered newest version first: by the `created_at` of each digest's
+  // earliest release under either spelling, then the release's own
+  // `created_at`, DESC. A twin registered for an older version after a newer
+  // one ranks by that earliest release. Without a selector every entry is its
+  // digest's original, one per digest, so this is
+  // `template_releases.created_at` unless the digest is stored under both
+  // spellings and its original isn't the earlier one.
   repeated ListLatestTemplateReleasesEntry entries = 1;
   // Visibility of the requested template. Response-level so the signal
   // survives an empty `entries` list: a template row with zero registered
@@ -1488,4 +1511,34 @@ message GetNodeRuntimeDesiredStateResponse {
   // can't be read fails the whole call, recipe included, rather than coming
   // back absent.
   RuntimeEnvironmentDesiredPolicy execution_policy = 2;
+}
+
+message FetchFirewallRulesRequest {}
+
+// `assignment`, `pending_round`, both or neither may be set.
+message FetchFirewallRulesResponse {
+  // The canonical node ID the server resolved, set on every success.
+  string node_id = 1;
+  // Absent when the node has no assignment, unlike one to an empty revision.
+  optional FirewallRulesAssignment assignment = 2;
+  // Absent when no round is pending; accepted evidence is never one.
+  optional FirewallRulesPendingRound pending_round = 3;
+}
+
+message FirewallRulesAssignment {
+  uint64 generation = 1;
+  string revision_id = 2;
+  // The revision's canonical, ordered JSON document
+  // (pplx-space-firewall-rules-protocol).
+  string revision = 3;
+}
+
+message FirewallRulesPendingRound {
+  uint64 round = 1;
+  // When the control plane first issued the round.
+  google.protobuf.Timestamp issued_at = 2;
+  // The assignment generation the round asks about, which needn't be this
+  // response's assignment; 0 is a generation. Absent from older servers and
+  // for a round that names none: such a round can't be answered.
+  optional uint64 assignment_generation = 3;
 }

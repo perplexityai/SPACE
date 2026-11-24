@@ -737,9 +737,8 @@ pub(crate) const DEFAULT_COMMAND_READY_PENDING_PROBE_TIMEOUT: Duration = Duratio
 pub(crate) const DEFAULT_COMMAND_READY_PENDING_TERMINAL_AGE_SECS: u64 = 3600;
 /// Minimum time since the last placement change before a provably-
 /// unrestorable `restoring` row (no source node, no eligible snapshot, no
-/// in-flight upload — see
-/// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards`) is
-/// failed.
+/// in-flight upload — see `unrestorable_restoring_guards` in
+/// `pplx-space-sandbox-store`'s `sweeper` module) is failed.
 /// The predicate itself is the primary guard; this window is belt-and-braces
 /// against enqueue latency and unmodeled transients, so it only needs to
 /// comfortably exceed suspend→backup-enqueue time (seconds).
@@ -1237,9 +1236,9 @@ pub trait SweepSink: Send + Sync + 'static {
     /// `placement_changed_at`, **not** `lifecycle_changed_at`: restore claims
     /// preserve the latter as the source-selection boundary, so it is not an
     /// activity clock; legacy rows may also carry prior lifecycle-clock
-    /// refreshes. See
-    /// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards` for
-    /// the full predicate and the deliberate absence of a lease guard.
+    /// refreshes. See `unrestorable_restoring_guards` in
+    /// `pplx-space-sandbox-store`'s `sweeper` module for the full predicate
+    /// and the deliberate absence of a lease guard.
     fn list_unrestorable_restoring(
         &self,
         min_placement_age: PositiveDuration,

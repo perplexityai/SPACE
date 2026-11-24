@@ -12,7 +12,7 @@ impl TemplateManagerService {
 
         let requested_shape = optional_pool_shape(req.vcpu, req.memory_mib)?;
         let (existing_pool, settings, runtime_defaults, build) = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = req.template.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -91,7 +91,7 @@ impl TemplateManagerService {
 
         // Snapshot boot requires a snapshot to exist for this template's latest build
         if boot_mode == "snapshot" {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let t = req.template.clone();
             let has_snapshot = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().map_err(|_| {
@@ -130,7 +130,7 @@ impl TemplateManagerService {
                 && pool.memory_mib == memory_mib
         });
         if !unchanged {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = req.template.clone();
             let boot_mode = boot_mode.clone();
             tokio::task::spawn_blocking(move || {
@@ -160,7 +160,7 @@ impl TemplateManagerService {
         validate_template_name(&req.template)?;
 
         {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = req.template.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -230,7 +230,7 @@ impl TemplateManagerService {
         }
 
         let pools = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let template = template.map(str::to_string);
             tokio::task::spawn_blocking(move || {
                 let conn = db

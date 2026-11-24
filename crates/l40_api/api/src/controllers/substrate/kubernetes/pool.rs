@@ -6,6 +6,7 @@ use pplx_space_cluster_pool::{
 };
 use pplx_space_execution_spec::VcpuCount;
 use pplx_space_k8s_ids::PodUid;
+use pplx_space_node_registration_store::lookup as node_lookup;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -122,6 +123,14 @@ pub(super) async fn upsert_pool_config(
         )),
         None => ControllerError::not_found("template release not found"),
     })?;
+    // After the release lookup, which reads no config row, and before the
+    // config write: a template whose first release registered after a lock
+    // taken earlier found no row would otherwise go unlocked.
+    if boots_template_twins {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &request.template_name)
+            .await?;
+    }
     let upsert_error = |err: pplx_space_cluster_pool::PoolError| match err {
         pplx_space_cluster_pool::PoolError::EncryptableConfigFenced => {
             ControllerError::bad_request(err.to_string())
@@ -206,6 +215,15 @@ pub(super) async fn disable_pool_config(
         .begin()
         .await
         .map_err(|err| db_contention_error("failed to start transaction", &err))?;
+    // Before the config's row, as the upsert takes it: a twin insert holds
+    // the template's row and then locks the twin's config rows, and a twin
+    // it hasn't committed yet is one this disable's read of the twins below
+    // can't see.
+    if let Some(template_name) = store.pool_config_template(&mut tx, id).await? {
+        store
+            .lock_template_against_twin_inserts(&mut tx, &template_name)
+            .await?;
+    }
     let disabled = WarmPoolStore::disable_config(&mut tx, id)
         .await
         .map_err(disable_error)?
@@ -508,9 +526,12 @@ fn admitted_slot_matches_request(
         && request
             .template_release_id
             .is_none_or(|release_id| release_id == reserved.template_release_id)
-        && request
-            .content_hash
-            .is_none_or(|content_hash| content_hash == reserved.content_hash)
+        // Either spelling of the digest: a create resolves a digest stored
+        // bare to its canonical `sha256:` form, and the slot records the
+        // release's stored spelling.
+        && request.content_hash.is_none_or(|content_hash| {
+            content_hash.trim_prefix("sha256:") == reserved.content_hash.trim_prefix("sha256:")
+        })
         && shape_matches
 }
 
@@ -756,46 +777,33 @@ pub(super) async fn release_claimed_pool_slot(
     Ok(())
 }
 
-#[derive(sqlx::FromRow)]
 struct PoolTemplateReleaseRow {
     id: Uuid,
     content_hash: String,
 }
 
-/// Resolve the template release a pool claim or config upsert targets: the
-/// release matching the requested content hash when one is pinned, otherwise
-/// the tagged-`latest` release, otherwise the newest release of the template.
-/// Only original releases are candidates (no older release of the same
-/// template and hash): a twin bound to another environment is registered
-/// after its original and would otherwise be the newest.
-/// Template-domain logic; deliberately not part of the warm-pool store.
+/// Resolve the template release a pool claim or config upsert targets
+/// (`pplx_space_template_release_store::lookup::pool_target_release`): with
+/// a pinned content hash, that digest's original, if it has one; without
+/// one, the `latest`-tagged digest's original, else the template's newest
+/// digest original.
 async fn resolve_pool_template_release(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
-    sqlx::query_as::<_, PoolTemplateReleaseRow>(sql!(
-        "SELECT r.id, r.hash AS content_hash
-         FROM template_releases r
-         LEFT JOIN template_release_tags t
-           ON t.template_release_id = r.id
-          AND t.template_name = r.template_name
-          AND t.tag = 'latest'
-         WHERE r.template_name = $1
-           AND ($2::TEXT IS NULL OR r.hash = $2)
-           AND NOT EXISTS (
-               SELECT 1
-               FROM template_releases o
-               WHERE o.template_name = r.template_name
-                 AND o.hash = r.hash
-                 AND (o.created_at, o.id) < (r.created_at, r.id))
-         ORDER BY (t.tag IS NOT NULL) DESC, r.created_at DESC
-         LIMIT 1"
-    ))
-    .bind(template_name)
-    .bind(content_hash)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::lookup::pool_target_release(
+        &mut **tx,
+        template_name,
+        content_hash,
+    )
     .await
+    .map(|release| {
+        release.map(|release| PoolTemplateReleaseRow {
+            id: release.id,
+            content_hash: release.content_hash,
+        })
+    })
     .map_err(|err| db_contention_error("failed to resolve pool template release", &err))
 }
 
@@ -807,24 +815,23 @@ async fn named_pool_template_release(
     template_name: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<PoolTemplateReleaseRow>, ControllerError> {
-    sqlx::query_as::<_, PoolTemplateReleaseRow>(sql!(
-        "SELECT r.id, r.hash AS content_hash
-         FROM template_releases r
-         WHERE r.id = $1
-           AND r.template_name = $2
-           AND ($3::TEXT IS NULL OR r.hash = $3)"
-    ))
-    .bind(release_id)
-    .bind(template_name)
-    .bind(content_hash)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::lookup::named_release(
+        &mut **tx,
+        release_id,
+        template_name,
+        content_hash,
+    )
     .await
+    .map(|release| {
+        release.map(|release| PoolTemplateReleaseRow {
+            id: release.id,
+            content_hash: release.content_hash,
+        })
+    })
     .map_err(|err| db_contention_error("failed to read the named pool template release", &err))
 }
 
-/// The worker registered under the slot pod's Kubernetes node name. Node ids
-/// are scoped by role, so a builder on the same host has its own row under
-/// that name.
+/// The worker registered under the slot pod's Kubernetes node name.
 async fn resolve_pool_slot_node_id(
     tx: &mut Transaction<'_, Postgres>,
     node_name: Option<&str>,
@@ -832,16 +839,7 @@ async fn resolve_pool_slot_node_id(
     let Some(node_name) = node_name else {
         return Ok(None);
     };
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT nk.node_id
-         FROM node_k8s nk
-         JOIN nodes n ON n.id = nk.node_id
-         WHERE nk.k8s_node_name = $1
-           AND n.role = 'worker'"
-    ))
-    .bind(node_name)
-    .fetch_optional(&mut **tx)
-    .await
+    node_lookup::worker_for_k8s_node_name(&mut **tx, node_name).await
 }
 
 async fn fetch_pool_config(

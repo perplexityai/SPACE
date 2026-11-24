@@ -14,9 +14,7 @@ use pplx_space_public_api::{
     PortExposureVisibility, RequestFingerprint,
 };
 use pplx_space_public_api_http::metrics::{ResponseKind, ResponseOrigin};
-use pplx_space_sql_locator::sql;
 use sha2::{Digest, Sha256};
-use sqlx::types::Json as SqlJson;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -245,22 +243,15 @@ async fn find_idempotent_port_response(
     path_template: OperationPathTemplate,
     fingerprint: &RequestFingerprint,
 ) -> Result<Option<PortExposureResponse>, PublicApiError> {
-    let row = sqlx::query_as::<_, (String, Option<SqlJson<serde_json::Value>>)>(sql!(
-        "SELECT request_fingerprint, response_json
-         FROM public_idempotency_records
-         WHERE org_id = $1
-           AND api_product = 'native'
-           AND method = 'POST'
-           AND path_template = $2
-           AND idempotency_key = $3
-           AND expires_at > NOW()"
-    ))
-    .bind(org_id)
-    .bind(path_template.as_str())
-    .bind(key.as_str())
-    .fetch_optional(&state.pool)
+    let row = pplx_space_public_operation_store::idempotency::find_live_native_post_reply(
+        &state.pool,
+        org_id,
+        path_template.as_str(),
+        key.as_str(),
+    )
     .await
-    .map_err(database_error)?;
+    .map_err(database_error)?
+    .map(|row| (row.request_fingerprint, row.response_json));
 
     let Some((stored_fingerprint, response_json)) = row else {
         return Ok(None);
@@ -308,31 +299,20 @@ async fn record_idempotent_port_response(
     )
     .await
     .map_err(database_error)?;
-    let inserted = sqlx::query(sql!(
-        "INSERT INTO public_idempotency_records (
-             id,
-             org_id,
-             api_product,
-             method,
-             path_template,
-             idempotency_key,
-             request_fingerprint,
-             response_json
-         )
-         VALUES ($1, $2, 'native', 'POST', $3, $4, $5, $6)
-         ON CONFLICT (org_id, api_product, method, path_template, idempotency_key) DO NOTHING"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(org_id)
-    .bind(path_template.as_str())
-    .bind(key.as_str())
-    .bind(fingerprint.as_str())
-    .bind(SqlJson(response_json))
-    .execute(&mut *tx)
-    .await
-    .map_err(database_error)?;
+    let inserted =
+        pplx_space_public_operation_store::idempotency::insert_native_post_reply_if_absent(
+            &mut *tx,
+            Uuid::now_v7(),
+            org_id,
+            path_template.as_str(),
+            key.as_str(),
+            fingerprint.as_str(),
+            response_json,
+        )
+        .await
+        .map_err(database_error)?;
 
-    if inserted.rows_affected() == 1 {
+    if inserted {
         tx.commit().await.map_err(database_error)?;
         return Ok(response.clone());
     }

@@ -1,4 +1,5 @@
 pub(crate) mod catalog;
+mod environments;
 
 use super::*;
 use pplx_space_node_api_client::proto::{FindTemplateReleaseResponse, TemplateRelease};
@@ -30,6 +31,17 @@ fn authorized_release_fixture() -> AuthorizedReleaseFixture {
     }
 }
 
+/// A lookup of `base` by digest, or by tag when `hash` is empty, naming no
+/// environment.
+fn lookup(hash: &str) -> ReleaseLookup<'_> {
+    ReleaseLookup {
+        name: "base",
+        req_hash: hash,
+        req_tag: "",
+        environment: None,
+    }
+}
+
 #[rstest::rstest]
 fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
     authorized_release_fixture: AuthorizedReleaseFixture,
@@ -40,7 +52,7 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
         response: valid,
     } = authorized_release_fixture;
     assert_eq!(
-        parse_release_response("base", &hash, Some(org), false, valid.clone())
+        parse_release_response(lookup(&hash), Some(org), false, valid.clone())
             .unwrap()
             .hash,
         hash
@@ -49,7 +61,7 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
     legacy_response.authorized_org_id = None;
     for requested_hash in ["", hash.as_str()] {
         let release =
-            parse_release_response("base", requested_hash, None, false, legacy_response.clone())
+            parse_release_response(lookup(requested_hash), None, false, legacy_response.clone())
                 .expect("unscoped callers accept releases from an older ClusterApi");
         assert_eq!(release.hash, hash);
     }
@@ -57,11 +69,11 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
     let mut generic = legacy_response.clone();
     generic.template_visibility = TemplateVisibility::Generic.into();
     assert!(matches!(
-        parse_release_response("base", &hash, None, true, generic.clone()),
+        parse_release_response(lookup(&hash), None, true, generic.clone()),
         Err(FindReleaseError::InvalidResponse)
     ));
     generic.generic_authorized = true;
-    parse_release_response("base", &hash, None, true, generic)
+    parse_release_response(lookup(&hash), None, true, generic)
         .expect("generic-only catalog acknowledgement permits prefetch");
 
     for mutation in 0..6 {
@@ -76,7 +88,7 @@ fn scoped_release_response_must_acknowledge_the_org_and_exact_release(
             _ => unreachable!(),
         }
         assert!(matches!(
-            parse_release_response("base", &hash, Some(org), false, response),
+            parse_release_response(lookup(&hash), Some(org), false, response),
             Err(FindReleaseError::InvalidResponse)
         ));
     }
@@ -205,8 +217,6 @@ fn lookup_tag_returns_req_tag_or_default() {
 /// is in place).
 #[tokio::test]
 async fn do_pull_aborts_early_when_build_is_marked_deleting() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
     let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     crate::db::upsert_build(
@@ -225,12 +235,13 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
     )
     .unwrap();
     // Eviction Phase 1: flip to deleting.
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
+    let db = crate::db::SharedConnection::new(conn);
 
     // `storage_uris` is empty; the early-abort check fires
     // before the storage-iteration loop so an empty list is
@@ -239,8 +250,12 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
     // different reason.
     let outcome = do_pull(
         db,
-        "seed",
-        hash,
+        ResolvedPull {
+            name: "seed",
+            content_hash: hash,
+            environment: None,
+            served_environment: None,
+        },
         &[],
         &[],
         None,
@@ -257,16 +272,18 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
 
 #[tokio::test]
 async fn do_pull_treats_empty_storage_locations_as_local_only_uncached() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     let outcome = do_pull(
         db,
-        "seed",
-        hash,
+        ResolvedPull {
+            name: "seed",
+            content_hash: hash,
+            environment: None,
+            served_environment: None,
+        },
         &[],
         &[],
         None,
@@ -1306,12 +1323,12 @@ async fn a_pull_waits_for_a_digest_claim_then_runs() {
         async move {
             puller
                 .pull_resolved(
-                    Arc::new(Mutex::new(crate::db::test_conn())),
+                    crate::db::SharedConnection::new(crate::db::test_conn()),
                     "claim-wait-test".to_string(),
                     content_hash,
                     Vec::new(),
                     &[],
-                    None,
+                    PullTarget::default(),
                 )
                 .await
         }
@@ -1450,8 +1467,6 @@ fn release_partition_reads_the_manifest_then_the_metadata_binding() {
 /// left nothing to serve.
 #[tokio::test]
 async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
-    use std::sync::Mutex;
-
     let conn = crate::db::test_conn();
     let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     crate::db::upsert_build(
@@ -1469,19 +1484,22 @@ async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
         },
     )
     .unwrap();
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
 
     let (outcome, _) = pull_resolved_owner(
-        Arc::new(Mutex::new(conn)),
+        crate::db::SharedConnection::new(conn),
         OwnedPull {
             name: "seed",
             resolved_hash: hash,
             storage_uris: &[],
             required: None,
+            environment: None,
+            served_environment: None,
         },
         &[],
         None,
@@ -1499,7 +1517,28 @@ async fn pull_refuses_retryably_before_counting_a_row_mid_eviction() {
 }
 
 /// A DB holding the legacy-partition build of `hash`, unbound.
-fn db_with_legacy_build(hash: &str) -> Arc<Mutex<rusqlite::Connection>> {
+fn db_with_legacy_build(hash: &str) -> crate::db::SharedConnection {
+    db_with_legacy_build_bound_to(hash, None)
+}
+
+/// A DB holding the legacy-partition build of `hash` bound to `environment`,
+/// or unbound. One bound to a non-initial environment is a build startup
+/// recovery adopted in place.
+fn db_with_legacy_build_bound_to(
+    hash: &str,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+) -> crate::db::SharedConnection {
+    use pplx_space_cpu_arch::Arch;
+    use pplx_space_execution_spec::ExecutionMetadata;
+    use pplx_space_template_manifest::TemplateManifest;
+    let mut manifest = TemplateManifest::default();
+    if let Some(environment) = environment {
+        manifest.set_execution_metadata(
+            ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])
+                .with_environment(environment),
+        );
+    }
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
     let conn = crate::db::test_conn();
     crate::db::upsert_build(
         &conn,
@@ -1508,7 +1547,7 @@ fn db_with_legacy_build(hash: &str) -> Arc<Mutex<rusqlite::Connection>> {
             content_hash: hash,
             cache_partition: TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
-            manifest_json: "{}",
+            manifest_json: &manifest_json,
             runtime: "fc",
             arch: "x86_64",
             artifact_size_bytes: 100,
@@ -1516,7 +1555,7 @@ fn db_with_legacy_build(hash: &str) -> Arc<Mutex<rusqlite::Connection>> {
         },
     )
     .unwrap();
-    Arc::new(Mutex::new(conn))
+    crate::db::SharedConnection::new(conn)
 }
 
 fn twin_partition() -> TemplateCachePartition {
@@ -1546,7 +1585,11 @@ async fn a_required_pull_takes_the_fast_path_only_for_the_required_partition_s_b
             hash,
             Vec::new(),
             &[],
-            required,
+            PullTarget {
+                required,
+                environment: None,
+                served_environment: None,
+            },
         )
         .await;
     assert_eq!(result.outcome.is_materialized(), fast_path);
@@ -1573,6 +1616,92 @@ async fn a_probed_partition_is_present_refused_or_pulled_into() {
         action(twin_partition()).unwrap(),
         ProbedPartition::Refuse(rowless_build_dir_refusal("seed", &hash, twin_partition()))
     );
+}
+
+/// The legacy partition's row of the digest is the release's build only when
+/// it's bound there: unbound, or bound to the initial environment. A build
+/// bound to another environment, as startup recovery adopts in place, holds
+/// the dir the release would land in, so the probe reports it rather than a
+/// hit that a lookup of the legacy partition wouldn't find.
+#[rstest::rstest]
+#[case::unbound(None, ProbedPartition::Present)]
+#[case::initial_environment(
+    Some(pplx_space_node_runtime_core::catalog::initial_environment_reference()),
+    ProbedPartition::Present
+)]
+#[case::adopted(
+    twin_partition().environment(),
+    ProbedPartition::HeldByAnotherEnvironment(twin_partition())
+)]
+fn a_legacy_row_is_present_only_when_bound_to_the_legacy_partition(
+    #[case] environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+    #[case] expected: ProbedPartition,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "c".repeat(64));
+    let db = db_with_legacy_build_bound_to(&hash, environment);
+    assert_eq!(
+        probed_partition_action(
+            &db,
+            root.path(),
+            "seed",
+            &hash,
+            TemplateCachePartition::Legacy
+        )
+        .unwrap(),
+        expected
+    );
+}
+
+/// A cache partition held by another environment's build ends the pull at
+/// the location that found it: every location's copy of the digest lands in
+/// that partition, so the next one could only hide the conflict behind its
+/// own failure, a missing manifest's here. Other failures still fall through
+/// to the next location.
+#[tokio::test]
+async fn a_held_partition_ends_the_pull_at_the_location_that_found_it() {
+    let uris = [
+        "s3://bucket/first?region=us-east-1".to_string(),
+        "s3://bucket/second?region=us-east-1".to_string(),
+    ];
+    // Each location's outcome, in order, and how many were tried.
+    let pull = async |outcomes: [Result<PullWrite, PullFailure>; 2]| {
+        let mut outcomes = outcomes.into_iter();
+        let mut tried = 0;
+        let result = pull_from_locations(&uris, &PullCleanupSlot::default(), |_| {
+            tried += 1;
+            std::future::ready(outcomes.next().unwrap().map_err(PullError::Failure))
+        })
+        .await;
+        (result, tried)
+    };
+
+    let (result, tried) = pull([
+        Err(PullFailure::PartitionHeldByAnotherEnvironment),
+        Err(PullFailure::StorageObjectMissing),
+    ])
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(PullError::Failure(
+                PullFailure::PartitionHeldByAnotherEnvironment
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(tried, 1);
+
+    let (result, tried) = pull([
+        Err(PullFailure::StorageObjectMissing),
+        Ok(PullWrite::AlreadyPresent),
+    ])
+    .await;
+    assert!(
+        matches!(result, Ok(PullWrite::AlreadyPresent)),
+        "{result:?}"
+    );
+    assert_eq!(tried, 2);
 }
 
 /// A pull that requires a partition and joins a flight whose owner found the
@@ -1611,7 +1740,11 @@ async fn a_required_pull_retries_after_joining_another_partition_s_fast_path(
         hash.clone(),
         Vec::new(),
         &[],
-        required,
+        PullTarget {
+            required,
+            environment: None,
+            served_environment: None,
+        },
     ));
     // One poll runs the pull to its first wait. The test holds the digest's
     // flight, so the pull can only join it, and pending there is the join.

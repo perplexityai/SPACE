@@ -20,10 +20,12 @@ pub enum InsertTwin {
     /// The insert conflicted and no usable release is in the target's
     /// partition: a unique index still admits only one release per
     /// `(template_name, hash)` (`idx_template_releases_template_name_hash_unique`,
-    /// which the contract migration drops), or a release without storage under
-    /// `original`'s exact spelling already occupies the target partition's
-    /// `(template_name, hash, environment)` slot.
+    /// which the contract migration drops).
     Refused,
+    /// A release without storage under `original`'s exact spelling already
+    /// occupies the target partition's `(template_name, hash, environment)`
+    /// slot, so no twin fits there until it's removed. Carries its id.
+    SlotTaken(Uuid),
 }
 
 /// Insert the twin of `original` bound to `target`, carrying
@@ -40,7 +42,7 @@ pub enum InsertTwin {
 /// `execution_metadata` doesn't bind `target.environment`, or when it would
 /// insert the twin and none of `locations` is one of the original's: a twin
 /// with no location would hold the environment's release slot with nothing
-/// fetchable and turn a retry into [`InsertTwin::Refused`]. `locations` isn't
+/// fetchable and turn a retry into [`InsertTwin::SlotTaken`]. `locations` isn't
 /// checked when nothing is inserted.
 ///
 /// The twin's `created_at` is never earlier than its original's, so the
@@ -140,8 +142,9 @@ async fn insert_in(
         // updating it, so the locking read above still returned it), or the
         // old index refused the row, or an inserter that doesn't take the
         // template lock filled the partition since the check above.
-        // Registration and this store take it; the Kind bootstrap script
-        // (`scripts/bootstrap-templates.sh`) inserts without it. Looking again
+        // Registration, this store and the Kind bootstrap script
+        // (`scripts/bootstrap-templates.sh`) take it, but a checkout of that
+        // script from before it took the lock inserts without it. Looking again
         // reports that last case as `Existing` rather than as the old index.
         if let Some(existing) =
             crate::release_of_hash_in_partition(&mut *tx, &template_name, &hash, target).await?
@@ -154,10 +157,26 @@ async fn insert_in(
         .bind(original)
         .fetch_one(&mut *tx)
         .await?;
-        return Ok(if original_present {
-            InsertTwin::Refused
-        } else {
-            InsertTwin::OriginalGone
+        if !original_present {
+            return Ok(InsertTwin::OriginalGone);
+        }
+        // The target slot under the exact spelling, which the partition
+        // lookup above skips when it has no storage: that release, rather
+        // than the old index, is what refused the row.
+        let occupant = sqlx::query_scalar::<_, Uuid>(sql!(
+            "SELECT id FROM template_releases
+             WHERE template_name = $1
+               AND hash = $2
+               AND (execution_metadata->>'environment') IS NOT DISTINCT FROM $3"
+        ))
+        .bind(&template_name)
+        .bind(&hash)
+        .bind(target.environment.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        return Ok(match occupant {
+            Some(occupant) => InsertTwin::SlotTaken(occupant),
+            None => InsertTwin::Refused,
         });
     };
     let copied = sqlx::query(sql!(

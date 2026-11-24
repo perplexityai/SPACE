@@ -12,6 +12,10 @@ workspace = true
 
 [dependencies]
 pplx-space-sandbox-model = { workspace = true }
+pplx-space-sql-codec = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true }
-sqlx = { workspace = true, features = ["derive", "postgres"] }
 thiserror = { workspace = true }
+
+[features]
+default = []
+sqlx = ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/postgres"]

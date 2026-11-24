@@ -7,15 +7,16 @@ import json
 import secrets
 import shlex
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from functools import cached_property
 from http.client import IncompleteRead
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -118,7 +119,19 @@ from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.console import ConsoleAssertions
-from space_smoke.execution_environment import ExecutionEnvironmentAdmission
+from space_smoke.environment_placement_gate import (
+    EnvironmentPlacementGate,
+    EnvironmentPlacementGateControl,
+)
+from space_smoke.execution_environment import (
+    BoundSeed,
+    ExecutionEnvironmentAdmission,
+    ExecutionEnvironmentControl,
+    SelectableEnvironment,
+    catalog_reference,
+    expect_runtime,
+)
+from space_smoke.runtime_upgrade_campaign import CampaignControl, TemplateCampaignAssertions
 from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
@@ -867,14 +880,20 @@ class EcwSandboxCollection(SandboxCollection):
         metadata: Mapping[str, str] | None = None,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        template: str | None = None,
     ) -> EcwSandbox:
-        """Create another run-owned sandbox with critical cleanup pre-armed."""
+        """Create another run-owned sandbox with critical cleanup pre-armed.
 
-        options = {}
+        `template` overrides the scenario's template for this create.
+        """
+
+        options: dict[str, Any] = {}
         if allow_internet_access is not None:
             options["allow_internet_access"] = allow_internet_access
         if network is not None:
             options["network"] = network
+        if template is not None:
+            options["template"] = template
         return self._sandboxes.create(metadata, **options)
 
     def attempt_create(
@@ -882,13 +901,21 @@ class EcwSandboxCollection(SandboxCollection):
         *,
         allow_internet_access: bool | None = None,
         network: NetworkConfig | None = None,
+        template: str | None = None,
+        refused_statuses: Collection[int] = (),
     ) -> EcwCreateAttempt:
-        """Observe a raw create using this scenario's template and timeout."""
+        """Observe a raw create using this scenario's template (or `template`) and timeout.
+
+        A status in `refused_statuses` is a server refusal the scenario
+        expects; its cleanup is dropped once the run's markers list no sandbox.
+        """
 
         with self._context.phase("attempt sandbox creation"):
             return self._sandboxes.attempt_create(
                 allow_internet_access=allow_internet_access,
                 network=network,
+                template=template,
+                refused_statuses=refused_statuses,
             )
 
     def fork(
@@ -2869,6 +2896,86 @@ class KindAdmin(ScenarioFixture):
             )
         return self._console_assertions
 
+    _execution_environment_control: ExecutionEnvironmentControl | None = None
+
+    def _environment_control(self) -> ExecutionEnvironmentControl:
+        if self._execution_environment_control is None:
+            raise SmokeConfigurationError(
+                "execution-environment control is only available on the kind backend"
+            )
+        return self._execution_environment_control
+
+    def admit_execution_environment(self, name: str) -> ExecutionEnvironmentAdmission:
+        """An admission of `name` the scenario drives itself, stage by stage.
+
+        For a scenario that needs some nodes to run the environment and others
+        not; nothing is admitted until it calls `admit(roles)`. It withdraws
+        the admission after deleting what runs it, as setup's admission does.
+        """
+
+        return ExecutionEnvironmentAdmission(
+            self, self._environment_control(), self._context.scope, name
+        )
+
+    _environment_placement_gate_control: EnvironmentPlacementGateControl | None = None
+    _environment_placement_gate: EnvironmentPlacementGate | None = None
+
+    @property
+    def environment_placement_gate(self) -> EnvironmentPlacementGate:
+        """Turn the environment placement gate on for this scenario, and put it back."""
+
+        if self._environment_placement_gate_control is None:
+            raise SmokeConfigurationError(
+                "environment placement gate control is only available on the kind backend"
+            )
+        if self._environment_placement_gate is None:
+            self._environment_placement_gate = EnvironmentPlacementGate(
+                self, self._environment_placement_gate_control, self._context.scope
+            )
+        return self._environment_placement_gate
+
+    _ecw_creator: Any = None
+
+    def create_ecw_sandbox(self) -> str:
+        """A sandbox of this scenario's template created through the ECW API; its bare id.
+
+        It names no shape, so it can claim a default-shape warm-pool slot,
+        which an admin or native create doesn't. Until the create answers,
+        cleanup finds what it made by this call's own metadata, so a lost
+        reply leaves nothing behind; once it answers, cleanup kills that
+        sandbox by ID, which also succeeds once its timeout has removed it.
+        """
+
+        if self._ecw_creator is None:
+            raise SmokeConfigurationError("ECW creates need the ECW SDK surface")
+        creator = self._ecw_creator
+        metadata = {"space_smoke_ecw_create": uuid.uuid4().hex}
+        by_metadata = self._context.scope.defer(
+            "kill the ECW sandbox", lambda: creator.kill_matching(metadata), critical=True
+        )
+        sandbox = creator.create(template=self.sandbox_template_name(), timeout=600, metadata=metadata)
+        sandbox_id = str(sandbox.sandbox_id)
+        self._context.scope.defer(
+            f"kill ECW sandbox {sandbox_id}", lambda: creator.kill_sandbox(sandbox_id), critical=True
+        )
+        by_metadata.disarm()
+        return sandbox_id
+
+    _campaign_control: CampaignControl | None = None
+    _campaign_assertions: TemplateCampaignAssertions | None = None
+
+    @property
+    def template_campaigns(self) -> TemplateCampaignAssertions:
+        """Template runtime-upgrade campaigns, driven and read through the admin API."""
+
+        if self._campaign_control is None:
+            raise SmokeConfigurationError("campaign control is only available on the kind backend")
+        if self._campaign_assertions is None:
+            self._campaign_assertions = TemplateCampaignAssertions(
+                self, self._campaign_control, self._context.scope
+            )
+        return self._campaign_assertions
+
     def sandbox_template_name(self) -> str:
         """The bare template name (no tag or digest) selected for this scenario."""
 
@@ -3271,6 +3378,39 @@ class KindEcw(Ecw, KindAdmin):
                 "this scenario's sandbox config names no kind_execution_environment"
             )
         return self._execution_environment
+
+    def bound_seed(self, environment: SelectableEnvironment) -> BoundSeed:
+        """Seed bound to an environment every node already runs (E0), built under no tag.
+
+        Its release is deleted by `delete()`, or in cleanup.
+        """
+
+        control = self._environment_control()
+        return BoundSeed(
+            self,
+            control,
+            self._context.scope,
+            name=environment.name,
+            reference=catalog_reference(self, control, environment),
+            evidence=f"{environment.name}_seed",
+        )
+
+    def node_manager_nodes(self, roles: Collection[str]) -> tuple[str, ...]:
+        """The kube nodes running a node-manager of `roles` (`execution_environment.NODE_ROLES`)."""
+
+        return self._environment_control().node_manager_nodes(roles)
+
+    def nodes_carrying_label(self, key: str, value: str | None = None) -> list[str]:
+        """The kube nodes carrying label `key`, with `value` when one is given."""
+
+        return self._environment_control().nodes_carrying_label(key, value)
+
+    def expect_running_environment(
+        self, sandbox_id: str, environment: SelectableEnvironment, *, step: str
+    ) -> None:
+        """The sandbox's running VM reports `environment`'s Firecracker."""
+
+        expect_runtime(self, self._environment_control(), environment, sandbox_id, step=step)
 
     _cross_node_control: CrossNodeRestoreControl | None = None
     _cross_node_assertions: CrossNodeRestoreAssertions | None = None

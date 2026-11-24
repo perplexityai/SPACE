@@ -11,8 +11,8 @@ description: Develop or review SPACE metrics, traces, sandbox events, Datadog da
   Define a product metric family, with its tag vocabulary, in a `metrics`
   module of the crate that records it, built on `pplx-space-metrics-emit`.
   When several crates record a family, define it in the recorder the others
-  depend on, or else in a crate they all depend on that is not one of the
-  `legacy` crates in `ARCHITECTURE.toml`, such as `pplx-space-grpc-metrics`;
+  depend on, or else in a crate they all depend on, such as
+  `pplx-space-grpc-metrics`;
   if there is none, add a `*-metrics` crate in the lowest layer whose rules
   allow its names, as `pplx-space-reconcile-metrics` (l10_foundation) and
   `pplx-space-sandbox-metrics` (l40_api) were added. A vocabulary whose values

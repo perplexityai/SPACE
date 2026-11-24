@@ -3,7 +3,8 @@
 use super::pooled::PooledPodEnvironment;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
-use pplx_space_node_model::{NodePoolName, SubstrateKind};
+use pplx_space_node_model::NodePoolName;
+use pplx_space_node_registration_store::lookup as node_lookup;
 
 impl SubstrateAdapter for KubernetesSubstrate {
     fn managed_by(&self) -> &'static str {
@@ -1562,27 +1563,16 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         node_id: NodeId,
     ) -> Result<BuilderClient, ControllerError> {
-        let node_name = sqlx::query_scalar::<_, String>(sql!(
-            "SELECT nk.k8s_node_name
-             FROM nodes n
-             JOIN node_k8s nk ON nk.node_id = n.id
-             WHERE n.id = $1
-               AND n.managed_by = $2
-               AND n.role = 'builder'
-             LIMIT 1"
-        ))
-        .bind(node_id.as_uuid())
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_optional(self.store.pool())
-        .await
-        .map_err(|error| {
-            db_contention_error(&format!("failed to load builder node {node_id}"), &error)
-        })?
-        .ok_or_else(|| {
-            ControllerError::service_unavailable(format!(
-                "builder node {node_id} is not registered"
-            ))
-        })?;
+        let node_name = node_lookup::builder_k8s_node_name(self.store.pool(), node_id)
+            .await
+            .map_err(|error| {
+                db_contention_error(&format!("failed to load builder node {node_id}"), &error)
+            })?
+            .ok_or_else(|| {
+                ControllerError::service_unavailable(format!(
+                    "builder node {node_id} is not registered"
+                ))
+            })?;
         let target = NodeApiTarget {
             managed_by: SpaceNodeManagedBy::Kubernetes,
             role: SpaceNodeRole::Builder,

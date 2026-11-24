@@ -236,9 +236,11 @@ newer copy, so the reconciler leaves the sandbox to that node in two ways.
   While a snapshot of the sandbox is still being created, the plan defers
   (reason `in_flight_snapshot`) before anything else. Otherwise a sandbox
   with no snapshot the recovery accepts doesn't defer: it's quarantined, or
-  deleted if it never finished creating, as before. A report whose publish hasn't committed by
-  then still isn't seen. The next listing skips the sandbox while the node
-  keeps reporting it.
+  deleted if it never finished creating, as before. Live classification and
+  recovery serialize on a per-sandbox advisory lock with any publish reporting
+  the sandbox present, so a publish already holding that lock finishes before
+  either reads `sandbox_observed_states` (dry-run planning doesn't take the
+  lock). The next listing skips the sandbox while the node keeps reporting it.
 
 **Detect it.** `space.sandbox.api.reconciler.rows_deferred` with
 `reason:node_reports_local_copy` counts each plan that deferred to the node.

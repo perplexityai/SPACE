@@ -1830,8 +1830,9 @@ version = "0.6.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.url]]
-version = "2.5.8"
+version = "2.5.9"
 criteria = "safe-to-deploy"
+notes = "Carry forward the existing exemption only to 2.5.9, the release fixing RUSTSEC-2026-0592. No configured imported audit covers this version. This is not an independent audit of url."
 
 [[exemptions.urlencoding]]
 version = "2.1.3"

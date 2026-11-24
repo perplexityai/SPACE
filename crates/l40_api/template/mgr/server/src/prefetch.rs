@@ -57,6 +57,13 @@
 //!       Data isolation can't depend on which RPC happened to succeed.
 //!       See "Visibility gate".
 //!
+//! 3. **Environment pass.** When node-manager reports the environments
+//!    the node can run, both lookups run again per environment, naming it,
+//!    and warm each release bound to it (a twin, or the release itself) in
+//!    that environment's cache partition. Its tag pins are written under that
+//!    partition, its release pins join the keep set, and its pulls join the
+//!    same drain under the same visibility gate. See [`environments`].
+//!
 //! ## Why both passes
 //!
 //! Tags are an intent layer (`prod`, `latest`, …) that doesn't change
@@ -300,7 +307,7 @@
 //! `trigger:on_demand|prefetch_tag|prefetch_latest_release` — see
 //! [`crate::volume::PullTrigger`].
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -312,7 +319,17 @@ use tracing::{debug, info, warn};
 use crate::pinned_digests::PinnedDigestsStore;
 use crate::volume::{LatestReleasesOutcome, PullTrigger, VolumePuller};
 
+mod environments;
+
 const INTERVAL_SECS: u64 = 60;
+/// How long a tick that doesn't know what's bound to the node's
+/// environments leaves release pins unpruned, counted from the last tick that
+/// did, or from the loop's first tick. The table doesn't record which pass wrote a
+/// pin, so a prune without the environment pass's keep entries would drop
+/// pins only it keeps; a node-manager that's still starting, or briefly
+/// unreachable, must not cost them. Past it, a node-manager that never
+/// answers is taken to predate environments, and pins prune as before them.
+const ENVIRONMENT_PIN_GRACE: Duration = Duration::from_secs(600);
 const CONCURRENCY: usize = 2;
 /// Default count for the per-template latest-N release warmer. Each
 /// pinned digest occupies an expanded rootfs on `/space/cache` until
@@ -374,6 +391,9 @@ pub struct PrefetchConfig {
     /// `ListLatestTemplateReleases` per template per tick (`limit = 1`)
     /// to learn each verdict. See the "Visibility gate" module docs.
     pub latest_n: u32,
+    /// Whether the environment pass runs; see
+    /// [`crate::node_environments::EnvironmentAwareness`].
+    pub(crate) environment_awareness: crate::node_environments::EnvironmentAwareness,
 }
 
 impl PrefetchConfig {
@@ -402,6 +422,7 @@ impl PrefetchConfig {
             interval: Duration::from_secs(INTERVAL_SECS),
             concurrency: CONCURRENCY,
             latest_n,
+            environment_awareness: crate::node_environments::EnvironmentAwareness::from_env(),
         }
     }
 }
@@ -458,6 +479,15 @@ pub async fn run_loop(pins: PinnedDigestsStore, volume_puller: VolumePuller, cfg
     );
     tokio::time::sleep(initial_stagger).await;
 
+    // The node's environments as last read; see `tick`.
+    let started_at = std::time::Instant::now();
+    let mut known_environments = KnownEnvironments {
+        last: None,
+        answered_at: started_at,
+        started_at,
+        tag_answered_at: HashMap::new(),
+        release_answered_at: HashMap::new(),
+    };
     loop {
         let started = std::time::Instant::now();
         let result = tick(
@@ -465,7 +495,9 @@ pub async fn run_loop(pins: PinnedDigestsStore, volume_puller: VolumePuller, cfg
             volume_puller.clone(),
             &semaphore,
             cfg.latest_n,
+            cfg.environment_awareness,
             &tag_tuples,
+            &mut known_environments,
         )
         .await;
         let result_label = match &result {
@@ -555,7 +587,9 @@ async fn tick(
     volume_puller: VolumePuller,
     semaphore: &Arc<Semaphore>,
     latest_n: u32,
+    environment_awareness: crate::node_environments::EnvironmentAwareness,
     tag_tuples: &[(TemplateName, TemplateTag)],
+    known_environments: &mut KnownEnvironments,
 ) -> Result<(), String> {
     if tag_tuples.is_empty() {
         // Fall through so the prune call below still clears any stale rows
@@ -586,10 +620,10 @@ async fn tick(
     // until the latest-N pass has had its say on every template — see
     // the queueing site in pass 1.
     let mut pending_tag_pulls: Vec<PendingTagPull> = Vec::new();
-    // Latest-N pulls, queued for the same drain purely so tag pulls can
-    // take the semaphore first; these need no verdict filtering, since
-    // the latest-N pass gates each template before reaching its
-    // releases.
+    // Latest-N pulls, queued for the same drain so tag pulls can take the
+    // semaphore first. The latest-N pass gates each template before
+    // reaching its releases, but the environment pass runs after it and
+    // can still confirm one org-specific, so the drain filters these too.
     let mut pending_release_pulls: Vec<(String, String)> = Vec::new();
     let mut org_specific_tag_tuples: HashSet<(String, String)> = HashSet::new();
     let mut org_specific_templates: BTreeSet<String> = BTreeSet::new();
@@ -604,11 +638,17 @@ async fn tick(
                 record_tag_candidate(name, tag, "unresolved");
                 continue;
             }
-            crate::volume::TagResolveOutcome::Error => {
+            // This lookup names no environment, so no selector goes unapplied
+            // and no binding reads as an `InvalidOrgSpecific` answer.
+            crate::volume::TagResolveOutcome::Error
+            | crate::volume::TagResolveOutcome::SelectorIgnored { .. }
+            | crate::volume::TagResolveOutcome::InvalidOrgSpecific => {
                 record_tag_candidate(name, tag, "resolve_error");
                 continue;
             }
-            crate::volume::TagResolveOutcome::Resolved { hash, visibility } => {
+            crate::volume::TagResolveOutcome::Resolved {
+                hash, visibility, ..
+            } => {
                 // Harden against a verdict already accumulated for this
                 // template, exactly as the latest-N pass does — the two
                 // passes must not protect only one direction. A template
@@ -710,8 +750,9 @@ async fn tick(
                     let name = name.to_string();
                     let tag = tag.to_string();
                     let hash = hash.clone();
-                    // Tag resolution names no environment yet; see
-                    // `PinnedDigestsStore`.
+                    // This pass's lookup names no environment, so its pin
+                    // is the legacy partition's; the environment pass pins
+                    // each runnable environment's.
                     move |s| {
                         s.upsert_tag(
                             &name,
@@ -769,6 +810,9 @@ async fn tick(
     // flush GC protection for everything cached on this node.
     let mut prunable_templates: Vec<String> = Vec::new();
     let mut release_pins_keep: Vec<(String, String)> = Vec::new();
+    // The release pins this tick's upserts actually wrote, which the
+    // environment pass doesn't write again.
+    let mut release_pins_written: HashSet<(String, String)> = HashSet::new();
     // Runs on every tick, whatever `latest_n` says.
     //
     // `latest_n == 0` disables the *warming*, but the pass is also the
@@ -787,7 +831,10 @@ async fn tick(
                         visibility,
                         releases,
                     } => (visibility, releases),
-                    LatestReleasesOutcome::Error => {
+                    // This pass names no environment, so it never gets
+                    // `SelectorIgnored`.
+                    LatestReleasesOutcome::Error
+                    | LatestReleasesOutcome::SelectorIgnored { .. } => {
                         record_release_candidate(&template_name, "", "resolve_error");
                         continue;
                     }
@@ -988,6 +1035,7 @@ async fn tick(
                     record_release_candidate(&template_name, &release.content_hash, "pin_error");
                     continue;
                 }
+                release_pins_written.insert((template_name.clone(), release.content_hash.clone()));
 
                 let locally_cached =
                     crate::volume::local_build_exists(&db, &template_name, &release.content_hash);
@@ -1035,6 +1083,56 @@ async fn tick(
         }
     }
 
+    // ── Pass 3: per-environment twins ──────────────────────────────────
+    //
+    // Each tagged and latest release again, once per environment the node
+    // can run, landing in that environment's cache partition; see
+    // `environments`. Runs after both environment-less passes so their
+    // verdicts gate it, and before the drain so a verdict it reaches gates
+    // theirs. A node whose environments are unknown skips it.
+    //
+    // A read that fails keeps the environments the last one returned, for
+    // `ENVIRONMENT_PIN_GRACE`: the release pins only this pass writes would
+    // otherwise drop out of the tick's keep set, and their twins lose GC
+    // protection, while node-manager is slow or restarting. After that, and
+    // in a process that has never read them, they're unknown: no
+    // environment pass runs and pruning is as before environments.
+    // With environment awareness off, the node's environments aren't read
+    // and the pass doesn't run, as before environments.
+    let last_read_at = known_environments.last.as_ref().map(|last| last.read_at);
+    let node_environments = environments::tick_environments(
+        environment_awareness,
+        tag_tuples,
+        &mut known_environments.last,
+        crate::node_environments::read,
+    )
+    .await;
+    let environment_pass = match environments::environments_to_warm(node_environments.as_ref()) {
+        Some(runnable) => {
+            let templates = unique_prefetch_templates(tag_tuples);
+            environments::run(environments::EnvironmentPass {
+                pins: &pins,
+                db: &db,
+                tag_tuples,
+                templates: &templates,
+                latest_n,
+                environments: runnable,
+                org_specific_tag_tuples: &mut org_specific_tag_tuples,
+                org_specific_templates: &mut org_specific_templates,
+                pinned_releases: &release_pins_written,
+            })
+            .await
+        }
+        None => environments::EnvironmentPassResult::default(),
+    };
+    // Moved out of the pass result, which stays usable for its other fields:
+    // the release prune honors these only if the environments still stand
+    // then (`environment_release_keep`).
+    let environment_keep = environment_pass.release_pins_keep;
+    // A template whose environment lookup failed keeps every release pin,
+    // as one whose environment-less lookup failed does.
+    prunable_templates.retain(|template| !environment_pass.unprunable_templates.contains(template));
+
     // Single dispatch point for the whole tick, tag pulls first.
     //
     // Isolation is the load-bearing reason it lives here rather than at
@@ -1076,22 +1174,52 @@ async fn tick(
         // which matches `template_releases.hash` directly and tolerates
         // a bare (non-`sha256:`-prefixed) digest.
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
-            pending.name.to_string(),
-            pending.hash,
-            PullTrigger::PrefetchTag,
+            PrefetchPull {
+                name: pending.name.to_string(),
+                content_hash: pending.hash,
+                environment: None,
+                trigger: PullTrigger::PrefetchTag,
+            },
         ));
     }
+    // The environment pass ran after the latest-N pass queued these, and can
+    // have confirmed one's template org-specific since.
     for (name, hash) in pending_release_pulls {
+        if org_specific_templates.contains(&name) {
+            record_release_candidate(&name, &hash, "skipped_org_specific");
+            continue;
+        }
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
-            name,
-            hash,
-            PullTrigger::PrefetchLatestRelease,
+            PrefetchPull {
+                name,
+                content_hash: hash,
+                environment: None,
+                trigger: PullTrigger::PrefetchLatestRelease,
+            },
+        ));
+    }
+    let environment_pulls = environments::dispatchable_environment_pulls(
+        environment_pass.pulls,
+        &org_specific_templates,
+    );
+    for pull in environment_pulls {
+        let trigger = pull.trigger();
+        spawned.push(dispatch_pull(
+            db.clone(),
+            volume_puller.clone(),
+            Arc::clone(semaphore),
+            PrefetchPull {
+                name: pull.template,
+                content_hash: pull.content_hash,
+                environment: Some(pull.environment),
+                trigger,
+            },
         ));
     }
 
@@ -1130,12 +1258,62 @@ async fn tick(
     let tag_prune = spawn_blocking_store_op(pins.clone(), move |s| s.prune_tags_outside(&keep))
         .await
         .map_err(|e| format!("prune pinned tags: {e}"));
+    // Tag pins of an environment the node no longer runs stop protecting
+    // their digests. Unknown environments prune nothing within the pin
+    // grace, and leave only the legacy partition's after it.
+    let (expired_tag_lookups, _) = age_lookups(
+        &mut known_environments.tag_answered_at,
+        environment_pass.answered_tag_lookups,
+        environment_pass.ignored_tag_lookups,
+        known_environments.started_at,
+        std::time::Instant::now(),
+    );
+    // Read once, after the drain, so the tag-partition and release prunes
+    // agree on whether the environments still stand.
+    let standing_environments = environments_for_partition_prune(
+        node_environments.as_ref(),
+        last_read_at,
+        known_environments.last.as_ref(),
+        std::time::Instant::now(),
+    );
+    let partition_prune = prune_tag_partitions(
+        &pins,
+        environment_awareness,
+        standing_environments,
+        expired_tag_lookups,
+        holds_release_pins(false, known_environments.answered_at.elapsed()),
+    )
+    .await;
+    let tag_prune = combine_prune_errors(tag_prune, partition_prune);
 
     // Fold the tick's org-specific verdicts into the release-prune
     // inputs: a tag-pass verdict must flush release pins even when the
     // latest-N pass never produced one for the template (`latest_n = 0`,
     // RPC failure, or a mid-tick skew where the latest pass still saw
     // generic and collected keep entries).
+    // While the node's environments are unknown, within ENVIRONMENT_PIN_GRACE
+    // of the last tick that read them, only the org-specific flush below
+    // prunes release pins.
+    let environments_answered = record_environments_read(known_environments, last_read_at);
+    if environments::reads_environments(environment_awareness, tag_tuples)
+        && holds_release_pins(
+            environments_answered,
+            known_environments.answered_at.elapsed(),
+        )
+    {
+        prunable_templates.clear();
+    }
+    hold_ignored_release_lookups(
+        known_environments,
+        environment_pass.answered_release_lookups,
+        environment_pass.ignored_release_lookups,
+        &mut prunable_templates,
+        std::time::Instant::now(),
+    );
+    release_pins_keep.extend(environment_release_keep(
+        standing_environments,
+        environment_keep,
+    ));
     flush_org_specific_release_pins(
         &org_specific_templates,
         &mut prunable_templates,
@@ -1157,6 +1335,171 @@ async fn tick(
     };
 
     combine_prune_errors(tag_prune, release_prune)
+}
+
+/// The node's environments as the prefetch loop last read them, and when it
+/// started.
+struct KnownEnvironments {
+    last: Option<environments::LastEnvironments>,
+    /// When a tick last read the node's environments itself, not from the
+    /// last answer: the read's own time ([`record_environments_read`]). The
+    /// loop's start until then.
+    answered_at: std::time::Instant,
+    /// When the loop started.
+    started_at: std::time::Instant,
+    /// When each environment tag lookup was last answered, for those
+    /// answered within the pin grace (`age_lookups`).
+    tag_answered_at: HashMap<environments::TagLookup, std::time::Instant>,
+    /// The same for each environment latest-releases lookup.
+    release_answered_at: HashMap<environments::ReleaseLookupKey, std::time::Instant>,
+}
+
+/// Splits the tick's ignored lookups into those whose pins age out, which
+/// the cluster hasn't answered within [`ENVIRONMENT_PIN_GRACE`], counting
+/// from the loop's start for one never answered, and those still holding.
+/// Each lookup's grace is its own, so one whose selector stays ignored can't
+/// expire another's pin that a recent tick refreshed, or hold it. Records
+/// this tick's answers in `answered_at` first and forgets those past the
+/// grace, which then read as never answered: the loop's start is older
+/// still. Each answer carries when its RPC returned, so the grace counts
+/// from the answer, not from this tick's prune. Generic over the key, a [`environments::TagLookup`] or a
+/// [`environments::ReleaseLookupKey`], so both pin kinds age the same way.
+/// `K: Eq + Hash` is what a `HashMap` key needs. Takes `now` so the bound
+/// has its own test.
+fn age_lookups<K: Eq + std::hash::Hash>(
+    answered_at: &mut HashMap<K, std::time::Instant>,
+    answered: Vec<(K, std::time::Instant)>,
+    ignored: Vec<K>,
+    started_at: std::time::Instant,
+    now: std::time::Instant,
+) -> (Vec<K>, Vec<K>) {
+    // The newest answer wins: configuration can list a lookup twice, and
+    // its answers needn't arrive in order.
+    for (lookup, at) in answered {
+        answered_at
+            .entry(lookup)
+            .and_modify(|last| *last = (*last).max(at))
+            .or_insert(at);
+    }
+    answered_at.retain(|_, at| now.duration_since(*at) < ENVIRONMENT_PIN_GRACE);
+    ignored.into_iter().partition(|lookup| {
+        let since = answered_at.get(lookup).copied().unwrap_or(started_at);
+        now.duration_since(since) >= ENVIRONMENT_PIN_GRACE
+    })
+}
+
+/// A template whose environment latest-releases lookup the cluster didn't
+/// apply the selector to keeps its release pins within the pin grace of that
+/// lookup's own last answer, so a template whose selector stays ignored can't
+/// hold another template's pins past theirs. Records this tick's answers in
+/// `known_environments` ([`age_lookups`]), then takes the templates still
+/// holding out of `prunable_templates` ([`hold_release_pins_of`]). The tick
+/// calls it with its own state and the time, so a test can drive the wiring
+/// tick after tick.
+fn hold_ignored_release_lookups(
+    known_environments: &mut KnownEnvironments,
+    answered: Vec<(environments::ReleaseLookupKey, std::time::Instant)>,
+    ignored: Vec<environments::ReleaseLookupKey>,
+    prunable_templates: &mut Vec<String>,
+    now: std::time::Instant,
+) {
+    let (_, holding) = age_lookups(
+        &mut known_environments.release_answered_at,
+        answered,
+        ignored,
+        known_environments.started_at,
+        now,
+    );
+    hold_release_pins_of(&holding, prunable_templates);
+}
+
+/// Takes the templates of the ignored release lookups still within their
+/// grace (`holding`, from [`age_lookups`]) out of the release prune, so their
+/// pins stay. It runs before [`flush_org_specific_release_pins`], which puts
+/// an org-specific template back: a verdict still flushes it. Takes slices,
+/// not owned `Vec`s, since it only reads `holding` and edits `prunable` in
+/// place. Pure function so the wiring has its own focused test.
+fn hold_release_pins_of(
+    holding: &[environments::ReleaseLookupKey],
+    prunable_templates: &mut Vec<String>,
+) {
+    prunable_templates.retain(|template| !holding.iter().any(|(held, _)| held == template));
+}
+
+/// Whether this tick knew the node's environments: it read them itself, so
+/// the last answer's read time moved from `read_before`. A tick using the
+/// last answer doesn't count, so the pin grace counts from the read and the
+/// last answer's own expiry doesn't add to it. An ignored selector is
+/// unknown for its own lookup alone ([`age_lookups`]).
+fn knew_environments_this_tick(
+    read_before: Option<std::time::Instant>,
+    last: Option<&environments::LastEnvironments>,
+) -> bool {
+    last.is_some_and(|last| Some(last.read_at) != read_before)
+}
+
+/// The environments the tag-partition prune keeps pins for. A read this tick
+/// made ([`knew_environments_this_tick`]) stands for the whole tick. The last
+/// answer, which a failed read reuses, stands only while it's within
+/// [`ENVIRONMENT_PIN_GRACE`] at prune time: the tick checked its age before
+/// the drain, and a slow drain can carry it past the grace. Past it, the
+/// environments are unknown, as on the next tick. The returned reference
+/// borrows from `node` (lifetime `'a`), not from `last`, so the caller can
+/// pass a short borrow of `known_environments.last`. Takes `now` so the bound
+/// has its own test.
+fn environments_for_partition_prune<'a>(
+    node: Option<&'a crate::node_environments::NodeEnvironments>,
+    read_before: Option<std::time::Instant>,
+    last: Option<&environments::LastEnvironments>,
+    now: std::time::Instant,
+) -> Option<&'a crate::node_environments::NodeEnvironments> {
+    let read_this_tick = knew_environments_this_tick(read_before, last);
+    node.filter(|_| {
+        read_this_tick
+            || last.is_some_and(|last| now.duration_since(last.read_at) < ENVIRONMENT_PIN_GRACE)
+    })
+}
+
+/// The environment pass's release keep entries the release prune honors: all
+/// of them while the environments the pass ran for still stand at prune time
+/// ([`environments_for_partition_prune`]), none once a reused answer has aged
+/// past [`ENVIRONMENT_PIN_GRACE`] during the drain. Past it, the twins' pins
+/// lose the protection only that answer gave them, as their tag pins do.
+/// Takes `keep` by value and hands it back, so honoring it moves the vector
+/// instead of copying it.
+fn environment_release_keep(
+    standing: Option<&crate::node_environments::NodeEnvironments>,
+    keep: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    if standing.is_some() { keep } else { Vec::new() }
+}
+
+/// Records whether this tick read the node's environments itself
+/// ([`knew_environments_this_tick`]), and if it did, moves `answered_at` to
+/// when the read happened. Not to when the tick gets here: the tick reads
+/// them before its pulls drain, and a slow drain would otherwise stretch the
+/// pin grace of every later tick that can't read them.
+fn record_environments_read(
+    known: &mut KnownEnvironments,
+    read_before: Option<std::time::Instant>,
+) -> bool {
+    // `known.last` and `known.answered_at` are separate fields, so the
+    // shared borrow of the one doesn't block assigning the other.
+    match known.last.as_ref() {
+        Some(last) if knew_environments_this_tick(read_before, Some(last)) => {
+            known.answered_at = last.read_at;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether a tick leaves release pins unpruned: what's bound to its node's
+/// environments is unknown, and it's within [`ENVIRONMENT_PIN_GRACE`] of the
+/// last tick that knew, or of the loop's first tick. Pure
+/// function so the bound has its own focused test.
+fn holds_release_pins(environments_known: bool, since_start: Duration) -> bool {
+    !environments_known && since_start < ENVIRONMENT_PIN_GRACE
 }
 
 /// Combine the tick's two pin-prune outcomes into one result, keeping
@@ -1303,18 +1646,59 @@ fn flush_org_specific_release_pins(
 }
 
 /// Run `op` against the [`PinnedDigestsStore`] on a blocking thread.
-/// Centralizes the `spawn_blocking` + `rusqlite::Error → String`
+/// Centralizes the `spawn_blocking` + `crate::db::Error → String`
 /// conversion so the call sites in [`tick`] aren't dominated by
 /// boilerplate. The closure runs on a blocking worker because every
 /// store method takes the SQLite mutex synchronously.
-async fn spawn_blocking_store_op<F>(pins: PinnedDigestsStore, op: F) -> Result<(), String>
+async fn spawn_blocking_store_op<T, F>(pins: PinnedDigestsStore, op: F) -> Result<T, String>
 where
-    F: FnOnce(&PinnedDigestsStore) -> rusqlite::Result<()> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&PinnedDigestsStore) -> crate::db::Result<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || op(&pins))
         .await
         .map_err(|e| format!("spawn_blocking panic: {e}"))?
         .map_err(|e| format!("{e}"))
+}
+
+/// Drop the tick's stale environment tag pins: those of partitions the node
+/// no longer runs ([`environments::tag_pin_partitions_to_keep`], which
+/// `holding` holds within the pin grace), and those of ignored lookups past
+/// their own grace (`expired`, from [`age_lookups`]). The pins this
+/// tick's lookups wrote are all in partitions it keeps: the pass ran on the
+/// same environments. An ignored selector leaves only its own tag's binding
+/// unknown, so it doesn't touch another tag's pin.
+async fn prune_tag_partitions(
+    pins: &PinnedDigestsStore,
+    awareness: crate::node_environments::EnvironmentAwareness,
+    node_environments: Option<&crate::node_environments::NodeEnvironments>,
+    expired: Vec<environments::TagLookup>,
+    holding: bool,
+) -> Result<(), String> {
+    let keep = environments::tag_pin_partitions_to_keep(awareness, node_environments, holding);
+    if keep.is_none() && expired.is_empty() {
+        return Ok(());
+    }
+    spawn_blocking_store_op(pins.clone(), move |s| {
+        if let Some(keep) = keep {
+            s.prune_tag_partitions_outside(&keep)?;
+        }
+        for (name, tag, partition) in &expired {
+            s.delete_tag(name, tag, *partition)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("prune pinned tag partitions: {e}"))
+}
+
+/// One prefetch pull: a digest and, for the environment pass, the
+/// environment whose twin it is.
+struct PrefetchPull {
+    name: String,
+    content_hash: String,
+    environment: Option<pplx_space_execution_spec::EnvironmentReference>,
+    trigger: PullTrigger,
 }
 
 /// Spawn a bounded prefetch pull. The semaphore is held for the full
@@ -1334,20 +1718,49 @@ where
 /// here, sending the digest as-is against `template_releases.hash`
 /// and bypassing any tag-based path entirely.
 fn dispatch_pull(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     puller: VolumePuller,
     semaphore: Arc<Semaphore>,
-    name: String,
-    content_hash: String,
-    trigger: PullTrigger,
+    pull: PrefetchPull,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let PrefetchPull {
+            name,
+            content_hash,
+            environment,
+            trigger,
+        } = pull;
+        // A twin's pull waits for any pull of its digest already running, as
+        // the environment-less passes' are, before it takes a permit rather
+        // than while holding one. Best effort: one that starts meanwhile is
+        // waited out inside the pull, with the permit held.
+        if let Some(environment) = environment {
+            puller
+                .wait_for_digest_flights(
+                    &name,
+                    &content_hash,
+                    Some(
+                        pplx_space_node_runtime_core::catalog::template_cache_partition(Some(
+                            environment,
+                        )),
+                    ),
+                )
+                .await;
+        }
         let _permit = match semaphore.acquire_owned().await {
             Ok(p) => p,
             Err(_) => return, // semaphore closed; daemon shutting down
         };
-        // The release's manifest picks the cache partition.
-        let outcome = puller.pull(db, &name, &content_hash, "", trigger).await;
+        // Without an environment the release's manifest picks the cache
+        // partition; with one, the twin lands in that environment's.
+        let outcome = match environment {
+            Some(environment) => {
+                puller
+                    .pull_in_environment(db, &name, &content_hash, environment, trigger)
+                    .await
+            }
+            None => puller.pull(db, &name, &content_hash, "", trigger).await,
+        };
         match outcome {
             crate::volume::PullOutcome::Materialized => {
                 info!(

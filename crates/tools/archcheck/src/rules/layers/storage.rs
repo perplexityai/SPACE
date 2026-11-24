@@ -10,13 +10,11 @@
 //! required (normal or build, not optional) dependency on a driver that
 //! `helpers` doesn't list is a `storage_access` finding until it is added. A
 //! listed helper need not depend on a driver, such as a connector for a
-//! driver's client that does not depend on the driver itself. A Foundation
-//! crate `[rules.layers] legacy` lists is never a helper, so it is checked
-//! like any other; test support and tools are left out. The codec facades
-//! are the Foundation crates `codec_facades` lists, other than helpers and
-//! legacy crates: each re-exports only a driver's codec items, behind
-//! features, those its `exports` list, so that list is what a codec may
-//! use.
+//! driver's client that does not depend on the driver itself. Test support
+//! and tools are left out. The codec facades are the Foundation crates
+//! `codec_facades` lists, other than helpers: each re-exports only a
+//! driver's codec items, behind features, those its `exports` list, so that
+//! list is what a codec may use.
 //!
 //! - `storage_access`: only stores and helpers may have a normal or build
 //!   dependency on a driver, helper or codec facade, optional or not, with
@@ -26,7 +24,7 @@
 //!   and a facade's own on a driver. Its findings also cover a facade's
 //!   source beyond its listed exports ([`facade`]), which no baseline entry
 //!   tolerates.
-//! - `codec_features`: a driver feature of a crate outside Storage, one that
+//! - `codec_features`: a driver feature of a crate other than a store, one that
 //!   turns on an optional dependency on a driver or helper, itself, through
 //!   the features it requests of an optional dependency, or by forwarding to
 //!   another crate's driver feature, may be enabled by stores and helpers:
@@ -37,6 +35,10 @@
 //!   then a driver feature, whose enabling is checked. A store's own
 //!   driver features are not checked: depending on a store is the way to
 //!   reach storage.
+//!
+//! A coordinator, the Storage crate that runs one transaction across stores,
+//! is no store: it holds no SQL and reaches storage only through the stores'
+//! verbs, so both checks treat it as they treat an API crate.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -94,12 +96,12 @@ struct Enabling<'b> {
 pub(super) struct Storage<'a> {
     pub helpers: BTreeMap<&'a str, Helper>,
     /// The codec facades: the Foundation crates `codec_facades` lists that
-    /// are neither helpers nor legacy.
+    /// are not helpers.
     facades: BTreeSet<&'a str>,
     /// The Foundation crates derivation finds that `helpers` doesn't list,
     /// each with the drivers it requires: no helper until listed.
     unlisted: BTreeMap<&'a str, BTreeSet<&'a str>>,
-    /// Each driver feature of each crate outside Storage, by crate and
+    /// Each driver feature of each crate other than a store, by crate and
     /// feature.
     features: BTreeMap<&'a str, BTreeMap<String, Reach>>,
     /// `storage_access` violations, as `(from, driver or helper)`.
@@ -136,7 +138,7 @@ impl<'a> Storage<'a> {
         let mut helpers = BTreeMap::new();
         let mut unlisted = BTreeMap::new();
         for member in graph.members.values() {
-            if member.layer != Some(Layer::Foundation) || config.legacy.contains(member.name()) {
+            if member.layer != Some(Layer::Foundation) {
                 continue;
             }
             // In manifest order, the first named in messages.
@@ -170,7 +172,6 @@ impl<'a> Storage<'a> {
                 member.layer == Some(Layer::Foundation)
                     && config.storage.codec_facades.contains_key(member.name())
                     && !config.storage.helpers.contains(member.name())
-                    && !config.legacy.contains(member.name())
             })
             .map(|member| member.name())
             .collect();
@@ -194,9 +195,10 @@ impl<'a> Storage<'a> {
     }
 
     /// Whether `member` is a store or a storage helper, which may use
-    /// drivers and helpers and enable driver features.
+    /// drivers and helpers and enable driver features; a coordinator is
+    /// neither.
     fn may_use(&self, member: &Member<'_>) -> bool {
-        member.layer == Some(Layer::Storage) || self.helpers.contains_key(member.name())
+        member.is_store() || self.helpers.contains_key(member.name())
     }
 
     /// Whether `from`'s dependency on `to` is a required driver dependency
@@ -234,7 +236,7 @@ impl<'a> Storage<'a> {
                 || (self.is_facade(member.name()) && config.storage.drivers.contains(to)))
     }
 
-    /// Each crate's driver features, outside Storage, to a fixpoint: a
+    /// Each crate's driver features, outside the stores, to a fixpoint: a
     /// feature that turns on an optional dependency on a driver or helper,
     /// or forwards to a feature that does, its own or another such crate's.
     fn driver_features(
@@ -245,7 +247,7 @@ impl<'a> Storage<'a> {
         let members: Vec<&Member<'a>> = graph
             .members
             .values()
-            .filter(|member| member.layer != Some(Layer::Storage))
+            .filter(|member| !member.is_store())
             .collect();
         let tables: BTreeMap<&str, BTreeMap<String, Vec<String>>> = members
             .iter()
@@ -468,15 +470,6 @@ impl<'a> Storage<'a> {
                          move the code that uses it{items} into a store or a storage helper."
                     )
                 }
-                (Layer::Foundation, _) if config.legacy.contains(from) => format!(
-                    "Fix: {}move the code that uses it{items} into a store or a storage helper, \
-                     as splitting {from} up would: [rules.{RULE}] legacy lists it, so it is no \
-                     storage helper itself.",
-                    codec
-                        .as_ref()
-                        .map(|codec| format!("{codec}; for anything else, "))
-                        .unwrap_or_default()
-                ),
                 (Layer::Foundation, _) => format!(
                     "Fix one of: {}if {from} names nothing SPACE-specific, list it in \
                      [rules.{RULE}.storage] helpers in {CONFIG_FILE}, which \
@@ -512,15 +505,27 @@ impl<'a> Storage<'a> {
             } else {
                 ""
             };
-            let detail = format!(
-                ": {from} ({layer}) depends on {to}, {what}, {}{optional}, but only l30_storage \
-                 crates and storage helpers may: nothing above l30_storage reaches a database or \
-                 object storage directly, l10_foundation does only in a helper that names \
-                 nothing SPACE-specific, and l20_domain and other l10_foundation crates hold at \
-                 most a codec, behind an optional normal dependency on a codec facade. {fixes} \
-                 See {GUIDE}.",
-                dependency.describe(),
-            );
+            let detail = if member.is_coordinator() {
+                format!(
+                    ": {from} is a coordinator (an l30_storage crate named *-coordinator) and \
+                     depends on {to}, {what}, {}{optional}, but a coordinator holds no SQL and \
+                     takes no driver, storage helper or codec facade: only stores and storage \
+                     helpers reach a database or object storage. Fix: move the code that uses \
+                     it{items} into the store that owns the rows, as a verb the coordinator calls \
+                     in its transaction. {no_helper} See {GUIDE}.",
+                    dependency.describe(),
+                )
+            } else {
+                format!(
+                    ": {from} ({layer}) depends on {to}, {what}, {}{optional}, but only \
+                     stores and storage helpers may: nothing above l30_storage \
+                     reaches a database or object storage directly, l10_foundation does only in \
+                     a helper that names nothing SPACE-specific, and l20_domain and other \
+                     l10_foundation crates hold at most a codec, behind an optional normal \
+                     dependency on a codec facade. {fixes} See {GUIDE}.",
+                    dependency.describe(),
+                )
+            };
             self.access.insert(
                 key,
                 Crossing {
@@ -621,7 +626,7 @@ impl<'a> Storage<'a> {
             };
             let detail = format!(
                 ": {from} ({layer}) enables the `{feature}` feature of {target}, {how}, which \
-                 {turns_on}, but only l30_storage crates and storage helpers may turn on a driver \
+                 {turns_on}, but only stores and storage helpers may turn on a driver \
                  feature, directly or through a feature of an l10_foundation or l20_domain \
                  crate's own that forwards to it. Fix: drop the feature, move the code that needs it, such as a codec or \
                  a client, into a store in l30_storage (which may enable the feature itself) or a \
@@ -774,7 +779,7 @@ impl<'a> Storage<'a> {
     }
 
     /// The member `package` names, if it has driver features: a crate
-    /// outside Storage.
+    /// other than a store.
     fn featured<'b>(&self, graph: &'b Graph<'_>, package: &str) -> Option<&'b str> {
         let member = graph.member(package)?;
         self.features
@@ -797,7 +802,7 @@ impl<'a> Storage<'a> {
         if let Some(why) = left_out(member) {
             return format!("{from} {why}, which the storage checks leave out");
         }
-        if member.layer == Some(Layer::Storage) {
+        if member.is_store() {
             return format!("{from} is a store, which may reach storage");
         }
         if self.helpers.contains_key(from) {
@@ -832,7 +837,7 @@ impl<'a> Storage<'a> {
         };
         match graph.member(package) {
             None => format!("no workspace member is named {package}"),
-            Some(target) if target.layer == Some(Layer::Storage) => {
+            Some(target) if target.is_store() => {
                 format!("{package} is a store, whose features are not checked")
             }
             Some(_)
@@ -982,9 +987,9 @@ pub(super) fn features_of(member: &Member<'_>) -> BTreeMap<String, Vec<String>> 
 }
 
 /// `layers.stale_entries` for `[rules.layers.storage]`: a `helpers` entry
-/// that is no Foundation crate or is legacy, and a `codec_facades` entry
-/// that is no Foundation crate, is legacy or is a helper. An entry for a crate without a
-/// layer is left to `layers.placement`.
+/// that is no Foundation crate, and a `codec_facades` entry that is no
+/// Foundation crate or is a helper. An entry for a crate without a layer is
+/// left to `layers.placement`.
 pub(super) fn stale_entries(
     ctx: &Context,
     config: &LayersConfig,
@@ -1001,10 +1006,6 @@ pub(super) fn stale_entries(
             Some(Some(layer)) if layer != Layer::Foundation => {
                 format!("a storage helper is an l10_foundation crate, and its layer is {layer}")
             }
-            Some(_) if config.legacy.contains(helper) => format!(
-                "[rules.{RULE}] legacy lists it too, which keeps a crate from being a storage \
-                 helper"
-            ),
             Some(_) => continue,
         };
         findings.push(config_finding(
@@ -1022,9 +1023,6 @@ pub(super) fn stale_entries(
             Some(Some(layer)) if layer != Layer::Foundation => {
                 format!("a codec facade is an l10_foundation crate, and its layer is {layer}")
             }
-            Some(_) if config.legacy.contains(facade) => format!(
-                "[rules.{RULE}] legacy lists it too, which keeps a crate from being a codec facade"
-            ),
             Some(_) if config.storage.helpers.contains(facade) => {
                 "helpers lists it too, and a storage helper may reach storage already".to_owned()
             }

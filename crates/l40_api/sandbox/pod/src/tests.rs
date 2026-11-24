@@ -81,6 +81,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleStage,
 };
 use pplx_space_node_model::NodeGroupName;
+use pplx_space_template_model::TemplateCachePartition;
 
 const TEST_SANDBOX_ID: pplx_space_sandbox_model::SandboxId =
     pplx_space_sandbox_model::SandboxId::from_uuid(Uuid::from_u128(
@@ -4009,7 +4010,6 @@ fn template_build_label_key_is_unchanged() {
 
 #[test]
 fn template_partition_label_key_is_a_distinct_presence_key() {
-    use pplx_space_template_model::TemplateCachePartition;
     let environment: TemplateCachePartition =
         TemplateCachePartition::from_key(&format!("sha256:{}", "cd".repeat(32))).unwrap();
     let partition_less = template_build_presence_label_key("seed", "sha256:abc");
@@ -4025,4 +4025,91 @@ fn template_partition_label_key_is_a_distinct_presence_key() {
         assert!(name.len() <= 63);
         assert!(is_template_presence_metadata_key(key));
     }
+}
+
+/// A pod that requires its environment prefers a node holding the build in
+/// that environment's cache partition, since a twin shares its original's
+/// digest; an unbound or shadowed pod prefers a node holding the digest in
+/// any partition.
+#[test]
+fn a_bound_pod_prefers_a_node_caching_its_environment_s_build() {
+    let env = BTreeMap::new();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let preferred_template_key = |environment: Option<PodEnvironment>| {
+        let pod = build_sandbox_pod(
+            &test_pod_config(),
+            SandboxPodRequest::OnDemand {
+                common: SandboxPodCommon {
+                    environment,
+                    ..test_common("space-sbx-bound-g1", TEST_SANDBOX_ID, 1, &env)
+                },
+                runtime: test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json),
+                node_pool: None,
+                node_group_placement: None,
+            },
+        );
+        preferred_scheduling_terms(&pod)
+            .into_iter()
+            .flat_map(|term| term.preference.match_expressions.unwrap_or_default())
+            .map(|expression| expression.key)
+            .find(|key| is_template_presence_metadata_key(key))
+            .expect("an on-demand create prefers a node caching its template")
+    };
+    let bound = PodEnvironment {
+        reference: bound_environment(),
+        required: true,
+    };
+    assert_eq!(
+        preferred_template_key(Some(bound)),
+        template_partition_presence_label_key("seed", TEST_CONTENT_HASH, bound.cache_partition())
+    );
+    assert_ne!(bound.cache_partition(), TemplateCachePartition::Legacy);
+    let any_partition = template_build_presence_label_key("seed", TEST_CONTENT_HASH);
+    assert_eq!(preferred_template_key(None), any_partition);
+    let shadowed = PodEnvironment {
+        required: false,
+        ..bound
+    };
+    assert_eq!(preferred_template_key(Some(shadowed)), any_partition);
+}
+
+#[test]
+fn an_environment_write_round_trips_and_stays_outside_the_template_write_prefix() {
+    let reference = TemplateReference::from_str(&format!("seed@{TEST_CONTENT_HASH}")).unwrap();
+    let write = TemplateEnvironmentWrite::new(reference.clone(), bound_environment()).unwrap();
+    let key = write.annotation_key();
+    let value = write.annotation_value();
+
+    assert_eq!(
+        parse_template_environment_write_annotation(&key, &value),
+        Some(write.clone())
+    );
+    // A node-ctl that predates it doesn't parse it as a template write.
+    assert!(!is_template_write_annotation_key(&key));
+    assert_eq!(parse_template_write_annotation(&key, &value), None);
+    // Each environment's request of a digest has its own key.
+    let other = TemplateEnvironmentWrite::new(
+        reference,
+        format!("sha256:{}", "f".repeat(64)).parse().unwrap(),
+    )
+    .unwrap();
+    assert_ne!(other.annotation_key(), key);
+    // Only an exact digest names one build.
+    assert_eq!(
+        TemplateEnvironmentWrite::new(
+            TemplateReference::from_str("seed:latest").unwrap(),
+            bound_environment()
+        ),
+        None
+    );
+    // A tag after a valid environment reaches the digest check, and fails it.
+    assert_eq!(
+        parse_template_environment_write_annotation(
+            &key,
+            &format!("{} seed:latest", bound_environment())
+        ),
+        None
+    );
 }

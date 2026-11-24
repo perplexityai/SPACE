@@ -4357,7 +4357,7 @@ fn pattern_ratchet_errors_point_at_the_line() {
 }
 
 /// Every behaviour of the layers rule, as `[rules.layers.<behaviour>]`.
-const LAYERS_BEHAVIOURS: [&str; 25] = [
+const LAYERS_BEHAVIOURS: [&str; 28] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -4381,6 +4381,9 @@ const LAYERS_BEHAVIOURS: [&str; 25] = [
     "test_only",
     "clients",
     "store_edges",
+    "coordinators",
+    "coordinator_edges",
+    "driver_reexports",
     "stale_entries",
     "policy_changed",
 ];
@@ -5469,12 +5472,698 @@ fn layers_edge_checks() {
     });
 }
 
+/// Two coordinators beside [`LAYERED`]'s members.
+const COORDINATORS: [(&str, &str); 2] = [
+    (
+        "crates/l30_storage/c/coordinator",
+        "pplx-space-c-coordinator",
+    ),
+    (
+        "crates/l30_storage/e/coordinator",
+        "pplx-space-e-coordinator",
+    ),
+];
+
+/// A coordinator, a Storage crate named `*-coordinator`, depends only on
+/// Domain, Foundation and the stores that list it, never on a driver or
+/// another coordinator, and declares no state; an API crate uses one only if
+/// it lists the crate in `coordinator_users`, and a store never does. No
+/// Storage crate's library root re-exports a driver. Entries of
+/// `coordinator_users` that allow nothing are stale.
+#[test]
+fn layers_coordinators() {
+    const C: &str = "crates/l30_storage/c/coordinator/Cargo.toml";
+    const S: &str = "crates/l30_storage/s/store/Cargo.toml";
+    const A: &str = "crates/l40_api/a/server/Cargo.toml";
+    const D: &str = "crates/l20_domain/d/Cargo.toml";
+    const S_LIB: &str = "crates/l30_storage/s/store/src/lib.rs";
+    const C_LIB: &str = "crates/l30_storage/c/coordinator/src/lib.rs";
+    /// Name, dependencies, `[rules.layers]` tables, files written over the
+    /// workspace's, and each finding as `(code, start of message,
+    /// location)`.
+    type Case<'a> = (
+        &'a str,
+        Vec<(&'a str, &'a str, &'a str)>,
+        String,
+        Vec<(&'a str, String)>,
+        Vec<(&'a str, String, String)>,
+    );
+    let normal = |from: &'static str, to: &'static str| (from, "dependencies", to);
+    let at = |manifest: &str, line: usize| format!("{manifest}:{line}");
+    // The line of `needle` in the ARCHITECTURE.toml of `tables`.
+    let config_at = |tables: &str, needle: &str| {
+        format!(
+            "ARCHITECTURE.toml:{}",
+            line_with(&layers_config(tables, "required"), needle)
+        )
+    };
+    let store_users = |entries: &str| format!("[rules.layers.store_users]\n{entries}");
+    let coordinator_users = |entries: &str| format!("[rules.layers.coordinator_users]\n{entries}");
+    let passing_tables = format!(
+        "{}{}",
+        store_users(
+            "pplx-space-s-store = [\"pplx-space-c-coordinator\"]\n\
+             pplx-space-t-store = [\"pplx-space-c-coordinator\"]\n"
+        ),
+        coordinator_users("pplx-space-c-coordinator = [\"pplx-space-a\"]\n")
+    );
+    let store_lists_c = coordinator_users("pplx-space-c-coordinator = [\"pplx-space-s-store\"]\n");
+    let not_a_coordinator = coordinator_users(
+        "pplx-space-s-store = [\"pplx-space-a\"]\npplx-space-nobody = [\"pplx-space-a\"]\n",
+    );
+    let unused_users = coordinator_users(
+        "pplx-space-c-coordinator = [\n  \"pplx-space-a\",\n  \"pplx-space-a-client\",\n  \
+         \"pplx-space-nobody\",\n]\n",
+    );
+    let store_users_of_c = store_users("pplx-space-c-coordinator = [\"pplx-space-a\"]\n");
+    let manifest = |name: &str, rest: &str| format!("[package]\nname = {name:?}\n{rest}");
+    let reexports = "use sqlx::Row;\n\
+                     pub(crate) use sqlx::Executor;\n\
+                     pub use sqlx::PgPool;\n\
+                     pub use {kv::Client, std::fmt};\n\
+                     pub mod reexported {\n    pub use ::sqlx as driver;\n}\n\
+                     mod private {\n    pub use sqlx::Postgres;\n}\n\
+                     #[cfg(test)]\npub mod tests {\n    pub use sqlx::Pool;\n}\n\
+                     #[cfg(all(test, unix))]\npub use sqlx::Column;\n\
+                     #[cfg(any(test, unix))]\npub use sqlx::Transaction;\n\
+                     pub fn pool() {}\n";
+    let reexported = |item: &str, place: &str, driver: &str| {
+        format!(
+            "{S_LIB}: `{item}` {place} re-exports the driver {driver} from the library root of \
+             pplx-space-s-store (l30_storage), which hands the store's users a driver."
+        )
+    };
+    let cases: Vec<Case> = vec![
+        (
+            "a coordinator of two stores that list it, used by a service it lists",
+            vec![
+                normal("pplx-space-c-coordinator", "pplx-space-d"),
+                normal("pplx-space-c-coordinator", "pplx-space-f"),
+                normal("pplx-space-c-coordinator", "pplx-space-s-store"),
+                normal("pplx-space-c-coordinator", "pplx-space-t-store"),
+                normal("pplx-space-a", "pplx-space-c-coordinator"),
+            ],
+            passing_tables,
+            vec![],
+            vec![],
+        ),
+        (
+            "a coordinator using a store that doesn't list it",
+            vec![normal("pplx-space-c-coordinator", "pplx-space-s-store")],
+            String::new(),
+            vec![],
+            vec![(
+                "layers.store_edges",
+                format!(
+                    "{C}: pplx-space-c-coordinator (l30_storage) depends on the store \
+                     pplx-space-s-store, a normal dependency, but pplx-space-s-store does not \
+                     list it in [rules.layers] store_users in ARCHITECTURE.toml. A coordinator \
+                     depends only on the stores that list it: if pplx-space-c-coordinator's \
+                     transaction calls pplx-space-s-store, add it to pplx-space-s-store's users, \
+                     which layers.policy_changed reports; otherwise remove the dependency. See \
+                     crates/tools/archcheck/README.md#layers."
+                ),
+                at(C, 6),
+            )],
+        ),
+        (
+            "a coordinator using another coordinator",
+            vec![normal(
+                "pplx-space-c-coordinator",
+                "pplx-space-e-coordinator",
+            )],
+            String::new(),
+            vec![],
+            vec![(
+                "layers.coordinators",
+                format!(
+                    "{C}: pplx-space-c-coordinator is a coordinator (an l30_storage crate named \
+                     *-coordinator), which depends only on l20_domain, l10_foundation and the \
+                     stores that list it in [rules.layers] store_users, but it depends on the \
+                     coordinator pplx-space-e-coordinator, a normal dependency. Coordinators \
+                     don't nest:"
+                ),
+                at(C, 6),
+            )],
+        ),
+        (
+            "a service using a coordinator that doesn't list it",
+            vec![normal("pplx-space-a", "pplx-space-c-coordinator")],
+            String::new(),
+            vec![],
+            vec![(
+                "layers.coordinator_edges",
+                format!(
+                    "{A}: pplx-space-a (l40_api) depends on the coordinator \
+                     pplx-space-c-coordinator, a normal dependency, but pplx-space-c-coordinator \
+                     does not list it in [rules.layers] coordinator_users in ARCHITECTURE.toml. \
+                     A coordinator is used only by the services that list it: if pplx-space-a \
+                     runs this transaction, add it to pplx-space-c-coordinator's users, which \
+                     layers.policy_changed reports;"
+                ),
+                at(A, 6),
+            )],
+        ),
+        (
+            "a store using a coordinator that lists it",
+            vec![normal("pplx-space-s-store", "pplx-space-c-coordinator")],
+            store_lists_c.clone(),
+            vec![],
+            vec![
+                (
+                    "layers.coordinator_edges",
+                    format!(
+                        "{S}: pplx-space-s-store (l30_storage) depends on the coordinator \
+                         pplx-space-c-coordinator, a normal dependency, but a store never uses \
+                         a coordinator:"
+                    ),
+                    at(S, 6),
+                ),
+                (
+                    "layers.stale_entries",
+                    "pplx-space-c-coordinator: lists pplx-space-s-store in [rules.layers] \
+                     coordinator_users in ARCHITECTURE.toml, but only l40_api crates use \
+                     coordinators by their users lists, and its layer is l30_storage, so the \
+                     entry allows nothing. Remove it from the list."
+                        .to_owned(),
+                    config_at(&store_lists_c, "pplx-space-c-coordinator = ["),
+                ),
+            ],
+        ),
+        (
+            "a coordinator reaching a driver",
+            vec![],
+            String::new(),
+            vec![
+                (
+                    C,
+                    manifest("pplx-space-c-coordinator", "[dependencies]\nsqlx = \"1\"\n"),
+                ),
+                (C_LIB, String::new()),
+            ],
+            vec![(
+                "layers.storage_access.no_crossing",
+                format!(
+                    "{C}: pplx-space-c-coordinator is a coordinator (an l30_storage crate named \
+                     *-coordinator) and depends on sqlx, a driver ([rules.layers.storage] drivers \
+                     lists it), a normal dependency, but a coordinator holds no SQL and takes no \
+                     driver, storage helper or codec facade: only stores and storage helpers \
+                     reach a database or object storage."
+                ),
+                at(C, 4),
+            )],
+        ),
+        (
+            "a service enabling a coordinator's own driver feature",
+            vec![],
+            coordinator_users("pplx-space-c-coordinator = [\"pplx-space-a\"]\n"),
+            vec![
+                (
+                    C,
+                    format!(
+                        "{}[features]\npg = [\"dep:sqlx\"]\n[dependencies]\n\
+                         sqlx = {{ version = \"1\", optional = true }}\n",
+                        package("pplx-space-c-coordinator")
+                    ),
+                ),
+                (
+                    A,
+                    format!(
+                        "{}[dependencies]\npplx-space-c-coordinator = {{ path = \
+                         \"../../../l30_storage/c/coordinator\", features = [\"pg\"] }}\n",
+                        package("pplx-space-a")
+                    ),
+                ),
+            ],
+            vec![
+                (
+                    "layers.storage_access.no_crossing",
+                    format!(
+                        "{C}: pplx-space-c-coordinator is a coordinator (an l30_storage crate \
+                         named *-coordinator) and depends on sqlx, a driver ([rules.layers.storage] \
+                         drivers lists it), a normal dependency (optional, so a feature turns it \
+                         on), but a coordinator holds no SQL"
+                    ),
+                    at(C, 8),
+                ),
+                (
+                    "layers.codec_features.no_crossing",
+                    format!(
+                        "{A}: pplx-space-a (l40_api) enables the `pg` feature of \
+                         pplx-space-c-coordinator, with features = [\"pg\"] on a normal \
+                         dependency, which turns on its optional dependency on sqlx, but only \
+                         stores and storage helpers may turn on a driver feature"
+                    ),
+                    at(A, 6),
+                ),
+            ],
+        ),
+        (
+            "a coordinator enabling a Domain crate's driver feature",
+            vec![],
+            String::new(),
+            vec![
+                (
+                    D,
+                    format!(
+                        "{}[features]\ndb = [\"dep:sqlx\"]\n[dependencies]\n\
+                         sqlx = {{ version = \"1\", optional = true }}\n",
+                        package("pplx-space-d")
+                    ),
+                ),
+                (
+                    C,
+                    format!(
+                        "{}[dependencies]\npplx-space-d = {{ path = \"../../../l20_domain/d\", \
+                         features = [\"db\"] }}\n",
+                        package("pplx-space-c-coordinator")
+                    ),
+                ),
+            ],
+            vec![
+                (
+                    "layers.storage_access.no_crossing",
+                    format!("{D}: pplx-space-d (l20_domain) depends on sqlx,"),
+                    at(D, 8),
+                ),
+                (
+                    "layers.codec_features.no_crossing",
+                    format!(
+                        "{C}: pplx-space-c-coordinator (l30_storage) enables the `db` feature of \
+                         pplx-space-d, with features = [\"db\"] on a normal dependency, which \
+                         turns on its optional dependency on sqlx, but only stores and storage \
+                         helpers may turn on a driver feature"
+                    ),
+                    at(C, 6),
+                ),
+            ],
+        ),
+        (
+            "a coordinator using a storage helper",
+            vec![normal("pplx-space-c-coordinator", "pplx-space-g")],
+            "[rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
+             helpers = [\"pplx-space-g\"]\n"
+                .to_owned(),
+            vec![],
+            vec![(
+                "layers.storage_access.no_crossing",
+                format!(
+                    "{C}: pplx-space-c-coordinator is a coordinator (an l30_storage crate named \
+                     *-coordinator) and depends on pplx-space-g, a storage helper \
+                     ([rules.layers.storage] helpers lists it), a normal dependency, but a \
+                     coordinator holds no SQL"
+                ),
+                at(C, 6),
+            )],
+        ),
+        (
+            "a coordinator declaring state",
+            vec![],
+            String::new(),
+            vec![(
+                C,
+                format!(
+                    "{}[package.metadata.space.state]\npostgres = []\n",
+                    package("pplx-space-c-coordinator")
+                ),
+            )],
+            vec![(
+                "layers.coordinators",
+                format!(
+                    "{C}: pplx-space-c-coordinator is a coordinator (an l30_storage crate named \
+                     *-coordinator), which owns no tables, but its Cargo.toml has a \
+                     [package.metadata.space.state]. Remove it:"
+                ),
+                at(C, 5),
+            )],
+        ),
+        (
+            "coordinator_users keys that are no coordinator",
+            vec![],
+            not_a_coordinator.clone(),
+            vec![],
+            vec![
+                (
+                    "layers.stale_entries",
+                    "pplx-space-nobody: is in [rules.layers] coordinator_users in \
+                     ARCHITECTURE.toml, but no workspace member has this name. Remove the entry."
+                        .to_owned(),
+                    config_at(&not_a_coordinator, "pplx-space-nobody = ["),
+                ),
+                (
+                    "layers.stale_entries",
+                    "pplx-space-s-store: is in [rules.layers] coordinator_users in \
+                     ARCHITECTURE.toml, but it is not a coordinator, an l30_storage crate named \
+                     *-coordinator. Remove the entry."
+                        .to_owned(),
+                    config_at(&not_a_coordinator, "pplx-space-s-store = ["),
+                ),
+            ],
+        ),
+        (
+            "coordinator users that don't use it or can't",
+            vec![],
+            unused_users.clone(),
+            vec![],
+            vec![
+                (
+                    "layers.stale_entries",
+                    "pplx-space-c-coordinator: lists pplx-space-a in [rules.layers] \
+                     coordinator_users in ARCHITECTURE.toml, but pplx-space-a has no normal or \
+                     build dependency on pplx-space-c-coordinator, and the list says who uses \
+                     the coordinator today. Remove it from the list."
+                        .to_owned(),
+                    config_at(&unused_users, "\"pplx-space-a\","),
+                ),
+                (
+                    "layers.stale_entries",
+                    "pplx-space-c-coordinator: lists pplx-space-a-client in [rules.layers] \
+                     coordinator_users in ARCHITECTURE.toml, but it is a client, which never \
+                     depends on a coordinator, so the entry allows nothing."
+                        .to_owned(),
+                    config_at(&unused_users, "\"pplx-space-a-client\","),
+                ),
+                (
+                    "layers.stale_entries",
+                    "pplx-space-c-coordinator: lists pplx-space-nobody in [rules.layers] \
+                     coordinator_users in ARCHITECTURE.toml, but no workspace member has this \
+                     name, so the entry allows nothing."
+                        .to_owned(),
+                    config_at(&unused_users, "\"pplx-space-nobody\","),
+                ),
+            ],
+        ),
+        (
+            "a coordinator listed in store_users as a store",
+            vec![],
+            store_users_of_c.clone(),
+            vec![],
+            vec![(
+                "layers.stale_entries",
+                "pplx-space-c-coordinator: is in [rules.layers] store_users in \
+                 ARCHITECTURE.toml, but it is a coordinator, not a store, and [rules.layers] \
+                 coordinator_users lists a coordinator's users. Remove the entry."
+                    .to_owned(),
+                config_at(&store_users_of_c, "pplx-space-c-coordinator = ["),
+            )],
+        ),
+        (
+            "a store's library root re-exporting drivers",
+            vec![],
+            String::new(),
+            vec![
+                (
+                    S,
+                    manifest(
+                        "pplx-space-s-store",
+                        "[dependencies]\nsqlx = \"1\"\nkv = { version = \"1\", package = \
+                         \"redis\" }\n",
+                    ),
+                ),
+                (S_LIB, reexports.to_owned()),
+            ],
+            vec![
+                (
+                    "layers.driver_reexports",
+                    reexported("pub use sqlx::PgPool", "at the file's top level", "sqlx"),
+                    at(S_LIB, 1),
+                ),
+                (
+                    "layers.driver_reexports",
+                    reexported("pub use kv::Client", "at the file's top level", "redis"),
+                    at(S_LIB, 1),
+                ),
+                (
+                    "layers.driver_reexports",
+                    reexported("pub use ::sqlx as driver", "in `reexported`", "sqlx"),
+                    at(S_LIB, 1),
+                ),
+                (
+                    "layers.driver_reexports",
+                    reexported(
+                        "pub use sqlx::Transaction",
+                        "at the file's top level",
+                        "sqlx",
+                    ),
+                    at(S_LIB, 1),
+                ),
+            ],
+        ),
+        (
+            "a coordinator's library root re-exporting its driver crate",
+            vec![],
+            String::new(),
+            vec![
+                (
+                    C,
+                    manifest("pplx-space-c-coordinator", "[dependencies]\nsqlx = \"1\"\n"),
+                ),
+                (C_LIB, "pub extern crate sqlx;\n".to_owned()),
+            ],
+            vec![
+                (
+                    "layers.storage_access.no_crossing",
+                    format!(
+                        "{C}: pplx-space-c-coordinator is a coordinator (an l30_storage crate \
+                         named *-coordinator) and depends on sqlx,"
+                    ),
+                    at(C, 4),
+                ),
+                (
+                    "layers.driver_reexports",
+                    format!(
+                        "{C_LIB}: `pub extern crate sqlx` at the file's top level re-exports the \
+                         driver sqlx from the library root of pplx-space-c-coordinator \
+                         (l30_storage), which hands the coordinator's users a driver."
+                    ),
+                    at(C_LIB, 1),
+                ),
+            ],
+        ),
+    ];
+    std::thread::scope(|scope| {
+        for (name, dependencies, tables, files, expected) in &cases {
+            scope.spawn(move || {
+                let ws = Layered {
+                    extra: &COORDINATORS,
+                    dependencies,
+                    tables,
+                    files: files.clone(),
+                }
+                .build();
+                let expected: Vec<(&str, &str, &str)> = expected
+                    .iter()
+                    .map(|(code, message, at)| (*code, message.as_str(), at.as_str()))
+                    .collect();
+                assert_layer_findings(name, &layer_findings(&load(ws.path(), None)), &expected);
+            });
+        }
+    });
+    // `layout`'s leaf rule accepts `c/coordinator` for `pplx-space-c`, so only
+    // `coordinators` keeps a crate there from being checked as a store
+    // unnoticed.
+    let ws = Layered {
+        extra: &[("crates/l30_storage/c/coordinator", "pplx-space-c")],
+        ..Layered::default()
+    }
+    .build();
+    assert_layer_findings(
+        "a store in a coordinator's directory",
+        &layer_findings(&load(ws.path(), None)),
+        &[(
+            "layers.coordinators",
+            "crates/l30_storage/c/coordinator/Cargo.toml: pplx-space-c is at \
+             crates/l30_storage/c/coordinator, a coordinator's directory, but its name doesn't \
+             end in -coordinator, so archcheck checks it as a store. Rename it \
+             pplx-space-<area>-coordinator, or move it out of the coordinator directory. See \
+             crates/tools/archcheck/README.md#layers.",
+            &format!("{C}:2"),
+        )],
+    );
+}
+
+/// With the state checks, `state.declarations` asks no coordinator for a
+/// state table and leaves one that has a table to `layers.coordinators`; a
+/// coordinator's write statement naming a store's table is a `state.writes`
+/// finding, which no co-writer grant lifts, and such a grant is stale.
+#[test]
+fn layers_coordinators_and_the_state_checks() {
+    const C: &str = "crates/l30_storage/c/coordinator/Cargo.toml";
+    let grant = "[rules.layers.state.co_writers.postgres]\na = [\"pplx-space-c-coordinator\"]\n";
+    /// Name, co-writer grants, files written over the workspace's, and each
+    /// finding as `(code, start of message, location)`.
+    type Case<'a> = (
+        &'a str,
+        String,
+        Vec<(&'a str, String)>,
+        Vec<(&'a str, &'a str, String)>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "a coordinator without a state table",
+            String::new(),
+            vec![],
+            vec![],
+        ),
+        (
+            "a coordinator with a state table",
+            String::new(),
+            vec![(
+                C,
+                format!(
+                    "{}[package.metadata.space.state]\npostgres = []\n",
+                    package("pplx-space-c-coordinator")
+                ),
+            )],
+            vec![(
+                "layers.coordinators",
+                "crates/l30_storage/c/coordinator/Cargo.toml: pplx-space-c-coordinator is a \
+                 coordinator",
+                format!("{C}:5"),
+            )],
+        ),
+        (
+            "a co-writer grant to a coordinator",
+            grant.to_owned(),
+            vec![],
+            vec![(
+                "layers.stale_entries",
+                "postgres.a: lists pplx-space-c-coordinator in \
+                 [rules.layers.state.co_writers.postgres] in ARCHITECTURE.toml, but it is a \
+                 coordinator, which owns and writes no tables, so the grant allows nothing.",
+                format!(
+                    "ARCHITECTURE.toml:{}",
+                    line_with(
+                        &layers_config(&format!("{STATE}{grant}"), "required"),
+                        "a = [\"pplx-space-c-coordinator\"]"
+                    )
+                ),
+            )],
+        ),
+    ];
+    let writer = || {
+        vec![
+            (
+                C,
+                "[package]\nname = \"pplx-space-c-coordinator\"\n".to_owned(),
+            ),
+            (
+                "crates/l30_storage/c/coordinator/src/lib.rs",
+                "pub const SQL: &str = \"UPDATE a SET id = 1\";\n".to_owned(),
+            ),
+        ]
+    };
+    let write = (
+        "layers.state.writes",
+        "crates/l30_storage/c/coordinator/src/lib.rs: pplx-space-c-coordinator writes postgres.a \
+         here (UPDATE a), but pplx-space-s-store owns that table, and a coordinator holds no \
+         SQL. Move the statement into pplx-space-s-store as a verb, and call it from \
+         pplx-space-c-coordinator's transaction. See crates/tools/archcheck/README.md#layers.",
+        "crates/l30_storage/c/coordinator/src/lib.rs:1".to_owned(),
+    );
+    let mut cases = cases;
+    // `b` is live and no store declares it: the coordinator's declaration
+    // leaves it unowned.
+    cases.push((
+        "a coordinator declaring an unowned live table",
+        String::new(),
+        vec![
+            (
+                "architecture-baseline.toml",
+                state_baseline(&[("sqlite.svc", "jobs")]),
+            ),
+            (
+                C,
+                format!(
+                    "{}[package.metadata.space.state]\npostgres = [\"b\"]\n",
+                    package("pplx-space-c-coordinator")
+                ),
+            ),
+        ],
+        vec![
+            (
+                "layers.coordinators",
+                "crates/l30_storage/c/coordinator/Cargo.toml: pplx-space-c-coordinator is a \
+                 coordinator",
+                format!("{C}:5"),
+            ),
+            (
+                "layers.unowned.no_crossing",
+                "postgres.b: is created by db/postgres/1_baseline.up.sql, but no store declares \
+                 it",
+                "db/postgres/1_baseline.up.sql:2".to_owned(),
+            ),
+        ],
+    ));
+    cases.push((
+        "a coordinator writing a store's table",
+        String::new(),
+        writer(),
+        vec![write.clone()],
+    ));
+    cases.push((
+        "a coordinator writing a store's table it is granted",
+        grant.to_owned(),
+        writer(),
+        vec![
+            write.clone(),
+            (
+                "layers.stale_entries",
+                "postgres.a: lists pplx-space-c-coordinator in \
+                 [rules.layers.state.co_writers.postgres] in ARCHITECTURE.toml, but it is a \
+                 coordinator, which owns and writes no tables, so the grant allows nothing.",
+                format!(
+                    "ARCHITECTURE.toml:{}",
+                    line_with(
+                        &layers_config(&format!("{STATE}{grant}"), "required"),
+                        "a = [\"pplx-space-c-coordinator\"]"
+                    )
+                ),
+            ),
+        ],
+    ));
+    for (name, grants, files, expected) in cases {
+        let mut all = vec![
+            (
+                "architecture-baseline.toml",
+                state_baseline(&[("postgres", "b"), ("sqlite.svc", "jobs")]),
+            ),
+            (
+                S_STORE,
+                stated_manifest("pplx-space-s-store", "postgres = [\"a\"]\n"),
+            ),
+            (
+                T_STORE,
+                stated_manifest("pplx-space-t-store", "sqlite.svc = [\"items\"]\n"),
+            ),
+        ];
+        all.extend(
+            CATALOGS
+                .iter()
+                .map(|(path, text)| (*path, (*text).to_owned())),
+        );
+        all.extend(files);
+        let tables = format!("{STATE}{grants}");
+        let ws = Layered {
+            extra: &COORDINATORS,
+            tables: &tables,
+            files: all,
+            ..Layered::default()
+        }
+        .build();
+        let expected: Vec<(&str, &str, &str)> = expected
+            .iter()
+            .map(|(code, message, at)| (*code, *message, at.as_str()))
+            .collect();
+        assert_layer_findings(name, &layer_findings(&load(ws.path(), None)), &expected);
+    }
+}
+
 /// `[rules.layers]` entries that no longer apply are stale, each shown on its
 /// line in `ARCHITECTURE.toml`: an `unmoved` crate that is gone or in a layer
-/// directory, a `legacy` crate that is gone, a `store_users` store that is not
-/// a Storage member or a user that can't use a store by its list or doesn't
-/// use it, and an `allowed_edges` edge that does not exist or needs no
-/// exception. A user reaching its store through a legacy crate uses it.
+/// directory, a `store_users` store that is not a Storage member or a user
+/// that can't use a store by its list or doesn't use it, and an
+/// `allowed_edges` edge that does not exist or needs no exception.
 #[test]
 fn layers_stale_config_entries() {
     /// Name, the text of the finding's line, `[rules.layers]`' tables, the
@@ -5509,15 +6198,6 @@ fn layers_stale_config_entries() {
             &[],
             "pplx-space-f: is in [rules.layers] unmoved in ARCHITECTURE.toml, but the crate is \
              at crates/l10_foundation/f, whose directory gives its layer.",
-        ),
-        (
-            "a legacy entry for no member",
-            "legacy = ",
-            "[rules.layers]\nlegacy = [\"pplx-space-nobody\"]\n",
-            &[],
-            &[],
-            "pplx-space-nobody: is in [rules.layers] legacy in ARCHITECTURE.toml, but no \
-             workspace member has this name. Remove it.",
         ),
         (
             "a store that is no member",
@@ -5575,8 +6255,8 @@ fn layers_stale_config_entries() {
             &[],
             "pplx-space-s-store: lists pplx-space-a in [rules.layers] store_users in \
              ARCHITECTURE.toml, but pplx-space-a has no normal or build dependency on \
-             pplx-space-s-store, directly or through a [rules.layers] legacy crate that depends \
-             on it, and the list says who uses the store today. Remove it from the list.",
+             pplx-space-s-store, and the list says who uses the store today. Remove it from the \
+             list.",
         ),
         (
             "a user with only a dev-dependency on its store",
@@ -5642,17 +6322,10 @@ fn layers_stale_config_entries() {
         );
     }
 
-    // A user reaching its store through a legacy crate, as through
-    // common-svc's re-exports, uses it; through another crate it doesn't.
-    let tables = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-legacy\"]\n\
-                  [rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a\"]\n\
-                  pplx-space-t-store = [\"pplx-space-a\"]\n\
-                  [rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n";
+    // A user reaching its store only through another crate doesn't use it.
+    let tables = "[rules.layers.store_users]\npplx-space-t-store = [\"pplx-space-a\"]\n";
     let ws = Layered {
-        extra: &[("crates/libs/legacy", "pplx-space-legacy")],
         dependencies: &[
-            ("pplx-space-a", "dependencies", "pplx-space-legacy"),
-            ("pplx-space-legacy", "dependencies", "pplx-space-s-store"),
             ("pplx-space-a", "dependencies", "pplx-space-f"),
             ("pplx-space-f", "dependencies", "pplx-space-t-store"),
         ],
@@ -5712,6 +6385,9 @@ fn layers_policy_changed() {
         |list: &str| format!("[rules.layers.store_users]\npplx-space-s-store = [\n{list}]\n");
     let a = "  \"pplx-space-a\",\n";
     let t = "  \"pplx-space-t-store\",\n";
+    let coordinator_users = |list: &str| {
+        format!("[rules.layers.coordinator_users]\npplx-space-c-coordinator = [\n{list}]\n")
+    };
     let edges = |list: &str| format!("[rules.layers.allowed_edges]\npplx-space-p = [\n{list}]\n");
     let storage = |drivers: &str, helpers: &str| {
         format!("[rules.layers.storage]\ndrivers = [\n  {drivers},\n]\nhelpers = [{helpers}]\n")
@@ -5721,9 +6397,6 @@ fn layers_policy_changed() {
             "{}[rules.layers.storage.codec_facades.\"pplx-space-g\".exports]\nsqlx = [\n{sqlx}]\n",
             storage("\"sqlx\"", "")
         )
-    };
-    let legacy = |list: &str| {
-        format!("[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nlegacy = [{list}]\n")
     };
     // After another `[rules.layers…]` header, as in the repository's copy.
     let protocols = |list: &str| {
@@ -5803,6 +6476,26 @@ fn layers_policy_changed() {
             )],
         ),
         (
+            "a coordinator user added",
+            required.clone(),
+            layers_config(&coordinator_users(a), "required"),
+            &[(
+                "\"pplx-space-a\"",
+                "ARCHITECTURE.toml: `pplx-space-a` was added to the users of \
+                 `pplx-space-c-coordinator` in [rules.layers] coordinator_users.",
+            )],
+        ),
+        (
+            "a coordinator user removed",
+            layers_config(&coordinator_users(a), "required"),
+            layers_config(&coordinator_users(""), "required"),
+            &[(
+                "pplx-space-c-coordinator = [",
+                "ARCHITECTURE.toml: `pplx-space-a` was removed from the users of \
+                 `pplx-space-c-coordinator` in [rules.layers] coordinator_users.",
+            )],
+        ),
+        (
             "an allowed edge added",
             required.clone(),
             layers_config(&edges("  \"pplx-space-s-store\",\n"), "required"),
@@ -5853,33 +6546,6 @@ fn layers_policy_changed() {
                 "[rules.layers.storage.codec_facades",
                 "ARCHITECTURE.toml: `sqlx::Pool` was removed from the exports of \
                  `pplx-space-g` in [rules.layers] storage.codec_facades.",
-            )],
-        ),
-        (
-            "legacy changed",
-            layers_config(&legacy("\"pplx-space-old\""), "required"),
-            layers_config(&legacy("\"pplx-space-new\""), "required"),
-            &[
-                (
-                    "legacy = ",
-                    "ARCHITECTURE.toml: `pplx-space-new` was added to [rules.layers] legacy.",
-                ),
-                (
-                    "legacy = ",
-                    "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] legacy.",
-                ),
-            ],
-        ),
-        (
-            "legacy removed",
-            layers_config(&legacy("\"pplx-space-old\""), "required"),
-            layers_config(
-                "[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\n",
-                "required",
-            ),
-            &[(
-                "[rules.layers]",
-                "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] legacy.",
             )],
         ),
         (
@@ -6584,19 +7250,18 @@ fn layers_rdjson_and_exit_codes() {
 /// The members, beyond [`LAYERED`]'s, of [`storage_workspace`]: a helper
 /// that `helpers` lists, a codec crate whose default feature is a driver
 /// feature, one that reaches drivers only through another codec crate, and
-/// a legacy crate.
+/// an unmoved crate.
 const STORAGE_EXTRA: [(&str, &str); 4] = [
     ("crates/l10_foundation/conn", "pplx-space-conn"),
     ("crates/l10_foundation/h", "pplx-space-h"),
     ("crates/l10_foundation/k", "pplx-space-k"),
-    ("crates/libs/legacy", "pplx-space-legacy"),
+    ("crates/libs/old", "pplx-space-old"),
 ];
 
 /// `[rules.layers]` tables for [`storage_workspace`].
-const STORAGE_TABLES: &str = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-legacy\"]\n\
+const STORAGE_TABLES: &str = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-old\"]\n\
                               [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
-                              helpers = [\"pplx-space-conn\", \"pplx-space-f\"]\n\
-                              [rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n";
+                              helpers = [\"pplx-space-conn\", \"pplx-space-f\"]\n";
 
 /// A layered workspace whose manifests reach drivers in every way the
 /// storage checks tell apart, with `tables` as `[rules.layers]`'s and
@@ -6613,14 +7278,14 @@ const STORAGE_TABLES: &str = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-s
 ///   `redis`, its `pg` forwards to `kv/sqlx`, and its `json` forwards to
 ///   `kv/serde`, no driver feature, which reaches `redis` only by turning
 ///   on that dependency;
-/// - the legacy crate (Foundation) has a required `sqlx`, but `legacy` lists
-///   it, which keeps it from being a helper, and it forwards its `codec`
-///   feature to `g`'s `sqlx`;
+/// - `old` (Foundation, unmoved) has a required `sqlx`, which makes it a
+///   helper `helpers` lacks, and it forwards its `codec` feature to `g`'s
+///   `sqlx`;
 /// - `d` (Domain) has an optional `sqlx`, enables `g`'s `sqlx`, and its
 ///   `hdb` turns on an optional dependency on `h` that requests `sqlx`,
 ///   behind a feature of its own;
-/// - `a` (API) depends on `sqlx`, `f`, `conn` and the legacy crate, enables
-///   the legacy crate's `codec`, and forwards its own `pg` to `g?/sqlx`;
+/// - `a` (API) depends on `sqlx`, `f`, `conn` and `old`, enables `old`'s
+///   `codec`, and forwards its own `pg` to `g?/sqlx`;
 /// - `p` (App) depends on `redis` and enables `a`'s `pg`, `q` takes `h`'s
 ///   default features and enables `d`'s `hdb`, and `b-client` depends on
 ///   `f` and enables `g`'s implicit `redis` and `k`'s `kv` and `json`;
@@ -6661,9 +7326,9 @@ fn storage_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
             ),
         ),
         (
-            "crates/libs/legacy/Cargo.toml",
+            "crates/libs/old/Cargo.toml",
             manifest(
-                "pplx-space-legacy",
+                "pplx-space-old",
                 "[features]\ncodec = [\"pplx-space-g/sqlx\"]\n[dependencies]\nsqlx = \"1\"\n\
                  pplx-space-g = { path = \"../../l10_foundation/g\" }\n",
             ),
@@ -6698,7 +7363,7 @@ fn storage_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
                  pplx-space-f = { path = \"../../../l10_foundation/f\" }\n\
                  pplx-space-conn = { path = \"../../../l10_foundation/conn\" }\n\
                  pplx-space-g = { path = \"../../../l10_foundation/g\", optional = true }\n\
-                 pplx-space-legacy = { path = \"../../../libs/legacy\", features = [\"codec\"] }\n\
+                 pplx-space-old = { path = \"../../../libs/old\", features = [\"codec\"] }\n\
                  [dev-dependencies]\n\
                  pplx-space-h = { path = \"../../../l10_foundation/h\" }\n",
             ),
@@ -6809,14 +7474,14 @@ fn layers_storage_checks() {
     let b = "crates/l40_api/b/client/Cargo.toml";
     let p = "crates/l50_app/p/Cargo.toml";
     let q = "crates/l50_app/q/Cargo.toml";
-    let legacy = "crates/libs/legacy/Cargo.toml";
+    let old = "crates/libs/old/Cargo.toml";
     let expected = [
         (
             "layers.storage_access.no_crossing",
             format!(
                 "{a}: pplx-space-a (l40_api) depends on pplx-space-conn, a storage helper \
                  ([rules.layers.storage] helpers lists it), a normal dependency, but only \
-                 l30_storage crates and storage helpers may"
+                 stores and storage helpers may"
             ),
             at(a, "pplx-space-conn ="),
         ),
@@ -6832,7 +7497,7 @@ fn layers_storage_checks() {
             "layers.storage_access.no_crossing",
             format!(
                 "{a}: pplx-space-a (l40_api) depends on sqlx, a driver ([rules.layers.storage] \
-                 drivers lists it), a normal dependency, but only l30_storage crates and storage \
+                 drivers lists it), a normal dependency, but only stores and storage \
                  helpers may: nothing above l30_storage reaches a database or object storage \
                  directly, l10_foundation does only in a helper that names nothing \
                  SPACE-specific, and l20_domain and other l10_foundation crates hold at most a \
@@ -6851,8 +7516,8 @@ fn layers_storage_checks() {
             "layers.storage_access.no_crossing",
             format!(
                 "{b}: pplx-space-b-client (l40_api) depends on pplx-space-f, a storage helper (it \
-                 has a required dependency on sqlx), a normal dependency, but only l30_storage \
-                 crates and storage helpers may: nothing above l30_storage reaches a database or \
+                 has a required dependency on sqlx), a normal dependency, but only stores \
+                  and storage helpers may: nothing above l30_storage reaches a database or \
                  object storage directly, l10_foundation does only in a helper that names \
                  nothing SPACE-specific, and l20_domain and other l10_foundation crates hold at \
                  most a codec, behind an optional normal dependency on a codec facade. Fix: a \
@@ -6870,7 +7535,7 @@ fn layers_storage_checks() {
             format!(
                 "{d}: pplx-space-d (l20_domain) depends on sqlx, a driver ([rules.layers.storage] \
                  drivers lists it), a normal dependency (optional, so a feature turns it on), but \
-                 only l30_storage crates and storage helpers may: nothing above l30_storage \
+                 only stores and storage helpers may: nothing above l30_storage \
                  reaches a database or object storage directly, l10_foundation does only in a \
                  helper that names nothing SPACE-specific, and l20_domain and other \
                  l10_foundation crates hold at most a codec, behind an optional normal \
@@ -6885,7 +7550,7 @@ fn layers_storage_checks() {
             format!(
                 "{g}: pplx-space-g (l10_foundation) depends on redis, a driver \
                  ([rules.layers.storage] drivers lists it), a normal dependency (optional, so a \
-                 feature turns it on), but only l30_storage crates and storage helpers may"
+                 feature turns it on), but only stores and storage helpers may"
             ),
             at(g, "redis = {"),
         ),
@@ -6910,25 +7575,27 @@ fn layers_storage_checks() {
         (
             "layers.storage_access.no_crossing",
             format!(
-                "{legacy}: pplx-space-legacy (l10_foundation) depends on sqlx, a driver \
+                "{old}: pplx-space-old (l10_foundation) depends on sqlx, a driver \
                  ([rules.layers.storage] drivers lists it), a normal dependency, but only \
-                 l30_storage crates and storage helpers may: nothing above l30_storage reaches \
+                 stores and storage helpers may: nothing above l30_storage reaches \
                  a database or object storage directly, l10_foundation does only in a helper \
                  that names nothing SPACE-specific, and l20_domain and other l10_foundation \
                  crates hold at most a codec, behind an optional normal dependency on a codec \
-                 facade. Fix: move the code that uses it into a store or a storage helper, as \
-                 splitting \
-                 pplx-space-legacy up would: [rules.layers] legacy lists it, so it is \
-                 no storage helper itself. See crates/tools/archcheck/README.md#layers."
+                 facade. Fix one of: [rules.layers.storage] helpers in ARCHITECTURE.toml lists \
+                 every storage helper, and a required driver dependency makes pplx-space-old \
+                 one, but the list lacks it: if pplx-space-old names nothing SPACE-specific, add \
+                 it to helpers; layers.policy_changed reports the change for review. Otherwise \
+                 move the code that uses it into a store or a storage helper. See \
+                 crates/tools/archcheck/README.md#layers."
             ),
-            at(legacy, "sqlx = \"1\""),
+            at(old, "sqlx = \"1\""),
         ),
         // Nor does an app, which goes through an API crate.
         (
             "layers.storage_access.no_crossing",
             format!(
                 "{p}: pplx-space-p (l50_app) depends on redis, a driver ([rules.layers.storage] \
-                 drivers lists it), a normal dependency, but only l30_storage crates and storage \
+                 drivers lists it), a normal dependency, but only stores and storage \
                  helpers may: nothing above l30_storage reaches a database or object storage \
                  directly, l10_foundation does only in a helper that names nothing \
                  SPACE-specific, and l20_domain and other l10_foundation crates hold at most a \
@@ -6946,7 +7613,7 @@ fn layers_storage_checks() {
             format!(
                 "{a}: pplx-space-a (l40_api) enables the `sqlx` feature of pplx-space-g, by \
                  forwarding \"pplx-space-g?/sqlx\" from its own feature `pg`, which turns on its \
-                 optional dependency on sqlx, but only l30_storage crates and storage helpers may \
+                 optional dependency on sqlx, but only stores and storage helpers may \
                  turn on a driver feature, directly or through a feature of an l10_foundation or \
                  l20_domain crate's own that forwards to it. Fix: drop the feature, move the code that needs it, \
                  such as a codec or a client, into a store in l30_storage (which may enable the \
@@ -6958,11 +7625,11 @@ fn layers_storage_checks() {
         (
             "layers.codec_features.no_crossing",
             format!(
-                "{a}: pplx-space-a (l40_api) enables the `codec` feature of pplx-space-legacy, \
+                "{a}: pplx-space-a (l40_api) enables the `codec` feature of pplx-space-old, \
                  with features = [\"codec\"] on a normal dependency, which reaches sqlx through \
                  pplx-space-g/sqlx"
             ),
-            at(a, "pplx-space-legacy ="),
+            at(a, "pplx-space-old ="),
         ),
         (
             "layers.codec_features.no_crossing",
@@ -7087,12 +7754,12 @@ fn layers_storage_checks() {
         ("pplx-space-g", "redis"),
         ("pplx-space-g", "sqlx"),
         ("pplx-space-h", "sqlx"),
-        ("pplx-space-legacy", "sqlx"),
+        ("pplx-space-old", "sqlx"),
         ("pplx-space-p", "redis"),
     ];
     let codecs = [
         ("pplx-space-a", "pplx-space-g/sqlx"),
-        ("pplx-space-a", "pplx-space-legacy/codec"),
+        ("pplx-space-a", "pplx-space-old/codec"),
         ("pplx-space-b-client", "pplx-space-g/redis"),
         ("pplx-space-b-client", "pplx-space-k/json"),
         ("pplx-space-b-client", "pplx-space-k/kv"),
@@ -7171,7 +7838,7 @@ fn layers_storage_checks() {
     let f = "crates/l10_foundation/f/Cargo.toml";
     let message = format!(
         "{f}: pplx-space-f (l10_foundation) depends on sqlx, a driver ([rules.layers.storage] \
-         drivers lists it), a normal dependency, but only l30_storage crates and storage helpers \
+         drivers lists it), a normal dependency, but only stores and storage helpers \
          may: nothing above l30_storage reaches a database or object storage directly, \
          l10_foundation does only in a helper that names nothing SPACE-specific, and l20_domain \
          and other l10_foundation crates hold at most a codec, behind an optional normal \
@@ -7200,18 +7867,14 @@ fn layers_storage_checks() {
 }
 
 /// An entry that no longer applies is stale, with the reason; so is a
-/// `helpers` entry of `[rules.layers.storage]` that does nothing, and a
-/// `[rules.layers] legacy` entry for a crate that is gone, but not one
-/// outside `l10_foundation`. Neither is for a crate without a layer, which
-/// `placement` reports.
+/// `helpers` entry of `[rules.layers.storage]` that does nothing, but not
+/// one for a crate without a layer, which `placement` reports.
 #[test]
 fn layers_storage_stale_entries() {
-    let tables = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-legacy\"]\n\
+    let tables = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-old\"]\n\
                   [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
                   helpers = [\n  \"pplx-space-conn\",\n  \"pplx-space-d\",\n  \"pplx-space-f\",\n  \
-                  \"pplx-space-gone\",\n  \"pplx-space-legacy\",\n]\n\
-                  [rules.layers]\n\
-                  legacy = [\n  \"pplx-space-d\",\n  \"pplx-space-legacy\",\n  \"pplx-space-old\",\n]\n";
+                  \"pplx-space-gone\",\n]\n";
     let access = [
         ("pplx-space-a", "pplx-space-conn"),
         ("pplx-space-a", "pplx-space-f"),
@@ -7224,14 +7887,14 @@ fn layers_storage_stale_entries() {
         ("pplx-space-g", "sqlx"),
         ("pplx-space-gone", "sqlx"),
         ("pplx-space-h", "sqlx"),
-        ("pplx-space-legacy", "sqlx"),
+        ("pplx-space-old", "sqlx"),
         ("pplx-space-p", "redis"),
         ("pplx-space-s-store", "sqlx"),
     ];
     let codecs = [
         ("pplx-space-a", "nofeature"),
         ("pplx-space-a", "pplx-space-g/sqlx"),
-        ("pplx-space-a", "pplx-space-legacy/codec"),
+        ("pplx-space-a", "pplx-space-old/codec"),
         ("pplx-space-a", "pplx-space-s-store/kubernetes"),
         ("pplx-space-b-client", "pplx-space-g/redis"),
         ("pplx-space-b-client", "pplx-space-k/json"),
@@ -7356,35 +8019,12 @@ fn layers_storage_stale_entries() {
             config_at(&format!("  \"{package}\",")),
         )
     };
-    // The second line naming a package in the config is its `legacy` entry.
-    let legacy = |package: &str, reason: &str| {
-        let line = config
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| *line == format!("  \"{package}\","))
-            .map(|(index, _)| index + 1)
-            .last()
-            .expect("the package is in legacy");
-        (
-            format!(
-                "{package}: is in [rules.layers] legacy in ARCHITECTURE.toml, but {reason}. \
-                 Remove it."
-            ),
-            format!("ARCHITECTURE.toml:{line}"),
-        )
-    };
-    // `legacy` is [rules.layers]'s own, whose entries are checked first.
     let expected = [
-        legacy("pplx-space-old", "no workspace member has this name"),
         helper(
             "pplx-space-d",
             "a storage helper is an l10_foundation crate, and its layer is l20_domain",
         ),
         helper("pplx-space-gone", "no workspace member has this name"),
-        helper(
-            "pplx-space-legacy",
-            "[rules.layers] legacy lists it too, which keeps a crate from being a storage helper",
-        ),
     ];
     let found: Vec<(&str, &str)> = config_stale
         .iter()
@@ -7396,11 +8036,10 @@ fn layers_storage_stale_entries() {
         .collect();
     assert_eq!(found, expected);
 
-    // Without its `unmoved` entry the legacy crate has no layer: its
-    // `helpers` and `legacy` entries are left to `placement`.
+    // Without its `unmoved` entry the unmoved crate has no layer: its
+    // `helpers` entry is left to `placement`.
     let tables = "[rules.layers.storage]\ndrivers = [\"sqlx\"]\n\
-                  helpers = [\"pplx-space-legacy\"]\n\
-                  [rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n";
+                  helpers = [\"pplx-space-old\"]\n";
     let ctx = load(storage_workspace(tables, Vec::new()).path(), None);
     let codes: Vec<String> = layer_findings(&ctx)
         .into_iter()
@@ -7498,6 +8137,17 @@ fn layers_storage_base_comparison_and_write_baseline() {
              change, which layers.policy_changed reports"
         )
     };
+    // `old`'s required driver dependency makes it a helper the list lacks.
+    let lacks = |package: &str| {
+        format!(
+            "not added: {package} (l10_foundation) -> sqlx in [layers.storage_access]; \
+             [rules.layers.storage] helpers lists every storage helper, and this required driver \
+             dependency makes {package} one: if it names nothing SPACE-specific, add it to \
+             helpers, which layers.policy_changed reports for review; otherwise fix the \
+             dependency (cargo arch says how). An entry added by hand fails \
+             layers.storage_access.no_new_entries"
+        )
+    };
     assert_eq!(
         not_added,
         [
@@ -7507,7 +8157,7 @@ fn layers_storage_base_comparison_and_write_baseline() {
             line("pplx-space-g (l10_foundation) -> redis"),
             line("pplx-space-g (l10_foundation) -> sqlx"),
             line("pplx-space-h (l10_foundation) -> sqlx"),
-            line("pplx-space-legacy (l10_foundation) -> sqlx"),
+            lacks("pplx-space-old"),
             line("pplx-space-p (l50_app) -> redis"),
         ],
         "{}",
@@ -7552,7 +8202,7 @@ fn layers_storage_base_comparison_and_write_baseline() {
             &line("pplx-space-g (l10_foundation) -> redis"),
             &line("pplx-space-g (l10_foundation) -> sqlx"),
             &line("pplx-space-h (l10_foundation) -> sqlx"),
-            &line("pplx-space-legacy (l10_foundation) -> sqlx"),
+            &lacks("pplx-space-old"),
             &line("pplx-space-p (l50_app) -> redis"),
         ],
         "{}",
@@ -8308,17 +8958,15 @@ fn layers_codec_facades() {
         write.stdout
     );
 
-    // A codec_facades entry outside l10_foundation, for a legacy crate, for
-    // a helper or for no crate does nothing.
+    // A codec_facades entry outside l10_foundation, for a helper or for no
+    // crate does nothing.
     let entry_table = |package: &str| {
         format!("[rules.layers.storage.codec_facades.\"{package}\".exports]\nsqlx = []\n")
     };
     let tables = format!(
-        "[rules.layers.storage]\ndrivers = [\"sqlx\"]\nhelpers = [\"pplx-space-f\"]\n{}{}{}{}\
-         [rules.layers]\nlegacy = [\"pplx-space-g\"]\n",
+        "[rules.layers.storage]\ndrivers = [\"sqlx\"]\nhelpers = [\"pplx-space-f\"]\n{}{}{}",
         entry_table("pplx-space-d"),
         entry_table("pplx-space-f"),
-        entry_table("pplx-space-g"),
         entry_table("pplx-space-gone"),
     );
     let ws = Layered {
@@ -8354,11 +9002,6 @@ fn layers_codec_facades() {
             entry(
                 "pplx-space-f",
                 "helpers lists it too, and a storage helper may reach storage already"
-            ),
-            entry(
-                "pplx-space-g",
-                "[rules.layers] legacy lists it too, which keeps a crate from being a codec \
-                 facade"
             ),
             entry("pplx-space-gone", "no workspace member has this name"),
         ]
@@ -8422,13 +9065,12 @@ const DOMAIN_EXTRA: [(&str, &str); 4] = [
     ("crates/l20_domain/m", "pplx-space-m"),
     ("crates/l20_domain/w/protocol", "pplx-space-w-protocol"),
     ("crates/l20_domain/wire", "pplx-space-wire"),
-    ("crates/libs/legacy", "pplx-space-legacy"),
+    ("crates/libs/old", "pplx-space-old"),
 ];
 
 /// `[rules.layers]` tables for [`domain_workspace`].
-const DOMAIN_TABLES: &str = "[rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n\
-                             protocols = [\"pplx-space-wire\"]\n\
-                             [rules.layers.unmoved]\nl20_domain = [\"pplx-space-legacy\"]\n\
+const DOMAIN_TABLES: &str = "[rules.layers]\nprotocols = [\"pplx-space-wire\"]\n\
+                             [rules.layers.unmoved]\nl20_domain = [\"pplx-space-old\"]\n\
                              [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
                              [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
                              http = [\"hyper\", \"reqwest\"]\nkube = [\"kube\"]\n";
@@ -8444,7 +9086,7 @@ const DOMAIN_TABLES: &str = "[rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n\
 /// - `m`, a model, dev-depends on `tokio` and `w-protocol`, and depends on
 ///   the model `d`;
 /// - `w-protocol` depends on `tokio` for one target, and on `d` and `wire`;
-/// - the legacy crate, a model, depends on `kube` (optional) and `wire`;
+/// - `old`, an unmoved model, depends on `kube` (optional) and `wire`;
 /// - `a` (API) depends on `tokio` and `w-protocol`.
 fn domain_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
     let manifest = |name: &str, body: &str| format!("{}{body}", package(name));
@@ -8484,9 +9126,9 @@ fn domain_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
             ),
         ),
         (
-            "crates/libs/legacy/Cargo.toml",
+            "crates/libs/old/Cargo.toml",
             manifest(
-                "pplx-space-legacy",
+                "pplx-space-old",
                 "[dependencies]\nkube = { version = \"1\", optional = true }\n\
                  pplx-space-wire = { path = \"../../l20_domain/wire\" }\n",
             ),
@@ -8551,19 +9193,19 @@ const DOMAIN_DEPENDENCIES: [(&str, &str); 5] = [
     ("pplx-space-d", "hyper"),
     ("pplx-space-d", "reqwest"),
     ("pplx-space-d", "tokio"),
-    ("pplx-space-legacy", "kube"),
+    ("pplx-space-old", "kube"),
     ("pplx-space-w-protocol", "tokio"),
 ];
 const MODEL_PROTOCOL: [(&str, &str); 3] = [
     ("pplx-space-d", "pplx-space-w-protocol"),
     ("pplx-space-d", "pplx-space-wire"),
-    ("pplx-space-legacy", "pplx-space-wire"),
+    ("pplx-space-old", "pplx-space-wire"),
 ];
 
 /// No Domain crate has a normal or build dependency on a fenced package,
 /// and no model one on a protocol; each finding is on the manifest line
 /// that declares it, says why and how to fix it. Drivers are left to
-/// storage_access, legacy crates are checked, and dev-dependencies and
+/// storage_access, unmoved crates are checked, and dev-dependencies and
 /// crates outside Domain are not.
 #[test]
 fn layers_domain_checks() {
@@ -8572,7 +9214,7 @@ fn layers_domain_checks() {
     let manifest = |path: &str| fs::read_to_string(ws.path().join(path)).unwrap();
     let at = |path: &str, needle: &str| format!("{path}:{}", line_with(&manifest(path), needle));
     let d = "crates/l20_domain/d/Cargo.toml";
-    let legacy = "crates/libs/legacy/Cargo.toml";
+    let old = "crates/libs/old/Cargo.toml";
     let w = "crates/l20_domain/w/protocol/Cargo.toml";
     let expected = [
         (
@@ -8610,10 +9252,10 @@ fn layers_domain_checks() {
         (
             "layers.domain_dependencies.no_crossing",
             format!(
-                "{legacy}: pplx-space-legacy (l20_domain) depends on kube, which \
+                "{old}: pplx-space-old (l20_domain) depends on kube, which \
                  [rules.layers.domain_fences] kube lists, a normal dependency (optional"
             ),
-            at(legacy, "kube ="),
+            at(old, "kube ="),
         ),
         (
             "layers.domain_dependencies.no_crossing",
@@ -8648,10 +9290,8 @@ fn layers_domain_checks() {
         ),
         (
             "layers.model_protocol.no_crossing",
-            format!(
-                "{legacy}: pplx-space-legacy (a model in l20_domain) depends on pplx-space-wire"
-            ),
-            at(legacy, "pplx-space-wire ="),
+            format!("{old}: pplx-space-old (a model in l20_domain) depends on pplx-space-wire"),
+            at(old, "pplx-space-wire ="),
         ),
     ];
     let expected: Vec<(&str, &str, &str)> = expected
@@ -8730,10 +9370,9 @@ fn layers_domain_proto_names() {
 /// a `domain_fences` package that storage_access checks.
 #[test]
 fn layers_domain_stale_entries() {
-    let tables = "[rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n\
-                  protocols = [\n  \"pplx-space-a\",\n  \"pplx-space-gone\",\n  \
+    let tables = "[rules.layers]\nprotocols = [\n  \"pplx-space-a\",\n  \"pplx-space-gone\",\n  \
                   \"pplx-space-w-protocol\",\n  \"pplx-space-wire\",\n]\n\
-                  [rules.layers.unmoved]\nl20_domain = [\"pplx-space-legacy\"]\n\
+                  [rules.layers.unmoved]\nl20_domain = [\"pplx-space-old\"]\n\
                   [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
                   [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
                   http = [\"hyper\", \"reqwest\"]\nkube = [\"kube\"]\ndb = [\"sqlx\"]\n";
@@ -8879,8 +9518,8 @@ fn layers_domain_stale_entries() {
     assert_eq!(found, expected);
 }
 
-/// An l10_foundation crate with a required dependency on a fenced package,
-/// legacy or not, is fenced under its family, to a fixpoint, and the
+/// An l10_foundation crate with a required dependency on a fenced package
+/// is fenced under its family, to a fixpoint, and the
 /// finding names the dependency; one with an optional dependency only is
 /// not, but can be listed. A listed crate that its dependencies fence is a
 /// stale entry; a `protocols` entry for a crate without a layer is not,
@@ -8892,8 +9531,7 @@ fn layers_domain_fences_derive_foundation_crates() {
         ("crates/libs/old", "pplx-space-old"),
         ("crates/libs/stray", "pplx-space-stray"),
     ];
-    let tables = "[rules.layers]\nlegacy = [\"pplx-space-old\"]\n\
-                  protocols = [\"pplx-space-stray\"]\n\
+    let tables = "[rules.layers]\nprotocols = [\"pplx-space-stray\"]\n\
                   [rules.layers.unmoved]\nl10_foundation = [\"pplx-space-old\"]\n\
                   [rules.layers.storage]\ndrivers = [\"sqlx\"]\n\
                   [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
@@ -9099,7 +9737,7 @@ fn layers_domain_base_comparison_and_write_baseline() {
              added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
              that needs the package for good is not Domain code and moves to its layer's \
              directory, a move reviewed in the diff",
-            "not added: pplx-space-legacy (l20_domain) -> kube (kube) in \
+            "not added: pplx-space-old (l20_domain) -> kube (kube) in \
              [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
              added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
              that needs the package for good is not Domain code and moves to its layer's \

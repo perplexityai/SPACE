@@ -6,11 +6,11 @@ use axum::{
     Json,
     extract::{Query, State},
 };
+use pplx_space_admin_audit_store::{AdminAuditEvent as AdminAuditEventRecord, NewAdminAuditEvent};
 use pplx_space_node_model::NodeDrainMode;
 use pplx_space_public_api::{OperationId, PublicSandboxId};
-use pplx_space_sql_locator::sql;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -41,7 +41,7 @@ pub(super) struct ListAdminAuditEventsResponse {
     events: Vec<AdminAuditEvent>,
 }
 
-#[derive(Debug, FromRow, Serialize)]
+#[derive(Debug, Serialize)]
 pub(super) struct AdminAuditEvent {
     id: Uuid,
     actor_user_id: UserId,
@@ -64,6 +64,43 @@ pub(super) struct AdminAuditEvent {
     target_user_id: Option<UserId>,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
+}
+
+impl From<AdminAuditEventRecord> for AdminAuditEvent {
+    fn from(record: AdminAuditEventRecord) -> Self {
+        let AdminAuditEventRecord {
+            id,
+            actor_user_id,
+            actor_org_id,
+            actor_email,
+            method,
+            path,
+            status_code,
+            success,
+            duration_ms,
+            target_org_id,
+            target_type,
+            target_id,
+            target_user_id,
+            created_at,
+        } = record;
+        Self {
+            id,
+            actor_user_id,
+            actor_org_id,
+            actor_email,
+            method,
+            path,
+            status_code,
+            success,
+            duration_ms,
+            target_org_id,
+            target_type,
+            target_id,
+            target_user_id,
+            created_at,
+        }
+    }
 }
 
 pub(super) struct AdminAuditRequestEntry<'a> {
@@ -154,30 +191,12 @@ pub(super) async fn list_audit_events(
     Query(query): Query<ListAdminAuditEventsQuery>,
 ) -> Result<Json<ListAdminAuditEventsResponse>, PublicApiError> {
     let limit = query.normalized_limit()?;
-    let events = sqlx::query_as::<_, AdminAuditEvent>(sql!(
-        "SELECT
-             id,
-             actor_user_id,
-             actor_org_id,
-             actor_email,
-             method,
-             path,
-             status_code,
-             success,
-             duration_ms,
-             target_org_id,
-             target_type,
-             target_id,
-             target_user_id,
-             created_at
-         FROM admin_audit_events
-         ORDER BY created_at DESC, id DESC
-         LIMIT $1"
-    ))
-    .bind(limit)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(database_error)?;
+    let events = pplx_space_admin_audit_store::list_newest(&state.pool, limit)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(AdminAuditEvent::from)
+        .collect();
 
     Ok(Json(ListAdminAuditEventsResponse { events }))
 }
@@ -186,38 +205,24 @@ pub(super) async fn record_request(
     pool: &PgPool,
     entry: AdminAuditRequestEntry<'_>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "INSERT INTO admin_audit_events (
-             id,
-             actor_user_id,
-             actor_org_id,
-             actor_email,
-             method,
-             path,
-             status_code,
-             success,
-             duration_ms,
-             target_org_id,
-             target_type,
-             target_id,
-             target_user_id
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(entry.actor.id)
-    .bind(entry.actor.org_id)
-    .bind(&entry.actor.email)
-    .bind(entry.method)
-    .bind(entry.path)
-    .bind(i32::from(entry.status_code))
-    .bind((200..400).contains(&entry.status_code))
-    .bind(entry.duration_ms)
-    .bind(entry.target.map(|target| target.org_id))
-    .bind(entry.target.map(|target| target.target_type.as_str()))
-    .bind(entry.target.and_then(|target| target.target_id.as_deref()))
-    .bind(entry.target.and_then(|target| target.user_id))
-    .execute(pool)
+    pplx_space_admin_audit_store::insert(
+        pool,
+        NewAdminAuditEvent {
+            id: Uuid::now_v7(),
+            actor_user_id: entry.actor.id,
+            actor_org_id: entry.actor.org_id,
+            actor_email: &entry.actor.email,
+            method: entry.method,
+            path: entry.path,
+            status_code: i32::from(entry.status_code),
+            success: (200..400).contains(&entry.status_code),
+            duration_ms: entry.duration_ms,
+            target_org_id: entry.target.map(|target| target.org_id),
+            target_type: entry.target.map(|target| target.target_type.as_str()),
+            target_id: entry.target.and_then(|target| target.target_id.as_deref()),
+            target_user_id: entry.target.and_then(|target| target.user_id),
+        },
+    )
     .await?;
 
     Ok(())

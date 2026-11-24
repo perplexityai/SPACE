@@ -53,6 +53,7 @@ pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-auto-lifecycle-receipt = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
+pplx-space-data-plane-session-store = { workspace = true }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
@@ -61,9 +62,13 @@ pplx-space-durations = { workspace = true, features = ["serde"] }
 pplx-space-ecw-credential = { workspace = true }
 pplx-space-execution-catalog = { workspace = true }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
+pplx-space-firewall-rules-protocol = { workspace = true }
+pplx-space-firewall-rules-store = { workspace = true }
 pplx-space-k8s-ids = { workspace = true, features = ["serde"] }
 pplx-space-network-roles = { workspace = true, features = ["serde"] }
-pplx-space-rpc-contracts = { workspace = true }
+pplx-space-node-execution-inventory-store = { workspace = true }
+pplx-space-node-registration-store = { workspace = true }
+pplx-space-node-template-inventory-store = { workspace = true }
 pplx-space-sandbox-grpc = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-events = { workspace = true }
@@ -75,11 +80,13 @@ pplx-space-reconcile-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-observability = { workspace = true }
 pplx-space-postgres-pool = { workspace = true }
 pplx-space-rpc-auth = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
+pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-execution-common = { workspace = true }
@@ -92,11 +99,18 @@ pplx-space-runtime-environment-policy-store = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-state-reconciliation = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
+pplx-space-template-release-original = { workspace = true }
+pplx-space-template-release-store = { workspace = true }
+pplx-space-template-store = { workspace = true }
 
 [dev-dependencies]
+pplx-space-template-release-store = { workspace = true, features = ["test-support"] }
+pplx-space-template-store = { workspace = true, features = ["test-support"] }
 pplx-space-api-route = { workspace = true, features = ["test-support"] }
 pplx-space-ecw-credential = { workspace = true, features = ["test-support"] }
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
+pplx-space-firewall-rules-store = { workspace = true, features = ["test-support"] }
+pplx-space-node-status-store = { workspace = true, features = ["test-support"] }
 hex = { workspace = true }
 insta = { workspace = true, features = ["yaml", "redactions"] }
 prost = { workspace = true }

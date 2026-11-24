@@ -12,7 +12,7 @@ fn export_fixture() -> (tempfile::TempDir, TemplateManagerService, String) {
     let digest = format!("sha256:{}", "a".repeat(64));
     insert_ready_build(&conn, TEMPLATE, &digest);
     insert_ready_build(&conn, TEMPLATE, &format!("sha256:{}", "b".repeat(64)));
-    conn.execute(
+    conn.raw().execute(
         "UPDATE template_builds SET build_date = '2026-05-14T00:00:00Z' WHERE content_hash != ?1",
         [&digest],
     )
@@ -122,7 +122,7 @@ async fn export_resolves_catalog_tag(
     assert!(enter_test_process(&[]));
     let (_root, service, digest) = export_fixture();
     if !cached {
-        service.db.lock().unwrap().execute(
+        service.db.lock().unwrap().raw().execute(
             "DELETE FROM template_builds WHERE content_hash = ?1",
             [&digest],
         )?;

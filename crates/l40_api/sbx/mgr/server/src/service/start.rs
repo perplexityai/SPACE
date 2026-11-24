@@ -1778,6 +1778,14 @@ impl SandboxManagerService {
         )
         .await?;
         self.refuse_unretired_runtime_upgrade(&sandbox.id)?;
+        // The staging below moves a stopped row onto a restaged checkpoint
+        // before the restore's activation admission. A sealed node refuses
+        // that activation, so it refuses the warm start here, under the
+        // artifact lock and before anything is staged or written: the row
+        // stays as it was, stopped with its pin, which a v2 drain reports
+        // pending.
+        self.activation_seal
+            .check(ActivationAdmissionKind::Restore.as_str(), &sandbox.id)?;
         tracing::Span::current().record(
             "start_execution_path",
             SandboxStartExecutionPath::WarmSnapshot.as_str(),
@@ -2330,7 +2338,7 @@ impl SandboxManagerService {
                 return Err(error);
             }
         };
-        activation_cleanup.admit(activation_admission_permit);
+        activation_cleanup.admit_activation(activation_admission_permit);
         let mut node_client = start_stage_timeout(
             "fresh.connect_node_mgr",
             START_NODE_METADATA_TIMEOUT,
@@ -2694,7 +2702,12 @@ impl SandboxManagerService {
         // — a device-layout choice, not an encryption decision.
         let rootfs_block_device_path = if sandbox.volume_encryption {
             match crate::rootfs_encryption::prepare_encrypted_rootfs(
+                self.cache_root(),
                 id,
+                crate::rootfs_encryption::PinnedCheckpoint::of(
+                    &sandbox,
+                    self.staged_checkpoint_disk,
+                ),
                 execution_fence,
                 None,
                 &self.node_manager,

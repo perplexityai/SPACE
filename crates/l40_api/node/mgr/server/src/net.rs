@@ -719,8 +719,9 @@ fn log_cleanup_result(operation: &str, result: Result<(), String>) {
 /// Reset a reusable network slot in place.
 ///
 /// This preserves the stable namespace/veth/tap objects and only scrubs
-/// lease-scoped mutable state. If core slot objects are missing, callers should
-/// fall back to full teardown + setup.
+/// lease-scoped mutable state, including every SPACE-owned nftables table. If
+/// core slot objects are missing, callers should fall back to full teardown +
+/// setup.
 pub fn reset_network_slot(ns: &str, net: &NetId, pod_netns: Option<&str>) -> Result<(), String> {
     if !ns_exists(ns) {
         return Err(format!("missing namespace {ns}"));
@@ -742,8 +743,7 @@ pub fn reset_network_slot(ns: &str, net: &NetId, pod_netns: Option<&str>) -> Res
         &vpeer_ip,
     )
     .map_err(|e| e.to_string())?;
-    crate::firewall::teardown_proxy_rules(ns);
-    crate::firewall::teardown_namespace_rules(ns);
+    crate::firewall::scrub_namespace_tables(ns).map_err(|e| e.to_string())?;
     clear_tproxy_policy_routing(ns);
     flush_namespace_transient_state(ns);
     native::reset_namespace_links(ns, net)?;

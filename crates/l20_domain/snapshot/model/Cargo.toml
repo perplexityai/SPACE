@@ -15,6 +15,7 @@ pplx-space-byte-size = { workspace = true }
 pplx-space-execution-spec = { workspace = true }
 pplx-space-sql-codec = { workspace = true, optional = true }
 pplx-space-template-model = { workspace = true }
+pplx-space-uuid-id = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
@@ -22,4 +23,8 @@ uuid = { workspace = true, features = ["v7"] }
 [features]
 default = []
 serde = ["dep:serde"]
-sqlx = ["dep:pplx-space-sql-codec", "pplx-space-sql-codec/postgres"]
+sqlx = [
+    "dep:pplx-space-sql-codec",
+    "dep:pplx-space-uuid-id",
+    "pplx-space-sql-codec/postgres",
+]

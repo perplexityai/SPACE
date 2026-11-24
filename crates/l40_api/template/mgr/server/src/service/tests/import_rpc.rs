@@ -190,6 +190,7 @@ impl ImportFixture {
                     .db
                     .lock()
                     .unwrap()
+                    .raw()
                     .pragma_update(None, "query_only", true)
                     .unwrap();
                 metadata["description"] = json!("updated");
