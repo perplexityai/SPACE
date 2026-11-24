@@ -18,12 +18,14 @@ use super::*;
 /// applying the same filters `resolve_pod_ip` applies and none of its writes.
 /// Every filter resolves to "no runtime to stop", which is always safe: the
 /// teardown proceeds to the pod delete instead of talking to a VM.
+///
+/// The address is the pod's published IP, or the one the row records for the
+/// same pod UID before kubelet publishes it (see [`current_pod_ip`]).
 fn fenced_runtime_pod_ip(
-    lifecycle: &str,
-    state: ActiveExecutionState,
+    active: &ActiveExecutionStatusRow,
     live_pod: Option<&SandboxPodView>,
 ) -> Option<PodIp> {
-    if is_suspended_lifecycle(lifecycle) || execution_pod_lookup_in_flight(state) {
+    if is_suspended_lifecycle(&active.lifecycle) || execution_pod_lookup_in_flight(active.state) {
         return None;
     }
     let live_pod = live_pod?;
@@ -33,7 +35,9 @@ fn fenced_runtime_pod_ip(
     {
         return None;
     }
-    assigned_pod_ip(live_pod).ok().flatten()
+    current_pod_ip(live_pod, active.pod_uid.as_ref(), active.pod_ip.as_deref())
+        .ok()
+        .flatten()
 }
 
 /// Whether the node reports an ambiguously acknowledged delete as admitted:
@@ -314,7 +318,7 @@ impl KubernetesSubstrate {
             return Ok(PodFenceCheck::AlreadyRetired);
         };
         let live_pod = self
-            .read_fenced_pod(&active.lifecycle, active.state, &fence.pod_name, freshness)
+            .read_fenced_pod(&active, &fence.pod_name, freshness)
             .await?;
         // One comparison, over the whole identity. Every earlier bug on this
         // path was a site that compared a different subset of these fields, or
@@ -343,11 +347,7 @@ impl KubernetesSubstrate {
                 ObservedPod::Absent | ObservedPod::Unobserved => None,
             },
             identity: current_execution_identity(&active, live_pod.as_deref()),
-            runtime_pod_ip: fenced_runtime_pod_ip(
-                &active.lifecycle,
-                active.state,
-                live_pod.as_deref(),
-            ),
+            runtime_pod_ip: fenced_runtime_pod_ip(&active, live_pod.as_deref()),
             node_name: active.k8s_node_name,
         })))
     }
@@ -372,15 +372,14 @@ impl KubernetesSubstrate {
     /// fence.
     async fn read_fenced_pod(
         &self,
-        lifecycle: &str,
-        state: ActiveExecutionState,
+        active: &ActiveExecutionStatusRow,
         pod_name: &PodName,
         freshness: FenceReadFreshness,
     ) -> Result<Option<Arc<SandboxPodView>>, SubstrateError> {
         let cached = self.lookup_sandbox_pod(pod_name.as_str());
         let authorizes_stop = cached
             .as_deref()
-            .is_some_and(|pod| fenced_runtime_pod_ip(lifecycle, state, Some(pod)).is_some());
+            .is_some_and(|pod| fenced_runtime_pod_ip(active, Some(pod)).is_some());
         if cached.is_some() && !authorizes_stop && freshness == FenceReadFreshness::CacheIsEnough {
             return Ok(cached);
         }

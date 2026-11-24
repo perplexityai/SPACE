@@ -8395,6 +8395,94 @@ mod kubernetes_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn node_reported_pod_ip_holds_until_kubelet_publishes_one() -> Result<(), BoxError> {
+        // A create bound the IP its node reported; kubelet publishes
+        // `status.podIP` later, and may publish a different one.
+        for (published_ip, expected_ip) in [(None, "10.0.0.7"), (Some("10.0.0.9"), "10.0.0.9")] {
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            let pod_name = "space-sbx-node-bound-g1";
+            insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_k8s_executions
+                     (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                      pod_ip, state, active)
+                 VALUES ($1, 1, $2, 'space', 'node-bound-uid',
+                         '10.0.0.7', 'running', TRUE)",
+            ))
+            .bind(sandbox_id)
+            .bind(pod_name)
+            .execute(&pool)
+            .await?;
+            let mut status = serde_json::json!({ "phase": "Running" });
+            if let Some(ip) = published_ip {
+                status["podIP"] = ip.into();
+            }
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": pod_name, "namespace": "space", "uid": "node-bound-uid" },
+                "status": status
+            }))?;
+            let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+                pool.clone(),
+                replace_existing_pod_kubernetes_client(
+                    pod.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                DEFAULT_SANDBOX_PROXY_PORT,
+                Some(pod),
+                Vec::new(),
+            );
+            let expected = Some(PodIp::parse(expected_ip)?);
+
+            assert_eq!(substrate.resolve_pod_ip(sandbox_id).await?, expected);
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                expected
+            );
+            // A hydration write that observed no published IP keeps the bound one.
+            substrate
+                .store
+                .persist_pod_metadata(sandbox_id, 1, Some("node-bound-uid"), published_ip, None)
+                .await?;
+            let row: (String, Option<String>) = sqlx::query_as(sql!(
+                "SELECT state, host(pod_ip)
+                   FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1 AND active",
+            ))
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(row, ("running".to_owned(), Some(expected_ip.to_owned())));
+            // A node report for a replaced pod is not written.
+            assert_eq!(
+                substrate
+                    .store
+                    .persist_node_reported_pod_ip(sandbox_id, 1, "replaced-uid", "10.0.0.6", None)
+                    .await?,
+                None
+            );
+            // A node write committing late does not replace the recorded IP.
+            assert_eq!(
+                substrate
+                    .store
+                    .persist_node_reported_pod_ip(sandbox_id, 1, "node-bound-uid", "10.0.0.8", None)
+                    .await?
+                    .as_deref(),
+                Some(expected_ip)
+            );
+            assert_eq!(
+                substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn recent_succeeded_pod_without_suspend_ownership_is_cleaned_up() -> Result<(), BoxError>
     {
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
@@ -15237,17 +15325,15 @@ mod kubernetes_tests {
         ClientBuilder::new(service, "space").build()
     }
 
-    /// The in-VM stop addresses the *sandbox*, not the pod, so the address it
-    /// uses decides which VM gets stopped. A fenced teardown derives that
-    /// address from the pod the fence verified — never from the execution row,
-    /// and never by re-resolving whatever is active by then, which on a race
-    /// is the successor. Here the row advertises a runtime the verified pod
-    /// does not have: a teardown that trusted the row would try to stop
-    /// 127.0.0.1 and fail the retire; this one sees no runtime to stop and
-    /// proceeds straight to the pod delete.
+    /// Before kubelet publishes `status.podIP`, the row's node-reported IP for
+    /// the same pod UID is the fenced pod's runtime, so the retire stops it
+    /// before deleting the pod.
     #[tokio::test(flavor = "current_thread")]
-    async fn fenced_retire_ignores_a_runtime_the_fenced_pod_does_not_have() -> Result<(), BoxError>
-    {
+    async fn fenced_retire_stops_the_runtime_recorded_for_an_unpublished_pod()
+    -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
@@ -15263,7 +15349,7 @@ mod kubernetes_tests {
             true,
         )
         .await?;
-        // The verified pod carries no IP; the execution row claims one.
+        // Kubelet has not published an IP; the row records the node's.
         let fenced_pod = Pod {
             metadata: kube::api::ObjectMeta {
                 name: Some(pod_name.clone()),
@@ -15273,6 +15359,17 @@ mod kubernetes_tests {
             },
             ..Default::default()
         };
+        let sim_worker = start_sim_worker().await?;
+        let mut record = pplx_space_node_api_sim::SandboxRecord::new_creating(
+            sandbox_id.to_string(),
+            "seed".into(),
+            "fc".into(),
+            "test".into(),
+            None,
+            false,
+        );
+        record.status = "running".into();
+        sim_worker.state().insert_new(record).await?;
         let captured_deletes = Arc::new(Mutex::new(Vec::new()));
         let substrate = substrate_with_store_client_proxy_port_and_pod(
             pool.clone(),
@@ -15280,7 +15377,7 @@ mod kubernetes_tests {
                 Arc::clone(&captured_deletes),
                 Some(fenced_pod.clone()),
             ),
-            DEFAULT_SANDBOX_PROXY_PORT,
+            sim_worker.port(),
             Some(fenced_pod),
         );
 
@@ -15294,12 +15391,20 @@ mod kubernetes_tests {
 
         assert_eq!(outcome, RetireExecutionOutcome::Retired);
         assert_eq!(
+            sim_worker
+                .state()
+                .get(&sandbox_id.to_string())
+                .await?
+                .status,
+            "stopped",
+            "the runtime is stopped before the pod is deleted"
+        );
+        assert_eq!(
             captured_deletes
                 .lock()
                 .expect("capture mutex poisoned")
                 .len(),
-            1,
-            "the fenced pod is still deleted; only the in-VM stop was skipped"
+            1
         );
         Ok(())
     }

@@ -1,4 +1,4 @@
-//! [`lock_tracked_pod_uid`] reads what its caller decides on, and holds a
+//! [`lock_tracked_pod`] reads what its caller decides on, and holds a
 //! `FOR UPDATE` lock on the active execution row until the caller's
 //! transaction ends.
 
@@ -9,7 +9,7 @@ use pplx_space_sql_locator::sql;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::lock_tracked_pod_uid;
+use super::lock_tracked_pod;
 
 async fn insert_sandbox(pool: &PgPool) -> TestResult<SandboxId> {
     let id = SandboxId::new();
@@ -76,7 +76,7 @@ async fn key_share_blocked(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lock_tracked_pod_uid_reads_the_active_generations_uid() -> TestResult {
+async fn lock_tracked_pod_reads_the_active_generations_uid() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -89,15 +89,34 @@ async fn lock_tracked_pod_uid_reads_the_active_generations_uid() -> TestResult {
 
     let mut tx = pool.begin().await?;
     assert_eq!(
-        lock_tracked_pod_uid(&mut tx, tracked, 2).await?,
+        lock_tracked_pod(&mut tx, tracked, 2)
+            .await?
+            .map(|pod| pod.pod_uid),
         Some(Some("uid-a".to_string()))
     );
-    assert_eq!(lock_tracked_pod_uid(&mut tx, blank, 1).await?, Some(None));
-    // A retired generation, one never minted, and a missing sandbox.
-    assert_eq!(lock_tracked_pod_uid(&mut tx, tracked, 1).await?, None);
-    assert_eq!(lock_tracked_pod_uid(&mut tx, tracked, 3).await?, None);
     assert_eq!(
-        lock_tracked_pod_uid(&mut tx, SandboxId::new(), 1).await?,
+        lock_tracked_pod(&mut tx, blank, 1)
+            .await?
+            .map(|pod| pod.pod_uid),
+        Some(None)
+    );
+    // A retired generation, one never minted, and a missing sandbox.
+    assert_eq!(
+        lock_tracked_pod(&mut tx, tracked, 1)
+            .await?
+            .map(|pod| pod.pod_uid),
+        None
+    );
+    assert_eq!(
+        lock_tracked_pod(&mut tx, tracked, 3)
+            .await?
+            .map(|pod| pod.pod_uid),
+        None
+    );
+    assert_eq!(
+        lock_tracked_pod(&mut tx, SandboxId::new(), 1)
+            .await?
+            .map(|pod| pod.pod_uid),
         None
     );
     tx.rollback().await?;
@@ -105,7 +124,7 @@ async fn lock_tracked_pod_uid_reads_the_active_generations_uid() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lock_tracked_pod_uid_holds_for_update_until_the_transaction_ends() -> TestResult {
+async fn lock_tracked_pod_holds_for_update_until_the_transaction_ends() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -117,21 +136,36 @@ async fn lock_tracked_pod_uid_holds_for_update_until_the_transaction_ends() -> T
 
     // Held until commit.
     let mut tx = pool.begin().await?;
-    assert!(lock_tracked_pod_uid(&mut tx, sandbox, 2).await?.is_some());
+    assert!(
+        lock_tracked_pod(&mut tx, sandbox, 2)
+            .await?
+            .map(|pod| pod.pod_uid)
+            .is_some()
+    );
     assert!(key_share_blocked(pool, sandbox, 2).await?);
     tx.commit().await?;
     assert!(!key_share_blocked(pool, sandbox, 2).await?);
 
     // Held until rollback.
     let mut tx = pool.begin().await?;
-    assert!(lock_tracked_pod_uid(&mut tx, sandbox, 2).await?.is_some());
+    assert!(
+        lock_tracked_pod(&mut tx, sandbox, 2)
+            .await?
+            .map(|pod| pod.pod_uid)
+            .is_some()
+    );
     assert!(key_share_blocked(pool, sandbox, 2).await?);
     tx.rollback().await?;
     assert!(!key_share_blocked(pool, sandbox, 2).await?);
 
     // A retired generation matches no row and locks nothing.
     let mut tx = pool.begin().await?;
-    assert_eq!(lock_tracked_pod_uid(&mut tx, sandbox, 1).await?, None);
+    assert_eq!(
+        lock_tracked_pod(&mut tx, sandbox, 1)
+            .await?
+            .map(|pod| pod.pod_uid),
+        None
+    );
     assert!(!key_share_blocked(pool, sandbox, 1).await?);
     assert!(!key_share_blocked(pool, sandbox, 2).await?);
     tx.rollback().await?;
