@@ -2,7 +2,8 @@
 
 use super::super::rounds::{Observed, RoundRefused};
 use super::*;
-use crate::slot_pool::{Failure, SlotOutcome, Unknown};
+use crate::slot_pool::SlotOutcome;
+use crate::slot_pool::firewall_rules::observe::{Failure, Refusal};
 
 fn outcomes(observed: &Observed) -> Vec<SlotOutcome> {
     let observation = observed.answer.as_ref().unwrap();
@@ -10,7 +11,8 @@ fn outcomes(observed: &Observed) -> Vec<SlotOutcome> {
 }
 
 // Catches a round swept twice, a final round answered afresh, a new round
-// served from the cache, or a stale or conflicting round answered.
+// served from the cache, a stale or conflicting round answered, other than
+// the last eight rounds kept, or a round evicted while queued still swept.
 #[tokio::test]
 async fn a_round_is_observed_once_and_never_recreated() {
     use SlotState::{Leased, Ready};
@@ -65,17 +67,35 @@ async fn a_round_is_observed_once_and_never_recreated() {
     assert_eq!(round_8.round, 8);
     // Never seen, but older than the newest.
     assert_eq!(refused(12, 6), Some(RoundRefused::Stale));
-    for round in 9..=16 {
-        bounded(sync.observe(pool, NODE, 12, round).unwrap()).await;
-    }
+    let through_8 = calls();
+
+    // 10 queues behind 9's sweep, and 11 to 18 evict both before it runs.
+    let (entered, release) = gate(&bound.host.observed);
+    let round_9 = sync.observe(pool, NODE, 12, 9).unwrap();
+    bounded(entered).await.unwrap();
+    let queued: Vec<_> = (10..=18)
+        .map(|round| sync.observe(pool, NODE, 12, round).unwrap())
+        .collect();
+    release.send(()).unwrap();
+    bounded(round_9).await;
+    let queued = bounded(futures_util::future::join_all(queued)).await;
+    assert!(
+        matches!(queued[0].answer, Err(Refusal::Unfinished)),
+        "{:?}",
+        queued[0]
+    );
+    // Every round from 9 to 18 but 10.
     let evicted = calls();
-    assert_eq!(refused(12, 7), Some(RoundRefused::Stale));
+    assert_eq!(evicted - through_8, 9 * 4);
+    assert_eq!(refused(12, 10), Some(RoundRefused::Stale));
+    let kept = bounded(sync.observe(pool, NODE, 12, 11).unwrap()).await;
+    assert!(Arc::ptr_eq(&kept, &queued[1]));
     assert_eq!(calls(), evicted);
     assert_eq!(bound.host.installs().len(), 2);
 }
 
-// Catches Applying claimed without pending apply work for the target, or a
-// mismatch the pass will still apply reported as Failed.
+// Catches Applying claimed without pending apply work for the target or for a
+// matching table, or a mismatch the pass will still apply reported as Failed.
 #[tokio::test]
 async fn only_pending_apply_work_is_applying() {
     use SlotState::Leased;
@@ -102,11 +122,18 @@ async fn only_pending_apply_work_is_applying() {
     sync_all(&bound.service, 12).await;
     bounded(entered).await.unwrap();
     assert!(!sync.applying(12, 0, &target(2)), "another occupant");
-    // Slot 1's entry is no longer a namespace: pending, but unreadable.
-    std::fs::remove_file(bound.host.link(1)).unwrap();
-    std::fs::write(bound.host.link(1), b"").unwrap();
-    let unreadable = SlotOutcome::Unknown(Unknown::NamespaceUnreadable);
+    // Slot 1 already matches: pending, but verified.
+    let matching = bound.namespaces[1];
+    bound
+        .host
+        .tables
+        .lock()
+        .unwrap()
+        .insert(matching, installed(12));
     let pending = bounded(sync.observe(pool, NODE, 12, 1).unwrap()).await;
-    assert_eq!(outcomes(&pending), [SlotOutcome::Applying, unreadable]);
+    assert_eq!(
+        outcomes(&pending),
+        [SlotOutcome::Applying, SlotOutcome::Verified]
+    );
     release.send(()).unwrap();
 }

@@ -4,25 +4,36 @@
 //! without one, as `/run/netns` is shared, reports that gap. A census carries
 //! at most [`MAX_CENSUS_GAPS`] gaps; beyond that it keeps the first ones in the
 //! order below and ends with one [`CensusGap::Truncated`], and is incomplete.
+//! A sweep starts no read past [`SWEEP_BUDGET`], and one read can take two nft
+//! probes, so it ends within about 70 s of its start; a slot left then is
+//! unread.
 //! Each reading is revalidated after the last one while its namespace is still
-//! pinned, since a released namespace's inode is soon reused.
+//! pinned, since a released namespace's inode is soon reused. A sweep so holds
+//! one descriptor per eligible slot until its final checks, at most
+//! [`MAX_IPV4_NETWORK_SLOTS`] (16,383) at once, counted against the open-file
+//! limit node-manager shares with its other work, which nothing here raises. A
+//! pin refused for lack of descriptors leaves its slot unread; a slot pinned
+//! at the limit can still fail to run nft, and reads `TableUnreadable`.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use pplx_space_accounts::NodeId;
 use pplx_space_firewall_rules_model::FirewallRuleRevision;
 use uuid::Uuid;
 
 use super::{
-    Live, NamespaceIdentity, NotRunnable, SlotHost, SlotTarget, eligible, identity, pin, runnable,
-    same_lifecycle,
+    Live, NamespaceIdentity, NotRunnable, SlotHost, SlotTarget, eligible, pin, runnable,
+    same_lifecycle, unchanged,
 };
 use crate::firewall::assignment::FirewallAssignments;
 use crate::firewall::rules::verify::{Verification, verify_with};
 use crate::firewall::rules::{Nft, nft};
+use crate::net::MAX_IPV4_NETWORK_SLOTS;
 use crate::slot_pool::{NetworkPool, SlotRecord};
 
 #[cfg(test)]
@@ -39,15 +50,23 @@ pub struct FirewallObservation {
 }
 
 /// The most gaps a census carries, counting the [`CensusGap::Truncated`] marker.
-/// Twice the largest slot pool, which can never overflow it alone.
 pub const MAX_CENSUS_GAPS: usize = 32_768;
 
-/// Complete when every eligible record was read with its namespace listed,
-/// and every listed entry is some record's. Gaps come in this order: each
-/// eligible record's, by slot; the listing's failure; each extra entry, sorted
-/// by path. Past [`MAX_CENSUS_GAPS`], the rest are omitted and counted by a
-/// final `Truncated`, so the census is never complete then.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// One gap per slot and the listing's never need truncating.
+const _: () = assert!(MAX_IPV4_NETWORK_SLOTS as usize + 1 < MAX_CENSUS_GAPS);
+
+/// How long a sweep keeps starting reads: a healthy pool of the default 300 slots
+/// takes a few seconds, and a sweep, even one queued behind another, ends well
+/// within five minutes.
+pub(crate) const SWEEP_BUDGET: Duration = Duration::from_secs(60);
+
+/// Complete when every eligible record was read at its final lifecycle, its
+/// namespace pinned, still the one its entry names and listed, and every
+/// listed entry is some record's. Gaps come in this order: each eligible
+/// record's, by slot; the listing's failure; each extra entry, sorted by path.
+/// Past [`MAX_CENSUS_GAPS`], the rest are omitted and counted by a final
+/// `Truncated`, so the census is never complete then.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Census {
     pub gaps: Vec<CensusGap>,
 }
@@ -68,7 +87,9 @@ pub enum CensusGap {
     Missing {
         slot_id: u32,
     },
-    /// An eligible slot wasn't read at its final lifecycle.
+    /// No reading of an eligible slot stands, though its namespace isn't
+    /// known to be missing: none was taken at its final lifecycle, its
+    /// namespace couldn't be pinned, or it changed after the read.
     Unread {
         slot_id: u32,
     },
@@ -83,15 +104,24 @@ pub enum CensusGap {
 }
 
 /// Gaps up to the bound, counting what falls past it.
-#[derive(Default)]
 struct Gaps {
+    bound: usize,
     kept: Vec<CensusGap>,
     omitted: u64,
 }
 
 impl Gaps {
+    /// At most `bound` gaps, the marker included.
+    fn new(bound: usize) -> Self {
+        Self {
+            bound,
+            kept: Vec::new(),
+            omitted: 0,
+        }
+    }
+
     fn push(&mut self, gap: CensusGap) {
-        if self.kept.len() < MAX_CENSUS_GAPS - 1 {
+        if self.kept.len() + 1 < self.bound {
             self.kept.push(gap);
         } else {
             self.omitted += 1;
@@ -137,7 +167,8 @@ pub enum Unknown {
     NamespaceMissing,
     NamespaceUnreadable,
     TableUnreadable,
-    /// Read, but not shown unchanged at the end.
+    /// No reading stands: read but not shown unchanged at the end, or not
+    /// read before the sweep's deadline.
     Unconfirmed,
 }
 
@@ -148,6 +179,7 @@ pub enum Refusal {
     Assignment(#[from] NotRunnable),
     #[error("node-manager is shutting down")]
     ShuttingDown,
+    /// The job panicked, or never ran.
     #[error("the observation job did not finish")]
     Unfinished,
 }
@@ -170,24 +202,42 @@ impl NetworkPool {
         generation: u64,
     ) -> Result<FirewallObservation, Refusal> {
         let (host, nft) = (Arc::new(Live), Arc::new(nft));
-        self.observe_firewall_rules_with(assignments, node_id, generation, host, nft, |_, _| false)
-            .await
+        let request = (node_id, generation);
+        let not_applying = |_: u32, _: &SlotTarget| false;
+        self.observe_firewall_rules_with(
+            assignments,
+            request,
+            host,
+            nft,
+            not_applying,
+            SWEEP_BUDGET,
+        )
+        .await
     }
 
-    /// `applying` says whether apply work for a target is pending.
+    /// `applying` says whether apply work for a target is pending; `budget`
+    /// is how long the sweep keeps starting reads.
     pub(crate) async fn observe_firewall_rules_with(
         self: &Arc<Self>,
         assignments: &Arc<FirewallAssignments>,
-        node_id: NodeId,
-        generation: u64,
+        request: (NodeId, u64),
         host: Arc<dyn SlotHost>,
         nft: Arc<Nft<'static>>,
         applying: impl Fn(u32, &SlotTarget) -> bool + Send + 'static,
+        budget: Duration,
     ) -> Result<FirewallObservation, Refusal> {
         let (pool, assignments) = (self.clone(), assignments.clone());
         let job = move || {
-            let request = (node_id, generation);
-            observe_blocking(&pool, &assignments, request, &*host, &*nft, &applying)
+            let deadline = Instant::now() + budget;
+            observe_blocking(
+                &pool,
+                &assignments,
+                request,
+                &*host,
+                &*nft,
+                &applying,
+                deadline,
+            )
         };
         // Nothing is written, so a panic is only a missing answer.
         match self.task_tracker.spawn_blocking(job).await {
@@ -207,51 +257,55 @@ fn observe_blocking(
     host: &dyn SlotHost,
     nft: &Nft<'_>,
     applying: &dyn Fn(u32, &SlotTarget) -> bool,
+    deadline: Instant,
 ) -> Result<FirewallObservation, Refusal> {
     let desired = runnable(assignments.current(), node_id, generation)?;
-    let mut observation = FirewallObservation {
-        node_id,
-        generation,
-        revision_id: desired.revision_id,
-        census: Census::default(),
-        slots: Vec::new(),
-    };
     // An unread inventory reads nothing; the final one reports the gap.
     let records = pool.all_records().unwrap_or_default();
-    let mut reached = Vec::new();
+    let (mut slots, mut reached) = (Vec::with_capacity(records.len()), Vec::new());
     for record in records {
-        // One job reads every slot, so shutdown is checked between them.
+        // One job reads every slot, so shutdown and the deadline are checked
+        // between them.
         if pool.shutdown_token.is_cancelled() {
             return Err(Refusal::ShuttingDown);
         }
+        let slot_id = record.info.slot;
         let mut target = SlotTarget::of(&record.info);
-        let outcome = if eligible(record.state, record.health, &record.info.sandbox_id) {
-            let pending = applying(record.info.slot, &target);
+        let outcome = if !eligible(record.state, record.health, &record.info.sandbox_id) {
+            SlotOutcome::Unknown(Unknown::Ineligible)
+        } else if Instant::now() >= deadline {
+            // Left unreached, so the census calls it unread.
+            SlotOutcome::Unknown(Unknown::Unconfirmed)
+        } else {
             let path = host.namespace_path(&record.info);
+            let pending = || applying(slot_id, &target);
             let (outcome, pinned) = read(&desired.revision, &path, nft, pending);
             target.namespace = pinned.as_ref().map(|(_, namespace)| *namespace);
-            let index = observation.slots.len();
             reached.push(Reached {
-                index,
-                record: record.clone(),
+                index: slots.len(),
+                record,
                 path,
                 pinned,
             });
             outcome
-        } else {
-            SlotOutcome::Unknown(Unknown::Ineligible)
         };
-        observation.slots.push(SlotEvidence {
-            slot_id: record.info.slot,
+        slots.push(SlotEvidence {
+            slot_id,
             target,
             outcome,
         });
     }
     host.observed();
-    finalize(pool, host, &reached, &mut observation);
+    let census = finalize(pool, host, &reached, &mut slots);
     // Last, so readings of a superseded generation are never returned.
     runnable(assignments.current(), node_id, generation)?;
-    Ok(observation)
+    Ok(FirewallObservation {
+        node_id,
+        generation,
+        revision_id: desired.revision_id,
+        census,
+        slots,
+    })
 }
 
 /// One slot's outcome through the read-only verifier, and the pin to keep.
@@ -259,7 +313,7 @@ fn read(
     revision: &FirewallRuleRevision,
     path: &Path,
     nft: &Nft<'_>,
-    pending: bool,
+    pending: impl Fn() -> bool,
 ) -> (SlotOutcome, Option<(File, NamespaceIdentity)>) {
     let (netns, namespace) = match pin(path) {
         Ok(pinned) => pinned,
@@ -275,7 +329,8 @@ fn read(
     let outcome = match &readback {
         Verification::Match => SlotOutcome::Verified,
         Verification::Inconclusive(_) => SlotOutcome::Unknown(Unknown::TableUnreadable),
-        Verification::Mismatch(_) if pending => SlotOutcome::Applying,
+        // Asked after the read, so work that finished during it isn't pending.
+        Verification::Mismatch(_) if pending() => SlotOutcome::Applying,
         Verification::Mismatch(_) => SlotOutcome::Failed(Failure::RulesMismatch),
     };
     if readback != Verification::Match {
@@ -290,63 +345,82 @@ fn finalize(
     pool: &NetworkPool,
     host: &dyn SlotHost,
     reached: &[Reached],
-    observation: &mut FirewallObservation,
-) {
+    slots: &mut [SlotEvidence],
+) -> Census {
     let now = pool.all_records().ok();
     let listed = listing(host);
+    let by_slot: HashMap<_, _> = now
+        .iter()
+        .flatten()
+        .map(|record| (record.info.slot, record))
+        .collect();
+    // Each reading still at its slot's lifecycle, and whether it stands.
+    let mut readings = HashMap::with_capacity(reached.len());
     for slot in reached {
-        let same_record = now
-            .iter()
-            .flatten()
-            .any(|now| same_lifecycle(now, &slot.record));
-        let same_namespace = slot.pinned.as_ref().is_some_and(|(_, namespace)| {
-            identity(std::fs::metadata(&slot.path)).is_ok_and(|now| now == *namespace)
-        });
+        let slot_id = slot.record.info.slot;
+        let same_record = by_slot
+            .get(&slot_id)
+            .is_some_and(|now| same_lifecycle(now, &slot.record));
+        let stands = same_record
+            && slot
+                .pinned
+                .as_ref()
+                .is_some_and(|(_, namespace)| unchanged(&slot.path, *namespace).is_ok());
         if slot.pinned.is_some()
-            && !(same_record && same_namespace)
-            && let Some(evidence) = observation.slots.get_mut(slot.index)
+            && !stands
+            && let Some(evidence) = slots.get_mut(slot.index)
         {
             evidence.outcome = SlotOutcome::Unknown(Unknown::Unconfirmed);
         }
+        if same_record {
+            readings.insert(slot_id, (slot.index, stands));
+        }
     }
-    let mut gaps = Gaps::default();
     let Some(now) = now else {
-        observation.census.gaps = vec![CensusGap::InventoryFailed];
-        return;
+        return Census {
+            gaps: vec![CensusGap::InventoryFailed],
+        };
     };
+    let mut gaps = Gaps::new(MAX_CENSUS_GAPS);
     let paths: Vec<_> = now
         .iter()
         .map(|record| host.namespace_path(&record.info))
         .collect();
+    let listed_paths: Option<HashSet<&PathBuf>> =
+        listed.as_ref().ok().map(|listed| listed.iter().collect());
     for (record, path) in now.iter().zip(&paths) {
         if !eligible(record.state, record.health, &record.info.sandbox_id) {
             continue;
         }
-        let read = reached
-            .iter()
-            .find(|slot| same_lifecycle(record, &slot.record));
         let slot_id = record.info.slot;
-        let Some(read) = read else {
+        let Some(&(index, stands)) = readings.get(&slot_id) else {
             gaps.push(CensusGap::Unread { slot_id });
             continue;
         };
         // Gone from the final listing, or outside the declared directory.
-        let unlisted = listed.as_ref().is_ok_and(|listed| !listed.contains(path));
-        let outcome = observation.slots.get(read.index).map(|slot| slot.outcome);
+        let unlisted = listed_paths
+            .as_ref()
+            .is_some_and(|listed| !listed.contains(path));
+        let outcome = slots.get(index).map(|slot| slot.outcome);
         if unlisted || outcome == Some(SlotOutcome::Unknown(Unknown::NamespaceMissing)) {
             gaps.push(CensusGap::Missing { slot_id });
+        } else if !stands {
+            gaps.push(CensusGap::Unread { slot_id });
         }
     }
     match listed {
         Err(gap) => gaps.push(gap),
         Ok(listed) => {
+            let paths: HashSet<_> = paths.iter().collect();
             let extra = listed.into_iter().filter(|entry| !paths.contains(entry));
             for entry in extra {
                 gaps.push(CensusGap::Extra { entry });
             }
         }
     }
-    observation.census.gaps = gaps.finish();
+    Census {
+        gaps: gaps.finish(),
+    }
 }
 
 /// Every entry of the host's managed-namespace directory, sorted.

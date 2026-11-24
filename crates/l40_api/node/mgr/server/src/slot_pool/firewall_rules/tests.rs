@@ -169,14 +169,9 @@ impl FakeHost {
 
     /// Points the slot's namespace entry at one of this process's namespaces.
     pub(crate) fn name(&self, slot_id: u32, kind: &str) -> NamespaceIdentity {
-        self.point(slot_id, format!("/proc/self/ns/{kind}"))
-    }
-
-    /// Points the slot's namespace entry at `namespace`.
-    pub(crate) fn point(&self, slot_id: u32, namespace: impl AsRef<Path>) -> NamespaceIdentity {
         let link = self.link(slot_id);
         let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(namespace, &link).unwrap();
+        std::os::unix::fs::symlink(format!("/proc/self/ns/{kind}"), &link).unwrap();
         identity(std::fs::metadata(&link)).unwrap()
     }
 
@@ -228,6 +223,15 @@ impl FakeHost {
         let listing = json!({"nftables": objects}).to_string();
         Some(output(0, listing.into_bytes()))
     }
+}
+
+/// nft as `host` fakes it, timing out where the fake does.
+pub(crate) fn fake_nft(host: &Arc<FakeHost>) -> Arc<Nft<'static>> {
+    let fake = host.clone();
+    Arc::new(move |netns: &File, args: &[&str], stdin: &[u8], _| {
+        fake.reply(netns, args, stdin)
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    })
 }
 
 /// What a submitted batch adds after the add and delete that make the
@@ -288,12 +292,7 @@ async fn apply_expecting(
         slot_id,
         expected,
     };
-    let fake = host.clone();
-    let nft = move |netns: &File, args: &[&str], stdin: &[u8], _| {
-        fake.reply(netns, args, stdin)
-            .ok_or_else(|| io::ErrorKind::TimedOut.into())
-    };
-    bounded(pool.apply_firewall_rules_with(store, request, host.clone(), Arc::new(nft)))
+    bounded(pool.apply_firewall_rules_with(store, request, host.clone(), fake_nft(host)))
         .await
         .unwrap()
 }

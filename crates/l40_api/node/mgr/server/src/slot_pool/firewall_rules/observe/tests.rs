@@ -1,40 +1,33 @@
 //! Observation against the slot apply's fake nft, whose namespace links sit in
 //! the fake host's own declared directory.
 
-use rusqlite::params;
-
 use super::*;
 use crate::slot_pool::firewall_rules::NamespaceIdentity;
 use crate::slot_pool::firewall_rules::tests::{
-    FakeHost, NODE, accept, bounded, busy, hook, installed, poison, pool, set_slot, store,
+    FakeHost, Fault, NODE, accept, bounded, busy, fake_nft, hook, installed, poison, pool,
+    set_slot, store,
 };
 use crate::slot_pool::{SlotInfo, SlotState};
 
-fn fake_nft(host: &Arc<FakeHost>) -> Arc<Nft<'static>> {
-    let fake = host.clone();
-    Arc::new(move |netns: &File, args: &[&str], stdin: &[u8], _| {
-        fake.reply(netns, args, stdin)
-            .ok_or_else(|| io::ErrorKind::TimedOut.into())
-    })
-}
+mod linux;
 
 async fn observe(
     pool: &Arc<NetworkPool>,
     store: &Arc<FirewallAssignments>,
     host: Arc<dyn SlotHost>,
     nft: &Arc<Nft<'static>>,
+    budget: Duration,
 ) -> Result<FirewallObservation, Refusal> {
-    let observed =
-        pool.observe_firewall_rules_with(store, NODE, 12, host, nft.clone(), |_, _| false);
+    let not_applying = |_: u32, _: &SlotTarget| false;
+    let observed = pool.observe_firewall_rules_with(
+        store,
+        (NODE, 12),
+        host,
+        nft.clone(),
+        not_applying,
+        budget,
+    );
     bounded(observed).await
-}
-
-/// A slot no sandbox holds, at generation 1.
-fn idle(pool: &NetworkPool, slot_id: u32, state: SlotState, health: &str) {
-    let update = "UPDATE network_slots SET state = ?1, health = ?2, generation = 1,
-                  sandbox_id = NULL WHERE slot_id = ?3";
-    let params = params![state.as_str(), health, slot_id];
-    pool.db.lock().unwrap().execute(update, params).unwrap();
 }
 
 fn slot(
@@ -64,51 +57,50 @@ impl SlotHost for Undeclared {
     }
 }
 
-// Catches a census that ignores a missing or extra managed namespace, a failed
-// inventory or an undeclared directory, a record left out, an unreadable or
-// busy slot misreported, or nft written.
+// Catches a census that ignores a missing, unreadable or extra managed
+// namespace, a failed inventory, an undeclared directory or the deadline, a
+// record left out, a slot mid-deletion, unlistable or busy misreported, or nft
+// written.
 #[tokio::test]
 async fn the_census_accounts_for_every_record_and_managed_namespace() {
     use SlotState::{Dirty, Leased, Missing, Ready};
     let (pool, _jobs) = pool(6);
     let (_dir, store) = store(Some(12));
     let host = FakeHost::new(None);
-    for (slot_id, state) in (0..).zip([Leased, Leased, Ready, Dirty]) {
+    for (slot_id, state) in (0..).zip([Leased, Leased, Ready, Dirty, Missing, Leased]) {
         set_slot(&pool, slot_id, state, 1);
     }
-    idle(&pool, 4, Missing, "degraded");
-    idle(&pool, 5, Missing, "unknown");
     let verified = host.name(0, "net");
     host.tables.lock().unwrap().insert(verified, installed(12));
-    // Slot 1 has no namespace; slot 2's entry is not one.
+    // Slot 1 has no namespace; slot 2's entry is mid-deletion, a plain file.
     std::fs::write(host.link(2), b"").unwrap();
     // A transitional or setup-interrupted slot keeps its namespace.
     host.name(3, "uts");
     host.name(4, "ipc");
+    // Slot 5's entry can't be opened at all.
+    std::os::unix::fs::symlink(host.link(5), host.link(5)).unwrap();
     host.name(9, "cgroup");
     let _busy = busy(&pool, 0);
     let nft = fake_nft(&host);
 
     let ineligible = SlotOutcome::Unknown(Unknown::Ineligible);
-    let slots = vec![
-        slot(0, true, Some(verified), SlotOutcome::Verified),
-        slot(
-            1,
-            true,
-            None,
-            SlotOutcome::Unknown(Unknown::NamespaceMissing),
-        ),
-        slot(
-            2,
-            false,
-            None,
-            SlotOutcome::Unknown(Unknown::NamespaceUnreadable),
-        ),
-        slot(3, true, None, ineligible),
-        slot(4, false, None, ineligible),
-        slot(5, false, None, ineligible),
-    ];
-    let observed = observe(&pool, &store, host.clone(), &nft).await.unwrap();
+    let missing = SlotOutcome::Unknown(Unknown::NamespaceMissing);
+    let slots = |first: SlotOutcome| {
+        vec![
+            slot(0, true, Some(verified), first),
+            slot(1, true, None, missing),
+            slot(2, false, None, missing),
+            slot(3, true, None, ineligible),
+            slot(4, true, None, ineligible),
+            slot(
+                5,
+                true,
+                None,
+                SlotOutcome::Unknown(Unknown::NamespaceUnreadable),
+            ),
+        ]
+    };
+    let observed = observe(&pool, &store, host.clone(), &nft, SWEEP_BUDGET).await;
     let expected = FirewallObservation {
         node_id: NODE,
         generation: 12,
@@ -116,77 +108,92 @@ async fn the_census_accounts_for_every_record_and_managed_namespace() {
         census: Census {
             gaps: vec![
                 CensusGap::Missing { slot_id: 1 },
+                CensusGap::Missing { slot_id: 2 },
+                CensusGap::Unread { slot_id: 5 },
                 CensusGap::Extra {
                     entry: host.link(9),
                 },
             ],
         },
-        slots: slots.clone(),
+        slots: slots(SlotOutcome::Verified),
     };
-    assert_eq!(observed, expected);
+    assert_eq!(observed.unwrap(), expected);
 
     let undeclared = Arc::new(Undeclared(host.clone()));
-    let observed = observe(&pool, &store, undeclared, &nft).await.unwrap();
-    let gaps = [CensusGap::Missing { slot_id: 1 }, CensusGap::Unowned];
+    let unlistable = fake_nft(&FakeHost::new(Some(Fault::Unlistable)));
+    let observed = observe(&pool, &store, undeclared, &unlistable, SWEEP_BUDGET).await;
+    let observed = observed.unwrap();
+    let gaps = [
+        CensusGap::Missing { slot_id: 1 },
+        CensusGap::Missing { slot_id: 2 },
+        CensusGap::Unread { slot_id: 5 },
+        CensusGap::Unowned,
+    ];
+    let unreadable = SlotOutcome::Unknown(Unknown::TableUnreadable);
     assert_eq!(
         (observed.census.gaps, observed.slots),
-        (gaps.to_vec(), slots)
+        (gaps.to_vec(), slots(unreadable))
+    );
+
+    // Past the deadline, no eligible slot is read.
+    let observed = observe(&pool, &store, host.clone(), &nft, Duration::ZERO).await;
+    let observed = observed.unwrap();
+    let unconfirmed = SlotOutcome::Unknown(Unknown::Unconfirmed);
+    let unreached = [
+        slot(0, true, None, unconfirmed),
+        slot(1, true, None, unconfirmed),
+        slot(2, false, None, unconfirmed),
+        slot(3, true, None, ineligible),
+        slot(4, true, None, ineligible),
+        slot(5, true, None, unconfirmed),
+    ];
+    let mut gaps: Vec<_> = [0, 1, 2, 5]
+        .map(|slot_id| CensusGap::Unread { slot_id })
+        .into();
+    gaps.push(CensusGap::Extra {
+        entry: host.link(9),
+    });
+    assert_eq!(
+        (observed.census.gaps, observed.slots),
+        (gaps, unreached.to_vec())
     );
 
     poison(&pool);
-    let observed = observe(&pool, &store, host.clone(), &nft).await.unwrap();
+    let observed = observe(&pool, &store, host.clone(), &nft, SWEEP_BUDGET).await;
+    let observed = observed.unwrap();
     let failed = (vec![CensusGap::InventoryFailed], Vec::new());
     assert_eq!((observed.census.gaps, observed.slots), failed);
     assert_eq!(host.installs(), []);
 }
 
-// Catches an unbounded census, an overflow with no marker or a wrong count, a
-// different or reordered survivor set, or an overflowing census called complete.
-#[tokio::test]
-async fn an_overflowing_census_keeps_a_prefix_and_ends_in_a_count() {
-    const KEPT: usize = MAX_CENSUS_GAPS - 1;
-    let (pool, _jobs) = pool(1);
-    let (_dir, store) = store(Some(12));
-    let host = FakeHost::new(None);
-    set_slot(&pool, 0, SlotState::Leased, 1);
-    let verified = host.name(0, "net");
-    host.tables.lock().unwrap().insert(verified, installed(12));
-    let nft = fake_nft(&host);
-    let extra = |index: usize| host.link(0).with_file_name(format!("extra-{index:06}"));
-    let mut made = 0;
-    // Gaps at the last count that fits, one more, and well past.
-    for (total, omitted) in [(KEPT, None), (KEPT + 1, Some(1)), (KEPT + 134, Some(134))] {
-        for index in made..total {
-            std::fs::write(extra(index), b"").unwrap();
+// Catches a bound overrun, a missing marker or a wrong count, or a different
+// or reordered prefix kept.
+#[test]
+fn gaps_past_the_bound_keep_a_prefix_and_end_in_a_count() {
+    let unread = |slot_id| CensusGap::Unread { slot_id };
+    for (pushed, omitted) in [(2, None), (3, Some(1)), (7, Some(5))] {
+        let mut gaps = Gaps::new(3);
+        for slot_id in 0..pushed {
+            gaps.push(unread(slot_id));
         }
-        made = total;
-        let observed = observe(&pool, &store, host.clone(), &nft).await.unwrap();
-        let mut expected: Vec<_> = (0..KEPT)
-            .map(|index| CensusGap::Extra {
-                entry: extra(index),
-            })
-            .collect();
+        let mut expected = vec![unread(0), unread(1)];
         expected.extend(omitted.map(|omitted| CensusGap::Truncated { omitted }));
-        assert_eq!(observed.census.gaps.len(), expected.len(), "{total} gaps");
-        assert!(observed.census.gaps == expected, "{total} gaps");
-        assert!(!observed.census.complete());
-        let outcomes: Vec<_> = observed.slots.iter().map(|slot| slot.outcome).collect();
-        assert_eq!(outcomes, [SlotOutcome::Verified]);
+        assert_eq!(gaps.finish(), expected, "{pushed} gaps");
     }
 }
 
-// Catches a reading kept after its namespace or slot changed, a census judged
-// before the last read, or a superseded generation's readings returned.
+// Catches a reading kept or counted after its namespace or slot changed, a
+// census judged before the last read, or a superseded generation's readings
+// returned.
 #[tokio::test]
 async fn changes_before_finalizing_leave_no_reading_standing() {
-    use SlotState::{Leased, Ready};
+    use SlotState::{Dirty, Leased, Ready};
     let (pool, _jobs) = pool(4);
     let (_dir, store) = store(Some(12));
     let host = FakeHost::new(None);
-    for slot_id in [0, 1, 3] {
-        set_slot(&pool, slot_id, Leased, 1);
+    for (slot_id, state) in (0..).zip([Leased, Leased, Dirty, Leased]) {
+        set_slot(&pool, slot_id, state, 1);
     }
-    idle(&pool, 2, Ready, "unknown");
     let namespaces = [(0, "net"), (1, "uts"), (2, "ipc"), (3, "cgroup")]
         .map(|(slot_id, kind)| host.name(slot_id, kind));
     for (namespace, generation) in namespaces.iter().zip([12, 11, 12, 12]) {
@@ -199,12 +206,13 @@ async fn changes_before_finalizing_leave_no_reading_standing() {
     hook(&host.observed, move || {
         fake.name(0, "mnt");
         set_slot(&slots, 1, Leased, 2);
-        // Adopted after the read, as startup reconciliation does.
-        idle(&slots, 2, Ready, "healthy");
+        // Reset after the read.
+        set_slot(&slots, 2, Ready, 1);
         std::fs::remove_file(fake.link(3)).unwrap();
     });
     let nft = fake_nft(&host);
-    let observed = observe(&pool, &store, host.clone(), &nft).await.unwrap();
+    let observed = observe(&pool, &store, host.clone(), &nft, SWEEP_BUDGET).await;
+    let observed = observed.unwrap();
     let unconfirmed = SlotOutcome::Unknown(Unknown::Unconfirmed);
     let outcomes: Vec<_> = observed.slots.iter().map(|slot| slot.outcome).collect();
     let ineligible = SlotOutcome::Unknown(Unknown::Ineligible);
@@ -213,6 +221,7 @@ async fn changes_before_finalizing_leave_no_reading_standing() {
         [unconfirmed, unconfirmed, ineligible, unconfirmed]
     );
     let gaps = [
+        CensusGap::Unread { slot_id: 0 },
         CensusGap::Unread { slot_id: 1 },
         CensusGap::Unread { slot_id: 2 },
         CensusGap::Missing { slot_id: 3 },
@@ -221,7 +230,7 @@ async fn changes_before_finalizing_leave_no_reading_standing() {
 
     let later = store.clone();
     hook(&host.observed, move || accept(&later, 13));
-    let superseded = observe(&pool, &store, host.clone(), &nft).await;
+    let superseded = observe(&pool, &store, host.clone(), &nft, SWEEP_BUDGET).await;
     assert!(
         matches!(
             superseded,

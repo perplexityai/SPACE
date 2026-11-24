@@ -10,9 +10,11 @@ use std::sync::{Arc, Mutex};
 use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Shared};
 use pplx_space_accounts::NodeId;
+use tokio::sync::oneshot;
 
 use super::{BoundSlots, FirewallSync};
-use crate::slot_pool::{FirewallObservation, NetworkPool, Refusal, SlotTarget};
+use crate::slot_pool::firewall_rules::observe::{Refusal, SWEEP_BUDGET};
+use crate::slot_pool::{FirewallObservation, NetworkPool, SlotTarget};
 
 /// Rounds kept for replay.
 const RETAINED: usize = 8;
@@ -62,66 +64,77 @@ impl FirewallSync {
         if node_id != self.fixture.node_id {
             return Err(RoundRefused::WrongNode);
         }
-        let mut rounds = lock(&self.rounds);
-        Ok(
+        let (send, observed) = {
+            let mut rounds = lock(&self.rounds);
             match rounds.retained.iter().find(|kept| kept.round == round) {
                 Some(kept) if kept.generation != generation => {
                     return Err(RoundRefused::Conflict {
                         generation: kept.generation,
                     });
                 }
-                Some(kept) => kept.observed.clone(),
+                Some(kept) => return Ok(kept.observed.clone()),
                 None if rounds.newest.is_some_and(|newest| round <= newest) => {
                     return Err(RoundRefused::Stale);
                 }
-                None => {
-                    let observed = self.sweep(pool, generation, round);
-                    rounds.newest = Some(round);
-                    rounds.retained.push_back(Round {
-                        round,
-                        generation,
-                        observed: observed.clone(),
-                    });
-                    if rounds.retained.len() > RETAINED {
-                        rounds.retained.pop_front();
-                    }
-                    observed
-                }
-            },
-        )
+                None => {}
+            }
+            let (send, receive) = oneshot::channel();
+            let observed = answer(round, receive);
+            rounds.newest = Some(round);
+            rounds.retained.push_back(Round {
+                round,
+                generation,
+                observed: observed.clone(),
+            });
+            if rounds.retained.len() > RETAINED {
+                rounds.retained.pop_front();
+            }
+            (send, observed)
+        };
+        self.sweep(pool, generation, round, send);
+        Ok(observed)
     }
 
     /// A tracked task, so a cancelled caller can't strand the round; sweeps
-    /// run one at a time.
-    fn sweep(self: &Arc<Self>, pool: &Arc<NetworkPool>, generation: u64, round: u64) -> Answer {
+    /// run one at a time, and one whose round was evicted while it waited
+    /// never runs, since nobody can ask for that round again.
+    fn sweep(
+        self: &Arc<Self>,
+        pool: &Arc<NetworkPool>,
+        generation: u64,
+        round: u64,
+        send: oneshot::Sender<Arc<Observed>>,
+    ) {
         let (sync, reader) = (self.clone(), pool.clone());
-        let task = pool.task_tracker.spawn(async move {
+        pool.task_tracker.spawn(async move {
             let _serial = sync.sweeps.lock().await;
+            if !lock(&sync.rounds)
+                .retained
+                .iter()
+                .any(|kept| kept.round == round)
+            {
+                return;
+            }
             let (host, nft) = (sync.fixture.host.clone(), sync.fixture.nft.clone());
             let pending = sync.clone();
             let applying = move |slot_id: u32, target: &SlotTarget| {
                 pending.applying(generation, slot_id, target)
             };
+            let request = (sync.fixture.node_id, generation);
             let answer = reader
                 .observe_firewall_rules_with(
                     &sync.assignments,
-                    sync.fixture.node_id,
-                    generation,
+                    request,
                     host,
                     nft,
                     applying,
+                    SWEEP_BUDGET,
                 )
                 .await;
-            Arc::new(Observed { round, answer })
+            if send.send(Arc::new(Observed { round, answer })).is_err() {
+                tracing::debug!(round, "firewall observation round was evicted while it ran");
+            }
         });
-        let observed = async move {
-            task.await.unwrap_or_else(|error| {
-                tracing::debug!(round, %error, "firewall observation round did not finish");
-                let answer = Err(Refusal::Unfinished);
-                Arc::new(Observed { round, answer })
-            })
-        };
-        observed.boxed().shared()
     }
 
     /// The live binding has this generation armed and its pass still to run
@@ -152,6 +165,18 @@ impl FirewallSync {
             Some(Err(_)) => false,
         }
     }
+}
+
+/// Resolves to what the round's sweep sends, or `Unfinished` once it can't.
+fn answer(round: u64, receive: oneshot::Receiver<Arc<Observed>>) -> Answer {
+    let observed = async move {
+        receive.await.unwrap_or_else(|_| {
+            tracing::debug!(round, "firewall observation round did not finish");
+            let answer = Err(Refusal::Unfinished);
+            Arc::new(Observed { round, answer })
+        })
+    };
+    observed.boxed().shared()
 }
 
 fn lock(rounds: &Mutex<Rounds>) -> std::sync::MutexGuard<'_, Rounds> {
