@@ -416,17 +416,15 @@ enum ObservedPodIp<'a> {
 }
 
 impl ObservedPodIp<'_> {
-    /// A node report is for the pod it observed; once the row records a
-    /// different pod UID, it describes a replaced pod and is not written.
+    /// A node report is for the pod it observed and is written only while the
+    /// row records that pod's UID. A row with another UID, or none because a
+    /// materialization cleared it, no longer tracks the reported pod.
     fn reports_another_pod(
         self,
         tracked: &super::runtime_attribution::TrackedPod,
         pod_uid: Option<&str>,
     ) -> bool {
         matches!(self, Self::NodeReported(_))
-            && tracked
-                .pod_uid
-                .as_deref()
-                .is_some_and(|recorded| pod_uid != Some(recorded))
+            && (pod_uid.is_none() || tracked.pod_uid.as_deref() != pod_uid)
     }
 }

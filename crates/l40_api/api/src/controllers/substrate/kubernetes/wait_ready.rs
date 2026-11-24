@@ -398,17 +398,21 @@ impl KubernetesSubstrate {
     /// kubelet's status sync publishes the same address. Only an address
     /// reported for this execution generation and the observed pod's UID is
     /// taken, and only once it is persisted; otherwise the wait is left to
-    /// the watch.
+    /// the watch. With `expected_pod_uid`, only that pod is looked up.
     async fn node_reported_pod_ip(
         &self,
         sandbox_id: SandboxId,
         generation: i64,
+        expected_pod_uid: Option<&str>,
         mut observed: tokio::sync::watch::Receiver<Option<SandboxPodView>>,
     ) -> Option<PodIp> {
         let pod = observed
             .wait_for(|pod| {
-                pod.as_ref()
-                    .is_some_and(|pod| pod.uid().is_some() && assigned_pod_node_name(pod).is_some())
+                pod.as_ref().is_some_and(|pod| {
+                    pod.uid()
+                        .is_some_and(|uid| expected_pod_uid.is_none_or(|e| e == uid))
+                        && assigned_pod_node_name(pod).is_some()
+                })
             })
             .await
             .ok()?
@@ -498,11 +502,15 @@ impl KubernetesSubstrate {
         &self,
         metric_identity: crate::metrics::sandbox::api::SandboxApiMetricIdentity,
         sandbox_id: SandboxId,
-        generation: i64,
-        pod_name: &str,
+        target: &PodProxyWaitTarget<'_>,
         deadline: Instant,
         phase: &'static str,
     ) -> Result<Option<PodIp>, SubstrateError> {
+        let PodProxyWaitTarget {
+            pod_name,
+            pod_uid,
+            generation,
+        } = *target;
         let started_at = Instant::now();
         if let Some(pod_ip) = self
             .resolve_pod_ip_for_readiness(sandbox_id, deadline)
@@ -529,7 +537,7 @@ impl KubernetesSubstrate {
                 )),
         );
         let node_reported = Box::pin(
-            self.node_reported_pod_ip(sandbox_id, generation, observed_by_node)
+            self.node_reported_pod_ip(sandbox_id, generation, pod_uid, observed_by_node)
                 .instrument(tracing::info_span!(
                     "substrate.k8s.node_pod_ip",
                     sandbox_id = %sandbox_id,
@@ -615,14 +623,7 @@ impl KubernetesSubstrate {
         let sandbox_id_string = sandbox_id.to_string();
 
         let pod_ip_assignment = self
-            .wait_for_pod_ip_assignment(
-                metric_identity,
-                sandbox_id,
-                target.generation,
-                target.pod_name,
-                deadline,
-                phase,
-            )
+            .wait_for_pod_ip_assignment(metric_identity, sandbox_id, &target, deadline, phase)
             .instrument(tracing::info_span!(
                 "substrate.k8s.wait_pod_ip",
                 sandbox_id = %sandbox_id,
@@ -1284,6 +1285,7 @@ pub(super) struct SwallowedCommandProbes {
 /// Identity of the execution pod a proxy-reachability wait targets. Groups
 /// the execution-row fields so `wait_for_pod_proxy_reachable`'s signature
 /// stays under clippy's `too_many_arguments` ceiling as knobs are added.
+#[derive(Clone, Copy)]
 pub(super) struct PodProxyWaitTarget<'a> {
     pub pod_name: &'a str,
     /// Becomes the binding's `execution_object_id` when present; the wake

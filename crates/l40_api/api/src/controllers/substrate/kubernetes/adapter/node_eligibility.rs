@@ -175,7 +175,7 @@ impl KubernetesSubstrate {
     /// readiness finalizer. Requiring a live proxy means a preserved create can
     /// actually be reached by the client's data-plane retry; anything else
     /// falls through to teardown, exactly as before this change.
-    pub(super) async fn preservable_create_node(
+    pub(in crate::controllers::substrate::kubernetes) async fn preservable_create_node(
         &self,
         sandbox_uuid: SandboxId,
         pod_name: &str,
@@ -190,16 +190,17 @@ impl KubernetesSubstrate {
             return None;
         }
         let pod = match self.lookup_sandbox_pod(pod_name) {
-            // Trust the cached pod only when it shows BOTH a node assignment
-            // and a pod IP. The reflector can observe the scheduling update
-            // (`nodeName`) before the later `podIP` assignment; an IP-lagged
-            // cached pod would make `assigned_pod_ip` below return `None` and
-            // wrongly drop a reachable slow-create to teardown even though the
-            // per-pod watch already persisted the IP (`row.pod_ip`, checked
-            // above). Fall through to the authoritative GET in that window.
+            // Trust the cached pod only when it shows a node assignment and
+            // its IP, published or recorded on the row for the same pod UID.
+            // The reflector can observe the scheduling update (`nodeName`)
+            // before a pod it does not know the IP of; fall through to the
+            // authoritative GET in that window.
             Some(pod)
                 if assigned_pod_node_name(&pod).is_some()
-                    && assigned_pod_ip(&pod).ok().flatten().is_some() =>
+                    && current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
+                        .ok()
+                        .flatten()
+                        .is_some() =>
             {
                 pod
             }
@@ -214,7 +215,9 @@ impl KubernetesSubstrate {
         }
         // Live evidence the runtime is reachable — not merely that an IP was
         // assigned. Same probe + timeout the create proxy-reachable loop uses.
-        let pod_ip = assigned_pod_ip(&pod).ok().flatten()?;
+        let pod_ip = current_pod_ip(&pod, row.pod_uid.as_ref(), row.pod_ip.as_deref())
+            .ok()
+            .flatten()?;
         if !Self::pod_proxy_accepts_tcp(
             pod_ip,
             self.k8s.sandbox_proxy_port,

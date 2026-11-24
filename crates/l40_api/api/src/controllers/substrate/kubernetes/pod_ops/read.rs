@@ -263,14 +263,22 @@ impl KubernetesSubstrate {
         {
             return Ok(None);
         }
-        let Some(pod) = self
-            .read_sandbox_pod(&row.pod_name)
-            .await
-            .map_err(|error| {
-                kube_error_for_substrate("failed to read reachable sandbox pod", error)
-            })?
-        else {
-            return Ok(None);
+        // The row's IP for the cached pod it names is current before kubelet
+        // publishes it; only a pod the row does not describe needs a settled read.
+        let cached = self.lookup_sandbox_pod(&row.pod_name).filter(|pod| {
+            row.pod_ip.is_some() && row.pod_uid.as_ref().map(PodUid::as_str) == pod.uid()
+        });
+        let pod = match cached {
+            Some(pod) => pod,
+            None => match self
+                .read_sandbox_pod(&row.pod_name)
+                .await
+                .map_err(|error| {
+                    kube_error_for_substrate("failed to read reachable sandbox pod", error)
+                })? {
+                Some(pod) => pod,
+                None => return Ok(None),
+            },
         };
         if pod.is_deleting()
             || terminal_pod_phase(&pod).is_some()

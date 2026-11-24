@@ -8478,7 +8478,96 @@ mod kubernetes_tests {
                 substrate.resolve_reachable_pod_ip(sandbox_id).await?,
                 expected
             );
+            // A report landing after a materialization cleared the pod is not
+            // written; one for the pod the row records next is.
+            let set_pod = |pod_uid: Option<&'static str>| {
+                sqlx::query(sql!(
+                    "UPDATE sandbox_k8s_executions SET pod_uid = $2, pod_ip = NULL
+                      WHERE sandbox_id = $1 AND active",
+                ))
+                .bind(sandbox_id)
+                .bind(pod_uid)
+                .execute(&pool)
+            };
+            set_pod(None).await?;
+            assert_eq!(
+                substrate
+                    .store
+                    .persist_node_reported_pod_ip(sandbox_id, 1, "node-bound-uid", "10.0.0.8", None)
+                    .await?,
+                None
+            );
+            set_pod(Some("next-uid")).await?;
+            assert_eq!(
+                substrate
+                    .store
+                    .persist_node_reported_pod_ip(sandbox_id, 1, "next-uid", "10.0.0.8", None)
+                    .await?
+                    .as_deref(),
+                Some("10.0.0.8")
+            );
         }
+        Ok(())
+    }
+
+    /// Before kubelet publishes a pod's IP, the one its node reported serves
+    /// from the cached pod: a create that outlives its budget is preserved on
+    /// its node, and a request resolves the pod, without a pod GET.
+    #[tokio::test(flavor = "current_thread")]
+    async fn node_reported_pod_ip_serves_from_the_cache_before_kubelet_publishes()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let (pod_name, node_name) = ("space-sbx-node-preserved-g1", "node-preserved");
+        insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                  pod_ip, k8s_node_name, state, active)
+             VALUES ($1, 1, $2, 'space', 'node-preserved-uid', '127.0.0.1', $3,
+                     'running', TRUE)",
+        ))
+        .bind(sandbox_id)
+        .bind(pod_name)
+        .bind(node_name)
+        .execute(&pool)
+        .await?;
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": pod_name, "namespace": "space", "uid": "node-preserved-uid" },
+            "spec": { "nodeName": node_name, "containers": [] },
+            "status": { "phase": "Running" }
+        }))?;
+        let kube_requests: KubeRequestLog = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+            pool,
+            logged_kubernetes_client(
+                replace_existing_pod_kubernetes_client(
+                    pod.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                Arc::clone(&kube_requests),
+            ),
+            proxy.local_addr()?.port(),
+            Some(pod),
+            vec![k8s_node_with_internal_ip(node_name, "10.0.0.60")],
+        );
+
+        assert!(
+            substrate
+                .preservable_create_node(sandbox_id, pod_name)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            substrate.resolve_reachable_pod_ip(sandbox_id).await?,
+            Some(PodIp::parse("127.0.0.1")?)
+        );
+        assert_eq!(*kube_requests.lock().unwrap(), Vec::new());
         Ok(())
     }
 
