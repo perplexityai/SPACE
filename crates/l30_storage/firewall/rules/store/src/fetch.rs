@@ -76,42 +76,32 @@ pub async fn fetch_instructions(
         }),
         _ => None,
     };
-    // The schema sets the round and its issue time together.
-    let pending_round = match (round, issued_at) {
-        (Some(round), Some(issued_at)) => Some(pending_round(
-            round,
-            issued_at,
-            bound_generation(round_generation)?,
-        )?),
-        _ => None,
-    };
+    let pending_round = pending_round(round, issued_at, round_generation)?;
     Ok(NodeInstructions {
         assignment,
         pending_round,
     })
 }
 
-/// A pending round as stored, with the generation it asks about, decoded
-/// alike for Fetch and the round opener.
+/// A pending round as stored, decoded alike for Fetch and the round opener.
+/// The schema sets all three columns or none, so a partial set is an error.
 pub(crate) fn pending_round(
-    round: i64,
-    issued_at: OffsetDateTime,
-    assignment_generation: u64,
-) -> Result<PendingRound, sqlx::Error> {
-    Ok(PendingRound {
-        round: non_negative(round)?,
-        issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
-            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
-        assignment_generation,
-    })
-}
-
-/// The generation a pending round names; the schema never stores one without.
-pub(crate) fn bound_generation(stored: Option<i64>) -> Result<u64, sqlx::Error> {
-    let stored = stored.ok_or_else(|| {
-        sqlx::Error::Decode("pending round names no assignment generation".into())
-    })?;
-    non_negative(stored)
+    round: Option<i64>,
+    issued_at: Option<OffsetDateTime>,
+    assignment_generation: Option<i64>,
+) -> Result<Option<PendingRound>, sqlx::Error> {
+    match (round, issued_at, assignment_generation) {
+        (None, None, None) => Ok(None),
+        (Some(round), Some(issued_at), Some(generation)) => Ok(Some(PendingRound {
+            round: non_negative(round)?,
+            issued_at: Timestamp::from_nanosecond(issued_at.unix_timestamp_nanos())
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+            assignment_generation: non_negative(generation)?,
+        })),
+        _ => Err(sqlx::Error::Decode(
+            "pending round columns are partly set".into(),
+        )),
+    }
 }
 
 /// The schema keeps every counter non-negative; report a violation rather

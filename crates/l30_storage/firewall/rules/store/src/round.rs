@@ -21,7 +21,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::{Connection, PgConnection};
 use time::OffsetDateTime;
 
-use crate::fetch::{PendingRound, bound_generation, pending_round};
+use crate::fetch::{PendingRound, pending_round};
 use crate::issue::wake_one;
 use crate::leased_item::{HeaderLock, lock_leased_item};
 use crate::{LeasedTarget, REPORT_MAX_AGE, Wakeup, Work, roll_back};
@@ -79,6 +79,9 @@ pub enum OpenRefusal {
 /// round, an expired one included, is replaced by a new one. The lease is
 /// rechecked at the clock reading that times the round, after the wakeup,
 /// which can wait on a lock.
+///
+/// A pending round with no generation is a stored-state error (`Err`), not a
+/// refusal to retry; the schema's CHECK forbids it.
 pub async fn open_round(
     conn: &mut PgConnection,
     target: &LeasedTarget,
@@ -154,7 +157,7 @@ async fn open(
     .execute(&mut **tx)
     .await?;
     // Expired as acceptance judges it: on the clock, from the original issue.
-    let (epoch, round, round_issued_at, bound, expired) =
+    let (epoch, round, issued_at, bound, expired) =
         sqlx::query_as::<_, (i64, Option<i64>, Option<OffsetDateTime>, Option<i64>, bool)>(sql!(
             "SELECT manager_epoch, pending_round, pending_round_issued_at,
                     pending_assignment_generation,
@@ -171,12 +174,7 @@ async fn open(
     if epoch != manager_epoch {
         return Ok(Opening::Refused(OpenRefusal::EpochMismatch));
     }
-    let pending = match (round, round_issued_at) {
-        (Some(round), Some(issued_at)) => {
-            Some(pending_round(round, issued_at, bound_generation(bound)?)?)
-        }
-        _ => None,
-    };
+    let pending = pending_round(round, issued_at, bound)?;
     match pending {
         Some(open) if open.assignment_generation == assignment_generation && !expired => {
             return Ok(Opening::AlreadyOpen(open));
@@ -191,7 +189,7 @@ async fn open(
     wake_one(tx, wakeup, target.node_id).await?;
     // After the wakeup, which may have waited, on one clock reading. The item
     // lock, held since the item was read, keeps its token as checked.
-    let opened = sqlx::query_as::<_, (i64, OffsetDateTime)>(sql!(
+    let opened = sqlx::query_as::<_, (Option<i64>, Option<OffsetDateTime>, Option<i64>)>(sql!(
         "WITH clock AS (SELECT clock_timestamp() AS reading)
          UPDATE firewall_rules_node_observations o
          SET pending_round = coalesce(greatest(o.pending_round, o.accepted_round) + 1, 1),
@@ -205,19 +203,18 @@ async fn open(
                WHERE i.rollout_id = $3
                  AND i.node_id = $1
                  AND i.lease_expires_at > clock.reading)
-         RETURNING o.pending_round, o.pending_round_issued_at"
+         RETURNING o.pending_round, o.pending_round_issued_at,
+                   o.pending_assignment_generation"
     ))
     .bind(target.node_id)
     .bind(assignment_generation.cast_signed())
     .bind(target.rollout_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((round, issued_at)) = opened else {
+    let Some((round, issued_at, bound)) = opened else {
         return Ok(Opening::Refused(OpenRefusal::Lapsed));
     };
-    Ok(Opening::Opened(pending_round(
-        round,
-        issued_at,
-        assignment_generation,
-    )?))
+    let opened = pending_round(round, issued_at, bound)?
+        .ok_or_else(|| sqlx::Error::Decode("opened round is not pending".into()))?;
+    Ok(Opening::Opened(opened))
 }
