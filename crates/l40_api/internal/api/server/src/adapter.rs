@@ -144,6 +144,140 @@ impl ClusterApiService {
             .await
             .map_err(|err| Status::internal(format!("resolve caller nodes: {err}")))
     }
+
+    /// `RegisterTemplateRelease`, whose result the trait method records as one
+    /// `template.release_registration` outcome, whichever return it took.
+    async fn register_template_release_unrecorded(
+        &self,
+        request: Request<RegisterTemplateReleaseRequest>,
+    ) -> Result<Response<RegisterTemplateReleaseResponse>, Status> {
+        pplx_space_rpc_auth::build::authorize_template_build(
+            &request,
+            request.get_ref().org_id.as_deref(),
+        )?;
+        let requires_grant =
+            pplx_space_rpc_auth::build::system_publication_requires_grant(&request);
+        let requires_tenant_grant =
+            pplx_space_rpc_auth::build::tenant_publication_requires_grant(&request);
+        let publisher_addr = request.remote_addr();
+        let publisher_node = pplx_space_rpc_auth::build::publication_node(&request).cloned();
+        let request = request.into_inner();
+        let template_name = template_publication::parse_template_name(&request.template_name)?;
+        let runtime = validated_template_runtime(&request.runtime)?;
+        let hash = validated_release_hash(&request.hash)?;
+        let tags = dedupe_required_strings(request.tags, "tag")?;
+        let storage_locations = validated_storage_connection_strings(
+            request.storage_connection_strings,
+            &self.trusted_template_storage,
+        )?;
+        let template_org = TemplateOrg::parse(request.org_id.as_deref())?;
+        let tenant_grant = template_publication::tenant_publication_grant(
+            request.tenant_publication_grant_id.as_deref(),
+            template_org,
+            requires_tenant_grant,
+        )?;
+        let system_grant = template_publication::system_publication_grant(
+            request.system_publication_grant_id.as_deref(),
+            template_org,
+            requires_grant,
+        )?;
+        self.reserved_template_names
+            .authorize(&template_name, template_org)?;
+        let publisher_nodes = match tenant_grant {
+            Some(_) => {
+                self.publisher_nodes(publisher_addr, publisher_node.as_ref())
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let execution_metadata = validated_execution_metadata(request.execution.as_ref())?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| template_publication::storage_status("begin tx", &err))?;
+
+        // Consumed with the release it authorizes: a rolled-back publication
+        // keeps its grant, and a committed one cannot be repeated.
+        if let Some(grant) = system_grant
+            && !template_system_publication_grants::consume(&mut *tx, &template_name, grant)
+                .await
+                .map_err(|err| {
+                    template_publication::storage_status("consume system publication", err.as_sql())
+                })?
+        {
+            return Err(template_publication::missing_system_publication_grant());
+        }
+        if let (Some(grant), TemplateOrg::Owned { org_id }) = (tenant_grant, template_org)
+            && !template_tenant_publication_grants::consume(
+                &mut *tx,
+                &template_tenant_publication_grants::TenantPublication {
+                    grant,
+                    template: &template_name,
+                    org_id,
+                    caller_nodes: &publisher_nodes,
+                },
+            )
+            .await
+            .map_err(|err| {
+                template_publication::storage_status("consume tenant publication", err.as_sql())
+            })?
+        {
+            return Err(template_publication::missing_tenant_publication_grant());
+        }
+        let release_org_id = self
+            .lock_template_for_publication(&mut tx, &template_name, template_org)
+            .await?;
+        let release = ensure_template_release(
+            &mut tx,
+            template_name.as_str(),
+            runtime,
+            &hash,
+            release_org_id,
+            execution_metadata.as_ref(),
+        )
+        .await?;
+
+        let mut tag_rows = Vec::with_capacity(tags.len());
+        if !tags.is_empty() {
+            let tagged = tag_release(&mut tx, &release).await?;
+            if tagged.id == release.id {
+                for tag in &tags {
+                    tag_rows.push(ensure_template_release_tag(&mut tx, &tagged, tag).await?);
+                }
+            } else {
+                tag_rows = twin_tags(&mut tx, &tagged, &tags).await?;
+            }
+        }
+
+        let mut location_rows = Vec::with_capacity(storage_locations.len());
+        for connection_string in &storage_locations {
+            let row = ensure_template_release_storage_location(
+                &mut tx,
+                &release,
+                connection_string.as_wire(),
+            )
+            .await?;
+            location_rows.push(row);
+        }
+
+        tx.commit()
+            .await
+            .map_err(|err| template_publication::storage_status("commit tx", &err))?;
+
+        Ok(Response::new(RegisterTemplateReleaseResponse {
+            release: Some(template_release_proto(release)),
+            tags: tag_rows
+                .into_iter()
+                .map(template_release_tag_proto)
+                .collect(),
+            storage_locations: location_rows
+                .into_iter()
+                .map(template_release_storage_location_proto)
+                .collect(),
+        }))
+    }
 }
 
 #[tonic::async_trait]
@@ -300,132 +434,11 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<RegisterTemplateReleaseRequest>,
     ) -> Result<Response<RegisterTemplateReleaseResponse>, Status> {
-        pplx_space_rpc_auth::build::authorize_template_build(
-            &request,
-            request.get_ref().org_id.as_deref(),
-        )?;
-        let requires_grant =
-            pplx_space_rpc_auth::build::system_publication_requires_grant(&request);
-        let requires_tenant_grant =
-            pplx_space_rpc_auth::build::tenant_publication_requires_grant(&request);
-        let publisher_addr = request.remote_addr();
-        let publisher_node = pplx_space_rpc_auth::build::publication_node(&request).cloned();
-        let request = request.into_inner();
-        let template_name = template_publication::parse_template_name(&request.template_name)?;
-        let runtime = validated_template_runtime(&request.runtime)?;
-        let hash = validated_release_hash(&request.hash)?;
-        let tags = dedupe_required_strings(request.tags, "tag")?;
-        let storage_locations = validated_storage_connection_strings(
-            request.storage_connection_strings,
-            &self.trusted_template_storage,
-        )?;
-        let template_org = TemplateOrg::parse(request.org_id.as_deref())?;
-        let tenant_grant = template_publication::tenant_publication_grant(
-            request.tenant_publication_grant_id.as_deref(),
-            template_org,
-            requires_tenant_grant,
-        )?;
-        let system_grant = template_publication::system_publication_grant(
-            request.system_publication_grant_id.as_deref(),
-            template_org,
-            requires_grant,
-        )?;
-        self.reserved_template_names
-            .authorize(&template_name, template_org)?;
-        let publisher_nodes = match tenant_grant {
-            Some(_) => {
-                self.publisher_nodes(publisher_addr, publisher_node.as_ref())
-                    .await?
-            }
-            None => Vec::new(),
-        };
-        let execution_metadata = validated_execution_metadata(request.execution.as_ref())?;
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|err| template_publication::storage_status("begin tx", &err))?;
-
-        // Consumed with the release it authorizes: a rolled-back publication
-        // keeps its grant, and a committed one cannot be repeated.
-        if let Some(grant) = system_grant
-            && !template_system_publication_grants::consume(&mut *tx, &template_name, grant)
-                .await
-                .map_err(|err| {
-                    template_publication::storage_status("consume system publication", err.as_sql())
-                })?
-        {
-            return Err(template_publication::missing_system_publication_grant());
-        }
-        if let (Some(grant), TemplateOrg::Owned { org_id }) = (tenant_grant, template_org)
-            && !template_tenant_publication_grants::consume(
-                &mut *tx,
-                &template_tenant_publication_grants::TenantPublication {
-                    grant,
-                    template: &template_name,
-                    org_id,
-                    caller_nodes: &publisher_nodes,
-                },
-            )
-            .await
-            .map_err(|err| {
-                template_publication::storage_status("consume tenant publication", err.as_sql())
-            })?
-        {
-            return Err(template_publication::missing_tenant_publication_grant());
-        }
-        let release_org_id = self
-            .lock_template_for_publication(&mut tx, &template_name, template_org)
-            .await?;
-        let release = ensure_template_release(
-            &mut tx,
-            template_name.as_str(),
-            runtime,
-            &hash,
-            release_org_id,
-            execution_metadata.as_ref(),
-        )
-        .await?;
-
-        let mut tag_rows = Vec::with_capacity(tags.len());
-        if !tags.is_empty() {
-            let tagged = tag_release(&mut tx, &release).await?;
-            if tagged.id == release.id {
-                for tag in &tags {
-                    tag_rows.push(ensure_template_release_tag(&mut tx, &tagged, tag).await?);
-                }
-            } else {
-                tag_rows = twin_tags(&mut tx, &tagged, &tags).await?;
-            }
-        }
-
-        let mut location_rows = Vec::with_capacity(storage_locations.len());
-        for connection_string in &storage_locations {
-            let row = ensure_template_release_storage_location(
-                &mut tx,
-                &release,
-                connection_string.as_wire(),
-            )
-            .await?;
-            location_rows.push(row);
-        }
-
-        tx.commit()
-            .await
-            .map_err(|err| template_publication::storage_status("commit tx", &err))?;
-
-        Ok(Response::new(RegisterTemplateReleaseResponse {
-            release: Some(template_release_proto(release)),
-            tags: tag_rows
-                .into_iter()
-                .map(template_release_tag_proto)
-                .collect(),
-            storage_locations: location_rows
-                .into_iter()
-                .map(template_release_storage_location_proto)
-                .collect(),
-        }))
+        let result = self.register_template_release_unrecorded(request).await;
+        crate::metrics::template::release_registration(
+            crate::metrics::template::TemplateReleaseRegistrationOutcome::of(&result),
+        );
+        result
     }
 
     async fn find_template_release(
