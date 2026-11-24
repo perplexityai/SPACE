@@ -6,9 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use pplx_space_accounts_store::{NewSession, clusters, organizations, sessions};
+use pplx_space_accounts_store::{NewSession, clusters, organizations, sessions, users};
 use pplx_space_node_model::SubstrateKind;
-use pplx_space_sql_locator::sql;
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -230,12 +229,7 @@ async fn create_session_for_password(
     let mut tx = pool.begin().await?;
     // Hold the password read through session insertion so resets revoke every
     // session authenticated with the old password.
-    let Some(user) =
-        sqlx::query_as::<_, User>(sql!("SELECT * FROM users WHERE email = $1 FOR SHARE"))
-            .bind(&request.email)
-            .fetch_optional(&mut *tx)
-            .await?
-    else {
+    let Some(user) = users::share_lock_user_by_email(&mut tx, &request.email).await? else {
         return Err(AuthRouteError::InvalidCredentials);
     };
 

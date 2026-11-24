@@ -12,7 +12,6 @@ use pplx_space_accounts_store::{
 };
 use pplx_space_byok_model::{KekProvider, platform_default_kek_provider};
 use pplx_space_sandbox_store::UserSandboxRows;
-use pplx_space_sql_locator::sql;
 use time::OffsetDateTime;
 
 use super::super::authz;
@@ -520,16 +519,9 @@ pub(super) async fn update_org(
     // re-sends every branding field on save, and a value stored before
     // validation existed must not block an edit to another field. Locked so
     // the comparison holds until the update.
-    let stored = sqlx::query_as::<_, StoredBranding>(sql!(
-        "SELECT theme_primary, theme_secondary, logo_url
-         FROM organizations
-         WHERE id = $1
-         FOR UPDATE"
-    ))
-    .bind(org_id)
-    .fetch_optional(tx.as_mut())
-    .await?
-    .ok_or(IdentityAdminError::NotFound)?;
+    let stored = organizations::lock_organization_branding(tx.as_mut(), org_id)
+        .await?
+        .ok_or(IdentityAdminError::NotFound)?;
     validate_branding(
         changed_value(
             theme_primary_present,
@@ -919,13 +911,6 @@ fn is_logo_url(value: &str) -> bool {
         Some("http") => matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]"),
         _ => false,
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct StoredBranding {
-    theme_primary: Option<String>,
-    theme_secondary: Option<String>,
-    logo_url: Option<String>,
 }
 
 /// The value a patch field sets, when it sets one other than the stored
