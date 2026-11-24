@@ -1,11 +1,10 @@
 use std::path::Path;
 
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, Result};
 
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
-use pplx_space_sql_locator::sql;
 use pplx_space_template_mgr_store::builds::{self, TemplateBuildRow};
 use pplx_space_template_mgr_store::database;
 use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
@@ -387,7 +386,7 @@ pub(crate) fn set_last_used_at_for_test(
     conn.execute(
         "UPDATE template_builds SET last_used_at = ?3
          WHERE name = ?1 AND content_hash = ?2",
-        params![name, content_hash, last_used_at_secs.to_string()],
+        rusqlite::params![name, content_hash, last_used_at_secs.to_string()],
     )?;
     Ok(())
 }
@@ -725,20 +724,12 @@ pub fn delete_template_network_policy_notifications(
     let tx = immediate_transaction(conn)?;
     let mut deleted = 0;
     for row in rows {
-        deleted += tx.execute(
-            sql!(
-                "DELETE FROM template_network_policy_notifications
-             WHERE template = ?1
-               AND generation = ?2
-               AND authority = ?3
-               AND policy_json = ?4"
-            ),
-            params![
-                row.template,
-                saturating_u64_to_i64(row.generation),
-                row.authority.as_str(),
-                row.policy_json
-            ],
+        deleted += network_policy_notifications::acknowledge(
+            &tx,
+            &row.template,
+            row.generation,
+            row.authority,
+            &row.policy_json,
         )?;
     }
     tx.commit()?;

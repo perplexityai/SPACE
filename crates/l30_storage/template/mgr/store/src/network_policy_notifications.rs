@@ -8,12 +8,12 @@ use pplx_space_policy_authority::PolicyAuthority;
 use pplx_space_sql_locator::sql;
 
 use crate::{
-    codec::{nonnegative_i64_to_u64, parse_policy_authority},
+    codec::{nonnegative_i64_to_u64, parse_policy_authority, saturating_u64_to_i64},
     limit_to_i64,
 };
 
 /// A queued notification. `policy_json` is the persisted bytes, the
-/// witness an acknowledgement must match.
+/// witness an acknowledgement must match (see [`acknowledge`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateNetworkPolicyNotificationRecord {
     pub template: String,
@@ -77,3 +77,35 @@ pub fn list(
     })?;
     rows.collect()
 }
+
+/// Acknowledge a sent notification: delete `template`'s row only while its
+/// generation, authority and persisted policy bytes are still the ones sent.
+/// Returns the number of rows deleted: zero when a newer notification
+/// replaced the sent one, which stays queued, or when none is queued. Run it
+/// in the caller's transaction to acknowledge a batch atomically.
+pub fn acknowledge(
+    conn: &Connection,
+    template: &str,
+    generation: u64,
+    authority: PolicyAuthority,
+    policy_json: &str,
+) -> Result<usize> {
+    conn.execute(
+        sql!(
+            "DELETE FROM template_network_policy_notifications
+             WHERE template = ?1
+               AND generation = ?2
+               AND authority = ?3
+               AND policy_json = ?4"
+        ),
+        params![
+            template,
+            saturating_u64_to_i64(generation),
+            authority.as_str(),
+            policy_json
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests;

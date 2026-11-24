@@ -1257,12 +1257,13 @@ async fn prune_catalog_rows_missing_on_disk(
                     content_hash = %content_hash,
                     "stuck 'deleting' template build: artifacts intact, restoring to 'ready'"
                 );
-                let _ = conn.execute(
-                    "UPDATE template_builds SET state = 'ready'
-                     WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                       AND state = 'deleting'",
-                    rusqlite::params![name, content_hash, partition.key()],
-                );
+                let _ =
+                    pplx_space_template_mgr_store::eviction::startup_reset_deleting_build_to_ready(
+                        &conn,
+                        name,
+                        content_hash,
+                        *partition,
+                    );
             }
         }
 

@@ -6,6 +6,7 @@ use pplx_space_execution_spec::{
 };
 use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
 use pplx_space_template_manifest::TemplateManifest;
+use rusqlite::params;
 
 use pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs;
 

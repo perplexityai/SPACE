@@ -8952,7 +8952,6 @@ dependencies = [
  "pplx-space-service-lifecycle",
  "pplx-space-service-mutex",
  "pplx-space-snapshot-model",
- "pplx-space-sql-locator",
  "pplx-space-state-reconciliation",
  "pplx-space-stopwatch",
  "pplx-space-subject-model",
