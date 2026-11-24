@@ -41,6 +41,151 @@ mod postgres_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn port_enqueue_and_pending_backup_publication_do_not_deadlock() -> TestResult {
+        use pplx_space_internal_api_server::{
+            ClusterApiService,
+            proto::{
+                PendingLocalBackupReport, PublishNodeStateRequest, PublishedSandboxState,
+                cluster_api_server::ClusterApi,
+            },
+        };
+        use pplx_space_sbx_mgr_client::proto::{ArtifactKind, PendingLocalBackup};
+
+        async fn waiter(pool: &PgPool, blocker_pid: i32) -> TestResult<i32> {
+            Ok(tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(pid) = sqlx::query_scalar(sql!(
+                        "SELECT pid FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND $1 = ANY(pg_blocking_pids(pid))"
+                    ))
+                    .bind(blocker_pid)
+                    .fetch_optional(pool)
+                    .await?
+                    {
+                        return Ok::<_, sqlx::Error>(pid);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await??)
+        }
+
+        let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+        let pool = &db.pool;
+        let node_id = NodeId::new();
+        pplx_space_db_test_fixtures::insert_ready_worker_node(pool, node_id).await?;
+        let sandbox_id = SandboxId::new();
+        let arriving_sandbox_id = SandboxId::new();
+        for id in [sandbox_id, arriving_sandbox_id] {
+            insert_sandbox(pool, id, "started").await?;
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET active_node_id = $2, placement = 'on_node' WHERE id = $1"
+            ))
+            .bind(id)
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+        }
+
+        let server = ClusterApiService::new(pool.clone());
+        let census = |ids: &[SandboxId], pending_local_backups| {
+            let mut request = tonic::Request::new(PublishNodeStateRequest {
+                node_id: node_id.to_string(),
+                sandbox_inventory_complete: true,
+                sandboxes: ids
+                    .iter()
+                    .map(|id| PublishedSandboxState {
+                        sandbox_id: id.to_string(),
+                        present: true,
+                        status: Some("started".to_owned()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                pending_local_backups,
+                ..Default::default()
+            });
+            request
+                .extensions_mut()
+                .insert(tonic::transport::server::TcpConnectInfo {
+                    local_addr: None,
+                    remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
+                });
+            request
+        };
+        ClusterApi::publish_node_state(&server, census(&[sandbox_id], None)).await?;
+
+        // Pause the census after it has locked the trigger for a first-seen
+        // sandbox, but before it mirrors the other sandbox's pending backup.
+        sqlx::raw_sql(
+            "CREATE FUNCTION pause_census_trigger() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 PERFORM pg_advisory_xact_lock(14702);
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER pause_census_trigger AFTER UPDATE ON node_reconcile_triggers
+               FOR EACH ROW EXECUTE FUNCTION pause_census_trigger();",
+        )
+        .execute(pool)
+        .await?;
+        let mut gate = pool.begin().await?;
+        let gate_pid = sqlx::query_scalar(sql!(
+            "SELECT pg_backend_pid() FROM pg_advisory_xact_lock(14702)"
+        ))
+        .fetch_one(&mut *gate)
+        .await?;
+        let artifact = Uuid::now_v7();
+        let publish = ClusterApi::publish_node_state(
+            &server,
+            census(
+                &[sandbox_id, arriving_sandbox_id],
+                Some(PendingLocalBackupReport {
+                    pending: vec![PendingLocalBackup {
+                        sandbox_id: sandbox_id.to_string(),
+                        local_artifact_id: artifact.to_string(),
+                        artifact_kind: ArtifactKind::Full as i32,
+                    }],
+                }),
+            ),
+        );
+        let race = async {
+            let publisher_pid = waiter(pool, gate_pid).await?;
+            let refs = [ReconcileRef::sandbox_desired_state(sandbox_id)];
+            let enqueue = enqueue_sandbox_reconcile_and_trigger(
+                pool,
+                sandbox_id,
+                &refs,
+                ReconcileReason::SandboxPortExposureUpdated,
+            );
+            let resume = async {
+                waiter(pool, publisher_pid).await?;
+                gate.rollback().await?;
+                TestResult::Ok(())
+            };
+            let (enqueue, resume) = tokio::join!(enqueue, resume);
+            resume?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(enqueue)
+        };
+        let (publish, enqueue) = tokio::time::timeout(Duration::from_secs(12), async {
+            tokio::join!(publish, race)
+        })
+        .await?;
+        let enqueue = enqueue?;
+        assert!(
+            publish.is_ok() && matches!(enqueue, Ok(Some(_))),
+            "publish={publish:?}, port enqueue={enqueue:?}"
+        );
+        let mirrored = sqlx::query_scalar::<_, Uuid>(sql!(
+            "SELECT artifact_id FROM node_local_backup_pending WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(mirrored, artifact);
+        Ok(())
+    }
+
     async fn insert_snapshot_with_storage_location(
         pool: &PgPool,
         sandbox_id: SandboxId,

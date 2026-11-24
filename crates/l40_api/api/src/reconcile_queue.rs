@@ -331,8 +331,10 @@ pub async fn enqueue_sandbox_reconcile_tx(
     sandbox_id: SandboxId,
     refs: &[ReconcileRef],
 ) -> Result<Option<EnqueuedNodeReconcile>, sqlx::Error> {
+    // Keep placement stable through enqueue without blocking foreign-key
+    // checks in a node publication that already holds its reconcile trigger.
     let node_id: Option<NodeId> = sqlx::query_scalar(sql!(
-        "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR UPDATE"
+        "SELECT active_node_id FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
     ))
     .bind(sandbox_id)
     .fetch_optional(&mut **tx)
