@@ -1,6 +1,7 @@
 pub mod boot;
 #[cfg(feature = "host-runtime")]
 pub mod cgroup;
+pub mod cgroup_memory;
 pub mod cgroup_paths;
 pub mod control;
 pub mod fc_api;
