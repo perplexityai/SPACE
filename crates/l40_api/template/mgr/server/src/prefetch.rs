@@ -1174,7 +1174,7 @@ async fn tick(
         // which matches `template_releases.hash` directly and tolerates
         // a bare (non-`sha256:`-prefixed) digest.
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
             PrefetchPull {
@@ -1193,7 +1193,7 @@ async fn tick(
             continue;
         }
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
             PrefetchPull {
@@ -1211,7 +1211,7 @@ async fn tick(
     for pull in environment_pulls {
         let trigger = pull.trigger();
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
             PrefetchPull {
@@ -1646,14 +1646,14 @@ fn flush_org_specific_release_pins(
 }
 
 /// Run `op` against the [`PinnedDigestsStore`] on a blocking thread.
-/// Centralizes the `spawn_blocking` + `rusqlite::Error → String`
+/// Centralizes the `spawn_blocking` + `crate::db::Error → String`
 /// conversion so the call sites in [`tick`] aren't dominated by
 /// boilerplate. The closure runs on a blocking worker because every
 /// store method takes the SQLite mutex synchronously.
 async fn spawn_blocking_store_op<T, F>(pins: PinnedDigestsStore, op: F) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnOnce(&PinnedDigestsStore) -> rusqlite::Result<T> + Send + 'static,
+    F: FnOnce(&PinnedDigestsStore) -> crate::db::Result<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || op(&pins))
         .await
@@ -1718,7 +1718,7 @@ struct PrefetchPull {
 /// here, sending the digest as-is against `template_releases.hash`
 /// and bypassing any tag-based path entirely.
 fn dispatch_pull(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     puller: VolumePuller,
     semaphore: Arc<Semaphore>,
     pull: PrefetchPull,

@@ -1,12 +1,11 @@
 //! An in-memory database with template-manager's schema, for the store's
 //! tests.
 
-use rusqlite::Connection;
-
+use crate::Connection;
 use crate::database::{COMMON_MIGRATOR, MIGRATOR};
 
 pub(crate) fn conn() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
     for migration in COMMON_MIGRATOR
         .iter()
         .chain(MIGRATOR.iter())
@@ -14,5 +13,5 @@ pub(crate) fn conn() -> Connection {
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    conn
+    Connection(conn)
 }

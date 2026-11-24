@@ -1,13 +1,15 @@
 //! A template's node-local state across tables: its builds, their components
 //! and snapshots, its pool and its settings.
 
-use rusqlite::{Connection, Result, Transaction, params};
+use rusqlite::params;
 
 use pplx_space_sql_locator::sql;
 
+use crate::{Connection, Result, Transaction};
+
 /// Whether any build row of the template exists, in any partition or state.
 pub fn template_has_builds(conn: &Connection, name: &str) -> Result<bool> {
-    let has_builds = conn.query_row(
+    let has_builds = conn.0.query_row(
         sql!("SELECT EXISTS(SELECT 1 FROM template_builds WHERE name = ?1)"),
         params![name],
         |row| row.get::<_, i64>(0),
@@ -19,20 +21,20 @@ pub fn template_has_builds(conn: &Connection, name: &str) -> Result<bool> {
 /// nothing cascades. The deletes are only correct together, so it takes the
 /// caller's transaction; the caller commits.
 pub fn delete_template_rows(tx: &Transaction<'_>, name: &str) -> Result<()> {
-    tx.execute(
+    tx.0.execute(
         sql!("DELETE FROM template_snapshots WHERE name = ?1"),
         params![name],
     )?;
-    tx.execute(
+    tx.0.execute(
         sql!("DELETE FROM template_build_components WHERE name = ?1"),
         params![name],
     )?;
-    tx.execute(
+    tx.0.execute(
         sql!("DELETE FROM template_builds WHERE name = ?1"),
         params![name],
     )?;
     crate::pools::delete_pool(tx, name)?;
-    tx.execute(
+    tx.0.execute(
         sql!("DELETE FROM template_settings WHERE template = ?1"),
         params![name],
     )?;
@@ -41,7 +43,7 @@ pub fn delete_template_rows(tx: &Transaction<'_>, name: &str) -> Result<()> {
 
 /// Whether the template has a snapshot, build, pool or settings row.
 pub fn template_local_state_exists(conn: &Connection, name: &str) -> Result<bool> {
-    let exists = conn.query_row(
+    let exists = conn.0.query_row(
         sql!(
             "SELECT EXISTS(
              SELECT 1 FROM template_snapshots WHERE name = ?1

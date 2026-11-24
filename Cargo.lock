@@ -9053,6 +9053,7 @@ dependencies = [
  "pplx-space-sql-locator",
  "pplx-space-sqlite",
  "pplx-space-template-model",
+ "ref-cast",
  "rusqlite",
  "serde",
  "serde_json",

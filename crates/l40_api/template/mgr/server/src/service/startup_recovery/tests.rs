@@ -327,20 +327,22 @@ async fn prune_drops_deleting_row_when_artifacts_missing() {
         },
     )
     .unwrap();
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting'
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting'
          WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
     // Artifacts intentionally missing.
 
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     prune_catalog_rows_missing_on_disk(&db, &store).await;
 
     let count: i64 = db
         .lock()
         .unwrap()
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_builds", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
@@ -383,19 +385,21 @@ async fn prune_restores_deleting_row_when_artifacts_intact() {
     std::fs::create_dir_all(&digest_dir).unwrap();
     std::fs::write(digest_dir.join(TEMPLATE_ROOTFS_FILE), b"x").unwrap();
 
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting'
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting'
          WHERE name = ?1 AND content_hash = ?2",
-        rusqlite::params!["seed", hash],
-    )
-    .unwrap();
+            rusqlite::params!["seed", hash],
+        )
+        .unwrap();
 
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     prune_catalog_rows_missing_on_disk(&db, &store).await;
 
     let state: String = db
         .lock()
         .unwrap()
+        .raw()
         .query_row(
             "SELECT state FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             rusqlite::params!["seed", hash],
@@ -606,7 +610,7 @@ fn registered(service: &TemplateManagerService, fixture: &DigestFixture) -> bool
     row_exists(service, "seed", &fixture.rootfs_hash)
 }
 
-fn insert_row(conn: &rusqlite::Connection, fixture: &DigestFixture, manifest: &TemplateManifest) {
+fn insert_row(conn: &crate::db::Connection, fixture: &DigestFixture, manifest: &TemplateManifest) {
     crate::db::upsert_build(
         conn,
         &crate::db::BuildUpsert {
@@ -933,7 +937,7 @@ async fn the_gc_tick_restores_or_removes_a_dir_the_reaper_left_rowless() {
     let missing: crate::eviction::ReaperDiskProbeFn = std::sync::Arc::new(|_, _, _| {
         Box::pin(async { crate::eviction::ReaperDiskState::Missing })
     });
-    crate::eviction::reap_stuck_deleting(std::sync::Arc::clone(&service.db), &missing).await;
+    crate::eviction::reap_stuck_deleting(service.db.clone(), &missing).await;
     assert!(!row_exists(&service, "seed", &intact_hash));
     assert!(intact_dir.exists() && wiped_dir.exists());
 
@@ -2032,7 +2036,7 @@ async fn recovery_keeps_a_legacy_dir_bound_to_another_environment() {
     bind_manifest(&mut manifest, twin_partition());
     write_manifest_json(fixture.dir.path(), &manifest);
     let conn = crate::db::test_conn();
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at)
          VALUES ('seed', ?1, 'd', ?2, 'fc', 'x86_64', '0')",
         rusqlite::params![fixture.rootfs_hash, serde_json::to_string(&manifest).unwrap()],
@@ -2146,7 +2150,7 @@ fn legacy_snapshots(
     .unwrap()
 }
 
-fn insert_legacy_row(conn: &rusqlite::Connection, template: &str, hash: &str) {
+fn insert_legacy_row(conn: &crate::db::Connection, template: &str, hash: &str) {
     crate::db::upsert_build(
         conn,
         &crate::db::BuildUpsert {
@@ -2655,7 +2659,7 @@ fn e1_execution() -> pplx_space_execution_spec::ExecutionMetadata {
 /// `with_row` get the row such a node recorded.
 fn place_legacy_e1_builds(
     root: &Path,
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     count: usize,
     with_row: &[usize],
 ) -> Vec<(String, std::path::PathBuf)> {
@@ -2672,7 +2676,7 @@ fn place_legacy_e1_builds(
             std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
             std::fs::rename(fixture.dir.path(), &dir).unwrap();
             if with_row.contains(&index) {
-                conn.execute(
+                conn.raw().execute(
                     "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at)
                      VALUES ('seed', ?1, 'd', ?2, 'fc', 'x86_64', '0')",
                     rusqlite::params![
@@ -2805,7 +2809,7 @@ fn a_snapshot_pruned_after_its_read_is_not_recorded() {
         vcpu: 2,
         memory_mib: 1024,
     };
-    let snapshots = |conn: &rusqlite::Connection| {
+    let snapshots = |conn: &crate::db::Connection| {
         crate::db::list_snapshots(
             conn,
             "seed",
@@ -2853,6 +2857,7 @@ fn a_snapshot_of_a_build_without_a_row_is_not_recorded() {
         Ok(false)
     );
     let recorded: i64 = conn
+        .raw()
         .query_row("SELECT COUNT(*) FROM template_snapshots", [], |row| {
             row.get(0)
         })

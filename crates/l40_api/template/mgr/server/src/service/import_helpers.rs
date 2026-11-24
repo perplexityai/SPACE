@@ -676,7 +676,7 @@ impl TemplateManagerService {
         let arch = template_arch(&metadata, &manifest);
 
         // Insert build into DB
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let n = template_id.to_string();
         let h = content_hash.to_string();
         tokio::task::spawn_blocking(move || {
@@ -818,7 +818,7 @@ impl TemplateManagerService {
         let _ = std::fs::write(format!("{snap_dir}/snapshot_hash"), &snap_hash);
         normalize_template_cache_tree(Path::new(snap_dir))?;
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let n = template_id.to_string();
         let h = content_hash.to_string();
         tokio::task::spawn_blocking(move || {

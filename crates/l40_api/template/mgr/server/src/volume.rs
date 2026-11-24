@@ -420,7 +420,7 @@ impl VolumePuller {
     /// decompressions.
     pub async fn pull(
         &self,
-        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        db: crate::db::SharedConnection,
         name: &str,
         req_hash: &str,
         req_tag: &str,
@@ -450,7 +450,7 @@ impl VolumePuller {
     /// as one that predates twins doesn't, is `ClusterMetadataUnavailable`.
     pub(crate) async fn pull_in_environment(
         &self,
-        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        db: crate::db::SharedConnection,
         name: &str,
         req_hash: &str,
         environment: EnvironmentReference,
@@ -481,7 +481,7 @@ impl VolumePuller {
     )]
     pub(crate) async fn pull_in_scope(
         &self,
-        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        db: crate::db::SharedConnection,
         spec: PullSpec<'_>,
         scope: Option<TemplateLookupScope>,
     ) -> PullOutcome {
@@ -506,7 +506,7 @@ impl VolumePuller {
     /// no `cluster_metadata_*` outcomes and no `template.pull.find_release_ms`.
     pub(crate) async fn materialize_release(
         &self,
-        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        db: crate::db::SharedConnection,
         spec: PullSpec<'_>,
         resolve_elapsed: Duration,
         release: ResolvedRelease,
@@ -534,7 +534,7 @@ impl VolumePuller {
 
     async fn pull_resolved(
         &self,
-        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        db: crate::db::SharedConnection,
         name: String,
         resolved_hash: String,
         storage_uris: Vec<String>,
@@ -569,7 +569,7 @@ impl VolumePuller {
                     Arc::clone(&flight),
                     Arc::clone(&self.in_flight),
                 );
-                let db = Arc::clone(&db);
+                let db = db.clone();
                 let name = name.clone();
                 let resolved_hash = resolved_hash.clone();
                 let storage_uris = storage_uris.clone();
@@ -1073,7 +1073,7 @@ pub(crate) struct PullSpec<'a> {
 
 async fn pull_inner(
     puller: &VolumePuller,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     spec: PullSpec<'_>,
     base_tags: &[String],
     path_taken: &mut PullPath,
@@ -1234,20 +1234,17 @@ fn probed_partition_refusal(
 /// (`state='deleting'`): its row still counts as present and its dir is the
 /// one being deleted.
 async fn refuse_pull_during_eviction(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     name: &str,
     content_hash: &str,
 ) -> Result<(), PullError> {
     let n = name.to_string();
     let h = content_hash.to_string();
-    let db_for_check = Arc::clone(db);
+    let db_for_check = db.clone();
     let is_deleting = tokio::task::spawn_blocking(move || {
-        let conn = db_for_check.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                Some("template DB mutex poisoned".to_string()),
-            )
-        })?;
+        let conn = db_for_check
+            .lock()
+            .map_err(|_| crate::db::Error::io_failure("template DB mutex poisoned".to_string()))?;
         crate::db::is_build_marked_deleting(&conn, &n, &h)
     })
     .await
@@ -1339,7 +1336,7 @@ fn environment_partition(
 
 /// The owner's work for one resolved digest.
 async fn pull_resolved_owner(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     pull: OwnedPull<'_>,
     base_tags: &[String],
     background_worker: Option<
@@ -1972,7 +1969,7 @@ fn finish_pull_failures(classified: PullFailure, downstream_status: Option<Statu
 }
 
 async fn do_pull(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     pull: ResolvedPull<'_>,
     storage_uris: &[String],
     base_tags: &[String],
@@ -2028,7 +2025,7 @@ async fn do_pull(
     // borrowing from the closure, which an `FnMut` can't lend out.
     let (db, cleanup_slot) = (&db, &cleanup);
     let result = pull_from_locations(storage_uris, &cleanup, move |parts| {
-        let db = Arc::clone(db);
+        let db = db.clone();
         async move {
             try_pull_from(
                 db,
@@ -2519,7 +2516,7 @@ impl Drop for ProbeDirGuard {
 }
 
 async fn try_pull_from(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     pull: ResolvedPull<'_>,
     parts: &StorageUri,
     base_tags: &[String],
@@ -3024,15 +3021,12 @@ async fn try_pull_from(
     // this is the only remaining commit step.
     let n = name.to_string();
     let h = content_hash.to_string();
-    let db_for_mark = Arc::clone(&db);
+    let db_for_mark = db.clone();
     let phase_started = Instant::now();
     let upsert = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                Some("template DB mutex poisoned".to_string()),
-            )
-        })?;
+        let conn = db
+            .lock()
+            .map_err(|_| crate::db::Error::io_failure("template DB mutex poisoned".to_string()))?;
         crate::db::upsert_build(
             &conn,
             &crate::db::BuildUpsert {
@@ -3934,7 +3928,7 @@ fn decompress_phase(target: &DecompressTarget, rootfs_filename: &str) -> &'stati
 /// `partition` ([`crate::db::find_ready_build_bound_to`]). A DB error reads
 /// as absent, so the pull goes ahead, as [`local_build_exists`] does.
 pub(crate) fn local_build_bound_to_exists(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     name: &str,
     content_hash: &str,
     partition: TemplateCachePartition,
@@ -3987,7 +3981,7 @@ enum ProbedPartition {
 /// The row read is one indexed query under the lock, as in
 /// [`local_build_exists`].
 fn probed_partition_action(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     template_root: &Path,
     name: &str,
     content_hash: &str,
@@ -4024,7 +4018,7 @@ fn probed_partition_action(
 
 /// Whether a build row exists for the digest in any cache partition.
 pub(crate) fn local_build_exists(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     name: &str,
     content_hash: &str,
 ) -> bool {

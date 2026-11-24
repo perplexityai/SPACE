@@ -365,7 +365,7 @@ async fn final_catalog_resolution_controls_prefetch(
 async fn assert_pull_outcome(visibility: TemplateVisibility, trigger: PullTrigger) -> TestResult {
     let release = crate::volume::find_release_inner(TEMPLATE, "", "latest", None).await?;
     assert_eq!(release.visibility, visibility);
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
 
     let outcome = VolumePuller::new()
         .pull(db, TEMPLATE, &release.hash, "", trigger)

@@ -4,7 +4,7 @@ use super::*;
 
 fn store_with_in_memory_db() -> PinnedDigestsStore {
     let conn = crate::db::test_conn();
-    PinnedDigestsStore::new(Arc::new(Mutex::new(conn)))
+    PinnedDigestsStore::new(crate::db::SharedConnection::new(conn))
 }
 
 #[test]
@@ -20,13 +20,14 @@ fn upsert_release_replaces_metadata_on_conflict() {
 
     let (release_id, release_created_at): (String, String) = {
         let conn = store.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT release_id, release_created_at FROM template_pinned_releases
+        conn.raw()
+            .query_row(
+                "SELECT release_id, release_created_at FROM template_pinned_releases
              WHERE name = ?1 AND content_hash = ?2",
-            params!["seed", "sha256:aa"],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
+                params!["seed", "sha256:aa"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
     };
     assert_eq!(release_id, "rel-2");
     assert_eq!(release_created_at, "2026-02-01T00:00:00Z");
@@ -321,6 +322,7 @@ fn tag_pins_of_partitions_the_node_no_longer_runs_are_pruned() {
 
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn
+        .raw()
         .prepare("SELECT cache_partition FROM template_pinned_tags ORDER BY cache_partition")
         .unwrap();
     let left: Vec<String> = stmt
@@ -345,6 +347,7 @@ fn deleting_a_tag_pin_drops_only_that_partition_s() {
 
     let conn = store.conn.lock().unwrap();
     let left: Vec<String> = conn
+        .raw()
         .prepare("SELECT cache_partition FROM template_pinned_tags")
         .unwrap()
         .query_map([], |row| row.get(0))

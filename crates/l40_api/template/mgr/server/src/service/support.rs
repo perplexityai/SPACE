@@ -206,7 +206,7 @@ pub(super) struct TemplateSelection {
 /// for the re-lookup after an auto-pull from the configured volume.
 pub(super) async fn build_get_template_response(
     template_root: PathBuf,
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     selection: TemplateSelection,
     snapshot_selector: Option<(u32, u32)>,
     policy_snapshot_memory_mib: Option<u32>,

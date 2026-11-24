@@ -1,30 +1,32 @@
-use rusqlite::{Connection, params};
+use rusqlite::params;
 
 use pplx_space_policy_authority::PolicyAuthority;
 
 use super::*;
-use crate::test_db;
+use crate::{Connection, test_db};
 
 const TEMPLATE: &str = "base";
 const POLICY_JSON: &str = r#"{"version":1}"#;
 
 fn insert_notification(conn: &Connection, generation: i64, authority: &str) {
-    conn.execute(
-        "INSERT INTO template_network_policy_notifications
+    conn.0
+        .execute(
+            "INSERT INTO template_network_policy_notifications
              (template, policy_json, generation, authority, requested_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, '0', '0')",
-        params![TEMPLATE, POLICY_JSON, generation, authority],
-    )
-    .unwrap();
+            params![TEMPLATE, POLICY_JSON, generation, authority],
+        )
+        .unwrap();
 }
 
 fn queued(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM template_network_policy_notifications WHERE template = ?1",
-        params![TEMPLATE],
-        |row| row.get(0),
-    )
-    .unwrap()
+    conn.0
+        .query_row(
+            "SELECT COUNT(*) FROM template_network_policy_notifications WHERE template = ?1",
+            params![TEMPLATE],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 #[test]
