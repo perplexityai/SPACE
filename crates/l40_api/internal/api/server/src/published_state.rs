@@ -1,7 +1,6 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_snapshot_model::SnapshotId;
 
-use pplx_space_sql_locator::sql;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::types::Json;
@@ -2073,55 +2072,6 @@ async fn apply_suspended_k8s_finalization(
     .map_err(|err| Status::internal(format!("delete retired warm-pool slot receipts: {err}")))?;
 
     Ok(projected)
-}
-
-pub async fn prune_absent_node_templates(
-    conn: &mut sqlx::PgConnection,
-    node_id: NodeId,
-    present_keys: &[(String, String)],
-) -> Result<(), Status> {
-    let templates = present_keys
-        .iter()
-        .map(|(template, _)| template.clone())
-        .collect::<Vec<_>>();
-    let content_hashes = present_keys
-        .iter()
-        .map(|(_, content_hash)| content_hash.clone())
-        .collect::<Vec<_>>();
-    sqlx::query(sql!(
-        "WITH present AS (
-             SELECT *
-             FROM UNNEST($2::TEXT[], $3::TEXT[]) AS present(template_name, content_hash)
-         ),
-         removed AS (
-             DELETE FROM node_template_inventory nti
-             WHERE nti.node_id = $1
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM present
-                   WHERE present.template_name = nti.template_name
-                     AND present.content_hash = nti.content_hash
-               )
-             RETURNING nti.template_name
-         ),
-         removed_elements AS (
-             SELECT DISTINCT 'template:' || template_name AS element
-             FROM removed
-         )
-         DELETE FROM node_facet_observed_status nfos
-         USING removed_elements
-         WHERE nfos.node_id = $1
-           AND nfos.facet = $4
-           AND nfos.element = removed_elements.element"
-    ))
-    .bind(node_id)
-    .bind(templates)
-    .bind(content_hashes)
-    .bind(FACET_NETWORK_POLICY)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("prune absent published templates: {err}")))?;
-    Ok(())
 }
 
 fn template_snapshots_json(snapshots: &[SnapshotInfo]) -> serde_json::Value {

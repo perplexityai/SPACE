@@ -2,12 +2,16 @@
 //! and their execution components (`node_template_components`, keyed to an
 //! inventory row and deleted with it), in the publishing transaction.
 //!
-//! Each verb takes the publication as one JSON array of objects, the
-//! recordset shape its statement reads with `jsonb_to_recordset`; the
-//! publisher builds and validates the objects.
+//! Each verb but [`prune_absent_templates`] takes the publication as one
+//! JSON array of objects, the recordset shape its statement reads with
+//! `jsonb_to_recordset`; the publisher builds and validates the objects.
+//! [`prune_absent_templates`] takes the builds a complete publication lists
+//! and deletes the rest.
 
 use pplx_space_accounts::NodeId;
+use pplx_space_postgres_pool::{DbError, Executor};
 use pplx_space_sql_locator::sql;
+use pplx_space_state_reconciliation::FACET_NETWORK_POLICY;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgExecutor};
 
@@ -356,6 +360,65 @@ pub async fn upsert_published_template_components(
     .bind(node_id)
     .bind(Json(rows))
     .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Delete `node_id`'s inventory rows whose `(template_name, content_hash)`
+/// is not among `present_keys`, the builds a complete publication lists
+/// (every row of the node when it is empty), and in the same statement the
+/// node's `network-policy` rows in `node_facet_observed_status` whose
+/// element is `template:<name>` for a template that lost a row. Their
+/// `node_template_components` and `node_facet_conditions` rows go with
+/// them (`ON DELETE CASCADE`).
+///
+/// `node_facet_observed_status` is sandbox-teardown's table, which this
+/// statement writes under a temporary co-writer grant: the two deletes stay
+/// one statement, reading one snapshot.
+pub async fn prune_absent_templates(
+    executor: impl Executor<'_>,
+    node_id: NodeId,
+    present_keys: &[(String, String)],
+) -> Result<(), DbError> {
+    let templates = present_keys
+        .iter()
+        .map(|(template, _)| template.clone())
+        .collect::<Vec<_>>();
+    let content_hashes = present_keys
+        .iter()
+        .map(|(_, content_hash)| content_hash.clone())
+        .collect::<Vec<_>>();
+    sqlx::query(sql!(
+        "WITH present AS (
+             SELECT *
+             FROM UNNEST($2::TEXT[], $3::TEXT[]) AS present(template_name, content_hash)
+         ),
+         removed AS (
+             DELETE FROM node_template_inventory nti
+             WHERE nti.node_id = $1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM present
+                   WHERE present.template_name = nti.template_name
+                     AND present.content_hash = nti.content_hash
+               )
+             RETURNING nti.template_name
+         ),
+         removed_elements AS (
+             SELECT DISTINCT 'template:' || template_name AS element
+             FROM removed
+         )
+         DELETE FROM node_facet_observed_status nfos
+         USING removed_elements
+         WHERE nfos.node_id = $1
+           AND nfos.facet = $4
+           AND nfos.element = removed_elements.element"
+    ))
+    .bind(node_id)
+    .bind(templates)
+    .bind(content_hashes)
+    .bind(FACET_NETWORK_POLICY)
+    .execute(executor.into_sqlx())
     .await?;
     Ok(())
 }

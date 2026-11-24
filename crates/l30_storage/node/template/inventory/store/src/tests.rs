@@ -8,6 +8,8 @@ use pplx_space_template_model::TemplateName;
 
 use super::*;
 
+mod prune_absent;
+
 /// Orgs seeded by the baseline migration's fixture data.
 const ORG_A: Uuid = Uuid::from_u128(0x1);
 const ORG_B: Uuid = Uuid::from_u128(0x3);
