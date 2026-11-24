@@ -430,8 +430,8 @@ impl NodeManagerService {
         let ns_name = info.ns_name();
 
         let ns_path = info.ns_path();
-        let pod_ip = match pod_netns {
-            Some(pod_netns) => read_pod_ip(sandbox_id, pod_netns).await,
+        let external_address = match pod_netns {
+            Some(netns) => read_external_address(sandbox_id, netns).await,
             None => None,
         };
 
@@ -446,7 +446,7 @@ impl NodeManagerService {
             slot_generation: info.generation,
             slot_label: info.slot_label(),
             sandbox_uid: info.sandbox_uid,
-            pod_ip,
+            external_address,
         }))
     }
 
@@ -1266,16 +1266,16 @@ impl NodeManagerService {
 #[cfg(target_os = "linux")]
 pub(super) mod tests;
 
-/// Best effort: a caller without the address falls back to Kubernetes status.
-async fn read_pod_ip(sandbox_id: &str, pod_netns: String) -> Option<String> {
-    match tokio::task::spawn_blocking(move || net::pod_ipv4(&pod_netns)).await {
+/// Best effort: a caller without the address falls back to its own source.
+async fn read_external_address(sandbox_id: &str, netns: String) -> Option<String> {
+    match tokio::task::spawn_blocking(move || net::default_route_ipv4(&netns)).await {
         Ok(Ok(ip)) => Some(ip.to_string()),
         Ok(Err(error)) => {
-            tracing::warn!(sandbox_id, %error, "failed to read pod IP");
+            tracing::warn!(sandbox_id, %error, "failed to read external netns address");
             None
         }
         Err(error) => {
-            tracing::warn!(sandbox_id, %error, "pod IP read task failed");
+            tracing::warn!(sandbox_id, %error, "external netns address read task failed");
             None
         }
     }

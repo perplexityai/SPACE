@@ -359,6 +359,7 @@ pub struct SlotInfo {
     /// If set, the pod's network namespace name (from CNI). The sandbox namespace
     /// bridges to this namespace via a veth pair + MASQUERADE instead of to the
     /// root namespace.
+    // TODO: rename to `external_netns`; the node manager needs no pod concept.
     pub pod_netns: Option<String>,
 }
 
@@ -831,9 +832,8 @@ fn get_default_iface_in_ns(ns: &str) -> Result<String, DefaultIfaceError> {
     native::default_iface(Some(ns))
 }
 
-/// The IPv4 address of `ns`'s default-route interface: in a CNI pod
-/// namespace, the address CNI assigned to the pod.
-pub fn pod_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
+/// The IPv4 address of `ns`'s default-route interface.
+pub fn default_route_ipv4(ns: &str) -> Result<std::net::Ipv4Addr, DefaultIfaceError> {
     native::default_iface_ipv4(ns)
 }
 

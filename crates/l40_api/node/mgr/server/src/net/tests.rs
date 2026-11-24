@@ -253,11 +253,11 @@ fn firewall_setup_classifier_preserves_transient_and_permanent_sources() {
     );
 }
 
-/// In a CNI pod namespace the pod IP is the address on the default route's
-/// interface, not the first address in the namespace.
+/// The external address is the one on the default route's interface, not
+/// the first address in the namespace.
 #[cfg(target_os = "linux")]
 #[test]
-fn pod_ip_is_the_default_route_interface_address() {
+fn external_address_is_the_default_route_interface_address() {
     if !pplx_space_test_env::root_or_skip("create a network namespace") {
         return;
     }
@@ -269,7 +269,7 @@ fn pod_ip_is_the_default_route_interface_address() {
                 .status();
         }
     }
-    let ns = Namespace(format!("space-test-pod-ip-{}", std::process::id()));
+    let ns = Namespace(format!("space-test-ext-addr-{}", std::process::id()));
     let ip = |args: &str| {
         let status = std::process::Command::new("ip")
             .args(args.replace("NS", &ns.0).split_whitespace())
@@ -286,7 +286,7 @@ fn pod_ip_is_the_default_route_interface_address() {
     ip("-n NS route add default via 10.244.3.1 dev eth0");
 
     assert_eq!(
-        super::pod_ipv4(&ns.0).unwrap(),
+        super::default_route_ipv4(&ns.0).unwrap(),
         "10.244.3.7".parse::<std::net::Ipv4Addr>().unwrap()
     );
 }
