@@ -1,5 +1,5 @@
 //! Postgres-backed implementation of [`super::NodeGroupSink`], over
-//! `pplx-space-node-group-store`'s verbs. The seed's lock statements stay here.
+//! `pplx-space-node-group-store`'s verbs. The seed's `lock_timeout` stays here.
 //!
 //! - **Seed**: a lock-free `SELECT ... WHERE is_default` fast path, and — only
 //!   when no default exists — a short transaction taking
@@ -174,9 +174,7 @@ impl NodeGroupSink for NodeGroupDbStore {
             .bind(format!("{}ms", self.seed_lock_timeout.as_millis()))
             .execute(&mut *tx)
             .await?;
-        sqlx::query(sql!("LOCK TABLE node_groups IN SHARE ROW EXCLUSIVE MODE"))
-            .execute(&mut *tx)
-            .await?;
+        pplx_space_node_group_store::locks::lock_node_groups_share_row_exclusive(&mut tx).await?;
 
         // Both facts are re-read under the lock: another replica may have
         // seeded a default since the fast path (making us a reader), or a

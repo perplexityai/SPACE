@@ -5,12 +5,11 @@
 //! orchestration, and audit logging; the helpers they call live here.
 //! Multi-step guarded writes (assign-org, set-default, delete) lock the group
 //! row `FOR UPDATE` and run their residue checks inside the same transaction so
-//! two operators cannot race a guard. This module keeps the `NODE_GROUP_SELECT`
-//! reads (`fetch`, `list` and the group-row lock that shares the fragment), the
-//! default-row lock, the template `FOR SHARE` read and the organization check.
-//! The other node-group and allowlist statements are verbs of
-//! `pplx-space-node-group-store`, the cached-template count is
-//! `pplx-space-node-template-inventory-store`'s and the occupancy count is
+//! two operators cannot race a guard. This module keeps the template
+//! `FOR SHARE` read and the organization check. The node-group and allowlist
+//! statements, the group reads and the group-row and default-row locks among
+//! them, are verbs of `pplx-space-node-group-store`, the cached-template count
+//! is `pplx-space-node-template-inventory-store`'s and the occupancy count is
 //! `pplx-space-sandbox-store`'s; each runs on the pool or transaction its
 //! helper is given.
 
@@ -23,20 +22,10 @@ use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
 use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateVisibility;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use time::OffsetDateTime;
 
 use super::node_store::SandboxOccupancy;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct NodeGroupRow {
-    pub(super) id: NodeGroupId,
-    pub(super) name: NodeGroupName,
-    pub(super) org_id: Option<OrgId>,
-    pub(super) template_policy: NodeGroupTemplatePolicy,
-    pub(super) is_default: bool,
-    pub(super) created_at: OffsetDateTime,
-    pub(super) nodes_count: i64,
-}
+pub(super) use pplx_space_node_group_store::groups::NodeGroupRow;
 
 /// Template fields consulted when validating a `restricted` allowlist entry.
 #[derive(Debug, Clone, FromRow)]
@@ -45,27 +34,6 @@ pub(super) struct CompatTemplateRow {
     pub(super) visibility: TemplateVisibility,
     pub(super) org_id: Option<OrgId>,
 }
-
-// `nodes_count` counts worker rows only — node groups are worker pools, and
-// builder/cluster rows always sit at `node_group_id` NULL because the mirror
-// stamps workers only. For the singleton default group the count also
-// includes NULL-membership workers: an unlabeled (or unknown-label) worker
-// mirrors as NULL, which the data model resolves to the default generic
-// group — without the `is_default` arm the shared pool would report zero
-// nodes until every worker is explicitly labeled. (A correlated subquery
-// rather than a GROUP BY join because this SELECT also backs
-// `FOR UPDATE OF g`, which Postgres forbids alongside GROUP BY.)
-const NODE_GROUP_SELECT: &str = "SELECT g.id,
-       g.name,
-       g.org_id,
-       g.template_policy,
-       g.is_default,
-       g.created_at,
-       (SELECT COUNT(*) FROM nodes n
-         WHERE n.role = 'worker'
-           AND (n.node_group_id = g.id
-                OR (g.is_default AND n.node_group_id IS NULL)))::BIGINT AS nodes_count
-FROM node_groups g";
 
 /// Pool-bound repository for node-group reads. Guarded writes that need a
 /// `FOR UPDATE` lock live as free functions below, since a `Transaction`
@@ -84,20 +52,11 @@ impl AdminNodeGroupStore {
         &self,
         node_group_id: NodeGroupId,
     ) -> Result<Option<NodeGroupRow>, sqlx::Error> {
-        sqlx::query_as::<_, NodeGroupRow>(sqlx::AssertSqlSafe(sql!(format!(
-            "{NODE_GROUP_SELECT}\nWHERE g.id = $1"
-        ))))
-        .bind(node_group_id)
-        .fetch_optional(&self.pool)
-        .await
+        pplx_space_node_group_store::groups::node_group(&self.pool, node_group_id).await
     }
 
     pub(super) async fn list(&self) -> Result<Vec<NodeGroupRow>, sqlx::Error> {
-        sqlx::query_as::<_, NodeGroupRow>(sqlx::AssertSqlSafe(sql!(format!(
-            "{NODE_GROUP_SELECT}\nORDER BY g.name ASC"
-        ))))
-        .fetch_all(&self.pool)
-        .await
+        pplx_space_node_group_store::groups::node_groups(&self.pool).await
     }
 
     /// Allowlist template names per group in one round trip. Groups with no
@@ -177,12 +136,7 @@ pub(super) async fn lock_group_for_update(
     tx: &mut Transaction<'_, Postgres>,
     node_group_id: NodeGroupId,
 ) -> Result<Option<NodeGroupRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeGroupRow>(sqlx::AssertSqlSafe(sql!(format!(
-        "{NODE_GROUP_SELECT}\nWHERE g.id = $1\nFOR UPDATE OF g"
-    ))))
-    .bind(node_group_id)
-    .fetch_optional(&mut **tx)
-    .await
+    pplx_space_node_group_store::groups::lock_node_group(tx, node_group_id).await
 }
 
 /// Lock the current default group's row (if any) and return its id.
@@ -193,11 +147,7 @@ pub(super) async fn lock_group_for_update(
 pub(super) async fn lock_current_default_for_update(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Option<NodeGroupId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeGroupId>(sql!(
-        "SELECT id FROM node_groups WHERE is_default FOR UPDATE"
-    ))
-    .fetch_optional(&mut **tx)
-    .await
+    pplx_space_node_group_store::locks::lock_default_node_group(tx).await
 }
 
 /// In-transaction sandbox occupancy across every node currently mirrored
