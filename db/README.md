@@ -651,8 +651,13 @@ semantics; only its exact reviewed content is exempt from the new-migration lint
 The same guard lane also rejects PRs that combine `db/postgres/*.sql`
 migrations with runtime/deployable app changes. Land Postgres migrations in a
 separate PR from application behavior changes so lock risk, rollout, and
-rollback are reviewed independently. Docs, tests, and migration-guard
-maintenance can travel with migration-only PRs.
+rollback are reviewed independently. Docs, tests under `scripts/tests/`, the
+SQL files directly in `crates/test_support/db/test/fixtures/schema-variants/`,
+and the migration guards under `scripts/` with their tests can travel with
+migration-only PRs. Apart from the bootstrap-role exceptions below, every other
+file under `crates/`, Rust tests included, counts as a runtime change, so a
+migration must keep every existing Rust test passing: tighten a constraint
+they violate only after a separate PR updates them.
 
 The sole production-code exception is the credential fence required by a
 credential-table migration. That PR may change the canonical table-name entries
