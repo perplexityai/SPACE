@@ -2,10 +2,11 @@
 //! own transaction before they re-check or write the row.
 //!
 //! Each verb runs on the caller's open transaction, and the lock it takes
-//! lasts until that transaction ends. The caller keeps the transaction, any
-//! `lock_timeout` it sets, and the re-checks it runs under the lock. A lock
-//! that carries a guard, or that only one path takes, lives in a module named
-//! for that path.
+//! lasts until that transaction ends. The verbs take a `&mut PgConnection`,
+//! never a pool, on which the lock would end with its own statement. The
+//! caller keeps the transaction, any `lock_timeout` it sets, and the
+//! re-checks it runs under the lock. A lock that carries a guard, or that
+//! only one path takes, lives in a module named for that path.
 
 use pplx_space_sandbox_model::SandboxId;
 

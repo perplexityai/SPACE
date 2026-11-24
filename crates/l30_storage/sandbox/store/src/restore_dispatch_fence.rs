@@ -18,8 +18,12 @@
 //! [`crate::restore_lease`]: an owner that predates the fence, or a takeover
 //! by one, writes none.
 //!
-//! The Kubernetes store keeps the row lock, the transactions and the decision
-//! of when to fence; these functions are the statements.
+//! The owner's sandbox row lock before it sends the Wake, which reads whether
+//! the row is still `restoring` under its token, is
+//! [`lock_dispatch_ownership`]; the takeover locks the row with
+//! [`crate::row_locks::lock_id`]. The Kubernetes store keeps the
+//! transactions those locks last for and the decision of when to fence;
+//! these functions are the statements.
 
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
@@ -109,6 +113,31 @@ pub async fn holds_fence(
     .bind(generation)
     .bind(restore_lease_token)
     .fetch_one(executor)
+    .await
+}
+
+/// Lock the sandbox row `FOR UPDATE` until the caller's transaction ends and
+/// read whether it is still `restoring` under `restore_lease_token`. `None`
+/// when no row exists. The row is locked whenever it exists, whatever the
+/// answer.
+///
+/// The owner takes it before [`clear_for_dispatch`]; the takeover holds the
+/// same row lock, so the two serialize.
+pub async fn lock_dispatch_ownership(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    restore_lease_token: Uuid,
+) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT LOWER(TRIM(lifecycle)) = 'restoring'
+                    AND restore_lease_token IS NOT DISTINCT FROM $2
+               FROM sandboxes
+              WHERE id = $1
+              FOR UPDATE"
+    ))
+    .bind(sandbox_id)
+    .bind(restore_lease_token)
+    .fetch_optional(conn)
     .await
 }
 

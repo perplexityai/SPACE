@@ -946,28 +946,33 @@ enum SandboxPod {
 /// because its claim does not hold here. With the pod cached, resume, pause,
 /// stop and kill finish while a transaction holds `FOR KEY SHARE` on the
 /// sandbox row, as on direct. Start and wake block on it in `SELECT lifecycle
-/// FROM sandboxes WHERE id = $1 FOR UPDATE`, the statement
-/// `lock_sandbox_execution_lifecycle_in` runs, whose row lock conflicts with
-/// `FOR KEY SHARE`. The `sql!` locator names where that function is defined,
-/// not which caller ran it: it has three (`persist_materialized_pod_metadata`,
-/// `claim_started_recovery` and `lock_sandbox_for_execution_lifecycle_in`,
-/// which the execution claim and `claim_active_execution_pod_materialization`
-/// both call). That the first wait is the execution claim `ensure_pod_exists`
-/// takes before it materializes the pod is an inference from the code.
+/// FROM sandboxes WHERE id = $1 FOR UPDATE`, sandbox-store's
+/// `row_locks::lock_lifecycle`, whose row lock conflicts with `FOR KEY
+/// SHARE`. The `sql!` locator names where that verb is defined,
+/// `pplx_space_sandbox_store::row_locks`, not which caller ran it. In the
+/// api, `lock_sandbox_execution_lifecycle_in` calls it, and so does the
+/// delete guard; that function in turn has three callers
+/// (`persist_materialized_pod_metadata`, `claim_started_recovery` and
+/// `lock_sandbox_for_execution_lifecycle_in`, which the execution claim and
+/// `claim_active_execution_pod_materialization` both call). That the first
+/// wait is the execution claim `ensure_pod_exists` takes before it
+/// materializes the pod is an inference from the code.
 ///
 /// Stop and kill of a sandbox whose pod is gone block too, before any pod is
 /// recreated, on `SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE`
-/// (`lock_sandbox_for_execution_mutation_in`, also in
-/// `store::execution_rows`). That statement has many callers; reading the
-/// code, the one waiting is the pod-tracking cleanup that resolving the
-/// missing pod runs (`resolve_pod_instance` → `forget_pod_tracking_if_generation`).
-/// Only after it does their recovering runtime client recreate the pod.
+/// (`row_locks::lock_id`, which `lock_sandbox_for_execution_mutation_in`
+/// calls). That statement has many callers; reading the code, the one
+/// waiting is the pod-tracking cleanup that resolving the missing pod runs
+/// (`resolve_pod_instance` → `forget_pod_tracking_if_generation`). Only
+/// after it does their recovering runtime client recreate the pod.
 ///
-/// Suspend blocks too, on the `SELECT id ... FOR UPDATE` that persists its
-/// commit (`persist_or_accept_suspend_commit`, the only statement of that
-/// shape in `store::suspend`), the counterpart of direct suspend's artifact
-/// lock. Kubernetes suspend then ends `unplaced`, where direct suspend leaves
-/// the row `on_node`.
+/// Suspend blocks too, on the same `row_locks::lock_id` statement, which
+/// `persist_or_accept_suspend_commit` takes to persist its commit: the
+/// counterpart of direct suspend's artifact lock. Its locator is the one
+/// stop and kill wait on, so it does not tell the suspend commit apart from
+/// the statement's other callers; that the commit is the one waiting is an
+/// inference from the code. Kubernetes suspend then ends `unplaced`, where
+/// direct suspend leaves the row `on_node`.
 ///
 /// In this interleaving the blocking transaction ends promptly, and each
 /// waiter then completes. A longer blocker is not waited out indefinitely.
@@ -989,7 +994,8 @@ enum SandboxPod {
 ///   outlives its request.
 ///
 /// Each wait is tied to the holder's backend pid through `pg_blocking_pids`
-/// and to the waiting statement's `sql!` locator, and every wait is bounded.
+/// and to the waiting statement's text and `sql!` locator, which names the
+/// store verb, not its caller, and every wait is bounded.
 #[tokio::test(flavor = "current_thread")]
 async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
     if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
@@ -1000,9 +1006,8 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
     let db = pg_test_db_with_max_connections(5).await?;
     let pool = &db.pool;
     let (worker, node_id) = start_kubernetes_sim_worker(pool).await?;
-    let materialization_lock = r"^/\*pplx_space_api::controllers::substrate::kubernetes::store::execution_rows:[0-9]+\*/ SELECT lifecycle FROM sandboxes WHERE id = \$1 FOR UPDATE$";
-    let pod_tracking_lock = r"^/\*pplx_space_api::controllers::substrate::kubernetes::store::execution_rows:[0-9]+\*/ SELECT id FROM sandboxes WHERE id = \$1 FOR UPDATE$";
-    let suspend_commit_lock = r"^/\*pplx_space_api::controllers::substrate::kubernetes::store::suspend:[0-9]+\*/ SELECT id\s+FROM sandboxes\s+WHERE id = \$1\s+FOR UPDATE$";
+    let lifecycle_lock = r"^/\*pplx_space_sandbox_store::row_locks:[0-9]+\*/ SELECT lifecycle FROM sandboxes WHERE id = \$1 FOR UPDATE$";
+    let id_lock = r"^/\*pplx_space_sandbox_store::row_locks:[0-9]+\*/ SELECT id FROM sandboxes WHERE id = \$1 FOR UPDATE$";
 
     for (action, prior, resident, completed, pod_seed, waits_on) in [
         (
@@ -1011,7 +1016,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
             "stopped",
             "started",
             SandboxPod::Cached,
-            Some(materialization_lock),
+            Some(lifecycle_lock),
         ),
         (
             SandboxAction::Wake,
@@ -1019,7 +1024,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
             "paused",
             "started",
             SandboxPod::Cached,
-            Some(materialization_lock),
+            Some(lifecycle_lock),
         ),
         (
             SandboxAction::Resume,
@@ -1059,7 +1064,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
             "running",
             "stopped",
             SandboxPod::Missing,
-            Some(pod_tracking_lock),
+            Some(id_lock),
         ),
         (
             SandboxAction::Kill,
@@ -1067,7 +1072,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
             "running",
             "stopped",
             SandboxPod::Missing,
-            Some(pod_tracking_lock),
+            Some(id_lock),
         ),
         (
             SandboxAction::Suspend,
@@ -1075,7 +1080,7 @@ async fn activations_and_suspend_wait_for_a_key_share_lock() -> TestResult {
             "running",
             "suspended",
             SandboxPod::Cached,
-            Some(suspend_commit_lock),
+            Some(id_lock),
         ),
     ] {
         let case = format!("{action:?} with the pod {pod_seed:?}");

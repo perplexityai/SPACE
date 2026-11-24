@@ -414,13 +414,10 @@ pub(crate) async fn persist_optional_current_local_artifact(
         .begin()
         .await
         .db_context("failed to start current local artifact transaction")?;
-    let sandbox_exists =
-        sqlx::query_scalar::<_, Uuid>(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
-            .bind(sandbox_id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .db_context("failed to lock sandbox for current local artifact")?
-            .is_some();
+    let sandbox_exists = pplx_space_sandbox_store::row_locks::lock_id(&mut tx, sandbox_id)
+        .await
+        .db_context("failed to lock sandbox for current local artifact")?
+        .is_some();
     if !sandbox_exists {
         tx.rollback()
             .await
