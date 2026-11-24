@@ -1357,7 +1357,9 @@ enum PodProxyProbe {
 
 /// Whether `sandboxes` show `target`'s execution served at `pod_ip`. A field
 /// the node does not report (an older node, or a sandbox manager that has
-/// restarted since the allocation) is not compared.
+/// restarted since the allocation) is not compared. Without a reported pod IP,
+/// a runtime sandbox recreated under the same Pod UID matches at its previous
+/// address.
 fn serves_target(
     sandboxes: Vec<pplx_space_sbx_mgr_client::proto::SandboxInfo>,
     sandbox_id: SandboxId,
