@@ -356,8 +356,12 @@ pub struct SpaceApiRouteIdentity {
     pub sandbox_id: Option<SandboxId>,
     pub route_generation: Option<RouteGeneration>,
     pub current_node_id: Option<NodeId>,
+    // TODO: replace with a caller-declared supervisor (node or external), so
+    // the sandbox manager branches on who supervises the VM, not on a substrate.
     pub substrate_kind: Option<NodeManagedBy>,
     pub execution_generation: Option<ExecutionGeneration>,
+    // TODO: rename to an opaque `instance_id` that the sandbox manager compares
+    // and never interprets.
     pub pod_uid: Option<PodUid>,
     pub activation_attempt_id: Option<SandboxActivationAttemptId>,
 }
