@@ -1,6 +1,14 @@
 //! `public_operations` rows: reads, inserts (one of them with its first
-//! event), deletes, and the claim, cancel and expiry writes whose rows the
-//! caller's transaction holds.
+//! event), deletes, the claim, cancel and expiry writes whose rows the
+//! caller's transaction holds, and the transitions guarded on a claim token
+//! (and, for payload writes and claim renewals, its generation), a state the
+//! row must still be in, a row with no actor, or a federated grant's newness.
+//! A guarded transition returns whether it matched, as another writer
+//! winning is a normal outcome; the caller decides what follows. The reads
+//! that lock rows until the caller's transaction ends, and the advisory
+//! locks on a sandbox's queue, on one kind's active operation on a sandbox,
+//! and on a fork source's capture leader, take its connection.
+//! The dispatcher's claim of due operations is [`crate::claim_queue`]'s.
 
 use std::sync::LazyLock;
 
@@ -468,7 +476,7 @@ pub async fn earliest_active_on_sandbox(
 }
 
 /// `kinds` as the labels a statement binds.
-fn kind_labels(kinds: &[OperationKind]) -> Vec<&'static str> {
+pub(crate) fn kind_labels(kinds: &[OperationKind]) -> Vec<&'static str> {
     kinds.iter().map(|kind| kind.as_str()).collect()
 }
 
@@ -769,9 +777,10 @@ pub async fn insert_completed_session_create(
     Ok(())
 }
 
-/// An operation as a claim returns it. `pplx-space-api`'s dispatcher claim
-/// also decodes this row, flattened into its own row type, so its
-/// `RETURNING` list must select every field added here.
+/// An operation as a claim returns it. The dispatcher's claim
+/// ([`crate::claim_queue::claim_due`]) also decodes this row, flattened into
+/// its own row type, so its `RETURNING` list must select every field added
+/// here.
 #[derive(Debug, FromRow)]
 pub struct ClaimedPublicOperationRow {
     pub operation_id: Uuid,
@@ -898,6 +907,610 @@ pub async fn expire_each(
     .bind(expiries.terminal_error_codes)
     .bind(expiries.terminal_error_jsons)
     .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Replace the payload of `operation_id` with `payload_json` while it is
+/// running under `claim_token` at `claim_generation`. `false` means the
+/// claim was lost, and nothing changed.
+pub async fn set_claimed_payload(
+    executor: impl PgExecutor<'_>,
+    operation_id: OperationId,
+    claim_token: &str,
+    claim_generation: i64,
+    payload_json: serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let changed = sqlx::query(sql!(
+        "UPDATE public_operations
+         SET payload_json = $4, updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND claim_generation = $3
+           AND state = 'running'"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(claim_generation)
+    .bind(Json(payload_json))
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(changed == 1)
+}
+
+/// Remove the payload's `json_path` from `operation_id` while it is running
+/// under `claim_token` at `claim_generation`. `false` means the claim was
+/// lost, and nothing changed.
+pub async fn scrub_claimed_payload_path(
+    executor: impl PgExecutor<'_>,
+    operation_id: OperationId,
+    claim_token: &str,
+    claim_generation: i64,
+    json_path: &[&str],
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(sql!(
+        "UPDATE public_operations
+             SET payload_json = payload_json #- $4::text[],
+                 updated_at = NOW()
+             WHERE operation_id = $1
+               AND claim_token = $2
+               AND claim_generation = $3
+               AND state = 'running'"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(claim_generation)
+    .bind(json_path)
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// Renew the claim on `operation_id` held under `claim_token` at
+/// `claim_generation`, stamping it at the database clock. `false` means the
+/// claim was lost, and nothing changed.
+pub async fn renew_claim(
+    executor: impl PgExecutor<'_>,
+    operation_id: OperationId,
+    claim_token: &str,
+    claim_generation: i64,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(sql!(
+        "UPDATE public_operations
+             SET claimed_at = NOW(), updated_at = NOW()
+             WHERE operation_id = $1
+               AND claim_token = $2
+               AND claim_generation = $3
+               AND state = $4"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(claim_generation)
+    .bind(OperationState::Running.as_str())
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// Give the queued native sandbox create `operation_id` of `org_id`, which
+/// `actor_user_id` requested, the federated create `context`, a JSON object,
+/// when it names the same issuer, org and subject, its grant has not
+/// expired by the database clock, and it is newer than the one recorded.
+/// `false` means one of these did not hold, or no queued native create
+/// `operation_id` of `org_id` by `actor_user_id` exists, and nothing
+/// changed.
+pub async fn renew_queued_native_create_grant(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+    actor_user_id: UserId,
+    operation_id: OperationId,
+    context: serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(sql!(
+        "UPDATE public_operations
+             SET payload_json = jsonb_set(payload_json, '{federated_create}', $4),
+                 updated_at = NOW()
+             WHERE org_id = $1 AND actor_user_id = $2 AND operation_id = $3
+               AND api_product = 'native' AND kind = 'create_sandbox' AND state = 'queued'
+               AND payload_json #>> '{federated_create,issuer}' = $4->>'issuer'
+               AND payload_json #>> '{federated_create,org_id}' = $4->>'org_id'
+               AND payload_json #>> '{federated_create,subject_id}' = $4->>'subject_id'
+               AND ($4->>'service_grant_expires_at_unix')::BIGINT > EXTRACT(EPOCH FROM NOW())
+               AND CASE
+                   WHEN $4->>'service_grant_issued_at_unix' IS NOT NULL
+                    AND payload_json #>> '{federated_create,service_grant_issued_at_unix}' IS NOT NULL
+                   THEN ($4->>'service_grant_issued_at_unix')::BIGINT >
+                     (payload_json #>> '{federated_create,service_grant_issued_at_unix}')::BIGINT
+                   WHEN $4->>'service_grant_issued_at_unix' IS NOT NULL THEN TRUE
+                   WHEN payload_json #>> '{federated_create,service_grant_issued_at_unix}' IS NOT NULL THEN FALSE
+                   ELSE ($4->>'service_grant_expires_at_unix')::BIGINT >
+                     (payload_json #>> '{federated_create,service_grant_expires_at_unix}')::BIGINT
+               END"
+    ))
+    .bind(org_id)
+    .bind(actor_user_id)
+    .bind(operation_id.as_uuid())
+    .bind(Json(context))
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// Replace the payload of the fork operation `operation_id` of `org_id` with
+/// `payload_json` while it is queued or running. `false` means no queued or
+/// running fork `operation_id` of `org_id` exists, and nothing changed.
+pub async fn set_active_fork_payload(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+    operation_id: OperationId,
+    payload_json: serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(sql!(
+        "UPDATE public_operations
+                 SET payload_json = $3, updated_at = NOW()
+                 WHERE org_id = $1
+                   AND operation_id = $2
+                   AND kind = 'fork_sandbox'
+                   AND state IN ('queued', 'running')"
+    ))
+    .bind(org_id)
+    .bind(operation_id.as_uuid())
+    .bind(Json(payload_json))
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// Make `actor_user_id` the actor of the system's operation `operation_id`
+/// while it is still queued with no actor. `false` means it had an actor or
+/// had left the queue, and nothing changed.
+pub async fn hand_over_queued_system_operation(
+    executor: impl PgExecutor<'_>,
+    operation_id: Uuid,
+    actor_user_id: UserId,
+) -> Result<bool, sqlx::Error> {
+    let handed_over = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+                    SET actor_user_id = $2, updated_at = NOW()
+                  WHERE operation_id = $1
+                    AND actor_user_id IS NULL
+                    AND state = 'queued'
+                  RETURNING operation_id"
+    ))
+    .bind(operation_id)
+    .bind(actor_user_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(handed_over.is_some())
+}
+
+/// The count [`inline_org_at_limit`] runs.
+///
+/// Cost: the organization's running operations, however claimed, through
+/// `idx_public_operations_org_state`, which has none of the other columns, so
+/// the claim-token, claim-time and kind filters apply after the read. Without
+/// that index this read every running row in the fleet through
+/// `idx_public_operations_state_next_attempt`, or, under a generic plan,
+/// intersected that with every operation the organization retains through
+/// `idx_public_operations_tenant_created`. A constant rather than a literal at
+/// its query site so the API's plan-cost test can `EXPLAIN` the text this
+/// runs.
+pub const INLINE_ORG_AT_LIMIT: &str = sql!(
+    "SELECT COUNT(*) >= $2
+       FROM public_operations
+      WHERE state = $3
+        AND org_id = $1
+        AND starts_with(claim_token, $4)
+        AND claimed_at > NOW() - make_interval(secs => $5::BIGINT)
+        AND kind <> ALL($6)"
+);
+
+/// Whether `org_id` has at least `limit` running operations, of no kind in
+/// `excluded_kinds`, whose claim token starts with `claim_token_prefix` and
+/// was renewed within `claim_stale_after_secs` of now by the database clock.
+/// See [`INLINE_ORG_AT_LIMIT`] for what it reads.
+pub async fn inline_org_at_limit(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+    limit: i64,
+    claim_token_prefix: &str,
+    claim_stale_after_secs: i64,
+    excluded_kinds: &[OperationKind],
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(INLINE_ORG_AT_LIMIT)
+        .bind(org_id)
+        .bind(limit)
+        .bind(OperationState::Running.as_str())
+        .bind(claim_token_prefix)
+        .bind(claim_stale_after_secs)
+        .bind(kind_labels(excluded_kinds))
+        .fetch_one(executor)
+        .await
+}
+
+/// A queued or running sandbox create [`lock_active_creates_on_sandbox`]
+/// found.
+#[derive(Debug)]
+pub struct ActiveCreate {
+    pub operation_id: Uuid,
+    pub api_product: String,
+    /// Queued with no claim, live or stale.
+    pub unclaimed: bool,
+}
+
+/// The queued or running creates of the sandbox `target_id` of `org_id`
+/// requested no later than now by the database clock, in request order,
+/// each locked until the caller's transaction ends. Waits for a claim or a
+/// release that holds one.
+pub async fn lock_active_creates_on_sandbox(
+    conn: &mut sqlx::PgConnection,
+    org_id: OrgId,
+    target_id: &str,
+) -> Result<Vec<ActiveCreate>, sqlx::Error> {
+    let active = sqlx::query_as::<_, (Uuid, String, bool)>(sql!(
+        "SELECT operation_id, api_product, state = $5 AND claim_token = ''
+         FROM public_operations
+         WHERE org_id = $1
+           AND target_type = $2
+           AND target_id = $3
+           AND kind = $4
+           AND state IN ($5, $6)
+           AND requested_at <= NOW()
+         ORDER BY requested_at, operation_id
+         FOR UPDATE"
+    ))
+    .bind(org_id)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(target_id)
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(active
+        .into_iter()
+        .map(|(operation_id, api_product, unclaimed)| ActiveCreate {
+            operation_id,
+            api_product,
+            unclaimed,
+        })
+        .collect())
+}
+
+/// Record `operation_id`, running under `claim_token`, succeeded with
+/// `progress_message` and `result_json`, releasing the claim and dropping a
+/// sandbox create's federated service grant. `false` means the claim was
+/// lost, and nothing changed.
+pub async fn complete_claimed(
+    executor: impl PgExecutor<'_>,
+    operation_id: OperationId,
+    claim_token: &str,
+    progress_message: &str,
+    result_json: serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             claim_token = '',
+             completed_at = NOW(),
+             progress_message = $4,
+             result_json = $5,
+             payload_json = CASE WHEN kind = 'create_sandbox'
+                 THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
+                 ELSE payload_json END,
+             updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $6
+         RETURNING operation_id"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(OperationState::Succeeded.as_str())
+    .bind(progress_message)
+    .bind(Json(result_json))
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(executor)
+    .await?;
+    Ok(updated.is_some())
+}
+
+/// A terminal error, as [`fail_claimed`] and [`expire_claimed`] record it.
+#[derive(Debug)]
+pub struct TerminalError<'a> {
+    pub progress_message: &'a str,
+    pub code: &'a str,
+    pub error: serde_json::Value,
+}
+
+/// Record `operation_id`, running under `claim_token`, failed with
+/// `terminal`, releasing the claim and dropping a sandbox create's federated
+/// service grant. `false` means the claim was lost, and nothing changed.
+pub async fn fail_claimed(
+    executor: impl PgExecutor<'_>,
+    operation_id: OperationId,
+    claim_token: &str,
+    terminal: TerminalError<'_>,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             claim_token = '',
+             completed_at = NOW(),
+             progress_message = $4,
+             terminal_error_code = $5,
+             terminal_error_json = $6,
+             payload_json = CASE WHEN kind = 'create_sandbox'
+                 THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
+                 ELSE payload_json END,
+             updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $7
+         RETURNING operation_id"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(OperationState::Failed.as_str())
+    .bind(terminal.progress_message)
+    .bind(terminal.code)
+    .bind(Json(terminal.error))
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(executor)
+    .await?;
+    Ok(updated.is_some())
+}
+
+/// Record `operation_id`, running under `claim_token`, expired with
+/// `terminal` rather than run, undoing the claim's attempt and start,
+/// releasing the claim and dropping a sandbox create's federated service
+/// grant. `false` means the claim was lost, and nothing changed.
+pub async fn expire_claimed(
+    executor: impl PgExecutor<'_>,
+    operation_id: OperationId,
+    claim_token: &str,
+    terminal: TerminalError<'_>,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             claim_token = '',
+             attempts = GREATEST(attempts - 1, 0),
+             started_at = NULL,
+             completed_at = NOW(),
+             progress_message = $4,
+             terminal_error_code = $5,
+             terminal_error_json = $6,
+             payload_json = CASE WHEN kind = 'create_sandbox'
+                 THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
+                 ELSE payload_json END,
+             updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $7
+         RETURNING operation_id"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(OperationState::Expired.as_str())
+    .bind(terminal.progress_message)
+    .bind(terminal.code)
+    .bind(Json(terminal.error))
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(executor)
+    .await?;
+    Ok(updated.is_some())
+}
+
+/// A queued operation [`lock_overdue_queued`] found.
+#[derive(Debug, FromRow)]
+pub struct OverdueQueuedRow {
+    pub operation_id: Uuid,
+    pub kind: String,
+    pub attempts: i32,
+    pub progress_message: String,
+}
+
+/// Up to `limit` of the oldest queued, unclaimed, never-started
+/// `api_product` operations of `kinds` created more than `max_age_secs`
+/// before now by the database clock, each locked until the caller's
+/// transaction ends, skipping any another transaction holds.
+pub async fn lock_overdue_queued(
+    conn: &mut sqlx::PgConnection,
+    api_product: &str,
+    kinds: &[OperationKind],
+    max_age_secs: i64,
+    limit: i64,
+) -> Result<Vec<OverdueQueuedRow>, sqlx::Error> {
+    sqlx::query_as::<_, OverdueQueuedRow>(sql!(
+        "SELECT operation_id, kind, attempts, progress_message
+         FROM public_operations
+         WHERE state = $1
+           AND claim_token = ''
+           AND started_at IS NULL
+           AND api_product = $2
+           AND kind = ANY($3)
+           AND created_at <= NOW() - make_interval(secs => $4::BIGINT)
+         ORDER BY created_at, operation_id
+         LIMIT $5
+         FOR UPDATE SKIP LOCKED"
+    ))
+    .bind(OperationState::Queued.as_str())
+    .bind(api_product)
+    .bind(kind_labels(kinds))
+    .bind(max_age_secs)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// The kind of `operation_id` while it is running under `claim_token`,
+/// locking its row until the caller's transaction ends. `None` means the
+/// claim was lost.
+pub async fn claimed_kind_locked(
+    conn: &mut sqlx::PgConnection,
+    operation_id: OperationId,
+    claim_token: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(sql!(
+        "SELECT kind
+         FROM public_operations
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $3
+         FOR UPDATE"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// A requeue for [`requeue_claimed`].
+#[derive(Debug)]
+pub struct Requeue<'a> {
+    pub progress_message: &'a str,
+    /// Seconds after now, by the database clock, before it is due again.
+    pub retry_after_secs: f64,
+    /// Whether the claim's attempt stays counted.
+    pub count_attempt: bool,
+    /// Whether the claim's start is undone.
+    pub undo_first_start: bool,
+}
+
+/// Return `operation_id`, running under `claim_token`, to the queue as
+/// `requeue` says, releasing the claim. `false` means the claim was lost,
+/// and nothing changed.
+pub async fn requeue_claimed(
+    executor: impl PgExecutor<'_>,
+    operation_id: OperationId,
+    claim_token: &str,
+    requeue: Requeue<'_>,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             claim_token = '',
+             progress_message = $4,
+             next_attempt_at = NOW() + make_interval(secs => $5::DOUBLE PRECISION),
+             attempts = GREATEST(attempts - CASE WHEN $7 THEN 0 ELSE 1 END, 0),
+             started_at = CASE WHEN $8 THEN NULL ELSE started_at END,
+             updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $6
+         RETURNING operation_id"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(OperationState::Queued.as_str())
+    .bind(requeue.progress_message)
+    .bind(requeue.retry_after_secs)
+    .bind(OperationState::Running.as_str())
+    .bind(requeue.count_attempt)
+    .bind(requeue.undo_first_start)
+    .fetch_optional(executor)
+    .await?;
+    Ok(updated.is_some())
+}
+
+/// Remove the payload's `json_path` from up to `limit` finished `kind`
+/// operations that still carry it, least recently updated first, skipping
+/// any another transaction holds. Returns how many were scrubbed.
+pub async fn scrub_finished_payload_path(
+    executor: impl PgExecutor<'_>,
+    kind: OperationKind,
+    json_path: &[&str],
+    limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let scrubbed = sqlx::query(sql!(
+        "WITH terminal_operations AS (
+             SELECT operation_id
+             FROM public_operations
+             WHERE kind = $2
+               AND state IN ($3, $4, $5, $6)
+               AND payload_json #> $7::text[] IS NOT NULL
+             ORDER BY updated_at ASC, operation_id ASC
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED
+         )
+         UPDATE public_operations AS operation
+         SET payload_json = operation.payload_json #- $7::text[],
+             updated_at = NOW()
+         FROM terminal_operations
+         WHERE operation.operation_id = terminal_operations.operation_id"
+    ))
+    .bind(limit)
+    .bind(kind.as_str())
+    .bind(OperationState::Succeeded.as_str())
+    .bind(OperationState::Failed.as_str())
+    .bind(OperationState::Canceled.as_str())
+    .bind(OperationState::Expired.as_str())
+    .bind(json_path)
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(scrubbed)
+}
+
+/// Up to `limit` finished operations past their `gc_after` by the database
+/// clock, earliest first.
+pub async fn due_for_gc(
+    executor: impl PgExecutor<'_>,
+    limit: i64,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT operation_id
+         FROM public_operations
+         WHERE state IN ($2, $3, $4, $5)
+           AND gc_after <= NOW()
+         ORDER BY gc_after ASC, operation_id ASC
+         LIMIT $1"
+    ))
+    .bind(limit)
+    .bind(OperationState::Succeeded.as_str())
+    .bind(OperationState::Failed.as_str())
+    .bind(OperationState::Canceled.as_str())
+    .bind(OperationState::Expired.as_str())
+    .fetch_all(executor)
+    .await
+}
+
+/// Take the transaction-level advisory lock on `key`, hashed, waiting for
+/// it. Callers key it per sandbox: one key for inserts into its queue, and
+/// one for creating or joining each kind's active operation on it. The
+/// lock lasts until the caller's transaction ends.
+pub async fn lock_sandbox_key(conn: &mut sqlx::PgConnection, key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    ))
+    .bind(key)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Take the transaction-level advisory lock that serializes choosing the
+/// capture leader among the forks of one source at one execution
+/// `generation`, keyed by `source_key` hashed with `generation` as the seed,
+/// waiting for it. The lock lasts until the caller's transaction ends.
+pub async fn lock_fork_capture_leader(
+    conn: &mut sqlx::PgConnection,
+    source_key: &str,
+    generation: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))"
+    ))
+    .bind(source_key)
+    .bind(generation)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }

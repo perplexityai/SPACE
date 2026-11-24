@@ -6,14 +6,16 @@ use uuid::Uuid;
 
 use crate::operations;
 
-const SEED_ORG: &str = "00000000-0000-0000-0000-000000000001";
-const SEED_USER: &str = "00000000-0000-0000-0000-000000000010";
+mod guarded;
 
-fn seed_org() -> TestResult<OrgId> {
+pub(super) const SEED_ORG: &str = "00000000-0000-0000-0000-000000000001";
+pub(super) const SEED_USER: &str = "00000000-0000-0000-0000-000000000010";
+
+pub(super) fn seed_org() -> TestResult<OrgId> {
     Ok(OrgId::from_uuid(Uuid::parse_str(SEED_ORG)?))
 }
 
-async fn insert_queued(
+pub(super) async fn insert_queued(
     pool: &sqlx::PgPool,
     kind: OperationKind,
     target_id: &str,

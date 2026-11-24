@@ -66,14 +66,6 @@ impl StoredReservation {
     const RESERVED: Self = Self::Pending { known: None };
 }
 
-#[derive(FromRow)]
-struct ReservationRow {
-    request_fingerprint: String,
-    response_json: Option<Json<serde_json::Value>>,
-    created_at: OffsetDateTime,
-    reservation_expired: bool,
-}
-
 impl PublicOperationStore {
     /// Reserve `idempotency` for a request whose work starts once this
     /// returns [`ResponseReservation::Reserved`], or report what an earlier
@@ -89,20 +81,12 @@ impl PublicOperationStore {
     ) -> Result<ResponseReservation, ResponseAdmissionError> {
         let mut tx = self.pool.begin().await?;
         lock_idempotency_key(&mut tx, org_id, api_product, idempotency).await?;
-        let row = sqlx::query_as::<_, ReservationRow>(sql!(
-            "SELECT request_fingerprint, response_json, created_at,
-                    created_at + make_interval(secs => $6) <= NOW() AS reservation_expired
-             FROM public_idempotency_records
-             WHERE org_id = $1 AND api_product = $2 AND method = $3
-               AND path_template = $4 AND idempotency_key = $5 AND expires_at > NOW()"
-        ))
-        .bind(org_id)
-        .bind(api_product.as_str())
-        .bind(idempotency.method.as_str())
-        .bind(idempotency.path_template.as_str())
-        .bind(idempotency.key.as_str())
-        .bind(lifetime.as_secs_f64())
-        .fetch_optional(&mut *tx)
+        let row = operation_store::idempotency::find_live_reservation(
+            &mut *tx,
+            api_product.as_str(),
+            idempotency.store_key(org_id),
+            lifetime.as_secs_f64(),
+        )
         .await?;
         if let Some(row) = row {
             if row.request_fingerprint != idempotency.request_fingerprint.as_str() {
@@ -163,16 +147,13 @@ impl PublicOperationStore {
         reservation: ReservationId,
         response: serde_json::Value,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(sql!(
-            "UPDATE public_idempotency_records SET response_json = $2
-             WHERE id = $1 AND response_json = $3"
-        ))
-        .bind(reservation.0)
-        .bind(Json(StoredReservation::Completed { response }))
-        .bind(Json(StoredReservation::RESERVED))
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        operation_store::idempotency::replace_recorded_reply(
+            &self.pool,
+            reservation.0,
+            &StoredReservation::RESERVED,
+            &StoredReservation::Completed { response },
+        )
+        .await
     }
 
     /// Keep a reservation whose work may have happened pending for good,
@@ -185,16 +166,13 @@ impl PublicOperationStore {
         reservation: ReservationId,
         known: serde_json::Value,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(sql!(
-            "UPDATE public_idempotency_records SET response_json = $2
-             WHERE id = $1 AND response_json = $3"
-        ))
-        .bind(reservation.0)
-        .bind(Json(StoredReservation::Pending { known: Some(known) }))
-        .bind(Json(StoredReservation::RESERVED))
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        operation_store::idempotency::replace_recorded_reply(
+            &self.pool,
+            reservation.0,
+            &StoredReservation::RESERVED,
+            &StoredReservation::Pending { known: Some(known) },
+        )
+        .await
     }
 
     /// Withdraw a reservation whose work did not start, so the key can be
@@ -203,13 +181,11 @@ impl PublicOperationStore {
         &self,
         reservation: ReservationId,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(sql!(
-            "DELETE FROM public_idempotency_records WHERE id = $1 AND response_json = $2"
-        ))
-        .bind(reservation.0)
-        .bind(Json(StoredReservation::RESERVED))
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        operation_store::idempotency::delete_recorded_reply(
+            &self.pool,
+            reservation.0,
+            &StoredReservation::RESERVED,
+        )
+        .await
     }
 }

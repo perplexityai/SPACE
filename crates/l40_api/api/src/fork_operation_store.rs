@@ -9,7 +9,7 @@ use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::no_newer_full_snapshot;
 use pplx_space_snapshot_model::LocalArtifactId;
 use pplx_space_sql_locator::sql;
-use sqlx::{PgPool, types::Json};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
@@ -194,12 +194,11 @@ impl ForkOperationStore {
             .source_lifecycle()
             .ok_or(ForkOperationStoreError::InvalidCaptureWorkflow)?;
         let mut tx = self.pool().begin().await?;
-        sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))"
-        ))
-        .bind(payload.source_sandbox_id().to_string())
-        .bind(generation)
-        .execute(&mut *tx)
+        operation_store::operations::lock_fork_capture_leader(
+            &mut tx,
+            &payload.source_sandbox_id().to_string(),
+            generation,
+        )
         .await?;
         // Forks of one source name it by either id form; see
         // `fork_operations::fork_operation_target_id`.
@@ -238,21 +237,14 @@ impl ForkOperationStore {
             leader_payload.set_capture_operation_id(leader);
             let leader_payload_json =
                 serde_json::to_value(ForkSandboxPayload::v1(leader_payload.clone()))?;
-            let updated = sqlx::query(sql!(
-                "UPDATE public_operations
-                 SET payload_json = $3, updated_at = NOW()
-                 WHERE org_id = $1
-                   AND operation_id = $2
-                   AND kind = 'fork_sandbox'
-                   AND state IN ('queued', 'running')"
-            ))
-            .bind(operation.org_id)
-            .bind(leader.as_uuid())
-            .bind(Json(leader_payload_json))
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            if updated != 1 {
+            let updated = operation_store::operations::set_active_fork_payload(
+                &mut *tx,
+                operation.org_id,
+                leader,
+                leader_payload_json,
+            )
+            .await?;
+            if !updated {
                 return Err(ForkOperationStoreError::ClaimSuperseded);
             }
         }

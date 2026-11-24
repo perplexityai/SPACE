@@ -1,4 +1,5 @@
-//! Plan-cost regression for [`INLINE_ORG_AT_LIMIT`].
+//! Plan-cost regression for
+//! [`INLINE_ORG_AT_LIMIT`](pplx_space_public_operation_store::operations::INLINE_ORG_AT_LIMIT).
 //!
 //! The limit's behaviour is covered in `tests`; this covers how much its count
 //! reads. A cached statement can switch to a generic plan, which knows no org,
@@ -25,7 +26,8 @@ use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::plan_explain::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
-use super::{ADMISSION_CLAIM_TOKEN_PREFIX, INLINE_ORG_AT_LIMIT, TEARDOWN_KINDS};
+use super::{ADMISSION_CLAIM_TOKEN_PREFIX, TEARDOWN_KINDS};
+use pplx_space_public_operation_store::operations::INLINE_ORG_AT_LIMIT;
 
 /// How many plan nodes may handle each of the org's running operations: its
 /// index entry, its heap row, and the filter that drops it or the aggregate
