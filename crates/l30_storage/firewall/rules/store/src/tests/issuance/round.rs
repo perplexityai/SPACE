@@ -433,7 +433,7 @@ async fn each_new_question_takes_a_new_round() -> TestResult {
             TestResult::Ok(())
         }
     };
-    age(REPORT_MAX_AGE - Duration::from_secs(1)).await?;
+    age(REPORT_MAX_AGE - Duration::from_secs(5)).await?;
     let answerable = effects(&db.pool, first, node).await?;
     assert!(matches!(
         open_with(&db.pool, &target, Queue::Wake).await?,

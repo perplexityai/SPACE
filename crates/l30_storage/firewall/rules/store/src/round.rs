@@ -33,8 +33,8 @@ use crate::{LeasedTarget, REPORT_MAX_AGE, Wakeup, Work, roll_back};
 pub enum Opening {
     /// This call opened the round and queued the wakeup, and committed.
     Opened(PendingRound),
-    /// The round was already open for this generation and can still be
-    /// answered; nothing changed.
+    /// The round was already open for this generation and wasn't expired at
+    /// the opener's clock reading; nothing changed.
     AlreadyOpen(PendingRound),
     /// Nothing changed.
     Refused(OpenRefusal),

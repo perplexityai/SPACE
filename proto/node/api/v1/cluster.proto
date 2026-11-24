@@ -1609,8 +1609,9 @@ enum FirewallRulesCensusGapKind {
   FIREWALL_RULES_CENSUS_GAP_KIND_MISSING = 4;
   // An eligible slot wasn't read at its final lifecycle.
   FIREWALL_RULES_CENSUS_GAP_KIND_UNREAD = 5;
-  // Retired before any worker sent them, EXTRA for the request's
-  // `extra_namespaces`; keep their numbers and names reserved.
+  // Retired before any worker sent them: EXTRA became the request's
+  // `extra_namespaces`, which made TRUNCATED unnecessary. Keep their numbers
+  // and names reserved.
   reserved 6, 7;
   reserved "FIREWALL_RULES_CENSUS_GAP_KIND_EXTRA", "FIREWALL_RULES_CENSUS_GAP_KIND_TRUNCATED";
 }

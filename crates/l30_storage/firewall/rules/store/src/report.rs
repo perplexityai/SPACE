@@ -29,7 +29,7 @@ const MAX_REPORT_SLOTS: usize = 16_384;
 /// `InventoryFailed`, `Unowned` and `ListingFailed`, once.
 const HOST_GAPS: usize = 3;
 /// Most managed namespaces no slot accounts for one report may count, 64
-/// times the largest pool. A larger count is malformed, not stored.
+/// times `MAX_REPORT_SLOTS`. A larger count is malformed, not stored.
 const MAX_EXTRA_NAMESPACES: u64 = 64 * MAX_REPORT_SLOTS as u64;
 /// The accepted document's only schema version. Any change to the document
 /// needs a new one: a retained document would otherwise compare as a conflict.
