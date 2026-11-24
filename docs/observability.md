@@ -144,14 +144,9 @@ DogStatsD keeps the original `version` wire tags.
 `template.fetch.error` tags the requested content hash as `hash` (`"<unset>"`
 when absent), so failures for distinct hashes remain separate. Older builds
 tag it `version` (`version.requested` on OTLP), so while both run, during a
-rollout or rollback, a query by hash reads both keys. The hash has unbounded cardinality; it
-shares the existing 2,000-attribute-set limit per instrument, with excess
-combinations going to the SDK overflow series.
-
-Every `template.*` metric the template manager emits also carries `git_sha`,
-the deployed build's revision (`unknown` without deployment metadata), so a
-rollout's old and new builds stay apart even when the node service runs
-without a process `version`.
+rollout or rollback, a query by hash reads both keys. The hash has unbounded
+cardinality; it shares the existing 2,000-attribute-set limit per instrument,
+with excess combinations going to the SDK overflow series.
 
 ### Mixed identity on the DogStatsD path
 
@@ -583,11 +578,10 @@ metric, for example with an explicit per-metric tag configuration. A tag that
 configuration does not list is still sent but cannot be grouped or filtered
 on. That applies to tags added after the configuration was written, including
 the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors,
-the `git_sha` on template-manager `template.*` metrics, the `hash` on
-`template.fetch.error`, and the `error_kind` on `template.build.latency_ms`,
-`template.build.step.latency_ms` and `snapshot.restore.failed`, the
-`fault` on `gateway.tcp.connection`, the `io_kind` on
-`gateway.tls.connection_error` and `gateway.tls.handshake`, and the
+the `hash` on `template.fetch.error`, and the `error_kind` on
+`template.build.latency_ms`, `template.build.step.latency_ms` and
+`snapshot.restore.failed`, the `fault` on `gateway.tcp.connection`, the
+`io_kind` on `gateway.tls.connection_error` and `gateway.tls.handshake`, and the
 `certificate` on `gateway.tls.handshake`. Add them to the
 metric's tag configuration before relying on them; series without them are
 unaffected.
