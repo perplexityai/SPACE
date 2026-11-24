@@ -28,6 +28,7 @@ mod leader_election;
 #[cfg(test)]
 mod lifecycle_writer_test_support;
 mod lost_started_sandboxes;
+mod memory_drop_objects;
 pub mod metrics;
 mod node_drain;
 mod node_group_labeler;

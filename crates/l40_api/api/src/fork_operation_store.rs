@@ -139,6 +139,17 @@ impl ForkOperationStore {
             .map_err(Into::into)
     }
 
+    /// Whether a memory drop holds the source sandbox sealed
+    /// (`pplx_space_sandbox_store::memory_drop::sealed`).
+    pub async fn source_memory_drop_sealed(
+        &self,
+        source_sandbox_id: SandboxId,
+    ) -> Result<bool, ForkOperationStoreError> {
+        pplx_space_sandbox_store::memory_drop::sealed(self.pool(), source_sandbox_id)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn suspended_source_artifact(
         &self,
         source_sandbox_id: SandboxId,

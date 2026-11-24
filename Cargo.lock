@@ -8463,6 +8463,7 @@ dependencies = [
  "pplx-space-cpu-arch",
  "pplx-space-db-test-fixtures",
  "pplx-space-execution-spec",
+ "pplx-space-object-store",
  "pplx-space-sandbox-model",
  "pplx-space-sandbox-portability",
  "pplx-space-snapshot-model",
@@ -8475,6 +8476,7 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

@@ -18,8 +18,11 @@ use sqlx::{Postgres, Transaction};
 /// It has no lifecycle predicate and overwrites whatever lifecycle the row
 /// holds. The caller supplies every guard, in the same transaction: the
 /// fork-source lifecycle lock, the check that no fork of the sandbox is
-/// queued or running, and the row's `FOR UPDATE` read, which returns the
-/// lifecycle to restore if the delete fails. The API's delete parses that
+/// queued or running, the row's `FOR UPDATE` read, which returns the
+/// lifecycle to restore if the delete fails, and the check under that lock
+/// that no memory drop holds the row sealed ([`crate::memory_drop::sealed`]).
+/// Writing `deleting` would clear the seal under a drop mid-copy, so the
+/// API's delete refuses a sealed row as retryable. The API's delete parses that
 /// read as a [`SandboxLifecycle`], which has no `deleted` variant, so those
 /// rows are refused before this write
 /// runs; a caller that skips the parse would overwrite them.

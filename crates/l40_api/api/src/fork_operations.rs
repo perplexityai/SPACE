@@ -950,6 +950,10 @@ pub enum AdmitForkOperationError {
     Store(#[from] PublicOperationStoreError),
     #[error("federated fork admission requires both owner and service grant")]
     IncompleteFederatedContext,
+    /// A memory drop holds the source sealed; the fork can be retried once
+    /// the drop commits or its seal lapses.
+    #[error("a memory drop of the source sandbox is in progress")]
+    SourceMemoryDropInProgress,
 }
 
 #[cfg(test)]
@@ -972,11 +976,19 @@ pub async fn admit_locked_fork_operation(
     if matches!(
         admission.observation(),
         crate::public_operations::ObservePublicOperationIdempotency::Missing
-    ) && !admission
-        .lock_target_lifecycle(input.source_sandbox_id)
-        .await?
-    {
-        return Ok(CreatePublicOperationResult::AdmissionDenied);
+    ) {
+        if !admission
+            .lock_target_lifecycle(input.source_sandbox_id)
+            .await?
+        {
+            return Ok(CreatePublicOperationResult::AdmissionDenied);
+        }
+        if admission
+            .target_memory_drop_sealed(input.source_sandbox_id)
+            .await?
+        {
+            return Err(AdmitForkOperationError::SourceMemoryDropInProgress);
+        }
     }
     admission
         .create(fork_operation_input(&input, &prepared))

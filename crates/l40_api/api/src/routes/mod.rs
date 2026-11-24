@@ -80,6 +80,10 @@ pub struct AppState {
     /// [`admin::RUNTIME_UPGRADE_DRIVEN_KINDS`].
     pub runtime_upgrade_driven_kinds:
         &'static [pplx_space_runtime_upgrade_campaign_store::CampaignKind],
+    /// Whether `POST /admin/api/v1/sandboxes/{id}:drop-memory` accepts a
+    /// drop. Read from the same switch the cluster controller's executor
+    /// reads; see [`crate::controllers::sandbox::memory_drop`].
+    pub memory_drop_enabled: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -283,6 +287,10 @@ impl AppState {
             native_hidden_operations,
             ecw_credential_keyring,
             runtime_upgrade_driven_kinds: admin::RUNTIME_UPGRADE_DRIVEN_KINDS,
+            memory_drop_enabled: pplx_space_env_vars::env_flag_var(
+                crate::controllers::sandbox::memory_drop::MEMORY_DROP_ENABLED_VAR,
+                false,
+            ),
         })
     }
 

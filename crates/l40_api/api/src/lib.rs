@@ -39,6 +39,7 @@ pub mod native_sandbox_limits;
 pub mod node_group_placement;
 pub mod public_operation_driver;
 pub mod public_operations;
+pub mod public_sandbox_memory_operations;
 pub mod public_sandbox_operations;
 mod public_sandbox_projection;
 pub mod public_sessions;

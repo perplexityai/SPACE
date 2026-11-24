@@ -196,6 +196,7 @@ pub mod k8s_executions;
 pub mod k8s_node_attribution;
 mod lifecycle;
 pub mod lost;
+pub mod memory_drop;
 pub mod node_desired_state;
 pub mod node_holds;
 pub mod node_local_backup_pending;
@@ -690,8 +691,9 @@ pub struct SandboxDesiredStatePatch<'a> {
 ///
 /// This row carries four further `BEFORE UPDATE` triggers, two of which
 /// (`sandboxes_clear_restore_lease`, `sandboxes_clear_evacuation_restore_target`)
-/// have no change guard. They fire on any update regardless of which columns
-/// this sets, so an all-`Unchanged` patch is still not a database no-op.
+/// have no column-change guard. They fire on any update regardless of which
+/// columns this sets, so an all-`Unchanged` patch is still not a database
+/// no-op.
 pub async fn update_desired_state(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,

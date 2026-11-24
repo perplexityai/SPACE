@@ -491,6 +491,21 @@ impl ForkSandboxOperationExecutor {
             network_policy: source.network_policy.map(|policy| policy.0),
         };
         let source_snapshot = if lifecycle == ForkSourceLifecycle::Suspended {
+            // A memory drop holding the source sealed is about to retire the
+            // artifact's memory, so don't copy it. Its seal checked that no
+            // fork was queued, and this release's admission refuses a sealed
+            // source, so an older API admitted this fork mid-copy. The drop's
+            // commit refuses while this fork is queued, so the drop gives up
+            // and lifts its seal, or the seal lapses; then this fork runs.
+            if self
+                .store
+                .source_memory_drop_sealed(payload.source_sandbox_id())
+                .await?
+            {
+                return Err(ForkExecutionError::Wait(
+                    "a memory drop of the suspended source is in progress".to_string(),
+                ));
+            }
             Some(
                 self.store
                     .suspended_source_artifact(payload.source_sandbox_id())

@@ -312,6 +312,9 @@ pub struct AdminSandboxAuditEntry<'a> {
     pub operation_id: Option<OperationId>,
     pub success: bool,
     pub error: Option<&'a str>,
+    /// The operator's stated reason, for the actions that require one
+    /// (`drop-memory`).
+    pub reason: Option<&'a str>,
 }
 
 /// Emit a high-signal audit log entry for an admin action.
@@ -354,6 +357,7 @@ pub fn record_sandbox(entry: AdminSandboxAuditEntry<'_>) {
         operation_id = entry.operation_id.map(|id| id.to_string()).unwrap_or_default(),
         success = entry.success,
         error = entry.error.unwrap_or(""),
+        reason = entry.reason.unwrap_or(""),
     );
 }
 

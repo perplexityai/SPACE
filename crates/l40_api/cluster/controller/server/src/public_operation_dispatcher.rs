@@ -23,6 +23,7 @@ use pplx_space_api::public_operations::{
     PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
     ReleasedClaim, TEARDOWN_KINDS,
 };
+use pplx_space_api::public_sandbox_memory_operations::SandboxMemoryDropOperationExecutor;
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
     UpdateSandboxOperationExecutor,
@@ -240,6 +241,7 @@ pub struct NativePublicOperationExecutor {
     sandbox_lifecycle: SandboxLifecycleOperationExecutor,
     delete_template: DeleteTemplateOperationExecutor,
     fork_sandbox: ForkSandboxOperationExecutor,
+    drop_sandbox_memory: SandboxMemoryDropOperationExecutor,
 }
 
 impl NativePublicOperationExecutor {
@@ -297,6 +299,10 @@ impl NativePublicOperationExecutor {
                 controller.clone(),
             ),
             delete_template: DeleteTemplateOperationExecutor::new(pool.clone()),
+            drop_sandbox_memory: SandboxMemoryDropOperationExecutor::new(
+                pool.clone(),
+                crate::memory_drop_objects::from_env(),
+            ),
             fork_sandbox: ForkSandboxOperationExecutor::new(pool, substrate, controller),
         }
     }
@@ -328,6 +334,7 @@ const NATIVE_PUBLIC_OPERATION_KINDS: &[OperationKind] = &[
     OperationKind::RollbackSandbox,
     OperationKind::DeleteTemplate,
     OperationKind::ForkSandbox,
+    OperationKind::DropSandboxMemory,
 ];
 
 #[async_trait]
@@ -345,6 +352,9 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             OperationKind::CreateSandbox => self.create_sandbox.execute(&operation).await.into(),
             OperationKind::UpdateSandbox => self.update_sandbox.execute(&operation).await.into(),
             OperationKind::DeleteTemplate => self.delete_template.execute(&operation).await.into(),
+            OperationKind::DropSandboxMemory => {
+                self.drop_sandbox_memory.execute(&operation).await.into()
+            }
             OperationKind::ForkSandbox => self
                 .fork_sandbox
                 .execute(claim_token, &operation)

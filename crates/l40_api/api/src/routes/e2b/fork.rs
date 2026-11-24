@@ -344,6 +344,9 @@ fn fork_internal_error(context: &'static str, error: impl std::fmt::Display) -> 
 fn fork_admission_error(context: &'static str, error: AdmitForkOperationError) -> E2bApiError {
     match error {
         AdmitForkOperationError::Store(store) => fork_store_error(context, store),
+        AdmitForkOperationError::SourceMemoryDropInProgress => {
+            E2bApiError::memory_drop_in_progress()
+        }
         other => fork_internal_error(context, other),
     }
 }

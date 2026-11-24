@@ -1339,6 +1339,20 @@ impl PublicOperationAdmission {
         Ok(exists)
     }
 
+    /// Whether a memory drop holds the target sealed
+    /// (`pplx_space_sandbox_store::memory_drop::sealed`). Read after
+    /// [`Self::lock_target_lifecycle`], under the fork-source lock the drop's
+    /// seal also takes, so either the seal committed first and this sees it, or
+    /// this fork commits first and the seal sees it queued and refuses.
+    pub(crate) async fn target_memory_drop_sealed(
+        &mut self,
+        target_id: SandboxId,
+    ) -> Result<bool, PublicOperationStoreError> {
+        pplx_space_sandbox_store::memory_drop::sealed(&mut *self.tx, target_id)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn create(
         mut self,
         input: CreatePublicOperation<'_>,

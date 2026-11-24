@@ -306,6 +306,23 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     ));
     identity_conflict_tx.rollback().await?;
 
+    // The flag is part of the identity: a start keys its refusal on it, so a
+    // replay that disagrees can't come back as the row it didn't write.
+    assert!(!inserted.is_written_off_node());
+    let mut flag_conflict_tx = db.pool.begin().await?;
+    let error = insert(
+        &mut flag_conflict_tx,
+        &make_snapshot(expected_uri.clone()).written_off_node(),
+    )
+    .await
+    .expect_err("one snapshot ID cannot identify a node's copy and an off-node one");
+    assert!(matches!(
+        error,
+        InsertSnapshotError::IdentityConflict { snapshot_id }
+            if snapshot_id == inserted_snapshot_id
+    ));
+    flag_conflict_tx.rollback().await?;
+
     assert_eq!(
         get(&db.pool, inserted_snapshot_id)
             .await?

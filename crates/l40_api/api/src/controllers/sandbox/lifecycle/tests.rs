@@ -648,6 +648,84 @@ async fn persisted_delete_intent_denies_later_fork_admission() -> TestResult {
     Ok(())
 }
 
+/// Fork admission refuses a source a memory drop holds sealed with a
+/// retryable error, and queues nothing, so the drop's commit can't find a
+/// fork it would have to give up for.
+#[tokio::test(flavor = "current_thread")]
+async fn fork_admission_refuses_a_source_a_memory_drop_holds_sealed() -> TestResult {
+    let db = pg_test_db_with_max_connections(3).await?;
+    let sandbox_id = SandboxId::new();
+    let org_id = SEED_ORG_ID;
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement,
+                 network_policy_generation
+             ) VALUES (
+                 $1,
+                 '00000000-0000-0000-0000-000000000010',
+                 $2,
+                 'space', 'suspended', 'unplaced', 1
+             )"
+    ))
+    .bind(sandbox_id)
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    // The write keeps the row `suspended`, so the trigger keeps the lease.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET restore_lease_token = gen_random_uuid(),
+             restore_lease_expires_at = NOW() + INTERVAL '1 minute'
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+
+    let request = crate::fork_operations::ForkRequest::from_wire(Some(300), Some(1))?;
+    let key = pplx_space_guest_process::IdempotencyKey::parse("fork-of-a-sealed-source")?;
+    let store = crate::public_operations::PublicOperationStore::new(db.pool.clone());
+    let admission = crate::fork_operations::begin_fork_operation_admission(
+        &store,
+        OrgId::from_uuid(org_id),
+        sandbox_id,
+        request,
+        None,
+        &key,
+    )
+    .await?;
+    let outcome = crate::fork_operations::admit_locked_fork_operation(
+        admission,
+        crate::fork_operations::AdmitForkOperation {
+            org_id: OrgId::from_uuid(org_id),
+            actor_user_id: None,
+            source_sandbox_id: sandbox_id,
+            request,
+            ecw_host_domain: "e2b.example.test",
+            hard_deadline: std::time::Duration::from_secs(240),
+            federated_owner: None,
+            federated_service_grant: None,
+            idempotency_key: &key,
+            client_id: &pplx_space_accounts::ClientId::unknown(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(crate::fork_operations::AdmitForkOperationError::SourceMemoryDropInProgress)
+        ),
+        "{outcome:?}"
+    );
+    let queued: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM public_operations WHERE kind = 'fork_sandbox'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(queued, 0);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn invalid_activation_options_reject_before_admission_and_requested_event() -> TestResult {
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -1093,5 +1171,65 @@ async fn resume_uses_resolved_runtime_without_async_observation() -> TestResult 
         client.resume_sandbox(request).await?;
         assert_eq!(worker.state().get(&id.to_string()).await?.status, "running");
     }
+    Ok(())
+}
+
+/// A memory drop seals a `suspended` row with its restore lease while it
+/// copies. Deleting the row then would move its lifecycle out from under the
+/// copy, so the delete refuses with a retryable 503 and writes nothing; once
+/// the seal is gone, the same delete goes through.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_of_a_row_a_memory_drop_holds_sealed_is_retryable() -> TestResult {
+    let db = pg_test_db_with_max_connections(3).await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement,
+                 network_policy_generation
+             ) VALUES (
+                 $1, '00000000-0000-0000-0000-000000000010', $2,
+                 'space', 'suspended', 'unplaced', 1
+             )"
+    ))
+    .bind(sandbox_id)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    // The seal's shape; the trigger keeps it on a write that stays
+    // `suspended`.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET restore_lease_token = $2,
+                restore_lease_expires_at = NOW() + INTERVAL '1 minute'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(uuid::Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+
+    let error = begin_delete_against_active_fork(&db.pool, sandbox_id)
+        .await
+        .expect_err("a sealed row refuses the delete");
+    assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let lifecycle: String =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(lifecycle, "suspended");
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET restore_lease_expires_at = NOW() - INTERVAL '1 second'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let previous = begin_delete_against_active_fork(&db.pool, sandbox_id).await?;
+    assert_eq!(
+        previous,
+        Some(pplx_space_sandbox_model::SandboxLifecycle::Suspended)
+    );
     Ok(())
 }

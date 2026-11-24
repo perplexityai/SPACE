@@ -131,6 +131,35 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: RuntimeCommands,
     },
+    /// Operate on individual sandboxes.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SandboxCommands {
+    /// Drop a suspended sandbox's memory offline
+    /// (POST /admin/api/v1/sandboxes/{sandbox}:drop-memory).
+    ///
+    /// The sandbox stays suspended, repinned to a disk-only copy of its
+    /// suspend snapshot; the full snapshot is retained. Only a Kubernetes
+    /// sandbox suspended off a node that's gone is eligible. Prints the
+    /// enqueued operation; the cluster controller runs it.
+    #[command(name = "drop-memory")]
+    DropMemory {
+        /// Sandbox id (sbx_<uuid>, a UUID, or its pod name).
+        sandbox: String,
+        /// Why the memory is dropped; recorded in the operation and the audit
+        /// event.
+        #[arg(long)]
+        reason: String,
+        /// Idempotency key. Defaults to a fresh one; pass the key a previous
+        /// attempt printed to retry it without enqueueing a second drop.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

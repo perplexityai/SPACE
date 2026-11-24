@@ -5565,6 +5565,17 @@ async fn ecw_contention_keeps_its_own_attribution() -> pplx_space_test_env::Test
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     );
 
+    // A memory drop holding the source sealed ends when the drop commits or
+    // its seal lapses, so the fork is retryable.
+    assert_eq!(
+        super::fork::fork_admission_error_for_test(
+            "admit fork",
+            crate::fork_operations::AdmitForkOperationError::SourceMemoryDropInProgress,
+        )
+        .status_for_test(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
     // The federated-owner materialization. Its contention case has to reach
     // the translator (so it lands `Api`/`Internal` rather than a fleet fault),
     // but *only* its contention case: the translator's fallthrough stamps

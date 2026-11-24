@@ -4,6 +4,31 @@
 use super::*;
 use pplx_space_sandbox_store::restore_lease;
 
+/// The retryable 503 a restore, wake or start of a `suspended` row gets once
+/// its memory was dropped (`pplx_space_sandbox_store::memory_drop`). Its disk
+/// artifact is durable, but no restore path boots a disk artifact into a
+/// sandbox from `suspended` yet. Retryable, so a wake in flight completes once
+/// a release that can is deployed. Unphased: no readiness wait ran.
+pub(in crate::controllers::substrate::kubernetes) fn memory_dropped_restore_pending()
+-> SubstrateError {
+    SubstrateError::Timeout {
+        message: "cannot restore suspended sandbox yet: its memory was dropped, its disk is \
+                  durable, and restoring a disk-only suspended sandbox is not supported yet"
+            .to_string(),
+        phase: None,
+    }
+}
+
+/// A memory drop holds the row sealed while it copies the disk. Retryable:
+/// the drop commits, gives up or its seal lapses within a minute.
+pub(in crate::controllers::substrate::kubernetes) fn memory_drop_in_progress() -> SubstrateError {
+    SubstrateError::Timeout {
+        message: "cannot restore suspended sandbox yet: a memory drop of it is in progress"
+            .to_string(),
+        phase: None,
+    }
+}
+
 impl K8sStore {
     /// Post-CAS-loss snapshot of the restore gate. Fresh execution work keeps
     /// ownership live after the original lease deadline so an already-issued
@@ -391,6 +416,23 @@ impl K8sStore {
         };
 
         let Some(restore_claim) = restore_claim else {
+            // Both claims refuse a row whose memory was dropped, or one a
+            // memory drop holds sealed. Checked first: their other answers (a
+            // lost drain claim the drain drops, an ownership collision, a
+            // lifecycle conflict) would hide why, and a sealed row is
+            // retryable.
+            if pplx_space_sandbox_store::memory_drop::dropped(&self.pool, sandbox_id)
+                .await
+                .db_context("failed to read whether the sandbox's memory was dropped")?
+            {
+                return Err(memory_dropped_restore_pending());
+            }
+            if pplx_space_sandbox_store::memory_drop::sealed(&self.pool, sandbox_id)
+                .await
+                .db_context("failed to read the memory drop seal")?
+            {
+                return Err(memory_drop_in_progress());
+            }
             let (lifecycle, marker, ownership_remaining_secs) =
                 self.fetch_restore_ownership_snapshot(sandbox_id).await?;
             // When the marker was required and the row is still in the

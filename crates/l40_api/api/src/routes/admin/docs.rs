@@ -391,6 +391,39 @@ fn insert_admin_sandbox_action_paths(paths: &mut Map<String, Value>) {
             }
         }),
     );
+    paths.insert(
+        "/sandboxes/{sandbox_id}:drop-memory".to_string(),
+        json!({
+            "post": {
+                "summary": "Enqueue an audited drop of a suspended sandbox's memory",
+                "description": "Copies the sandbox's suspend snapshot, without its memory, to a disk-only artifact and repins the sandbox to it; the sandbox stays suspended and its next start boots from the disk. Only a Kubernetes sandbox that is suspended, unplaced and unencrypted, pinned to a durable full suspend snapshot that is its newest, whose node is gone and that no fork is reading, is eligible. The full snapshot is retained, so an operator can repoint the sandbox back to it. Until disk-only restore lands, a restore, start or wake of the dropped sandbox answers a retryable 503. Runs under the sandbox's owning organization; the reason is recorded in the operation and the audit event, and is part of the idempotency fingerprint. A sandbox already dropped isn't refused: the operation finds it done.",
+                "parameters": [
+                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } },
+                    { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["reason"],
+                                "additionalProperties": false,
+                                "properties": { "reason": { "type": "string", "minLength": 1, "description": "Why the memory is dropped; must not be blank" } }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "202": { "description": "Operation enqueued" },
+                    "400": { "description": "Invalid sandbox id, a missing or blank reason, or a missing or invalid idempotency key" },
+                    "404": { "description": "Sandbox not found" },
+                    "409": { "description": "The sandbox isn't eligible, with the reason, or an idempotency conflict" },
+                    "503": { "description": "The memory drop is disabled (SPACE_MEMORY_DROP_ENABLED), or retry: another drop holds the sandbox (memory_drop_in_progress) or a fork of it is running (fork_active)" }
+                }
+            }
+        }),
+    );
 }
 
 fn insert_api_key_paths(paths: &mut Map<String, Value>) {
