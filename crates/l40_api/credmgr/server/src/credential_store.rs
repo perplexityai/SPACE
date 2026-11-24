@@ -1,10 +1,8 @@
-//! Direct Postgres reads for sandbox-owner resolution. Runs as the read-only
-//! `space_credmgr` role.
+//! Sandbox-owner resolution, read through `pplx-space-sandbox-store`. Runs as
+//! the read-only `space_credmgr` role.
 
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_sandbox_model::SandboxId;
-
-use pplx_space_sql_locator::sql;
 
 /// The owner identity a sandbox's credentials are resolved against.
 #[derive(Debug, Clone, Copy)]
@@ -52,18 +50,11 @@ impl CredentialStore for PgCredentialStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<SandboxOwner>, CredentialStoreError> {
-        let row: Option<(UserId, OrgId, bool)> = sqlx::query_as(sql!(
-            "SELECT s.user_id, s.org_id, o.byok_enabled \
-             FROM sandboxes s JOIN organizations o ON o.id = s.org_id \
-             WHERE s.id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(user_id, org_id, byok_enabled)| SandboxOwner {
-            user_id,
-            org_id,
-            byok_enabled,
+        let row = pplx_space_sandbox_store::row_reads::owner(&self.pool, sandbox_id).await?;
+        Ok(row.map(|row| SandboxOwner {
+            user_id: row.user_id,
+            org_id: row.org_id,
+            byok_enabled: row.byok_enabled,
         }))
     }
 }

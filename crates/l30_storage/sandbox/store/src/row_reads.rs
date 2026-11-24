@@ -1,11 +1,12 @@
 //! Reads of one `sandboxes` row that answer a question rather than return
 //! the row: who owns it, whether it has prior state, how long its restore
-//! lease has left, and whose activation its runtime records.
+//! lease has left, and whose activation its runtime records. [`owner`] also
+//! reads whether the owning organization brings its own key.
 //!
 //! Plain reads: none takes a lock, and each runs on the executor its caller
 //! passes.
 
-use pplx_space_accounts::{ClientId, OrgId};
+use pplx_space_accounts::{ClientId, OrgId, UserId};
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sql_locator::sql;
 
@@ -97,5 +98,30 @@ pub async fn restore_lease_remaining_secs(
     ))
     .bind(sandbox_id)
     .fetch_one(executor)
+    .await
+}
+
+/// A sandbox's owning user and organization, and whether that organization
+/// brings its own key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct OwnerRecord {
+    pub user_id: UserId,
+    pub org_id: OrgId,
+    /// `organizations.byok_enabled`.
+    pub byok_enabled: bool,
+}
+
+/// The sandbox's [`OwnerRecord`]. `None` when no such sandbox exists.
+pub async fn owner(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Option<OwnerRecord>, sqlx::Error> {
+    sqlx::query_as::<_, OwnerRecord>(sql!(
+        "SELECT s.user_id, s.org_id, o.byok_enabled \
+         FROM sandboxes s JOIN organizations o ON o.id = s.org_id \
+         WHERE s.id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_optional(executor)
     .await
 }

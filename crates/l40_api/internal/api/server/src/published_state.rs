@@ -1519,21 +1519,18 @@ pub async fn publish_sandbox_states_with_retirement(
 
     let mut accepted = 0_u64;
     if !absent_ids.is_empty() {
-        let result = sqlx::query(sql!(
-            "DELETE FROM sandbox_observed_states sos
-             WHERE sos.node_id = $1
-               AND sos.sandbox_id = ANY($2)"
-        ))
-        .bind(node_id)
-        .bind(&absent_ids)
-        .execute(&mut *conn)
+        let deleted = pplx_space_sandbox_store::observed_states::delete_absent_on_node(
+            &mut *conn,
+            node_id,
+            &absent_ids,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!(
                 "delete absent published sandbox observed state: {err}"
             ))
         })?;
-        accepted = accepted.saturating_add(result.rows_affected());
+        accepted = accepted.saturating_add(deleted);
 
         let elements = absent_ids
             .iter()
@@ -2489,30 +2486,11 @@ async fn publish_sandbox_snapshots_batch(
             })
         })
         .collect::<Vec<_>>();
-    sqlx::query(sql!(
-        "WITH scope AS (
-             SELECT UNNEST($1::UUID[]) AS sandbox_id
-         ),
-         incoming AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS incoming(
-                 sandbox_id UUID,
-                 snapshot_id TEXT
-             )
-         )
-         DELETE FROM sandbox_snapshot_inventory ssi
-         USING scope
-         WHERE ssi.sandbox_id = scope.sandbox_id
-           AND NOT EXISTS (
-               SELECT 1
-               FROM incoming
-               WHERE incoming.sandbox_id = ssi.sandbox_id
-                 AND incoming.snapshot_id = ssi.snapshot_id
-           )"
-    ))
-    .bind(sandbox_ids)
-    .bind(Json(serde_json::Value::Array(snapshot_ids_payload)))
-    .execute(&mut *conn)
+    pplx_space_sandbox_store::snapshot_inventory::prune_unpublished(
+        &mut *conn,
+        sandbox_ids,
+        serde_json::Value::Array(snapshot_ids_payload),
+    )
     .await
     .map_err(|err| Status::internal(format!("prune absent published sandbox snapshots: {err}")))?;
 

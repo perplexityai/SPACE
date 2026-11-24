@@ -85,13 +85,21 @@
 //!   included. [`k8s_node_attribution`] lists the registered nodes the
 //!   sandbox's placement, latest execution and a named snapshot attribute to
 //!   it, for scoping the storage credentials a node may receive.
+//!   [`spaced_version_counts`] groups the rows and the observed states nodes
+//!   publish by the template, `spaced` version and status the admin list
+//!   shows.
 //! * **So are single-question reads.** A read of the `sandboxes` row that
 //!   callers made inline moves here whole, as a module named for the question
-//!   it answers, such as [`restore_pod_owners`] or [`stopped_replacements`].
-//!   Two such modules also read a table another store owns:
+//!   it answers, such as [`restore_pod_owners`] or [`stopped_replacements`],
+//!   and so does one that joins the row to what it references, as
+//!   [`row_reads::owner`] (its organization) and [`debug_reads::record`]
+//!   (its nodes) do.
+//!   Some such modules also read tables another store owns. For example,
 //!   [`active_quarantines`] and [`quarantine_recovery_authority`] join
 //!   `sandbox_quarantine_state`, which belongs to
-//!   `pplx-space-sandbox-quarantine-store`.
+//!   `pplx-space-sandbox-quarantine-store`, and [`debug_reads::record`] joins
+//!   `nodes` and `node_k8s`, which belong to
+//!   `pplx-space-node-registration-store`.
 //! * **Sibling tables get a module each.** The unlocked reads and the
 //!   unguarded steps that callers ran on the sandbox-scoped tables this
 //!   crate declares, mostly inside a larger transaction, move into modules
@@ -185,6 +193,7 @@ pub mod runtime_population;
 pub mod sandbox_id_bounds;
 pub mod snapshot_capture_fields;
 pub mod snapshot_inventory;
+pub mod spaced_version_counts;
 pub mod stopped_replacement_claim;
 pub mod stopped_replacements;
 pub mod stuck;
