@@ -5300,11 +5300,11 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "futures-util",
+ "pplx-space-accounts",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
  "pplx-space-build-mgr-store",
  "pplx-space-common-grpc",
- "pplx-space-common-jobs",
  "pplx-space-content-digest",
  "pplx-space-execution-spec",
  "pplx-space-grpc-server",
@@ -5333,11 +5333,16 @@ dependencies = [
 name = "pplx-space-build-mgr-store"
 version = "0.8.2"
 dependencies = [
+ "pplx-space-common-jobs",
  "pplx-space-job-id",
  "pplx-space-sql-locator",
+ "ref-cast",
  "rusqlite",
+ "serde",
  "sqlx",
  "thiserror 2.0.20",
+ "tokio-util",
+ "tonic",
 ]
 
 [[package]]

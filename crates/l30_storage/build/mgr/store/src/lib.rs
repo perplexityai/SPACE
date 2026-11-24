@@ -2,22 +2,31 @@
 //! finished build job produced, and build-manager's reads of its shared
 //! `jobs` table and its expired-lease give-up there.
 //!
-//! The database's opening and PRAGMAs stay in `pplx-space-build-mgr-server`,
-//! and `pplx-space-db-migrate` applies its migrations. The job queue itself is
-//! read and written through `pplx-space-common-jobs`. The lease-guarded result
-//! write and the expired-lease give-up are verbs here with their `WHERE`
-//! whole. The result write's guard checks that the job the caller names is
-//! `running` under the lease owner the caller passes. The give-up's guard
-//! compares each running build job's lease expiry with SQLite's clock, and a
-//! job with no expiry counts as expired. Matching no row is an outcome, not an
-//! error. Each function takes a `rusqlite::Connection`, so a caller can pass
-//! its own open transaction, and returns rusqlite's error unchanged.
+//! [`database`] opens the database for `pplx-space-build-mgr-server` and
+//! holds the connection types callers name; `pplx-space-db-migrate` applies
+//! its migrations. The job queue itself is read and written by the
+//! common-jobs worker, which build-manager reaches only through
+//! [`jobs::JobWorker`]. This crate's `AGENTS.md` states the rules for
+//! extending either. The lease-guarded result write and the expired-lease
+//! give-up are verbs here with their `WHERE` whole. The result write's guard
+//! checks that the job the caller names is `running` under the lease owner
+//! the caller passes. The give-up's guard compares each running build job's
+//! lease expiry with SQLite's clock, and a job with no expiry counts as
+//! expired. Matching no row is an outcome, not an error. Each function takes
+//! a [`database::Connection`], so it runs under the caller's held lock, and
+//! fails with [`database::Error`], whose `Display` and `source` are
+//! rusqlite's, unchanged.
 
 #![forbid(unsafe_code)]
 
+pub mod database;
+pub mod jobs;
+
 use pplx_space_job_id::JobId;
 use pplx_space_sql_locator::sql;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
+
+use crate::database::{Connection, Error};
 
 /// The `jobs.kind` of every build job.
 pub const BUILD_JOB_KIND: &str = "template_build";
@@ -77,7 +86,8 @@ pub struct ParseBuildTerminalStateError {
 pub fn get_build_result(
     conn: &Connection,
     job_id: &JobId,
-) -> rusqlite::Result<Option<BuildJobResult>> {
+) -> Result<Option<BuildJobResult>, Error> {
+    let conn = &conn.0;
     conn.query_row(
         sql!(
             "SELECT template_id, state, content_hash, error
@@ -103,6 +113,7 @@ pub fn get_build_result(
         },
     )
     .optional()
+    .map_err(Error::from)
 }
 
 /// Record a job's result, replacing anything recorded for it before.
@@ -110,8 +121,8 @@ pub fn upsert_build_result(
     conn: &Connection,
     job_id: &JobId,
     result: &BuildJobResult,
-) -> rusqlite::Result<()> {
-    conn.execute(
+) -> Result<(), Error> {
+    conn.0.execute(
         sql!(
             "INSERT INTO build_job_results (job_id, template_id, state, content_hash, error)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -142,8 +153,8 @@ pub fn record_build_result_as_lease_owner(
     job_id: &JobId,
     lease_owner: &str,
     result: &BuildJobResult,
-) -> rusqlite::Result<bool> {
-    let rows = conn.execute(
+) -> Result<bool, Error> {
+    let rows = conn.0.execute(
         sql!(
             "INSERT INTO build_job_results (job_id, template_id, state, content_hash, error)
          SELECT ?1, ?3, ?4, ?5, ?6
@@ -191,8 +202,8 @@ pub fn record_build_result_as_lease_owner(
 pub fn fail_expired_running_builds(
     conn: &Connection,
     error: &str,
-) -> rusqlite::Result<Vec<(JobId, Option<String>)>> {
-    let mut stmt = conn.prepare(sql!(
+) -> Result<Vec<(JobId, Option<String>)>, Error> {
+    let mut stmt = conn.0.prepare(sql!(
         "UPDATE jobs
          SET status = 'failed',
              error_kind = 'permanent',
@@ -212,7 +223,8 @@ pub fn fail_expired_running_builds(
     stmt.query_map(params![BUILD_JOB_KIND, error], |row| {
         Ok((row.get(0)?, row.get(1)?))
     })?
-    .collect()
+    .collect::<rusqlite::Result<_>>()
+    .map_err(Error::from)
 }
 
 /// Number of build jobs for `subject_id` (the template) that are pending or
@@ -223,7 +235,8 @@ pub fn count_other_active_builds_for_subject(
     conn: &Connection,
     subject_id: &str,
     exclude_job_id: &JobId,
-) -> rusqlite::Result<usize> {
+) -> Result<usize, Error> {
+    let conn = &conn.0;
     conn.query_row(
         sql!(
             "SELECT COUNT(*) FROM jobs
@@ -236,10 +249,12 @@ pub fn count_other_active_builds_for_subject(
         |row| row.get::<_, i64>(0),
     )
     .map(sqlite_count_to_usize)
+    .map_err(Error::from)
 }
 
 /// Number of build jobs that are pending or running.
-pub fn count_active_build_jobs(conn: &Connection) -> rusqlite::Result<usize> {
+pub fn count_active_build_jobs(conn: &Connection) -> Result<usize, Error> {
+    let conn = &conn.0;
     conn.query_row(
         sql!(
             "SELECT COUNT(*) FROM jobs
@@ -249,13 +264,15 @@ pub fn count_active_build_jobs(conn: &Connection) -> rusqlite::Result<usize> {
         |row| row.get::<_, i64>(0),
     )
     .map(sqlite_count_to_usize)
+    .map_err(Error::from)
 }
 
 /// Number of running build jobs leased to `lease_owner`.
 pub fn count_running_build_jobs_by_lease_owner(
     conn: &Connection,
     lease_owner: &str,
-) -> rusqlite::Result<usize> {
+) -> Result<usize, Error> {
+    let conn = &conn.0;
     conn.query_row(
         sql!(
             "SELECT COUNT(*) FROM jobs
@@ -267,6 +284,7 @@ pub fn count_running_build_jobs_by_lease_owner(
         |row| row.get::<_, i64>(0),
     )
     .map(sqlite_count_to_usize)
+    .map_err(Error::from)
 }
 
 fn sqlite_count_to_usize(count: i64) -> usize {

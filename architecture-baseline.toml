@@ -75,10 +75,6 @@ pplx-space-api = [
 pplx-space-build-mgr = [
   "pplx-space-object-store",
 ]
-pplx-space-build-mgr-server = [
-  "pplx-space-common-jobs",
-  "rusqlite",
-]
 pplx-space-cluster-controller-server = [
   "sqlx",
 ]
