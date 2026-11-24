@@ -5424,6 +5424,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
+ "pplx-space-data-plane-session-store",
  "pplx-space-db-test-fixtures",
  "pplx-space-durations",
  "pplx-space-env-vars",
@@ -5963,6 +5964,7 @@ version = "0.8.2"
 dependencies = [
  "pplx-space-accounts",
  "pplx-space-db-test-fixtures",
+ "pplx-space-k8s-ids",
  "pplx-space-sandbox-model",
  "pplx-space-sql-locator",
  "pplx-space-test-env",

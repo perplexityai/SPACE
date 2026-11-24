@@ -3,7 +3,6 @@ use pplx_space_data_plane_session_store::{
     self as data_plane_session_store, Session as PublicSessionRow,
 };
 use pplx_space_public_operation_store as operation_store;
-use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -214,12 +213,13 @@ impl PublicSessionStore {
         session_id: DataPlaneSessionId,
     ) -> Result<Option<PublicSession>, PublicSessionStoreError> {
         let session_id_string = session_id.to_string();
-        let row = sqlx::query_as::<_, PublicSessionRow>(SESSION_SELECT_SQL)
-            .bind(org_id)
-            .bind(sandbox_id.as_uuid())
-            .bind(&session_id_string)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = data_plane_session_store::live_session(
+            &self.pool,
+            org_id,
+            sandbox_id.into(),
+            &session_id_string,
+        )
+        .await?;
 
         row.map(|row| session_into_public(row, None, self.data_plane_base_url.as_str()))
             .transpose()
@@ -230,44 +230,29 @@ impl PublicSessionStore {
         input: ListPublicSessions,
     ) -> Result<Vec<PublicSession>, PublicSessionStoreError> {
         let kind = input.kind.map(SessionKind::as_str);
-        let rows = sqlx::query_as::<_, PublicSessionRow>(sql!(
-            "SELECT session_id,
-                    sandbox_id,
-                    kind,
-                    state,
-                    reconnect_count,
-                    last_reconnect_reason,
-                    scopes,
-                    target_port,
-                    target_protocol,
-                    target_path,
-                    created_at,
-                    updated_at,
-                    expires_at
-             FROM data_plane_sessions
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND ($3::TEXT IS NULL OR kind = $3)
-               AND (
-                   $4::TIMESTAMPTZ IS NULL
-                   OR (created_at, session_id) < ($4::TIMESTAMPTZ, $5::TEXT)
-               )
-               AND (expires_at IS NULL OR expires_at > NOW())
-             ORDER BY created_at DESC, session_id DESC
-             LIMIT $6"
-        ))
-        .bind(input.org_id)
-        .bind(input.sandbox_id.as_uuid())
-        .bind(kind)
-        .bind(input.cursor.as_ref().map(|cursor| cursor.created_at))
-        .bind(
+        let cursor_session_id = input
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.session_id.to_string());
+        let cursor =
             input
                 .cursor
                 .as_ref()
-                .map(|cursor| cursor.session_id.to_string()),
+                .zip(cursor_session_id.as_deref())
+                .map(
+                    |(cursor, session_id)| data_plane_session_store::SessionCursor {
+                        created_at: cursor.created_at,
+                        session_id,
+                    },
+                );
+        let rows = data_plane_session_store::list_live_sessions(
+            &self.pool,
+            input.org_id,
+            input.sandbox_id.into(),
+            kind,
+            cursor,
+            i64::from(input.limit) + 1,
         )
-        .bind(i64::from(input.limit) + 1)
-        .fetch_all(&self.pool)
         .await?;
 
         rows.into_iter()
@@ -280,61 +265,32 @@ impl PublicSessionStore {
         input: RevokePublicSession<'_>,
     ) -> Result<Option<PublicSession>, PublicSessionStoreError> {
         let mut tx = self.pool.begin().await?;
-        let prior_status = sqlx::query_scalar::<_, String>(sql!(
-            "SELECT revocation_status
-             FROM data_plane_sessions
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND session_id = $3
-               AND (expires_at IS NULL OR expires_at > NOW())
-             FOR UPDATE"
-        ))
-        .bind(input.org_id)
-        .bind(input.sandbox_id.as_uuid())
-        .bind(input.session_id.to_string())
-        .fetch_optional(&mut *tx)
+        let session_id = input.session_id.to_string();
+        let prior_status = data_plane_session_store::lock_live_revocation_status(
+            &mut tx,
+            input.org_id,
+            input.sandbox_id.into(),
+            &session_id,
+        )
         .await?;
         let Some(prior_status) = prior_status else {
             return Ok(None);
         };
         let transitioned = prior_status != "revoked";
 
-        let row = sqlx::query_as::<_, PublicSessionRow>(
-            sql!("UPDATE data_plane_sessions
-             SET revocation_epoch = CASE WHEN $5::BOOL THEN revocation_epoch + 1 ELSE revocation_epoch END,
-                 revocation_status = 'revoked',
-                 revocation_reason = COALESCE(revocation_reason, $4),
-                 revocation_updated_at = NOW(),
-                 state = 'revoked',
-                 token_hash = NULL,
-                 token_expires_at = NOW(),
-                 attach_deadline_at = NULL,
-                 updated_at = NOW()
-             WHERE org_id = $1
-               AND sandbox_id = $2
-               AND session_id = $3
-               AND (expires_at IS NULL OR expires_at > NOW())
-             RETURNING session_id,
-                       sandbox_id,
-                       kind,
-                       state,
-                       reconnect_count,
-                       last_reconnect_reason,
-                       scopes,
-                       target_port,
-                       target_protocol,
-                       target_path,
-                       created_at,
-                       updated_at,
-                       expires_at"),
+        // The row lock above keeps other writers off the row until the
+        // transaction ends, and `NOW()` is the transaction's start in both
+        // statements, so the revoke matches the row the lock read.
+        let row = data_plane_session_store::revoke_live_session(
+            &mut *tx,
+            input.org_id,
+            input.sandbox_id.into(),
+            &session_id,
+            input.reason,
+            transitioned,
         )
-        .bind(input.org_id)
-        .bind(input.sandbox_id.as_uuid())
-        .bind(input.session_id.to_string())
-        .bind(input.reason)
-        .bind(transitioned)
-        .fetch_one(&mut *tx)
-        .await?;
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
 
         if transitioned {
             data_plane_session_store::advance_org_revocation_epoch(&mut *tx, input.org_id).await?;
@@ -462,27 +418,6 @@ struct PublicSessionIdempotencyRecord {
     request_fingerprint: RequestFingerprint,
 }
 
-const SESSION_SELECT_SQL: &str = sql!(
-    "SELECT session_id,
-       sandbox_id,
-       kind,
-       state,
-       reconnect_count,
-       last_reconnect_reason,
-       scopes,
-       target_port,
-       target_protocol,
-       target_path,
-       created_at,
-       updated_at,
-       expires_at
-FROM data_plane_sessions
-WHERE org_id = $1
-  AND sandbox_id = $2
-  AND session_id = $3
-  AND (expires_at IS NULL OR expires_at > NOW())"
-);
-
 async fn find_idempotency_record(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
@@ -570,23 +505,15 @@ async fn refresh_attach_token_tx(
     let token = DataPlaneToken::new();
     let now = OffsetDateTime::now_utc();
     let session_id_string = session_id.to_string();
-    let refreshed = sqlx::query(sql!(
-        "UPDATE data_plane_sessions
-         SET token_hash = $2,
-             token_expires_at = $3,
-             attach_deadline_at = $4,
-             updated_at = NOW()
-         WHERE session_id = $1
-           AND revocation_status = 'active'
-           AND (expires_at IS NULL OR expires_at > NOW())"
-    ))
-    .bind(&session_id_string)
-    .bind(token.hash.as_str())
-    .bind(now + DEFAULT_ATTACH_TOKEN_TTL)
-    .bind(now + DEFAULT_ATTACH_DEADLINE)
-    .execute(&mut **tx)
+    let refreshed = data_plane_session_store::refresh_live_attach_token(
+        &mut **tx,
+        &session_id_string,
+        token.hash.as_str(),
+        now + DEFAULT_ATTACH_TOKEN_TTL,
+        now + DEFAULT_ATTACH_DEADLINE,
+    )
     .await?;
-    Ok((refreshed.rows_affected() > 0).then_some(token))
+    Ok(refreshed.then_some(token))
 }
 
 async fn fetch_session_tx(
@@ -596,11 +523,7 @@ async fn fetch_session_tx(
     session_id: DataPlaneSessionId,
 ) -> Result<Option<PublicSessionRow>, sqlx::Error> {
     let session_id_string = session_id.to_string();
-    sqlx::query_as::<_, PublicSessionRow>(SESSION_SELECT_SQL)
-        .bind(org_id)
-        .bind(sandbox_id.as_uuid())
-        .bind(&session_id_string)
-        .fetch_optional(&mut **tx)
+    data_plane_session_store::live_session(&mut **tx, org_id, sandbox_id.into(), &session_id_string)
         .await
 }
 

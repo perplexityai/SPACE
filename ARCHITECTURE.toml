@@ -388,6 +388,7 @@ pplx-space-byok-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-data-plane-session-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
 ]
 pplx-space-direct-store = ["pplx-space-api"]

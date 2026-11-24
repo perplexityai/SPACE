@@ -3,9 +3,10 @@
 //!
 //! The API's admin gate writes a row with [`insert`] and its audit route
 //! lists them with [`list_newest`]. The cluster controller's retention loop
-//! caps the table with [`delete_beyond_newest`] and reports [`count`]. Its
-//! age-based delete compares `created_at` with the database clock and stays
-//! in that loop.
+//! deletes aged rows with [`delete_older_than`], caps the table with
+//! [`delete_beyond_newest`] and reports [`count`]. The age-based delete
+//! compares `created_at` with the database clock in its SQL, so it compares
+//! against the start of the transaction the caller runs it in.
 //!
 //! Every verb takes an executor, so a caller can run it in its own
 //! transaction.
@@ -154,6 +155,33 @@ pub async fn delete_beyond_newest(
           RETURNING e.id::TEXT"
     ))
     .bind(keep)
+    .bind(limit)
+    .fetch_all(executor)
+    .await?
+    .len())
+}
+
+/// Delete up to `limit` of the events created more than `retention_secs`
+/// before the database clock, oldest first, and return how many it deleted.
+pub async fn delete_older_than(
+    executor: impl sqlx::PgExecutor<'_>,
+    retention_secs: i64,
+    limit: i64,
+) -> Result<usize, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, String>(sql!(
+        "WITH candidates AS (
+                 SELECT id
+                   FROM admin_audit_events
+                  WHERE created_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
+                  ORDER BY created_at ASC, id ASC
+                  LIMIT $2
+             )
+             DELETE FROM admin_audit_events e
+              USING candidates c
+              WHERE e.id = c.id
+              RETURNING e.id::TEXT"
+    ))
+    .bind(retention_secs)
     .bind(limit)
     .fetch_all(executor)
     .await?
