@@ -1,16 +1,16 @@
 use super::*;
 use rusqlite::params;
 
-fn test_db() -> Arc<Mutex<Connection>> {
-    let mut conn = Connection::open_in_memory().unwrap();
-    crate::tests::initialize_schema(&mut conn);
+fn test_db() -> SharedConnection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::tests::initialize_schema(&conn);
 
     conn.execute(
         "INSERT INTO jobs (job_id, kind, payload) VALUES ('019d84bd-280d-7331-99c6-000000000001', ?1, '{}')",
         params![BUILD_JOB_KIND],
     )
     .unwrap();
-    Arc::new(Mutex::new(conn))
+    SharedConnection::new(database::Connection::from_raw(conn))
 }
 
 #[test]
@@ -45,7 +45,8 @@ fn stores_and_reads_build_result() {
     assert_eq!(stored.error, None);
 }
 
-fn insert_build_job(conn: &Connection, job_id: &str, subject_id: &str, status: &str) {
+fn insert_build_job(conn: &database::Connection, job_id: &str, subject_id: &str, status: &str) {
+    let conn = conn.raw();
     conn.execute(
         "INSERT INTO jobs (job_id, kind, payload, subject_id, status)
          VALUES (?1, ?2, '{}', ?3, ?4)",

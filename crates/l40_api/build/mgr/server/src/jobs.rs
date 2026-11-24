@@ -1,13 +1,13 @@
-use std::sync::{Arc, Mutex, MutexGuard};
-
+use pplx_space_accounts::JobId;
 use pplx_space_build_mgr::metrics::TemplateBuildResult;
 use pplx_space_build_mgr::{SystemPublicationGrantId, TemplateOrg, TenantPublicationGrantId};
 use pplx_space_build_mgr_client::proto::BuildState;
+use pplx_space_build_mgr_store::database::{self, ConnectionGuard, SharedConnection};
+use pplx_space_build_mgr_store::jobs::{Job, JobError};
 pub use pplx_space_build_mgr_store::{
     BUILD_JOB_KIND, BuildJobResult, BuildTerminalState, ParseBuildTerminalStateError,
     count_other_active_builds_for_subject, fail_expired_running_builds, get_build_result,
 };
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 // The job kind remains stable for queue accounting and scheduling. Nest the
@@ -23,18 +23,16 @@ pub enum VersionedBuildJobPayload {
 }
 
 pub fn decode_payload(
-    job: &pplx_space_common_jobs::Job,
+    job: &Job,
 ) -> Result<
     (
         BuildJobPayload,
         Option<pplx_space_execution_spec::EnvironmentReference>,
     ),
-    pplx_space_common_jobs::JobError,
+    JobError,
 > {
     if job.kind != BUILD_JOB_KIND {
-        return Err(pplx_space_common_jobs::JobError::permanent(
-            "unsupported build job kind",
-        ));
+        return Err(JobError::permanent("unsupported build job kind"));
     }
     // Dispatch on the envelope before decoding its body so malformed or future
     // envelopes cannot fall back to an ordinary build or erase the parse cause.
@@ -47,11 +45,11 @@ pub fn decode_payload(
     }
 }
 
-fn db_lock(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<MutexGuard<'_, Connection>> {
+fn db_lock(db: &SharedConnection) -> Result<ConnectionGuard<'_>, database::Error> {
     db.lock().map_err(|error| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        database::Error::to_sql_conversion(std::io::Error::other(format!(
             "build-manager db mutex poisoned: {error}"
-        ))))
+        )))
     })
 }
 
@@ -90,20 +88,20 @@ pub fn proto_build_state(state: BuildTerminalState) -> BuildState {
 }
 
 pub fn store_build_result(
-    db: &Arc<Mutex<Connection>>,
-    job_id: &pplx_space_common_jobs::JobId,
+    db: &SharedConnection,
+    job_id: &JobId,
     result: &BuildJobResult,
-) -> rusqlite::Result<()> {
+) -> Result<(), database::Error> {
     let conn = db_lock(db)?;
     pplx_space_build_mgr_store::upsert_build_result(&conn, job_id, result)
 }
 
 pub fn store_build_result_if_lease_owner(
-    db: &Arc<Mutex<Connection>>,
-    job_id: &pplx_space_common_jobs::JobId,
+    db: &SharedConnection,
+    job_id: &JobId,
     lease_owner: &str,
     result: &BuildJobResult,
-) -> rusqlite::Result<bool> {
+) -> Result<bool, database::Error> {
     let conn = db_lock(db)?;
     pplx_space_build_mgr_store::record_build_result_as_lease_owner(
         &conn,

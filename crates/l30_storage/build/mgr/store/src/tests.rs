@@ -14,7 +14,7 @@ fn terminal_state_round_trips_wire_string() {
 const JOB: &str = "019d84bd-280d-7331-99c6-000000000001";
 
 fn test_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
     let service = sqlx::migrate!("../../../../../db/build-manager");
     let common = sqlx::migrate!("../../../../../db/common");
     for migration in common
@@ -24,7 +24,7 @@ fn test_db() -> Connection {
     {
         conn.execute_batch(migration.sql.as_ref()).unwrap();
     }
-    conn
+    Connection(conn)
 }
 
 fn job_id(id: &str) -> JobId {
@@ -32,6 +32,7 @@ fn job_id(id: &str) -> JobId {
 }
 
 fn insert_build_job(conn: &Connection, job_id: &str, subject_id: &str, status: &str) {
+    let conn = &conn.0;
     conn.execute(
         "INSERT INTO jobs (job_id, kind, payload, subject_id, status)
          VALUES (?1, ?2, '{}', ?3, ?4)",
@@ -41,6 +42,7 @@ fn insert_build_job(conn: &Connection, job_id: &str, subject_id: &str, status: &
 }
 
 fn lease(conn: &Connection, job_id: &str, owner: Option<&str>, expires_in: Option<&str>) {
+    let conn = &conn.0;
     conn.execute(
         "UPDATE jobs
          SET lease_owner = ?2,
@@ -61,6 +63,7 @@ type JobRow = (
 );
 
 fn job_row(conn: &Connection, job_id: &str) -> JobRow {
+    let conn = &conn.0;
     conn.query_row(
         "SELECT status, error_kind, error, completed_at, lease_owner, lease_expires_at
          FROM jobs WHERE job_id = ?1",
@@ -196,12 +199,13 @@ fn expired_reaper_ignores_other_kinds_and_jobs_not_running() {
     let other_kind = "019d84bd-280d-7331-99c6-00000000000a";
     let finished = "019d84bd-280d-7331-99c6-00000000000b";
     let cancelling = "019d84bd-280d-7331-99c6-00000000000c";
-    conn.execute(
-        "INSERT INTO jobs (job_id, kind, payload, subject_id, status)
+    conn.0
+        .execute(
+            "INSERT INTO jobs (job_id, kind, payload, subject_id, status)
          VALUES (?1, 'other', '{}', 'tpl-a', 'running')",
-        params![other_kind],
-    )
-    .unwrap();
+            params![other_kind],
+        )
+        .unwrap();
     lease(&conn, other_kind, Some("dead-worker"), Some("-1 second"));
     insert_build_job(&conn, finished, "tpl-a", "completed");
     // Requesting cancellation leaves the lease in place.
