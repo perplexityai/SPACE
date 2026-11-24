@@ -2,6 +2,8 @@ use super::*;
 
 use std::borrow::Cow;
 use std::fmt;
+use std::num::NonZeroU32;
+use std::time::Duration;
 
 use sqlx::SqlSafeStr as _;
 use sqlx::error::{DatabaseError, ErrorKind};
@@ -63,6 +65,28 @@ fn test_migrator(no_tx: bool) -> Migrator {
         Cow::Borrowed("probe"),
         MigrationType::Simple,
         "SELECT 1".into_sql_str(),
+        no_tx,
+    )])
+}
+
+/// Millisecond-scale schedule so a test spans the same number of attempts a
+/// real deploy would, in a fraction of the wall clock. The window is left
+/// wide so the attempt budget is always what binds here.
+fn fast_policy(attempts: u32) -> LockRetryPolicy {
+    LockRetryPolicy {
+        attempts: NonZeroU32::new(attempts).expect("test attempt budget is non-zero"),
+        initial_backoff: Duration::from_millis(100),
+        max_backoff: Duration::from_millis(200),
+        max_total_wait: Duration::from_secs(60),
+    }
+}
+
+fn probe_migrator(sql: String, no_tx: bool) -> Migrator {
+    Migrator::with_migrations(vec![Migration::new(
+        PROBE_VERSION,
+        Cow::Borrowed("probe"),
+        MigrationType::Simple,
+        sqlx::AssertSqlSafe(sql).into_sql_str(),
         no_tx,
     )])
 }
@@ -443,4 +467,5 @@ fn the_window_is_what_keeps_retrying_a_small_slice_of_the_job_deadline() {
     );
 }
 
+mod postgres_invalid_index_tests;
 mod postgres_lock_retry_tests;
