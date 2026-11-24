@@ -59,3 +59,16 @@ fn selectors_count_sandboxes_not_retiring_execution_leases() {
         sandbox
     );
 }
+
+#[test]
+fn grow_rootfs_summary_reports_sizes_and_the_guest_step() {
+    let summary = grow_rootfs_summary(
+        "019d84bd-280d-7331-99c6-b63312345678",
+        &GrowSandboxRootfsResponse {
+            previous_bytes: 20_480 * 1024 * 1024,
+            rootfs_bytes: 30_720 * 1024 * 1024,
+        },
+    );
+    assert!(summary.contains("from 20480 MiB to 30720 MiB"), "{summary}");
+    assert!(summary.contains("sudo resize2fs /dev/vda"), "{summary}");
+}
