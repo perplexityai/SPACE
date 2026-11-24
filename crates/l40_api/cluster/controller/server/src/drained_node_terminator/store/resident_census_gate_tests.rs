@@ -20,10 +20,9 @@ use pplx_space_sandbox_residency::{CENSUS_INVENTORY_MAX_AGE, CENSUS_PLACEMENT_SE
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
-use super::{
-    PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence, delete_refusal_diagnostics_query,
-    mark_terminating_query,
-};
+use pplx_space_node_registration_store::orphan_reap_refusal;
+
+use super::{PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence, mark_terminating_query};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -240,14 +239,16 @@ async fn refusal_diagnostics_count_residents_through_the_same_predicate() -> Tes
     let node_id = insert_drained_node(pool, true).await?;
     insert_started_sandbox(pool, node_id).await?;
 
-    let query = delete_refusal_diagnostics_query(ResidencyEvidence::NodeCensusAware);
-    let (_, _, _, active_residents): (bool, bool, i64, i64) =
-        sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node_id)
-            .bind(Option::<String>::None)
-            .bind(SubstrateKind::Kubernetes)
-            .fetch_one(pool)
-            .await?;
+    let orphan_reap_refusal::OrphanReapRefusal {
+        active_residents, ..
+    } = orphan_reap_refusal::diagnose(
+        pool,
+        node_id,
+        None,
+        SubstrateKind::Kubernetes,
+        ResidencyEvidence::NodeCensusAware,
+    )
+    .await?;
     assert_eq!(
         active_residents, 0,
         "the diagnosis must discount the same rows the guard does"

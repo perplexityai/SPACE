@@ -5,8 +5,9 @@
 //! environments, so every reader asks the same question;
 //! [`upsert_from_publish`], the internal API's write from a node-state
 //! publication; [`create_failure`], the Direct substrate's write after a
-//! create on a worker failed; and [`status_summaries`], the admin node
-//! inventory's read.
+//! create on a worker failed; [`status_summaries`], the admin node
+//! inventory's read; and [`backup_inventory`], whether a node's pending
+//! backup report is fresh enough for node drain to believe.
 
 use std::fmt;
 use std::str::FromStr;
@@ -17,6 +18,7 @@ use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 use time::OffsetDateTime;
 
+pub mod backup_inventory;
 pub mod create_failure;
 
 #[cfg(test)]

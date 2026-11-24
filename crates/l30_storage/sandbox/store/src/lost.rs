@@ -1,6 +1,6 @@
-//! Guarded writes for sandboxes given up as lost because the node holding
-//! their only copy is gone, and the scan that finds the `started` ones
-//! ([`started_lost_candidates`]).
+//! Guarded writes, and the give-up's candidate lock, for sandboxes given up
+//! as lost because the node holding their only copy is gone, and the scan
+//! that finds the `started` ones ([`started_lost_candidates`]).
 
 use pplx_space_accounts::NodeId;
 use pplx_space_node_model::SubstrateKind;
@@ -343,6 +343,54 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
     )
 }
 
+/// `$1` = node id. Built once: the fragment is
+/// [`snapshot_durable_for_source_release`] over a fixed alias.
+///
+/// The durability check is wrapped in a scalar subquery, `NOT (SELECT …)`: a
+/// bare `NOT EXISTS` is pullable, and the planner may realise it as a hash or
+/// merge anti-join over the whole `snapshots` ⋈ `snapshot_storage_locations`
+/// product. Inside a scalar subquery it stays a per-row `SubPlan`, whose
+/// `sn.sandbox_id = s.id` makes each execution an index probe. `FOR UPDATE`
+/// locks the rows of its own `FROM` list only, so it locks `sandboxes` rows and
+/// nothing else: the durability check is a sublink.
+static LOCK_UNRECOVERABLE_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+    let durable = snapshot_durable_for_source_release("s");
+    sql!(format!(
+        "SELECT s.id
+           FROM sandboxes s
+          WHERE s.lifecycle = 'suspended'
+            AND s.target_node_id = $1
+            AND NOT (SELECT {durable})
+          ORDER BY s.id
+          FOR UPDATE"
+    ))
+});
+
+/// Lock the `suspended` sandboxes pinned to `node_id` that have no durable
+/// copy, in `id` order, and return their ids: the drained-node terminator's
+/// gone-node give-up claim, taken before [`mark_unrecoverable_sandboxes_lost`]
+/// so the flip can act only on rows it claimed.
+///
+/// It claims only rows without a durable copy, because those are the only rows
+/// [`mark_unrecoverable_sandboxes_lost`] can flip: the flip re-checks
+/// `AND NOT {durable}` on the claimed ids. A row that loses durability after
+/// the claim isn't claimed this tick; it still blocks the reap through the
+/// drain-gate blockers, so the next tick's give-up claims it.
+///
+/// The `FOR UPDATE` row locks last until the caller's transaction ends. They
+/// conflict with the `KEY SHARE` foreign-key lock a concurrent artifact backup
+/// insert takes on the sandbox row, which the flip's own `NO KEY UPDATE` lock
+/// does not.
+pub async fn lock_unrecoverable_candidates(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(LOCK_UNRECOVERABLE_CANDIDATES.as_str()))
+        .bind(node_id)
+        .fetch_all(&mut **tx)
+        .await
+}
+
 /// Fail the `claimed` `suspended` sandboxes pinned to a drained, gone node that
 /// have no recoverable copy anywhere ([`mark_unrecoverable_sandboxes_lost_query`]),
 /// returning the ids it flipped. `expected_uid` is the `node_k8s.k8s_node_uid`
@@ -351,8 +399,8 @@ pub fn mark_unrecoverable_sandboxes_lost_query() -> String {
 ///
 /// Writes an **inference**: the terminator's give-up on the cloud provider's
 /// verdict. Its node guards are snapshot reads, so it runs only in the
-/// transaction that claimed `claimed` and locked the `nodes` and `node_k8s`
-/// rows.
+/// transaction that claimed `claimed` ([`lock_unrecoverable_candidates`]) and
+/// locked the `nodes` and `node_k8s` rows.
 pub async fn mark_unrecoverable_sandboxes_lost(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
@@ -370,6 +418,9 @@ pub async fn mark_unrecoverable_sandboxes_lost(
         .fetch_all(&mut **tx)
         .await
 }
+
+#[cfg(test)]
+mod giveup_claim_tests;
 
 #[cfg(test)]
 mod tests;

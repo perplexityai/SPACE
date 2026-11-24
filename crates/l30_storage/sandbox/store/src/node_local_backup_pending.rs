@@ -8,14 +8,16 @@
 //! and [`crate::lost::write_off_lost_sandboxes`] removes a gone node's rows.
 //! Both deletes carry their durability proof from
 //! `pplx-space-sandbox-portability` rather than spelling it here, so the
-//! drain that reads the queue agrees with them on what "durable" means.
+//! drain that reads the queue agrees with them on what "durable" means. That
+//! read is [`queued_candidates`]: a node's rows that still owe a backup.
 
 use std::sync::LazyLock;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_portability::{
-    artifact_has_durable_copy, queued_artifact_recoverable_without_node,
+    artifact_has_durable_copy, inflight_suspend_upload_exists,
+    queued_artifact_recoverable_without_node, snapshot_durable_for_source_release,
 };
 use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
 use pplx_space_sql_locator::sql;
@@ -180,6 +182,88 @@ pub async fn delete_finalized(
         .rows_affected()
         > 0;
     Ok(removed)
+}
+
+/// The `LIMIT` both [`queued_candidates`] statements carry, spelled into their
+/// text as a literal so the planner's `tuple_fraction` bias survives
+/// `plan_cache_mode = force_generic_plan`. The same page as
+/// [`crate::pinned_local_only::PAGE_LIMIT`].
+pub const QUEUED_CANDIDATES_LIMIT: usize = 513;
+
+/// One queued row of a node that still owes a durable backup, with the
+/// artifact the node reported. `artifact_kind` is the stored text, for the
+/// caller to parse.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct QueuedBackupCandidate {
+    pub sandbox_id: SandboxId,
+    pub artifact_id: LocalArtifactId,
+    pub artifact_kind: String,
+}
+
+/// `$1` = node id. Every row is re-checked against the same two fragments
+/// [`crate::pinned_local_only::page`] applies, over `sandboxes s` rather than
+/// the queue row, so this read can only narrow that one. Both `q.node_id` and
+/// `s.target_node_id` are matched, for the same reason. The durability probe
+/// stays inside a scalar subquery, as there.
+/// Why the queue only narrows and both node columns are matched is argued on
+/// `list_pinned_local_candidates` in `pplx-space-cluster-controller-server`'s
+/// `node_drain/store.rs`.
+static QUEUED_CANDIDATES: LazyLock<String> = LazyLock::new(|| {
+    let snapshot_exists = snapshot_durable_for_source_release("s");
+    let inflight_upload = inflight_suspend_upload_exists("s");
+    sql!(format!(
+        "SELECT q.sandbox_id, q.artifact_id, q.artifact_kind
+           FROM node_local_backup_pending q
+           JOIN sandboxes s ON s.id = q.sandbox_id
+          WHERE q.node_id = $1
+            AND s.target_node_id = $1
+            AND q.artifact_kind = 'full'
+            AND s.lifecycle = 'suspended'
+            AND NOT (SELECT {snapshot_exists})
+            AND NOT {inflight_upload}
+          LIMIT 513"
+    ))
+});
+
+/// [`QUEUED_CANDIDATES`] without the rows whose sandbox's
+/// `current_local_artifact_id` is NULL.
+static QUEUED_CANDIDATES_EXCLUDING_LEGACY_ROWS: LazyLock<String> = LazyLock::new(|| {
+    let snapshot_exists = snapshot_durable_for_source_release("s");
+    let inflight_upload = inflight_suspend_upload_exists("s");
+    sql!(format!(
+        "SELECT q.sandbox_id, q.artifact_id, q.artifact_kind
+           FROM node_local_backup_pending q
+           JOIN sandboxes s ON s.id = q.sandbox_id
+          WHERE q.node_id = $1
+            AND s.target_node_id = $1
+            AND q.artifact_kind = 'full'
+            AND s.lifecycle = 'suspended'
+            AND NOT (SELECT {snapshot_exists})
+            AND NOT {inflight_upload}
+            AND s.current_local_artifact_id IS NOT NULL
+          LIMIT 513"
+    ))
+});
+
+/// Up to [`QUEUED_CANDIDATES_LIMIT`] of `node_id`'s queued `full` rows whose
+/// sandbox is still `suspended`, pinned to `node_id`, without a durable copy
+/// and without an upload in flight, in no particular order. With
+/// `exclude_legacy_rows`, only rows whose sandbox names its current local
+/// artifact. A read; it takes no lock.
+pub async fn queued_candidates(
+    executor: impl PgExecutor<'_>,
+    node_id: NodeId,
+    exclude_legacy_rows: bool,
+) -> Result<Vec<QueuedBackupCandidate>, sqlx::Error> {
+    let statement = if exclude_legacy_rows {
+        QUEUED_CANDIDATES_EXCLUDING_LEGACY_ROWS.as_str()
+    } else {
+        QUEUED_CANDIDATES.as_str()
+    };
+    sqlx::query_as(sqlx::AssertSqlSafe(statement))
+        .bind(node_id)
+        .fetch_all(executor)
+        .await
 }
 
 #[cfg(test)]

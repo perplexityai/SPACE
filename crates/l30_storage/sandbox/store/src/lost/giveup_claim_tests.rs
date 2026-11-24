@@ -1,8 +1,8 @@
-//! Plan regression for [`gone_node_giveup_claim_query`] on a node whose
+//! Plan regression for [`lock_unrecoverable_candidates`] on a node whose
 //! pinned history is large and almost entirely durable.
 //!
-//! The behavioural tests in `inflight_upload_terminate_gate_tests` cover which
-//! rows the give-up claims and flips, over a handful of sandboxes. They can't
+//! The cluster controller's drained-node terminator tests cover which rows the
+//! give-up claims and flips, over a handful of sandboxes. They can't
 //! see how the claim's durability check is planned, and that check now runs
 //! over the node's whole pinned `suspended` history to find the few rows
 //! without a durable copy.
@@ -12,7 +12,8 @@ use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::gone_node_giveup_claim_query;
+use super::{LOCK_UNRECOVERABLE_CANDIDATES, lock_unrecoverable_candidates};
+use pplx_space_accounts::NodeId;
 
 use pplx_space_test_env::TestResult;
 
@@ -129,11 +130,13 @@ async fn the_claim_keeps_its_durability_check_fenced() -> TestResult {
     .execute(pool)
     .await?;
 
-    let claim = gone_node_giveup_claim_query();
-    let claimed = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql!(claim.as_str())))
-        .bind(node)
-        .fetch_all(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    let claimed: Vec<Uuid> = lock_unrecoverable_candidates(&mut tx, NodeId::from_uuid(node))
+        .await?
+        .into_iter()
+        .map(|id| id.as_uuid())
+        .collect();
+    tx.rollback().await?;
     assert_eq!(
         claimed, casualty,
         "the claim must return exactly the node's one row without a durable copy; \
@@ -142,7 +145,10 @@ async fn the_claim_keeps_its_durability_check_fenced() -> TestResult {
 
     // Not `ANALYZE`: only the plan's shape is read, and the claim already ran
     // above.
-    let statement = format!("EXPLAIN (FORMAT JSON) {claim}");
+    let statement = format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        LOCK_UNRECOVERABLE_CANDIDATES.as_str()
+    );
     let raw: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(statement.as_str())))
         .bind(node)
         .fetch_one(pool)

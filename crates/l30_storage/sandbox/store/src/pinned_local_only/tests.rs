@@ -1,7 +1,7 @@
-//! Scale regression for [`pinned_local_only_sandboxes_query`].
+//! Scale regression for [`page`].
 //!
-//! The behavioural tests in `durable_upload_gate_tests` cover which rows the
-//! query returns, over fixtures of a handful of sandboxes. They cannot see the
+//! The cluster controller's node drain tests cover which rows the query
+//! returns, over fixtures of a handful of sandboxes. They cannot see the
 //! cost of scanning a node's lifetime history. `target_node_id` is a placement
 //! diagnostic that suspend never clears, so a long-lived node accumulates
 //! every sandbox ever suspended from it. A slow blocker query can exhaust the
@@ -16,9 +16,9 @@
 //!    `sn.timestamp >= s.placement_changed_at`, so it cannot become a hashed
 //!    subplan either: it re-executed once per outer row, rescanning every
 //!    `state='creating'` full snapshot in the cluster each time.
-//!    [`inflight_suspend_upload_exists`] now nests both branches inside one
-//!    correlated `EXISTS`, which is logically identical and reachable as an
-//!    anti-join. [`pathological_predicate_reexecutes_per_row_but_merged_does_not`]
+//!    `pplx_space_sandbox_portability::inflight_suspend_upload_exists` now
+//!    nests both branches inside one correlated `EXISTS`, which is logically
+//!    identical and reachable as an anti-join. [`pathological_predicate_reexecutes_per_row_but_merged_does_not`]
 //!    asserts on the re-execution count directly.
 //!
 //! 2. Without a `LIMIT` the planner priced the durability `NOT EXISTS` as a
@@ -27,11 +27,14 @@
 //!    the cap that gives the planner a `tuple_fraction` instead, together with
 //!    the property that capping does not change *which* rows are eligible.
 
+use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_portability::snapshot_durable_for_source_release;
+use pplx_space_sql_locator::sql;
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::*;
+use super::{PAGE_LIMIT, page, page_statement};
 
 use pplx_space_test_env::TestResult;
 
@@ -320,12 +323,7 @@ async fn pathological_predicate_reexecutes_per_row_but_merged_does_not() -> Test
          for {pinned_rows} pinned rows; plan was {pathological:?}"
     );
 
-    let merged = explain(
-        pool,
-        &pinned_local_only_sandboxes_query(false, PINNED_LOCAL_ONLY_ENUMERATION_CAP),
-        node,
-    )
-    .await?;
+    let merged = explain(pool, page_statement(false), node).await?;
     let merged_executions = merged.inflight_scan_executions();
     assert!(
         merged_executions < pinned_rows,
@@ -349,12 +347,11 @@ async fn enumeration_is_capped_and_still_finds_non_durable_rows() -> TestResult 
     let node = Uuid::now_v7();
     let expected = seed_node_with_history(pool, node).await?;
 
-    let pinned = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql!(
-        pinned_local_only_sandboxes_query(false, PINNED_LOCAL_ONLY_ENUMERATION_CAP)
-    )))
-    .bind(node)
-    .fetch_all(pool)
-    .await?;
+    let pinned: Vec<Uuid> = page(pool, NodeId::from_uuid(node), false)
+        .await?
+        .into_iter()
+        .map(|id| id.as_uuid())
+        .collect();
 
     let mut got = pinned.clone();
     got.sort();
@@ -368,17 +365,23 @@ async fn enumeration_is_capped_and_still_finds_non_durable_rows() -> TestResult 
 
     // The cap is a page size, not a filter: shrinking it truncates the page
     // and leaves eligibility untouched, so the short page is a prefix of the
-    // full answer rather than a different set.
-    let short_cap = NonZeroUsize::new(GENUINE_WORK - 3).unwrap();
-    let short_page = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql!(
-        pinned_local_only_sandboxes_query(false, short_cap)
-    )))
-    .bind(node)
-    .fetch_all(pool)
-    .await?;
+    // full answer rather than a different set. The statement carries its
+    // limit as a literal, so the short page is the production statement with
+    // only that literal lowered.
+    let short_cap = GENUINE_WORK - 3;
+    let full_limit = format!("LIMIT {PAGE_LIMIT}");
+    assert!(
+        page_statement(false).ends_with(&full_limit),
+        "the page must end in its literal `{full_limit}`"
+    );
+    let short_statement = page_statement(false).replace(&full_limit, &format!("LIMIT {short_cap}"));
+    let short_page = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(short_statement))
+        .bind(node)
+        .fetch_all(pool)
+        .await?;
     assert_eq!(
         short_page.len(),
-        short_cap.get(),
+        short_cap,
         "a cap below the backlog must fill exactly one page; got {short_page:?}"
     );
     for id in &short_page {
@@ -414,12 +417,7 @@ async fn durability_check_stays_an_unpullable_subquery() -> TestResult {
     let node = Uuid::now_v7();
     seed_node_with_history(pool, node).await?;
 
-    let plan = explain(
-        pool,
-        &pinned_local_only_sandboxes_query(false, PINNED_LOCAL_ONLY_ENUMERATION_CAP),
-        node,
-    )
-    .await?;
+    let plan = explain(pool, page_statement(false), node).await?;
 
     assert!(
         plan.durability_probe_is_fenced(),

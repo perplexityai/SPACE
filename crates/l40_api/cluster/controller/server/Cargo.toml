@@ -96,6 +96,7 @@ pplx-space-postgres-pool = { workspace = true }
 pplx-space-sandbox-quarantine-store = { workspace = true }
 pplx-space-sandbox-residency = { workspace = true }
 pplx-space-node-registration-store = { workspace = true }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-snapshot-storage = { workspace = true, features = ["s3"] }

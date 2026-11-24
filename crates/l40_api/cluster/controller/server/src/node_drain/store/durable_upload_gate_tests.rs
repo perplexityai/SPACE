@@ -4,7 +4,7 @@ use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
 use uuid::Uuid;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
-use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
+use pplx_space_sandbox_portability::{fresh_ready_snapshot_exists, latest_full_snapshot_ready};
 use pplx_space_sandbox_store::drain::{
     abandon_stale_resident_sandboxes_query, adopt_remote_snapshot_for_drain_query,
     adopt_remote_snapshot_on_gone_node_query, fail_resident_sandboxes_on_gone_node_query,
@@ -103,21 +103,11 @@ async fn insert_aged_creating_snapshot(
 }
 
 async fn pinned_local_only(pool: &PgPool, node_id: NodeId) -> TestResult<Vec<SandboxId>> {
-    Ok(sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
-        pinned_local_only_sandboxes_query(false, PINNED_LOCAL_ONLY_ENUMERATION_CAP)
-    )))
-    .bind(node_id)
-    .fetch_all(pool)
-    .await?)
+    Ok(sandbox_store::pinned_local_only::page(pool, node_id, false).await?)
 }
 
 async fn drain_blocking_count(pool: &PgPool, node_id: NodeId) -> TestResult<i64> {
-    Ok(
-        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql!(drain_blocking_sandboxes_query())))
-            .bind(node_id)
-            .fetch_one(pool)
-            .await?,
-    )
+    Ok(sandbox_store::drain_gate_blockers::count_on_node(pool, node_id).await?)
 }
 
 async fn lifecycle_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<String> {
@@ -669,11 +659,11 @@ async fn restore_pending_with(
     honor_backoff_windows: bool,
 ) -> TestResult<Vec<(SandboxId, String)>> {
     Ok(
-        sqlx::query_as::<_, (SandboxId, String)>(sqlx::AssertSqlSafe(sql!(
-            restore_pending_evacuations_query(honor_backoff_windows),
-        )))
-        .fetch_all(pool)
-        .await?,
+        sandbox_store::evacuation_restores::pending(pool, honor_backoff_windows)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, row.evacuation_restore_target))
+            .collect(),
     )
 }
 
@@ -2493,13 +2483,12 @@ async fn fail_inflight_snapshots(
     node: NodeId,
     expected_uid: Option<&str>,
 ) -> TestResult<u64> {
-    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(
-        fail_inflight_snapshots_on_gone_node_query(),
-    )))
-    .bind(node)
-    .bind(expected_uid)
-    .bind(GONE_NODE_UPLOAD_FAILURE_REASON)
-    .fetch_all(pool)
+    let rows = snapshot_lost::fail_inflight_uploads_from_gone_node(
+        pool,
+        node,
+        expected_uid,
+        GONE_NODE_UPLOAD_FAILURE_REASON,
+    )
     .await?;
     Ok(rows.len() as u64)
 }

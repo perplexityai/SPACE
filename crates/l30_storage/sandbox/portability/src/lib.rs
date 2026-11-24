@@ -715,7 +715,7 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 /// When the newest full snapshot is `failed` (the current evacuation upload
 /// failed), this makes [`latest_full_snapshot_ready`] false, so the sandbox is
 /// not restore-pending and keeps blocking source release. It does **not**
-/// wedge: the node-drain reupload queue (`pinned_local_only_sandboxes_query`)
+/// wedge: the node-drain reupload queue (`pplx_space_sandbox_store::pinned_local_only::page`)
 /// uses [`snapshot_durable_for_source_release`] — also marker-aware — so a
 /// marked sandbox whose newest snapshot is `failed` is enumerated, reuploaded
 /// from the on-disk artifacts (still present, since the source can't terminate

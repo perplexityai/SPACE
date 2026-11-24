@@ -732,7 +732,7 @@ pub(super) enum RestoreClaim {
     /// node outside the evacuation claim's window. Left `restoring` with the
     /// marker, it stays inside that window, and the claim's next call takes it
     /// as `RedroveRestoring`; the drain's restore sweep lists such a row
-    /// (the stopped arm of `restore_pending_evacuations_query` admits
+    /// (the stopped arm of `pplx_space_sandbox_store::evacuation_restores::pending` admits
     /// `restoring`). Its restore plan resolves the disk artifact for that
     /// `restoring` row through `selected_stopped_evacuation_restore_source`,
     /// since `selected_stopped_restore_storage_uri` serves only `lifecycle =

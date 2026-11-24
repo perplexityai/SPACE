@@ -6,9 +6,8 @@
 //! drain itself: for one row of every stored lifecycle, in every placement,
 //! reported by its node's census or not, under both evidence modes, the rows
 //! tagged `resident`, `drain_blocker` and `active_resident` are exactly as
-//! many as [`resident_sandbox_counts_query`]'s `occupying`,
-//! [`drain_blocking_sandboxes_query`]'s count and the summed
-//! [`termination_blocking_residents_query`], each run through the sink that
+//! many as the resident scan's `occupying`, the drain-gate blocker count and
+//! the summed termination-blocking count, each run through the sink that
 //! runs it in production. A drift in any of those statements that changes how
 //! lifecycle, placement or the census count fails here. The sweep seeds no
 //! snapshot or evacuation marker; the API agreement test covers those states

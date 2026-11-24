@@ -614,7 +614,7 @@ static GROUP_OCCUPANCY: LazyLock<String> = LazyLock::new(|| {
                     -- node via target_node_id while active_node_id is still
                     -- NULL (begin_restore_lifecycle clears active_node_id but
                     -- leaves target_node_id on the source). Mirror the
-                    -- node-drain blocker (drain_blocking_sandboxes_query):
+                    -- node-drain blocker (drain_gate_blockers::count_on_node):
                     -- `suspending` always occupies; `restoring` occupies for
                     -- non-evacuation restores.
                     OR (
@@ -1014,7 +1014,7 @@ pub fn pinned_local_only_sandboxes_statement_with_limit(limit: NonZeroUsize) -> 
 ///
 /// Excludes sandboxes whose durable upload is already in flight from any node
 /// (`NOT inflight_suspend_upload_exists`), mirroring the node-drain reupload
-/// queue (`node_drain::store::pinned_local_only_sandboxes_query`):
+/// queue (`pinned_local_only::page`):
 /// force-reuploading a sandbox
 /// whose original upload is still `creating` is redundant and racy, and a
 /// resulting newer `failed` snapshot would make `latest_full_snapshot_ready`
