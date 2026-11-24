@@ -2,12 +2,11 @@
 //! (`/sys/fs/cgroup/space`), which holds every sandbox's VM and sidecar
 //! cgroups and carries the node's aggregate sandbox `memory.max`.
 
-use pplx_space_metrics_emit::{gauge, tag};
+use pplx_space_metrics_emit::{counter, gauge, tag};
 use pplx_space_node_runtime_core::cgroup_memory::CgroupMemoryState;
 
 /// One reading of the parent cgroup. Byte gauges the kernel does not report
-/// are skipped, as is `max_bytes` when the parent is unlimited. `events` is
-/// the cumulative `memory.events` count per `event`, a monotonic gauge.
+/// are skipped, as is `max_bytes` when the parent is unlimited.
 pub fn space_cgroup(state: &CgroupMemoryState) {
     let bytes = |name: &str, value: Option<u64>| {
         if let Some(value) = value {
@@ -29,21 +28,6 @@ pub fn space_cgroup(state: &CgroupMemoryState) {
         stat.sec_pagetables,
     );
     bytes("node_memory.space_cgroup.shmem_bytes", stat.shmem);
-    let events = &state.events;
-    for (event, count) in [
-        ("low", events.low),
-        ("high", events.high),
-        ("max", events.max),
-        ("oom", events.oom),
-        ("oom_kill", events.oom_kill),
-        ("oom_group_kill", events.oom_group_kill),
-    ] {
-        gauge(
-            "node_memory.space_cgroup.events",
-            count as f64,
-            &[tag("event", event)],
-        );
-    }
     if let Some(pressure) = state.pressure {
         gauge(
             "node_memory.space_cgroup.psi_some_avg10",
@@ -56,6 +40,17 @@ pub fn space_cgroup(state: &CgroupMemoryState) {
             &[],
         );
     }
+}
+
+/// New `memory.events` occurrences in the parent since the previous reading,
+/// counted per `event` (`low`, `high`, `max`, `oom`, `oom_kill`,
+/// `oom_group_kill`).
+pub fn space_cgroup_events(event: &'static str, count: u64) {
+    counter(
+        "node_memory.space_cgroup.events",
+        count,
+        &[tag("event", event)],
+    );
 }
 
 /// Whether the last parent cgroup read succeeded, so a stale byte gauge is
