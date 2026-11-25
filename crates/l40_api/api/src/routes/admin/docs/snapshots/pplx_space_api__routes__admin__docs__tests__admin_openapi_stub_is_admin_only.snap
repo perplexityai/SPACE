@@ -31,6 +31,9 @@ expression: paths_by_method
     "get",
     "patch"
   ],
+  "/nodes/{node_id}/drain-v2-preview": [
+    "get"
+  ],
   "/nodes/{node_id}/health": [
     "get"
   ],
