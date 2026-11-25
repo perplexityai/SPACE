@@ -202,16 +202,20 @@ async fn receipt_defers_while_publication_holds_observation_then_retries() -> Te
     publish_sandbox_states(&mut seed, node_id, std::slice::from_ref(&state)).await?;
     seed.commit().await?;
 
-    // Pause publication after it writes the observation, before it updates
-    // the sandbox clocks. The old receipt path can then claim the sandbox
-    // row and wait on this same gate while reading snapshot evidence.
+    // Pause publication after it takes the shared observation lock, at its
+    // first facet write, before it locks or writes the observation row. Only
+    // the advisory lock can then defer the receipt: without it, the receipt
+    // claims the observation and sandbox rows and waits on this same gate
+    // while deleting the sandbox's facet rows.
     let mut gate = db.pool.begin().await?;
     let gate_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
         .fetch_one(&mut *gate)
         .await?;
-    sqlx::query(sql!("LOCK TABLE snapshots IN ACCESS EXCLUSIVE MODE"))
-        .execute(&mut *gate)
-        .await?;
+    sqlx::query(sql!(
+        "LOCK TABLE node_facet_observed_status IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(&mut *gate)
+    .await?;
     let monitor_pool = &db.pool;
     let wait_at_gate = |count| async move {
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -295,12 +299,14 @@ async fn receipt_defers_while_publication_holds_observation_then_retries() -> Te
 #[case::explicit_absent(false)]
 #[case::complete_inventory_omission(true)]
 #[tokio::test(flavor = "current_thread")]
-async fn receipt_serializes_with_nonpresent_publication(#[case] omitted: bool) -> TestResult {
+async fn receipt_serializes_with_absence_writes_outside_the_advisory_lock(
+    #[case] omitted: bool,
+) -> TestResult {
     use std::time::Duration;
 
-    use crate::proto::{
-        PublishNodeStateRequest, PublishedSandboxState, cluster_api_server::ClusterApi,
-    };
+    use pplx_space_state_reconciliation::FACET_NETWORK_POLICY;
+
+    use crate::proto::PublishedSandboxState;
     use crate::published_state::publish_sandbox_states;
 
     let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
@@ -322,14 +328,14 @@ async fn receipt_serializes_with_nonpresent_publication(#[case] omitted: bool) -
     .bind(sandbox_id)
     .execute(&db.pool)
     .await?;
-    let mut state = PublishedSandboxState {
+    let state = PublishedSandboxState {
         sandbox_id: sandbox_id.to_string(),
         status: Some("stopped".to_owned()),
         present: true,
         ..Default::default()
     };
     let mut seed = db.pool.begin().await?;
-    publish_sandbox_states(&mut seed, node_id, std::slice::from_ref(&state)).await?;
+    publish_sandbox_states(&mut seed, node_id, &[state]).await?;
     if omitted {
         // Make the prune visit its removed-observation CTE before marking the sandbox.
         sqlx::query(sql!(
@@ -385,22 +391,37 @@ async fn receipt_serializes_with_nonpresent_publication(#[case] omitted: bool) -
     });
     let receipt_pid = wait_for_blocked(gate_pid).await?;
 
-    state.present = false;
+    // Publication's absence writes, explicit or census, without the shared
+    // advisory lock publication takes first. Only the receipt's observation
+    // row lock can then keep these writers from deleting the observation
+    // before waiting on the sandbox row the receipt holds.
     let pool = db.pool.clone();
     let publishing = tokio::spawn(async move {
-        let mut request = tonic::Request::new(PublishNodeStateRequest {
-            node_id: node_id.to_string(),
-            sandboxes: if omitted { vec![] } else { vec![state] },
-            sandbox_inventory_complete: omitted,
-            ..Default::default()
-        });
-        request
-            .extensions_mut()
-            .insert(tonic::transport::server::TcpConnectInfo {
-                local_addr: None,
-                remote_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 49000))),
-            });
-        ClusterApi::publish_node_state(&crate::ClusterApiService::new(pool), request).await
+        let mut tx = pool.begin().await?;
+        if omitted {
+            pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes(
+                &mut *tx,
+                node_id,
+                &[sandbox_id],
+                FACET_NETWORK_POLICY,
+            )
+            .await?;
+        } else {
+            pplx_space_sandbox_teardown::observed_states::delete_absent_on_node(
+                &mut *tx,
+                node_id,
+                &[sandbox_id],
+            )
+            .await?;
+            pplx_space_sandbox_store::ingest::delete_published_absent_stopped(
+                &mut *tx,
+                node_id,
+                &[sandbox_id],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        TestResult::Ok(())
     });
     wait_for_blocked(receipt_pid).await?;
     gate.commit().await?;
