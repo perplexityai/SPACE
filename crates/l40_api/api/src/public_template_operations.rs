@@ -8,6 +8,7 @@ use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicErrorDetail, PublicOperationResult,
     PublicTemplateOperationResult,
 };
+use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
 use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
@@ -18,7 +19,7 @@ use crate::{
     public_sandbox_operations::PublicOperationExecutionResult,
     reconcile_queue::{
         NetworkPolicyTarget, ReconcileElementRef, ReconcileRef,
-        delete_reconcile_state_for_elements, enqueue_node_reconcile_refs_for_nodes,
+        enqueue_node_reconcile_refs_for_nodes,
     },
     reconcile_trigger::enqueue_triggers,
 };

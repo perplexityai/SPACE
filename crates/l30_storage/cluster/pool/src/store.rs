@@ -20,11 +20,11 @@ use crate::{
     FailedAutoscaleCandidate, InvalidAutoscaleRow, ManualPoolConfigSpec, NewPoolSlot,
     OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError,
     PoolReservation, PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease,
-    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TEMPLATE_USAGE_SANDBOX_ID_LIMIT,
-    TemplateWarmPoolUsage, WarmPoolConfigRef, WarmPoolPolicyShape,
+    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TemplateWarmPoolUsage,
+    WarmPoolConfigRef, WarmPoolPolicyShape,
     models::{
-        PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
-        vcpu_to_i32,
+        PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease,
+        TEMPLATE_USAGE_SANDBOX_ID_LIMIT, memory_to_mib_i32, vcpu_to_i32,
     },
     rows::{
         ClaimedPoolSlotRow, PoolConfigRow, PoolObservedDemandRow, PoolPolicyReleaseRow,
