@@ -201,18 +201,22 @@ impl ClusterApiService {
         // Consumed with the release it authorizes: a rolled-back publication
         // keeps its grant, and a committed one cannot be repeated.
         if let Some(grant) = system_grant
-            && !template_system_publication_grants::consume(&mut *tx, &template_name, grant)
-                .await
-                .map_err(|err| {
-                    template_publication::storage_status("consume system publication", err.as_sql())
-                })?
+            && !pplx_space_template_store::publication_grants::consume_system(
+                &mut *tx,
+                &template_name,
+                grant,
+            )
+            .await
+            .map_err(|err| {
+                template_publication::storage_status("consume system publication", &err)
+            })?
         {
             return Err(template_publication::missing_system_publication_grant());
         }
         if let (Some(grant), TemplateOrg::Owned { org_id }) = (tenant_grant, template_org)
-            && !template_tenant_publication_grants::consume(
+            && !pplx_space_template_store::publication_grants::consume_tenant(
                 &mut *tx,
-                &template_tenant_publication_grants::TenantPublication {
+                &pplx_space_template_store::publication_grants::TenantPublication {
                     grant,
                     template: &template_name,
                     org_id,
@@ -221,7 +225,7 @@ impl ClusterApiService {
             )
             .await
             .map_err(|err| {
-                template_publication::storage_status("consume tenant publication", err.as_sql())
+                template_publication::storage_status("consume tenant publication", &err)
             })?
         {
             return Err(template_publication::missing_tenant_publication_grant());
@@ -397,7 +401,7 @@ impl ClusterApi for ClusterApiService {
         if let (Some(grant), TemplateOrg::Owned { org_id }) = (tenant_grant, template_org)
             && !pplx_space_template_store::publication_grants::tenant_grant_covers(
                 &mut *tx,
-                &template_tenant_publication_grants::TenantPublication {
+                &pplx_space_template_store::publication_grants::TenantPublication {
                     grant,
                     template: &name,
                     org_id,

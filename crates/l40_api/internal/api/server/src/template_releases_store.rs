@@ -39,6 +39,8 @@ use tonic::Status;
 ///   pins it to the accepting builder seconds after dispatch; a pinned grant
 ///   serves that builder alone, for seven days, so a job that waits in the
 ///   builder's queue behind long builds keeps its authorization until it runs.
+///   A tenant build's publication grant honours the same two windows; see
+///   `pplx_space_template_store::publication_grants::tenant_grant_covers`.
 ///
 /// The placement clauses deliberately ignore `desired_state`: a sandbox
 /// placed on the node still needs its template pulled while that template is
