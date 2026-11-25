@@ -114,9 +114,13 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
             .extensions
             .get::<axum::extract::MatchedPath>()
             .is_some_and(|path| path.as_str().ends_with("/sandboxes"))
-        && !crate::auth::org_has_local_owner(&state.pool, org_id)
-            .await
-            .map_err(database_error)?
+        && !pplx_space_accounts_store::organizations::organization_has_local_owner(
+            &state.pool,
+            org_id,
+        )
+        .await
+        .map_err(sqlx::Error::from)
+        .map_err(database_error)?
     {
         return Err(PublicApiError::forbidden(
             "federated sandbox creation requires an asserted owner and grant",
