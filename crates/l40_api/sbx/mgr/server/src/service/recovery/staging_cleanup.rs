@@ -80,13 +80,13 @@ impl SandboxManagerService {
             // whose deletion is pending. No unlink occurs until node-manager
             // confirms exclusion from surviving captures and transfers.
             let wake = self.auto_lifecycle.wake_lock(&id);
-            let artifact = self.auto_lifecycle.artifact_lock(&id);
             let guards = match (
                 wake.try_lock(),
-                artifact.try_lock(),
+                self.write_gate
+                    .try_lock(&id, DrainCompatible::StagingCleanup),
                 self.try_cleanup_fence(&id),
             ) {
-                (Ok(wake), Ok(artifact), CleanupLockTryResult::Acquired(cleanup)) => {
+                (Ok(wake), Some(artifact), CleanupLockTryResult::Acquired(cleanup)) => {
                     Some((wake, artifact, cleanup))
                 }
                 _ => None,

@@ -147,13 +147,16 @@ fn checkpoint_context(state: impl Into<SandboxStatus>) -> (CheckpointContext, St
         crate::db::fixture::params![sandbox_id, lifecycle, cleanup_state],
     )
     .unwrap();
+    let auto_lifecycle = crate::auto_lifecycle::AutoLifecycleCoordinator::default();
     (
         CheckpointContext {
             db: crate::db::SharedConnection::new(conn),
-            auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
+            write_gate: crate::service::write_gate::NodeWriteGate::unsealed_for_test(
+                auto_lifecycle.clone(),
+            ),
+            auto_lifecycle,
             health_lifecycle: crate::watchdog::HealthLifecycleEpochs::default(),
             node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
-            activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
         },
         sandbox_id,
     )
@@ -682,7 +685,7 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         // Whether the sandbox's artifact lock was free while each staging
         // delete ran, and whether it was held while the capture ran.
         let lock_free_at_staging_delete = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let coordinator = ctx.auto_lifecycle.clone();
+        let gate = ctx.write_gate.clone();
         let deleted_by_name = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deleted_by_path = Arc::new(std::sync::Mutex::new(Vec::new()));
         let listed = names.clone();
@@ -712,17 +715,18 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
             .unary("DeleteCacheArtifact", {
                 let (deleted_by_path, root) =
                     (Arc::clone(&deleted_by_path), root.path().to_owned());
-                let (lock_free, coordinator, sandbox_id) = (
+                let (lock_free, gate, sandbox_id) = (
                     Arc::clone(&lock_free_at_staging_delete),
-                    coordinator.clone(),
+                    gate.clone(),
                     sandbox_id.clone(),
                 );
                 move |request: DeleteCacheArtifactRequest| {
                     lock_free.lock().unwrap().push(
-                        coordinator
-                            .artifact_lock(&sandbox_id)
-                            .try_lock_owned()
-                            .is_ok(),
+                        gate.try_lock_for_read(
+                            &sandbox_id,
+                            crate::service::write_gate::Reader::Test,
+                        )
+                        .is_some(),
                     );
                     let path = Path::new(&request.local_path);
                     assert!(path.starts_with(&root));
@@ -756,18 +760,16 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
             1,
             &mut recorded,
             async |_| {
-                let free = coordinator
-                    .artifact_lock(&sandbox_id)
-                    .try_lock_owned()
-                    .is_ok();
+                let free = gate
+                    .try_lock_for_read(&sandbox_id, crate::service::write_gate::Reader::Test)
+                    .is_some();
                 *prepared.lock().unwrap() = Some((free, deleted_by_path.lock().unwrap().len()));
                 Ok(())
             },
             async |_, ()| {
-                let held = coordinator
-                    .artifact_lock(&sandbox_id)
-                    .try_lock_owned()
-                    .is_err();
+                let held = gate
+                    .try_lock_for_read(&sandbox_id, crate::service::write_gate::Reader::Test)
+                    .is_none();
                 *captured_under_lock.lock().unwrap() = Some(held);
                 Ok(())
             },
@@ -1658,49 +1660,18 @@ mod incomplete_checkpoint;
 
 /// `ctx` with its own seal, read from its database, sealed when `sealed`.
 fn with_seal(mut ctx: CheckpointContext, sealed: bool) -> CheckpointContext {
-    ctx.activation_seal = Arc::new(crate::activation_seal::ActivationSeal::load(
+    let seal = Arc::new(crate::activation_seal::ActivationSeal::load(
         &ctx.db.lock().unwrap(),
     ));
     if sealed {
-        ctx.activation_seal.seal(&ctx.db, 3).unwrap();
+        seal.seal(&ctx.db, 3).unwrap();
     }
+    ctx.write_gate = crate::service::write_gate::NodeWriteGate::new(
+        seal,
+        ctx.db.clone(),
+        ctx.auto_lifecycle.clone(),
+    );
     ctx
-}
-
-/// A scheduled capture asks the seal under the artifact lock: a node known
-/// sealed refuses it, with the seal's plain refusal, for every row without a
-/// VM, and admits it, counted in flight, for a started or paused one. A node
-/// never sealed admits every row, as before.
-#[test]
-fn a_sealed_node_admits_a_scheduled_capture_only_of_a_sandbox_with_a_vm() {
-    for state in SandboxStatus::sweep() {
-        let has_vm = matches!(
-            state.unowned(),
-            Some(SandboxState::Started | SandboxState::Paused)
-        );
-        for sealed in [false, true] {
-            let (ctx, sandbox_id) = checkpoint_context(state);
-            let ctx = with_seal(ctx, sealed);
-            match admit_scheduled_producer(&ctx, "scheduled disk snapshot", &sandbox_id) {
-                Ok(token) => {
-                    assert!(!sealed || has_vm, "{state} admitted sealed");
-                    assert_eq!(
-                        ctx.activation_seal.status().producers_in_flight,
-                        std::slice::from_ref(&sandbox_id)
-                    );
-                    drop(token);
-                }
-                Err(refused) => {
-                    assert!(sealed && !has_vm, "{state} refused: {refused}");
-                    assert!(
-                        refused.starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
-                        "{state}: {refused}"
-                    );
-                }
-            }
-            ctx.activation_seal.assert_quiesced();
-        }
-    }
 }
 
 /// On a sealed node, the scheduler's disk capture and its checkpoint of a
@@ -1737,7 +1708,7 @@ async fn a_sealed_node_refuses_the_scheduled_capture_of_a_sandbox_without_a_vm()
             &mut None,
             async |_| Ok(()),
             async |_, ()| {
-                in_flight = Some(ctx.activation_seal.status().producers_in_flight);
+                in_flight = Some(ctx.write_gate.seal().status().producers_in_flight);
                 Ok(())
             },
         )
@@ -1765,6 +1736,6 @@ async fn a_sealed_node_refuses_the_scheduled_capture_of_a_sandbox_without_a_vm()
                 "{state}"
             );
         }
-        ctx.activation_seal.assert_quiesced();
+        ctx.write_gate.seal().assert_quiesced();
     }
 }

@@ -9,7 +9,6 @@ use pplx_space_auto_lifecycle::{
     AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, AutoLifecycleTransition,
     AutoLifecycleWakeSource,
 };
-use pplx_space_snapshot_model::ArtifactKind;
 use tonic::Status;
 
 use pplx_space_sbx_mgr_protocol::proto;
@@ -109,38 +108,48 @@ impl Drop for LifecycleMutex {
     }
 }
 
-fn lifecycle_lock(registry: &Arc<LifecycleLockRegistry>, sandbox_id: &str) -> Arc<LifecycleMutex> {
-    let mut locks = registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(lock) = locks.get(sandbox_id).and_then(Weak::upgrade) {
-        return lock;
+/// One family of per-sandbox [`LifecycleMutex`]es: a sandbox id names the
+/// same lock for as long as any caller, waiter or guard holds it. Each family
+/// is its own registry, so a lock is reachable only through the registry that
+/// issued it.
+#[derive(Clone, Debug, Default)]
+pub struct LifecycleLocks(Arc<LifecycleLockRegistry>);
+
+impl LifecycleLocks {
+    /// The lock of `sandbox_id` in this family.
+    pub fn get(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lock) = locks.get(sandbox_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(LifecycleMutex {
+            sandbox_id: sandbox_id.to_owned(),
+            registry: Arc::downgrade(&self.0),
+            mutex: Arc::new(tokio::sync::Mutex::new(())),
+            waiters: tokio::sync::watch::channel(()).0,
+        });
+        locks.insert(sandbox_id.to_owned(), Arc::downgrade(&lock));
+        lock
     }
-    let lock = Arc::new(LifecycleMutex {
-        sandbox_id: sandbox_id.to_owned(),
-        registry: Arc::downgrade(registry),
-        mutex: Arc::new(tokio::sync::Mutex::new(())),
-        waiters: tokio::sync::watch::channel(()).0,
-    });
-    locks.insert(sandbox_id.to_owned(), Arc::downgrade(&lock));
-    lock
 }
 
+/// The node's wake, staging and runtime-upgrade locks. A sandbox's artifact
+/// lock, which live full-artifact capture takes after its wake lock, is
+/// sandbox-manager's write gate's own.
 #[derive(Clone, Default)]
 pub struct AutoLifecycleCoordinator {
-    wake_locks: Arc<LifecycleLockRegistry>,
-    /// Serializes publication and consumption of immutable local artifacts.
-    /// Live full-artifact capture takes this after `wake_locks`; disk
-    /// publication, direct restore, and backup admission take it directly.
-    artifact_locks: Arc<LifecycleLockRegistry>,
+    wake_locks: LifecycleLocks,
     /// Per-sandbox-id mutex guarding S3 snapshot staging. Distinct from
     /// `wake_locks` because some staging call sites are reachable while
     /// the wake lock is already held on the same task, and
     /// `tokio::sync::Mutex` is non-reentrant.
-    staging_locks: Arc<LifecycleLockRegistry>,
+    staging_locks: LifecycleLocks,
     /// Serializes the drivers of one sandbox's runtime upgrade: its RPC and
     /// the recovery loop. The upgrade's own cold start takes the other locks.
-    runtime_upgrade_locks: Arc<LifecycleLockRegistry>,
+    runtime_upgrade_locks: LifecycleLocks,
     /// Instant of the most recent completed wake per canonical sandbox id.
     /// Read by the suspend path both to surface suspend-shortly-after-wake
     /// oscillation (each cycle pays a full suspend snapshot) and to arbitrate
@@ -188,40 +197,17 @@ impl AutoLifecycleCoordinator {
     }
 
     pub fn wake_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
-        lifecycle_lock(&self.wake_locks, sandbox_id)
+        self.wake_locks.get(sandbox_id)
     }
 
     /// Per-sandbox-id mutex for S3 staging serialization. Held independently
     /// of `wake_lock` so callers may hold both.
     pub fn staging_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
-        lifecycle_lock(&self.staging_locks, sandbox_id)
-    }
-
-    pub fn artifact_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
-        lifecycle_lock(&self.artifact_locks, sandbox_id)
+        self.staging_locks.get(sandbox_id)
     }
 
     pub fn runtime_upgrade_lock(&self, sandbox_id: &str) -> Arc<LifecycleMutex> {
-        lifecycle_lock(&self.runtime_upgrade_locks, sandbox_id)
-    }
-
-    pub async fn artifact_publication_locks(
-        &self,
-        sandbox_id: &str,
-        artifact_kind: ArtifactKind,
-    ) -> (Option<LifecycleMutexGuard>, LifecycleMutexGuard) {
-        let wake_guard = if artifact_kind == ArtifactKind::Full {
-            Some(self.wake_lock(sandbox_id).lock_owned().await)
-        } else {
-            None
-        };
-        let artifact = self.artifact_lock(sandbox_id);
-        let artifact_guard = if artifact_kind == ArtifactKind::Full {
-            artifact.lock_for_capture().await
-        } else {
-            artifact.lock_owned().await
-        };
-        (wake_guard, artifact_guard)
+        self.runtime_upgrade_locks.get(sandbox_id)
     }
 
     pub fn try_staging_guard(&self, sandbox_id: &str) -> Option<LifecycleMutexGuard> {

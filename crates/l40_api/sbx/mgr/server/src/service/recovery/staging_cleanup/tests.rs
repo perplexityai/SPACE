@@ -92,9 +92,8 @@ async fn staging_cleanup_requires_stable_unowned_lifecycle() {
         });
         let _artifact = (owner == 1).then(|| {
             service
-                .auto_lifecycle
-                .artifact_lock(&id)
-                .try_lock_owned()
+                .write_gate
+                .try_lock_for_read(&id, crate::service::write_gate::Reader::Test)
                 .unwrap()
         });
         let _cleanup = (owner == 2).then(|| match service.try_cleanup_fence(&id) {
@@ -223,9 +222,8 @@ async fn publication_retirement_is_owned_by_the_sweep_in_any_lifecycle_state() {
         .try_lock_owned()
         .unwrap();
     let _artifact = service
-        .auto_lifecycle
-        .artifact_lock(&id)
-        .try_lock_owned()
+        .write_gate
+        .try_lock_for_read(&id, crate::service::write_gate::Reader::Test)
         .unwrap();
 
     suspend_snapshot_publication::publish_suspend_snapshot_dir(
@@ -726,9 +724,8 @@ async fn newer_attempt_does_not_let_stale_intent_block_recovery_forever() {
     std::fs::create_dir_all(&current).unwrap();
     let service = SandboxManagerService::for_test(conn);
     let guard = service
-        .auto_lifecycle
-        .artifact_lock(&id)
-        .lock_for_capture()
+        .write_gate
+        .lock_for_capture(&id, crate::service::write_gate::DrainCompatible::Suspend)
         .await;
     assert!(sweep(&service, cache.path()).is_empty());
     drop(guard);

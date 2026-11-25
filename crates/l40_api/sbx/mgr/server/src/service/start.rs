@@ -49,6 +49,7 @@ use super::validation::{
     TemplateRuntimeDefaults, optional_positive_or_default,
     reject_incompatible_template_spaced_compatibility,
 };
+use super::write_gate::{DrainCompatible, UnlockedWriter};
 use super::{
     CACHE_DIR, DEFAULT_BLOCKING_READY_TIMEOUT_SECS, RUN_DIR, RouteStreamEpochIdentity,
     SandboxManagerService,
@@ -1305,6 +1306,13 @@ impl SandboxManagerService {
     /// A stage interrupted after adopting the row is resumed. A sandbox
     /// already on this node in any other state is left to the upgrade, which
     /// checks its checkpoint against the one it was decided from.
+    ///
+    /// A new stage is the upgrade's admission, so a node known sealed refuses
+    /// it before it stages anything
+    /// ([`super::write_gate::NodeWriter::UpgradeStage`]); one admitted before
+    /// the seal counts in flight until it returns, and the upgrade's fence
+    /// decides again under the artifact lock. The resume of an interrupted
+    /// stage is admitted sealed too, since a drain already waits on its row.
     pub(super) async fn stage_missing_checkpoint(&self, req: StartRequest) -> Result<(), Status> {
         let mut start_ctx = StartSandboxContext::from_request(&req)?;
         match self.resolve_start_sandbox_target(&req.sandbox_id, &start_ctx, false)? {
@@ -1314,9 +1322,12 @@ impl SandboxManagerService {
                 if lookup.sandbox.state.is_unowned(SandboxState::Restoring) =>
             {
                 let sandbox_id = lookup.sandbox.id.clone();
-                let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox_id);
-                let _artifact_guard =
-                    wait_for_activation_admission(&sandbox_id, artifact_lock.lock()).await?;
+                let _artifact_guard = wait_for_activation_admission(
+                    &sandbox_id,
+                    self.write_gate
+                        .lock(&sandbox_id, DrainCompatible::StageResume),
+                )
+                .await?;
                 self.refuse_unretired_runtime_upgrade(&sandbox_id)?;
                 let staging_lock = self.auto_lifecycle.staging_lock(&sandbox_id);
                 if staging_lock.try_lock().is_err() {
@@ -1351,14 +1362,21 @@ impl SandboxManagerService {
             }
             // Another activation created the row since the caller looked.
             StartSandboxTarget::Local(_) => Ok(()),
-            StartSandboxTarget::MissingCheckpointRestore { sandbox_id } => self
-                .materialize_missing_checkpoint_restore(&sandbox_id, &mut start_ctx)
-                .instrument(tracing::info_span!(
-                    "sbxmgr.start.runtime_upgrade_stage",
-                    sandbox_id = %sandbox_id
-                ))
-                .await
-                .map(drop),
+            StartSandboxTarget::MissingCheckpointRestore { sandbox_id } => {
+                // Counted until the stage returns: it adopts the row only
+                // once it has pulled the metadata, so until then a drain has
+                // no row to find.
+                let _stage = self
+                    .write_gate
+                    .admit(&sandbox_id, UnlockedWriter::UpgradeStage)?;
+                self.materialize_missing_checkpoint_restore(&sandbox_id, &mut start_ctx)
+                    .instrument(tracing::info_span!(
+                        "sbxmgr.start.runtime_upgrade_stage",
+                        sandbox_id = %sandbox_id
+                    ))
+                    .await
+                    .map(drop)
+            }
         }
     }
 
@@ -1439,12 +1457,15 @@ impl SandboxManagerService {
                 SandboxStartExecutionPath::CheckpointRestore.as_str(),
             );
         }
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let mut artifact_guard = Some(
             start_stage(
                 "restore.artifact_lock_wait",
                 &sandbox.id,
-                wait_for_activation_admission(&sandbox.id, artifact_lock.lock()),
+                wait_for_activation_admission(
+                    &sandbox.id,
+                    self.write_gate
+                        .lock_for_activation(&sandbox.id, ActivationAdmissionKind::Restore),
+                ),
             )
             .await?,
         );
@@ -1564,8 +1585,14 @@ impl SandboxManagerService {
                 )
                 .await?;
             }
-            artifact_guard =
-                Some(wait_for_activation_admission(&sandbox.id, artifact_lock.lock()).await?);
+            artifact_guard = Some(
+                wait_for_activation_admission(
+                    &sandbox.id,
+                    self.write_gate
+                        .lock_for_activation(&sandbox.id, ActivationAdmissionKind::Restore),
+                )
+                .await?,
+            );
             sandbox = self.lookup_sandbox(&sandbox.id)?;
         }
         let _artifact_guard = artifact_guard;
@@ -1773,7 +1800,8 @@ impl SandboxManagerService {
             &sandbox.id,
             wait_for_activation_admission(
                 &sandbox.id,
-                self.auto_lifecycle.artifact_lock(&sandbox.id).lock_owned(),
+                self.write_gate
+                    .lock_for_activation(&sandbox.id, ActivationAdmissionKind::Restore),
             ),
         )
         .await?;
@@ -1784,8 +1812,8 @@ impl SandboxManagerService {
         // artifact lock and before anything is staged or written: the row
         // stays as it was, stopped with its pin, which a v2 drain reports
         // pending.
-        self.activation_seal
-            .check(ActivationAdmissionKind::Restore.as_str(), &sandbox.id)?;
+        self.write_gate
+            .check_activation(ActivationAdmissionKind::Restore, &sandbox.id)?;
         tracing::Span::current().record(
             "start_execution_path",
             SandboxStartExecutionPath::WarmSnapshot.as_str(),

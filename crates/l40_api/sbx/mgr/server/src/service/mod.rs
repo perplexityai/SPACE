@@ -433,6 +433,9 @@ pub struct SandboxManagerService {
     /// Refuses every VM activation while the node is sealed, and tracks the
     /// activation work in flight, which a drain reports as pending.
     activation_seal: Arc<crate::activation_seal::ActivationSeal>,
+    /// The node's one admission point: every artifact-lock writer and VM
+    /// activation is admitted through it.
+    write_gate: write_gate::NodeWriteGate,
     /// The node drain's work in flight in this process.
     drain_actions: Arc<drain_node::DrainActions>,
     /// At most one in-process driver may advance a persisted teardown suspend
@@ -1813,6 +1816,11 @@ impl SandboxManagerService {
             &options.task_tracker,
         );
         let auto_lifecycle = AutoLifecycleCoordinator::default();
+        let write_gate = write_gate::NodeWriteGate::new(
+            Arc::clone(&activation_seal),
+            db.clone(),
+            auto_lifecycle.clone(),
+        );
         let network_policy_reconcile_queue = NetworkPolicyReconcileQueue::default();
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
         // Force the lazy known-egress env parse here rather than on the first
@@ -1826,7 +1834,7 @@ impl SandboxManagerService {
             auto_lifecycle: auto_lifecycle.clone(),
             health_lifecycle: health_lifecycle.clone(),
             node_manager: options.node_manager.clone(),
-            activation_seal: Arc::clone(&activation_seal),
+            write_gate: write_gate.clone(),
         });
         let snapshot_scheduler = Arc::new(
             crate::snapshot_scheduler::SnapshotScheduler::new_with_ownership(
@@ -1840,7 +1848,7 @@ impl SandboxManagerService {
             db.clone(),
             network_policy_reconcile_queue.clone(),
             snapshot_scheduler.clone(),
-            auto_lifecycle.clone(),
+            write_gate.clone(),
             health_lifecycle,
             feature_flags.clone(),
             options.shutdown_token.clone(),
@@ -1915,6 +1923,7 @@ impl SandboxManagerService {
             )),
             activation_admission_limiter: Arc::new(ActivationAdmissionLimiter::from_env()),
             activation_seal,
+            write_gate,
             drain_actions: Arc::new(drain_node::DrainActions::with_window(
                 drain_node::drain_node_window_from_env(),
             )),
@@ -2061,6 +2070,7 @@ impl SandboxManagerService {
         let cfg = crate::snapshot_gc::GcConfig::from_env();
         let ownership = crate::snapshot_gc::GcOwnership {
             coordinator: self.auto_lifecycle.clone(),
+            write_gate: self.write_gate.clone(),
             drain: Arc::clone(&self.drain_state),
             shutdown: shutdown_token,
             node_manager: self.node_manager.clone(),
@@ -2195,6 +2205,7 @@ pub(crate) use guest_image::profile_for_sandbox;
 pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;
+pub(crate) mod write_gate;
 pub(crate) use eviction::{EvictionClaim, is_unrecorded_snapshot_refusal};
 mod drain_node;
 mod external_addresses;

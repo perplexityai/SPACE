@@ -6,6 +6,7 @@ use crate::db::guest_updates::{
     self as store, Action, Admission, GuestIdentity, Intent, Outcome, Phase, Record,
 };
 use crate::service::cleanup_support::CleanupLockTryResult;
+use crate::service::write_gate::DrainCompatible;
 use pplx_space_sandbox_model::SandboxActivationAttemptId;
 use pplx_space_spaced_guest_protocol::proto::update as wire;
 use pplx_space_spaced_host_client::RawSpacedHostGuestUpdateClient as Client;
@@ -291,12 +292,14 @@ impl SandboxManagerService {
         // capture can observe no intent and then snapshot a newly admitted one.
         // Brief observer/inventory reads should not turn a healthy admission
         // into an error. A capture or another activation still bounds this wait.
-        let artifact = self
-            .auto_lifecycle
-            .artifact_lock(&intent.sandbox.to_string());
-        let _artifact = tokio::time::timeout(RPC_BUDGET, artifact.lock_owned())
-            .await
-            .map_err(|_| Status::aborted("guest maintenance yields to an artifact operation"))?;
+        let sandbox_id = intent.sandbox.to_string();
+        let _artifact = tokio::time::timeout(
+            RPC_BUDGET,
+            self.write_gate
+                .lock(&sandbox_id, DrainCompatible::GuestMaintenance),
+        )
+        .await
+        .map_err(|_| Status::aborted("guest maintenance yields to an artifact operation"))?;
         let _writer = self.state_writer_lease("GuestUpdate")?;
         self.retire_stale_guest_update(&intent.sandbox.to_string())?;
         let operation = intent.operation;
@@ -449,9 +452,10 @@ impl SandboxManagerService {
         // touches remain writable throughout the trial. Stop/delete take the
         // cleanup fence only around a bounded Arm/Restart/Commit RPC below;
         // transfers and status polling never retain that fence.
-        let artifact = self.auto_lifecycle.artifact_lock(&id);
-        let priority = artifact.subscribe_capture_requests();
-        let Ok(_artifact) = artifact.try_lock_owned() else {
+        let Some((_artifact, priority)) = self
+            .write_gate
+            .try_lock_yielding_to_capture(&id, DrainCompatible::GuestMaintenance)
+        else {
             return Ok(());
         };
         let _writer = self.state_writer_lease("GuestUpdateRecovery")?;
@@ -481,10 +485,7 @@ impl SandboxManagerService {
                 "resume the paused execution to settle its pending guest maintenance before capture",
             ));
         }
-        let priority = self
-            .auto_lifecycle
-            .artifact_lock(sandbox)
-            .subscribe_capture_requests();
+        let priority = self.write_gate.subscribe_capture_requests(sandbox);
         self.drive_guest_update(record, true, false, priority).await
     }
 

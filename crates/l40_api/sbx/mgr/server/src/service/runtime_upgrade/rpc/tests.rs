@@ -4648,3 +4648,260 @@ async fn closure_recovery_guard_for_reused_operation() {
     );
     assert_eq!(report.attempt_id.as_deref(), Some(OTHER_POD_UID));
 }
+
+/// The refusal a sealed node answers a new upgrade of a sandbox that has no
+/// VM and isn't stopped with.
+#[track_caller]
+fn assert_sealed(error: &Status) {
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(
+        error
+            .message()
+            .starts_with(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+        "{error}"
+    );
+}
+
+/// An upgrade of suspended `sandbox_id` that stages it from object storage
+/// if it's absent from the node.
+fn staged_upgrade(
+    sandbox_id: &str,
+    target: &ExecutionMetadata,
+    operation_id: RuntimeUpgradeOperationId,
+) -> UpgradeRuntimeRequest {
+    let mut request = pod_upgrade(sandbox_id, target, operation_id, WakeTargetState::Started);
+    request.checkpoint_local_artifact_id = Some(LocalArtifactId::new().to_string());
+    request.stage_from = Some(crate::proto::RuntimeUpgradeStageFrom {
+        suspend_restore_storage_uri: format!(
+            "s3://space-test/suspend/{sandbox_id}/{}?region=us-east-1",
+            uuid::Uuid::now_v7()
+        ),
+        suspend_restore_source_node: None,
+    });
+    request
+}
+
+impl Fixture {
+    /// Leave the fixture's `restoring` row as a remote stage that adopted it
+    /// and recorded its metadata staging, then stopped.
+    fn interrupt_remote_stage(&self) {
+        let db = self.service.db.lock().unwrap();
+        db.execute(
+            "UPDATE sandboxes
+                SET restore_origin = 'remote',
+                    restore_phase = 'metadata_staging',
+                    restore_storage_uri = ?2
+              WHERE id = ?1",
+            crate::db::fixture::params![
+                self.sandbox_id,
+                format!(
+                    "s3://space-test/suspend/{}?region=us-east-1",
+                    self.sandbox_id
+                )
+            ],
+        )
+        .unwrap();
+        assert!(crate::db::record_remote_restore_artifact_staging(&db, &self.sandbox_id).unwrap());
+    }
+}
+
+/// A node known sealed refuses a new upgrade of a sandbox that has no VM and
+/// isn't stopped before it changes anything there: a suspended sandbox
+/// absent from the node isn't staged onto it, and one present isn't finished,
+/// fenced or preserved, node-manager asked for nothing. A stopped sandbox's
+/// upgrade, which a v2 drain doesn't move, reaches its node work as on a
+/// node never sealed.
+#[tokio::test]
+async fn a_sealed_node_refuses_a_new_upgrade_before_it_stages_or_fences() {
+    let (source, _) = environments();
+    let target = certified_target(&source);
+    let service = SandboxManagerService::new_with_options(
+        crate::db::test_conn(),
+        crate::service::SandboxManagerServiceOptions::for_test(),
+    );
+    service.activation_seal.seal(&service.db, 7).unwrap();
+    let sandbox_id = SandboxId::new().to_string();
+    let staged = staged_upgrade(&sandbox_id, &target, operation());
+    assert_sealed(&upgrade(&service, staged).await.unwrap_err());
+    assert!(
+        service.lookup_sandbox(&sandbox_id).is_err(),
+        "nothing staged"
+    );
+
+    let f = fixture(SandboxState::Suspended, false, FakeNodeManager::default());
+    let checkpoint = f.adopt_checkpoint();
+    f.service.activation_seal.seal(&f.service.db, 7).unwrap();
+    let mut request = pod_upgrade(
+        &f.sandbox_id,
+        &certified_target(&f.source),
+        operation(),
+        WakeTargetState::Started,
+    );
+    request.checkpoint_local_artifact_id = Some(checkpoint.to_string());
+    assert_sealed(&upgrade(&f.service, request).await.unwrap_err());
+    f.assert_no_node_calls();
+    assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Suspended));
+    assert_eq!(
+        crate::db::read::runtime_upgrade_fence(&f.service.db.lock().unwrap(), &f.sandbox_id)
+            .unwrap(),
+        None
+    );
+
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    f.service.activation_seal.seal(&f.service.db, 7).unwrap();
+    let request = pod_upgrade(
+        &f.sandbox_id,
+        &certified_target(&f.source),
+        operation(),
+        WakeTargetState::Started,
+    );
+    let error = upgrade(&f.service, request).await.unwrap_err();
+    assert!(
+        f._node
+            .calls()
+            .iter()
+            .any(|call| call.contains("BtrfsSnapshot")),
+        "{error}: {:?}",
+        f._node.calls()
+    );
+}
+
+/// A node known sealed resumes a stage interrupted after it adopted the row
+/// as a node never sealed does: a drain already waits on that row, which
+/// stays pending until the stage settles, and a refused resume would leave
+/// the drain waiting until the undrain. This harness has no object store, so
+/// the resumed stage fails at its pull on either node. A new stage, of a
+/// sandbox absent from the node, is refused on the sealed node before it
+/// stages anything.
+#[tokio::test]
+async fn a_sealed_node_resumes_an_interrupted_stage_and_refuses_a_new_one() {
+    for sealed in [false, true] {
+        let f = fixture(SandboxState::Restoring, false, FakeNodeManager::default());
+        f.interrupt_remote_stage();
+        if sealed {
+            f.service.activation_seal.seal(&f.service.db, 7).unwrap();
+        }
+        let target = certified_target(&f.source);
+
+        let resumed = upgrade(
+            &f.service,
+            staged_upgrade(&f.sandbox_id, &target, operation()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            resumed.code(),
+            tonic::Code::Unavailable,
+            "sealed: {sealed}: {resumed}"
+        );
+        assert!(
+            resumed
+                .message()
+                .contains("resume interrupted cross-node restore staging"),
+            "sealed: {sealed}: {resumed}"
+        );
+        assert_eq!(f.row().state, SandboxStatus::from(SandboxState::Restoring));
+
+        let absent = SandboxId::new().to_string();
+        let new = upgrade(&f.service, staged_upgrade(&absent, &target, operation()))
+            .await
+            .unwrap_err();
+        if sealed {
+            assert_sealed(&new);
+        } else {
+            assert!(
+                !new.message()
+                    .contains(crate::activation_seal::ACTIVATIONS_SEALED_MARKER),
+                "{new}"
+            );
+        }
+        assert!(f.service.lookup_sandbox(&absent).is_err(), "nothing staged");
+        f.service.activation_seal.assert_quiesced();
+    }
+}
+
+/// One `DrainNode` call under generation 7 that leaves running sandboxes
+/// running, and its report.
+async fn drain_pass(service: &SandboxManagerService) -> crate::proto::DrainReport {
+    use crate::proto::drain_node_request::{Drain, Op};
+    let response = service
+        .drain_node(internal_request(crate::proto::DrainNodeRequest {
+            generation: 7,
+            op: Some(Op::Drain(Drain { evacuate: false })),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    match response.result {
+        Some(crate::proto::drain_node_response::Result::Drain(report)) => report,
+        other => panic!("a drain call answers a report: {other:?}"),
+    }
+}
+
+/// A new stage is counted in flight from its admission until it returns: it
+/// adopts the row only once it has pulled the metadata, so until then a
+/// drain has no row of it to find. A drain whose seal lands while the stage
+/// is past its admission and short of the adoption reports the sandbox
+/// pending on every pass, never finished. Once the stage returns, here
+/// having staged nothing for lack of an object store, the drain finishes.
+/// Holding the sandbox's staging lock parks the stage short of the adoption.
+#[tokio::test]
+async fn a_stage_admitted_before_the_seal_keeps_the_drain_pending_until_it_returns() {
+    let node = FakeNodeManager::default()
+        .unary(
+            "ListOrphanCandidates",
+            |_: pplx_space_node_mgr_client::proto::ListOrphanCandidatesRequest| {
+                Ok(pplx_space_node_mgr_client::proto::ListOrphanCandidatesResponse::default())
+            },
+        )
+        .serve();
+    let service = SandboxManagerService::new_with_options(
+        crate::db::test_conn(),
+        crate::service::SandboxManagerServiceOptions {
+            node_manager: node.connector(),
+            ..crate::service::SandboxManagerServiceOptions::for_test()
+        },
+    );
+    let (source, _) = environments();
+    let sandbox_id = SandboxId::new().to_string();
+    let staging = service.auto_lifecycle.staging_lock(&sandbox_id);
+    let parked = Arc::clone(&staging).lock_owned().await;
+    let unstaged = Arc::strong_count(&staging);
+    let stage = tokio::spawn({
+        let service = service.clone();
+        let request = staged_upgrade(&sandbox_id, &certified_target(&source), operation());
+        async move { upgrade(&service, request).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while Arc::strong_count(&staging) == unstaged {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the stage reaches the staging lock");
+
+    for pass in 0..2 {
+        let report = drain_pass(&service).await;
+        assert!(
+            report
+                .pending
+                .iter()
+                .any(|entry| entry.sandbox_id == sandbox_id),
+            "pass {pass}: {report:?}"
+        );
+        assert!(report.evacuated.is_empty(), "pass {pass}: {report:?}");
+    }
+
+    drop(parked);
+    stage.await.unwrap().unwrap_err();
+    assert!(
+        service.lookup_sandbox(&sandbox_id).is_err(),
+        "nothing staged"
+    );
+    let report = drain_pass(&service).await;
+    assert!(
+        report.pending.is_empty() && report.blocked.is_empty(),
+        "{report:?}"
+    );
+    service.activation_seal.assert_quiesced();
+}

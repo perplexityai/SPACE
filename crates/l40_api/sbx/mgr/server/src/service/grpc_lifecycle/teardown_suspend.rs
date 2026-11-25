@@ -205,7 +205,7 @@ fn durable_teardown_suspend_prepare_response(
 /// The wake and artifact locks the teardown driver holds for its whole run.
 type TeardownSuspendLocks = (
     crate::auto_lifecycle::LifecycleMutexGuard,
-    crate::auto_lifecycle::LifecycleMutexGuard,
+    crate::service::write_gate::ArtifactWriteGuard,
 );
 
 impl SandboxManagerService {
@@ -977,8 +977,13 @@ impl SandboxManagerService {
         let sandbox_id_string = sandbox_id.to_string();
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox_id_string);
         let wake_guard = wake_lock.lock_owned().await;
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox_id_string);
-        let artifact_guard = artifact_lock.lock_for_capture().await;
+        let artifact_guard = self
+            .write_gate
+            .lock_for_capture(
+                &sandbox_id_string,
+                crate::service::write_gate::DrainCompatible::TeardownSuspend,
+            )
+            .await;
         let status = {
             let db = self.db_conn()?;
             crate::db::read::sandbox_view(&db, &sandbox_id_string)

@@ -1120,7 +1120,7 @@ async fn pause_failed_recovery_fixture(
 ) -> (
     crate::db::SharedConnection,
     Arc<SnapshotScheduler>,
-    AutoLifecycleCoordinator,
+    NodeWriteGate,
     HealthLifecycleEpochs,
     SandboxId,
 ) {
@@ -1145,15 +1145,16 @@ async fn pause_failed_recovery_fixture(
         .expect("pause-failed quarantine must be recorded")
     );
     let db = crate::db::SharedConnection::new(conn);
-    let auto_lifecycle = AutoLifecycleCoordinator::default();
+    let auto_lifecycle = crate::auto_lifecycle::AutoLifecycleCoordinator::default();
+    let write_gate = NodeWriteGate::unsealed_for_test(auto_lifecycle.clone());
     let lifecycle_epochs = HealthLifecycleEpochs::default();
     let snapshot_scheduler = Arc::new(SnapshotScheduler::new(Arc::new(
         crate::snapshot_scheduler::CheckpointContext {
             db: db.clone(),
-            auto_lifecycle: auto_lifecycle.clone(),
+            auto_lifecycle,
             health_lifecycle: lifecycle_epochs.clone(),
             node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
-            activation_seal: Arc::new(crate::activation_seal::ActivationSeal::unsealed()),
+            write_gate: write_gate.clone(),
         },
     )));
     snapshot_scheduler
@@ -1175,7 +1176,7 @@ async fn pause_failed_recovery_fixture(
     (
         db,
         snapshot_scheduler,
-        auto_lifecycle,
+        write_gate,
         lifecycle_epochs,
         sandbox_id,
     )
@@ -1183,12 +1184,12 @@ async fn pause_failed_recovery_fixture(
 
 #[tokio::test]
 async fn pause_failed_recovery_applies_node_side_effects() {
-    let (db, snapshot_scheduler, auto_lifecycle, lifecycle_epochs, sandbox_id) =
+    let (db, snapshot_scheduler, write_gate, lifecycle_epochs, sandbox_id) =
         pause_failed_recovery_fixture(VmState::Paused).await;
     reconcile_pause_failed_quarantine(
         &db,
         snapshot_scheduler.as_ref(),
-        &auto_lifecycle,
+        &write_gate,
         &lifecycle_epochs,
         &sandbox_id,
         0,
@@ -1221,23 +1222,22 @@ async fn pause_failed_recovery_applies_node_side_effects() {
 
 #[tokio::test]
 async fn pause_failed_recovery_revalidates_epoch_after_artifact_lock() {
-    let (db, snapshot_scheduler, auto_lifecycle, lifecycle_epochs, sandbox_id) =
+    let (db, snapshot_scheduler, write_gate, lifecycle_epochs, sandbox_id) =
         pause_failed_recovery_fixture(VmState::Paused).await;
     let sandbox_id_string = sandbox_id.to_string();
-    let artifact_guard = auto_lifecycle
-        .artifact_lock(&sandbox_id_string)
-        .lock_owned()
+    let artifact_guard = write_gate
+        .lock_for_read(&sandbox_id_string, crate::service::write_gate::Reader::Test)
         .await;
     let recovery = {
         let db = db.clone();
         let snapshot_scheduler = snapshot_scheduler.clone();
-        let auto_lifecycle = auto_lifecycle.clone();
+        let write_gate = write_gate.clone();
         let lifecycle_epochs = lifecycle_epochs.clone();
         tokio::spawn(async move {
             reconcile_pause_failed_quarantine(
                 &db,
                 snapshot_scheduler.as_ref(),
-                &auto_lifecycle,
+                &write_gate,
                 &lifecycle_epochs,
                 &sandbox_id,
                 0,

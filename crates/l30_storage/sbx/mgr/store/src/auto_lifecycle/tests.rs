@@ -582,15 +582,16 @@ fn last_wake_completed_records_per_sandbox_and_clears_on_remove() {
 
 #[tokio::test]
 async fn retired_sandbox_keeps_existing_lock_owners_and_waiters_serialized() {
-    use super::AutoLifecycleCoordinator;
+    use super::{AutoLifecycleCoordinator, LifecycleLocks};
 
     let coord = AutoLifecycleCoordinator::default();
+    let artifact_locks = LifecycleLocks::default();
     let sandbox_id = "019e31ec-5633-7111-b27c-1b6ac5cb170a";
 
     for family in 0..3 {
         let acquire = || match family {
             0 => coord.wake_lock(sandbox_id),
-            1 => coord.artifact_lock(sandbox_id),
+            1 => artifact_locks.get(sandbox_id),
             _ => coord.staging_lock(sandbox_id),
         };
         let before = acquire();

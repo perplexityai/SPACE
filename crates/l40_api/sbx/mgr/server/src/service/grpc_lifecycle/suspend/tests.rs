@@ -419,11 +419,12 @@ async fn cancelled_suspend_keeps_preparation_owned_but_never_detaches_lock_waite
             .wake_lock(&id)
             .try_lock_owned()
             .unwrap_err();
-        service
-            .auto_lifecycle
-            .artifact_lock(&id)
-            .try_lock_owned()
-            .unwrap_err();
+        assert!(
+            service
+                .write_gate
+                .try_lock_for_read(&id, crate::service::write_gate::Reader::Test)
+                .is_none()
+        );
         gate.release.add_permits(1);
         // Preparation still completes its rollback after the response is gone.
         let _settled =

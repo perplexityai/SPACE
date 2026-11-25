@@ -27,11 +27,13 @@ use crate::service::suspend_snapshot_publication::{
 use crate::service::tail_support::{
     RuntimeArtifactReadError, checkpoint_execution_metadata, sandbox_execution_metadata_in,
 };
+use crate::service::write_gate::{DrainCompatible, LockedWriter};
 use crate::state::SandboxState;
 
-/// How long retirement waits for a restore, export or publication holding the
+/// How long retirement, and a failed upgrade's restore of a suspended
+/// sandbox's disk, wait for a restore, export or publication holding the
 /// sandbox's artifacts, so one busy sandbox can't stall the recovery loop.
-const RETIRE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const ARTIFACT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(in crate::service) struct NodeRuntimeUpgradeEffects {
     service: SandboxManagerService,
@@ -487,14 +489,30 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
 
     /// Snapshot rollback, export and checkpoint publication take the artifact
     /// lock before they touch the instance or the checkpoint.
-    async fn exclude_disk_mutations(&self, sandbox_id: &str) -> Box<dyn Send> {
-        Box::new(
+    async fn exclude_disk_mutations(&self, sandbox_id: &str) -> Result<Box<dyn Send>, Status> {
+        Ok(Box::new(
             self.service
-                .auto_lifecycle
-                .artifact_lock(sandbox_id)
-                .lock_owned()
-                .await,
+                .write_gate
+                .lock_for_write(sandbox_id, LockedWriter::RuntimeUpgrade)
+                .await?,
+        ))
+    }
+
+    async fn exclude_disk_mutations_to_restore(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Box<dyn Send>, Status> {
+        let artifact = tokio::time::timeout(
+            ARTIFACT_LOCK_WAIT,
+            self.service
+                .write_gate
+                .lock(sandbox_id, DrainCompatible::UpgradeRollback),
         )
+        .await
+        .map_err(|_| {
+            Status::unavailable("the sandbox's artifacts are busy; the rollback retries later")
+        })?;
+        Ok(Box::new(artifact))
     }
 
     /// Retire the checkpoint the upgrade superseded, by identity only: the
@@ -512,11 +530,10 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
         // Excludes suspend publication, restore staging and the reaper, as the
         // reaper's own deletions do.
         let _artifact = tokio::time::timeout(
-            RETIRE_LOCK_WAIT,
+            ARTIFACT_LOCK_WAIT,
             self.service
-                .auto_lifecycle
-                .artifact_lock(&record.sandbox_id)
-                .lock_owned(),
+                .write_gate
+                .lock(&record.sandbox_id, DrainCompatible::CheckpointRetirement),
         )
         .await
         .map_err(|_| {

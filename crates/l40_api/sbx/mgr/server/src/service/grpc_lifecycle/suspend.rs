@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::service::cleanup_support::{StateWriteRejected, require_state_write_from};
+use crate::service::write_gate::{ArtifactWriteGuard, DrainCompatible};
 
 fn completed_suspend_retry_response(
     sandbox: &crate::db::SandboxRow,
@@ -191,8 +192,10 @@ impl SandboxManagerService {
                  should still be suspended",
             ));
         }
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let artifact_guard = artifact_lock.lock_for_capture().await;
+        let artifact_guard = self
+            .write_gate
+            .lock_for_capture(&sandbox.id, DrainCompatible::Suspend)
+            .await;
         // A blocking suspend commits the full artifact before replying. If the
         // caller loses the response or its control-plane marker write fails,
         // retrying must return that exact committed artifact instead of trying
@@ -280,7 +283,7 @@ impl SandboxManagerService {
         &self,
         context: &SuspendRequestContext,
         _wake_guard: &crate::auto_lifecycle::LifecycleMutexGuard,
-        _artifact_guard: &crate::auto_lifecycle::LifecycleMutexGuard,
+        _artifact_guard: &ArtifactWriteGuard,
     ) -> Result<(String, SuspendSnapshotPublicationContext), Status> {
         self.ensure_snapshot_restore_supported("suspend")?;
         self.settle_guest_update_for_lifecycle(&context.sandbox_id)

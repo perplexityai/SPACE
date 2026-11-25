@@ -11,6 +11,7 @@ use crate::proto::{
     DrainBlocked, DrainEvacuated, DrainNodeRequest, DrainNodeResponse, DrainPending, DrainReport,
     DrainWait as WireWait, PreviewDrainNodeRequest, PreviewDrainNodeResponse,
 };
+use crate::service::start_support::ActivationAdmissionKind;
 use crate::service::*;
 use pplx_space_snapshot_model::ArtifactKind;
 
@@ -1102,7 +1103,10 @@ async fn an_empty_sealed_node_is_finished_unless_a_scan_failed() {
 #[tokio::test]
 async fn an_activation_in_flight_before_the_seal_is_pending() {
     let service = SandboxManagerService::for_test(crate::db::test_conn());
-    let token = service.activation_seal.admit("restore", "sbx-a").unwrap();
+    let token = service
+        .admit_vm_activation(ActivationAdmissionKind::Restore, "sbx-a")
+        .await
+        .unwrap();
     service.begin_drain(7, EVACUATE).unwrap();
     let first = service.activation_seal.status();
     let report = service.finish_drain(7, &first, DrainScans::default());
@@ -1166,8 +1170,10 @@ async fn the_report_has_an_entry_for_every_reason_the_node_isnt_finished() {
     assert!(finished(&report(&sealed, DrainScans::default())));
 
     // An activation in flight at the first read.
-    let token = service.activation_seal.admit("cold", "sbx-a");
-    assert!(token.is_err(), "a sealed node admits no activation");
+    let refused = service
+        .write_gate
+        .check_activation(ActivationAdmissionKind::Cold, "sbx-a");
+    assert!(refused.is_err(), "a sealed node admits no activation");
     let in_flight = ActivationSealStatus {
         in_flight: vec!["sbx-a".into()],
         ..sealed.clone()
@@ -1427,7 +1433,10 @@ async fn a_writer_holding_a_rows_artifact_lock_keeps_the_row_pending() {
         evacuated
     );
     for id in ["sbx-a", "sbx-f"] {
-        let writer = service.auto_lifecycle.artifact_lock(id).lock_owned().await;
+        let writer = service
+            .write_gate
+            .lock_for_read(id, crate::service::write_gate::Reader::Test)
+            .await;
         let report = service.finish_drain(7, &first, DrainScans::default());
         assert_eq!(
             kinds(&report.pending),
@@ -2495,8 +2504,10 @@ async fn a_suspend_waiting_for_its_locks_suspends_nothing_under_a_later_seal() {
         let service = service_with_node_manager(conn, &node_manager);
         service.begin_drain(7, EVACUATE).unwrap();
         // A capture elsewhere holds the artifact lock.
-        let artifact_lock = service.auto_lifecycle.artifact_lock(&id);
-        let capture = artifact_lock.lock_for_capture().await;
+        let capture = service
+            .write_gate
+            .lock_for_capture(&id, crate::service::write_gate::DrainCompatible::Suspend)
+            .await;
         let suspend = tokio::spawn({
             let service = service.clone();
             let id = id.clone();

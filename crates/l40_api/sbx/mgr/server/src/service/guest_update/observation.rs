@@ -85,7 +85,7 @@ impl SandboxManagerService {
                         // PrepareSuspend may have succeeded just before the
                         // manager crashed or lost its reply. Only a resident,
                         // running execution outside a capture may reopen it.
-                        let Ok(_artifact) = self.auto_lifecycle.artifact_lock(id).try_lock_owned() else { return Err(error); };
+                        let Some(_artifact) = self.write_gate.try_lock(id, DrainCompatible::GuestMaintenance) else { return Err(error); };
                         let current = self.lookup_sandbox(id)?;
                         if current.state.is_unowned(SandboxState::Started) && current.node_execution_id == Some(execution)
                             && let Err(error) = notify_resume_clock_sync_best_effort(id, pplx_space_spaced_host_client::proto::ResumeReason::SuspendResume).await {
@@ -108,7 +108,7 @@ impl SandboxManagerService {
                     if !matches!(phase(&seen)?, wire::Phase::Stable | wire::Phase::Committed | wire::Phase::RolledBack | wire::Phase::Restarted | wire::Phase::Staged | wire::Phase::RecoveryRequired) { continue; }
                     let CleanupLockTryResult::Acquired(_cleanup) = self.try_cleanup_fence(id) else { continue; };
                     let Ok(_wake) = self.auto_lifecycle.wake_lock(id).try_lock_owned() else { continue; };
-                    let Ok(_artifact) = self.auto_lifecycle.artifact_lock(id).try_lock_owned() else { continue; };
+                    let Some(_artifact) = self.write_gate.try_lock(id, DrainCompatible::GuestMaintenance) else { continue; };
                     let current = self.lookup_sandbox(id)?;
                     if !current.state.is_unowned(SandboxState::Started) || current.node_execution_id != Some(execution) { return Ok(()); }
                     if crate::db::read::active_guest_update(&*self.db_conn()?, id).map_err(internal)?.is_some() { continue; }

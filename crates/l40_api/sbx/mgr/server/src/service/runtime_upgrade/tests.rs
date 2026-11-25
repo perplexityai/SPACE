@@ -451,12 +451,20 @@ impl RuntimeUpgradeEffects for Arc<Fake> {
         Ok(())
     }
 
-    async fn exclude_disk_mutations(&self, sandbox_id: &str) -> Box<dyn Send> {
+    async fn exclude_disk_mutations(&self, sandbox_id: &str) -> Result<Box<dyn Send>, Status> {
         self.called("exclude");
-        Box::new(Exclusion {
+        Ok(Box::new(Exclusion {
             fake: Arc::clone(self),
             sandbox_id: sandbox_id.to_string(),
-        })
+        }))
+    }
+
+    async fn exclude_disk_mutations_to_restore(
+        &self,
+        _sandbox_id: &str,
+    ) -> Result<Box<dyn Send>, Status> {
+        self.called("exclude restore");
+        Ok(Box::new(()))
     }
 
     async fn retire_checkpoint(&self, record: &RuntimeUpgradeRecord) -> Result<(), Status> {
@@ -789,18 +797,27 @@ async fn a_failed_cold_boot_leaves_the_old_pair_intact_and_restorable() {
 
         assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{error}");
         assert!(error.message().contains("rolled back"), "{error}");
+        // A suspended sandbox's disk is restored under its artifact lock, a
+        // stopped one's as before.
+        let restore: &[&str] = match state {
+            SandboxState::Suspended => &["exclude restore", "restore"],
+            _ => &["restore"],
+        };
         assert_eq!(
             h.fake.calls(),
             [
-                "exclude",
-                "inspect",
-                "release fenced",
-                "preserve",
-                "resolve",
-                "boot",
-                "restore",
-                "discard"
-            ],
+                &[
+                    "exclude",
+                    "inspect",
+                    "release fenced",
+                    "preserve",
+                    "resolve",
+                    "boot"
+                ][..],
+                restore,
+                &["discard"],
+            ]
+            .concat(),
             "{state}"
         );
         assert_eq!(h.record(operation_id), None);
@@ -891,6 +908,7 @@ async fn a_rollback_waits_for_the_failed_boot_to_settle_and_keeps_the_fence_unti
             "preserve",
             "resolve",
             "boot", // first attempt
+            "exclude restore",
             "restore",
             "discard", // rollback on retry
             "exclude",

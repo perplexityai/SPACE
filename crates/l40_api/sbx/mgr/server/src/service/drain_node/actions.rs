@@ -8,6 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 use super::planner::*;
 use crate::proto::EnqueueArtifactBackupRequest;
 use crate::service::grpc_lifecycle::{BackupCaller, SuspendRequestContext};
+use crate::service::write_gate::DrainCompatible;
 use crate::service::*;
 use pplx_space_events::SandboxEventTrigger;
 
@@ -465,8 +466,10 @@ impl SandboxManagerService {
         if !from.allows(sandbox.state.unowned()) {
             return Ok(());
         }
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let artifact_guard = artifact_lock.lock_for_capture().await;
+        let artifact_guard = self
+            .write_gate
+            .lock_for_capture(&sandbox.id, DrainCompatible::DrainSuspend)
+            .await;
         let started = sandbox.state.is_unowned(SandboxState::Started);
         if self.activation_seal.status().sealed_generation != Some(generation)
             || (started && !self.drain_actions.evacuating(generation))

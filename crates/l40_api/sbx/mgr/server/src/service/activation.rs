@@ -19,6 +19,7 @@ use super::network_runtime::{
     NetGatewayRouteVerificationKeyPushOutcome, push_route_security_with_retry_policy,
 };
 use super::restart_admission::wait_for_activation_admission;
+use super::start_support::ActivationAdmissionKind;
 use super::tail_support::*;
 use super::validation::duration_ceil_secs;
 use super::*;
@@ -702,9 +703,14 @@ impl SandboxManagerService {
                             .finish_resident_wake(&sandbox.id, &start, activity)
                             .await;
                     }
-                    let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-                    let _guard =
-                        wait_for_activation_admission(&sandbox.id, artifact_lock.lock()).await?;
+                    let _guard = wait_for_activation_admission(
+                        &sandbox.id,
+                        self.write_gate.lock_for_activation(
+                            &sandbox.id,
+                            ActivationAdmissionKind::ResidentResume,
+                        ),
+                    )
+                    .await?;
                     return self
                         .finish_resident_wake_after_resume(
                             &sandbox.id,
@@ -908,9 +914,12 @@ impl SandboxManagerService {
                 return Ok(transition);
             }
             SandboxState::Paused => {
-                let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-                let _guard =
-                    wait_for_activation_admission(&sandbox.id, artifact_lock.lock()).await?;
+                let _guard = wait_for_activation_admission(
+                    &sandbox.id,
+                    self.write_gate
+                        .lock_for_activation(&sandbox.id, ActivationAdmissionKind::ResidentResume),
+                )
+                .await?;
                 self.finish_resident_wake_after_resume(
                     &sandbox.id,
                     &start,

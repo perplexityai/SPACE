@@ -337,15 +337,14 @@ impl SandboxManagerService {
         let mut held = Vec::new();
         for row in rows.iter().filter(|row| !waiting.contains(&row.sandbox_id)) {
             match self
-                .auto_lifecycle
-                .artifact_lock(&row.sandbox_id)
-                .try_lock_owned()
+                .write_gate
+                .try_lock_for_read(&row.sandbox_id, write_gate::Reader::DrainConfirm)
             {
-                Ok(guard) => {
+                Some(guard) => {
                     guards.push(guard);
                     held.push(row);
                 }
-                Err(_) => plan.recheck(&row.sandbox_id, "another writer holds its artifacts"),
+                None => plan.recheck(&row.sandbox_id, "another writer holds its artifacts"),
             }
         }
         if held.is_empty() {

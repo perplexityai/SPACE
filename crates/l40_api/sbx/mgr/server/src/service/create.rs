@@ -839,8 +839,8 @@ impl SandboxManagerService {
         // refuses the restore here, before its claim, its network allocation
         // or its cleanup episode: the row stays as it was. The admission
         // below still refuses a seal that lands after this check.
-        self.activation_seal
-            .check(ActivationAdmissionKind::Restore.as_str(), id)?;
+        self.write_gate
+            .check_activation(ActivationAdmissionKind::Restore, id)?;
 
         let cleanup_episode = {
             let db = self.db_conn()?;

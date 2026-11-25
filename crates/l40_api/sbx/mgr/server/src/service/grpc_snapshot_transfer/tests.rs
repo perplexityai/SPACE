@@ -77,9 +77,8 @@ async fn snapshot_staging_reaper_preserves_live_owner_and_unrelated_entries() {
     std::fs::create_dir(&path).unwrap();
     std::fs::write(path.join("partial"), b"not published").unwrap();
     let guard = service
-        .auto_lifecycle
-        .artifact_lock(&sandbox)
-        .lock_owned()
+        .write_gate
+        .lock_for_read(&sandbox, crate::service::write_gate::Reader::Test)
         .await;
     assert!(
         !service

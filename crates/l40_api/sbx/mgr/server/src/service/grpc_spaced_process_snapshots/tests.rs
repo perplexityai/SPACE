@@ -574,7 +574,7 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
             // was held while node-manager deleted it.
             let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let coordinator = Arc::new(std::sync::OnceLock::<
-                crate::auto_lifecycle::AutoLifecycleCoordinator,
+                crate::service::write_gate::NodeWriteGate,
             >::new());
             let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
                 .unary("ListBtrfsSnapshots", |_: ListBtrfsSnapshotsRequest| {
@@ -596,9 +596,8 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
                         let lock_held = coordinator
                             .get()
                             .expect("the service is built before any delete")
-                            .artifact_lock(&sandbox)
-                            .try_lock_owned()
-                            .is_err();
+                            .try_lock_for_read(&sandbox, crate::service::write_gate::Reader::Test)
+                            .is_none();
                         deletions
                             .lock()
                             .unwrap()
@@ -624,7 +623,7 @@ async fn delete_snapshots_answers_each_named_delete_outcome() {
                 },
             );
             coordinator
-                .set(service.auto_lifecycle.clone())
+                .set(service.write_gate.clone())
                 .unwrap_or_else(|_| unreachable!());
             // `for_test_in` roots the sandbox cache here.
             let local_path = format!(

@@ -105,9 +105,14 @@ fn partial_direct_provenance_publishes_a_conservative_common_floor() {
 #[tokio::test]
 async fn full_snapshot_capture_serializes_resume_on_wake_lock() {
     let coordinator = AutoLifecycleCoordinator::default();
+    let gate = crate::service::write_gate::NodeWriteGate::unsealed_for_test(coordinator.clone());
     let sandbox_id = "sandbox-full-snapshot-race";
-    let (_wake_guard, _artifact_guard) = coordinator
-        .artifact_publication_locks(sandbox_id, pplx_space_snapshot_model::ArtifactKind::Full)
+    let (_wake_guard, _artifact_guard) = gate
+        .lock_publication_for_read(
+            sandbox_id,
+            pplx_space_snapshot_model::ArtifactKind::Full,
+            crate::service::write_gate::Reader::Test,
+        )
         .await;
 
     let (resumed_tx, mut resumed_rx) = oneshot::channel();

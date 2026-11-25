@@ -11,6 +11,7 @@ use super::cleanup_support::{
 };
 use super::start_support::{ActivationAdmissionPermit, ActivationCleanupGuard};
 use super::tail_support::*;
+use super::write_gate::DrainCompatible;
 use super::*;
 use crate::db::cleanup_jobs::CleanupOutcome;
 use pplx_space_events::{
@@ -1187,7 +1188,7 @@ impl SandboxManagerService {
         // the fence, so a cancelled caller can't release it before the claim
         // commits, and it's dropped before the cleanup runs.
         let artifact_guard = if spec.discard_retained_filesystem {
-            let Ok(guard) = self.auto_lifecycle.artifact_lock(&id).try_lock_owned() else {
+            let Some(guard) = self.write_gate.try_lock(&id, DrainCompatible::Cleanup) else {
                 return Err(CleanupAdmissionError::DiscardCaptureUnfinished {
                     sandbox_id,
                     reason: "its artifacts are locked, as by a backup being admitted",
@@ -2123,9 +2124,8 @@ impl SandboxManagerService {
         job_id: Option<&JobId>,
     ) -> CleanupFinalizationOutcome {
         let artifact_guard = self
-            .auto_lifecycle
-            .artifact_lock(sandbox_id)
-            .lock_owned()
+            .write_gate
+            .lock(sandbox_id, DrainCompatible::Cleanup)
             .await;
         let owned_sandbox_id = sandbox_id.to_owned();
         // Inspected under the artifact lock, which the completion below keeps.

@@ -13,6 +13,7 @@ use super::create_support::*;
 use super::spaced_bridge::*;
 use super::start_support::ActivationAdmissionKind;
 use super::tail_support::*;
+use super::write_gate::{DrainCompatible, LockedWriter, Producer, Reader};
 use super::*;
 use futures_util::StreamExt;
 use pplx_space_events::{
@@ -929,8 +930,10 @@ impl SandboxManagerService {
 
         for sandbox_id in sandbox_ids {
             let sandbox = self.lookup_snapshot_inventory_sandbox(sandbox_id).await?;
-            let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-            let _guard = artifact_lock.lock().await;
+            let _guard = self
+                .write_gate
+                .lock_for_read(&sandbox.id, Reader::Listing)
+                .await;
             let sandbox = self.lookup_snapshot_inventory_sandbox(sandbox.id).await?;
             let batch = list_snapshots_for_sandbox(
                 &mut node_client,
@@ -1303,9 +1306,14 @@ impl SandboxManagerService {
         }
 
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let artifact_guard = artifact_lock.lock().await;
-        let sandbox = self.lookup_sandbox(&sandbox.id)?;
+        // A full snapshot restarts by restoring it, a disk snapshot by a cold
+        // boot.
+        let is_full = snapshot_name.starts_with("f-");
+        let restart_activation = if is_full {
+            ActivationAdmissionKind::Restore
+        } else {
+            ActivationAdmissionKind::Cold
+        };
         // A rollback that doesn't restart rewrites the sandbox's disk, which a
         // drain may already have reported durable, and leaves it stopped. It
         // is a producer like any other: a node known sealed refuses it for a
@@ -1314,17 +1322,18 @@ impl SandboxManagerService {
         // meanwhile reports the sandbox pending until it ends. A running or
         // paused sandbox's rollback is admitted; the stopped sandbox it leaves
         // keeps a v2 drain pending, since the drain doesn't move one. A
-        // restarting rollback is refused below by the seal's check of its
-        // restart.
-        let _producer = if auto_restart {
-            None
+        // restarting rollback is an activation, refused below by the seal's
+        // check of its restart.
+        let artifact_guard = if auto_restart {
+            self.write_gate
+                .lock_for_activation(&sandbox.id, restart_activation)
+                .await
         } else {
-            Some(self.activation_seal.admit_producer(
-                "rollback",
-                &sandbox.id,
-                crate::activation_seal::has_vm(sandbox.state),
-            )?)
+            self.write_gate
+                .lock_for_write(&sandbox.id, LockedWriter::Producer(Producer::Rollback))
+                .await?
         };
+        let sandbox = self.lookup_sandbox(&sandbox.id)?;
         #[cfg(test)]
         if !auto_restart {
             crate::auto_lifecycle::AutoLifecycleCoordinator::rendezvous(
@@ -1410,21 +1419,13 @@ impl SandboxManagerService {
             ));
         }
 
-        // A full snapshot restarts by restoring it, a disk snapshot by a cold
-        // boot.
-        let is_full = snapshot_name.starts_with("f-");
-        let restart_activation = if is_full {
-            ActivationAdmissionKind::Restore
-        } else {
-            ActivationAdmissionKind::Cold
-        };
         // A sealed node refuses the restart's activation: refuse the rollback
         // before it stops or rewrites anything, rather than leave a
         // rolled-back sandbox stopped. A seal that lands after this check
         // still refuses the restart ([`Self::rollback_restart_failure`]).
         if auto_restart {
-            self.activation_seal
-                .check(restart_activation.as_str(), &sandbox.id)?;
+            self.write_gate
+                .check_activation(restart_activation, &sandbox.id)?;
         }
 
         // Check every required input before stopping the VM. A published full
@@ -1733,8 +1734,8 @@ impl SandboxManagerService {
     ) -> Status {
         let sealed = status.code() == tonic::Code::FailedPrecondition
             && self
-                .activation_seal
-                .check(activation.as_str(), sandbox_id)
+                .write_gate
+                .check_activation(activation, sandbox_id)
                 .is_err();
         let stopped = self
             .lookup_sandbox(sandbox_id)

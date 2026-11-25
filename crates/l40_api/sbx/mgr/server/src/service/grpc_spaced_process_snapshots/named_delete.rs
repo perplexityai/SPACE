@@ -66,8 +66,10 @@ impl SandboxManagerService {
         staged: &mut Vec<(String, String)>,
     ) -> Result<Response<DeleteSnapshotsResponse>, Status> {
         let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let _guard = artifact_lock.lock().await;
+        let _guard = self
+            .write_gate
+            .lock(&sandbox.id, DrainCompatible::SnapshotDelete)
+            .await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.require_snapshot_mutation_ownership(&sandbox.id)?;
         let protected_instance_path = sandbox.current_local_artifact_id.and_then(|artifact_id| {

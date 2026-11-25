@@ -6,6 +6,8 @@ use crate::db::{Edge, edges};
 use crate::service::cleanup_support::{
     StateWriteRejected, require_state_write_from, state_write_result, update_state_from_best_effort,
 };
+use crate::service::start_support::ActivationAdmissionKind;
+use crate::service::write_gate::DrainCompatible;
 
 const PAUSE_RECONCILIATION_ATTEMPTS: usize = 3;
 
@@ -280,8 +282,10 @@ impl SandboxManagerService {
             SandboxEventSource::SbxManager,
             event_details,
         );
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let _artifact_guard = artifact_lock.lock_for_capture().await;
+        let _artifact_guard = self
+            .write_gate
+            .lock_for_capture(&sandbox.id, DrainCompatible::Pause)
+            .await;
         self.settle_guest_update_for_lifecycle(&sandbox.id).await?;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
@@ -439,8 +443,10 @@ impl SandboxManagerService {
         let sandbox_id = sandbox.id.clone();
         let wake_lock = self.auto_lifecycle.wake_lock(&sandbox.id);
         let _guard = wake_lock.lock().await;
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let _guard = artifact_lock.lock().await;
+        let _guard = self
+            .write_gate
+            .lock_for_activation(&sandbox.id, ActivationAdmissionKind::ResidentResume)
+            .await;
 
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Resume")?;

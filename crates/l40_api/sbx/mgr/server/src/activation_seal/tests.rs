@@ -164,12 +164,16 @@ fn an_activation_reads_the_seal_in_memory_not_the_database() {
     )
     .unwrap();
     drop(
-        seal.admit("cold", SANDBOX)
+        seal.admit(&GateKey::FOR_TEST, "cold", SANDBOX)
             .expect("the seal in memory is unsealed"),
     );
 
     let restarted = ActivationSeal::load(&db.lock().unwrap());
-    let refused = restarted.admit("cold", SANDBOX).unwrap_err();
+    let refused = Status::from(
+        restarted
+            .admit(&GateKey::FOR_TEST, "cold", SANDBOX)
+            .unwrap_err(),
+    );
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(refused.message().contains("generation 4"), "{refused:?}");
     seal.assert_quiesced();
@@ -194,7 +198,8 @@ fn restore_seal_table(db: &SharedConnection, row: Option<ActivationSealRecord>) 
 }
 
 #[track_caller]
-fn assert_unreadable_refusal(refused: &Status) {
+fn assert_unreadable_refusal(refused: SealRefusal) {
+    let refused = Status::from(refused);
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
     assert!(
         refused
@@ -214,11 +219,14 @@ fn an_unreadable_seal_refuses_activations_until_a_seal_call_reads_it() {
     let db = SharedConnection::new(crate::db::test_conn());
     hide_seal_table(&db);
     let seal = ActivationSeal::load(&db.lock().unwrap());
-    assert_unreadable_refusal(&seal.admit("restore", SANDBOX).unwrap_err());
-    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+    assert_unreadable_refusal(
+        seal.admit(&GateKey::FOR_TEST, "restore", SANDBOX)
+            .unwrap_err(),
+    );
+    assert_unreadable_refusal(seal.check(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
     assert!(seal.status().in_flight.is_empty());
     assert_eq!(seal.seal(&db, 6).unwrap_err().code(), tonic::Code::Internal);
-    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+    assert_unreadable_refusal(seal.check(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
 
     restore_seal_table(
         &db,
@@ -227,10 +235,13 @@ fn an_unreadable_seal_refuses_activations_until_a_seal_call_reads_it() {
             sealed: true,
         }),
     );
-    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+    assert_unreadable_refusal(seal.check(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
     seal.seal(&db, 5).unwrap();
     assert_eq!(seal.status().sealed_generation, Some(5));
-    let refused = seal.admit("restore", SANDBOX).unwrap_err();
+    let refused = Status::from(
+        seal.admit(&GateKey::FOR_TEST, "restore", SANDBOX)
+            .unwrap_err(),
+    );
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(
         refused.message().contains(ACTIVATIONS_SEALED_MARKER),
@@ -267,7 +278,7 @@ async fn the_background_read_publishes_the_seal_row_once_it_reads() {
         ));
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(!retry.is_finished(), "{row:?}: retries while unreadable");
-        assert_unreadable_refusal(&seal.admit("cold", SANDBOX).unwrap_err());
+        assert_unreadable_refusal(seal.admit(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
 
         restore_seal_table(&db, row);
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -275,11 +286,12 @@ async fn the_background_read_publishes_the_seal_row_once_it_reads() {
         retry.await.unwrap();
         match row.filter(|row| row.sealed) {
             None => drop(
-                seal.admit("cold", SANDBOX)
+                seal.admit(&GateKey::FOR_TEST, "cold", SANDBOX)
                     .unwrap_or_else(|refused| panic!("{row:?}: {refused:?}")),
             ),
             Some(_) => {
-                let refused = seal.admit("cold", SANDBOX).unwrap_err();
+                let refused =
+                    Status::from(seal.admit(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
                 assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{row:?}");
                 assert!(refused.message().contains("generation 4"), "{refused:?}");
             }
@@ -305,7 +317,7 @@ fn a_seal_call_between_the_background_read_and_its_publication_wins() {
     seal.seal(&db, 9).unwrap();
     assert!(seal.publish_recovered(read), "the seal is known");
     assert_eq!(seal.status().sealed_generation, Some(9));
-    let refused = seal.admit("cold", SANDBOX).unwrap_err();
+    let refused = Status::from(seal.admit(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     seal.assert_quiesced();
 }
@@ -332,13 +344,13 @@ async fn an_activation_is_refused_not_blocked_while_the_background_read_waits() 
     let (sent, received) = std::sync::mpsc::channel();
     let checking = Arc::clone(&seal);
     std::thread::spawn(move || {
-        let _ = sent.send(checking.check("cold", SANDBOX));
+        let _ = sent.send(checking.check(&GateKey::FOR_TEST, "cold", SANDBOX));
     });
     let refused = received
         .recv_timeout(Duration::from_secs(2))
         .expect("the check is not blocked behind the background read")
         .unwrap_err();
-    assert_unreadable_refusal(&refused);
+    assert_unreadable_refusal(refused);
     drop(guard);
     shutdown.cancel();
     retry.await.unwrap();
@@ -365,7 +377,11 @@ async fn the_background_read_runs_only_while_the_seal_is_unknown() {
     tokio::time::timeout(Duration::from_secs(1), tracker.wait())
         .await
         .expect("the retry ends at shutdown");
-    assert_unreadable_refusal(&unknown.check("cold", SANDBOX).unwrap_err());
+    assert_unreadable_refusal(
+        unknown
+            .check(&GateKey::FOR_TEST, "cold", SANDBOX)
+            .unwrap_err(),
+    );
 }
 
 /// The WARN events logged while it is the thread's default subscriber, each
@@ -435,7 +451,7 @@ async fn a_poisoned_database_is_reported_by_the_background_read() {
         "the poisoned read is published"
     );
     assert!(warnings.any_contains(POISONED_DATABASE), "{:?}", warnings.0);
-    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+    assert_unreadable_refusal(seal.check(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
     shutdown.cancel();
     retry.await.unwrap();
 }
@@ -466,7 +482,7 @@ async fn a_panicked_background_read_is_reported() {
     let error = seal.lock_state().record.clone().unwrap_err();
     assert!(error.contains("panicked"), "{error}");
     assert!(warnings.any_contains("panicked"), "{:?}", warnings.0);
-    assert_unreadable_refusal(&seal.check("cold", SANDBOX).unwrap_err());
+    assert_unreadable_refusal(seal.check(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap_err());
 }
 
 /// The token ends its work's in-flight count however the work ends: it
@@ -479,7 +495,7 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
     let failed = {
         let seal = Arc::clone(&seal);
         move || -> Result<(), &'static str> {
-            let _token = seal.admit("cold", SANDBOX).unwrap();
+            let _token = seal.admit(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap();
             Err("launch failed")
         }
     };
@@ -490,7 +506,9 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
     let cancelled = tokio::spawn({
         let seal = Arc::clone(&seal);
         async move {
-            let _token = seal.admit("resident_resume", SANDBOX).unwrap();
+            let _token = seal
+                .admit(&GateKey::FOR_TEST, "resident_resume", SANDBOX)
+                .unwrap();
             let _ = held_tx.send(());
             std::future::pending::<()>().await;
         }
@@ -504,7 +522,7 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
     let panicked = tokio::spawn({
         let seal = Arc::clone(&seal);
         async move {
-            let _token = seal.admit("cold", SANDBOX).unwrap();
+            let _token = seal.admit(&GateKey::FOR_TEST, "cold", SANDBOX).unwrap();
             panic!("activation step panicked");
         }
     });
@@ -513,104 +531,9 @@ async fn in_flight_tokens_are_released_on_error_cancellation_and_panic() {
 
     seal.assert_quiesced();
     #[allow(clippy::mem_forget, reason = "the leak a forgotten token is")]
-    std::mem::forget(seal.admit("restore", SANDBOX).unwrap());
+    std::mem::forget(seal.admit(&GateKey::FOR_TEST, "restore", SANDBOX).unwrap());
     assert!(
         std::panic::catch_unwind(|| seal.assert_quiesced()).is_err(),
         "the leak check fails on a forgotten token"
     );
-}
-
-/// A node-local artifact producer for a sandbox without a VM is refused on a
-/// node known sealed, with the plain sealed refusal, and admitted on a node
-/// never sealed or whose seal is unknown; one for a sandbox with a VM is
-/// admitted sealed too. Each admitted producer is in flight, apart from the
-/// activations, until its token drops.
-#[test]
-fn a_sealed_node_refuses_only_the_producers_of_sandboxes_without_a_vm() {
-    let db = SharedConnection::new(crate::db::test_conn());
-    let seal = ActivationSeal::load(&db.lock().unwrap());
-    let unsealed = seal.admit_producer("snapshot", SANDBOX, false).unwrap();
-    seal.seal(&db, 3).unwrap();
-    let refused = seal
-        .admit_producer("snapshot", "sandbox-2", false)
-        .unwrap_err();
-    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        refused.message().starts_with(ACTIVATIONS_SEALED_MARKER),
-        "{refused:?}"
-    );
-    let with_vm = seal.admit_producer("snapshot", "sandbox-3", true).unwrap();
-    let status = seal.status();
-    assert_eq!(status.producers_in_flight, [SANDBOX, "sandbox-3"]);
-    assert!(status.in_flight.is_empty());
-    drop((unsealed, with_vm));
-    seal.assert_quiesced();
-
-    hide_seal_table(&db);
-    let unknown = ActivationSeal::load(&db.lock().unwrap());
-    assert!(unknown.read_error().is_some());
-    let admitted = unknown.admit_producer("snapshot", SANDBOX, false).unwrap();
-    assert_eq!(unknown.status().producers_in_flight, [SANDBOX]);
-    drop(admitted);
-    unknown.assert_quiesced();
-}
-
-/// The admission of work that would leave a sandbox stopped, the idle
-/// auto-stop of a suspended, started or paused sandbox, which asks as a
-/// producer of a sandbox without a VM: a node known sealed refuses it with
-/// the sealed refusal and counts nothing; a node never sealed, cancelled or
-/// whose seal row can't be read admits it, and counts it in flight until its
-/// token is dropped.
-#[test]
-fn a_sealed_node_refuses_work_that_would_leave_a_sandbox_stopped() {
-    let db = SharedConnection::new(crate::db::test_conn());
-    let seal = ActivationSeal::load(&db.lock().unwrap());
-    let admitted = seal
-        .admit_producer("idle auto-stop", SANDBOX, false)
-        .unwrap();
-    assert_eq!(seal.status().producers_in_flight, [SANDBOX]);
-    drop(admitted);
-    seal.seal(&db, 3).unwrap();
-    let refused = seal
-        .admit_producer("idle auto-stop", SANDBOX, false)
-        .unwrap_err();
-    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        refused.message().starts_with(ACTIVATIONS_SEALED_MARKER)
-            && refused.message().contains("idle auto-stop"),
-        "{refused:?}"
-    );
-    seal.assert_quiesced();
-    seal.unseal(&db, 3).unwrap();
-    drop(
-        seal.admit_producer("idle auto-stop", SANDBOX, false)
-            .unwrap(),
-    );
-    seal.assert_quiesced();
-
-    hide_seal_table(&db);
-    let unknown = ActivationSeal::load(&db.lock().unwrap());
-    assert!(unknown.read_error().is_some());
-    let admitted = unknown
-        .admit_producer("idle auto-stop", SANDBOX, false)
-        .unwrap();
-    assert_eq!(unknown.status().producers_in_flight, [SANDBOX]);
-    drop(admitted);
-    unknown.assert_quiesced();
-}
-
-/// A sandbox has a VM while no cleanup owns its row and its lifecycle is
-/// `started` or `paused`.
-#[test]
-fn only_a_started_or_paused_sandbox_has_a_vm() {
-    for state in SandboxStatus::sweep() {
-        assert_eq!(
-            has_vm(state),
-            matches!(
-                state,
-                SandboxStatus::Unowned(SandboxState::Started | SandboxState::Paused)
-            ),
-            "{state}"
-        );
-    }
 }

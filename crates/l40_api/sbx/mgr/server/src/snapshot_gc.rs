@@ -78,6 +78,8 @@ use crate::local_artifacts::{
 
 pub(crate) struct GcOwnership {
     pub coordinator: crate::auto_lifecycle::AutoLifecycleCoordinator,
+    /// The artifact locks each eviction takes.
+    pub write_gate: crate::service::write_gate::NodeWriteGate,
     pub drain: Arc<crate::service::drain::DrainState>,
     pub shutdown: CancellationToken,
     pub node_manager: crate::node_manager_transport::NodeManagerConnector,
@@ -480,11 +482,13 @@ async fn gc_tick(
             .ok_or_else(|| format!("plan_inputs missing key {}", candidate.key))?;
         let candidate_id_str = candidate.key.clone();
         let candidate_size = candidate.size_bytes;
-        let artifact_lock = ownership.coordinator.artifact_lock(&sandbox_id);
         let staging_lock = ownership.coordinator.staging_lock(&sandbox_id);
-        let guards = artifact_lock
-            .try_lock_owned()
-            .ok()
+        let guards = ownership
+            .write_gate
+            .try_lock(
+                &sandbox_id,
+                crate::service::write_gate::DrainCompatible::GarbageCollection,
+            )
             .zip(staging_lock.try_lock_owned().ok());
         let Some(guards) = guards else {
             report.skipped_not_ready += 1;

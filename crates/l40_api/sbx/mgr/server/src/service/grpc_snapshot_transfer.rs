@@ -1,5 +1,6 @@
 use super::cleanup_support::CleanupLockTryResult;
 use super::create_support::{validate_path_component, validate_snapshot_name};
+use super::write_gate::{DrainCompatible, LockedWriter, Producer, Reader};
 use super::*;
 use std::mem::DropGuard;
 
@@ -69,8 +70,10 @@ impl SandboxManagerService {
         if transfer.get_version_num() != 7 {
             return Ok(false);
         }
-        let artifact = self.auto_lifecycle.artifact_lock(&sandbox.to_string());
-        let Ok(_guard) = artifact.try_lock_owned() else {
+        let Some(_guard) = self
+            .write_gate
+            .try_lock(&sandbox.to_string(), DrainCompatible::StagingCleanup)
+        else {
             return Ok(false);
         };
         let metadata = std::fs::symlink_metadata(path)?;
@@ -97,7 +100,7 @@ impl SandboxManagerService {
         .await;
         let id = pinned.id;
         let wake = self.auto_lifecycle.wake_lock(&id).lock_owned().await;
-        let artifact = self.auto_lifecycle.artifact_lock(&id).lock_owned().await;
+        let artifact = self.write_gate.lock_for_read(&id, Reader::Export).await;
         let CleanupLockTryResult::Acquired(fence) = self.try_cleanup_fence(&id) else {
             return Err(Status::aborted("sandbox cleanup is in progress"));
         };
@@ -336,9 +339,10 @@ impl SandboxManagerService {
             self.auto_lifecycle.wake_lock(&sandbox_id).lock_owned(),
         )
         .await?;
-        let _artifact = super::restart_admission::wait_for_activation_admission(
+        let locked = super::restart_admission::wait_for_activation_admission(
             &sandbox_id,
-            self.auto_lifecycle.artifact_lock(&sandbox_id).lock_owned(),
+            self.write_gate
+                .lock_for_read(&sandbox_id, Reader::BeforeAdmission),
         )
         .await?;
         let CleanupLockTryResult::Acquired(_fence) = self.try_cleanup_fence(&sandbox_id) else {
@@ -371,7 +375,9 @@ impl SandboxManagerService {
                 "snapshot target identity or state does not match",
             ));
         }
-        let _producer = self.admit_artifact_producer("snapshot import", &sandbox)?;
+        // Admitted under the lock its target was read under, and held until
+        // the import is published.
+        let _artifact = locked.admit(LockedWriter::Producer(Producer::SnapshotImport))?;
         let base = pplx_space_host_layout::paths::sandbox_snapshots_dir(&sandbox_id);
         let final_dir = format!("{base}/{name}");
         match tokio::fs::symlink_metadata(&final_dir).await {

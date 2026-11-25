@@ -14,7 +14,7 @@ use pplx_space_sandbox_model::SandboxId;
 use tokio::sync::Semaphore;
 
 use super::planner::{DrainScans, PlannedAction, SNAPSHOT_REASON, STOPPED_REASON};
-use crate::activation_seal::ACTIVATIONS_SEALED_MARKER;
+use crate::activation_seal::{ACTIVATIONS_SEALED_MARKER, ActivationSealStatus};
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::proto::{CreateSnapshotRequest, DrainReport, DrainWait as WireWait, SnapshotType};
 use crate::service::activation_support::internal_request;
@@ -300,6 +300,103 @@ async fn a_snapshot_in_flight_on_a_sealed_node_keeps_the_drain_pending() {
     }
 }
 
+/// Pin a durable full snapshot to suspended `sandbox_id`, so a drain finds
+/// it evacuated but for anything else it holds.
+fn pin_durable_snapshot(service: &SandboxManagerService, sandbox_id: &str) {
+    let pinned = pplx_space_snapshot_model::LocalArtifactId::new();
+    let db = service.db.lock().unwrap();
+    db.execute(
+        "INSERT INTO local_artifacts (
+             local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+             local_path, created_at, backup_completed_at, state
+         ) VALUES (?1, ?2, 'full', 'suspend', '/tmp/a', '0', '1', 'ready')",
+        crate::db::fixture::params![pinned.to_string(), sandbox_id],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE sandboxes SET current_local_artifact_id = ?2,
+             current_local_artifact_kind = 'full',
+             current_local_artifact_origin = 'suspend'
+         WHERE id = ?1",
+        crate::db::fixture::params![sandbox_id, pinned.to_string()],
+    )
+    .unwrap();
+}
+
+/// The write gate's invariant, through a drain's pass: a producer admitted
+/// before the seal holds the sandbox's artifact lock until its artifact is
+/// registered, so a pass that would find the sandbox evacuated checks it
+/// again instead, even with a first read that missed the producer; once its
+/// write commits, the new artifact is pending upload, and the drain is
+/// finished only once that artifact is durable.
+#[tokio::test]
+async fn a_producer_admitted_before_the_seal_keeps_its_row_pending_until_its_artifact_is_durable() {
+    let gate = Arc::new(Semaphore::new(0));
+    let node_manager = gated_node_manager(&gate);
+    let (conn, id) = sandbox_in(SandboxState::Suspended);
+    let service = service_on(conn, &node_manager);
+    pin_durable_snapshot(&service, &id);
+    // A suspended sandbox's disk snapshot, which a node known sealed would
+    // refuse, admitted before the seal.
+    let snapshot = tokio::spawn({
+        let service = service.clone();
+        let id = id.clone();
+        async move {
+            service
+                .create_snapshot(snapshot_request(&id, SnapshotType::Disk))
+                .await
+        }
+    });
+    producer_in_flight(&service, &id).await;
+    let first = service.begin_drain(7, HOLD).unwrap();
+    let missed = ActivationSealStatus {
+        producers_in_flight: Vec::new(),
+        ..first
+    };
+
+    let report = service.finish_drain(7, &missed, DrainScans::default());
+    assert!(report.evacuated.is_empty(), "{report:?}");
+    assert_eq!(kinds(&report), [(id.clone(), WireWait::External, false)]);
+    assert!(
+        report.pending[0]
+            .reason
+            .contains("another writer holds its artifacts"),
+        "{report:?}"
+    );
+
+    gate.add_permits(1);
+    let published = snapshot
+        .await
+        .unwrap()
+        .unwrap()
+        .into_inner()
+        .published_artifact
+        .expect("the snapshot is published");
+    let first = service.activation_seal.status();
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(!finished(&report), "{report:?}");
+    assert_eq!(kinds(&report), [(id.clone(), WireWait::Moving, false)]);
+    service.drain_actions.wait_idle().await;
+
+    service
+        .local_artifacts()
+        .mark_backup_completed(published.local_artifact_id.parse().unwrap())
+        .unwrap();
+    let first = service.activation_seal.status();
+    let report = service.finish_drain(7, &first, DrainScans::default());
+    assert!(finished(&report), "{report:?}");
+    assert_eq!(
+        report
+            .evacuated
+            .iter()
+            .map(|entry| entry.sandbox_id.as_str())
+            .collect::<Vec<_>>(),
+        [id.as_str()]
+    );
+    service.drain_actions.wait_idle().await;
+    service.activation_seal.assert_quiesced();
+}
+
 /// A snapshot that waits for the artifact lock a drain's suspend holds reads
 /// the row again once it has the lock: after the suspend it finds no VM and
 /// is refused, writing nothing. Had the suspend failed, leaving the VM, it
@@ -314,9 +411,14 @@ async fn a_snapshot_queued_behind_the_drains_suspend_is_refused_once_suspended()
         service.begin_drain(7, EVACUATE).unwrap();
         // The locks a drain suspend holds while it suspends the VM.
         let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
-        let artifact_lock = service.auto_lifecycle.artifact_lock(&id);
-        let capture = artifact_lock.lock_for_capture().await;
-        let unwaited = Arc::strong_count(&artifact_lock);
+        let capture = service
+            .write_gate
+            .lock_for_capture(
+                &id,
+                crate::service::write_gate::DrainCompatible::DrainSuspend,
+            )
+            .await;
+        let unwaited = service.write_gate.artifact_lock_handles(&id);
         let snapshot = tokio::spawn({
             let service = service.clone();
             let id = id.clone();
@@ -329,7 +431,7 @@ async fn a_snapshot_queued_behind_the_drains_suspend_is_refused_once_suspended()
         // The snapshot read the row once it waits for the artifact lock,
         // holding the lock's handle.
         tokio::time::timeout(Duration::from_secs(2), async {
-            while Arc::strong_count(&artifact_lock) == unwaited {
+            while service.write_gate.artifact_lock_handles(&id) == unwaited {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })

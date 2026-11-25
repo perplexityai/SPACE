@@ -19,6 +19,7 @@ use pplx_space_node_mgr_client::NodeManagerGrpcClient;
 use pplx_space_snapshot_model::ArtifactKind;
 
 use crate::local_artifacts::{CheckoutError, LocalArtifacts, NamedSnapshotDelete};
+use crate::service::write_gate::{DrainCompatible, LockedWriter, Producer};
 
 /// Snapshot retention per tier. Each tier's count covers the gap to the next tier.
 /// d-1m:  keep 5  → covers minutes 1-5 (until d-5m takes over)
@@ -169,8 +170,8 @@ pub(super) fn retention_candidate(
 /// not separate it from the capture. Its value is handed to `capture` and
 /// returned.
 ///
-/// Under the capture's locks, the capture asks the activation seal first
-/// ([`super::admit_scheduled_producer`]): on a sealed node, a sandbox that no
+/// The capture's locks admit it as a producer
+/// ([`Producer::ScheduledDiskSnapshot`]): on a sealed node, a sandbox that no
 /// longer has a VM is refused, and the tick fails with nothing captured.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prune_and_capture<T>(
@@ -186,9 +187,9 @@ pub(super) async fn prune_and_capture<T>(
     let artifacts = LocalArtifacts::new(ctx.db.clone());
     let mut staged = Staged::default();
     let pruned = {
-        let (_wake_guard, _artifact_guard) = ctx
-            .auto_lifecycle
-            .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
+        let _artifact_guard = ctx
+            .write_gate
+            .lock(sandbox_id, DrainCompatible::GarbageCollection)
             .await;
         prune_scheduled_snapshots(node_client, &artifacts, sandbox_id, cache_root, &mut staged)
             .await
@@ -215,10 +216,14 @@ pub(super) async fn prune_and_capture<T>(
     }
     let prepared = prepare(node_client).await?;
     let (_wake_guard, _artifact_guard) = ctx
-        .auto_lifecycle
-        .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
-        .await;
-    let _producer = super::admit_scheduled_producer(ctx, "scheduled disk snapshot", sandbox_id)?;
+        .write_gate
+        .lock_for_publication(
+            sandbox_id,
+            ArtifactKind::Disk,
+            LockedWriter::Producer(Producer::ScheduledDiskSnapshot),
+        )
+        .await
+        .map_err(|refusal| refusal.to_string())?;
     capture(node_client, &prepared).await?;
     Ok(prepared)
 }
