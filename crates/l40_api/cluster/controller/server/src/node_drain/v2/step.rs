@@ -329,10 +329,12 @@ pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
             .await
             .then_some(NodeStep::Drained),
         // A drained node waits for `:terminate` or `:undrain`. It is still
-        // sealed, so its tick keeps its cordon, and writes no sandbox row and
-        // makes no node call.
+        // sealed, so its tick keeps its cordon; it writes no sandbox row and
+        // makes no node call, and counts the durable rows still homed on it
+        // evacuated.
         Some("drained") => {
             let _ = converge_cordon(sink, node).await;
+            count_drained(sink, node.id, generation).await;
             None
         }
         Some("terminating") => terminate(sink, authority, node, generation).await,

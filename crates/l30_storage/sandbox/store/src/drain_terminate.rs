@@ -310,5 +310,37 @@ pub async fn release_durable_suspended(
     Ok(released)
 }
 
+/// The rows the drained tick of a v2 drain counts evacuated from
+/// `node_id`, by id: the `suspended` rows naming it, active or target, whose
+/// state a durable snapshot holds
+/// ([`snapshot_durable_for_source_release`]). A v2 drain never moves a
+/// stopped sandbox, so no stopped row is counted. A read: it takes no lock
+/// and writes nothing.
+pub async fn durable_suspended_rows_naming(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    /// `$1` = node id.
+    static DURABLE: LazyLock<String> = LazyLock::new(|| {
+        let suspended = snapshot_durable_for_source_release("s");
+        sql!(format!(
+            "SELECT s.id
+               FROM sandboxes s
+              WHERE s.id IN (
+                      SELECT id FROM sandboxes WHERE active_node_id = $1
+                      UNION
+                      SELECT id FROM sandboxes WHERE target_node_id = $1
+                    )
+                AND s.lifecycle = 'suspended'
+                AND {suspended}
+              ORDER BY s.id"
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(DURABLE.as_str()))
+        .bind(node_id)
+        .fetch_all(executor)
+        .await
+}
+
 #[cfg(test)]
 mod tests;
