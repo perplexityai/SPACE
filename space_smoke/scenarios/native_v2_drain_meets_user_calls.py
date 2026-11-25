@@ -42,8 +42,8 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
     on the sealed worker, and it keeps running there with its data intact.
     A wake of the one its user paused is told to retry with a 503, never a
     409, and lands it on the other worker once the drain made it durable.
-    Past the deadline, each call to the running one passes until the node
-    suspends it. Once the node suspends it, with its upload cut, a wake and
+    From just before the deadline, each call that meets the running one
+    passes until the node suspends it. Once the node suspends it, with its upload cut, a wake and
     a command of it are recorded, and no second execution of it runs off
     the worker; once the upload goes through, a wake lands it on the other
     worker, its data intact. The node reaches `drained`."""
@@ -95,7 +95,7 @@ def v2_drain_meets_user_calls(test: smoke.CommandSandboxFixture) -> None:
             uploads = drain.block("object-store")
             drain.expect_started_until_deadline([serving.sandbox_id], margin=5)
 
-        with test.phase("past the deadline: calls to the running one pass until the node suspends it"):
+        with test.phase("around the deadline: calls to the running one pass until the node suspends it"):
             drain.expect_calls_pass_until_suspended(serving)
 
         # The node's suspend reaches the row only once its snapshot is

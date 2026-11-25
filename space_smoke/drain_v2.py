@@ -1969,42 +1969,53 @@ class DrainV2Assertions:
         )
 
     def expect_calls_pass_until_suspended(
-        self, sandbox: DurableLifecycleSandbox, *, timeout: float = 180
-    ) -> list[int]:
-        """Past the deadline, until the node suspends the sandbox: the status
-        of each command create that met its VM running on the drained worker
-        before and after the call. Each passes, as before the deadline: a
-        drain refuses no call to a running sandbox. Watching starts at the
-        deadline, a call a second: the controller's first evacuating tick
-        lands up to its tick after the deadline and the node's suspend takes
-        longer, so at least one call must meet the VM running."""
+        self, sandbox: DurableLifecycleSandbox, *, lead: float = 5
+    ) -> dict[str, list[int]]:
+        """From `lead` seconds before the deadline until the node suspends the
+        sandbox, a command a second: each that met its VM running on the
+        drained worker before and after the call passes, before the deadline
+        and past it, as a drain refuses no call to a running sandbox. At
+        least one such call lands before the deadline, when the node still
+        holds the VM. Past the deadline the node suspends at the controller's
+        first evacuating call, up to one 5 s tick after it, so some runs meet
+        the VM running there and some don't: the calls that did are judged,
+        and how many there were is recorded. The statuses before and past
+        the deadline."""
 
         subject = cast(RawCallSandbox, sandbox)
-        self.wait_until_deadline()
-        seen: list[int] = []
-        deadline = time.monotonic() + timeout
+        bare = self.bare_id(sandbox.sandbox_id)
+        while (remaining := self.seconds_to_deadline()) > lead:
+            self._fixture.wait(max(1, remaining - lead))
+        before: list[int] = []
+        past: list[int] = []
+        # The lead, a tick, a call within its 45 s budget and the node's
+        # suspend starting, with a 30 s margin.
+        deadline = time.monotonic() + lead + 5 + 45 + 30
         while self.node_holds_vm_running(sandbox.sandbox_id):
+            asked = self.seconds_to_deadline()
             answer = subject.command_answer("true")
             if not self.node_holds_vm_running(sandbox.sandbox_id):
                 break
-            seen.append(answer.status)
+            (before if asked > 0 else past).append(answer.status)
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "the node never suspended the running sandbox past the deadline",
-                sandbox_id=self.bare_id(sandbox.sandbox_id),
-                statuses=seen[-10:],
+                sandbox_id=bare,
+                before_deadline=before[-10:],
+                past_deadline=past[-10:],
             )
             self._fixture.wait(1)
-        self._fixture.record(f"calls_past_deadline_{self.bare_id(sandbox.sandbox_id)}", seen)
+        seen = {"before_deadline": before, "past_deadline": past}
+        self._fixture.record(f"calls_around_deadline_{bare}", seen)
         self._fixture.verify(
-            bool(seen),
-            "no call met the VM running past the deadline",
-            sandbox_id=self.bare_id(sandbox.sandbox_id),
+            bool(before),
+            "no call met the VM running in the seconds before the deadline",
+            sandbox_id=bare,
         )
         self._fixture.verify(
-            all(status == CALL_PASSED_STATUS for status in seen),
-            "a call to a running sandbox past the deadline did not pass",
-            statuses=seen,
+            all(status == CALL_PASSED_STATUS for status in before + past),
+            "a call to a running sandbox around the deadline did not pass",
+            **seen,
         )
         return seen
 

@@ -399,26 +399,30 @@ class GateAnswers(unittest.TestCase):
         with self.assertRaises(InvariantViolation):
             drain.expect_told_to_retry(self._answer(state="succeeded", progress=[GATE_RETRY_TEXT]))
 
-    def test_past_the_deadline_calls_pass_until_the_node_suspends(self) -> None:
+    def test_calls_around_the_deadline_pass_until_the_node_suspends(self) -> None:
         sandbox = "00000000-0000-4000-8000-00000000000d"
         # The node's own state: its row stays `started` with the upload cut.
         states = ["started", "started", "started", "suspending"]
         drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
-        drain._deadline = 0
+        # Inside the lead: the calls start at once, before the deadline.
+        drain._deadline = int(time.time()) + 3
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS, GATE_REFUSAL_STATUS])
-        self.assertEqual(drain.expect_calls_pass_until_suspended(caller), [CALL_PASSED_STATUS])  # type: ignore[arg-type]
+        self.assertEqual(
+            drain.expect_calls_pass_until_suspended(caller),  # type: ignore[arg-type]
+            {"before_deadline": [CALL_PASSED_STATUS], "past_deadline": []},
+        )
         self.assertEqual(caller.commands, 2)
         for refused in (409, GATE_REFUSAL_STATUS):
             drain, fixture = _assertions(_Control(node_states={sandbox: list(states)}))
-            drain._deadline = 0
+            drain._deadline = int(time.time()) + 3
             with self.subTest(refused=refused), self.assertRaises(InvariantViolation):
                 drain.expect_calls_pass_until_suspended(_Sandbox(sandbox, [refused, 201]))  # type: ignore[arg-type]
-            self.assertIn(f"calls_past_deadline_{sandbox}", fixture.evidence)
+            self.assertIn(f"calls_around_deadline_{sandbox}", fixture.evidence)
 
-    def test_past_the_deadline_a_call_must_meet_the_vm_running(self) -> None:
+    def test_before_the_deadline_a_call_must_meet_the_vm_running(self) -> None:
         sandbox = "00000000-0000-4000-8000-00000000000e"
         drain, _ = _assertions(_Control(node_states={sandbox: ["suspending"]}))
-        drain._deadline = 0
+        drain._deadline = int(time.time()) + 3
         caller = _Sandbox(sandbox, [CALL_PASSED_STATUS])
         with self.assertRaisesRegex(InvariantViolation, "no call met the VM running"):
             drain.expect_calls_pass_until_suspended(caller)  # type: ignore[arg-type]

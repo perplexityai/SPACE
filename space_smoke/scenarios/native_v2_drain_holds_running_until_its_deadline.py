@@ -12,15 +12,33 @@ from space_smoke.drain_v2 import (
 )
 
 PATH = "/tmp/space-smoke-v2-held.txt"
-# Long enough for the idle sandbox to be seen running and answering under
-# the drain; short enough that it suspends on its own inside the run.
-IDLE_TIMEOUT = "120s"
+# Long enough for the idle sandbox to be seen held and answering under the
+# drain (its last command is the file read there), and well under the bench's
+# 120 s eviction floor (`minIdleSecs` in space-sandbox-manager-local's
+# values.yaml), which counts from that same command: the idle suspend lands
+# at about 50 s, so its upload and the next report have more than a minute
+# before eviction may drop the node's rows, where an idle policy equal to the
+# floor left them one 15 s eviction interval.
+IDLE_TIMEOUT = "45s"
+IDLE_SECONDS = 45
 # The first hold: the drain must not reach it.
 LONG_HOLD_SECONDS = 60 * 60
 # How far ahead of the repeat the shortened deadline lands: a hold that only
 # has to pass, with the admin view showing it within a couple of the
 # controller's 5 s ticks and the held sandbox answering once before it.
 SHORT_AHEAD_SECONDS = 30
+# The paused resident's suspend and upload, from the seal: a report (62 s,
+# as below) and the work, under 5 s measured, four times over, with a 30 s
+# margin.
+DURABLE_SECONDS = 62 + 4 * 5 + 30
+# The idle suspend, from its last command: the idle policy, the node's 5 s
+# auto-lifecycle sweep, the suspend and upload (under 30 s measured) and a
+# 3 s poll, with a 30 s margin.
+IDLE_SUSPENDED_SECONDS = IDLE_SECONDS + 5 + 30 + 3 + 30
+# The next report after the row reads suspended: a 5 s controller tick, a
+# call within its 45 s budget, and a 2 s poll, with a 10 s margin. Inside
+# the minute eviction leaves it.
+REPORTED_SECONDS = 5 + 45 + 2 + 10
 
 
 # The hold's parts are crate tests: the planner's hold of a started row
@@ -87,19 +105,21 @@ def v2_drain_holds_running_until_its_deadline(test: smoke.CommandSandboxFixture)
                 drain.expect_file(sandbox, PATH)
 
         with test.phase("the paused one is made durable at once; a wake lands it on the other worker"):
-            drain.expect_durable(paused.sandbox_id, timeout=600)
+            drain.expect_durable(paused.sandbox_id, timeout=DURABLE_SECONDS)
             drain.wake_elsewhere(paused)
             drain.expect_file(paused, PATH)
 
         with test.phase("the idle one suspends on its own on the sealed worker and is reported evacuated"):
-            drain.expect_lifecycle_back(idle.sandbox_id, "suspended", timeout=600)
+            drain.expect_lifecycle_back(idle.sandbox_id, "suspended", timeout=IDLE_SUSPENDED_SECONDS)
+            # A report names it evacuated, and the controller keeps every
+            # sandbox a report named in `evacuated_total`, which only a report
+            # adds to before `drained`: read from either, so a report this
+            # poll missed still counts, and one that never came does not.
             drain.wait_for_report(
-                lambda report: any(
-                    entry.get("sandbox_id") == drain.bare_id(idle.sandbox_id)
-                    for entry in report.get("evacuated", [])
-                ),
+                lambda report: drain.bare_id(idle.sandbox_id)
+                in drain.evacuated_residents(report, [idle.sandbox_id]) | drain.evacuated_total(report),
                 "the node never reported the self-suspended sandbox evacuated",
-                timeout=600,
+                timeout=REPORTED_SECONDS,
             )
             drain.expect_held(busy.sandbox_id)
 
