@@ -595,9 +595,10 @@ message AllocateResponse {
   string slot_label = 9;
   // Slot-derived UID that owns lease-scoped host resources.
   uint32 sandbox_uid = 10;
-  // IPv4 address of the default-route interface in the request's netns_path,
-  // the externally created namespace the sandbox bridges to. Absent without a
-  // netns_path or when the node manager could not read it.
+  // First IPv4 address, in interface index order, that is neither loopback
+  // nor link-local in the request's netns_path, the externally created
+  // namespace the sandbox bridges to; the same address the shim selects.
+  // Absent without a netns_path or when the node manager could not read it.
   optional string external_address = 11;
 }
 
