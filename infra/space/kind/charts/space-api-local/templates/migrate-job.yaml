@@ -25,9 +25,17 @@ spec:
   activeDeadlineSeconds: {{ .Values.migrate.jobDeadlineSeconds }}
   template:
     metadata:
+      # The migrator logs plain text with no identity of its own, so the
+      # collecting Agent tags its lines from these: without them a lock-race
+      # retry or a "giving up on the migration" line lands under the image's
+      # name, with no cluster or version to scope a search or a monitor to.
+      # The version is the one the API pods this Job gates report.
+      annotations:
+        ad.datadoghq.com/tags: {{ dict "team" .Values.datadogTeam "cluster_id" .Values.clusterId "version" (.Values.telemetry.version | default .Values.image.tag) | toJson | quote }}
       labels:
         app.kubernetes.io/name: space-db-migrate
         app.kubernetes.io/instance: {{ .Release.Name }}
+        tags.datadoghq.com/service: space-db-migrator
     spec:
       restartPolicy: Never
       {{- with .Values.nodeSelector }}
