@@ -1,6 +1,5 @@
 //! Production [`SweepSink`] backed by Postgres and the substrate.
 
-use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +16,7 @@ use pplx_space_durations::PositiveDuration;
 use pplx_space_k8s_ids::{PodName, PodUid};
 use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_store::k8s_executions::transient_sweeper;
 use pplx_space_sandbox_store::row_locks;
 use pplx_space_sandbox_store::sweeper;
 use sqlx::PgPool;
@@ -36,20 +36,6 @@ use pplx_space_api::controllers::substrate::AbandonedRestoreRetirement;
 /// steady-state candidate count is tiny (only slow-create preserves no client
 /// ever retried), so this rarely binds.
 const COMMAND_READY_PENDING_BATCH: i64 = 50;
-
-/// Rotate a failed-cleanup candidate behind the others by bumping its active
-/// execution's `updated_at`. Bind order: `$1` = sandbox id, `$2` =
-/// [`SubstrateKind::Kubernetes`] (see [`failed_active_execution_scope`]).
-pub(super) const NOTE_FAILED_CLEANUP_ATTEMPT_SQL: &str = sql!(
-    "UPDATE sandbox_k8s_executions e
-     SET updated_at = NOW()
-     FROM sandboxes s
-     WHERE e.sandbox_id = s.id
-       AND s.id = $1
-       AND s.managed_by = $2
-       AND s.lifecycle = 'failed'
-       AND e.active"
-);
 
 /// The `managed_by` the failed-active-execution cleanup binds, or `None` when
 /// the running substrate is not Kubernetes. That cleanup's statements scope to
@@ -242,31 +228,16 @@ async fn retire_reverted_restore_execution(
     if fence.recorded == RecordedExecution::Unread {
         return Ok(false);
     }
-    let retired = sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions
-            SET active = FALSE,
-                state = 'replaced',
-                pod_ip = NULL,
-                terminated_at = COALESCE(terminated_at, NOW()),
-                updated_at = NOW()
-          WHERE sandbox_id = $1
-            AND active
-            AND pod_name = $2
-            AND generation IS NOT DISTINCT FROM $3
-            AND activation_attempt_id IS NOT DISTINCT FROM $4
-            AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $5::TEXT
-            AND route_activation_id IS NOT DISTINCT FROM $6"
-    ))
-    .bind(sandbox_id)
-    .bind(fence.pod_name.as_str())
-    .bind(fence.generation)
-    .bind(fence.activation_attempt_id)
-    .bind(fence.recorded.pod_uid().map(PodUid::as_str))
-    .bind(fence.recorded.route_activation_id())
-    .execute(&mut **tx)
-    .await?
-    .rows_affected()
-        == 1;
+    let retired = transient_sweeper::retire_reverted_restore_execution(
+        &mut **tx,
+        sandbox_id,
+        fence.pod_name.as_str(),
+        fence.generation,
+        fence.activation_attempt_id,
+        fence.recorded.pod_uid().map(PodUid::as_str),
+        fence.recorded.route_activation_id(),
+    )
+    .await?;
     if retired {
         // The retired execution no longer places the row. The cleanup that
         // follows unplaces it too, but it is best-effort, and a `suspended`
@@ -672,16 +643,7 @@ impl SweepSink for SubstrateSweepSink {
         // CAS's "no pod IP" check reads a committed IP rather than racing one.
         // If an execution-only writer holds that lock, defer to the next tick
         // rather than waiting while holding the sandbox lock.
-        let execution_locked = sqlx::query(sql!(
-            "SELECT id
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND active
-                FOR UPDATE NOWAIT"
-        ))
-        .bind(sandbox_id)
-        .execute(&mut *tx)
-        .await;
+        let execution_locked = transient_sweeper::lock_active_nowait(&mut tx, sandbox_id).await;
         match execution_locked {
             Ok(_) => {}
             Err(error) if crate::node_drain::store::is_lock_timeout(&error) => {
@@ -897,11 +859,7 @@ impl SweepSink for SubstrateSweepSink {
         // because a `failed` sandbox cannot have a create in flight, so
         // nothing reads that age for these rows; were it read, every rotation
         // would refresh it and an abandoned create would defer forever.
-        sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)
-            .bind(sandbox_id)
-            .bind(managed_by)
-            .execute(&self.pool)
-            .await?;
+        transient_sweeper::note_failed_cleanup_attempt(&self.pool, sandbox_id, managed_by).await?;
         Ok(())
     }
 

@@ -50,9 +50,11 @@ use uuid::Uuid;
 /// The `jsonb_to_recordset` column list of one published sandbox row with
 /// its transition receipt, as the publish path serializes it.
 /// [`lock_suspended_projection_candidates`](crate::quarantine_publication::lock_suspended_projection_candidates)
-/// and a statement still in the internal API splice it as well, and its names
-/// must match the fields that path serializes: `jsonb_to_recordset` reads a
-/// missing field as NULL.
+/// splices it as well, and
+/// [`lock_activation_rollback_candidates`](crate::k8s_executions::quarantine_rollback::lock_activation_rollback_candidates)
+/// spells the same list out: change them together. Its names must match the
+/// fields that path serializes: `jsonb_to_recordset` reads a missing field
+/// as NULL.
 pub const TRANSITION_RECEIPT_RECORD_COLUMNS: &str = "
     sandbox_id UUID,
     published_lifecycle TEXT,

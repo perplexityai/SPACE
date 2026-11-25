@@ -123,6 +123,7 @@ use pplx_space_sandbox_portability::{
     pod_less_drain_revert_loses_no_newer_bytes,
 };
 use pplx_space_sandbox_store::drain;
+use pplx_space_sandbox_store::k8s_executions::pod_less_giveup;
 use pplx_space_sandbox_store::row_locks;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
@@ -602,16 +603,7 @@ async fn recover_pod_less_sandbox_locked(
     // it. The drained-node terminator's flip fences the same way.
     locks::share_lock_node(&mut tx, candidate.source_node_id).await?;
     row_locks::lock_exists(&mut tx, candidate.sandbox_id).await?;
-    sqlx::query(sql!(
-        "SELECT 1
-           FROM sandbox_k8s_executions
-          WHERE sandbox_id = $1
-          ORDER BY generation
-            FOR UPDATE"
-    ))
-    .bind(candidate.sandbox_id)
-    .execute(&mut *tx)
-    .await?;
+    pod_less_giveup::lock_executions_in_generation_order(&mut tx, candidate.sandbox_id).await?;
 
     let eligible = precheck(&mut *tx, candidate).await?.and_then(|generation| {
         if generation == expected {
@@ -657,19 +649,7 @@ async fn retire_executions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions e
-            SET active = FALSE,\n\
-                state = 'suspended',\n\
-                pod_ip = NULL,\n\
-                terminated_at = COALESCE(e.terminated_at, NOW()),\n\
-                updated_at = NOW()
-          WHERE e.sandbox_id = $1
-            AND e.active"
-    ))
-    .bind(sandbox_id)
-    .execute(&mut **tx)
-    .await?;
+    pod_less_giveup::retire_active_executions(&mut **tx, sandbox_id).await?;
     Ok(())
 }
 

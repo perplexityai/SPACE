@@ -18,8 +18,6 @@
 //! transactions, their lock order (the sandbox row before its executions),
 //! their re-checks between statements and the decision on each outcome.
 
-pub mod activation_fence;
-
 use pplx_space_accounts::{ClientId, NodeId};
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_node_model::SubstrateKind;
@@ -30,9 +28,19 @@ use uuid::Uuid;
 
 use crate::SandboxStoreError;
 
+pub mod activation_fence;
+pub mod auto_lifecycle_delete;
+pub mod backup_generation_fence;
 pub mod claim;
 pub mod materialize;
+#[cfg(test)]
+pub(crate) mod ownership_test_fixture;
+pub mod pod_less_giveup;
+pub mod quarantine_recovery;
+pub mod quarantine_rollback;
 pub mod retire;
+pub mod suspended_reaper;
+pub mod transient_sweeper;
 pub mod transition;
 
 /// The sandbox's active execution, as [`active_execution`] reads it.

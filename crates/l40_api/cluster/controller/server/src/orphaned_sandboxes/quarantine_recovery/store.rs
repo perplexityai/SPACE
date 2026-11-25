@@ -2,6 +2,7 @@
 
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sandbox_store::k8s_executions::quarantine_recovery;
 use pplx_space_sandbox_store::{quarantine_recovery_candidates, row_locks};
 use pplx_space_sql_locator::sql;
 use sqlx::{PgExecutor, PgPool};
@@ -32,12 +33,7 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
     row_locks::lock_id(&mut tx, expected.sandbox_id).await?;
     pplx_space_sandbox_quarantine_store::locks::lock_quarantine_state(&mut tx, expected.sandbox_id)
         .await?;
-    sqlx::query(sql!(
-        "SELECT id FROM sandbox_k8s_executions WHERE sandbox_id = $1 FOR UPDATE"
-    ))
-    .bind(expected.sandbox_id)
-    .execute(&mut *tx)
-    .await?;
+    quarantine_recovery::lock_executions(&mut tx, expected.sandbox_id).await?;
     pplx_space_snapshot_store::quarantine_recovery::share_lock_snapshot(
         &mut tx,
         expected.snapshot_id,
@@ -65,14 +61,7 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
         expected.artifact_id,
     )
     .await?;
-    sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions SET active = FALSE, state = 'suspended', pod_ip = NULL,
-             terminated_at = COALESCE(terminated_at, NOW()), updated_at = NOW()
-          WHERE id = $1"
-    ))
-    .bind(expected.execution_id)
-    .execute(&mut *tx)
-    .await?;
+    quarantine_recovery::retire_recovered_execution(&mut *tx, expected.execution_id).await?;
     pplx_space_sandbox_store::observed_states::delete(&mut *tx, expected.sandbox_id).await?;
     pplx_space_sandbox_store::port_exposures::invalidate_open_observations(
         &mut *tx,

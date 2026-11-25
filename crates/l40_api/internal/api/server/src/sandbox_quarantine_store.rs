@@ -13,13 +13,12 @@ use pplx_space_sandbox_model::{
     SandboxTransitionReceiptKind, SandboxTransitionTargetState,
 };
 use pplx_space_sandbox_quarantine_store::node_recovery_receipt::{self, NodeRecovery};
-use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
+use pplx_space_sandbox_store::k8s_executions::quarantine_rollback;
 use pplx_space_sandbox_store::quarantine_publication::{
     self, PauseFailedRecoveryCandidate, SuspendedProjectionBinds,
 };
 use pplx_space_sandbox_store::quarantine_recovery_authority;
 use pplx_space_snapshot_model::{LocalArtifactId, SnapshotId};
-use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 use sqlx::types::Json;
 use tonic::Status;
@@ -260,54 +259,17 @@ pub(super) async fn select_activation_rollback_candidates(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
-    type CandidateRow = (
-        SandboxId,
-        SandboxCleanupEpisodeId,
-        i64,
-        SandboxActivationAttemptId,
-        String,
-        String,
-        String,
-        Option<String>,
-    );
-    let query = format!(
-        "SELECT s.id,
-                input.transition_receipt_id,
-                input.transition_receipt_execution_generation,
-                input.transition_receipt_activation_attempt_id,
-                input.transition_receipt_target_state,
-                input.transition_receipt_reason_code,
-                LOWER(TRIM(s.lifecycle)),
-                input.failure_reason
-           FROM sandboxes s
-           JOIN jsonb_to_recordset($2::jsonb) AS input({TRANSITION_RECEIPT_RECORD_COLUMNS})
-             ON input.sandbox_id = s.id
-           JOIN sandbox_k8s_executions execution
-             ON execution.sandbox_id = s.id
-            AND execution.active
-            AND execution.generation = input.transition_receipt_execution_generation
-            AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
-          WHERE s.active_node_id = $1
-            AND input.transition_receipt_kind = $3
-            AND input.published_lifecycle = input.transition_receipt_target_state
-            AND input.transition_receipt_target_state IN ('created', 'stopped', 'suspended')
-            AND LOWER(TRIM(s.lifecycle)) NOT IN (
-                'quarantined', 'deleted', 'deleting'
-            )
-          FOR UPDATE OF s, execution"
-    );
-    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(rows_json)
-        .bind(SandboxTransitionReceiptKind::ActivationRollback.as_str())
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|error| {
-            Status::internal(format!("select activation rollback receipts: {error}"))
-        })?;
+    let rows = quarantine_rollback::lock_activation_rollback_candidates(
+        conn,
+        node_id,
+        rows_json,
+        SandboxTransitionReceiptKind::ActivationRollback,
+    )
+    .await
+    .map_err(|error| Status::internal(format!("select activation rollback receipts: {error}")))?;
 
     let mut candidates = Vec::with_capacity(rows.len());
-    for (
+    for quarantine_rollback::ActivationRollbackCandidateRow {
         sandbox_id,
         receipt_id,
         execution_generation,
@@ -316,7 +278,7 @@ pub(super) async fn select_activation_rollback_candidates(
         reason_code,
         prior_lifecycle,
         failure_message,
-    ) in rows
+    } in rows
     {
         // The stored column has no CHECK, so it can hold text no lifecycle
         // names. That is one row's problem: skip its receipt and leave its
@@ -433,26 +395,16 @@ pub(super) async fn apply_activation_rollback_candidates(
         } else {
             "replaced"
         };
-        let retired = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET active = FALSE,
-                    state = $3,
-                    pod_ip = NULL,
-                    terminated_at = COALESCE(terminated_at, NOW()),
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation = $2
-                AND activation_attempt_id = $4
-                AND active"
-        ))
-        .bind(candidate.sandbox_id)
-        .bind(candidate.execution_generation)
-        .bind(execution_state)
-        .bind(candidate.activation_attempt_id)
-        .execute(&mut *conn)
+        let retired = quarantine_rollback::retire_rolled_back_execution(
+            &mut *conn,
+            candidate.sandbox_id,
+            candidate.execution_generation,
+            execution_state,
+            candidate.activation_attempt_id,
+        )
         .await
         .map_err(|error| Status::internal(format!("retire rollback execution: {error}")))?;
-        if retired.rows_affected() == 0 {
+        if !retired {
             continue;
         }
 
