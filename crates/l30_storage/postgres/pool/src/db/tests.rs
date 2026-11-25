@@ -175,3 +175,5 @@ fn futures_using_the_pool_and_a_tx_are_send() {
 
     assert_send(task);
 }
+
+mod settings;

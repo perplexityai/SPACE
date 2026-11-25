@@ -23,7 +23,7 @@ mod error;
 pub mod identity;
 pub mod metrics;
 
-pub use db::{Db, Executor, Tx};
+pub use db::{Db, Executor, SavedLockTimeout, Tx, TxSettings};
 pub use error::{DbError, DbErrorKind};
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
