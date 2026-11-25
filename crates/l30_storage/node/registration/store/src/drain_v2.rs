@@ -77,10 +77,16 @@ pub struct StoredV2Report {
     /// When the controller stored it.
     pub reported_at: i64,
     /// The one stall stamp: the last time the set of sandboxes the node
-    /// reports evacuated grew, or the deadline once it has passed if the
-    /// set hasn't grown since, so this plus the stall bound is when the
-    /// drain stalls.
+    /// reports evacuated grew, or when the evacuation began
+    /// ([`Self::evacuate_asked_at`]) if the set hasn't grown since, so this
+    /// plus the stall bound is when the drain stalls.
     pub evacuated_grew_at: i64,
+    /// The listing time of the drain generation's first evacuating tick
+    /// whose report the loop stored; a failed or aborted evacuating call
+    /// stamps nothing. Absent until then: the loop reads a report without
+    /// it as not evacuating yet, whoever stored it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evacuate_asked_at: Option<i64>,
     #[serde(default)]
     pub evacuated: Vec<StoredV2Evacuated>,
     #[serde(default)]

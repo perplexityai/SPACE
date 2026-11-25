@@ -90,17 +90,22 @@ fn drain_report(response: &DrainNodeResponse, generation: u64) -> Result<&DrainR
 
 /// What `drain_status.report` holds: the node's report, what the loop
 /// recorded of it (`unrecorded`), when it stored it (`reported_at`, the
-/// recording's `now`) and the stall clock (`evacuated_grew_at`, see
-/// [`evacuated_grew_at`]). Every stamp is Unix seconds by the database clock
-/// but a pending entry's `since`, which is the node's.
+/// recording's `now`), the stall clock (`evacuated_grew_at`, see
+/// [`evacuated_grew_at`]) and the listing time of the first evacuating tick
+/// whose report it stored (`evacuate_asked_at`, see [`evacuate_asked_at`]).
+/// Every stamp is
+/// Unix seconds by the database clock but a pending entry's `since`, which
+/// is the node's.
 pub fn stored_report(
     report: &DrainReport,
     recording: &Recording,
     evacuated_grew_at: i64,
+    evacuate_asked_at: Option<i64>,
 ) -> StoredV2Report {
     StoredV2Report {
         reported_at: recording.now,
         evacuated_grew_at,
+        evacuate_asked_at,
         evacuated: report
             .evacuated
             .iter()
@@ -140,16 +145,19 @@ pub fn stored_report(
     }
 }
 
-/// Why a drain is stalled at `now`, if it is: past its deadline (a drain
-/// without one is), not finished, and the set of sandboxes its node reports
-/// evacuated hasn't grown for `bound`, counted from the later of when it
-/// last grew ([`evacuated_grew_at`]) and the deadline. Before its deadline a
-/// drain is never stalled, however long it holds: its running sandboxes
-/// wait for the deadline. `pending` and `blocked` are what the report still
-/// lists, for the message.
+/// Why a drain is stalled at `now`, if it is: it evacuates (the database
+/// clock had reached its deadline when the tick listed it, or it has none),
+/// it isn't finished, and the set of sandboxes its node reports evacuated
+/// hasn't grown for `bound`, counted from its stall stamp
+/// ([`evacuated_grew_at`]): the later of when the set last grew and the
+/// listing time of the first evacuating tick whose report the loop stored.
+/// A drain that still holds is never
+/// stalled, however long it holds: its running sandboxes wait for the
+/// deadline. `pending` and `blocked` are what the report still lists, for
+/// the message.
 pub fn stalled(
     finished: bool,
-    deadline_at: Option<i64>,
+    evacuate: bool,
     evacuated_grew_at: i64,
     now: i64,
     bound: Duration,
@@ -157,13 +165,10 @@ pub fn stalled(
     blocked: usize,
 ) -> Option<String> {
     let bound_secs = i64::try_from(bound.as_secs()).unwrap_or(i64::MAX);
-    if finished || deadline_at.is_some_and(|deadline_at| now < deadline_at) {
+    if finished || !evacuate {
         return None;
     }
-    let since = deadline_at.map_or(evacuated_grew_at, |deadline_at| {
-        evacuated_grew_at.max(deadline_at)
-    });
-    (now.saturating_sub(since) >= bound_secs).then(|| {
+    (now.saturating_sub(evacuated_grew_at) >= bound_secs).then(|| {
         format!(
             "the drain is stalled: no sandbox evacuated for over {} past its deadline \
              ({pending} pending, {blocked} blocked)",
@@ -182,11 +187,32 @@ fn humanize(bound: Duration) -> String {
     }
 }
 
+/// The listing time of the drain generation's first evacuating tick whose
+/// report the loop stored, as the report it stores this tick records it
+/// (`evacuate_asked_at`): none while the drain holds; once it evacuates, the
+/// stamp the stored report carries, else now. A failed or aborted
+/// evacuating call stores no report, so it stamps nothing. A stored report
+/// without the stamp, stored while the drain held or by a controller from
+/// before the stamp, reads as not evacuating yet, so the clock starts at
+/// this tick.
+pub fn evacuate_asked_at(node: &V2Node) -> Option<i64> {
+    if !node.evacuate {
+        return None;
+    }
+    Some(
+        node.report
+            .as_ref()
+            .and_then(|report| report.evacuate_asked_at)
+            .unwrap_or(node.db_now),
+    )
+}
+
 /// The stall clock a report stores: the last time the set of sandboxes the
 /// node reports evacuated grew (now, when `report` names one the stored
 /// report didn't, or on the first report; the stored stamp otherwise), or
-/// the deadline once it has passed, if the set hasn't grown since, so the
-/// stamp plus the stall bound is when the drain stalls.
+/// the listing time of the first evacuating tick whose report the loop
+/// stored ([`evacuate_asked_at`]), if the set hasn't grown since, so the stamp plus the stall bound is when
+/// the drain stalls.
 pub fn evacuated_grew_at(node: &V2Node, report: &DrainReport) -> i64 {
     let now = node.db_now;
     let grew_at = match node.stored_evacuated() {
@@ -200,9 +226,9 @@ pub fn evacuated_grew_at(node: &V2Node, report: &DrainReport) -> i64 {
         }
         _ => now,
     };
-    match node.deadline_at {
-        Some(deadline_at) if now >= deadline_at => grew_at.max(deadline_at),
-        _ => grew_at,
+    match evacuate_asked_at(node) {
+        Some(asked) => grew_at.max(asked),
+        None => grew_at,
     }
 }
 
@@ -436,10 +462,10 @@ async fn store<S: DrainV2Sink>(
 ) -> Result<Option<Stored>, String> {
     let recording = record_evacuations(sink, node, report).await;
     let grew_at = evacuated_grew_at(node, report);
-    let stored = stored_report(report, &recording, grew_at);
+    let stored = stored_report(report, &recording, grew_at, evacuate_asked_at(node));
     let stall = stalled(
         stored.finished(),
-        node.deadline_at,
+        node.evacuate,
         grew_at,
         node.db_now,
         config.stall_bound,

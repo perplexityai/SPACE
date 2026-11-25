@@ -194,8 +194,9 @@ export function drainProgress(drain: AdminNodeDrain, nowMs: number): DrainProgre
     state = 'evacuating';
     headline = 'past the deadline: the node suspends the sandboxes it held';
   }
-  // The stall clock starts at the later of the last growth and the deadline,
-  // as the cluster controller's does: a hold isn't a stall.
+  // The stall clock starts at the later of the last growth and the deadline.
+  // The controller's stamp also includes when its first evacuating report was
+  // stored, so the two agree once it stores one; a hold isn't a stall.
   const grew = ms(drain.evacuated_grew_at);
   const since = grew === null ? null : deadline === null ? grew : Math.max(grew, deadline);
   const stalledAt = since === null ? null : since + STALL_BOUND_MS;

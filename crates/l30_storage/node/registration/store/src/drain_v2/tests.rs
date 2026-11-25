@@ -118,7 +118,7 @@ async fn a_start_records_its_generation_and_deadline() -> TestDbResult<()> {
 
 /// `drain_status` carries exactly the frozen keys, and reads back the
 /// same: the scalars, the two id lists, the fence, its two stamps, the
-/// instance the terminated stamp is about, and the report's six keys.
+/// instance the terminated stamp is about, and the report's seven keys.
 #[test]
 fn the_stored_status_carries_the_frozen_keys() {
     let status = StoredV2Status {
@@ -133,6 +133,7 @@ fn the_stored_status_carries_the_frozen_keys() {
         report: Some(StoredV2Report {
             reported_at: 150,
             evacuated_grew_at: 140,
+            evacuate_asked_at: Some(130),
             evacuated: vec![StoredV2Evacuated {
                 sandbox_id: "a".to_owned(),
                 artifact_kind: StoredV2ArtifactKind::Full,
@@ -185,6 +186,7 @@ fn the_stored_status_carries_the_frozen_keys() {
         keys(&json["report"]),
         [
             "blocked",
+            "evacuate_asked_at",
             "evacuated",
             "evacuated_grew_at",
             "pending",

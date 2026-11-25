@@ -85,10 +85,15 @@
 //!    report is stored in
 //!    `drain_status`, each recorded evacuation is added to
 //!    `evacuated_total`, and each pending entry the node reports running,
-//!    but for a warm-pool member, to `observed_running`. Past its deadline,
-//!    a drain whose evacuated set hasn't grown for the stall bound (15
-//!    minutes) is stalled, in `drain_last_error` and on the
-//!    `node_drain.v2.stalled` gauge; the mark changes nothing else. Once the
+//!    but for a warm-pool member, to `observed_running`. A drain the loop
+//!    asks to evacuate whose evacuated set hasn't grown for the stall bound
+//!    (15 minutes), counted from the later of its last growth and the
+//!    listing time of the generation's first evacuating tick whose report
+//!    the loop stored (`report.evacuate_asked_at`; a failed or aborted
+//!    evacuating call stamps nothing, and a report without it counts from
+//!    the next evacuating tick), is stalled, in `drain_last_error` and on
+//!    the `node_drain.v2.stalled` gauge; the mark changes nothing else. A
+//!    hold shortened into the past thus doesn't stall at once. Once the
 //!    stored report is finished (nothing pending, nothing blocked, every
 //!    evacuation recorded: `StoredV2Report::finished`, the one rule), the
 //!    node moves to `drained`.
@@ -184,7 +189,10 @@ use cleanup::{
 pub use cleanup::{Fence, TerminatedDelete};
 use step::{OutstandingRows, step};
 #[cfg(test)]
-use step::{Recording, TERMINATE_WAITS_FOR_A_CALL, outstanding_rows, stalled, stored_report};
+use step::{
+    Recording, TERMINATE_WAITS_FOR_A_CALL, evacuated_grew_at, outstanding_rows, stalled,
+    stored_report,
+};
 
 use crate::warn_pacer::PerNodeWarnPacer;
 
@@ -193,8 +201,9 @@ use crate::warn_pacer::PerNodeWarnPacer;
 /// build reads the defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct V2LoopConfig {
-    /// How long past its deadline a drain may evacuate no further sandbox
-    /// before the loop marks it stalled.
+    /// How long, counted from the stall stamp (`evacuated_grew_at`), a
+    /// drain may evacuate no further sandbox before the loop marks it
+    /// stalled.
     pub stall_bound: Duration,
     /// How long a sandbox a drain saw running may stay suspended before
     /// `node_drain.v2.evacuated_still_suspended` counts it.

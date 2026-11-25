@@ -1925,12 +1925,14 @@ fn the_stored_report_names_the_evacuations_not_yet_recorded() {
             now: 1_060,
         },
         1_000,
+        Some(990),
     );
     assert_eq!(
         serde_json::to_value(&stored).unwrap(),
         serde_json::json!({
             "reported_at": 1_060,
             "evacuated_grew_at": 1_000,
+            "evacuate_asked_at": 990,
             "evacuated": [
                 {"sandbox_id": "a", "artifact_kind": "full", "artifact_id": "artifact"},
                 {"sandbox_id": "b", "artifact_kind": "full", "artifact_id": "artifact"},
@@ -2280,73 +2282,106 @@ const MINUTE: i64 = 60;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
 
-/// Before its deadline a drain is never stalled, however long its node has
-/// evacuated nothing. Past it, a drain that isn't finished stalls once
-/// nothing more has been evacuated for the bound, counted from the later of
-/// the set's last growth and the deadline. A finished drain never stalls,
-/// and one without a deadline counts from the last growth.
+/// A drain is stalled once it evacuates, its report isn't finished, and the
+/// set its node reports evacuated hasn't grown for the bound since the
+/// later of its last growth and the first evacuating tick whose report the
+/// loop stored. A drain that holds never is. A report without the stamp,
+/// stored while the drain held or by a controller from before the stamp,
+/// starts the clock at the first evacuating tick, so a hold shortened into
+/// the past doesn't stall at once.
 #[test]
-fn a_drain_stalls_only_past_its_deadline_with_nothing_evacuated_for_the_bound() {
+fn a_drain_stalls_only_once_evacuating_with_nothing_evacuated_for_the_bound() {
     let bound = V2LoopConfig::default().stall_bound;
-    for (case, finished, deadline, grew_at, stalls) in [
+    // (case, evacuates, the stored report's grew-at and asked-at stamps or
+    // none stored, the deadline, finished, stalls)
+    for (case, evacuate, stored, deadline, finished, stalls) in [
         (
-            "holding a day before the deadline",
+            "holding, a day since it grew",
             false,
-            Some(DB_NOW + 1),
-            DB_NOW - DAY,
+            Some((DB_NOW - DAY, None)),
+            DB_NOW + 1,
+            false,
             false,
         ),
         (
-            "14 minutes past the deadline",
-            false,
-            Some(DB_NOW - 14 * MINUTE),
+            "asked 14 minutes ago",
+            true,
+            Some((DB_NOW - DAY, Some(DB_NOW - 14 * MINUTE))),
             DB_NOW - DAY,
+            false,
             false,
         ),
         (
-            "15 minutes past the deadline",
-            false,
-            Some(DB_NOW - 15 * MINUTE),
+            "asked 15 minutes ago",
+            true,
+            Some((DB_NOW - DAY, Some(DB_NOW - 15 * MINUTE))),
             DB_NOW - DAY,
+            false,
             true,
         ),
         (
-            "grew 14 minutes ago, past the deadline",
-            false,
-            Some(DB_NOW - HOUR),
-            DB_NOW - 14 * MINUTE,
-            false,
-        ),
-        (
-            "grew 15 minutes ago, past the deadline",
-            false,
-            Some(DB_NOW - HOUR),
-            DB_NOW - 15 * MINUTE,
+            "grew 14 minutes ago, asked an hour ago",
             true,
-        ),
-        (
-            "finished, an hour past the deadline",
-            true,
-            Some(DB_NOW - HOUR),
+            Some((DB_NOW - 14 * MINUTE, Some(DB_NOW - HOUR))),
             DB_NOW - DAY,
             false,
+            false,
         ),
         (
-            "no deadline, grew 14 minutes ago",
+            "grew 15 minutes ago, asked an hour ago",
+            true,
+            Some((DB_NOW - 15 * MINUTE, Some(DB_NOW - HOUR))),
+            DB_NOW - DAY,
             false,
+            true,
+        ),
+        (
+            "finished, asked an hour ago",
+            true,
+            Some((DB_NOW - DAY, Some(DB_NOW - HOUR))),
+            DB_NOW - DAY,
+            true,
+            false,
+        ),
+        (
+            "a hold shortened a day into the past, first evacuating tick",
+            true,
+            Some((DB_NOW - DAY, None)),
+            DB_NOW - DAY,
+            false,
+            false,
+        ),
+        (
+            "no report stored yet, deadline a day ago",
+            true,
             None,
-            DB_NOW - 14 * MINUTE,
+            DB_NOW - DAY,
+            false,
             false,
         ),
         (
-            "no deadline, grew 15 minutes ago",
-            false,
-            None,
-            DB_NOW - 15 * MINUTE,
+            "a report without the stamp, an hour past the deadline",
             true,
+            Some((DB_NOW - DAY, None)),
+            DB_NOW - HOUR,
+            false,
+            false,
         ),
     ] {
-        let stall = stalled(finished, deadline, grew_at, DB_NOW, bound, 2, 1);
+        let node = V2Node {
+            evacuate,
+            deadline_at: Some(deadline),
+            report: stored.map(|(evacuated_grew_at, evacuate_asked_at)| StoredV2Report {
+                reported_at: DB_NOW - DAY,
+                evacuated_grew_at,
+                evacuate_asked_at,
+                ..StoredV2Report::default()
+            }),
+            ..node(Some("draining"), Some(5))
+        };
+        // Nothing new evacuated.
+        let grew_at = evacuated_grew_at(&node, &DrainReport::default());
+        let stall = stalled(finished, node.evacuate, grew_at, DB_NOW, bound, 2, 1);
         assert_eq!(stall.is_some(), stalls, "{case}");
         if let Some(stall) = stall {
             assert!(
@@ -2359,8 +2394,8 @@ fn a_drain_stalls_only_past_its_deadline_with_nothing_evacuated_for_the_bound() 
     // A shorter bound, as the test hook sets it, stalls sooner.
     let stall = stalled(
         false,
-        Some(DB_NOW - 30),
-        DB_NOW - DAY,
+        true,
+        DB_NOW - 30,
         DB_NOW,
         Duration::from_secs(30),
         0,
@@ -2375,10 +2410,12 @@ fn a_drain_stalls_only_past_its_deadline_with_nothing_evacuated_for_the_bound() 
 /// The stall clock a report stores, which is what the next tick, by a
 /// controller that restarted in between, reads back: a drain past its
 /// deadline whose node reports no new evacuation stalls 15 minutes after
-/// the deadline under another controller, and stays stalled; a report
-/// naming a new evacuation clears it and starts the clock again. A hold
-/// before the deadline is never stalled. The stall is in `drain_last_error`;
-/// the stored stamp plus the bound is when it began.
+/// the first tick that asked it to evacuate under another controller, and
+/// stays stalled; a report naming a new evacuation clears it and starts the
+/// clock again. A hold before the deadline is never stalled, and a hold
+/// shortened into the past starts the clock at its first evacuating tick.
+/// The stall is in `drain_last_error`; the stored stamp plus the bound is
+/// when it began.
 #[tokio::test(flavor = "current_thread")]
 async fn the_stall_clock_survives_a_controller_restart() {
     let deadline = DB_NOW + HOUR;
@@ -2406,6 +2443,9 @@ async fn the_stall_clock_survives_a_controller_restart() {
     let mut stored = first.stored();
     assert_eq!(stored.evacuated_grew_at, DB_NOW);
 
+    assert_eq!(stored.evacuate_asked_at, None, "holding");
+    // The first tick that asks the node to evacuate.
+    let asked = deadline + MINUTE;
     for (case, at, evacuated_ids, grew_at, stalls) in [
         (
             "holding until just before the deadline",
@@ -2414,25 +2454,26 @@ async fn the_stall_clock_survives_a_controller_restart() {
             DB_NOW,
             false,
         ),
+        ("the first evacuating tick", asked, &["a"][..], asked, false),
         (
-            "14 minutes past the deadline",
-            deadline + 14 * MINUTE,
+            "14 minutes after it",
+            asked + 14 * MINUTE,
             &["a"][..],
-            deadline,
+            asked,
             false,
         ),
         (
-            "15 minutes past the deadline",
-            deadline + 15 * MINUTE,
+            "15 minutes after it",
+            asked + 15 * MINUTE,
             &["a"][..],
-            deadline,
+            asked,
             true,
         ),
         (
             "still nothing new, later",
             deadline + HOUR,
             &["a"][..],
-            deadline,
+            asked,
             true,
         ),
         (
@@ -2465,6 +2506,9 @@ async fn the_stall_clock_survives_a_controller_restart() {
         run_tick(&next, &FakeAuthority::ok()).await;
         stored = next.stored();
         assert_eq!(stored.evacuated_grew_at, grew_at, "{case}");
+        if at >= deadline {
+            assert_eq!(stored.evacuate_asked_at, Some(asked), "{case}");
+        }
         assert_eq!(
             next.calls().iter().any(
                 |call| call.starts_with(&format!("error {} the drain is stalled", relisted.id))
@@ -2800,6 +2844,7 @@ async fn a_tick_writes_a_nodes_status_once_and_only_when_it_changes() {
     let stale_report = |since: i64| StoredV2Report {
         reported_at: since,
         evacuated_grew_at: since,
+        evacuate_asked_at: Some(since),
         ..StoredV2Report::default()
     };
     // (case, node, the answer to its drain call, its cordon's failure, the
@@ -2835,7 +2880,6 @@ async fn a_tick_writes_a_nodes_status_once_and_only_when_it_changes() {
         (
             "stalled, with a cordon error",
             V2Node {
-                deadline_at: Some(DB_NOW - HOUR),
                 report: Some(stale_report(DB_NOW - HOUR)),
                 ..node(Some("draining"), Some(5))
             },
@@ -3033,6 +3077,7 @@ async fn a_refused_terminate_publishes_its_reports_rows_unstalled() {
             let target = V2Node {
                 report: Some(StoredV2Report {
                     evacuated_grew_at: DB_NOW - HOUR,
+                    evacuate_asked_at: Some(DB_NOW - HOUR),
                     evacuated: vec![StoredV2Evacuated {
                         sandbox_id: "a".to_owned(),
                         artifact_kind: StoredV2ArtifactKind::Full,
@@ -3181,4 +3226,61 @@ async fn a_tick_takes_no_new_node_after_shutdown() {
     assert_eq!(sink.requests().len(), NODE_CONCURRENCY);
     assert_eq!(sink.reports.lock().unwrap().len(), NODE_CONCURRENCY);
     assert_eq!(report.drained.len(), NODE_CONCURRENCY);
+}
+
+/// A hold shortened into the past doesn't stall the drain on the next tick:
+/// the stall clock starts at the first tick that asks the node to
+/// evacuate, and the drain stalls once the bound has passed since it with
+/// nothing evacuated.
+#[tokio::test]
+async fn a_hold_shortened_into_the_past_stalls_only_after_the_bound() {
+    let bound = V2LoopConfig::default().stall_bound;
+    let bound_secs = i64::try_from(bound.as_secs()).unwrap();
+    let held = || {
+        Ok(answer(
+            5,
+            DrainReport {
+                pending: vec![pending("c", DrainWait::Moving)],
+                ..DrainReport::default()
+            },
+        ))
+    };
+    // Its last report was stored while it held, a day after it started;
+    // the hold is then shortened to end at the drain's start.
+    let mut stored = StoredV2Report {
+        reported_at: DB_NOW - 60,
+        evacuated_grew_at: DB_NOW - DAY,
+        evacuate_asked_at: None,
+        ..StoredV2Report::default()
+    };
+    for (case, at, stalls) in [
+        ("the first evacuating tick", DB_NOW, false),
+        ("just short of the bound", DB_NOW + bound_secs - 1, false),
+        ("the bound past it", DB_NOW + bound_secs, true),
+    ] {
+        let target = V2Node {
+            deadline_at: Some(DB_NOW - DAY),
+            evacuate: true,
+            db_now: at,
+            report: Some(stored.clone()),
+            ..node(Some("draining"), Some(5))
+        };
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: HashMap::from([((target.id, false), held())]),
+            ..FakeSink::default()
+        };
+        run_tick(&sink, &FakeAuthority::ok()).await;
+        stored = sink.stored();
+        assert_eq!(stored.evacuate_asked_at, Some(DB_NOW), "{case}");
+        assert_eq!(
+            status_writes(&sink, &target)
+                .iter()
+                .flatten()
+                .any(|status| status.starts_with("the drain is stalled")),
+            stalls,
+            "{case}: {:?}",
+            sink.calls()
+        );
+    }
 }
