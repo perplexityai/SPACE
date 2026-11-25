@@ -2908,8 +2908,14 @@ type StartRequest struct {
 	// `RestoreArtifactAsNewContext.artifact_snapshot_id`, which the fork
 	// transport already checks against its URI locally.
 	ExpectedLocalArtifactId *string `protobuf:"bytes,20,opt,name=expected_local_artifact_id,json=expectedLocalArtifactId,proto3,oneof" json:"expected_local_artifact_id,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Internal-only: the pod's IPv4 address as read from `netns_path`, which it
+	// requires. Kubernetes publishes the same address in the Pod's status, but
+	// later; the sandbox manager reports it as `SandboxInfo.pod_ip` for the
+	// activation named by `route_identity.pod_uid` so the control plane need
+	// not wait for that publication.
+	PodIp         *string `protobuf:"bytes,21,opt,name=pod_ip,json=podIp,proto3,oneof" json:"pod_ip,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StartRequest) Reset() {
@@ -3050,6 +3056,13 @@ func (x *StartRequest) GetActivationAutoLifecycle() *AutoLifecyclePolicy {
 func (x *StartRequest) GetExpectedLocalArtifactId() string {
 	if x != nil && x.ExpectedLocalArtifactId != nil {
 		return *x.ExpectedLocalArtifactId
+	}
+	return ""
+}
+
+func (x *StartRequest) GetPodIp() string {
+	if x != nil && x.PodIp != nil {
+		return *x.PodIp
 	}
 	return ""
 }
@@ -3984,7 +3997,12 @@ type SandboxInfo struct {
 	CurrentLocalArtifactCreatedAt *timestamppb.Timestamp `protobuf:"bytes,58,opt,name=current_local_artifact_created_at,json=currentLocalArtifactCreatedAt,proto3,oneof" json:"current_local_artifact_created_at,omitempty"`
 	// The row's recorded node-local cleanup. Absent when none is recorded, or
 	// from an older node that never set it.
-	Cleanup       *SandboxCleanup `protobuf:"bytes,59,opt,name=cleanup,proto3,oneof" json:"cleanup,omitempty"`
+	Cleanup *SandboxCleanup `protobuf:"bytes,59,opt,name=cleanup,proto3,oneof" json:"cleanup,omitempty"`
+	// The pod address the shim reported with the Start that installed this
+	// row's current `pod_uid`. Absent for other substrates, for an activation
+	// that reported none, and after a sandbox-manager restart; callers fall
+	// back to the Pod's published status.
+	PodIp         *string `protobuf:"bytes,60,opt,name=pod_ip,json=podIp,proto3,oneof" json:"pod_ip,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4388,6 +4406,13 @@ func (x *SandboxInfo) GetCleanup() *SandboxCleanup {
 		return x.Cleanup
 	}
 	return nil
+}
+
+func (x *SandboxInfo) GetPodIp() string {
+	if x != nil && x.PodIp != nil {
+		return *x.PodIp
+	}
+	return ""
 }
 
 // A node-local cleanup recorded on a sandbox row. An activation records one,
@@ -5850,8 +5875,10 @@ type WakeStartContext struct {
 	// Required with `target_state = STOPPED`; see
 	// `StartRequest.expected_local_artifact_id`, which this is forwarded to.
 	ExpectedLocalArtifactId *string `protobuf:"bytes,14,opt,name=expected_local_artifact_id,json=expectedLocalArtifactId,proto3,oneof" json:"expected_local_artifact_id,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// See `StartRequest.pod_ip`.
+	PodIp         *string `protobuf:"bytes,15,opt,name=pod_ip,json=podIp,proto3,oneof" json:"pod_ip,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WakeStartContext) Reset() {
@@ -5950,6 +5977,13 @@ func (x *WakeStartContext) GetExpectedExecutionGeneration() int64 {
 func (x *WakeStartContext) GetExpectedLocalArtifactId() string {
 	if x != nil && x.ExpectedLocalArtifactId != nil {
 		return *x.ExpectedLocalArtifactId
+	}
+	return ""
+}
+
+func (x *WakeStartContext) GetPodIp() string {
+	if x != nil && x.PodIp != nil {
+		return *x.PodIp
 	}
 	return ""
 }
@@ -15220,7 +15254,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"_namespaceB\v\n" +
 	"\t_log_pathB\x11\n" +
 	"\x0f_vsock_uds_pathB\x11\n" +
-	"\x0f_route_identity\"\xdc\t\n" +
+	"\x0f_route_identity\"\x83\n" +
+	"\n" +
 	"\fStartRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x17\n" +
@@ -15244,7 +15279,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x1foperation_activation_attempt_id\x18\x12 \x01(\tH\tR\x1coperationActivationAttemptId\x88\x01\x01\x12n\n" +
 	"\x19activation_auto_lifecycle\x18\x13 \x01(\v2-.space.sandbox.manager.v1.AutoLifecyclePolicyH\n" +
 	"R\x17activationAutoLifecycle\x88\x01\x01\x12@\n" +
-	"\x1aexpected_local_artifact_id\x18\x14 \x01(\tH\vR\x17expectedLocalArtifactId\x88\x01\x01B\a\n" +
+	"\x1aexpected_local_artifact_id\x18\x14 \x01(\tH\vR\x17expectedLocalArtifactId\x88\x01\x01\x12\x1a\n" +
+	"\x06pod_ip\x18\x15 \x01(\tH\fR\x05podIp\x88\x01\x01B\a\n" +
 	"\x05_vcpuB\r\n" +
 	"\v_memory_mibB\r\n" +
 	"\v_checkpointB\r\n" +
@@ -15256,7 +15292,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x18_restore_artifact_as_newB\"\n" +
 	" _operation_activation_attempt_idB\x1c\n" +
 	"\x1a_activation_auto_lifecycleB\x1d\n" +
-	"\x1b_expected_local_artifact_id\"\xcb\x02\n" +
+	"\x1b_expected_local_artifact_idB\t\n" +
+	"\a_pod_ip\"\xcb\x02\n" +
 	"\rStartResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x10\n" +
@@ -15323,7 +15360,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x0emetadata_valid\x18\x04 \x01(\bR\rmetadataValidB\v\n" +
 	"\t_template\"b\n" +
 	"\x12CleanupTargetBatch\x12L\n" +
-	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\xda\x1f\n" +
+	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\x81 \n" +
 	"\vSandboxInfo\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -15382,7 +15419,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x15activation_attempt_id\x188 \x01(\tH#R\x13activationAttemptId\x88\x01\x01\x12R\n" +
 	"\tlifecycle\x189 \x01(\x0e2/.space.sandbox.manager.v1.SandboxLifecycleStateH$R\tlifecycle\x88\x01\x01\x12i\n" +
 	"!current_local_artifact_created_at\x18: \x01(\v2\x1a.google.protobuf.TimestampH%R\x1dcurrentLocalArtifactCreatedAt\x88\x01\x01\x12G\n" +
-	"\acleanup\x18; \x01(\v2(.space.sandbox.manager.v1.SandboxCleanupH&R\acleanup\x88\x01\x01B\v\n" +
+	"\acleanup\x18; \x01(\v2(.space.sandbox.manager.v1.SandboxCleanupH&R\acleanup\x88\x01\x01\x12\x1a\n" +
+	"\x06pod_ip\x18< \x01(\tH'R\x05podIp\x88\x01\x01B\v\n" +
 	"\t_templateB\x06\n" +
 	"\x04_pidB\f\n" +
 	"\n" +
@@ -15428,7 +15466,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"_lifecycleB$\n" +
 	"\"_current_local_artifact_created_atB\n" +
 	"\n" +
-	"\b_cleanup\"\xa9\x01\n" +
+	"\b_cleanupB\t\n" +
+	"\a_pod_ip\"\xa9\x01\n" +
 	"\x0eSandboxCleanup\x12R\n" +
 	"\n" +
 	"completion\x18\x01 \x01(\x0e22.space.sandbox.manager.v1.SandboxCleanupCompletionR\n" +
@@ -15559,7 +15598,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x12target_environment\x18\x02 \x01(\tR\x11targetEnvironment\x12[\n" +
 	"\rauthorization\x18\x03 \x01(\v25.space.sandbox.manager.v1.RuntimeUpgradeAuthorizationR\rauthorization\x12D\n" +
 	"\x1ccheckpoint_local_artifact_id\x18\x04 \x01(\tH\x00R\x19checkpointLocalArtifactId\x88\x01\x01B\x1f\n" +
-	"\x1d_checkpoint_local_artifact_id\"\x98\a\n" +
+	"\x1d_checkpoint_local_artifact_id\"\xbf\a\n" +
 	"\x10WakeStartContext\x12\x17\n" +
 	"\x04vcpu\x18\x01 \x01(\rH\x00R\x04vcpu\x88\x01\x01\x12\"\n" +
 	"\n" +
@@ -15573,7 +15612,9 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x1foperation_activation_attempt_id\x18\v \x01(\tH\x06R\x1coperationActivationAttemptId\x88\x01\x01\x12n\n" +
 	"\x19activation_auto_lifecycle\x18\f \x01(\v2-.space.sandbox.manager.v1.AutoLifecyclePolicyH\aR\x17activationAutoLifecycle\x88\x01\x01\x12G\n" +
 	"\x1dexpected_execution_generation\x18\r \x01(\x03H\bR\x1bexpectedExecutionGeneration\x88\x01\x01\x12@\n" +
-	"\x1aexpected_local_artifact_id\x18\x0e \x01(\tH\tR\x17expectedLocalArtifactId\x88\x01\x01B\a\n" +
+	"\x1aexpected_local_artifact_id\x18\x0e \x01(\tH\tR\x17expectedLocalArtifactId\x88\x01\x01\x12\x1a\n" +
+	"\x06pod_ip\x18\x0f \x01(\tH\n" +
+	"R\x05podIp\x88\x01\x01B\a\n" +
 	"\x05_vcpuB\r\n" +
 	"\v_memory_mibB\r\n" +
 	"\v_netns_pathB\x1e\n" +
@@ -15583,7 +15624,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	" _operation_activation_attempt_idB\x1c\n" +
 	"\x1a_activation_auto_lifecycleB \n" +
 	"\x1e_expected_execution_generationB\x1d\n" +
-	"\x1b_expected_local_artifact_id\"\xe3\x01\n" +
+	"\x1b_expected_local_artifact_idB\t\n" +
+	"\a_pod_ip\"\xe3\x01\n" +
 	"\fWakeResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12H\n" +

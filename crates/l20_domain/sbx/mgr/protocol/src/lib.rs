@@ -270,6 +270,7 @@ pub fn direct_restore_start_request(
         from_warm: false,
         blocking,
         netns_path: None,
+        pod_ip: None,
         ready_timeout_secs,
         target_state: 0,
         suspend_restore_storage_uri,

@@ -1139,6 +1139,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                     vcpu: sandbox_vcpu_option(&sandbox),
                                     memory_mib: sandbox_memory_mib_option(&sandbox),
                                     netns_path: None,
+                                    pod_ip: None,
                                     suspend_restore_storage_uri: restore_plan
                                         .as_ref()
                                         .and_then(|plan| plan.storage_uri.clone()),

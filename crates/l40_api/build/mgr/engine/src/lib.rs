@@ -588,6 +588,7 @@ fn build_vm_start_request(sandbox_id: String, vcpu: u32, memory_mib: u32) -> Sta
         from_warm: false,
         blocking: true,
         netns_path: None,
+        pod_ip: None,
         ready_timeout_secs: None,
         target_state: 0,
         suspend_restore_storage_uri: None,

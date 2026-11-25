@@ -629,6 +629,13 @@ impl SandboxManagerService {
         }
         let target_state = wake_target_state_from_proto(req.target_state)?;
         self.authorize_netns_start_context(&request, "Start.netns_path", &req.netns_path)?;
+        let pod_address = super::pod_addresses::ReportedPodAddress::parse(
+            "Start",
+            &req.sandbox_id,
+            req.netns_path.as_deref(),
+            req.pod_ip.as_deref(),
+            req.route_identity.as_ref(),
+        )?;
         if let Some(context) = &req.restore_artifact_as_new {
             self.authorize_peer(
                 &request,
@@ -699,6 +706,11 @@ impl SandboxManagerService {
         }
         .instrument(span)
         .await;
+        if result.is_ok()
+            && let Some(pod_address) = pod_address
+        {
+            self.pod_addresses.record(pod_address);
+        }
         if publish_node_state && result.is_ok() {
             mark_sandbox_dirty(&self.db, &sandbox_id);
         }

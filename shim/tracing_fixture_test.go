@@ -87,7 +87,8 @@ func traceOperationErrors(t *testing.T) {
 	result := make(chan dataPlaneRedirectResult, 1)
 	// The opt-in process suite exercises the real five-second timeout, without
 	// creating network namespaces or touching the host sandbox-manager socket.
-	prepareDataPlaneRedirect(context.Background(), "fixture", filepath.Join(bundle, "missing-netns"), "fixture", result)
+	netnsPath := filepath.Join(bundle, "missing-netns")
+	prepareDataPlaneRedirect(context.Background(), "fixture", netnsPath, podIPForDataPlane(context.Background(), netnsPath), "fixture", result)
 	if got := <-result; got.err == nil || got.podIP != "" {
 		t.Fatalf("missing netns accepted: %+v", got)
 	}

@@ -637,6 +637,12 @@ message StartRequest {
   // `RestoreArtifactAsNewContext.artifact_snapshot_id`, which the fork
   // transport already checks against its URI locally.
   optional string expected_local_artifact_id = 20;
+  // Internal-only: the pod's IPv4 address as read from `netns_path`, which it
+  // requires. Kubernetes publishes the same address in the Pod's status, but
+  // later; the sandbox manager reports it as `SandboxInfo.pod_ip` for the
+  // activation named by `route_identity.pod_uid` so the control plane need
+  // not wait for that publication.
+  optional string pod_ip = 21;
 }
 
 message StartResponse {
@@ -868,6 +874,11 @@ message SandboxInfo {
   // The row's recorded node-local cleanup. Absent when none is recorded, or
   // from an older node that never set it.
   optional SandboxCleanup cleanup = 59;
+  // The pod address the shim reported with the Start that installed this
+  // row's current `pod_uid`. Absent for other substrates, for an activation
+  // that reported none, and after a sandbox-manager restart; callers fall
+  // back to the Pod's published status.
+  optional string pod_ip = 60;
 }
 
 // A node-local cleanup recorded on a sandbox row. An activation records one,
@@ -1161,6 +1172,8 @@ message WakeStartContext {
   // Required with `target_state = STOPPED`; see
   // `StartRequest.expected_local_artifact_id`, which this is forwarded to.
   optional string expected_local_artifact_id = 14;
+  // See `StartRequest.pod_ip`.
+  optional string pod_ip = 15;
 }
 message WakeResponse {
   string sandbox_id = 1;

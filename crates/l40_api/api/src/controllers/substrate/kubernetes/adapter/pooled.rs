@@ -37,6 +37,7 @@ pub(super) fn pooled_wake_request(
             vcpu: claim.vcpu,
             memory_mib: claim.memory_mib,
             netns_path: None,
+            pod_ip: None,
             suspend_restore_storage_uri: None,
             suspend_restore_source_node: None,
             expected_local_artifact_id: None,

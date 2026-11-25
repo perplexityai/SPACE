@@ -38,6 +38,7 @@ fn base_snapshot_start_request(
         from_warm: false,
         blocking: true,
         netns_path: None,
+        pod_ip: None,
         ready_timeout_secs: Some(ready_timeout),
         target_state: 0,
         suspend_restore_storage_uri: None,
