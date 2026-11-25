@@ -397,34 +397,32 @@ impl AdminNodeStore {
     }
 }
 
-/// `true` if the user-API drain gate is currently refusing
-/// `start`/`wake`/`resume`/`restore` for sandboxes pinned to this node.
+/// The node's drain, read fresh from its shared drain columns; `None` when
+/// the node has no drain or no row.
 ///
 /// `:force-upload-local-snapshots` calls this per-sandbox during its fan-out so a
 /// concurrent drain transition short-circuits the remaining uploads rather than
 /// letting them register a snapshot whose on-disk bytes may already be racing
-/// with a user wake.
-///
-/// This asks about the **gate**, not the phase. A non-NULL `drain_phase` used to
-/// imply the gate was closed; with drain modes it does not — a gentle drain keeps
-/// serving user traffic by design. Reading the phase alone here would let an
-/// `:undrain` + gentle `:drain` landing mid-fan-out look like the safe regime it
-/// isn't, which is the whole failure this re-check exists to prevent. Resolved
-/// through the same [`NodeDrain::refuses_activations`] the gate itself uses,
-/// from the node's shared drain columns.
-pub(super) async fn is_node_wake_gate_closed(
+/// with a user wake. The handler decides from the drain through the same
+/// predicate its entry guard uses (`force_upload_refusal`), which reads the
+/// **gate**, not the phase: a non-NULL `drain_phase` used to imply the gate was
+/// closed; with drain modes it does not — a gentle drain keeps serving user
+/// traffic by design. Reading the phase alone would let an `:undrain` + gentle
+/// `:drain` landing mid-fan-out look like the safe regime it isn't, which is
+/// the whole failure this re-check exists to prevent.
+pub(super) async fn read_node_drain(
     pool: &PgPool,
     node_id: NodeId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<NodeDrain>, sqlx::Error> {
     let Some(NodeDrainColumns {
         drain_phase,
         drain_mode,
         drain_engine,
     }) = drain_reads::drain_columns(pool, node_id).await?
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    // An unknown phase fails the check with a decode error on column 0, the
+    // An unknown phase fails the read with a decode error on column 0, the
     // phase's position in `drain_columns`, so the fan-out aborts instead of
     // reading the gate as open.
     let phase = drain_phase
@@ -446,7 +444,7 @@ pub(super) async fn is_node_wake_gate_closed(
             index: "2".to_owned(),
             source: format!("unrecognized drain engine {drain_engine:?}").into(),
         }),
-        drain => Ok(drain.is_some_and(NodeDrain::refuses_activations)),
+        drain => Ok(drain),
     }
 }
 
@@ -606,6 +604,6 @@ mod node_holds_agreement_tests;
 /// otherwise the agreement proves nothing.
 #[cfg(test)]
 pub(super) mod terminate_gate_agreement_tests;
-/// Postgres-backed decoding contract for [`is_node_wake_gate_closed`].
+/// Postgres-backed decoding contract for [`read_node_drain`].
 #[cfg(test)]
 mod wake_gate_tests;

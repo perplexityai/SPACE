@@ -1397,7 +1397,7 @@ fn persisted_decrement_capacity(request: &DrainRequest) -> bool {
 /// The 409 body for a `:drain` whose `replace_after_terminate` disagrees with
 /// the drain already in flight.
 ///
-/// Extracted for the same reason as [`force_upload_gate_open_message`]: it is a
+/// Extracted for the same reason as [`force_upload_refusal`]: it is a
 /// sentence an operator reads and acts on, and it has to say what to do instead.
 /// Its first draft shipped with two 22-space runs from a hand-wrapped literal
 /// missing its `\` continuations — invisible in review, obvious in a terminal,
@@ -2445,52 +2445,78 @@ const _: () = {
     );
 };
 
-/// `:force-upload-local-snapshots` action handler.
+/// The stable `code` of the 409 `:force-upload-local-snapshots` gets on a node
+/// whose drain is v2, in any phase, its cancel pending included.
+const FORCE_UPLOAD_DRAIN_V2_CODE: &str = "drain_v2_uploads_local_snapshots";
+
+/// Why `:force-upload-local-snapshots` is refused on a node: the audit's
+/// `error`, the JSON `error` an operator reads, and the stable `code` the
+/// refusal carries, if any.
+#[derive(Debug, PartialEq, Eq)]
+struct ForceUploadRefusal {
+    audit: &'static str,
+    detail: &'static str,
+    code: Option<&'static str>,
+}
+
+/// Why `:force-upload-local-snapshots` is refused under the node's `drain`,
+/// or `None` when it may run: under a v1 drain that refuses activations.
 ///
-/// Enumerates every suspended sandbox whose `target_node_id` still pins
-/// it to this node **and** whose snapshot has not yet been registered
-/// to S3 (via [`admin_occupancy::pinned_local_only_sandboxes`]), then
-/// calls the controller's `enqueue_suspended_snapshot_backup` per sandbox. That
-/// RPC enqueues a durable-worker upload on the on-node sbx-mgr; the
-/// worker lands a `state='ready'` row in `snapshots` +
-/// `snapshot_storage_locations` and the sandbox stops counting toward
-/// `sandboxes_local_snapshots`.
+/// The upload reads the live on-disk snapshot directory, so it needs the wake
+/// gate closed ([`NodeDrain::refuses_activations`]): a gentle v1 drain keeps
+/// serving user traffic, and a wake plus re-suspend would let it register a
+/// torn snapshot. A v2 drain refuses activations too, but its cancel may have
+/// unsealed the node before the row says so, and nothing makes the cancel wait
+/// for an upload. Nor is it needed there: the sealed node itself uploads each
+/// local snapshot of a suspended resident that it has not recorded as backed
+/// up. A pin it has recorded as backed up that the catalog doesn't hold ready
+/// takes catalog loss outside the product's flow, and the drain keeps that row
+/// pending. So it is refused under v2 in every phase.
 ///
-/// Returns a per-sandbox `reuploaded` / `failed` / `deferred` breakdown.
-/// Idempotent: re-invoking against a node whose pinned list is empty
-/// returns empty arrays. Each upload trigger is itself idempotent on
-/// the substrate side — overwriting in place is safe because the drain
-/// gate freezes user-driven wake during drain, so on-disk artifacts
-/// don't change underneath us.
+/// Both callers reject a drain this build can't read before asking: the entry
+/// guard with a 500 ([`force_upload_drain_state`]) and the fan-out's re-check
+/// with an abort ([`node_store::read_node_drain`]). The `Unknown` arm refuses
+/// only in case a future caller passes one: it is the fail-closed default.
 ///
-/// Latency contract enforced via [`FORCE_UPLOAD_RPC_TIMEOUT`],
-/// [`FORCE_UPLOAD_RPC_CONCURRENCY`], and
-/// [`FORCE_UPLOAD_MAX_PER_INVOCATION`].
-/// Operator-facing refusal for `:force-upload-local-snapshots` when the wake
-/// gate is open, as the JSON `error` / `detail` pair.
-///
-/// Extracted from the handler so the emitted text is directly assertable: the
-/// handler needs a full `AppState` that the test module has no harness for, and
-/// these strings are read by operators. A multi-line literal here bakes its own
-/// source indentation into the message unless every line ends in a `\`
-/// continuation, which is invisible in review and shows up as runs of spaces in
-/// the API response.
-fn force_upload_gate_open_message(drain_state: Option<NodeDrain>) -> (&'static str, &'static str) {
-    match drain_state {
-        None => (
-            "conflict: node is not draining",
-            "node is not in a drain phase; force-upload-local-snapshots is only \
-             valid while the drain gate is blocking concurrent user wake",
-        ),
-        Some(_) => (
-            "conflict: node is draining gently, so the wake gate is open",
-            "node is draining in gentle mode, which deliberately keeps serving \
-             user traffic, so the drain gate is not blocking wakes. The legacy \
-             snapshot reupload this action performs reads the live on-disk \
-             snapshot directory and a concurrent wake plus re-suspend would let \
-             it register a torn snapshot. Escalate the drain to forced (or wait \
-             for `drained`) before forcing uploads.",
-        ),
+/// Extracted from the handler so the decision and the emitted text are
+/// directly assertable. A multi-line literal here bakes its own source
+/// indentation into the message unless every line ends in a `\`
+/// continuation, which is invisible in review and shows up as runs of spaces
+/// in the API response.
+fn force_upload_refusal(drain: Option<NodeDrain>) -> Option<ForceUploadRefusal> {
+    match drain {
+        Some(drain @ NodeDrain::V1 { .. }) if drain.refuses_activations() => None,
+        None => Some(ForceUploadRefusal {
+            audit: "conflict: node is not draining",
+            detail: "node is not in a drain phase; force-upload-local-snapshots is only \
+                     valid while the drain gate is blocking concurrent user wake",
+            code: None,
+        }),
+        Some(NodeDrain::V1 { .. }) => Some(ForceUploadRefusal {
+            audit: "conflict: node is draining gently, so the wake gate is open",
+            detail: "node is draining in gentle mode, which deliberately keeps serving \
+                     user traffic, so the drain gate is not blocking wakes. The legacy \
+                     snapshot reupload this action performs reads the live on-disk \
+                     snapshot directory and a concurrent wake plus re-suspend would let \
+                     it register a torn snapshot. Escalate the drain to forced (or wait \
+                     for `drained`) before forcing uploads.",
+            code: None,
+        }),
+        Some(NodeDrain::V2 { .. }) => Some(ForceUploadRefusal {
+            audit: "conflict: a v2 drain uploads each snapshot not recorded as backed up",
+            detail: "the node is under a v2 drain, which itself uploads, while the node \
+                     is sealed, each local snapshot of a suspended resident that the node \
+                     has not recorded as backed up, so force-upload-local-snapshots is \
+                     refused in every phase of a v2 drain, its undrain's cancel included; \
+                     the drain's progress says what it still waits on",
+            code: Some(FORCE_UPLOAD_DRAIN_V2_CODE),
+        }),
+        Some(NodeDrain::Unknown) => Some(ForceUploadRefusal {
+            audit: "conflict: node's drain is unrecognized",
+            detail: "the node's drain is in a state this build doesn't know, so it can't \
+                     tell whether the drain gate is blocking wakes",
+            code: None,
+        }),
     }
 }
 
@@ -2525,6 +2551,31 @@ fn force_upload_drain_state(
     }
 }
 
+/// `:force-upload-local-snapshots` action handler.
+///
+/// Enumerates every suspended sandbox whose `target_node_id` still pins
+/// it to this node **and** whose snapshot has not yet been registered
+/// to S3 (via [`admin_occupancy::pinned_local_only_sandboxes`]), then
+/// calls the controller's `enqueue_suspended_snapshot_backup` per sandbox. That
+/// RPC enqueues a durable-worker upload on the on-node sbx-mgr; the
+/// worker lands a `state='ready'` row in `snapshots` +
+/// `snapshot_storage_locations` and the sandbox stops counting toward
+/// `sandboxes_local_snapshots`.
+///
+/// Returns a per-sandbox `reuploaded` / `failed` / `deferred` breakdown.
+/// Idempotent: re-invoking against a node whose pinned list is empty
+/// returns empty arrays. Each upload trigger is itself idempotent on
+/// the substrate side — overwriting in place is safe because the drain
+/// gate freezes user-driven wake during drain, so on-disk artifacts
+/// don't change underneath us.
+///
+/// Runs only under a v1 drain ([`force_upload_refusal`]): a v2 drain's sealed
+/// node itself uploads each local snapshot of a suspended resident that it
+/// has not recorded as backed up.
+///
+/// Latency contract enforced via [`FORCE_UPLOAD_RPC_TIMEOUT`],
+/// [`FORCE_UPLOAD_RPC_CONCURRENCY`], and
+/// [`FORCE_UPLOAD_MAX_PER_INVOCATION`].
 async fn apply_force_upload_local_snapshots(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -2566,7 +2617,8 @@ async fn apply_force_upload_local_snapshots(
     // its `drain_phase` is non-NULL. `drained` and `terminating` still pass in
     // either mode. Sharing the predicate with the gate is what keeps the two from
     // drifting — the whole hazard here is a reader that thinks wakes are blocked
-    // when they aren't.
+    // when they aren't. A v2 drain refuses wakes but is refused anyway
+    // ([`force_upload_refusal`]): its cancel may already have unsealed the node.
     let drain_state = match force_upload_drain_state(
         node.drain_engine.as_deref(),
         node.drain_phase.as_deref(),
@@ -2577,8 +2629,7 @@ async fn apply_force_upload_local_snapshots(
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
         }
     };
-    if !drain_state.is_some_and(NodeDrain::refuses_activations) {
-        let (error, detail) = force_upload_gate_open_message(drain_state);
+    if let Some(refusal) = force_upload_refusal(drain_state) {
         audit::record(AdminAuditEntry {
             actor: &actor,
             action: "force-upload-local-snapshots",
@@ -2590,14 +2641,14 @@ async fn apply_force_upload_local_snapshots(
             replace_after_terminate: None,
             drain_mode: drain_state.and_then(NodeDrain::mode),
             success: false,
-            error: Some(error),
+            error: Some(refusal.audit),
             outcome_counts: None,
         });
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": detail })),
-        )
-            .into_response();
+        let body = match refusal.code {
+            Some(code) => serde_json::json!({ "error": refusal.detail, "code": code }),
+            None => serde_json::json!({ "error": refusal.detail }),
+        };
+        return (StatusCode::CONFLICT, Json(body)).into_response();
     }
 
     // The page is `cap + 1` rows so a returned slice of length `cap + 1` is
@@ -2671,29 +2722,36 @@ async fn apply_force_upload_local_snapshots(
     // Per-RPC wake-gate re-check closes a TOCTOU between the up-front guard and
     // the per-sandbox RPC dispatch: a concurrent `:undrain` — or an `:undrain`
     // followed by a *gentle* `:drain`, which leaves the phase non-NULL while
-    // reopening the gate — could otherwise let the user wake a sandbox while we
-    // still have uploads in flight. It asks the same question as the entry guard,
-    // through the same predicate, for exactly that reason. Cheap indexed PG
-    // point-read; the short-circuit almost never trips, and when it does the
-    // remaining sandboxes are reported in `failed[]` so the operator can
-    // re-invoke or accept the abort.
+    // reopening the gate, or by a v2 one, whose cancel clears the row on its
+    // own as soon as the node answers it, without waiting for an upload —
+    // could otherwise let the user wake a sandbox while we still have uploads
+    // in flight. It asks the same question as the entry guard, through the
+    // same predicate ([`force_upload_refusal`]), for exactly that reason. Cheap
+    // indexed PG point-read; the short-circuit almost never trips, and when it
+    // does the remaining sandboxes are reported in `failed[]` so the operator
+    // can re-invoke or accept the abort.
     let results: Vec<(SandboxId, Result<(), String>)> = stream::iter(to_process)
         .map(|sandbox_id| async move {
-            match node_store::is_node_wake_gate_closed(pool_ref, node_id).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return (
-                        sandbox_id,
-                        Err(
-                            "aborted: the node's wake gate opened during fan-out — it was \
-                             undrained, or re-drained in gentle mode, which keeps serving \
-                             user traffic. Re-invoke once the node is draining in forced \
-                             mode (or drained), or accept that the local-only snapshot \
-                             will be reuploaded by the next drain cycle"
-                                .to_string(),
-                        ),
-                    );
-                }
+            match node_store::read_node_drain(pool_ref, node_id).await {
+                Ok(drain) => match force_upload_refusal(drain) {
+                    None => {}
+                    Some(refusal) if matches!(drain, Some(NodeDrain::V2 { .. })) => {
+                        return (sandbox_id, Err(format!("aborted: {}", refusal.detail)));
+                    }
+                    Some(_) => {
+                        return (
+                            sandbox_id,
+                            Err(
+                                "aborted: the node's wake gate opened during fan-out — it was \
+                                 undrained, or re-drained in gentle mode, which keeps serving \
+                                 user traffic. Re-invoke once the node is draining in forced \
+                                 mode (or drained), or accept that the local-only snapshot \
+                                 will be reuploaded by the next drain cycle"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                },
                 Err(err) => {
                     return (
                         sandbox_id,

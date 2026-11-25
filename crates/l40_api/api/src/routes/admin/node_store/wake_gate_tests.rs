@@ -1,13 +1,22 @@
-//! Postgres-backed contract for [`is_node_wake_gate_closed`]'s decoding of the
-//! drain columns: a gate-closing state reads closed, and an engine or a
-//! phase this build does not know fails the check, never reading as open.
+//! Postgres-backed contract for [`read_node_drain`]'s decoding of the drain
+//! columns: a gate-closing state reads closed, and an engine or a phase this
+//! build does not know fails the read, never reading as open.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
-use super::is_node_wake_gate_closed;
+use pplx_space_node_model::NodeDrain;
+
+use super::read_node_drain;
+
+/// Whether the drain [`read_node_drain`] reads refuses activations.
+async fn is_node_wake_gate_closed(pool: &PgPool, node_id: NodeId) -> Result<bool, sqlx::Error> {
+    Ok(read_node_drain(pool, node_id)
+        .await?
+        .is_some_and(NodeDrain::refuses_activations))
+}
 
 async fn set_drain(
     pool: &PgPool,
@@ -80,7 +89,7 @@ async fn unrecognized_drain_phase_fails_the_wake_gate_check() -> TestResult {
     )
     .await?;
 
-    let err = is_node_wake_gate_closed(&db.pool, node_id)
+    let err = read_node_drain(&db.pool, node_id)
         .await
         .expect_err("an unrecognized drain phase must fail the check");
     assert!(
@@ -113,7 +122,7 @@ async fn an_unrecognized_engine_or_v2_phase_fails_the_wake_gate_check() -> TestR
             .bind(engine)
             .execute(&db.pool)
             .await?;
-        let err = is_node_wake_gate_closed(&db.pool, node_id)
+        let err = read_node_drain(&db.pool, node_id)
             .await
             .expect_err("an unrecognized drain must fail the check");
         assert!(
