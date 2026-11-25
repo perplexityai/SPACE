@@ -20,11 +20,17 @@ pub struct CgroupMemoryState {
 }
 
 impl CgroupMemoryState {
-    /// Anonymous plus kernel memory: what reclaim cannot drop without
-    /// swap, which sandbox cgroups do not have. `None` when the kernel
-    /// reports no `anon` or `kernel`.
+    /// Anonymous, kernel and shared memory: memory that sandbox cgroups,
+    /// which have no swap, cannot reclaim. `shmem` (tmpfs, shm segments and
+    /// shared anonymous mappings) is counted inside `file`, not `anon`, so
+    /// adding it does not double count. All kernel memory is included,
+    /// including reclaimable slab. `None` when the kernel reports no `anon`,
+    /// `kernel` or `shmem`.
     pub fn unreclaimable_bytes(&self) -> Option<u64> {
-        self.stat.anon?.checked_add(self.stat.kernel?)
+        self.stat
+            .anon?
+            .checked_add(self.stat.kernel?)?
+            .checked_add(self.stat.shmem?)
     }
 
     /// `memory.max` minus [`Self::unreclaimable_bytes`], saturating at zero:
@@ -181,8 +187,8 @@ mod tests {
 
         let state = read_cgroup_memory_state(dir.path()).unwrap();
 
-        assert_eq!(state.unreclaimable_bytes(), Some(3700));
-        assert_eq!(state.headroom_bytes(), Some(8_589_934_592 - 3700));
+        assert_eq!(state.unreclaimable_bytes(), Some(3800));
+        assert_eq!(state.headroom_bytes(), Some(8_589_934_592 - 3800));
         assert_eq!(
             state,
             CgroupMemoryState {
