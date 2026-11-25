@@ -31,7 +31,7 @@ impl StoredSandboxLifecycle {
     ///
     /// The live half is [`SandboxLifecycle::all`], so a variant listed there
     /// reaches every sweep with no edit here. The tombstone half is
-    /// [`TOMBSTONES`]; the wildcard-free match in `tombstone_position` makes a
+    /// `TOMBSTONES`; the wildcard-free match in `tombstone_position` makes a
     /// new stored-only variant fail to compile until it is classified, and
     /// listing it stays manual.
     pub const fn all() -> &'static [Self] {

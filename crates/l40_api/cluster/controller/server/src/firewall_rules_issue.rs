@@ -3,7 +3,7 @@
 //! ([`pplx_space_firewall_rules_store::issue_first_assignment`]). No worker
 //! is called.
 //!
-//! [`run`] issues a canary's one target each tick and then leaves it alone,
+//! `run` issues a canary's one target each tick and then leaves it alone,
 //! due check included; checks, rolling and completion belong to a later
 //! driver. It's off in every deployment: there is no production lease or
 //! first-check delay, and the targets come from a start that isn't enabled.

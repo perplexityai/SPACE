@@ -647,7 +647,7 @@ impl ClusterApiService {
 
     /// Point the template-visibility lookup at its own pool.
     ///
-    /// See [`ClusterApiService::visibility_pool`]. Call this with a small
+    /// See `ClusterApiService::visibility_pool`. Call this with a small
     /// dedicated pool in any deployment that serves sandbox-create pulls;
     /// without it the lookup shares the load-bearing pool and an
     /// `ALTER TABLE templates` can starve release resolution.
@@ -666,7 +666,7 @@ impl ClusterApiService {
 
     /// Point the runtime environment catalog read at its own pool.
     ///
-    /// See [`ClusterApiService::runtime_catalog_pool`]. Call this with a small
+    /// See `ClusterApiService::runtime_catalog_pool`. Call this with a small
     /// dedicated pool in any deployment that admits nodes to the provisioning
     /// recipe; without it a blocked `runtime_environments` read shares the
     /// load-bearing pool.

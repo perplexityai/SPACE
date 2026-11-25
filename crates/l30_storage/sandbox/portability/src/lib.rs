@@ -11,11 +11,21 @@
 //! The same freshness fragment shows up in two decision-points with subtly
 //! different lifecycle scopes:
 //!
-//! * **Drain-completion** — admin `:terminate` guard, drain reconciler
-//!   blocker count, drain reconciler mark-failed atomic re-check. Only
-//!   `lifecycle = 'suspended'` rows can be portable here: `suspending` /
-//!   `restoring` rows are mid-flight and don't yet have a snapshot to
-//!   promote, so they always block drain.
+//! * **Source release**: may a draining node let go of its sandboxes? The
+//!   drain gate holds the node while a row pinned to it (`target_node_id`) is
+//!   `suspending`, `restoring` for a restore that isn't an evacuation, or
+//!   `suspended` without a durable snapshot, and while a suspend upload from
+//!   the node is still in flight for a row that isn't durable yet. "Durable"
+//!   is [`snapshot_durable_for_source_release`]: [`latest_full_snapshot_ready`]
+//!   for an evacuation-marked row, the freshness fragment
+//!   ([`fresh_ready_snapshot_exists`]) for an unmarked one. For a row with
+//!   `current_local_artifact_id` both require a `ready` full backup of that
+//!   exact artifact on a storage location that isn't orphaned, so the
+//!   evacuation mark changes the test only for a row whose
+//!   `current_local_artifact_id` is NULL. Production asks
+//!   [`drain_gate_blockers_for_node`] or [`drain_gate_blocker_pairs`];
+//!   `drain_gate_blocks_source_release` writes the gate down as the reference
+//!   definition the tests compare them with.
 //! * **Restore fallback selection** — the API drain gate's portable-bypass and
 //!   the initial Kubernetes user-restore fallback selection. The scope widens
 //!   to `lifecycle IN ('suspended', 'restoring')` because
@@ -51,7 +61,7 @@
 //! it directly. Enumerated rather than counted, because an earlier revision of
 //! this paragraph undercounted them:
 //!
-//! 1. [`matching_ready_backup_exists`], in this file.
+//! 1. `matching_ready_backup_exists`, in this file.
 //! 2. [`snapshot_is_live_restore_source`], in this file — the deletion guard.
 //! 3. The snapshot-retention store's marked-restore-breach reporting query,
 //!    which composes the fragment directly rather than through (2).
@@ -463,7 +473,7 @@ pub fn sandbox_attached_anywhere(sandbox_alias: &str) -> String {
 ///   a real relocation (`target_node_id = placed.node_id`), so a genuine
 ///   restore elsewhere satisfies them.
 ///
-///   Deliberately **not** [`matching_ready_backup_exists`], which looks like
+///   Deliberately **not** `matching_ready_backup_exists`, which looks like
 ///   exactly this and filters `sn.type = 'full'`. `begin_artifact_backup`
 ///   derives `snapshots.type` from the artifact kind, so that filter means
 ///   `artifact_kind = 'full'`, and a `stopped` sandbox's marker is a `disk`
@@ -1721,7 +1731,7 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 ///   disk in practice, but nothing here requires it.
 ///
 /// Deliberately **not** placement-gated, following the exact-identity branch
-/// of [`fresh_ready_snapshot_exists`] — [`matching_ready_backup_exists`] omits
+/// of [`fresh_ready_snapshot_exists`] — `matching_ready_backup_exists` omits
 /// `placement_changed_at`, and only the markerless legacy branch beside it
 /// compares timestamps. Matching the pin is this module's currency test, so a
 /// re-place must not revoke the exemption.
@@ -1940,7 +1950,7 @@ pub fn current_disk_artifact_backup_ready(sandbox_alias: &str) -> String {
 ///
 /// The two branches are nested *inside* a single correlated `EXISTS`, the same
 /// shape [`snapshot_durable_for_source_release`] uses, rather than composed
-/// through [`artifact_identity_or_legacy`] as two sibling `EXISTS`
+/// through `artifact_identity_or_legacy` as two sibling `EXISTS`
 /// expressions. The two forms are logically identical — the branch key
 /// `current_local_artifact_id IS [NOT] NULL` reads only the outer row, so
 /// distributing it inside the `EXISTS` preserves truth for every row — but they
@@ -2256,7 +2266,7 @@ fn drain_gate_target_pinned_blocks(sandbox_alias: &str, node_expr: &str) -> Stri
 /// is what this module's `drain_gate_differential_tests` assert against a live
 /// Postgres:
 ///
-/// * The first branch applies [`drain_gate_target_pinned_blocks`] with the node
+/// * The first branch applies `drain_gate_target_pinned_blocks` with the node
 ///   expression bound to `s.target_node_id`, so the lifecycle vocabulary and the
 ///   durability rules are never restated here — only pre-filtered by an
 ///   indexable equality so the planner has a driver. It carries the

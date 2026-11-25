@@ -76,7 +76,7 @@ pub const STUCK_TRANSIENT_AFTER: Duration = crate::drain::STALE_ABANDON_AFTER;
 /// Why a row holds the node: the one sentence an operator reads first. The
 /// gate terms that count it are [`NodeHoldTerms`]; a reason is not a term.
 ///
-/// Variants are in the order [`NodeHoldReason::of`] tests them, which is also
+/// Variants are in the order `NodeHoldReason::of` tests them, which is also
 /// the order [`list`] returns each group's rows in (see [`NodeHolds::rows`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]

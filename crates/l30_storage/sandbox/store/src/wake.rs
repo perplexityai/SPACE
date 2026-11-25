@@ -92,7 +92,7 @@ fn fenced_completion_cas() -> String {
 }
 
 /// Complete a wake whose request was cancelled mid-flight, once the redrive
-/// found its execution routable ([`fenced_completion_cas`]). Returns whether
+/// found its execution routable (`fenced_completion_cas`). Returns whether
 /// the row flipped; `false` means the row moved on, a restore lease is still
 /// live, or the execution was replaced after the redrive checked it.
 ///
