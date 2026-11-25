@@ -7,7 +7,7 @@ use pplx_space_template_mgr_store::builds::{self, TemplateBuildRow};
 use pplx_space_template_mgr_store::database;
 use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
 use pplx_space_template_mgr_store::template_local_state;
-pub use pplx_space_template_mgr_store::{
+pub(crate) use pplx_space_template_mgr_store::{
     Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction,
 };
 use pplx_space_template_mgr_store::{network_policy_notifications, pins};
@@ -16,10 +16,6 @@ pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;
 
 pub fn open() -> Result<Connection, database::SqliteError> {
     database::open(Path::new(DB_PATH))
-}
-
-fn immediate_transaction(conn: &Connection) -> Result<Transaction<'_>> {
-    Transaction::immediate(conn)
 }
 
 #[cfg(test)]
@@ -312,7 +308,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
             format: component.format.as_ref().map(|value| value.as_str()),
         })
         .collect();
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     if !builds::upsert_build(&tx, &row, &components)? {
         tracing::warn!(
             template = b.name,
@@ -356,7 +352,7 @@ pub fn touch_build(
     builds::touch_build(conn, name, content_hash, cache_partition, &ts)
 }
 
-pub use pplx_space_template_mgr_store::builds::BuildEvictionRow;
+pub(crate) use pplx_space_template_mgr_store::builds::BuildEvictionRow;
 
 /// Return every `ready` build with the timestamps the eviction
 /// planner needs. The planner is purely functional, so this is the
@@ -415,7 +411,7 @@ pub fn delete_build(
 }
 
 pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     template_local_state::delete_template_rows(&tx, name)?;
     tx.commit()?;
     Ok(())
@@ -425,7 +421,7 @@ pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> 
 /// so a build a concurrent pull just recorded keeps its settings. Returns
 /// whether it deleted.
 pub fn delete_template_local_state_without_builds(conn: &Connection, name: &str) -> Result<bool> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     if template_local_state::template_has_builds(&tx, name)? {
         return Ok(false);
     }
@@ -511,24 +507,24 @@ pub fn list_build_partitions(conn: &Connection, name: &str) -> Result<Vec<Templa
 
 // ── Snapshots ──────────────────────────────────────────────────────────────
 
-pub use pplx_space_template_mgr_store::snapshots::{
+pub(crate) use pplx_space_template_mgr_store::snapshots::{
     SnapshotKey, SnapshotRow, delete_snapshot, delete_snapshots_for_build, get_snapshot,
     list_snapshots, upsert_snapshot,
 };
 
 // ── Pools ──────────────────────────────────────────────────────────────────
 
-pub use pplx_space_template_mgr_store::pools::{
+pub(crate) use pplx_space_template_mgr_store::pools::{
     PoolRow, delete_pool, get_all_pools, get_pool, insert_pool,
 };
 
 // ── Template settings ──────────────────────────────────────────────────────
 
-pub use pplx_space_template_mgr_store::template_settings::{
-    TemplateNetworkPolicyUpdate, TemplateNetworkPolicyUpsertError, TemplateSettingsPolicies,
-    TemplateSettingsRow, get_template_settings, list_template_settings,
-    list_template_snapshot_policies, record_snapshot_reconcile_completed,
-    record_snapshot_reconcile_started, update_template_snapshot_policy,
+pub(crate) use pplx_space_template_mgr_store::template_settings::{
+    TemplateNetworkPolicyUpdate, TemplateNetworkPolicyUpsertError, TemplateSettingsRow,
+    get_template_settings, list_template_settings, list_template_snapshot_policies,
+    record_snapshot_reconcile_completed, record_snapshot_reconcile_started,
+    update_template_snapshot_policy,
 };
 use pplx_space_template_mgr_store::template_settings::{
     try_update_template_network_policy_tx, upsert_template_settings_tx,
@@ -539,7 +535,7 @@ pub fn upsert_template_settings(
     template: &str,
     default_auto_lifecycle: &AutoLifecyclePolicy,
 ) -> Result<()> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     upsert_template_settings_tx(
         &tx,
         template,
@@ -565,7 +561,7 @@ pub fn try_upsert_template_network_policy(
     default_network_policy_generation: u64,
     authority: PolicyAuthority,
 ) -> std::result::Result<bool, TemplateNetworkPolicyUpsertError> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let decision = try_update_template_network_policy_tx(
         &tx,
         template,
@@ -591,7 +587,7 @@ pub fn update_template_settings_with_outbox(
     conn: &Connection,
     update: TemplateSettingsUpdate<'_>,
 ) -> std::result::Result<TemplateSettingsUpdateOutcome, TemplateNetworkPolicyUpsertError> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let mut auto_lifecycle_applied = false;
     if let Some(policy) = update.default_auto_lifecycle {
         auto_lifecycle_applied = upsert_template_settings_tx(
@@ -657,7 +653,7 @@ fn enqueue_node_dirty_network_policy_template_tx(
 }
 
 pub fn enqueue_node_dirty_template_inventory(conn: &Connection, template: &str) -> Result<bool> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let queued = enqueue_node_dirty_template_inventory_tx(&tx, template)?;
     tx.commit()?;
     Ok(queued)
@@ -672,7 +668,7 @@ fn enqueue_node_dirty_template_inventory_tx(tx: &Transaction<'_>, template: &str
 /// Acknowledge only the obligations read before sending. A newer enqueue, even
 /// for a previously deleted key, remains pending for the worker's next retry.
 pub fn delete_node_dirty_refs(conn: &Connection, refs: &[NodeDirtyRefRow]) -> Result<usize> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let deleted = node_dirty_refs::delete_node_dirty_refs_at_revision(&tx, refs)?;
     tx.commit()?;
     Ok(deleted)
@@ -718,7 +714,7 @@ pub fn delete_template_network_policy_notifications(
     conn: &Connection,
     rows: &[TemplateNetworkPolicyNotificationRow],
 ) -> Result<usize> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let mut deleted = 0;
     for row in rows {
         deleted += network_policy_notifications::acknowledge(

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use pplx_space_node_mgr_store::{Connection, Transaction, executions, meta, slots};
-pub use pplx_space_node_mgr_store::{LeaseKind, PoolValueParseError, SlotHealth, SlotState};
+pub(crate) use pplx_space_node_mgr_store::{LeaseKind, PoolValueParseError, SlotHealth, SlotState};
 use pplx_space_sandbox_model::{SandboxId, SandboxIdParseError};
 #[cfg(test)]
 use rusqlite::params;
