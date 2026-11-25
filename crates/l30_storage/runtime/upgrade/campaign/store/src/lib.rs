@@ -546,8 +546,8 @@ pub async fn list_records(
         .collect()
 }
 
-/// [`unfinished_from`] after taking the transaction-scoped advisory lock
-/// that every [`create_campaign`] for `kind` and `source` takes first. Run
+/// The id of an unfinished campaign of `kind` from `source`, if any, read
+/// under the advisory lock every such [`create_campaign`] takes first. Run
 /// inside a caller's transaction, it holds off any such create until that
 /// transaction ends, so a caller that refuses to act while a campaign is
 /// unfinished (a policy block, say) can't race one into existence. The lock
@@ -575,7 +575,7 @@ pub async fn unfinished_from_locked(
 /// [`create_campaign`] would refuse a second for. Takes no lock, so it's a
 /// read for a caller's check, not a guarantee; [`unfinished_from_locked`]
 /// is the guarded form.
-pub async fn unfinished_from(
+pub(crate) async fn unfinished_from(
     executor: impl sqlx::PgExecutor<'_>,
     kind: CampaignKind,
     source: EnvironmentReference,
