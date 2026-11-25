@@ -82,7 +82,14 @@ The runner starts N isolated benches side by side, each one CI shard runner
 shared images once, and picks N from the host's CPUs, available memory, free
 disk and a short write-throughput probe of the bench volume (`--benches N`
 overrides). It takes about 23 minutes at N=4 or 5 on that host shape with a
-warm Rust target directory. An unexcused scenario failure here fails the run
+warm Rust target directory. A cold host builds Rust unless it reuses main's
+image for the same Rust input key: where the image package cannot be read,
+export `SPACE_KIND_REGISTRY_MIRROR` to pull it by digest through a
+pull-through mirror of ghcr.io (digests from main CI's
+`kind-rust-artifact-digest` artifacts, or `SPACE_KIND_RUST_DIGESTS_FILE`). The
+summary's `Rust image` line says whether it was reused and from where; never
+write the mirror's address into the repository or shared evidence. An
+unexcused scenario failure here fails the run
 with exit `1`; one the known-failures list excused is listed as
 `known failure` and leaves the exit status as the rest of the run sets it. If
 a failed scenario passes when rerun, report both runs. Call a failure
