@@ -386,7 +386,9 @@ async fn a_page_isnt_judged_under_inputs_that_changed_since_the_plan() -> TestRe
         panic!("a blocked source with an edge scans");
     };
     assert!(plan.moves);
-    let page = driver.find_subjects(&campaign, plan, None, 10).await?;
+    let SubjectScan::Page(page) = driver.find_subjects(&campaign, plan, None, 10).await? else {
+        panic!("the plan matches");
+    };
     assert_eq!(page.on_source.len(), 1);
 
     // Deprecated, the source's running sandboxes no longer count, so a page
@@ -402,7 +404,7 @@ async fn a_page_isnt_judged_under_inputs_that_changed_since_the_plan() -> TestRe
     tx.commit().await?;
     assert_eq!(
         driver.find_subjects(&campaign, plan, None, 10).await,
-        Err(PLAN_CHANGED.to_owned())
+        Ok(SubjectScan::PlanChanged)
     );
     let Plan::Scan(replanned) = driver.plan(&campaign).await? else {
         panic!("a deprecated source with an edge scans");

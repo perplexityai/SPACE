@@ -79,11 +79,13 @@ pub async fn sandbox_candidates(
     .await
 }
 
-/// A leased sandbox as it is now: its lifecycle and the execution it last
+/// A leased sandbox as it is now: its lifecycle, when that lifecycle last
+/// changed (`sandboxes_touch_lifecycle_changed_at`), and the execution it last
 /// published, which says which environment it's on.
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
 pub struct SubjectSandbox {
     pub lifecycle: String,
+    pub lifecycle_changed_at: time::OffsetDateTime,
     /// The published execution. Every field but the id is `None` when the
     /// node hasn't published the sandbox.
     #[sqlx(flatten)]
@@ -97,8 +99,8 @@ pub async fn subject_sandbox(
     sandbox_id: uuid::Uuid,
 ) -> Result<Option<SubjectSandbox>, sqlx::Error> {
     sqlx::query_as::<_, SubjectSandbox>(sql!(
-        "SELECT s.lifecycle, s.id AS sandbox_id, o.execution_metadata, o.runtime,
-                o.runtime_version, o.state_format_name, o.state_format_version
+        "SELECT s.lifecycle, s.lifecycle_changed_at, s.id AS sandbox_id, o.execution_metadata,
+                o.runtime, o.runtime_version, o.state_format_name, o.state_format_version
          FROM sandboxes s
          LEFT JOIN sandbox_observed_states o ON o.sandbox_id = s.id
          WHERE s.id = $1"

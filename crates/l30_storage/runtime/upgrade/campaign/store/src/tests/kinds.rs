@@ -35,19 +35,40 @@ async fn items_go_only_into_campaigns_of_their_subject_kind() -> TestResult {
         return Ok(());
     };
     let sandboxes = insert_campaign(&db.pool, CampaignSeed::default()).await?;
+    let force_restarts = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            kind: CampaignKind::SandboxForceRestarts,
+            ..CampaignSeed::default()
+        },
+    )
+    .await?;
     let releases = insert_campaign(&db.pool, templates(CampaignSeed::default())).await?;
     let subjects = [Uuid::now_v7()];
 
+    for sandbox_campaign in [sandboxes, force_restarts] {
+        assert_eq!(
+            insert_pending(
+                &db.pool,
+                sandbox_campaign,
+                SubjectKind::TemplateRelease,
+                &subjects,
+                MAX_ATTEMPTS
+            )
+            .await?,
+            0
+        );
+    }
     assert_eq!(
         insert_pending(
             &db.pool,
-            sandboxes,
-            SubjectKind::TemplateRelease,
+            force_restarts,
+            SubjectKind::Sandbox,
             &subjects,
             MAX_ATTEMPTS
         )
         .await?,
-        0
+        1
     );
     assert_eq!(
         insert_pending(

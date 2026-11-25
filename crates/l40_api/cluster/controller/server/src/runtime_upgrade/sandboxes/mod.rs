@@ -51,23 +51,26 @@ use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{CampaignDriver, MAX_ATTEMPTS, Plan, ScanPlan, SubjectPage};
+use super::{CampaignDriver, MAX_ATTEMPTS, Plan, ScanPlan, SubjectPage, SubjectScan};
 
 mod dispatcher;
+mod force_restarts;
 
 #[cfg(test)]
 mod tests;
 
-pub use dispatcher::{DispatchError, GuardedStop, SandboxUpgradeDispatcher, StoppedUpgrade};
+pub use dispatcher::{
+    DispatchError, ForceRestartProgress, GuardedStop, SandboxUpgradeDispatcher, StoppedUpgrade,
+    TargetStart,
+};
 use dispatcher::{Step, step};
+pub use force_restarts::{MemoryRetirement, MemoryRetirementSource, SandboxForceRestartDriver};
 
 pub(super) const NO_LONGER_ON_SOURCE: &str = "the sandbox is no longer on the campaign's source";
 pub(super) const ON_NEITHER_END: &str =
     "the sandbox is on neither the campaign's source nor its target";
 pub(super) const POLICY_STOPPED_MOVING_RUNNING: &str =
     "the policy no longer moves this campaign's running sandboxes";
-pub(super) const PLAN_CHANGED: &str =
-    "the policy or catalog changed since the campaign was planned; retrying next tick";
 
 /// Drives `sandboxes` campaigns of one substrate's sandboxes.
 pub struct SandboxDriver<D> {
@@ -163,13 +166,13 @@ const fn scanned_lifecycles(takes_running: bool) -> &'static [SandboxLifecycle] 
 }
 
 /// The policy and the unretired catalog, as every decision reads them.
-struct Inputs {
-    policy: RuntimeEnvironmentPolicy,
-    catalog: Vec<CatalogEnvironment>,
+pub(super) struct Inputs {
+    pub(super) policy: RuntimeEnvironmentPolicy,
+    pub(super) catalog: Vec<CatalogEnvironment>,
 }
 
 impl Inputs {
-    async fn read(pool: &PgPool) -> Result<Self, String> {
+    pub(super) async fn read(pool: &PgPool) -> Result<Self, String> {
         let policy = pplx_space_runtime_environment_policy_store::get(pool)
             .await
             .map_err(|error| format!("reading the policy failed: {error}"))?;
@@ -183,12 +186,17 @@ impl Inputs {
         Ok(Self { policy, catalog })
     }
 
-    fn plan(&self, campaign: &Campaign) -> SandboxPlan {
-        let from_catalog = self
-            .catalog
+    pub(super) fn catalog_entry(
+        &self,
+        reference: EnvironmentReference,
+    ) -> Option<&CatalogEnvironment> {
+        self.catalog
             .iter()
-            .find(|environment| environment.reference == campaign.from);
-        sandbox_plan(&self.policy, from_catalog, campaign)
+            .find(|environment| environment.reference == reference)
+    }
+
+    fn plan(&self, campaign: &Campaign) -> SandboxPlan {
+        sandbox_plan(&self.policy, self.catalog_entry(campaign.from), campaign)
     }
 
     /// The loop's plan for `campaign`, and which lifecycles it scans.
@@ -208,22 +216,22 @@ impl Inputs {
         }
     }
 
-    /// A fingerprint of what judges a sandbox besides `moves`: the catalog
-    /// and the legacy unbound setting, which attribute it to an environment,
-    /// and which lifecycles count. Within one process, equal inputs give
-    /// equal fingerprints.
-    fn fingerprint(&self, takes_running: bool) -> u64 {
+    /// A fingerprint of what judges a sandbox besides `moves`: the policy
+    /// generation (so a policy hold-and-unhold between ticks restarts an open
+    /// pass), the catalog and the legacy unbound setting, which attribute it
+    /// to an environment, and any mode-specific selector (`extra`). Within one
+    /// process, equal inputs give equal fingerprints.
+    pub(super) fn fingerprint(&self, extra: impl std::hash::Hash) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.policy.generation.hash(&mut hasher);
         format!("{:?}", self.catalog).hash(&mut hasher);
         self.policy.legacy_unbound_allowed.hash(&mut hasher);
-        takes_running.hash(&mut hasher);
+        extra.hash(&mut hasher);
         hasher.finish()
     }
 
-    /// The environment `execution` puts its sandbox on, as a start
-    /// attributes it.
-    fn attributed(&self, execution: &SandboxCandidate) -> Option<EnvironmentReference> {
+    fn parse_published(execution: &SandboxCandidate) -> Option<RecordedExecution> {
         // A publish that carried no execution is no evidence, as a start's
         // read of the published execution rules: it isn't a record from
         // before execution metadata existed, which the legacy setting would
@@ -234,19 +242,68 @@ impl Inputs {
         {
             return None;
         }
-        let recorded = RecordedExecution::from_record(
+        Some(RecordedExecution::from_record(
             execution.execution_metadata.as_deref(),
             execution.runtime.clone(),
             execution.runtime_version.clone(),
             execution.state_format_name.clone(),
             execution.state_format_version.clone(),
-        );
+        ))
+    }
+
+    /// Whether `execution` carries a published unbound record (whose
+    /// attribution depends on the catalog or `legacy_unbound_allowed`).
+    pub(super) fn is_published_unbound(execution: &SandboxCandidate) -> bool {
+        Self::parse_published(execution).is_some_and(|recorded| recorded.environment.is_none())
+    }
+
+    /// The environment `execution` puts its sandbox on, as a start
+    /// attributes it.
+    pub(super) fn attributed(&self, execution: &SandboxCandidate) -> Option<EnvironmentReference> {
+        let recorded = Self::parse_published(execution)?;
         attribute(&recorded, &self.catalog, self.policy.legacy_unbound_allowed)
     }
 
     /// Whether `execution` puts its sandbox on `campaign`'s source.
-    fn on_source(&self, execution: &SandboxCandidate, campaign: &Campaign) -> bool {
+    pub(super) fn on_source(&self, execution: &SandboxCandidate, campaign: &Campaign) -> bool {
         self.attributed(execution) == Some(campaign.from)
+    }
+
+    /// Read one page of `lifecycles` candidates for `campaign` and split them
+    /// into those attributed to `campaign`'s source and those attributed
+    /// elsewhere.
+    pub(super) async fn page_candidates(
+        &self,
+        pool: &PgPool,
+        campaign: &Campaign,
+        managed_by: &str,
+        lifecycles: &[SandboxLifecycle],
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<SubjectPage, String> {
+        let page = store::sandbox_candidates(
+            pool,
+            campaign.id,
+            managed_by,
+            lifecycles,
+            after,
+            limit,
+            MAX_ATTEMPTS,
+        )
+        .await
+        .map_err(|error| format!("reading candidates failed: {error}"))?;
+        let (on_source, elsewhere): (Vec<&SandboxCandidate>, Vec<&SandboxCandidate>) = page
+            .iter()
+            .partition(|candidate| self.on_source(candidate, campaign));
+        Ok(SubjectPage {
+            on_source: on_source.iter().map(|c| c.sandbox_id).collect(),
+            // A candidate the catalog attributes elsewhere can still carry a
+            // skipped item from when it was on the source. Retired, it
+            // neither comes back as a candidate nor holds the campaign open.
+            elsewhere: elsewhere.iter().map(|c| c.sandbox_id).collect(),
+            last: page.last().map(|candidate| candidate.sandbox_id),
+            examined: page.len(),
+        })
     }
 }
 
@@ -270,38 +327,26 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
         plan: ScanPlan,
         after: Option<Uuid>,
         limit: u32,
-    ) -> Result<SubjectPage, String> {
+    ) -> Result<SubjectScan, String> {
         // Read again rather than trusting `plan`'s inputs: the page is
         // judged under what's read here, so it must be what `plan` was made
         // from. A change since restarts the pass next tick.
         let inputs = Inputs::read(&self.pool).await?;
         let takes_running = match inputs.scan_plan(campaign) {
             Ok((now, takes_running)) if now == plan => takes_running,
-            _ => return Err(PLAN_CHANGED.to_owned()),
+            _ => return Ok(SubjectScan::PlanChanged),
         };
-        let page = store::sandbox_candidates(
-            &self.pool,
-            campaign.id,
-            self.managed_by,
-            scanned_lifecycles(takes_running),
-            after,
-            limit,
-            MAX_ATTEMPTS,
-        )
-        .await
-        .map_err(|error| format!("reading candidates failed: {error}"))?;
-        let (on_source, elsewhere): (Vec<&SandboxCandidate>, Vec<&SandboxCandidate>) = page
-            .iter()
-            .partition(|candidate| inputs.on_source(candidate, campaign));
-        Ok(SubjectPage {
-            on_source: on_source.iter().map(|c| c.sandbox_id).collect(),
-            // A candidate the catalog attributes elsewhere can still carry a
-            // skipped item from when it was on the source. Retired, it
-            // neither comes back as a candidate nor holds the campaign open.
-            elsewhere: elsewhere.iter().map(|c| c.sandbox_id).collect(),
-            last: page.last().map(|candidate| candidate.sandbox_id),
-            examined: page.len(),
-        })
+        inputs
+            .page_candidates(
+                &self.pool,
+                campaign,
+                self.managed_by,
+                scanned_lifecycles(takes_running),
+                after,
+                limit,
+            )
+            .await
+            .map(SubjectScan::Page)
     }
 
     async fn upgrade(&self, campaign: &Campaign, item: &LeasedItem) -> ItemOutcome {
@@ -337,13 +382,15 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
         }
         match step {
             Step::Upgrade => {}
-            Step::StopThenUpgrade => match self.dispatcher.stop(sandbox_id, campaign.from).await {
-                Ok(GuardedStop::Stopped) => {}
-                Ok(GuardedStop::Declined(reason)) => {
-                    return ItemOutcome::Skipped(ItemError::new(reason));
+            Step::StopThenUpgrade => {
+                match self.dispatcher.stop(None, sandbox_id, campaign.from).await {
+                    Ok(GuardedStop::Stopped { .. }) => {}
+                    Ok(GuardedStop::Declined(reason)) => {
+                        return ItemOutcome::Skipped(ItemError::new(reason));
+                    }
+                    Err(error) => return error_outcome(error),
                 }
-                Err(error) => return error_outcome(error),
-            },
+            }
             Step::Release(reason) => return ItemOutcome::Release(ItemError::new(reason)),
             Step::Skip(reason) => return ItemOutcome::Skipped(ItemError::new(reason)),
         }
@@ -361,7 +408,7 @@ impl<D: SandboxUpgradeDispatcher> CampaignDriver for SandboxDriver<D> {
 
 /// The outcome a dispatch error records. The loop fails a retry on the
 /// item's last attempt.
-fn error_outcome(error: DispatchError) -> ItemOutcome {
+pub(super) fn error_outcome(error: DispatchError) -> ItemOutcome {
     match error {
         DispatchError::Retryable(message) => ItemOutcome::Retry(ItemError::new(message)),
         DispatchError::Failed(message) => ItemOutcome::Failed(ItemError::new(message)),

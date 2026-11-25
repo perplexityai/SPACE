@@ -2604,11 +2604,12 @@ decision is counted by `runtime_upgrade.activation.decision`.
 ### Runtime upgrade campaigns
 
 A campaign moves one kind of subject, template releases (`templates`) or
-sandboxes (`sandboxes`), off one execution environment and onto another, at a
-pace an operator sets. Campaigns live in `runtime_upgrade_campaigns`, with one
-row per subject in `runtime_upgrade_items`. The cluster controller's
-`runtime_upgrade` loop drives them, and the admin API starts and steers them.
-Both read `runtime_upgrade_campaigns.generation`, so the migration that adds it
+sandboxes (`sandboxes` and `sandbox_force_restarts`), off one execution
+environment and onto another, at a pace an operator sets. Campaigns live in
+`runtime_upgrade_campaigns`, with one row per subject in
+`runtime_upgrade_items`. The cluster controller's `runtime_upgrade` loop drives
+them, and the admin API starts and steers them. Both read
+`runtime_upgrade_campaigns.generation`, so the migration that adds it
 (`20261118041622_runtime_upgrade_campaigns_generation`) has to be applied to a
 cluster before a build with campaigns runs there, and stay applied for as long
 as such a build may be rolled back to.
@@ -2620,8 +2621,9 @@ kind's driver. Only template campaigns have one the controller runs
 ([Template runtime upgrade campaigns](#template-runtime-upgrade-campaigns)), so
 the admin API refuses to start a valid sandbox campaign (409), and the loop
 only reports one it finds; a campaign row of a kind from a newer build is
-logged and skipped. The sandbox driver is built but not registered: it moves
-sandboxes through a node-side upgrade dispatcher that doesn't exist yet.
+logged and skipped. Both sandbox drivers (`sandboxes` and
+`sandbox_force_restarts`) are built but not registered: they move sandboxes
+through a sandbox upgrade dispatcher that doesn't exist yet.
 Each tick the
 loop also returns a finished campaign's in-flight items whose leases lapsed to
 pending (see abort below), and for every unfinished campaign whose kind has a
@@ -2676,8 +2678,10 @@ managing-organization admin. `space-admin-cli runtime campaign` wraps them
   target, `canary_size` (`1`, the default, or `0` to start rolling; a canary
   is one subject, so nothing else is accepted),
   `max_in_flight_per_cluster`, `max_in_flight_per_node` (default 1),
-  `failure_budget`, `include_running` (sandbox campaigns only: also take
-  running and paused sandboxes, as the sandbox driver defines it) and a
+  `failure_budget`, `include_running` (`sandboxes` campaigns only: also take
+  running and paused sandboxes, as the sandbox driver defines it; refused on
+  `templates` and `sandbox_force_restarts`, whose subjects are already running
+  and paused sandboxes) and a
   required `reason`. An invalid request is refused (400) first. A valid one is
   refused (409) for a kind with no driver, and while an unfinished campaign of
   the same kind moves the same source.

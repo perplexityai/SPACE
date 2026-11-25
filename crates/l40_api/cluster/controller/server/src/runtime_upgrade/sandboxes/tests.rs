@@ -4,7 +4,7 @@
 //! driver decides: which sandboxes are on the source, which lifecycles count,
 //! and what each item's upgrade does.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +28,8 @@ use sqlx::PgPool;
 use super::super::{Drivers, Reconciler, ReconcilerConfig, TickReport};
 use super::*;
 
+mod force_restart_recovery;
+mod force_restarts;
 mod moves;
 mod passes;
 
@@ -56,6 +58,15 @@ fn change() -> PolicyChange {
         actor: None,
         reason: PolicyChangeReason::new("runtime upgrade test").expect("valid reason"),
     }
+}
+
+fn to_jiff(value: time::OffsetDateTime) -> jiff::Timestamp {
+    jiff::Timestamp::from_nanosecond(value.unix_timestamp_nanos()).expect("valid test timestamp")
+}
+
+fn to_offset_date_time(value: jiff::Timestamp) -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp_nanos(value.as_nanosecond())
+        .expect("valid sqlx timestamp")
 }
 
 /// The catalog and policy a campaign off `source()` runs under: both
@@ -130,6 +141,9 @@ enum Published {
         kernel: &'static str,
         state_format_version: &'static str,
     },
+    /// Unbound from before execution metadata: kernel component only, with no
+    /// runtime or state-format version.
+    PreMetadata { kernel: &'static str },
     /// A publish that carried no execution.
     Nothing,
 }
@@ -170,6 +184,11 @@ async fn insert_sandbox(
             Some(serde_json::json!({ "components": [{ "kind": "kernel", "version": kernel }] })),
             Some(runtime_version),
             Some(state_format_version),
+        ),
+        Published::PreMetadata { kernel } => (
+            Some(serde_json::json!({ "components": [{ "kind": "kernel", "version": kernel }] })),
+            None,
+            None,
         ),
         Published::Nothing => (None, None, None),
     };
@@ -281,10 +300,26 @@ async fn set_lifecycle(pool: &PgPool, sandbox: Uuid, lifecycle: &str) -> TestRes
     Ok(())
 }
 
+async fn set_bound(pool: &PgPool, sandbox: Uuid, environment: EnvironmentReference) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandbox_observed_states
+         SET execution_metadata = $2,
+             runtime_version = NULL,
+             state_format_version = NULL
+         WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox)
+    .bind(serde_json::json!({ "environment": environment.to_string() }))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
     Stop(Uuid),
     Upgrade(Uuid),
+    Start(Uuid),
 }
 
 #[derive(Default)]
@@ -296,7 +331,33 @@ struct FakeState {
     stop_sources: Vec<EnvironmentReference>,
     /// What a stop returns per sandbox; `Stopped` otherwise.
     stop_script: HashMap<Uuid, GuardedStop>,
-    /// Upgrades in progress, by node, and the most seen at once.
+    /// Pre-commit errors a stop returns per sandbox, in order, before touching
+    /// Postgres or recording [`ForceRestartProgress`].
+    stop_errors: HashMap<Uuid, VecDeque<DispatchError>>,
+    /// Post-commit errors a stop returns per sandbox after committing the
+    /// guarded stop in Postgres and recording [`ForceRestartProgress::Stopped`].
+    post_commit_stop_errors: HashMap<Uuid, VecDeque<DispatchError>>,
+    /// Virtual-clock advance a stop performs before hanging indefinitely after
+    /// committing the guarded stop and [`ForceRestartProgress::Stopped`],
+    /// deterministically tripping `item_deadline` without wall-clock races.
+    post_commit_stop_deadline_advances: HashMap<Uuid, Duration>,
+    /// Durable force-restart progress persisted in the substrate by
+    /// `(campaign_id, sandbox_id)`.
+    force_restart_progress: HashMap<(CampaignId, Uuid), ForceRestartProgress>,
+    /// Errors `force_restart_progress` returns per sandbox, in order.
+    progress_read_errors: HashMap<Uuid, VecDeque<DispatchError>>,
+    /// The target each start was asked for, in call order.
+    start_targets: Vec<EnvironmentReference>,
+    /// The `(sandbox, stopped_at, target)` fence each start received, in call order.
+    start_fences: Vec<(Uuid, jiff::Timestamp, EnvironmentReference)>,
+    /// Sandboxes that a user starts and stops again right before `start` claims
+    /// the stopped row, exercising `stopped_at` fencing inside `start`.
+    user_restarts_before_start: HashSet<Uuid>,
+    /// Results a start returns per sandbox, in order; `Started` once exhausted.
+    start_script: HashMap<Uuid, VecDeque<Result<TargetStart, DispatchError>>>,
+    /// The result for every start without a script.
+    start_default: Option<Result<TargetStart, DispatchError>>,
+    /// Upgrades or starts in progress, by node, and the most seen at once.
     in_flight: HashMap<Option<NodeId>, u64>,
     max_in_flight: u64,
     max_on_node: u64,
@@ -306,13 +367,16 @@ struct FakeState {
     default: Option<Result<StoppedUpgrade, DispatchError>>,
 }
 
-/// Records every call and answers from a script. Each upgrade takes
+/// Records every call and answers from a script. Each upgrade or start takes
 /// `delay`, so the items of one tick overlap.
 #[derive(Clone, Default)]
 struct FakeDispatcher {
     state: Arc<Mutex<FakeState>>,
     nodes: Arc<HashMap<Uuid, NodeId>>,
     delay: Duration,
+    /// When set, `GuardedStop::Stopped` writes `stopped` to `sandboxes` and
+    /// `TargetStart::Started` writes `started` on `target` to Postgres.
+    persist_pool: Option<PgPool>,
 }
 
 impl FakeDispatcher {
@@ -322,6 +386,11 @@ impl FakeDispatcher {
             delay: Duration::from_millis(20),
             ..Self::default()
         }
+    }
+
+    fn persisting(mut self, pool: PgPool) -> Self {
+        self.persist_pool = Some(pool);
+        self
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
@@ -336,6 +405,26 @@ impl FakeDispatcher {
         self.state().script.insert(sandbox, results.into());
     }
 
+    fn script_start(&self, sandbox: Uuid, results: Vec<Result<TargetStart, DispatchError>>) {
+        self.state().start_script.insert(sandbox, results.into());
+    }
+
+    fn tracked_driver_stops(&self) -> usize {
+        self.state()
+            .force_restart_progress
+            .values()
+            .filter(|entry| matches!(entry, ForceRestartProgress::Stopped { .. }))
+            .count()
+    }
+
+    fn tracked_started_on_target(&self) -> usize {
+        self.state()
+            .force_restart_progress
+            .values()
+            .filter(|entry| matches!(entry, ForceRestartProgress::StartedOnTarget))
+            .count()
+    }
+
     fn calls(&self) -> Vec<Call> {
         self.state().calls.clone()
     }
@@ -347,16 +436,44 @@ impl FakeDispatcher {
             .into_iter()
             .filter_map(|call| match call {
                 Call::Upgrade(sandbox) => Some(sandbox),
-                Call::Stop(_) => None,
+                Call::Stop(_) | Call::Start(_) => None,
             })
             .collect();
         upgraded.sort();
         upgraded
     }
 
+    /// The sandboxes starts were asked for, sorted, repeats included.
+    fn started(&self) -> Vec<Uuid> {
+        let mut started: Vec<Uuid> = self
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Start(sandbox) => Some(sandbox),
+                Call::Stop(_) | Call::Upgrade(_) => None,
+            })
+            .collect();
+        started.sort();
+        started
+    }
+
     fn peaks(&self) -> (u64, u64) {
         let state = self.state();
         (state.max_in_flight, state.max_on_node)
+    }
+
+    fn enter_in_flight(&self, sandbox: Uuid, call: Call) -> Option<NodeId> {
+        let node = self.nodes.get(&sandbox).copied();
+        let mut state = self.state();
+        state.calls.push(call);
+        *state.in_flight.entry(node).or_default() += 1;
+        let total = state.in_flight.values().sum();
+        state.max_in_flight = state.max_in_flight.max(total);
+        if node.is_some() {
+            let on_node = state.in_flight[&node];
+            state.max_on_node = state.max_on_node.max(on_node);
+        }
+        node
     }
 }
 
@@ -367,41 +484,332 @@ impl SandboxUpgradeDispatcher for FakeDispatcher {
         target: EnvironmentReference,
     ) -> Result<StoppedUpgrade, DispatchError> {
         let sandbox = sandbox_id.as_uuid();
-        let node = self.nodes.get(&sandbox).copied();
-        {
-            let mut state = self.state();
-            state.calls.push(Call::Upgrade(sandbox));
-            state.targets.push(target);
-            *state.in_flight.entry(node).or_default() += 1;
-            let total = state.in_flight.values().sum();
-            state.max_in_flight = state.max_in_flight.max(total);
-            if node.is_some() {
-                let on_node = state.in_flight[&node];
-                state.max_on_node = state.max_on_node.max(on_node);
-            }
-        }
+        self.state().targets.push(target);
+        let node = self.enter_in_flight(sandbox, Call::Upgrade(sandbox));
         tokio::time::sleep(self.delay).await;
-        let mut state = self.state();
-        *state.in_flight.entry(node).or_default() -= 1;
-        let scripted = state.script.get_mut(&sandbox).and_then(VecDeque::pop_front);
-        scripted
-            .or_else(|| state.default.clone())
-            .unwrap_or(Ok(StoppedUpgrade::Upgraded))
+        let outcome = {
+            let mut state = self.state();
+            *state.in_flight.entry(node).or_default() -= 1;
+            let scripted = state.script.get_mut(&sandbox).and_then(VecDeque::pop_front);
+            scripted
+                .or_else(|| state.default.clone())
+                .unwrap_or(Ok(StoppedUpgrade::Upgraded))
+        };
+        if matches!(outcome, Ok(StoppedUpgrade::Upgraded))
+            && let Some(pool) = &self.persist_pool
+        {
+            sqlx::query(sql!(
+                "UPDATE sandbox_observed_states
+                 SET execution_metadata = $2,
+                     runtime_version = NULL,
+                     state_format_version = NULL
+                 WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox)
+            .bind(serde_json::json!({ "environment": target.to_string() }))
+            .execute(pool)
+            .await
+            .expect("persisting fake stopped upgrade target");
+        }
+        outcome
     }
 
     async fn stop(
         &self,
+        campaign_id: Option<CampaignId>,
         sandbox_id: SandboxId,
         source: EnvironmentReference,
     ) -> Result<GuardedStop, DispatchError> {
         let sandbox = sandbox_id.as_uuid();
+        let scripted = {
+            let mut state = self.state();
+            state.calls.push(Call::Stop(sandbox));
+            state.stop_sources.push(source);
+            if let Some(error) = state
+                .stop_errors
+                .get_mut(&sandbox)
+                .and_then(VecDeque::pop_front)
+            {
+                return Err(error);
+            }
+            state.stop_script.remove(&sandbox)
+        };
+        if let Some(scripted) = scripted {
+            if let (Some(campaign_id), GuardedStop::Stopped { stopped_at }) =
+                (campaign_id, &scripted)
+            {
+                self.state().force_restart_progress.insert(
+                    (campaign_id, sandbox),
+                    ForceRestartProgress::Stopped {
+                        stopped_at: *stopped_at,
+                    },
+                );
+            }
+            return Ok(scripted);
+        }
+        let stopped_at = if let Some(pool) = &self.persist_pool {
+            let changed_at: time::OffsetDateTime = sqlx::query_scalar(sql!(
+                "UPDATE sandboxes
+                 SET lifecycle = $2
+                 WHERE id = $1
+                 RETURNING lifecycle_changed_at"
+            ))
+            .bind(sandbox)
+            .bind(SandboxLifecycle::Stopped.as_str())
+            .fetch_one(pool)
+            .await
+            .expect("persisting fake stop");
+            to_jiff(changed_at)
+        } else {
+            jiff::Timestamp::UNIX_EPOCH
+        };
+        let (post_deadline_advance, post_error) = {
+            let mut state = self.state();
+            if let Some(campaign_id) = campaign_id {
+                state.force_restart_progress.insert(
+                    (campaign_id, sandbox),
+                    ForceRestartProgress::Stopped { stopped_at },
+                );
+            }
+            let advance = state.post_commit_stop_deadline_advances.remove(&sandbox);
+            let error = state
+                .post_commit_stop_errors
+                .get_mut(&sandbox)
+                .and_then(VecDeque::pop_front);
+            (advance, error)
+        };
+        if let Some(advance) = post_deadline_advance {
+            struct ResumeClockOnDrop;
+            impl Drop for ResumeClockOnDrop {
+                fn drop(&mut self) {
+                    tokio::time::resume();
+                }
+            }
+            let _resume_clock = ResumeClockOnDrop;
+            tokio::time::pause();
+            tokio::time::advance(advance).await;
+            std::future::pending::<()>().await;
+        }
+        if let Some(error) = post_error {
+            return Err(error);
+        }
+        Ok(GuardedStop::Stopped { stopped_at })
+    }
+
+    async fn start(
+        &self,
+        campaign_id: CampaignId,
+        sandbox_id: SandboxId,
+        stopped_at: jiff::Timestamp,
+        target: EnvironmentReference,
+    ) -> Result<TargetStart, DispatchError> {
+        let sandbox = sandbox_id.as_uuid();
+        {
+            let mut state = self.state();
+            state.start_targets.push(target);
+            state.start_fences.push((sandbox, stopped_at, target));
+        }
+        let node = self.enter_in_flight(sandbox, Call::Start(sandbox));
+        tokio::time::sleep(self.delay).await;
+        let (explicit_outcome, user_restarted) = {
+            let mut state = self.state();
+            *state.in_flight.entry(node).or_default() -= 1;
+            let user_restarted = state.user_restarts_before_start.remove(&sandbox);
+            let scripted = state
+                .start_script
+                .get_mut(&sandbox)
+                .and_then(VecDeque::pop_front);
+            (
+                scripted.or_else(|| state.start_default.clone()),
+                user_restarted,
+            )
+        };
+        if user_restarted && let Some(pool) = &self.persist_pool {
+            // Simulate a user starting and stopping the sandbox between the
+            // driver's read/stop and `start`'s guarded row claim; backdating
+            // before the user's stop ensures `sandboxes_touch_lifecycle_changed_at`
+            // stamps a strictly newer `lifecycle_changed_at` without sleeping.
+            sqlx::query(sql!(
+                "UPDATE sandboxes
+                 SET lifecycle_changed_at = lifecycle_changed_at - INTERVAL '1 second'
+                 WHERE id = $1"
+            ))
+            .bind(sandbox)
+            .execute(pool)
+            .await
+            .expect("aging stopped timestamp before simulated user restart");
+            set_lifecycle(pool, sandbox, SandboxLifecycle::Started.as_str())
+                .await
+                .expect("simulating user start before start claim");
+            set_lifecycle(pool, sandbox, SandboxLifecycle::Stopped.as_str())
+                .await
+                .expect("simulating user stop before start claim");
+        }
+        let mut outcome = explicit_outcome.clone().unwrap_or(Ok(TargetStart::Started));
+        if matches!(
+            outcome,
+            Ok(TargetStart::Started | TargetStart::AlreadyOnTarget)
+        ) && let Some(pool) = &self.persist_pool
+        {
+            let already_on_target: bool = sqlx::query_scalar(sql!(
+                "SELECT execution_metadata ->> 'environment' = $2
+                 FROM sandbox_observed_states
+                 WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox)
+            .bind(target.to_string())
+            .fetch_optional(pool)
+            .await
+            .expect("reading recorded environment before fake start")
+            .flatten()
+            .unwrap_or(false);
+            let claimed = sqlx::query(sql!(
+                "UPDATE sandboxes
+                 SET lifecycle = $3
+                 WHERE id = $1
+                   AND lifecycle = $2
+                   AND lifecycle_changed_at = $4"
+            ))
+            .bind(sandbox)
+            .bind(SandboxLifecycle::Stopped.as_str())
+            .bind(SandboxLifecycle::Started.as_str())
+            .bind(to_offset_date_time(stopped_at))
+            .execute(pool)
+            .await
+            .expect("persisting fake start lifecycle")
+            .rows_affected();
+            if claimed == 0 {
+                self.state()
+                    .force_restart_progress
+                    .remove(&(campaign_id, sandbox));
+                return Ok(TargetStart::NotOnTarget(
+                    "the sandbox changed lifecycle since this campaign stopped it".to_owned(),
+                ));
+            }
+            sqlx::query(sql!(
+                "UPDATE sandbox_observed_states
+                 SET execution_metadata = $2,
+                     runtime_version = NULL,
+                     state_format_version = NULL
+                 WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox)
+            .bind(serde_json::json!({ "environment": target.to_string() }))
+            .execute(pool)
+            .await
+            .expect("persisting fake start target");
+            if explicit_outcome.is_none() && already_on_target {
+                outcome = Ok(TargetStart::AlreadyOnTarget);
+            }
+        }
+        match &outcome {
+            Ok(TargetStart::Started | TargetStart::AlreadyOnTarget) => {
+                self.state().force_restart_progress.insert(
+                    (campaign_id, sandbox),
+                    ForceRestartProgress::StartedOnTarget,
+                );
+            }
+            Ok(TargetStart::NotOnTarget(_)) => {
+                self.state()
+                    .force_restart_progress
+                    .remove(&(campaign_id, sandbox));
+            }
+            Ok(TargetStart::HeldStopped(_)) | Err(_) => {}
+        }
+        outcome
+    }
+
+    async fn force_restart_progress(
+        &self,
+        campaign_id: CampaignId,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<ForceRestartProgress>, DispatchError> {
+        let sandbox = sandbox_id.as_uuid();
         let mut state = self.state();
-        state.calls.push(Call::Stop(sandbox));
-        state.stop_sources.push(source);
+        if let Some(error) = state
+            .progress_read_errors
+            .get_mut(&sandbox)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(error);
+        }
         Ok(state
-            .stop_script
-            .remove(&sandbox)
-            .unwrap_or(GuardedStop::Stopped))
+            .force_restart_progress
+            .get(&(campaign_id, sandbox))
+            .copied())
+    }
+
+    async fn clear_force_restart_progress(
+        &self,
+        campaign_id: CampaignId,
+        sandbox_id: SandboxId,
+    ) -> Result<(), DispatchError> {
+        self.state()
+            .force_restart_progress
+            .remove(&(campaign_id, sandbox_id.as_uuid()));
+        Ok(())
+    }
+
+    fn retain_force_restart_campaigns(&self, unfinished: &[CampaignId]) {
+        self.state()
+            .force_restart_progress
+            .retain(|(campaign_id, _), _| unfinished.contains(campaign_id));
+    }
+}
+
+#[derive(Default)]
+struct FakeMemoryRetirementState {
+    retired: HashSet<EnvironmentReference>,
+    generation: u64,
+    script: VecDeque<Result<bool, String>>,
+}
+
+#[derive(Clone, Default)]
+struct FakeMemoryRetirement {
+    state: Arc<Mutex<FakeMemoryRetirementState>>,
+}
+
+impl FakeMemoryRetirement {
+    fn retired(environment: EnvironmentReference) -> Self {
+        let source = Self::default();
+        source.retire(environment);
+        source
+    }
+
+    fn retire(&self, environment: EnvironmentReference) {
+        let mut state = self.state.lock().unwrap();
+        if state.retired.insert(environment) {
+            state.generation += 1;
+        }
+    }
+
+    fn unretire(&self, environment: EnvironmentReference) {
+        let mut state = self.state.lock().unwrap();
+        if state.retired.remove(&environment) {
+            state.generation += 1;
+        }
+    }
+
+    fn script_reads(&self, reads: impl IntoIterator<Item = Result<bool, String>>) {
+        self.state.lock().unwrap().script.extend(reads);
+    }
+}
+
+impl MemoryRetirementSource for FakeMemoryRetirement {
+    async fn memory_retirement(
+        &self,
+        environment: EnvironmentReference,
+    ) -> Result<MemoryRetirement, String> {
+        let mut state = self.state.lock().unwrap();
+        let generation = state.generation;
+        let retired = match state.script.pop_front() {
+            Some(scripted) => scripted?,
+            None => state.retired.contains(&environment),
+        };
+        Ok(MemoryRetirement {
+            retired,
+            generation,
+        })
     }
 }
 
@@ -421,6 +829,56 @@ fn paging(pool: &PgPool, dispatcher: FakeDispatcher, page: u32) -> Reconciler {
 
 fn reconciler(pool: &PgPool, dispatcher: FakeDispatcher) -> Reconciler {
     paging(pool, dispatcher, ReconcilerConfig::default().candidate_page)
+}
+
+fn force_restart_paging(
+    pool: &PgPool,
+    dispatcher: FakeDispatcher,
+    memory_retirement: FakeMemoryRetirement,
+    page: u32,
+) -> Reconciler {
+    Reconciler::new(
+        pool.clone(),
+        Drivers::default().with(SandboxForceRestartDriver::new(
+            pool.clone(),
+            K8S.as_str(),
+            dispatcher,
+            memory_retirement,
+        )),
+        ReconcilerConfig {
+            enabled: true,
+            candidate_page: page,
+            ..ReconcilerConfig::default()
+        },
+    )
+}
+
+fn force_restart_reconciler(
+    pool: &PgPool,
+    dispatcher: FakeDispatcher,
+    memory_retirement: FakeMemoryRetirement,
+) -> Reconciler {
+    force_restart_paging(
+        pool,
+        dispatcher,
+        memory_retirement,
+        ReconcilerConfig::default().candidate_page,
+    )
+}
+
+fn force_restart_seed() -> CampaignSeed {
+    CampaignSeed {
+        kind: CampaignKind::SandboxForceRestarts,
+        ..seed()
+    }
+}
+
+async fn resident_on_source(
+    pool: &PgPool,
+    lifecycle: SandboxLifecycle,
+    node: NodeId,
+) -> TestResult<Uuid> {
+    insert_sandbox(pool, K8S, lifecycle, node, Published::Bound(source())).await
 }
 
 /// One tick, and every dispatch it started.

@@ -213,6 +213,27 @@ async fn a_subject_sandbox_reads_its_lifecycle_and_published_execution() -> Test
         Some(environment(0).to_string().as_str())
     );
     assert_eq!(read.execution.runtime_version.as_deref(), Some("1.15.1"));
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '1 hour' WHERE id = $1"
+    ))
+    .bind(published)
+    .execute(&db.pool)
+    .await?;
+    let initial_changed_at = subject_sandbox(&db.pool, published)
+        .await?
+        .expect("the sandbox exists")
+        .lifecycle_changed_at;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1"
+    ))
+    .bind(published)
+    .execute(&db.pool)
+    .await?;
+    let stopped = subject_sandbox(&db.pool, published)
+        .await?
+        .expect("the sandbox exists");
+    assert_eq!(stopped.lifecycle, "stopped");
+    assert!(stopped.lifecycle_changed_at > initial_changed_at);
     let read = subject_sandbox(&db.pool, unpublished)
         .await?
         .expect("an unpublished sandbox still exists");

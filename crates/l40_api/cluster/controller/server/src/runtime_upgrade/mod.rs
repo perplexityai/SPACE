@@ -91,7 +91,9 @@ mod worker;
 mod tests;
 
 pub use sandboxes::{
-    DispatchError, GuardedStop, SandboxDriver, SandboxUpgradeDispatcher, StoppedUpgrade,
+    DispatchError, ForceRestartProgress, GuardedStop, MemoryRetirement, MemoryRetirementSource,
+    SandboxDriver, SandboxForceRestartDriver, SandboxUpgradeDispatcher, StoppedUpgrade,
+    TargetStart,
 };
 
 /// The switch: `1`, `true`, `yes`, `on` or `enabled` turns the loop on;
@@ -227,6 +229,17 @@ pub struct SubjectPage {
     pub examined: usize,
 }
 
+/// What [`CampaignDriver::find_subjects`] found for one page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubjectScan {
+    /// One page of subjects judged under the tick's [`ScanPlan`].
+    Page(SubjectPage),
+    /// The campaign's plan changed or began holding since [`CampaignDriver::plan`]
+    /// ran: discard the open pass cursor and lease nothing this tick, so the
+    /// next tick re-plans and restarts from the beginning.
+    PlanChanged,
+}
+
 /// What a campaign kind's upgrade needs: its subjects, its plan, and the
 /// upgrade of one subject. Registered in [`Drivers`] by kind.
 ///
@@ -250,7 +263,11 @@ pub trait CampaignDriver: Send + Sync + 'static {
         plan: ScanPlan,
         after: Option<uuid::Uuid>,
         limit: u32,
-    ) -> Result<SubjectPage, String>;
+    ) -> Result<SubjectScan, String>;
+
+    /// Drop any in-memory per-campaign state for campaigns no longer in
+    /// `unfinished`.
+    fn retain_campaigns(&self, _unfinished: &[Campaign]) {}
 
     /// Upgrade one leased item and say how it ended. Must be idempotent and
     /// safe to run again after any failure, including one that left the
@@ -291,9 +308,9 @@ impl Drivers {
 }
 
 /// The drivers this build runs: templates ([`templates::TemplateDriver`]).
-/// The sandbox driver ([`SandboxDriver`]) isn't one of them until a
-/// production [`SandboxUpgradeDispatcher`] exists. A driver added here adds
-/// its kind to
+/// The sandbox drivers ([`SandboxDriver`] and [`SandboxForceRestartDriver`])
+/// aren't among them until a production [`SandboxUpgradeDispatcher`] exists. A
+/// driver added here adds its kind to
 /// `pplx_space_api::routes::admin::RUNTIME_UPGRADE_DRIVEN_KINDS` too, so the
 /// admin API starts campaigns of it; a test holds the two equal. Building
 /// them reads nothing: a disabled loop never asks them anything.
@@ -420,6 +437,10 @@ struct Pass {
     after: Option<uuid::Uuid>,
     /// The plan this pass's pages were examined under.
     plan: Option<ScanPlan>,
+    /// The `campaign.generation` this pass's pages were examined under. Any
+    /// campaign row change (`:pause`/`:resume` between ticks, say) advances
+    /// the generation and restarts an open pass.
+    generation: Option<u64>,
     /// Whether nothing changed an item during this pass: it began with no
     /// item pending or in flight, and this loop has leased nothing since.
     /// Only such a pass can complete the campaign: an item leased mid-pass
@@ -433,6 +454,9 @@ struct Pass {
 enum PassProgress {
     /// The pass continues next tick, or the page failed.
     Continues,
+    /// The campaign's plan changed or began holding before the page was read;
+    /// the pass was discarded and nothing should be leased this tick.
+    PlanChanged,
     /// This page ended the pass; `settled` as [`Pass::settled`] had it.
     Ended { settled: bool },
 }
@@ -534,12 +558,24 @@ impl Reconciler {
         report: &mut TickReport,
     ) {
         self.redrive(campaign, report).await;
-        if !campaign.phase.leases() || self.pause_if_over_budget(campaign, report).await {
+        if !campaign.phase.leases() {
+            // While a campaign is paused, subjects can enter its source behind
+            // a half-scanned pass's cursor without `drive` observing a hold, so
+            // `:resume` starts a fresh pass.
+            self.lock_passes().remove(&campaign.id);
+            return;
+        }
+        if self.pause_if_over_budget(campaign, report).await {
             return;
         }
         let plan = match driver.plan(campaign).await {
             Ok(Plan::Scan(plan)) => plan,
             Ok(Plan::Hold(reason)) => {
+                // Subjects can reach the source behind a half-scanned pass's
+                // cursor while the campaign is held (for example, while its
+                // source is allowed or its memory isn't retired), so the pass
+                // starts over once the hold clears.
+                self.lock_passes().remove(&campaign.id);
                 metrics::campaign_held(campaign.kind.as_str(), reason);
                 tracing::info!(
                     campaign_id = %campaign.id,
@@ -554,6 +590,9 @@ impl Reconciler {
             }
         };
         let progress = self.find_subjects(driver, campaign, plan, report).await;
+        if progress == PassProgress::PlanChanged {
+            return;
+        }
         // A pass that moved nothing proves nothing moved: a stranded
         // campaign stays open, reporting its stranded count, until its
         // driver moves it or an operator aborts it. A pass that leased
@@ -611,6 +650,7 @@ impl Reconciler {
     async fn pause_if_over_budget(&self, campaign: &Campaign, report: &mut TickReport) -> bool {
         match store::pause_if_over_budget(&self.pool, campaign.id).await {
             Ok(true) => {
+                self.lock_passes().remove(&campaign.id);
                 metrics::campaign_auto_paused(campaign.kind.as_str());
                 tracing::warn!(
                     campaign_id = %campaign.id,
@@ -645,10 +685,12 @@ impl Reconciler {
         let after = {
             let mut passes = self.lock_passes();
             let pass = passes.entry(campaign.id).or_default();
-            if pass.after.is_some() && pass.plan != Some(plan) {
+            if pass.after.is_some()
+                && (pass.plan != Some(plan) || pass.generation != Some(campaign.generation))
+            {
                 tracing::info!(
                     campaign_id = %campaign.id,
-                    "runtime_upgrade: the campaign's plan changed mid-pass; restarting the pass"
+                    "runtime_upgrade: the campaign's plan or generation changed mid-pass; restarting the pass"
                 );
                 pass.after = None;
             }
@@ -666,7 +708,15 @@ impl Reconciler {
             .find_subjects(campaign, plan, after, self.config.candidate_page)
             .await
         {
-            Ok(page) => page,
+            Ok(SubjectScan::Page(page)) => page,
+            Ok(SubjectScan::PlanChanged) => {
+                self.lock_passes().remove(&campaign.id);
+                tracing::info!(
+                    campaign_id = %campaign.id,
+                    "runtime_upgrade: the campaign's plan changed before its subjects were read; restarting the pass next tick"
+                );
+                return PassProgress::PlanChanged;
+            }
             Err(error) => {
                 tracing::warn!(campaign_id = %campaign.id, %error, "runtime_upgrade: finding subjects failed");
                 return PassProgress::Continues;
@@ -699,6 +749,7 @@ impl Reconciler {
             let mut passes = self.lock_passes();
             let pass = passes.entry(campaign.id).or_default();
             pass.plan = Some(plan);
+            pass.generation = Some(campaign.generation);
             pass.after = if ended { None } else { page.last };
             pass.settled
         };
@@ -761,6 +812,9 @@ impl Reconciler {
     fn forget_finished(&self, campaigns: &[Campaign]) {
         self.lock_passes()
             .retain(|campaign_id, _| campaigns.iter().any(|campaign| campaign.id == *campaign_id));
+        for driver in self.drivers.0.values() {
+            driver.retain_campaigns(campaigns);
+        }
     }
 
     async fn lease(&self, campaign: &Campaign) -> Vec<LeasedItem> {

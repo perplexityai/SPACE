@@ -44,7 +44,7 @@ use pplx_space_template_release_store::{
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::{CampaignDriver, Plan, ScanPlan, SubjectPage, TemplateStorageOrigins};
+use super::{CampaignDriver, Plan, ScanPlan, SubjectPage, SubjectScan, TemplateStorageOrigins};
 
 mod metadata;
 
@@ -284,17 +284,17 @@ impl CampaignDriver for TemplateDriver {
         _plan: ScanPlan,
         after: Option<Uuid>,
         limit: u32,
-    ) -> Result<SubjectPage, String> {
+    ) -> Result<SubjectScan, String> {
         let on_source =
             releases::source_releases_page(&self.pool, partition_of(campaign.from), after, limit)
                 .await
                 .map_err(|error| format!("listing the source's releases: {error}"))?;
-        Ok(SubjectPage {
+        Ok(SubjectScan::Page(SubjectPage {
             last: on_source.last().copied(),
             examined: on_source.len(),
             on_source,
             elsewhere: Vec::new(),
-        })
+        }))
     }
 
     async fn upgrade(&self, campaign: &Campaign, item: &LeasedItem) -> ItemOutcome {

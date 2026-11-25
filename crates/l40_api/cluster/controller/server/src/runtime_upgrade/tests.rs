@@ -192,7 +192,7 @@ impl CampaignDriver for FakeDriver {
         _plan: ScanPlan,
         after: Option<Uuid>,
         limit: u32,
-    ) -> Result<SubjectPage, String> {
+    ) -> Result<SubjectScan, String> {
         let mut state = self.state();
         state.finds.push(after);
         let page: Vec<Uuid> = state
@@ -202,12 +202,12 @@ impl CampaignDriver for FakeDriver {
             .filter(|subject| after.is_none_or(|after| *subject > after))
             .take(limit as usize)
             .collect();
-        Ok(SubjectPage {
+        Ok(SubjectScan::Page(SubjectPage {
             examined: page.len(),
             last: page.last().copied(),
             on_source: page,
             elsewhere: Vec::new(),
-        })
+        }))
     }
 
     async fn upgrade(&self, _campaign: &Campaign, item: &LeasedItem) -> ItemOutcome {

@@ -30,8 +30,8 @@ pub struct NewCampaign {
     pub max_in_flight_per_node: u64,
     pub max_in_flight_per_cluster: u64,
     pub failure_budget: u64,
-    /// For a sandbox campaign, also take running and paused sandboxes. The
-    /// sandbox driver gives it its meaning; a template campaign refuses it.
+    /// For a `sandboxes` campaign, also take running and paused sandboxes. The
+    /// `sandboxes` driver gives it its meaning; other kinds refuse it.
     pub include_running: bool,
     /// Why the campaign runs: 1 to 1024 characters, no NUL.
     pub reason: String,
@@ -90,7 +90,7 @@ pub fn validate(campaign: &NewCampaign) -> Result<(), &'static str> {
     } else if campaign.failure_budget == 0 {
         Err("failure_budget must be at least 1")
     } else if campaign.include_running && campaign.kind != CampaignKind::Sandboxes {
-        Err("include_running applies only to sandbox campaigns")
+        Err("include_running applies only to sandboxes campaigns")
     } else {
         check_reason(&campaign.reason)
     }

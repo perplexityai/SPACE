@@ -1925,7 +1925,15 @@ fn a_campaign_with_impossible_pacing_or_reason_is_refused_before_the_database() 
                 ..new_campaign(10, CampaignKind::Templates)
             },
             "include_running on a template campaign",
-            "include_running applies only to sandbox campaigns",
+            "include_running applies only to sandboxes campaigns",
+        ),
+        (
+            NewCampaign {
+                include_running: true,
+                ..new_campaign(10, CampaignKind::SandboxForceRestarts)
+            },
+            "include_running on a force-restart campaign",
+            "include_running applies only to sandboxes campaigns",
         ),
         (
             NewCampaign {

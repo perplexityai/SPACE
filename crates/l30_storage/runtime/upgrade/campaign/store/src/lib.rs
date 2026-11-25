@@ -207,6 +207,7 @@ closed_vocabulary!(
     CampaignKind, "campaign kind" {
         Templates => "templates",
         Sandboxes => "sandboxes",
+        SandboxForceRestarts => "sandbox_force_restarts",
     }
 );
 
@@ -293,7 +294,7 @@ impl CampaignKind {
     pub const fn subject_kind(self) -> SubjectKind {
         match self {
             Self::Templates => SubjectKind::TemplateRelease,
-            Self::Sandboxes => SubjectKind::Sandbox,
+            Self::Sandboxes | Self::SandboxForceRestarts => SubjectKind::Sandbox,
         }
     }
 }
@@ -312,8 +313,8 @@ pub struct Campaign {
     pub max_in_flight_per_cluster: u64,
     /// Failed items at which the campaign pauses itself; at least 1.
     pub failure_budget: u64,
-    /// Whether a sandbox campaign also takes running and paused sandboxes.
-    /// The sandbox driver gives it its meaning; other kinds ignore it.
+    /// Whether a `sandboxes` campaign also takes running and paused sandboxes.
+    /// The `sandboxes` driver gives it its meaning; other kinds ignore it.
     pub include_running: bool,
     /// Raised by exactly one with every change to the campaign row.
     pub generation: u64,
