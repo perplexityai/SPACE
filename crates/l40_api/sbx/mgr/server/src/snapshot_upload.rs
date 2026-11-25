@@ -532,9 +532,17 @@ pub struct SnapshotUploadJobs {
     /// [`UploadFailureScope::Attempt`].
     #[serde(default, skip_serializing_if = "UploadFailureScope::is_attempt")]
     pub failure_scope: UploadFailureScope,
+    /// Whether this upload's permanent failure was the control plane
+    /// refusing this node as the artifact's source (`PermissionDenied`); see
+    /// [`UploadFailureScope::SourceNode`]. A field of its own rather than a
+    /// recorded scope, so an sbx-mgr that predates it reads the failure as
+    /// the attempt's and decodes the payload.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_node_refused: bool,
 }
 
-/// What a permanently failed upload failed: the attempt, or the artifact.
+/// What a permanently failed upload failed: the attempt, the artifact, or
+/// this node's standing as the artifact's source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadFailureScope {
@@ -547,6 +555,14 @@ pub enum UploadFailureScope {
     /// The control plane refused the artifact's registration for good, so no
     /// attempt can register it.
     Artifact,
+    /// The control plane refused this node as the artifact's source
+    /// (`PermissionDenied`). Every attempt from this node meets the same
+    /// refusal until it lifts, as when the control plane attributes the
+    /// capture to this node, so a teardown re-asks instead of spending
+    /// attempts. Never recorded as `failure_scope`: a teardown derives it
+    /// from [`SnapshotUploadJobs::source_node_refused`].
+    #[serde(skip)]
+    SourceNode,
 }
 
 impl UploadFailureScope {
@@ -554,6 +570,7 @@ impl UploadFailureScope {
         match self {
             Self::Attempt => "attempt",
             Self::Artifact => "artifact",
+            Self::SourceNode => "source_node",
         }
     }
 
@@ -1093,6 +1110,7 @@ pub(crate) fn prepare_suspend_snapshot(
         execution_generation: None,
         execution_generation_names_capture: false,
         failure_scope: UploadFailureScope::Attempt,
+        source_node_refused: false,
     })
 }
 
