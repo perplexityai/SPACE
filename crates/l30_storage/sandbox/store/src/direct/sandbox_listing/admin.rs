@@ -181,6 +181,7 @@ impl AdminIdSearch {
 
     /// The IDs that start with the digits, `[low, high]`, when there are
     /// enough of them.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn id_prefix(&self) -> Option<(SandboxId, SandboxId)> {
         self.id_prefix
     }

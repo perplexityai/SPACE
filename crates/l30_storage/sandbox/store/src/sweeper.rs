@@ -342,7 +342,7 @@ pub enum EvacuationRestoreTarget {
 
 impl EvacuationRestoreTarget {
     /// The stored string, which [`FromStr`] accepts back.
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Started => "started",
             Self::Paused => "paused",
