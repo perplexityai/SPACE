@@ -405,6 +405,144 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
     Ok(())
 }
 
+/// A stop or kill of a sandbox whose node has a v2 drain recorded is refused
+/// at the action's entry, with the drain's retryable 503 and `Retry-After`,
+/// before its `*_requested` event, so an operation retrying the refused stop
+/// leaves no orphaned event. A rollback without restart is refused the same
+/// way, before any runtime call. The gate follows the node's persisted drain:
+/// this controller reads no drain v2 switch. Once the node has no drain, the
+/// stop goes on to its runtime as before, emitting its requested event.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_under_a_v2_drain_is_refused_before_its_requested_event() -> TestResult {
+    use axum::response::IntoResponse as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let db = pg_test_db_with_max_connections(3).await?;
+    let node_id = pplx_space_accounts::NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state, drain_engine, drain_phase,
+                            drain_started_at, drain_status)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'ready', 'v2', 'draining', NOW(),
+                 '{\"generation\": 7, \"deadline_at\": 0}'::JSONB)"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement, active_node_id,
+             network_policy_override_json, network_policy_generation
+         )
+         VALUES (
+             $1,
+             '00000000-0000-0000-0000-000000000010',
+             '00000000-0000-0000-0000-000000000001',
+             'space',
+             'started',
+             'placed',
+             $2,
+             $3,
+             1
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(sqlx::types::Json(NetworkPolicyV1::default()))
+    .execute(&db.pool)
+    .await?;
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&db.pool, sandbox_id)
+        .await?
+        .expect("sandbox row exists");
+    let controller = SandboxController::new(crate::test_support::direct_substrate(&db.pool));
+    let act = |action: SandboxAction| {
+        controller.action(
+            &db.pool,
+            sandbox_id,
+            Some(&sandbox),
+            crate::metrics::sandbox::api::SandboxApiMetricIdentity::native(action.as_str()),
+            action,
+            None,
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+    };
+
+    for (action, requested) in [
+        (SandboxAction::Stop, "stop_requested"),
+        (SandboxAction::Kill, "kill_requested"),
+    ] {
+        let capture = SandboxEventCapture::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let refused = act(action)
+            .await
+            .expect_err("a stop under a v2 drain is refused");
+        drop(guard);
+        assert!(
+            refused.to_string().contains("under a v2 node drain"),
+            "{action}: {refused}"
+        );
+        let response = refused.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{action}"
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "{action}"
+        );
+        let emitted = capture.types.lock().unwrap().clone();
+        assert!(
+            !emitted.iter().any(|event_type| event_type == requested),
+            "{action}: a refused stop emits no {requested}; saw {emitted:?}"
+        );
+    }
+
+    let refused = controller
+        .rollback(&db.pool, &sandbox, sandbox_id, "d-snap".to_owned(), false)
+        .await
+        .expect_err("a rollback without restart under a v2 drain is refused");
+    assert!(
+        refused.to_string().contains("under a v2 node drain"),
+        "{refused}"
+    );
+    assert_eq!(
+        refused.into_response().status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // The node's drain gone, the stop goes on to the runtime.
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = NULL, drain_phase = NULL, drain_status = NULL
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let capture = SandboxEventCapture::default();
+    let guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let answer = act(SandboxAction::Stop).await;
+    drop(guard);
+    if let Err(err) = &answer {
+        assert!(
+            !err.to_string().contains("node drain"),
+            "an undrained node's stop isn't refused by a drain: {err}"
+        );
+    }
+    let emitted = capture.types.lock().unwrap().clone();
+    assert!(
+        emitted
+            .iter()
+            .any(|event_type| event_type == "stop_requested"),
+        "{emitted:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult {
     // Arrange.

@@ -10,12 +10,15 @@ use pplx_space_node_model::{NodeDrainPhase, SubstrateKind};
 use pplx_space_sql_locator::sql;
 use sqlx::PgExecutor;
 
-/// A node's drain columns, both undecoded: a phase this build does not know
-/// still reads, and each caller decides what it means.
+/// A node's drain columns, all undecoded: a phase or an engine this build
+/// does not know still reads, and each caller decides what it means. The
+/// columns are read in this order, the phase first, so a caller's decode
+/// error can name a column by its position.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct NodeDrainColumns {
     pub drain_phase: Option<String>,
     pub drain_mode: Option<String>,
+    pub drain_engine: Option<String>,
 }
 
 /// The drain columns of `node_id`; `None` when the `nodes` row is gone.
@@ -24,7 +27,7 @@ pub async fn drain_columns(
     node_id: NodeId,
 ) -> Result<Option<NodeDrainColumns>, sqlx::Error> {
     sqlx::query_as::<_, NodeDrainColumns>(sql!(
-        "SELECT drain_phase, drain_mode FROM nodes WHERE id = $1"
+        "SELECT drain_phase, drain_mode, drain_engine FROM nodes WHERE id = $1"
     ))
     .bind(node_id)
     .fetch_optional(executor)
@@ -123,28 +126,33 @@ pub async fn terminate_target(
     .await
 }
 
-/// The drain columns of a node that is draining.
+/// The drain columns of a node that is draining. The engine is undecoded:
+/// one this build does not know still reads. A phase it does not know fails
+/// the read; a v2 drain being cancelled has none.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct DrainingSibling {
-    pub drain_phase: NodeDrainPhase,
+    pub drain_engine: Option<String>,
+    pub drain_phase: Option<NodeDrainPhase>,
     pub drain_mode: Option<String>,
 }
 
 /// Every node registered under a Kubernetes node name that has a drain
-/// phase. `node_k8s.k8s_node_name` has no unique constraint, so one
-/// Kubernetes node can map to several `nodes` rows (worker and builder roles),
-/// and those rows can differ in both phase and mode; there is no `LIMIT`, and
-/// the caller picks among them.
+/// phase or a drain engine. A v2 drain being cancelled has no phase, and its
+/// node may still be sealed, so an engine without a phase counts.
+/// `node_k8s.k8s_node_name` has no unique constraint, so one Kubernetes node
+/// can map to several `nodes` rows (worker and builder roles), and those rows
+/// can differ in both phase and mode; there is no `LIMIT`, and the caller
+/// picks among them.
 pub async fn draining_nodes_for_k8s_node_name(
     executor: impl PgExecutor<'_>,
     k8s_node_name: &str,
 ) -> Result<Vec<DrainingSibling>, sqlx::Error> {
     sqlx::query_as::<_, DrainingSibling>(sql!(
-        "SELECT n.drain_phase, n.drain_mode
+        "SELECT n.drain_engine, n.drain_phase, n.drain_mode
            FROM node_k8s nk
            JOIN nodes n ON n.id = nk.node_id
           WHERE nk.k8s_node_name = $1
-            AND n.drain_phase IS NOT NULL"
+            AND (n.drain_phase IS NOT NULL OR n.drain_engine IS NOT NULL)"
     ))
     .bind(k8s_node_name)
     .fetch_all(executor)

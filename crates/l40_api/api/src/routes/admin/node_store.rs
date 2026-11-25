@@ -741,7 +741,8 @@ impl AdminNodeStore {
 /// serving user traffic by design. Reading the phase alone here would let an
 /// `:undrain` + gentle `:drain` landing mid-fan-out look like the safe regime it
 /// isn't, which is the whole failure this re-check exists to prevent. Resolved
-/// through the same [`NodeDrain::blocks_placement`] the gate itself uses.
+/// through the same [`NodeDrain::refuses_activations`] the gate itself uses,
+/// from the node's shared drain columns.
 pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
@@ -749,6 +750,7 @@ pub(super) async fn is_node_wake_gate_closed(
     let Some(NodeDrainColumns {
         drain_phase,
         drain_mode,
+        drain_engine,
     }) = drain_reads::drain_columns(pool, node_id).await?
     else {
         return Ok(false);
@@ -764,8 +766,19 @@ pub(super) async fn is_node_wake_gate_closed(
             index: "0".to_owned(),
             source: source.into(),
         })?;
-    Ok(NodeDrain::from_v1_columns(phase, drain_mode.as_deref())
-        .is_some_and(NodeDrain::blocks_placement))
+    // So does an engine this build doesn't know, on column 2, the engine's
+    // position: this build is the old replica relative to any newer engine.
+    match NodeDrain::from_columns(
+        drain_engine.as_deref(),
+        phase.map(NodeDrainPhase::as_str),
+        drain_mode.as_deref(),
+    ) {
+        Some(NodeDrain::Unknown) => Err(sqlx::Error::ColumnDecode {
+            index: "2".to_owned(),
+            source: format!("unrecognized drain engine {drain_engine:?}").into(),
+        }),
+        drain => Ok(drain.is_some_and(NodeDrain::refuses_activations)),
+    }
 }
 
 /// The in-place update for a node that is already `draining`: rewrite

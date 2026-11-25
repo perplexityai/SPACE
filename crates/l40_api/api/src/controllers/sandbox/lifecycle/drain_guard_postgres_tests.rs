@@ -4,7 +4,7 @@ use pplx_space_sandbox_model::SandboxId;
 use super::*;
 use axum::{http::StatusCode, response::IntoResponse};
 use pplx_space_db_test_fixtures::pg_test_db;
-use pplx_space_node_model::NodeDrainMode;
+use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase};
 
 use pplx_space_test_env::TestResult;
 
@@ -745,6 +745,12 @@ async fn drain_gate_statements(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> TestResult<(Option<NodeDrain>, Vec<String>)> {
+    let (state, statements) = statements_of(fetch_active_node_drain_state(pool, sandbox_id)).await;
+    Ok((state?, statements))
+}
+
+/// What `call` answers, and the `sql!` locators of every statement it sends.
+async fn statements_of<T>(call: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
     use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -753,7 +759,7 @@ async fn drain_gate_statements(
     let state = {
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
         keep_query_events_enabled();
-        fetch_active_node_drain_state(pool, sandbox_id).await?
+        call.await
     };
     let statements = events
         .events()
@@ -772,7 +778,7 @@ async fn drain_gate_statements(
                 .map_or_else(|| sql.to_string(), |(locator, _)| locator.to_string())
         })
         .collect();
-    Ok((state, statements))
+    (state, statements)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -839,5 +845,677 @@ async fn missing_sandbox_has_no_drain_state() -> TestResult {
     assert_eq!(state, None);
     // No row, so no primary; the executions fallback still runs, as before.
     assert_eq!(statements.len(), 2, "{statements:#?}");
+    Ok(())
+}
+
+/// Make `node_id`'s drain a v2 one in `phase` (`None`: its cancel pending),
+/// as the admin route writes it: no mode, and `drain_status` with a deadline
+/// `deadline` seconds from now and, as a node would have reported, every
+/// sandbox of `pending` pending. The gates read none of the status.
+async fn set_v2_drain(
+    pool: &PgPool,
+    node_id: NodeId,
+    phase: Option<&str>,
+    deadline: i64,
+    pending: &[SandboxId],
+) -> TestResult {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let status = serde_json::json!({
+        "generation": 1,
+        "deadline_at": now + deadline,
+        "report": {
+            "reported_at": now,
+            "evacuated_grew_at": now,
+            "pending": pending.iter().map(|sandbox_id| serde_json::json!({
+                "sandbox_id": sandbox_id.to_string(), "wait": "moving", "running": true,
+            })).collect::<Vec<_>>(),
+        },
+    });
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = 'v2', drain_phase = $2, drain_mode = NULL,
+                          drain_status = $3
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .bind(phase)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The refusal a v2 drain gives: a 503 with `Retry-After`.
+fn assert_retryable(err: ControllerError, case: &str) {
+    let response = err.into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+    assert!(
+        response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER),
+        "{case}"
+    );
+}
+
+/// The sandboxes of one node, in each lifecycle the v2 tests ask about.
+struct V2Residents {
+    running: SandboxId,
+    paused: SandboxId,
+    stopped: SandboxId,
+}
+
+async fn v2_residents(pool: &PgPool, node_id: NodeId) -> TestResult<V2Residents> {
+    let residents = V2Residents {
+        running: SandboxId::new(),
+        paused: SandboxId::new(),
+        stopped: SandboxId::new(),
+    };
+    for (sandbox_id, lifecycle) in [
+        (residents.running, "started"),
+        (residents.paused, "paused"),
+        (residents.stopped, "stopped"),
+    ] {
+        insert_sandbox(pool, sandbox_id, lifecycle, Some(node_id), Some(node_id)).await?;
+    }
+    Ok(residents)
+}
+
+/// While a v2 drain is `draining`, before its deadline or past it, and with
+/// its cancel pending, its node is sealed: a started sandbox's calls go
+/// through, its wake included, and so does every sandbox's suspend, stop,
+/// pause, kill and stats read; every activation of a sandbox that isn't
+/// running is refused with a 503 and `Retry-After`: a start, wake, restore,
+/// resume or implicit wake. The gate reads the shared columns only: what
+/// the stored status says of the deadline or of a sandbox changes nothing.
+/// Once the cancel finished, nothing is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_draining_v2_drain_refuses_only_activations_with_a_503() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_node(&db.pool, node_id, Some("draining")).await?;
+    let V2Residents {
+        running,
+        paused,
+        stopped,
+    } = v2_residents(&db.pool, node_id).await?;
+    let open = [
+        (running, SandboxAction::Spaced),
+        (running, SandboxAction::Stats),
+        (running, SandboxAction::Wake),
+        (running, SandboxAction::Start),
+        (running, SandboxAction::Suspend),
+        (running, SandboxAction::Pause),
+        (running, SandboxAction::Stop),
+        (paused, SandboxAction::Suspend),
+        (paused, SandboxAction::Kill),
+        (paused, SandboxAction::Stats),
+        (stopped, SandboxAction::Kill),
+        (stopped, SandboxAction::Stats),
+    ];
+    let refused = [
+        (paused, SandboxAction::Wake),
+        (paused, SandboxAction::Resume),
+        (
+            paused,
+            SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
+        ),
+        (paused, SandboxAction::Spaced),
+        (stopped, SandboxAction::Start),
+        (stopped, SandboxAction::Restore),
+    ];
+    for (case, phase, deadline) in [
+        ("draining, holding", Some("draining"), 600),
+        ("draining, evacuating", Some("draining"), -60),
+        ("cancel pending", None, -60),
+    ] {
+        set_v2_drain(&db.pool, node_id, phase, deadline, &[running, paused]).await?;
+        for (sandbox_id, action) in open {
+            ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+                .await
+                .unwrap_or_else(|err| panic!("{case}: {action:?} on {sandbox_id}: {err:?}"));
+        }
+        for (sandbox_id, action) in refused {
+            let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+                .await
+                .expect_err("the sealed node refuses it");
+            assert_retryable(err, &format!("{case}: {action:?} on {sandbox_id}"));
+        }
+    }
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = NULL, drain_status = NULL WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    for (sandbox_id, action) in refused {
+        ensure_resolved_node_not_draining(&db.pool, sandbox_id, action).await?;
+    }
+    Ok(())
+}
+
+/// A v2 drain `drained` or `terminating` blocks everything, a running
+/// sandbox's calls included, as v1 does in those phases, and every refusal
+/// is a 503 with `Retry-After`. So does a drain under an engine this build
+/// doesn't know, which fails closed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drained_or_unknown_v2_drain_blocks_everything_with_a_503() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_node(&db.pool, node_id, Some("draining")).await?;
+    let V2Residents {
+        running, stopped, ..
+    } = v2_residents(&db.pool, node_id).await?;
+    for (case, engine, phase) in [
+        ("drained", "v2", "drained"),
+        ("terminating", "v2", "terminating"),
+        ("an unknown engine", "v3", "draining"),
+    ] {
+        set_v2_drain(&db.pool, node_id, Some(phase), -60, &[]).await?;
+        sqlx::query(sql!("UPDATE nodes SET drain_engine = $2 WHERE id = $1"))
+            .bind(node_id)
+            .bind(engine)
+            .execute(&db.pool)
+            .await?;
+        for (sandbox_id, action) in [
+            (running, SandboxAction::Spaced),
+            (running, SandboxAction::Wake),
+            (stopped, SandboxAction::Start),
+        ] {
+            let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, action)
+                .await
+                .expect_err("the drain blocks it");
+            assert_retryable(err, &format!("{case}: {action:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// A drain phase this build doesn't know fails the gate's read with a decode
+/// error, as before v2, under either engine: only an engine it doesn't know
+/// reads as a drain that fails closed.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unknown_drain_phase_fails_the_gate_read_under_either_engine() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_node(&db.pool, node_id, Some("draining")).await?;
+    let V2Residents { running, .. } = v2_residents(&db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "ALTER TABLE nodes DROP CONSTRAINT nodes_drain_phase_check"
+    ))
+    .execute(&db.pool)
+    .await?;
+    for engine in [None, Some("v2")] {
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_engine = $2, drain_phase = 'unrecognized-phase'
+              WHERE id = $1"
+        ))
+        .bind(node_id)
+        .bind(engine)
+        .execute(&db.pool)
+        .await?;
+        let err = fetch_node_drain_gate(&db.pool, running)
+            .await
+            .err()
+            .expect("an unknown phase fails the read");
+        assert!(
+            matches!(err, sqlx::Error::ColumnDecode { .. }),
+            "engine {engine:?}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A v1 drain's refusal stays its 409, whatever its `drain_status` reads,
+/// and its gate is still one read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_v1_drains_refusal_stays_a_409() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id, Some("draining")).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'worker-v1')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_sandbox(
+        &db.pool,
+        sandbox_id,
+        "started",
+        Some(node_id),
+        Some(node_id),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_status = '{\"generation\": 1, \"deadline_at\": 0}'::JSONB
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Wake)
+        .await
+        .expect_err("a forced v1 drain blocks it");
+    assert_eq!(err.into_response().status(), StatusCode::CONFLICT);
+    set_v2_drain(&db.pool, node_id, Some("draining"), 600, &[]).await?;
+    let (state, statements) = drain_gate_statements(&db.pool, sandbox_id).await?;
+    assert!(state.is_some_and(NodeDrain::is_v2));
+    assert_eq!(
+        statements.len(),
+        1,
+        "a v2 drain's gate is one read: {statements:#?}"
+    );
+    Ok(())
+}
+
+/// Under a draining v2 drain, an access path whose runtime client would wake
+/// a dormant sandbox is refused on a suspended row whose snapshot isn't
+/// durable elsewhere, with the caller's own action in the 503: a `spaced`
+/// connect with an activity and a port open. A started sandbox's access
+/// passes that gate; with no pod to reach, its `spaced` fallback and the port
+/// open then try to recover its runtime, and the recovery gate refuses that
+/// with the same retryable 503 instead of booting it elsewhere.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_v2_drain_refuses_access_that_would_wake_a_dormant_sandbox() -> TestResult {
+    use crate::controllers::substrate::Substrate;
+    use crate::controllers::substrate::kubernetes::tests::substrate_with_store;
+
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    let suspended = SandboxId::new();
+    let running = SandboxId::new();
+    insert_node(pool, node_id, Some("draining")).await?;
+    insert_sandbox(pool, suspended, "suspended", Some(node_id), Some(node_id)).await?;
+    insert_sandbox(pool, running, "started", Some(node_id), Some(node_id)).await?;
+    set_v2_drain(pool, node_id, Some("draining"), 600, &[running]).await?;
+    let controller = SandboxController::new(Substrate::from_kubernetes(substrate_with_store(
+        pool.clone(),
+    )));
+
+    for (sandbox_id, refused) in [(suspended, true), (running, false)] {
+        let sandbox = crate::controllers::sandbox::fetch_sandbox(pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        // Both rows answer at once: the suspended one at the drain gate, the
+        // started one at the recovery gate.
+        let wait = std::time::Duration::from_secs(10);
+        let spaced = tokio::time::timeout(
+            wait,
+            crate::controllers::sandbox::spaced::connect_spaced_runtime_client(
+                &controller.substrate,
+                None,
+                true,
+                pool,
+                &sandbox,
+                SandboxApiMetricIdentity::ecw("test"),
+                Some(ExecutionActivityKind::Access),
+            ),
+        )
+        .await
+        .map(|result| result.err());
+        let port = tokio::time::timeout(
+            wait,
+            controller.ensure_sandbox_port_exposure_applied(pool, &sandbox, 8080, "test"),
+        )
+        .await
+        .map(|result| result.err());
+        for (call, error, action) in [("spaced", spaced, "spaced"), ("port", port, "open_port")] {
+            let drain_refusal = error
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .filter(|error| {
+                    error.status() == 503 && error.to_string().contains("under a node drain")
+                });
+            if refused {
+                let error = drain_refusal.unwrap_or_else(|| {
+                    panic!("{call} on the suspended row must be refused: {error:?}")
+                });
+                assert!(
+                    error.to_string().contains(&format!("cannot {action} yet")),
+                    "{call}: {error}"
+                );
+            } else {
+                assert!(
+                    drain_refusal.is_none(),
+                    "{call} on the started row must pass the drain gate: {error:?}"
+                );
+                let recovery = error
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .filter(|error| {
+                        error.status() == 503
+                            && error.to_string().contains("is not recovered elsewhere")
+                    });
+                assert!(
+                    recovery.is_some(),
+                    "{call} on the started row must stop at the recovery gate: {error:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The v2 stop gate's answer for `sandbox_id`, for each action that ends a
+/// sandbox stopped: `:stop`/`:force-stop` ([`SandboxAction::Stop`]),
+/// `:kill`/`:force-kill` ([`SandboxAction::Kill`]) and a rollback without
+/// restart, `:force-rollback`'s included ([`SandboxAction::Rollback`]).
+async fn stop_gate(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> TestResult<Vec<Result<(), ControllerError>>> {
+    let mut answers = Vec::new();
+    for action in [
+        SandboxAction::Stop,
+        SandboxAction::Kill,
+        SandboxAction::Rollback,
+    ] {
+        answers.push(
+            ensure_stop_admitted_by_v2_drain(pool, sandbox_id, action)
+                .await
+                .map(|_| ()),
+        );
+    }
+    Ok(answers)
+}
+
+/// Point `sandbox_id`'s latest execution at `node_id`'s Kubernetes node, the
+/// executions fallback the gate reads when both placement columns are NULL.
+async fn insert_fallback_execution(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+) -> TestResult {
+    let k8s_node_name = format!("fallback-node-{node_id}");
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)
+         ON CONFLICT DO NOTHING"
+    ))
+    .bind(node_id)
+    .bind(&k8s_node_name)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace,
+             k8s_node_name, state, active
+         )
+         VALUES ($1, 1, 'pod-A', 'space', $2, 'terminated', false)"
+    ))
+    .bind(sandbox_id)
+    .bind(&k8s_node_name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A stop, a kill or a rollback without restart of a sandbox on a node with
+/// a v2 drain recorded is refused with a 503 and `Retry-After` in every
+/// phase, the cancel pending included, whether the node is the sandbox's
+/// active or its target node and whatever its lifecycle, a portable
+/// suspended row included: a v2 drain doesn't move a stopped sandbox. So is
+/// one whose placement columns are both NULL and whose latest execution
+/// names the node: the gate's drain state comes from the executions
+/// fallback. A drain engine this build doesn't know, with no phase, is
+/// refused the same way: the gate fails closed. The refusal follows the
+/// node's persisted drain, so it holds on a replica whose
+/// `SPACE_DRAIN_V2_ENABLED` is off: the gate reads no switch.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_on_a_v2_drained_node_is_refused_with_a_503() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    insert_node_with_mode(pool, node_id, None, None).await?;
+    let residents = v2_residents(pool, node_id).await?;
+    let suspended = SandboxId::new();
+    insert_sandbox(pool, suspended, "suspended", Some(node_id), None).await?;
+    insert_fresh_ready_snapshot(pool, suspended).await?;
+    let targeting = SandboxId::new();
+    insert_sandbox(pool, targeting, "started", None, Some(node_id)).await?;
+    let unplaced = SandboxId::new();
+    insert_sandbox(pool, unplaced, "started", None, None).await?;
+    insert_fallback_execution(pool, unplaced, node_id).await?;
+    let sandboxes = [
+        residents.running,
+        residents.paused,
+        residents.stopped,
+        suspended,
+        targeting,
+        unplaced,
+    ];
+    for (case, engine, phase, deadline) in [
+        ("draining, holding", "v2", Some("draining"), 600),
+        ("draining, evacuating", "v2", Some("draining"), -60),
+        ("drained", "v2", Some("drained"), -60),
+        ("terminating", "v2", Some("terminating"), -60),
+        ("cancel pending", "v2", None, -60),
+        ("an unknown engine", "v9", None, -60),
+    ] {
+        set_v2_drain(pool, node_id, phase, deadline, &[residents.running]).await?;
+        sqlx::query(sql!("UPDATE nodes SET drain_engine = $2 WHERE id = $1"))
+            .bind(node_id)
+            .bind(engine)
+            .execute(pool)
+            .await?;
+        for sandbox_id in sandboxes {
+            for err in stop_gate(pool, sandbox_id).await? {
+                assert_retryable(
+                    err.expect_err("a stop on a v2 drained node is refused"),
+                    &format!("{case}: {sandbox_id}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// With both placement columns NULL, the gate reads the drain from every
+/// node row of the latest execution's Kubernetes node. A forced v1 drain on
+/// one of them wins the drain state, which blocks placement, but a v2 drain,
+/// or an engine this build doesn't know, on another still seals the node: a
+/// stop or a kill is refused with the drain's 503. A rollback without
+/// restart, through its own gate, is refused first by the forced v1 drain's
+/// placement block, with v1's 409. Under two v1 siblings, forced and gentle,
+/// the stop and the kill pass, and the rollback gets the same 409, as on
+/// main.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_is_refused_when_any_fallback_sibling_has_a_v2_drain() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let forced = NodeId::new();
+    let sibling = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let shared_k8s_name = format!("shared-node-{}", sandbox_id.as_uuid().simple());
+    insert_node(pool, forced, Some("draining")).await?;
+    insert_node_with_mode(pool, sibling, None, None).await?;
+    for node_id in [forced, sibling] {
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+        ))
+        .bind(node_id)
+        .bind(&shared_k8s_name)
+        .execute(pool)
+        .await?;
+    }
+    insert_sandbox(pool, sandbox_id, "started", None, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace,
+             k8s_node_name, state, active
+         )
+         VALUES ($1, 1, 'pod-A', 'space', $2, 'terminated', false)"
+    ))
+    .bind(sandbox_id)
+    .bind(&shared_k8s_name)
+    .execute(pool)
+    .await?;
+
+    for (case, engine, phase, unknown) in [
+        ("a v2 drain draining", "v2", Some("draining"), false),
+        ("a v2 cancel pending", "v2", None, false),
+        ("an unknown engine", "v9", None, true),
+    ] {
+        set_v2_drain(pool, sibling, phase, 600, &[sandbox_id]).await?;
+        sqlx::query(sql!("UPDATE nodes SET drain_engine = $2 WHERE id = $1"))
+            .bind(sibling)
+            .bind(engine)
+            .execute(pool)
+            .await?;
+        assert!(
+            fetch_active_node_drain_state(pool, sandbox_id)
+                .await?
+                .is_some_and(NodeDrain::blocks_placement),
+            "{case}: the forced v1 sibling wins the drain state"
+        );
+        for action in [SandboxAction::Stop, SandboxAction::Kill] {
+            let err = ensure_stop_admitted_by_v2_drain(pool, sandbox_id, action)
+                .await
+                .expect_err(case);
+            assert_eq!(
+                err.to_string().contains("doesn't know"),
+                unknown,
+                "{case}: {action}: {err}"
+            );
+            assert_retryable(err, &format!("{case}: {action}"));
+        }
+        assert_rollback_refused_by_the_v1_drain(pool, sandbox_id, case).await;
+    }
+
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = NULL, drain_status = NULL WHERE id = $1"
+    ))
+    .bind(sibling)
+    .execute(pool)
+    .await?;
+    insert_node_with_mode(pool, sibling, Some("draining"), Some(NodeDrainMode::Gentle)).await?;
+    for action in [SandboxAction::Stop, SandboxAction::Kill] {
+        ensure_stop_admitted_by_v2_drain(pool, sandbox_id, action)
+            .await
+            .unwrap_or_else(|err| panic!("two v1 siblings: {action}: {err:?}"));
+    }
+    assert_rollback_refused_by_the_v1_drain(pool, sandbox_id, "two v1 siblings").await;
+    Ok(())
+}
+
+/// A rollback without restart's production gate refuses `sandbox_id` with a
+/// v1 drain's 409, which carries no `Retry-After`.
+async fn assert_rollback_refused_by_the_v1_drain(pool: &PgPool, sandbox_id: SandboxId, case: &str) {
+    let err = ensure_stop_admitted_by_drain(pool, sandbox_id, SandboxAction::Rollback)
+        .await
+        .expect_err(case);
+    let response = err.into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT, "{case}: rollback");
+    assert!(
+        !response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER),
+        "{case}: rollback"
+    );
+}
+
+/// The v2 stop gate refuses nothing on an undrained node, on a node whose v2
+/// drain's cancel finished, or under a v1 drain in any phase and mode,
+/// whether the gate reads it from the sandbox's node or from its latest
+/// execution's, and nothing for a sandbox placed nowhere. A v1 drain's own
+/// refusal of a stop is [`ensure_resolved_node_not_draining`]'s, as on main.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_off_a_v2_drain_passes_the_stop_gate() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    insert_node_with_mode(pool, node_id, None, None).await?;
+    let residents = v2_residents(pool, node_id).await?;
+    let unplaced = SandboxId::new();
+    insert_sandbox(pool, unplaced, "stopped", None, None).await?;
+    let fallback = SandboxId::new();
+    insert_sandbox(pool, fallback, "started", None, None).await?;
+    insert_fallback_execution(pool, fallback, node_id).await?;
+    let mut cases = vec![("undrained", None, None)];
+    for phase in ["draining", "drained", "terminating"] {
+        for mode in [
+            Some(NodeDrainMode::Gentle),
+            Some(NodeDrainMode::Forced),
+            None,
+        ] {
+            cases.push(("a v1 drain", Some(phase), mode));
+        }
+    }
+    for (case, phase, mode) in cases {
+        insert_node_with_mode(pool, node_id, phase, mode).await?;
+        for sandbox_id in [
+            residents.running,
+            residents.paused,
+            residents.stopped,
+            unplaced,
+            fallback,
+        ] {
+            for answer in stop_gate(pool, sandbox_id).await? {
+                answer.unwrap_or_else(|err| {
+                    panic!("{case} {phase:?} {mode:?}: {sandbox_id}: {err:?}")
+                });
+            }
+        }
+    }
+    // A v2 drain whose cancel finished leaves no engine.
+    set_v2_drain(pool, node_id, None, -60, &[]).await?;
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_engine = NULL, drain_status = NULL WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    for answer in stop_gate(pool, residents.running).await? {
+        answer.unwrap_or_else(|err| panic!("cancel finished: {err:?}"));
+    }
+    Ok(())
+}
+
+/// With no v2 drain recorded, which with drain v2 off is every node, a stop
+/// reads the drain gate once, as it did: its stop gate sends the statements
+/// of the read its Stop arm made (`fetch_active_node_drain_state`), which now
+/// reuses the gate's answer. A rollback without restart sends what every
+/// rollback's drain gate sends. The v2 check is two columns of that read.
+#[tokio::test(flavor = "current_thread")]
+async fn the_stop_gate_adds_no_statement() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(pool, node_id, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'worker-a')"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    insert_sandbox(pool, sandbox_id, "started", Some(node_id), None).await?;
+
+    let (_, arm_statements) = drain_gate_statements(pool, sandbox_id).await?;
+    for action in [SandboxAction::Stop, SandboxAction::Kill] {
+        let (stop, statements) =
+            statements_of(ensure_stop_admitted_by_v2_drain(pool, sandbox_id, action)).await;
+        assert_eq!(stop?, None, "{action}");
+        assert_eq!(statements, arm_statements, "{action}");
+    }
+    let (plain, rollback_statements) = statements_of(ensure_resolved_node_not_draining(
+        pool,
+        sandbox_id,
+        SandboxAction::Rollback,
+    ))
+    .await;
+    plain?;
+    let (rollback, statements) = statements_of(ensure_stop_admitted_by_drain(
+        pool,
+        sandbox_id,
+        SandboxAction::Rollback,
+    ))
+    .await;
+    rollback?;
+    assert_eq!(statements, rollback_statements);
+    assert_eq!(arm_statements.len(), 1, "{arm_statements:#?}");
     Ok(())
 }

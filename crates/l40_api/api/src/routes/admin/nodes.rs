@@ -2153,6 +2153,28 @@ fn force_upload_gate_open_message(drain_state: Option<NodeDrain>) -> (&'static s
     }
 }
 
+/// The drain the force-upload gate reads from a node's columns, or why it
+/// can't read one: a phase this build doesn't know aborts the upload, as on
+/// a build without v2, and so does an engine it doesn't know. This build is
+/// the old replica relative to any newer engine, so it can't tell whether
+/// that drain refuses wakes, and the upload's byte-stability rests on it.
+fn force_upload_drain_state(
+    engine: Option<&str>,
+    phase: Option<&str>,
+    mode: Option<&str>,
+) -> Result<Option<NodeDrain>, String> {
+    let phase = phase
+        .map(NodeDrainPhase::parse)
+        .transpose()
+        .map_err(|err| format!("node has an unrecognized drain phase: {err}"))?;
+    match NodeDrain::from_columns(engine, phase.map(NodeDrainPhase::as_str), mode) {
+        Some(NodeDrain::Unknown) => {
+            Err(format!("node has an unrecognized drain engine: {engine:?}"))
+        }
+        drain_state => Ok(drain_state),
+    }
+}
+
 async fn apply_force_upload_local_snapshots(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -2195,19 +2217,14 @@ async fn apply_force_upload_local_snapshots(
     // either mode. Sharing the predicate with the gate is what keeps the two from
     // drifting — the whole hazard here is a reader that thinks wakes are blocked
     // when they aren't.
-    let drain_state = match node
-        .drain_phase
-        .as_deref()
-        .map(NodeDrainPhase::parse)
-        .transpose()
-    {
-        Ok(phase) => NodeDrain::from_v1_columns(phase, node.drain_mode.as_deref()),
-        Err(err) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("node has an unrecognized drain phase: {err}"),
-            )
-            .into_response();
+    let drain_state = match force_upload_drain_state(
+        node.drain_engine.as_deref(),
+        node.drain_phase.as_deref(),
+        node.drain_mode.as_deref(),
+    ) {
+        Ok(drain_state) => drain_state,
+        Err(message) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
         }
     };
     if !drain_state.is_some_and(NodeDrain::refuses_activations) {
