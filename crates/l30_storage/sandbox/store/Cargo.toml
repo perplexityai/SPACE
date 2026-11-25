@@ -29,7 +29,8 @@ default = []
 # sandbox's activating-client record, for the api's attribution tests;
 # `test_support::sweeper`, the transient-lifecycle sweeper's statements, for
 # the cluster controller's sweeper tests; `test_support::admin_occupancy`, the
-# node and fleet occupancy statements, for the api's plan tests; and
+# node and fleet occupancy statements and the batched oracle they are compared
+# against, for the api's plan and differential tests; and
 # `direct::sandbox_listing::admin::AdminIdSearch::id_prefix`, the ID-prefix
 # range a search binds, for the api's admin-search tests. This crate's unit
 # tests get them under `cfg(test)`.
