@@ -20,7 +20,7 @@ pub fn artifact_backup_dedup_key(local_artifact_id: LocalArtifactId) -> String {
 
 /// Cancel the live upload of `artifact`, a drain suspend's capture that a
 /// later publication superseded, as eviction cancels an evicted artifact's
-/// ([`super::eviction`]): a pending job is cancelled outright and never runs
+/// (`super::eviction`): a pending job is cancelled outright and never runs
 /// again; a running one is marked `cancelling`, and its worker records it
 /// cancelled once its attempt returns. Returns the job as it was before, so
 /// the caller can settle what it registered; none when no live job uploads
