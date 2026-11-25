@@ -227,7 +227,8 @@ loop's own API client, outside the page, so that the node answers the page
 receives are the console's own:
 
 - `node-v2-drain-now` starts a v2 drain with the hold Now (`hold_seconds:
-  0`), follows the empty worker to `drained`, shows the API's own phase
+  0`), follows the empty worker to `drained`, checks that neither the
+  draining nor the drained node offers Upload local snapshots, shows the API's own phase
   refusal for a terminate sent after an undrain (`:terminate` refuses a v2
   node only on its phase), and waits for the undrain's cancel to finish;
 - `node-v2-hold-shorten-undrain` places one running sandbox on the worker,
@@ -243,7 +244,8 @@ receives are the console's own:
   (answered by the step), and the page's stale-read warning, then, with the
   cluster controller scaled to 0 so nothing moves, End hold now (`hold_seconds:
   0`) and an undrain mid-drain, whose cancel stays pending until the
-  controller is scaled back;
+  controller is scaled back, while the page offers no drain and no Upload
+  local snapshots;
 - `node-v2-refusals` shows the cap's 409 with `Retry-After`, the stale
   heartbeat's 409 and the switched-off 400, each answered by the step with
   the API's body;
@@ -278,7 +280,7 @@ in a drain phase first. `node-holds-panel` checks that the node page's "What
 holds this node" panel lists every row of the holds answer the page received,
 in the five groups in order, each with a sentence and exactly the gates that
 count it, under the residency evidence the answer reports. It also checks that Upload local snapshots
-sits beside the local-only rows exactly when the API accepts that action, and
+sits beside the local-only rows exactly when the API accepts that action, under a v1 drain, and
 that a node no term counts reads "Nothing holds this node" in the panel and
 the Drain section. `node-history-filters` opens the collapsed History and
 checks the lifecycle filter and, on a draining node, "Failed during this

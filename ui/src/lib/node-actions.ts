@@ -103,7 +103,7 @@ export type NodeAction = {
 // stays v1's gentle one. A v2 drain takes no mode: while it is draining,
 // Shorten hold moves its deadline earlier and End hold now moves it to now.
 // Terminate is offered only on a drained node, the one phase the API accepts
-// it from.
+// it from. Upload local snapshots is offered only under a v1 drain.
 export function nodeActions(
   n: Pick<AdminNodeResponse, 'role' | 'drain_phase' | 'drain_mode' | 'drain_engine'> & {
     drain?: Pick<NonNullable<AdminNodeResponse['drain']>, 'fenced'> | null;
@@ -188,10 +188,13 @@ export function nodeActions(
       confirm: v2 ? V2_TERMINATE_ENDS : TERMINATE_ENDS,
     });
   }
-  // The API accepts this only while the drain gate refuses wakes: drained,
-  // terminating, a forced v1 drain, or any v2 drain, whose node is sealed.
+  // The API accepts this only under a v1 drain whose gate refuses wakes:
+  // drained, terminating, or forced. It refuses it under a v2 drain, in every
+  // phase and while its cancel is pending: the sealed node itself uploads
+  // each local snapshot of a suspended resident that it has not recorded as
+  // backed up.
   const uploadOpen =
-    v2 || n.drain_phase === 'drained' || n.drain_phase === 'terminating' || (n.drain_phase === 'draining' && n.drain_mode === 'forced');
+    !v2 && (n.drain_phase === 'drained' || n.drain_phase === 'terminating' || (n.drain_phase === 'draining' && n.drain_mode === 'forced'));
   if (supportsDrain && uploadOpen) {
     actions.push({
       action: 'force-upload-local-snapshots', label: 'Upload local snapshots', dangerous: true,
