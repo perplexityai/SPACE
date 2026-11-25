@@ -35,6 +35,9 @@ export interface StepResult {
   ok: boolean;
   events: StepEvent[];
   notes: string[];
+  // With --video, where the step is in the run's recording, in ms from its
+  // start: what `npm run gifs` cuts each step's GIF from.
+  video?: { fromMs: number; toMs: number };
 }
 
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
@@ -211,7 +214,10 @@ export class Recorder {
 
   async end(index: number, startedAt: number, failure: unknown): Promise<StepResult> {
     if (failure) {
-      const text = failure instanceof Error ? failure.message.split('\n')[0] : String(failure);
+      // A Playwright timeout says what it waited for on a later line.
+      const lines = failure instanceof Error ? failure.message.split('\n') : [String(failure)];
+      const waiting = lines.slice(1).find((line) => /waiting for /.test(line))?.trim();
+      const text = waiting ? `${lines[0]} (${waiting})` : lines[0];
       this.add({ kind: 'exception', message: text.slice(0, 600), signature: `exception|${this.normalize(text).slice(0, 160)}` });
     }
     // Let in-flight responses settle so their bodies land in this step.
