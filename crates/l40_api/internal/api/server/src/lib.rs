@@ -162,8 +162,8 @@ mod published_state;
 pub use published_state::{publish_sandbox_states, publish_sandbox_states_with_retirement};
 mod sandbox_quarantine_store;
 use published_state::{
-    capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
-    publish_template_states, snapshot_execution_metadata,
+    capture_host_cpu, project_ready_suspend_snapshot, publish_template_states,
+    snapshot_execution_metadata,
 };
 
 const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];

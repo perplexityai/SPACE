@@ -141,7 +141,13 @@ impl ClusterApiService {
             SandboxInventoryPrune::Skipped
         };
         if template_inventory_complete {
-            prune_absent_node_templates(&mut tx, origin.id, &present_template_keys).await?;
+            pplx_space_node_template_inventory_store::prune_absent_templates(
+                &mut *tx,
+                origin.id,
+                &present_template_keys,
+            )
+            .await
+            .map_err(|err| Status::internal(format!("prune absent published templates: {err}")))?;
         }
         // Mirror the node's pending-backup set before the status upsert that
         // stamps its freshness gate, so the gate is only ever written after
