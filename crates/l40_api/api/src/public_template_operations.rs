@@ -1,14 +1,15 @@
 use pplx_space_accounts::NodeId;
 
-use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use pplx_space_cluster_pool::{TemplateWarmPoolUsage, WarmPoolStore};
+use pplx_space_cluster_trigger_queue::enqueue_triggers;
 use pplx_space_node_model::SubstrateKind;
 use pplx_space_public_api::{
     OperationState, PublicErrorCode, PublicErrorDetail, PublicOperationResult,
     PublicTemplateOperationResult,
 };
+use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
 use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
@@ -19,9 +20,8 @@ use crate::{
     public_sandbox_operations::PublicOperationExecutionResult,
     reconcile_queue::{
         NetworkPolicyTarget, ReconcileElementRef, ReconcileRef,
-        delete_reconcile_state_for_elements, enqueue_node_reconcile_refs_for_nodes,
+        enqueue_node_reconcile_refs_for_nodes,
     },
-    reconcile_trigger::enqueue_triggers,
 };
 
 const TEMPLATE_DELETE_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -391,20 +391,11 @@ async fn nodes_with_template_inventory(
     pool: &PgPool,
     template: &TemplateName,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT DISTINCT nti.node_id
-         FROM node_template_inventory nti
-         JOIN nodes n ON n.id = nti.node_id
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         WHERE nti.template_name = $1
-           AND (
-             n.managed_by != $2
-             OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
-           )"
-    ))
-    .bind(template.as_str())
-    .bind(SubstrateKind::Space)
-    .fetch_all(pool)
+    pplx_space_node_template_inventory_store::direct::template_holder_ids(
+        pool,
+        template,
+        SubstrateKind::Space,
+    )
     .await
 }
 
@@ -441,12 +432,7 @@ pub(crate) async fn mark_template_deleted(
     // storage location this transaction deleted, while this one waits on
     // that delete's tag row. `NO KEY UPDATE` is the lock the final update
     // takes anyway, and doesn't conflict with foreign-key checks.
-    sqlx::query(sql!(
-        "SELECT 1 FROM templates WHERE name = $1 FOR NO KEY UPDATE"
-    ))
-    .bind(template.as_str())
-    .execute(&mut *tx)
-    .await?;
+    pplx_space_template_store::templates::lock_no_key_update(&mut tx, template).await?;
     if let Some(in_use) = TemplateInUse::check(&mut tx, template).await? {
         return Ok(MarkTemplateDeleted::InUse(in_use));
     }

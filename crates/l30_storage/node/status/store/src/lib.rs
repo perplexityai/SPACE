@@ -1,12 +1,13 @@
 //! The `node_status_snapshots` row: what each node last reported about
 //! itself, one row per node.
 //!
-//! One writer predates this store and hasn't moved in yet: the Direct
-//! substrate's own snapshot. What lives here today is the rule for reading
-//! the row's published environments, so every reader asks the same
-//! question; [`upsert_from_publish`], the internal API's write from a
-//! node-state publication; and [`status_summaries`], the admin node
-//! inventory's read.
+//! What lives here is the rule for reading the row's published
+//! environments, so every reader asks the same question;
+//! [`upsert_from_publish`], the internal API's write from a node-state
+//! publication; [`create_failure`], the Direct substrate's write after a
+//! create on a worker failed; [`status_summaries`], the admin node
+//! inventory's read; and [`backup_inventory`], whether a node's pending
+//! backup report is fresh enough for node drain to believe.
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,6 +17,9 @@ use pplx_space_execution_spec::ExecutionPolicyObservation;
 use pplx_space_sql_locator::sql;
 use sqlx::types::Json;
 use time::OffsetDateTime;
+
+pub mod backup_inventory;
+pub mod create_failure;
 
 #[cfg(test)]
 mod tests;

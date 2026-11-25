@@ -2,9 +2,16 @@ use pplx_space_accounts::NodeId;
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_auto_lifecycle::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecycleStage,
+    AutoLifecyclePolicy, AutoLifecycleStage,
 };
 use pplx_space_sandbox_model::SandboxId;
+use pplx_space_sql_locator::sql;
+use pplx_space_state_reconciliation::{
+    FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
+    SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
+    SANDBOX_FAILURE_POD_UID_KEY,
+};
+use sqlx::types::Json as SqlJson;
 use uuid::Uuid;
 
 use super::*;

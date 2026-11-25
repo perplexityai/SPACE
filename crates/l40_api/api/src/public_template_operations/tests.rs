@@ -3,6 +3,7 @@ use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_cluster_pool::{PoolConfigOwner, PoolSlotState};
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, pg_test_db, pg_test_db_with_max_connections};
 use pplx_space_public_api::{OperationId, OperationKind, OperationTargetType};
+use pplx_space_sql_locator::sql;
 
 use super::*;
 use crate::public_operations::{

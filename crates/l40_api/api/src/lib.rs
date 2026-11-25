@@ -45,7 +45,6 @@ pub mod public_sessions;
 mod public_store;
 pub mod public_template_operations;
 pub mod reconcile_queue;
-pub mod reconcile_trigger;
 pub(crate) mod redis_otel;
 pub mod retry_deferral;
 pub mod routes;

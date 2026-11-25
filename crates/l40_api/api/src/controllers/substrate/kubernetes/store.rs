@@ -27,15 +27,9 @@ use pplx_space_sandbox_model::{
     ExecutionGeneration, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
     SandboxTransitionTargetState,
 };
-use pplx_space_sandbox_portability::{
-    fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
-    restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
-    snapshot_is_current_local_artifact,
-};
 use pplx_space_snapshot_model::{ArtifactKind, ArtifactOrigin, LocalArtifactId, SnapshotState};
 use pplx_space_sql_locator::sql;
-use pplx_space_state_reconciliation::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_LOCAL_SUSPEND_KEY};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{controllers::sandbox::fetch_sandbox as fetch_api_sandbox, models::Sandbox};
@@ -313,7 +307,6 @@ pub(super) struct K8sNodeRoleUpsert<'a> {
     pub instance_id: Option<&'a Ec2InstanceId>,
 }
 
-#[derive(sqlx::FromRow)]
 pub(super) struct ActiveExecutionStatusRow {
     pub(super) generation: i64,
     pub(super) pod_name: String,
@@ -321,7 +314,6 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) pod_ip: Option<String>,
     pub(super) k8s_node_name: Option<String>,
     pub(super) current_node_id: Option<NodeId>,
-    #[sqlx(try_from = "String")]
     pub(super) state: ActiveExecutionState,
     pub(super) lifecycle: String,
     pub(super) create_age_expired: bool,
@@ -329,6 +321,39 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
     /// The sandbox's record of whose activation created its runtime.
     pub(super) activating_client_id: Option<pplx_space_accounts::ClientId>,
+}
+
+impl TryFrom<pplx_space_sandbox_store::k8s_executions::ActiveExecutionStatus>
+    for ActiveExecutionStatusRow
+{
+    type Error = sqlx::Error;
+
+    /// Parses `state` as the `#[sqlx(try_from = "String")]` column it
+    /// replaced did, failing with the same `ColumnDecode` error.
+    fn try_from(
+        status: pplx_space_sandbox_store::k8s_executions::ActiveExecutionStatus,
+    ) -> Result<Self, Self::Error> {
+        let state = ActiveExecutionState::try_from(status.state).map_err(|error| {
+            sqlx::Error::ColumnDecode {
+                index: "state".to_string(),
+                source: Box::new(error),
+            }
+        })?;
+        Ok(Self {
+            generation: status.generation,
+            pod_name: status.pod_name,
+            pod_uid: status.pod_uid,
+            pod_ip: status.pod_ip,
+            k8s_node_name: status.k8s_node_name,
+            current_node_id: status.current_node_id,
+            state,
+            lifecycle: status.lifecycle,
+            create_age_expired: status.create_age_expired,
+            activation_attempt_id: status.activation_attempt_id,
+            route_activation_id: status.route_activation_id,
+            activating_client_id: status.activating_client_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,22 +617,26 @@ impl std::str::FromStr for ActiveExecutionState {
     }
 }
 
-impl<'row> sqlx::FromRow<'row, PgRow> for CommittedSuspendArtifactRow {
-    fn from_row(row: &'row PgRow) -> Result<Self, sqlx::Error> {
-        let execution_state = row
-            .try_get::<String, _>("execution_state")?
+impl TryFrom<pplx_space_sandbox_store::suspend_reads::CommittedSuspendMarker>
+    for CommittedSuspendArtifactRow
+{
+    type Error = sqlx::Error;
+
+    fn try_from(
+        marker: pplx_space_sandbox_store::suspend_reads::CommittedSuspendMarker,
+    ) -> Result<Self, Self::Error> {
+        let execution_state = marker
+            .execution_state
             .try_into()
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-        let artifact_id = row
-            .try_get::<Option<Uuid>, _>("artifact_id")?
-            .map(LocalArtifactId::from_uuid);
-        let artifact_kind = row
-            .try_get::<Option<String>, _>("artifact_kind")?
+        let artifact_id = marker.artifact_id.map(LocalArtifactId::from_uuid);
+        let artifact_kind = marker
+            .artifact_kind
             .map(ArtifactKind::try_from)
             .transpose()
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-        let artifact_origin = row
-            .try_get::<Option<String>, _>("artifact_origin")?
+        let artifact_origin = marker
+            .artifact_origin
             .map(ArtifactOrigin::try_from)
             .transpose()
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
@@ -703,7 +732,7 @@ pub(super) enum RestoreClaim {
     /// node outside the evacuation claim's window. Left `restoring` with the
     /// marker, it stays inside that window, and the claim's next call takes it
     /// as `RedroveRestoring`; the drain's restore sweep lists such a row
-    /// (the stopped arm of `restore_pending_evacuations_query` admits
+    /// (the stopped arm of `pplx_space_sandbox_store::evacuation_restores::pending` admits
     /// `restoring`). Its restore plan resolves the disk artifact for that
     /// `restoring` row through `selected_stopped_evacuation_restore_source`,
     /// since `selected_stopped_restore_storage_uri` serves only `lifecycle =

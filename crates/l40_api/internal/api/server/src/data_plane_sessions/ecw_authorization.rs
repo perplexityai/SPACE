@@ -83,7 +83,7 @@ pub(super) async fn api_key_belongs_to_org(
         return Ok(false);
     };
 
-    crate::api_key_store::authorizes_ecw_sandbox(pool, api_key_sha256, org_id)
+    pplx_space_accounts_store::api_keys::ecw_api_key_authorizes_org(pool, api_key_sha256, org_id)
         .await
         .map_err(|error| {
             Status::internal(format!("validate sandbox service route api key: {error}"))

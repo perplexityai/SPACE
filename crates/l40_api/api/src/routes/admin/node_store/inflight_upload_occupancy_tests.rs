@@ -5,10 +5,10 @@ use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_residency::ResidencyEvidence;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
-use std::num::NonZeroUsize;
 use uuid::Uuid;
 
-use super::{AdminNodeStore, list_pinned_local_only_sandboxes, sandbox_occupancy_for_node_in_tx};
+use super::AdminNodeStore;
+use pplx_space_sandbox_store::admin_occupancy::{pinned_local_only_sandboxes, terminate_occupancy};
 
 use pplx_space_test_env::TestResult;
 
@@ -35,8 +35,7 @@ async fn insert_sandbox(pool: &PgPool, id: SandboxId, target_node_id: NodeId) ->
 
 async fn in_tx_local_snapshots(pool: &PgPool, node: NodeId) -> TestResult<i64> {
     let mut tx = pool.begin().await?;
-    let occ =
-        sandbox_occupancy_for_node_in_tx(&mut tx, node, ResidencyEvidence::LifecycleOnly).await?;
+    let occ = terminate_occupancy(&mut *tx, node, ResidencyEvidence::LifecycleOnly).await?;
     tx.commit().await?;
     Ok(occ.drain_blockers)
 }
@@ -253,8 +252,7 @@ async fn force_upload_enumeration_excludes_inflight_uploads() -> TestResult {
     .execute(pool)
     .await?;
 
-    let listed =
-        list_pinned_local_only_sandboxes(pool, node, NonZeroUsize::new(100).unwrap()).await?;
+    let listed = pinned_local_only_sandboxes(pool, node).await?;
     assert_eq!(
         listed,
         vec![needs_upload],
@@ -438,92 +436,11 @@ async fn inflight_upload_from_the_target_node_counts_once_not_twice() -> TestRes
     // The enumeration operators read to decide what to do about it excludes
     // in-flight uploads, so the sandbox is counted but not offered for a
     // force-upload — those are different questions about the same row.
-    let pinned =
-        list_pinned_local_only_sandboxes(pool, node, NonZeroUsize::new(10).unwrap()).await?;
+    let pinned = pinned_local_only_sandboxes(pool, node).await?;
     assert!(
         !pinned.contains(&SandboxId::from_uuid(sandbox)),
         "an upload already in flight is not a force-upload candidate"
     );
-    Ok(())
-}
-
-/// The `:terminate` guard's `active` count applies the census discount, so it
-/// refuses exactly what node-drain's gate and `mark_terminating_query` refuse.
-///
-/// This is the wedge the guard would otherwise be: `active` used to restate the
-/// exclusion list with no census term. A worker whose own census disproves its
-/// phantom `active_node_id` rows clears the census-aware drain gate, reaches
-/// `drained` — and a guard that still counted those rows would 409 every
-/// `:terminate` for the rest of the node's life, with `space-rollout-mng.py`
-/// permanently excluding it.
-///
-/// The `LifecycleOnly` half of the loop is the kill switch: with the discount
-/// off, the phantom row counts again and the guard refuses. Fail-closed.
-#[tokio::test(flavor = "current_thread")]
-async fn terminate_guard_active_count_honors_the_census_discount() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let node = NodeId::new();
-    sqlx::query(sql!(
-        "INSERT INTO nodes (id, address, role, managed_by, state)
-         VALUES ($1, '10.0.0.71'::inet, 'worker', 'k8s', 'registered')"
-    ))
-    .bind(node)
-    .execute(&db.pool)
-    .await?;
-    // Reachable with a fresh heartbeat: the only state in which the census may
-    // be read as proof of absence.
-    sqlx::query(sql!(
-        // `sandbox_inventory_pruned_at` is the second, independent precondition
-        // of the census discount (`node_census_fresh`): a fresh heartbeat alone
-        // no longer earns it. Stamped current so this fixture isolates the thing
-        // it is about — whether the guard applies the discount — rather than
-        // withholding it for a reason the test never mentions.
-        "INSERT INTO node_status_snapshots (
-             node_id, observed_at, stale_after, reachable, role,
-             scheduling_status, services, sandbox_inventory_pruned_at, updated_at
-         )
-         VALUES ($1, NOW(), NOW() + INTERVAL '30 seconds', TRUE,
-                 'worker', 'ready', '[]'::jsonb, NOW(), NOW())"
-    ))
-    .bind(node)
-    .execute(&db.pool)
-    .await?;
-    // A phantom: `active_node_id` names the node, placement settled long ago,
-    // and the node's census carries no row for it.
-    sqlx::query(sql!(
-        "INSERT INTO sandboxes (
-             id, user_id, org_id, lifecycle, placement, managed_by,
-             active_node_id, placement_changed_at, network_policy_generation
-         )
-         VALUES (
-             $1,
-             '00000000-0000-0000-0000-000000000010',
-             '00000000-0000-0000-0000-000000000001',
-             'started', 'on_node', 'k8s',
-             $2, NOW() - INTERVAL '1 hour', 1
-         )"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(node)
-    .execute(&db.pool)
-    .await?;
-
-    for (residency, want_active) in [
-        (ResidencyEvidence::NodeCensusAware, 0),
-        (ResidencyEvidence::LifecycleOnly, 1),
-    ] {
-        let mut tx = db.pool.begin().await?;
-        let occ = sandbox_occupancy_for_node_in_tx(&mut tx, node, residency).await?;
-        tx.commit().await?;
-        assert_eq!(
-            occ.active, want_active,
-            "{residency}: a census-absent row must be discounted here exactly as \
-             the drain gate discounts it, or `:terminate` refuses a node the \
-             drain gate already released"
-        );
-    }
     Ok(())
 }
 

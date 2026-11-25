@@ -1,16 +1,22 @@
 //! Storage for the control-plane Postgres `sandbox_quarantine_state` and
 //! `sandbox_quarantine_history` tables.
 //!
-//! Two parts. The column lists and conflict assignments below are SQL
-//! fragments that the cluster controller's orphaned-sandbox sweep and the
-//! internal API's published-state writer splice into their statements; other
-//! writers of those tables still write their SQL inline. [`active_quarantine`]
-//! and [`quarantine_history`] are the read verbs;
+//! [`active_quarantine`] and [`quarantine_history`] are the read verbs;
 //! [`record_recovered_to_suspended`] and [`delete_quarantine_state`] are the
 //! cluster controller's recovery of an abandoned publication, run in its
-//! transaction under its locks and rechecks. sbx-mgr's SQLite tables of
-//! the same names belong to `pplx-space-sbx-mgr-store`, not here. The fragments
-//! stay here until store functions for these tables replace them.
+//! transaction under its locks and rechecks. Two modules hold the writes
+//! that enter quarantine, each named for the path that issues them:
+//! [`orphan_quarantine`], the cluster controller's orphaned-sandbox sweep,
+//! and [`published_quarantine`], the internal API's published-state writer.
+//! Other writers of these tables still write their SQL inline. sbx-mgr's
+//! SQLite tables of the same names belong to `pplx-space-sbx-mgr-store`, not
+//! here.
+//!
+//! [`locks`] holds episode-only locks callers take on their transaction, and
+//! [`node_recovery_receipt`] the internal API's guarded retirement of an
+//! episode a node recovered. The internal API's pause-failed recovery locks
+//! episodes together with their `sandboxes` rows in one statement, in
+//! `pplx-space-sandbox-store`'s `quarantine_publication` module.
 
 use pplx_space_accounts::NodeId;
 use pplx_space_sandbox_model::SandboxId;
@@ -19,6 +25,11 @@ use pplx_space_sql_locator::sql;
 use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+pub mod locks;
+pub mod node_recovery_receipt;
+pub mod orphan_quarantine;
+pub mod published_quarantine;
 
 /// A sandbox's open quarantine episode, from `sandbox_quarantine_state`.
 ///
@@ -153,52 +164,6 @@ pub async fn delete_quarantine_state(
     .execute(executor)
     .await?;
     Ok(result.rows_affected() > 0)
-}
-
-pub fn quarantine_state_insert_columns() -> &'static str {
-    "sandbox_id,
-     quarantine_id,
-     entered_at,
-     updated_at,
-     entered_from_lifecycle,
-     source,
-     reason_code,
-     reason_message,
-     evidence,
-     next_action,
-     last_observed_node_id"
-}
-
-pub fn quarantine_state_conflict_assignments() -> &'static str {
-    "quarantine_id = EXCLUDED.quarantine_id,
-     entered_at = EXCLUDED.entered_at,
-     updated_at = EXCLUDED.updated_at,
-     entered_from_lifecycle = EXCLUDED.entered_from_lifecycle,
-     source = EXCLUDED.source,
-     reason_code = EXCLUDED.reason_code,
-     reason_message = EXCLUDED.reason_message,
-     evidence = EXCLUDED.evidence,
-     next_action = EXCLUDED.next_action,
-     next_action_after = NULL,
-     next_action_owner = NULL,
-     attempt_count = 0,
-     claim_token = NULL,
-     claim_expires_at = NULL,
-     last_error = NULL,
-     last_observed_node_id = EXCLUDED.last_observed_node_id"
-}
-
-pub fn quarantine_history_insert_columns() -> &'static str {
-    "id,
-     quarantine_id,
-     sandbox_id,
-     occurred_at,
-     source,
-     action,
-     reason_code,
-     message,
-     next_action,
-     evidence"
 }
 
 #[cfg(test)]

@@ -4,125 +4,82 @@
 //! state-machine, and audit logging; the SQL strings, row structs, and
 //! transaction-bound helpers live here.
 
+#[cfg(test)]
 use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
 use pplx_space_accounts::NodeId;
 use pplx_space_admin_protocol::{
     AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters,
 };
 use pplx_space_node_execution_inventory_store::InstallationGuestRow;
-use pplx_space_node_model::{
-    NodeAddress, NodeDrain, NodeDrainMode, NodeDrainPhase, NodeGroupId, NodeManagedBy, NodeRole,
-};
+use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase};
+use pplx_space_node_registration_store::direct;
 use pplx_space_node_registration_store::drain_reads::{self, NodeDrainColumns};
 use pplx_space_node_registration_store::drain_write::{self, DrainColumnsUpdate};
 use pplx_space_sandbox_model::SandboxId;
 #[cfg(test)]
 use pplx_space_sandbox_portability::drain_gate_blocker_pairs;
-use pplx_space_sandbox_portability::{
-    drain_gate_blockers_for_node, inflight_suspend_upload_exists,
-    snapshot_durable_for_source_release,
-};
-use pplx_space_sandbox_residency::{ResidencyEvidence, active_resident_predicate};
+#[cfg(test)]
+use pplx_space_sandbox_portability::snapshot_durable_for_source_release;
+use pplx_space_sandbox_residency::ResidencyEvidence;
 #[cfg(test)]
 use pplx_space_sandbox_residency::{
     node_heartbeat_fresh, non_resident_lifecycle_exclusion, occupies_node_predicate,
     resident_lifecycle,
 };
-use pplx_space_sandbox_store::admin_occupancy;
+use pplx_space_sandbox_store::{admin_occupancy, node_placements};
 use serde::Serialize;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use time::OffsetDateTime;
-use uuid::Uuid;
+
+/// The admin node row with api's node health types for its JSON columns.
+pub(super) type AdminNodeRow =
+    direct::AdminNodeRow<Vec<AdminNodeServiceHealth>, AdminNodeCtlStatus>;
 
 #[cfg(test)]
 mod fleet_occupancy;
 #[cfg(test)]
 mod single_node_occupancy;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct AdminNodeRow {
-    pub(super) id: NodeId,
-    pub(super) name: Option<String>,
-    pub(super) address: Option<NodeAddress>,
-    pub(super) node_api_endpoint: Option<String>,
-    pub(super) role: NodeRole,
-    pub(super) managed_by: NodeManagedBy,
-    pub(super) state: Option<String>,
-    pub(super) scheduling_status: Option<String>,
-    pub(super) scheduling_reason: Option<String>,
-    pub(super) status_stale_after: Option<OffsetDateTime>,
-    pub(super) status_reachable: Option<bool>,
-    pub(super) status_error: Option<String>,
-    pub(super) status_role: Option<String>,
-    pub(super) status_node_id_reported: Option<String>,
-    pub(super) network_slots_ready: Option<i32>,
-    pub(super) network_pool_min_ready: Option<i32>,
-    pub(super) network_slots_degraded: Option<i32>,
-    pub(super) network_slots_quarantined: Option<i32>,
-    pub(super) network_slots_total: Option<i32>,
-    pub(super) network_slots_leased: Option<i32>,
-    pub(super) network_pool_max_slots: Option<i32>,
-    pub(super) drain_phase: Option<String>,
-    /// Raw column value, not a decoded [`NodeDrainMode`]: a typed decode fails
-    /// the whole row on a value this build does not recognize, which would turn
-    /// one bad column into a 500 for the entire node listing. Callers resolve
-    /// it through `NodeDrainMode::from_column_str`.
-    pub(super) drain_mode: Option<String>,
-    pub(super) drain_started_at: Option<OffsetDateTime>,
-    pub(super) drain_last_error: Option<String>,
-    pub(super) terminate_decrement_capacity: bool,
-    pub(super) node_group_id: Option<NodeGroupId>,
-    pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
-    pub(super) last_heartbeat: Option<OffsetDateTime>,
-    pub(super) status_observed_at: Option<OffsetDateTime>,
-    // Decode diagnostics after reading the row: unknown policy schemas must
-    // not prevent node inspection or the lock used by administrative actions.
-    pub(super) execution_policy: Option<sqlx::types::Json<serde_json::Value>>,
-    pub(super) execution_policy_received_at: Option<OffsetDateTime>,
-    pub(super) execution_inventory_status: Option<String>,
-    pub(super) execution_inventory_received_at: Option<OffsetDateTime>,
-    pub(super) status_health_healthy: Option<bool>,
-    pub(super) status_services: Option<sqlx::types::Json<Vec<AdminNodeServiceHealth>>>,
-    pub(super) status_node_ctl: Option<sqlx::types::Json<AdminNodeCtlStatus>>,
-    pub(super) created_at: OffsetDateTime,
-    pub(super) updated_at: Option<OffsetDateTime>,
-    pub(super) deleted_at: Option<OffsetDateTime>,
-    pub(super) substrate_node_id: Option<String>,
-}
-
-impl AdminNodeRow {
-    /// The node's published execution policy and its receipt time. `None`
-    /// when the node published none, or published one this build can't
-    /// decode: that withholds the policy evidence rather than failing the
-    /// node read.
-    pub(super) fn execution_policy(
-        &self,
-    ) -> Option<(
-        pplx_space_execution_spec::ExecutionPolicyObservation,
-        Option<OffsetDateTime>,
-    )> {
-        let value = self.execution_policy.as_ref()?;
-        match serde_json::from_value(value.0.clone()) {
-            Ok(policy) => Some((policy, self.execution_policy_received_at)),
-            Err(error) => {
-                tracing::warn!(node_id = %self.id, %error, "invalid stored execution policy; withholding policy evidence");
-                None
-            }
+/// The node's published execution policy and its receipt time. `None` when
+/// the node published none, or published one this build can't decode: that
+/// withholds the policy evidence rather than failing the node read.
+pub(super) fn execution_policy(
+    row: &AdminNodeRow,
+) -> Option<(
+    pplx_space_execution_spec::ExecutionPolicyObservation,
+    Option<OffsetDateTime>,
+)> {
+    let value = row.execution_policy.as_ref()?;
+    match serde_json::from_value(value.0.clone()) {
+        Ok(policy) => Some((policy, row.execution_policy_received_at)),
+        Err(error) => {
+            tracing::warn!(node_id = %row.id, %error, "invalid stored execution policy; withholding policy evidence");
+            None
         }
     }
 }
 
 /// Placement rows attributed to the selected node, without durability accounting.
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 pub(super) struct NodeSandboxRow {
     pub(super) id: SandboxId,
     pub(super) lifecycle: String,
     pub(super) active_node_id: Option<NodeId>,
     pub(super) target_node_id: Option<NodeId>,
+}
+
+impl From<node_placements::NodePlacementRow> for NodeSandboxRow {
+    fn from(row: node_placements::NodePlacementRow) -> Self {
+        Self {
+            id: row.id,
+            lifecycle: row.lifecycle.as_str().to_owned(),
+            active_node_id: row.active_node_id,
+            target_node_id: row.target_node_id,
+        }
+    }
 }
 
 /// Both occupancy counts that the admin response surfaces:
@@ -140,27 +97,7 @@ pub(super) struct SandboxOccupancy {
     pub(super) local_snapshots: i64,
 }
 
-/// What the `:terminate` guard counts, kept separate from
-/// [`SandboxOccupancy`] on purpose.
-///
-/// The two are produced by different statements for different jobs.
-/// `SandboxOccupancy` is what the node *listing* reports, and its
-/// `local_snapshots` is a diagnostic an operator reads. This one is what the
-/// 409 is *decided* on, and its second term is the shared node-drain gate
-/// (`drain_gate_blockers_for_node`) so the endpoint and the reconciler cannot
-/// disagree about whether a node is safe to terminate.
-///
-/// Sharing one struct would have forced one meaning on both, and the
-/// meanings are genuinely different — see the comment on the statement.
-#[derive(Debug)]
-pub(super) struct TerminateOccupancy {
-    pub(super) active: i64,
-    /// Rows the node-drain gate counts against this node. Named for what it
-    /// is rather than for the field it replaced: it is not a count of local
-    /// snapshots and reading it as one is how the previous divergence went
-    /// unnoticed.
-    pub(super) drain_blockers: i64,
-}
+pub(super) use pplx_space_sandbox_store::admin_occupancy::TerminateOccupancy;
 
 /// The lifecycle scope of the `active` occupancy count: everything that has
 /// neither terminated (`failed` / `deleted`) nor migrated off the node
@@ -338,55 +275,10 @@ fn long_runner_age_secs(age: Duration) -> i64 {
         .expect("clamped to MAX_LONG_RUNNER_AGE, which fits in i64")
 }
 
-const ADMIN_NODE_SELECT: &str = "SELECT n.id,
-       nd.name,
-       host(n.address) AS address,
-       nd.node_api_endpoint,
-       n.role,
-       n.managed_by,
-       n.state,
-       nss.scheduling_status,
-       nss.scheduling_reason,
-       nss.stale_after AS status_stale_after,
-       nss.reachable AS status_reachable,
-       nss.error AS status_error,
-       nss.role AS status_role,
-       nss.node_id_reported AS status_node_id_reported,
-       nss.network_slots_ready,
-       nss.network_pool_min_ready,
-       nss.network_slots_degraded,
-       nss.network_slots_quarantined,
-       nss.network_slots_total,
-       nss.network_slots_leased,
-       nss.network_pool_max_slots,
-       n.drain_phase,
-       n.drain_mode,
-       n.drain_started_at,
-       n.drain_last_error,
-       n.terminate_decrement_capacity,
-       n.node_group_id,
-       nd.metadata,
-       n.last_heartbeat,
-       nss.observed_at AS status_observed_at,
-       nss.execution_policy,
-       nss.execution_policy_received_at,
-       nss.execution_inventory_status,
-       nss.execution_inventory_received_at,
-       nss.health_healthy AS status_health_healthy,
-       nss.services AS status_services,
-       nss.node_ctl AS status_node_ctl,
-       n.created_at,
-       nd.updated_at,
-       nd.deleted_at,
-       nk.k8s_node_name AS substrate_node_id
-FROM nodes n
-LEFT JOIN node_direct nd ON nd.node_id = n.id
-LEFT JOIN node_k8s nk ON nk.node_id = n.id
-LEFT JOIN node_status_snapshots nss ON nss.node_id = n.id";
-
-/// Pool-bound repository for admin node queries. Operations that need their
-/// own transaction (locking + writing under `FOR UPDATE`) live as free
-/// functions below, since a `Transaction` cannot be held inside `&self`.
+/// Pool-bound repository for admin node queries. Operations that run in the
+/// caller's transaction (the writes made under [`direct::lock_admin_node`]'s
+/// row lock) live as free functions below, since a `Transaction` cannot be
+/// held inside `&self`.
 #[derive(Clone)]
 pub(super) struct AdminNodeStore {
     pool: PgPool,
@@ -397,74 +289,48 @@ impl AdminNodeStore {
         Self { pool }
     }
 
-    /// Each branch filters on one indexed placement column and returns at most
-    /// one page. UNION deduplicates rows active and targeted on the same node.
+    /// The node's placement rows by id, unfiltered:
+    /// [`node_placements::list_by_id`] with an empty filter.
     pub(super) async fn list_sandboxes(
         &self,
         node_id: NodeId,
         after: Option<SandboxId>,
         limit: i64,
     ) -> Result<Vec<NodeSandboxRow>, sqlx::Error> {
-        sqlx::query_as(sql!(
-            "SELECT id, lifecycle, active_node_id, target_node_id FROM (
-                (SELECT id, lifecycle, active_node_id, target_node_id
-                 FROM sandboxes
-                 WHERE active_node_id = $1 AND id > $2
-                 ORDER BY id LIMIT $3)
-                UNION
-                (SELECT id, lifecycle, active_node_id, target_node_id
-                 FROM sandboxes
-                 WHERE target_node_id = $1 AND id > $2
-                 ORDER BY id LIMIT $3)
-             ) node_sandboxes ORDER BY id LIMIT $3"
-        ))
-        .bind(node_id)
-        .bind(after.map(|id| id.as_uuid()).unwrap_or(Uuid::nil()))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
+        let rows = node_placements::list_by_id(
+            &self.pool,
+            node_id,
+            &node_placements::NodePlacementFilter::default(),
+            after,
+            limit,
+        )
+        .await?;
+        Ok(rows.into_iter().map(NodeSandboxRow::from).collect())
     }
 
+    /// The node's admin row: [`direct::admin_node`].
     pub(super) async fn fetch(&self, node_id: NodeId) -> Result<Option<AdminNodeRow>, sqlx::Error> {
-        sqlx::query_as::<_, AdminNodeRow>(sqlx::AssertSqlSafe(sql!(format!(
-            "{ADMIN_NODE_SELECT}\nWHERE n.id = $1"
-        ))))
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await
+        direct::admin_node(&self.pool, node_id).await
     }
 
+    /// The admin rows matching `filters`: [`direct::list_admin_nodes`].
     pub(super) async fn list(
         &self,
         filters: &ListAdminNodesFilters,
     ) -> Result<Vec<AdminNodeRow>, sqlx::Error> {
-        // Three filterable axes layered onto the base SELECT. We bind
-        // sentinels rather than concatenate to keep the prepared-statement
-        // cache useful.
-        let phase_param: Option<String> = match filters.drain_phase.as_deref() {
-            Some("none") => Some(String::new()),
-            Some(other) => Some(other.to_string()),
-            None => None,
+        // Three filterable axes, each bound as a nullable sentinel rather
+        // than concatenated, to keep the prepared-statement cache useful.
+        let phase_param: Option<&str> = match filters.drain_phase.as_deref() {
+            Some("none") => Some(""),
+            other => other,
         };
-        let query = format!(
-            "{ADMIN_NODE_SELECT}\n\
-             WHERE ($1::TEXT IS NULL OR n.role = $1)\n\
-               AND ($2::BOOL OR nd.deleted_at IS NULL)\n\
-               AND (\n\
-                 $3::TEXT IS NULL\n\
-                 OR ($3 = '' AND n.drain_phase IS NULL)\n\
-                 OR n.drain_phase = $3\n\
-               )\n\
-             ORDER BY n.role ASC,\n\
-                      COALESCE(nd.name, nk.k8s_node_name) ASC NULLS LAST,\n\
-                      nd.node_api_endpoint ASC NULLS LAST"
-        );
-        sqlx::query_as::<_, AdminNodeRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(filters.role.as_deref())
-            .bind(filters.include_deleted)
-            .bind(phase_param)
-            .fetch_all(&self.pool)
-            .await
+        direct::list_admin_nodes(
+            &self.pool,
+            filters.role.as_deref(),
+            filters.include_deleted,
+            phase_param,
+        )
+        .await
     }
 
     /// The runtime installations each of `node_ids` last reported, one row
@@ -605,7 +471,7 @@ impl AdminNodeStore {
         // quarantine preserves the hot-node association for later inspection.
         //
         // Deliberately **not** census-aware, unlike the `:terminate` guard in
-        // `sandbox_occupancy_for_node_in_tx`. This scan is multi-node
+        // `admin_occupancy::terminate_occupancy`. This scan is multi-node
         // (`ANY($1::UUID[])`), so the discount's node expression would have to be
         // the per-row `active_node_id` column rather than a bound parameter —
         // the shape `sandbox_residency::node_heartbeat_fresh` documents as
@@ -862,302 +728,6 @@ impl AdminNodeStore {
     }
 }
 
-/// `SELECT ... FOR UPDATE OF n` — admin handlers lock the row for the duration
-/// of the validate + write window so two operators cannot race transitions.
-pub(super) async fn lock_node_for_update(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-) -> Result<Option<AdminNodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, AdminNodeRow>(sqlx::AssertSqlSafe(sql!(format!(
-        "{ADMIN_NODE_SELECT}\nWHERE n.id = $1\nFOR UPDATE OF n"
-    ))))
-    .bind(node_id)
-    .fetch_optional(&mut **tx)
-    .await
-}
-
-/// In-transaction occupancy lookup used by the `:terminate` guard so the
-/// strand-risk count is observed under the same `FOR UPDATE` lock as the
-/// drain-phase write.
-pub(super) async fn sandbox_occupancy_for_node_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: NodeId,
-    residency: ResidencyEvidence,
-) -> Result<TerminateOccupancy, sqlx::Error> {
-    // Both properties the hand-written predicate used to provide are now
-    // properties of the shared gate, so they are asserted there rather than
-    // restated here: an evacuation-marked sandbox blocks until its newest
-    // full snapshot is `ready` (`snapshot_durable_for_source_release`), and a
-    // suspend upload still in flight *from* this node blocks even when the
-    // sandbox's `target_node_id` has since drifted elsewhere — the gate's
-    // second arm drives from `snapshots.source_node_id` precisely so that
-    // drift cannot hide it. Terminating mid-upload kills the worker holding
-    // the only durable copy.
-    //
-    // Quarantined sandboxes remain active placement blockers by design:
-    // quarantine preserves the hot-node association until a quarantine-aware
-    // release or cleanup path decides it is safe to drop.
-    // `active` routes through the shared `active_resident_predicate` rather than
-    // through this module's `active_occupancy_lifecycles`. The two agree on the
-    // exclusion list — the helper is exactly that list — but the shared
-    // predicate also carries `active_node_id = $1` and, load-bearing here, the
-    // census term. So this guard counts exactly the rows node-drain's
-    // `draining → drained` gate and `mark_terminating_query` count.
-    //
-    // The census term is why: this endpoint now *refuses* on `active`, and
-    // `space-rollout-mng.py` drives it automatically. Without the discount, a
-    // worker whose own census disproves its phantom `active_node_id` rows
-    // clears the census-aware drain gate, reaches `drained`, and would then be
-    // refused here forever wherever `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` is
-    // on. `$1` is a bound parameter, which is the shape that keeps the heartbeat
-    // subquery a once-per-execution InitPlan.
-    let active = active_resident_predicate("sandboxes", "$1", residency);
-    // The second count is `drain_gate_blockers_for_node`, not a third
-    // hand-written gate. Two things change by routing it here.
-    //
-    // **It stops disagreeing with the reconciler.** The previous predicate
-    // counted `lifecycle = 'suspended'` only, so a `suspending` row, or a
-    // non-evacuation `restoring` row, pinned to the node by `target_node_id`
-    // was invisible to it. When such a row's `active_node_id` is NULL, the
-    // `active` half, which keys on `active_node_id`, cannot see it either; an
-    // in-flight user restore of a suspended sandbox is the common case. The
-    // node-drain gate counts those rows (`drain_gate_target_pinned_blocks`),
-    // so `:terminate` would accept a `drained` node that had picked up such a
-    // row since it drained, one the gate would hold, and `space-rollout-mng.py`
-    // drives that endpoint unattended.
-    //
-    // **It stops scanning the table.** The old statement had no `WHERE` at
-    // all — the node predicates lived inside the `FILTER`s — so both counts
-    // were paid over the whole `sandboxes` table on every `:terminate`. Each
-    // count is now its own node-scoped subquery.
-    //
-    // What this deliberately does *not* do is redefine the listing's
-    // `local_snapshots`. That number is reported, not gated on, and it and
-    // `drain_blockers` legitimately differ — the listing's in-flight branch
-    // inlines the legacy freshness gate while the blocker fragment takes the
-    // artifact-exact arm (see
-    // `live_residents_tests::an_artifact_mismatched_inflight_upload_counts_the_sandbox_once`).
-    // Collapsing the reported count into the gate would erase a distinction
-    // an operator reading the listing may need; collapsing the *decision*
-    // into the gate is the whole point.
-    let blockers = drain_gate_blockers_for_node("$1");
-    let query = format!(
-        "SELECT
-     (SELECT COUNT(*)::BIGINT FROM sandboxes WHERE {active}) AS active,
-     (SELECT COUNT(*)::BIGINT FROM (
-{blockers}
-          ) gate_blockers) AS drain_blockers"
-    );
-    let row: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    Ok(TerminateOccupancy {
-        active: row.0,
-        drain_blockers: row.1,
-    })
-}
-
-/// `$1` = node id. Suspended sandboxes whose `target_node_id` points at this
-/// node and whose snapshot has not yet been registered to S3, as the lowest
-/// `limit` sandbox ids. Used by the `:force-upload-local-snapshots` admin
-/// handler to enumerate the sandboxes that still need a durable upload before
-/// the source node can terminate.
-///
-/// Built as a `String` rather than issued here so the plan-structure regression
-/// in `pinned_local_only_plan_tests` can `EXPLAIN` the statement body the
-/// handler runs — `sql!` prepends a locator comment to it, which changes no
-/// plan. `sql!` stays at the query site in
-/// [`list_pinned_local_only_sandboxes`], so this statement keeps its own
-/// call-site locator instead of collapsing onto a shared one.
-///
-/// The caller passes `limit = enumeration_cap + 1` so a returned slice
-/// of length `enumeration_cap + 1` is the unambiguous "more pinned
-/// sandboxes exist beyond what's listed" signal — the handler trims
-/// the sentinel row and surfaces `truncated: true` to the operator.
-/// This bounds DB transfer and JSON response size to O(1) regardless
-/// of how big the node's pinned-list actually is.
-///
-/// ## The page is the ascending-id prefix, and that is a contract
-///
-/// `ORDER BY s.id` makes the page stable across re-invocations: the handler
-/// slices `to_process` from the head and the `deferred` tail in Rust, so a
-/// non-deterministic row order would publish a `deferred[]` array that is a
-/// sample rather than the work the next call picks up.
-///
-/// A head that keeps failing therefore keeps being retried while the rows
-/// behind it wait. That residual is deliberate and it is loud rather than
-/// silent — the same ids come back in `failed[]` and the same `deferred[]` on
-/// every call. Reshuffling the page so a stuck sandbox is eventually skipped
-/// would hide it instead.
-///
-/// ## What makes the ordering cheap
-///
-/// `idx_sandboxes_target_node_ordered` covers `(target_node_id, id)`. The equality
-/// on `$1` fixes the leading column, so the scan emits the node's rows already
-/// ordered by `id`: the ordering needs no `Sort`, and the `LIMIT` stops at the
-/// page size. Work is bounded by the node's own pinned history — which is the
-/// question being asked — rather than by the table.
-///
-/// The index makes that plan available; the predicate's shape keeps the
-/// planner on it. Written as two bare conjuncts, the probes can be pulled up
-/// into a join-driven plan that reads the whole table even with this index
-/// present, and on the test fixture a generic plan does exactly that. The
-/// `CASE` and the scalar-subquery fences below each rule that plan out.
-///
-/// The planner may still pick the narrow `idx_sandboxes_target_node` plus a
-/// sort when the table is small enough that the two cost the same. That plan
-/// is node-bounded too, which is the property that matters, so the sort's
-/// absence is the common case rather than an invariant.
-///
-/// Without that index the planner takes the ordering from the primary key's
-/// own index instead, expecting the `LIMIT` to stop early. For a node whose
-/// non-durable set is empty there is nothing to stop early on, so that plan
-/// filters the whole table and runs past the 10 s admin-handler budget. Empty
-/// is the ordinary answer here: it is what an operator gets once the backlog
-/// has cleared, and it was the true answer on the node whose forced drain this
-/// query family stalled.
-///
-/// ## Why both probes are wrapped in scalar subqueries
-///
-/// The `CASE` described below already keeps both checks out of reach of
-/// sublink pull-up, which Postgres applies only to a top-level `WHERE` or
-/// `JOIN … ON` conjunct, including a top-level `NOT` directly over an
-/// `EXISTS`. The fences are a second guard for the conjunct form: if the
-/// predicate is ever written as conjuncts, they keep the plan this
-/// section describes. The rest of the section is about that form.
-///
-/// `(SELECT {snapshot_exists})` rather than a bare `{snapshot_exists}`, and
-/// the same for the in-flight check. The two forms are identical in truth —
-/// `EXISTS` yields a non-NULL boolean and the scalar subquery returns exactly
-/// one row — but as a top-level conjunct the bare sublink is *pullable*:
-/// Postgres may realise it as a nested loop, a hash anti-join, or a merge
-/// anti-join over the whole `snapshots` ⋈
-/// `snapshot_storage_locations` product. A nested loop keeps the work bounded
-/// to the requested sandboxes. Inside a scalar subquery it cannot be pulled up
-/// at all, so it is always a per-row `SubPlan` whose own `sn.sandbox_id = s.id`
-/// makes each execution a `sandbox_id`-keyed index probe.
-///
-/// The node-drain twin fences the same predicate for the same reason. Updated
-/// statistics can otherwise make a merge anti-join cheaper in the planner's
-/// estimate without any query change. The fence removes that alternative.
-///
-/// The in-flight check is fenced for the same reason, and here this statement
-/// departs from its node-drain twin, which leaves that check bare. Bare, it is
-/// the planner's cost choice. It can read the cluster's `state='creating'` full
-/// snapshots once and anti-join against them, which is cheap, but the
-/// node-ordered scan beneath it also makes a merge anti-join
-/// along `idx_snapshots_sandbox_id` available, and that one walks every
-/// snapshot whose sandbox id sorts below the page, whichever node owns it.
-/// Fenced, each execution is correlated on the one sandbox being asked about.
-/// That doesn't make each execution cheap. Which index serves it is still a
-/// cost choice: the test fixtures' plans use a scan keyed on
-/// `idx_snapshots_sandbox_id`, but a planner that overestimates how many
-/// snapshots a sandbox has can instead `BitmapAnd` that index with
-/// `idx_snapshots_state_type`, whose side reads the cluster's whole in-flight
-/// set on every execution. The test fixture doesn't reproduce that plan, and
-/// the plan tests' read counts don't include a bitmap index scan's reads,
-/// which is why they also bound how often the check runs. The fence bounds which
-/// sandboxes the check is about; the evaluation order below bounds how often
-/// it runs.
-///
-/// ## Why the in-flight check sits in a `CASE` branch
-///
-/// `CASE WHEN (SELECT {snapshot_exists}) THEN false ELSE NOT (SELECT
-/// {inflight_upload}) END` rather than two `AND NOT` conjuncts. The two forms
-/// are identical in truth, since neither scalar subquery can yield NULL. But
-/// Postgres orders the conjuncts of a filter by its own cost estimate, so it's
-/// free to evaluate the in-flight check first, on every suspended row the node
-/// ever pinned. A long-lived node's pinned history is almost entirely durable,
-/// so that order runs the check once per row of history. Under the bitmap plan
-/// above, each of those executions also passes over the in-flight set, and the
-/// statement's cost becomes history × in-flight set.
-///
-/// Postgres documents that a `CASE` evaluates only the subexpressions needed
-/// to determine its result, in order, so the in-flight check runs only for
-/// rows the durability check didn't exclude. That's the node's backlog, which
-/// is what an operator came to drain, and it holds whichever plan the planner
-/// picks for the check itself. Postgres calls the rule not ironclad and names
-/// constant subexpressions folded at planning time and aggregates as the
-/// cases that break it. Neither applies: both conditions read the row.
-///
-/// The fixed order has a cost of its own: the durability check runs on
-/// every suspended row, including those the in-flight check alone would have
-/// excluded. That cost is bounded by the node's rows, and each execution has
-/// an index that fits it exactly: `idx_snapshots_sandbox_ready_latest_covering`
-/// is keyed on `sandbox_id` with the probe's own `state = 'ready' AND type =
-/// 'full'` as its predicate, and it serves the probe in every plan the tests
-/// measure. `snapshot_scans_stay_within_the_nodes_snapshots` and
-/// `inflight_check_runs_only_for_non_durable_rows` both bound its reads per
-/// scan; only the first bounds the in-flight check's the same way.
-///
-/// ## Why `limit` is a literal
-///
-/// `limit` is interpolated as a literal rather than bound. `LIMIT $2` is not
-/// a constant when Postgres builds a *generic* plan, so there is no
-/// `tuple_fraction` to apply and the planner loses the low-startup bias the
-/// cap exists to buy — and sqlx prepares every statement, so the plan cache
-/// decides which kind of plan this gets. The value is an in-process
-/// constant, never operator-supplied, and `NonZeroUsize` renders as digits.
-///
-/// ## What the predicates mean
-///
-/// Routes through the shared marker-aware
-/// [`snapshot_durable_for_source_release`] fragment so the "still needs a
-/// durable upload" predicate here matches the admin occupancy counters and the
-/// node-drain drain-blocker / terminator source-release guards exactly —
-/// drifting them produces a node the counter says is stuck while the handler
-/// enumerates nothing (or vice versa). An evacuation-marked sandbox whose
-/// newest snapshot is already `ready` is **not** enumerated (it needs no
-/// further upload), even if a failed-restore placement bump made it
-/// non-placement-fresh. (The API drain-gate bypass and restore-affinity hint
-/// answer a different question — user-op admission and placement — and keep the
-/// freshness predicate; they are intentionally not source-release guards.)
-///
-/// This is deliberately the authoritative predicate rather than the per-node
-/// backup-pending queue the drain reconciler consumes. The endpoint exists to
-/// rescue what the automated path missed, so reading the derived state it
-/// exists to rescue would make exactly the situation an operator reaches for it
-/// in the situation it cannot fix. Keeping the two definitions separate also
-/// makes this a drift oracle against that queue.
-///
-/// Excludes sandboxes whose durable upload is already in flight from any node
-/// (`NOT inflight_suspend_upload_exists`), mirroring the node-drain reupload
-/// queue (`node_drain::store::pinned_local_only_sandboxes_query`):
-/// force-reuploading a sandbox
-/// whose original upload is still `creating` is redundant and racy, and a
-/// resulting newer `failed` snapshot would make `latest_full_snapshot_ready`
-/// stop seeing the in-flight upload and could strand an evacuation restore.
-fn pinned_local_only_sandboxes_query(limit: NonZeroUsize) -> String {
-    let snapshot_exists = snapshot_durable_for_source_release("s");
-    let inflight_upload = inflight_suspend_upload_exists("s");
-    format!(
-        "SELECT s.id
-           FROM sandboxes s
-          WHERE s.target_node_id = $1
-            AND s.lifecycle = 'suspended'
-            AND CASE WHEN (SELECT {snapshot_exists}) THEN false
-                     ELSE NOT (SELECT {inflight_upload}) END
-          ORDER BY s.id
-          LIMIT {limit}"
-    )
-}
-
-/// List up to `limit` suspended sandboxes on this node that still need a
-/// durable upload, lowest sandbox id first. See
-/// [`pinned_local_only_sandboxes_query`] for the statement and its contract.
-pub(super) async fn list_pinned_local_only_sandboxes(
-    pool: &PgPool,
-    node_id: NodeId,
-    limit: NonZeroUsize,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
-    let query = sql!(pinned_local_only_sandboxes_query(limit));
-    sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(query))
-        .bind(node_id)
-        .fetch_all(pool)
-        .await
-}
-
 /// `true` if the user-API drain gate is currently refusing
 /// `start`/`wake`/`resume`/`restore` for sandboxes pinned to this node.
 ///
@@ -1171,7 +741,8 @@ pub(super) async fn list_pinned_local_only_sandboxes(
 /// serving user traffic by design. Reading the phase alone here would let an
 /// `:undrain` + gentle `:drain` landing mid-fan-out look like the safe regime it
 /// isn't, which is the whole failure this re-check exists to prevent. Resolved
-/// through the same [`NodeDrain::blocks_placement`] the gate itself uses.
+/// through the same [`NodeDrain::refuses_activations`] the gate itself uses,
+/// from the node's shared drain columns.
 pub(super) async fn is_node_wake_gate_closed(
     pool: &PgPool,
     node_id: NodeId,
@@ -1179,6 +750,7 @@ pub(super) async fn is_node_wake_gate_closed(
     let Some(NodeDrainColumns {
         drain_phase,
         drain_mode,
+        drain_engine,
     }) = drain_reads::drain_columns(pool, node_id).await?
     else {
         return Ok(false);
@@ -1194,8 +766,19 @@ pub(super) async fn is_node_wake_gate_closed(
             index: "0".to_owned(),
             source: source.into(),
         })?;
-    Ok(NodeDrain::from_v1_columns(phase, drain_mode.as_deref())
-        .is_some_and(NodeDrain::blocks_placement))
+    // So does an engine this build doesn't know, on column 2, the engine's
+    // position: this build is the old replica relative to any newer engine.
+    match NodeDrain::from_columns(
+        drain_engine.as_deref(),
+        phase.map(NodeDrainPhase::as_str),
+        drain_mode.as_deref(),
+    ) {
+        Some(NodeDrain::Unknown) => Err(sqlx::Error::ColumnDecode {
+            index: "2".to_owned(),
+            source: format!("unrecognized drain engine {drain_engine:?}").into(),
+        }),
+        drain => Ok(drain.is_some_and(NodeDrain::refuses_activations)),
+    }
 }
 
 /// The in-place update for a node that is already `draining`: rewrite
@@ -1349,13 +932,6 @@ mod live_residents_tests;
 mod in_flight_drain_tests;
 #[cfg(test)]
 mod node_holds_agreement_tests;
-/// Postgres-backed plan-structure and page-shape regression for the
-/// `:force-upload-local-snapshots` enumeration: the scan stays bounded by the
-/// node's own pinned history rather than the fleet, the in-flight probe runs
-/// only for non-durable rows, and the page stays the ascending-id prefix the
-/// handler's `deferred[]` tail depends on.
-#[cfg(test)]
-mod pinned_local_only_plan_tests;
 /// The `:terminate` guard and the node-drain gate must count the same rows.
 /// Postgres-backed, and each case also shows the pre-change guard disagreed —
 /// otherwise the agreement proves nothing.

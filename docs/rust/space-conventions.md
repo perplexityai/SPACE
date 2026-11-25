@@ -179,9 +179,8 @@ sqlx::query_scalar::<_, NodeId>(sql!(
 The statement stays syntactically whole, as the store rules require: new code
 writes whole statements with bound values, not fragments around the value.
 The failed-restorable repair guard builder
-(`failed_repair_row_state_guards` in
-`crates/l30_storage/sandbox/store/src/repair.rs`, public only because the cluster
-controller's candidate scan composes it) and the shared
+(`failed_repair_row_state_guards`, private to
+`crates/l30_storage/sandbox/store/src/repair.rs`) and the shared
 `routable_execution_or_non_k8s` routability fragment
 (`crates/l30_storage/sandbox/routability/src/lib.rs`) take their placeholder as an
 argument only because they are existing fragments; they are not a pattern for

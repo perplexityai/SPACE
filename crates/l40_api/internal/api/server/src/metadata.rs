@@ -25,13 +25,6 @@ pub(super) struct TemplateRow {
     pub(super) network_policy_generation: i64,
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplatePolicyRow {
-    pub(super) template: String,
-    pub(super) network_policy_json: Json<NetworkPolicyV1>,
-    pub(super) network_policy_generation: i64,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct SandboxPolicyRow {
     pub(super) sandbox_id: SandboxId,
@@ -86,44 +79,6 @@ impl TryFrom<pplx_space_sandbox_store::SandboxNetworkPolicyInputs> for SandboxPo
 /// separate `TemplateNetworkPolicyState` lineage, not a sandbox's apply.
 pub(super) fn sandbox_effective_policy_generation(row: &SandboxPolicyRow) -> i64 {
     row.network_policy_generation
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct NodeTemplateBaseSnapshotPolicyRow {
-    pub(super) template: String,
-    pub(super) ensure_base_snapshot: bool,
-    pub(super) snapshot_vcpu: Option<i32>,
-    pub(super) snapshot_memory_mib: Option<i32>,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplateDesiredStateRow {
-    pub(super) template: String,
-    pub(super) desired_state: String,
-    pub(super) default_auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
-    pub(super) pool_target: Option<i32>,
-    pub(super) pool_boot_mode: Option<String>,
-    pub(super) pool_vcpu: Option<i32>,
-    pub(super) pool_memory_mib: Option<i32>,
-    /// The node has a reason to hold the template, so it is answered.
-    pub(super) admitted: bool,
-    /// The node's published inventory lists the template.
-    pub(super) held_here: bool,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct SandboxPortExposureDesiredStateRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) protocol: String,
-    pub(super) guest_port: i32,
-    pub(super) desired_state: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct PortExposureApplyMissRow {
-    pub(super) sandbox_id: SandboxId,
-    pub(super) protocol: String,
-    pub(super) guest_port: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +150,9 @@ pub(super) struct QueuedFacetRefRow {
 /// claim picked the refs: longest queued first, by `requested_at`, then facet
 /// and element. A traceparent shared by several refs takes its first ref's
 /// place.
-pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<String> {
+pub(super) fn claimed_origin_traceparents(
+    rows: &[pplx_space_cluster_trigger_queue::ref_claims::ClaimedReconcileRef],
+) -> Vec<String> {
     let mut picked = rows.iter().collect::<Vec<_>>();
     picked.sort_by(|left, right| {
         (left.requested_at, &left.facet, &left.element).cmp(&(
@@ -212,16 +169,6 @@ pub(super) fn claimed_origin_traceparents(rows: &[ClaimedFacetRefRow]) -> Vec<St
         .filter(|traceparent| seen.insert(*traceparent))
         .map(str::to_string)
         .collect()
-}
-
-/// A claimed ref, its saved trace context, and when it was first queued:
-/// the claim's own ordering key.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct ClaimedFacetRefRow {
-    pub(super) facet: String,
-    pub(super) element: Option<String>,
-    pub(super) traceparent: Option<String>,
-    pub(super) requested_at: time::OffsetDateTime,
 }
 
 pub(super) fn proto_facet(value: ReconcileFacet) -> ProtoReconcileFacet {
@@ -1030,22 +977,6 @@ pub(super) async fn template_visibility(
             visibility_miss(reason, observations)
         }
     }
-}
-
-/// Flat row from the `find_template_release` LEFT JOIN. Storage fields are
-/// `NULL` when a release exists but has no storage locations yet.
-#[derive(Debug, FromRow)]
-pub(super) struct FindTemplateReleaseRow {
-    pub(super) generic_authorized: bool,
-    pub(super) release_id: Uuid,
-    pub(super) release_template_name: String,
-    pub(super) release_type: String,
-    pub(super) release_hash: String,
-    pub(super) release_created_at: OffsetDateTime,
-    pub(super) release_environment: Option<String>,
-    pub(super) storage_id: Option<Uuid>,
-    pub(super) storage_connection_string: Option<String>,
-    pub(super) storage_created_at: Option<OffsetDateTime>,
 }
 
 pub(super) fn trimmed_required(value: &str, field: &str) -> Result<String, Status> {

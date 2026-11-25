@@ -1,4 +1,3 @@
-use pplx_space_sql_locator::sql;
 use std::{collections::HashSet, time::Duration};
 
 use axum::{
@@ -10,12 +9,16 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use pplx_space_accounts::NodeId;
 use pplx_space_bearer_token::SpaceBearerToken;
+use pplx_space_cluster_trigger_queue::enqueue_triggers;
+use pplx_space_direct_coordinator::{DirectNode, DirectNodeRegistration, DirectNodeUpdate};
 use pplx_space_node_api_client::proto::{
     GetNodeInfoRequest, NodeRole as ProtoNodeRole, NodeSource, PullTemplateRequest, TransferSource,
     node_info_client::NodeInfoClient, transfer_source::Source,
 };
 use pplx_space_node_api_client::{BuilderApiClient, NodeApiClient, WorkerApiClient};
 use pplx_space_node_model::{NodeManagedBy, NodeRole, SubstrateKind};
+use pplx_space_node_registration_store::direct::registry as direct_registry;
+use pplx_space_postgres_pool::Db;
 use pplx_space_state_reconciliation::{FACET_NETWORK_POLICY, ReconcileFacet, ReconcileReason};
 use pplx_space_template_mgr_client::proto::{
     DeleteTemplateBuildRequest, DeleteTemplateRequest, TemplateRef,
@@ -32,7 +35,6 @@ use crate::{
         ReconcileRef, enqueue_node_reconcile_refs_and_trigger,
         enqueue_node_reconcile_refs_for_nodes,
     },
-    reconcile_trigger::enqueue_triggers,
     routes::{AppState, admin::support::require_managing_org_admin},
 };
 
@@ -59,6 +61,26 @@ struct NodeRow {
     updated_at: Option<OffsetDateTime>,
     deleted_at: Option<OffsetDateTime>,
     node_name: Option<String>,
+}
+
+impl From<direct_registry::RegistryNodeRow> for NodeRow {
+    fn from(row: direct_registry::RegistryNodeRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            address: row.address,
+            node_api_endpoint: row.node_api_endpoint,
+            role: row.role,
+            managed_by: row.managed_by,
+            state: row.state,
+            metadata: row.metadata,
+            last_heartbeat: row.last_heartbeat,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deleted_at: row.deleted_at,
+            node_name: row.node_name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,6 +190,26 @@ pub(super) fn db_error(err: sqlx::Error) -> (StatusCode, Json<serde_json::Value>
     crate::routes::admin::support::db_error(err)
 }
 
+/// The admin row of a node the registry just wrote, which has no Kubernetes
+/// registration.
+fn registered_row(node: DirectNode) -> NodeRow {
+    NodeRow {
+        id: node.id,
+        name: node.name,
+        address: node.address,
+        node_api_endpoint: Some(node.node_api_endpoint),
+        role: node.role,
+        managed_by: node.managed_by,
+        state: node.state,
+        metadata: Some(sqlx::types::Json(node.metadata)),
+        last_heartbeat: node.last_heartbeat,
+        created_at: node.created_at,
+        updated_at: Some(node.updated_at),
+        deleted_at: node.deleted_at,
+        node_name: None,
+    }
+}
+
 fn node_response(row: NodeRow) -> NodeResponse {
     NodeResponse {
         id: row.id,
@@ -233,28 +275,9 @@ fn inventory_entry_to_row(
 }
 
 async fn fetch_node(pool: &sqlx::PgPool, id: NodeId) -> Result<Option<NodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeRow>(sql!(
-        "SELECT n.id,
-                nd.name,
-                host(n.address) AS address,
-                nd.node_api_endpoint,
-                n.role,
-                n.managed_by,
-                n.state,
-                nd.metadata,
-                n.last_heartbeat,
-                n.created_at,
-                nd.updated_at,
-                nd.deleted_at,
-                nk.k8s_node_name AS node_name
-         FROM nodes n
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         LEFT JOIN node_k8s nk ON nk.node_id = n.id
-         WHERE n.id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await
+    Ok(direct_registry::registry_node(pool, id)
+        .await?
+        .map(NodeRow::from))
 }
 
 async fn fetch_nodes(
@@ -262,33 +285,11 @@ async fn fetch_nodes(
     role: Option<NodeRole>,
     include_deleted: bool,
 ) -> Result<Vec<NodeRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeRow>(sql!(
-        "SELECT n.id,
-                nd.name,
-                host(n.address) AS address,
-                nd.node_api_endpoint,
-                n.role,
-                n.managed_by,
-                n.state,
-                nd.metadata,
-                n.last_heartbeat,
-                n.created_at,
-                nd.updated_at,
-                nd.deleted_at,
-                nk.k8s_node_name AS node_name
-         FROM nodes n
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         LEFT JOIN node_k8s nk ON nk.node_id = n.id
-         WHERE ($1::TEXT IS NULL OR n.role = $1)
-           AND ($2::BOOL OR nd.deleted_at IS NULL)
-         ORDER BY n.role ASC,
-                  COALESCE(nd.name, nk.k8s_node_name) ASC NULLS LAST,
-                  nd.node_api_endpoint ASC NULLS LAST"
-    ))
-    .bind(role.map(NodeRole::as_str))
-    .bind(include_deleted)
-    .fetch_all(pool)
-    .await
+    Ok(direct_registry::registry_nodes(pool, role, include_deleted)
+        .await?
+        .into_iter()
+        .map(NodeRow::from)
+        .collect())
 }
 
 async fn fetch_inventory_nodes(
@@ -375,85 +376,25 @@ pub async fn create_node(
     }
 
     let reuse_deleted_by_endpoint = !req.verify && req.id.is_none();
-    let reactivated = sqlx::query_as::<_, NodeRow>(sql!(
-        "WITH candidate AS (
-           SELECT nd.node_id
-           FROM node_direct nd
-           JOIN nodes n ON n.id = nd.node_id
-           WHERE nd.deleted_at IS NOT NULL
-             AND n.managed_by = $10
-             AND (
-               n.id = $1
-               OR ($8::BOOL AND nd.node_api_endpoint = $6)
-             )
-           ORDER BY (n.id = $1) DESC,
-                    nd.updated_at DESC,
-                    n.created_at DESC,
-                    n.id DESC
-           LIMIT 1
-         ),
-         updated_node AS (
-           UPDATE nodes n
-           SET address = NULLIF($3, '')::INET,
-             role = $4,
-             managed_by = $10,
-             state = COALESCE($5, 'registered'),
-             last_heartbeat = CASE
-                 WHEN $9::BOOL THEN NOW()
-                 ELSE n.last_heartbeat
-             END
-           WHERE n.id = (SELECT node_id FROM candidate)
-           RETURNING n.id,
-                     host(n.address) AS address,
-                     n.role,
-                     n.managed_by,
-                     n.state,
-                     n.last_heartbeat,
-                     n.created_at
-         ),
-         updated_direct AS (
-           UPDATE node_direct nd
-           SET name = $2,
-             node_api_endpoint = $6,
-             metadata = $7,
-             deleted_at = NULL,
-             updated_at = NOW()
-           WHERE nd.node_id = (SELECT id FROM updated_node)
-           RETURNING nd.node_id,
-                     nd.name,
-                     nd.node_api_endpoint,
-                     nd.metadata,
-                     nd.updated_at,
-                     nd.deleted_at
-         )
-         SELECT n.id,
-                d.name,
-                n.address,
-                d.node_api_endpoint,
-                n.role,
-                n.managed_by,
-                n.state,
-                d.metadata,
-                n.last_heartbeat,
-                n.created_at,
-                d.updated_at,
-                d.deleted_at,
-                NULL::TEXT AS node_name
-         FROM updated_node n
-         JOIN updated_direct d ON d.node_id = n.id"
-    ))
-    .bind(node_id)
-    .bind(&req.name)
-    .bind(req.address.as_deref().unwrap_or(""))
-    .bind(role.as_str())
-    .bind(&req.state)
-    .bind(&endpoint)
-    .bind(sqlx::types::Json(&req.metadata))
-    .bind(reuse_deleted_by_endpoint)
-    .bind(req.verify)
-    .bind(REGISTRY_SUBSTRATE)
-    .fetch_optional(&state.pool)
-    .await;
+    let db = Db::from(state.pool.clone());
+    let registration = DirectNodeRegistration {
+        node_id,
+        name: req.name.as_deref(),
+        address: req.address.as_deref(),
+        node_api_endpoint: &endpoint,
+        role,
+        managed_by: REGISTRY_SUBSTRATE,
+        state: req.state.as_deref(),
+        metadata: &req.metadata,
+        stamp_heartbeat: req.verify,
+    };
+    let reactivated = pplx_space_direct_coordinator::reactivate_node(
+        &db,
+        &registration,
+        reuse_deleted_by_endpoint,
+    )
+    .await
+    .map(|node| node.map(registered_row));
 
     match reactivated {
         Ok(Some(row)) => {
@@ -461,73 +402,19 @@ pub async fn create_node(
             return (StatusCode::CREATED, Json(node_response(row))).into_response();
         }
         Ok(None) => {}
-        Err(err) => return db_error(err).into_response(),
+        Err(err) => return db_error(err.into()).into_response(),
     }
 
-    let result = sqlx::query_as::<_, NodeRow>(sql!(
-        "WITH inserted_node AS (
-           INSERT INTO nodes (id, address, role, managed_by, state, last_heartbeat)
-           VALUES (
-               $1,
-               NULLIF($3, '')::INET,
-               $4,
-               $9,
-               COALESCE($5, 'registered'),
-               CASE WHEN $8::BOOL THEN NOW() ELSE NULL END
-           )
-           RETURNING id,
-                     host(address) AS address,
-                     role,
-                     managed_by,
-                     state,
-                     last_heartbeat,
-                     created_at
-         ),
-         inserted_direct AS (
-           INSERT INTO node_direct (node_id, name, node_api_endpoint, metadata)
-           SELECT id, $2, $6, $7
-           FROM inserted_node
-           RETURNING node_id,
-                     name,
-                     node_api_endpoint,
-                     metadata,
-                     updated_at,
-                     deleted_at
-         )
-         SELECT n.id,
-                d.name,
-                n.address,
-                d.node_api_endpoint,
-                n.role,
-                n.managed_by,
-                n.state,
-                d.metadata,
-                n.last_heartbeat,
-                n.created_at,
-                d.updated_at,
-                d.deleted_at,
-                NULL::TEXT AS node_name
-         FROM inserted_node n
-         JOIN inserted_direct d ON d.node_id = n.id"
-    ))
-    .bind(node_id)
-    .bind(&req.name)
-    .bind(req.address.as_deref().unwrap_or(""))
-    .bind(role.as_str())
-    .bind(&req.state)
-    .bind(&endpoint)
-    .bind(sqlx::types::Json(&req.metadata))
-    .bind(req.verify)
-    .bind(REGISTRY_SUBSTRATE)
-    .fetch_one(&state.pool)
-    .await;
+    let result = pplx_space_direct_coordinator::create_node(&db, &registration)
+        .await
+        .map(registered_row);
 
     match result {
         Ok(row) => {
             enqueue_default_node_publish(&state.pool, &row, ReconcileReason::NodeRegistered).await;
             (StatusCode::CREATED, Json(node_response(row))).into_response()
         }
-        Err(err) => db_error(err).into_response(),
+        Err(err) => db_error(err.into()).into_response(),
     }
 }
 
@@ -596,69 +483,20 @@ pub async fn update_node(
             Err(err) => return err.into_response(),
         }
     }
-    let result = sqlx::query_as::<_, NodeRow>(sql!(
-        "WITH updated_node AS (
-           UPDATE nodes n
-           SET address = COALESCE(NULLIF($2, '')::INET, address),
-               role = COALESCE($4, role),
-               state = COALESCE($5, state),
-               last_heartbeat = CASE
-                   WHEN $8::BOOL THEN NOW()
-                   ELSE n.last_heartbeat
-               END
-           WHERE n.id = $7
-             AND n.managed_by = $9
-           RETURNING n.id,
-                     host(n.address) AS address,
-                     n.role,
-                     n.managed_by,
-                     n.state,
-                     n.last_heartbeat,
-                     n.created_at
-         ),
-         updated_direct AS (
-           UPDATE node_direct nd
-           SET name = COALESCE($1, name),
-               node_api_endpoint = COALESCE($3, node_api_endpoint),
-               metadata = COALESCE($6::JSONB, metadata),
-               updated_at = NOW()
-           FROM updated_node n
-           WHERE nd.node_id = n.id
-             AND nd.deleted_at IS NULL
-           RETURNING nd.node_id,
-                     nd.name,
-                     nd.node_api_endpoint,
-                     nd.metadata,
-                     nd.updated_at,
-                     nd.deleted_at
-         )
-         SELECT n.id,
-                d.name,
-                n.address,
-                d.node_api_endpoint,
-                n.role,
-                n.managed_by,
-                n.state,
-                d.metadata,
-                n.last_heartbeat,
-                n.created_at,
-                d.updated_at,
-                d.deleted_at,
-                NULL::TEXT AS node_name
-         FROM updated_node n
-         JOIN updated_direct d ON d.node_id = n.id"
-    ))
-    .bind(&req.name)
-    .bind(req.address.as_deref().unwrap_or(""))
-    .bind(&endpoint)
-    .bind(req.role.map(NodeRole::as_str))
-    .bind(&req.state)
-    .bind(req.metadata.as_ref().map(sqlx::types::Json))
-    .bind(id)
-    .bind(req.verify)
-    .bind(REGISTRY_SUBSTRATE)
-    .fetch_optional(&state.pool)
-    .await;
+    let update = DirectNodeUpdate {
+        node_id: id,
+        managed_by: REGISTRY_SUBSTRATE,
+        name: req.name.as_deref(),
+        address: req.address.as_deref(),
+        node_api_endpoint: endpoint.as_deref(),
+        role: req.role,
+        state: req.state.as_deref(),
+        metadata: req.metadata.as_ref(),
+        stamp_heartbeat: req.verify,
+    };
+    let result = pplx_space_direct_coordinator::update_node(&Db::from(state.pool.clone()), &update)
+        .await
+        .map(|node| node.map(registered_row));
 
     match result {
         Ok(Some(row)) => {
@@ -666,7 +504,7 @@ pub async fn update_node(
             Json(node_response(row)).into_response()
         }
         Ok(None) => api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
-        Err(err) => db_error(err).into_response(),
+        Err(err) => db_error(err.into()).into_response(),
     }
 }
 
@@ -682,31 +520,18 @@ pub async fn delete_node(
         return err.into_response();
     }
 
-    let result = hard_delete_direct_node(&state.pool, id).await;
+    let result = pplx_space_node_registration_store::direct::delete_direct_node(
+        &state.pool,
+        id,
+        REGISTRY_SUBSTRATE,
+    )
+    .await;
 
     match result {
         Ok(count) if count > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => api_error(StatusCode::NOT_FOUND, "Node not found").into_response(),
         Err(err) => db_error(err).into_response(),
     }
-}
-
-async fn hard_delete_direct_node(pool: &sqlx::PgPool, id: NodeId) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(sql!(
-        "DELETE FROM nodes n
-         WHERE n.id = $1
-           AND n.managed_by = $2
-           AND EXISTS (
-               SELECT 1
-               FROM node_direct nd
-               WHERE nd.node_id = n.id
-           )"
-    ))
-    .bind(id)
-    .bind(REGISTRY_SUBSTRATE)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 #[cfg(test)]

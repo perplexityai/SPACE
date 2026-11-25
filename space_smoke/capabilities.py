@@ -1459,6 +1459,7 @@ class KindEnvironment(Protocol):
     def admin_request(
         self, method: str, resource: str, body: dict[str, object] | None = None,
         *, expected: tuple[int, ...] = (200, 201, 202, 204),
+        idempotency_key: str | None = None,
     ) -> Any: ...
 
     def seed_api_key(

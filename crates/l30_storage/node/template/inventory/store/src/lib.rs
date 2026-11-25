@@ -3,13 +3,16 @@
 //! control-plane database.
 //!
 //! Nodes publish their inventory through internal-api, which upserts it and
-//! its components and deletes the templates a node reports absent here. The
-//! full-inventory prune, internal-api's `prune_absent_node_templates`, still
-//! deletes rows directly, in one statement with the `node_facet_observed_status`
-//! rows of the templates it removes. The admin node-template routes delete one
-//! node's cached copies and list them; template admin and public routes, and
-//! the release lookups, read what nodes hold. Each verb takes any executor, so
-//! a caller's guard keeps its transaction and locks.
+//! its components and deletes the templates a node reports absent here. A
+//! complete publication's prune ([`prune_absent_templates`]) also deletes, in
+//! the same statement, the node's `network-policy` rows in
+//! `node_facet_observed_status` for the templates whose builds it deletes, a
+//! table this store writes under a temporary co-writer grant. The admin
+//! node-template routes delete one node's cached copies and list them;
+//! template admin and public routes, and the release lookups, read what
+//! nodes hold. Each verb takes any executor, so a caller's guard keeps its
+//! transaction and locks. The reads that also ask whether a Direct node's
+//! registry row is live are in [`direct`].
 //!
 //! Rows whose `snapshots` JSON a caller decodes are generic over that payload
 //! type: the shape belongs to the caller's response, and decoding it in the
@@ -22,11 +25,12 @@ use serde::de::DeserializeOwned;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgExecutor};
 
+pub mod direct;
 mod publish;
 mod template;
 
 pub use publish::{
-    AcceptedTemplateBuild, delete_unpublished_template_components,
+    AcceptedTemplateBuild, delete_unpublished_template_components, prune_absent_templates,
     upsert_published_template_components, upsert_published_templates,
 };
 pub use template::{

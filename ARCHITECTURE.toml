@@ -1,17 +1,29 @@
 # Repository structure rules, checked by `cargo arch` (crates/tools/archcheck).
 
-# Direct-only control-plane Postgres tables belong to the Direct substrate;
-# existing users outside it are baselined until moved behind it. Postgres folds
-# unquoted identifiers, so the names match in any case.
+# Direct-only control-plane Postgres tables belong to the Direct substrate and
+# its store, pplx-space-direct-store; existing users outside them are baselined
+# until moved behind them. Postgres folds unquoted identifiers, so the names
+# match in any case. Naming the store's crate, or `pplx-space-direct-coordinator`'s,
+# counts as a use, so the store's verbs stay behind the Direct substrate and the
+# coordinator, and the coordinator's callers outside the Direct substrate stay
+# baselined. A store's `direct` module may also name these tables: a statement
+# whose main table that store owns, but which joins a Direct table, moves there
+# verbatim.
 [rules.pattern_ratchet.direct_tables]
 patterns = [
   '(?i)\bnode_direct\b',
   '(?i)\bsandbox_direct_route_identities\b',
   '(?i)\bsandbox_direct_route_provenance\b',
+  '\bpplx_space_direct_store\b',
+  '\bpplx_space_direct_coordinator\b',
 ]
 allow = [
   "crates/l40_api/api/src/controllers/substrate/direct.rs",
   "crates/l40_api/api/src/controllers/substrate/direct/**",
+  "crates/l30_storage/direct/coordinator/**",
+  "crates/l30_storage/direct/store/**",
+  "crates/l30_storage/**/src/direct.rs",
+  "crates/l30_storage/**/src/direct/**",
 ]
 
 [rules.pattern_ratchet.direct_tables.no_crossing]       # only allowed and listed files may match
@@ -164,6 +176,66 @@ mode = "required"
 [rules.pattern_ratchet.substrate_literals.stale_entries]     # entries with fewer matches, none, or gone
 mode = "required"
 
+# A string function wrapped around a table's column in a predicate, such as
+# `AND replace(o.hash, 'sha256:', '') = replace(r.hash, 'sha256:', '')`, can't
+# use the column's index. On the probed side of a join or a correlated subquery
+# that means every outer row rescans the inner table's candidates, a cost that
+# grows with the square of their count and that tests on small tables never
+# show. Compare the bare column with each spelling instead,
+# `o.hash IN (replace(r.hash, 'sha256:', ''), 'sha256:' || replace(r.hash,
+# 'sha256:', ''))`: the function wraps only the outer value, and the index
+# serves the lookup. Don't fold the spellings into an `OR` with the exact match
+# either (`o.hash = r.hash OR replace(o.hash, ...) = ...`): only a custom plan
+# can drop the second branch, and a cached statement runs its generic plan. A
+# line matcher counts a function from the list below applied to an
+# alias-qualified column, with no parentheses among its arguments, when it is
+# compared (by =, <>, !=, IN) and either
+# - follows AND, OR, WHERE or ON, optionally with NOT and then opening
+#   parentheses between; the comparison may start the next line, so a call
+#   that ends its line counts there too; or
+# - starts its line, the form of a predicate whose AND ends the line before.
+# A call that neither ends its line nor is compared isn't in a predicate
+# (`DISTINCT ON (lower(t.x))`, an ORDER BY or select-list expression), and
+# doesn't count.
+# Not caught: an unqualified column, a call split across lines before its
+# column, a schema-qualified or nested call (`pg_catalog.lower(o.x)`,
+# `lower(trim(o.name))`), a call with a parenthesized argument
+# (`substr(o.x, length($1))`), a call followed by a closing parenthesis or an
+# operator before its comparison (`(lower(o.x)) = $1`, `lower(o.x) || 'a' =`),
+# a call that starts its line after a quote or ends it before a `\` or `",`,
+# a predicate after WHEN, NOT after a parenthesis
+# or with no space before one (`NOT(lower(o.x) = $1)`), a keyword with no space
+# after it (`AND(lower(o.x)`), a call that starts its line with NOT, a call
+# compared other than by =, <>, != or IN or cast first (`LIKE`, `::int =`),
+# COALESCE (mostly over unindexed state columns, and too common to count), a
+# wrapped column on the right of the comparison, and SQL outside production
+# `.rs` files, such as the `.sql` fragments that
+# pplx-space-template-release-original reads with `include_str!`.
+# False positives: a wrapped column that is a residual filter after an index
+# lookup, or that belongs to the outer row; such lines are baselined. The
+# plan-cost tests of `pplx_space_db_test_fixtures::plan` catch what this misses.
+[rules.pattern_ratchet.sql_wrapped_column_predicate]
+patterns = [
+  '''(?i)\b(?:AND|OR|WHERE|ON)\s+(?:NOT\s+)?\(*\s*(?:replace|regexp_replace|translate|lower|upper|initcap|substring|substr|left|right|trim|btrim|ltrim|rtrim|split_part|concat|md5)\s*\(\s*"?[a-z_][a-z0-9_]*"?\s*\.\s*"?[a-z_][a-z0-9_]*[^()]*\)\s*(?:=|<>|!=|\bIN\b|"?\s*$)''',
+  '''(?i)^\s*\(*\s*(?:replace|regexp_replace|translate|lower|upper|initcap|substring|substr|left|right|trim|btrim|ltrim|rtrim|split_part|concat|md5)\s*\(\s*"?[a-z_][a-z0-9_]*"?\s*\.\s*"?[a-z_][a-z0-9_]*[^()]*\)\s*(?:=|<>|!=|\bIN\b)''',
+]
+allow = []
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.no_crossing]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.no_new_entries]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.no_raised_caps]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.sql_wrapped_column_predicate.stale_entries]
+mode = "required"
+
 # Writes of the control-plane Postgres `public.sandboxes` row move into its
 # store, `pplx-space-sandbox-store`; this ratchet only shrinks. It counts each
 # production line that opens a statement writing the row (`UPDATE`,
@@ -302,9 +374,8 @@ mode = "required"
 # edges, and `state.writes` scans only stores' and helpers' write statements.
 # Without this ratchet, pplx-space-db-migrate, a store that depends on sqlx
 # and rusqlite, could name sbx-mgr's migrator or a default-path helper for its
-# database again, and a node service with a baselined `rusqlite` edge
-# (node-ctl-server, node-mgr, node-runtime-manager, template-mgr, volmgr,
-# build-mgr-server) could open `SANDBOX_MANAGER_DB`.
+# database again, and a node service with a baselined `rusqlite` edge could open
+# `SANDBOX_MANAGER_DB`.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema]
 patterns = [
   '\bpplx_space_sbx_mgr_migrations\b',
@@ -358,8 +429,14 @@ mode = "advisory"
 # matrix and how to fix a finding: crates/tools/archcheck/README.md (Layers).
 
 # Each store's users: the l40_api and l30_storage crates that own its state
-# and use the store today.
+# and use the store today, and the coordinators that call it.
 [rules.layers.store_users]
+pplx-space-accounts-store = [
+  "pplx-space-api",
+  "pplx-space-credmgr",
+  "pplx-space-db-migrate",
+  "pplx-space-internal-api-server",
+]
 pplx-space-admin-audit-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
@@ -372,6 +449,7 @@ pplx-space-cluster-pool = [
 ]
 pplx-space-cluster-trigger-queue = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-cluster-reconciler",
   "pplx-space-internal-api-server",
 ]
@@ -380,7 +458,12 @@ pplx-space-byok-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-data-plane-session-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+]
+pplx-space-direct-store = [
+  "pplx-space-api",
+  "pplx-space-direct-coordinator",
 ]
 pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
 pplx-space-firewall-rules-store = [
@@ -401,14 +484,21 @@ pplx-space-node-registration-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-credmgr",
+  "pplx-space-direct-coordinator",
   "pplx-space-internal-api-server",
 ]
 pplx-space-node-mgr-store = ["pplx-space-node-mgr"]
-pplx-space-node-runtime-manager-store = ["pplx-space-node-runtime-manager"]
+pplx-space-node-runtime-manager-store = [
+  "pplx-space-db-migrate",
+  "pplx-space-node-runtime-manager",
+]
 pplx-space-node-status-store = [
   "pplx-space-api",
+  "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+  "pplx-space-node-registration-store",
   "pplx-space-runtime-upgrade-campaign-store",
+  "pplx-space-sandbox-store",
 ]
 pplx-space-node-template-inventory-store = [
   "pplx-space-api",
@@ -417,8 +507,14 @@ pplx-space-node-template-inventory-store = [
 pplx-space-postgres-pool = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
+  "pplx-space-cluster-reconciler",
+  "pplx-space-cluster-trigger-queue",
   "pplx-space-credmgr",
+  "pplx-space-direct-coordinator",
+  "pplx-space-direct-store",
   "pplx-space-internal-api-server",
+  "pplx-space-node-registration-store",
+  "pplx-space-node-template-inventory-store",
 ]
 pplx-space-public-operation-store = ["pplx-space-api"]
 pplx-space-runtime-environment-catalog-store = [
@@ -439,8 +535,8 @@ pplx-space-sandbox-portability = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+  "pplx-space-node-registration-store",
   "pplx-space-sandbox-store",
-  "pplx-space-snapshot-retention",
   "pplx-space-snapshot-store",
 ]
 pplx-space-sandbox-quarantine-store = [
@@ -452,6 +548,7 @@ pplx-space-sandbox-residency = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-node-registration-store",
+  "pplx-space-node-status-store",
   "pplx-space-sandbox-store",
 ]
 pplx-space-sandbox-routability = [
@@ -486,9 +583,7 @@ pplx-space-snapshot-store = [
 pplx-space-storage-vend-store = ["pplx-space-credmgr"]
 pplx-space-template-mgr-store = ["pplx-space-template-mgr"]
 pplx-space-template-release-original = [
-  "pplx-space-api",
   "pplx-space-cluster-pool",
-  "pplx-space-internal-api-server",
   "pplx-space-template-release-store",
 ]
 # The API resolves creates, placement and pool claims to a release's twin
@@ -500,7 +595,9 @@ pplx-space-template-release-original = [
 # campaign's source releases, writes twins' metadata.json through its
 # objects, and inserts the twins; and the internal API's release
 # registration reads, inserts and fills releases and their storage
-# locations. The credential manager checks whether a release is published
+# locations, and its template catalog reads releases and their storage
+# locations for the nodes that pull them. The credential manager checks
+# whether a release is published
 # before it vends write credentials for its storage.
 pplx-space-template-release-store = [
   "pplx-space-api",
@@ -516,6 +613,14 @@ pplx-space-template-store = [
   "pplx-space-internal-api-server",
 ]
 pplx-space-volmgr-store = ["pplx-space-volmgr"]
+
+# Each coordinator's users: the l40_api crates that run its transaction
+# today. A coordinator (l30_storage, named *-coordinator) runs one transaction
+# across the stores that list it in store_users, owns no tables and holds no
+# SQL.
+[rules.layers.coordinator_users]
+# The admin node registry registers, reactivates and updates Direct nodes.
+pplx-space-direct-coordinator = ["pplx-space-api"]
 
 # Edges the dependency matrix forbids, allowed by name.
 [rules.layers.allowed_edges]
@@ -780,6 +885,15 @@ mode = "required"
 [rules.layers.store_edges]        # API and Storage crates use only the stores that list them
 mode = "required"
 
+[rules.layers.coordinators]       # a coordinator declares no state and uses no other coordinator
+mode = "required"
+
+[rules.layers.coordinator_edges]  # API crates use only the coordinators that list them; stores none
+mode = "required"
+
+[rules.layers.driver_reexports]   # no l30_storage crate's library root re-exports a driver
+mode = "required"
+
 [rules.layers.stale_entries]      # [rules.layers] entries that no longer apply
 mode = "required"
 
@@ -810,10 +924,24 @@ common = [
 node_facet_conditions = ["pplx-space-sandbox-store"]
 # Pruning a node's absent sandboxes deletes their facet rows in one statement.
 # Temporary: the prune calls sandbox-teardown for those rows.
-node_facet_observed_status = ["pplx-space-sandbox-store"]
+# node-template-inventory-store: the absent-template prune deletes the
+# network-policy rows of the templates whose builds it deletes, in the same
+# statement as their inventory rows. Temporary: it goes when the statement
+# splits into one verb per store, once a split is proven equivalent or a
+# per-node publication lock orders the prune against node-ctl's concurrent
+# publications.
+node_facet_observed_status = [
+  "pplx-space-node-template-inventory-store",
+  "pplx-space-sandbox-store",
+]
 # Teardown deletes an element's queued refs in the caller's transaction.
 # Temporary: the delete moves into cluster-trigger-queue and teardown calls it.
 node_reconcile_queue = ["pplx-space-sandbox-teardown"]
+# Pause-failed recovery and the census prune write sandboxes in the same
+# statement as the observed rows.
+# Temporary: it goes once neither statement writes the table, after a
+# pause-failed recovery coordinator and the census prune's own split.
+sandbox_observed_states = ["pplx-space-sandbox-store"]
 # Pause-failed recovery retires the quarantine in its sandboxes update.
 # Temporary: the recovery calls sandbox-quarantine-store for the quarantine.
 sandbox_quarantine_history = ["pplx-space-sandbox-store"]

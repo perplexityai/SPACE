@@ -779,7 +779,7 @@ pub fn drop_stopped_artifact_pin(conn: &Connection, id: &str) -> Result<bool> {
 /// unknown capture time is reported as absent, never guessed. Read under the
 /// same lock of sbx-mgr's single connection as the sandbox row, so no writer
 /// moves the pin in between.
-pub fn pinned_local_artifact_created_at(
+pub(crate) fn pinned_local_artifact_created_at(
     conn: &Connection,
     sandbox_ids: &[String],
 ) -> Result<HashMap<String, timestamps::EpochSeconds>> {

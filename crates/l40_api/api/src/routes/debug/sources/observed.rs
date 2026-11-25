@@ -1,6 +1,6 @@
 use pplx_space_sandbox_model::SandboxId;
 
-use pplx_space_sql_locator::sql;
+use pplx_space_sandbox_teardown::observed_states::{self, ObservedStateWithNode};
 use sqlx::PgPool;
 
 use crate::routes::debug::{response::ObservedResources, sources::begin_read_only};
@@ -10,40 +10,66 @@ pub(in crate::routes::debug) async fn fetch(
     sandbox_id: SandboxId,
 ) -> Result<Option<ObservedResources>, sqlx::Error> {
     let mut tx = begin_read_only(pool).await?;
-    let observed = sqlx::query_as::<_, ObservedResources>(sql!(
-        "SELECT sos.sandbox_id,
-                sos.node_id,
-                host(n.address) AS node_address,
-                n.role AS node_role,
-                n.managed_by AS node_managed_by,
-                nk.k8s_node_name,
-                sos.status,
-                sos.pid,
-                sos.namespace,
-                sos.uptime,
-                sos.sandbox_owner AS sandbox_user,
-                sos.image_hash,
-                sos.snapshots_enabled,
-                sos.disk_usage_bytes,
-                sos.pool_template,
-                sos.failure_reason,
-                sos.observed_created_at,
-                sos.network_tx_bytes,
-                sos.network_rx_bytes,
-                sos.missing_publish_count,
-                sos.template,
-                sos.network_policy_authority,
-                sos.auto_lifecycle_authority,
-                sos.observed_at,
-                sos.updated_at
-           FROM sandbox_observed_states sos
-      LEFT JOIN nodes n ON n.id = sos.node_id
-      LEFT JOIN node_k8s nk ON nk.node_id = n.id
-          WHERE sos.sandbox_id = $1"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let observed = observed_states::get_with_node(&mut *tx, sandbox_id).await?;
     tx.commit().await?;
-    Ok(observed)
+    Ok(observed.map(ObservedResources::from))
+}
+
+impl From<ObservedStateWithNode> for ObservedResources {
+    fn from(row: ObservedStateWithNode) -> Self {
+        let ObservedStateWithNode {
+            sandbox_id,
+            node_id,
+            node_address,
+            node_role,
+            node_managed_by,
+            k8s_node_name,
+            status,
+            pid,
+            namespace,
+            uptime,
+            sandbox_user,
+            image_hash,
+            snapshots_enabled,
+            disk_usage_bytes,
+            pool_template,
+            failure_reason,
+            observed_created_at,
+            network_tx_bytes,
+            network_rx_bytes,
+            missing_publish_count,
+            template,
+            network_policy_authority,
+            auto_lifecycle_authority,
+            observed_at,
+            updated_at,
+        } = row;
+        Self {
+            sandbox_id,
+            node_id,
+            node_address,
+            node_role,
+            node_managed_by,
+            k8s_node_name,
+            status,
+            pid,
+            namespace,
+            uptime,
+            sandbox_user,
+            image_hash,
+            snapshots_enabled,
+            disk_usage_bytes,
+            pool_template,
+            failure_reason,
+            observed_created_at,
+            network_tx_bytes,
+            network_rx_bytes,
+            missing_publish_count,
+            template,
+            network_policy_authority,
+            auto_lifecycle_authority,
+            observed_at,
+            updated_at,
+        }
+    }
 }

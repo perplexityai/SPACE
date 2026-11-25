@@ -118,17 +118,12 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<Option<TrackedPod>, SubstrateError> {
-        let Some(pod_uid) = sqlx::query_scalar::<_, Option<String>>(sql!(
-            "SELECT NULLIF(BTRIM(pod_uid), '')
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1 AND generation = $2 AND active
-              FOR UPDATE"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_optional(&mut *conn)
-        .await
-        .db_context("failed to lock the tracked Kubernetes pod")?
+        let Some(pod_uid) =
+            pplx_space_sandbox_store::k8s_executions::runtime_attribution::lock_tracked_pod_uid(
+                &mut *conn, sandbox_id, generation,
+            )
+            .await
+            .db_context("failed to lock the tracked Kubernetes pod")?
         else {
             return Ok(None);
         };
@@ -138,16 +133,16 @@ impl K8sStore {
                 sandbox: None,
             }));
         }
-        let sandbox = sqlx::query_as::<_, (String, Option<ClientId>)>(sql!(
-            "SELECT lifecycle, activating_client_id FROM sandboxes WHERE id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .db_context("failed to read the sandbox's activating client")?;
-        Ok(sandbox.map(|(lifecycle, record)| TrackedPod {
+        let sandbox =
+            pplx_space_sandbox_store::row_reads::activation_record(&mut *conn, sandbox_id)
+                .await
+                .db_context("failed to read the sandbox's activating client")?;
+        Ok(sandbox.map(|sandbox| TrackedPod {
             pod_uid,
-            sandbox: Some(TrackedSandbox { lifecycle, record }),
+            sandbox: Some(TrackedSandbox {
+                lifecycle: sandbox.lifecycle,
+                record: sandbox.activating_client_id,
+            }),
         }))
     }
 

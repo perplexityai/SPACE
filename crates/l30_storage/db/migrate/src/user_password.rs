@@ -30,7 +30,7 @@ pub enum SetUserPasswordError {
     Database(#[from] sqlx::Error),
 }
 
-pub async fn run(args: SetUserPasswordArgs) -> Result<(), SetUserPasswordError> {
+pub(crate) async fn run(args: SetUserPasswordArgs) -> Result<(), SetUserPasswordError> {
     let password =
         std::env::var("SPACE_USER_PASSWORD").map_err(|_| SetUserPasswordError::InvalidPassword)?;
     let hash = hash_password(password).await?;
@@ -69,17 +69,9 @@ async fn set_password_hash(
         tx.commit().await?;
         return Ok(());
     }
-    sqlx::query(sql!(
-        "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2"
-    ))
-    .bind(hash)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sql!("DELETE FROM sessions WHERE user_id = $1"))
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+    let user_id = pplx_space_accounts::UserId::from_uuid(user_id);
+    pplx_space_accounts_store::users::set_user_password_hash(&mut *tx, user_id, hash).await?;
+    pplx_space_accounts_store::sessions::delete_user_sessions(&mut *tx, user_id).await?;
     tx.commit().await?;
     Ok(())
 }

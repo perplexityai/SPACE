@@ -1,5 +1,6 @@
 use pplx_space_accounts::NodeId;
 use pplx_space_snapshot_model::SnapshotId;
+use pplx_space_sql_locator::sql;
 
 use super::*;
 use k8s_openapi::api::core::v1::{
@@ -12,6 +13,7 @@ use pplx_space_auto_lifecycle::{
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStage,
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, try_pg_test_db};
+use sqlx::types::Json;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

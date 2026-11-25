@@ -2,9 +2,9 @@
 //! tombstone checks.
 
 use super::*;
-use pplx_space_node_model::SubstrateKind;
 use pplx_space_node_registration_store::{
-    K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, register_k8s_node,
+    K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, demotion,
+    register_k8s_node,
 };
 
 impl K8sStore {
@@ -42,46 +42,12 @@ impl K8sStore {
         }
 
         let missing_grace_secs = i64::try_from(missing_grace.as_secs()).unwrap_or(i64::MAX);
-        let mut changed = sqlx::query_scalar::<_, String>(sql!(
-            "WITH candidates AS MATERIALIZED (
-                 SELECT candidate.id,
-                        candidate.last_heartbeat,
-                        candidate_k8s.updated_at AS k8s_updated_at
-                 FROM nodes AS candidate
-                 JOIN node_k8s AS candidate_k8s
-                   ON candidate_k8s.node_id = candidate.id
-                 WHERE candidate.managed_by = $4
-                   AND candidate.state = 'ready'
-                   AND candidate.drain_phase IS NULL
-                   AND NOT (candidate_k8s.k8s_node_name = ANY($1::TEXT[]))
-                   AND (
-                        candidate.last_heartbeat IS NULL
-                        OR candidate.last_heartbeat
-                           < NOW() - ($2 * INTERVAL '1 second')
-                   )
-                   AND candidate_k8s.updated_at
-                       < NOW() - ($2 * INTERVAL '1 second')
-                 ORDER BY candidate_k8s.updated_at, candidate.id
-                 LIMIT $3
-             )
-             UPDATE nodes AS n
-             SET state = 'registered'
-             FROM node_k8s AS nk
-             JOIN candidates AS candidate
-               ON candidate.id = nk.node_id
-             WHERE n.id = candidate.id
-               AND n.managed_by = $4
-               AND n.state = 'ready'
-               AND n.drain_phase IS NULL
-               AND n.last_heartbeat IS NOT DISTINCT FROM candidate.last_heartbeat
-               AND nk.updated_at = candidate.k8s_updated_at
-             RETURNING nk.k8s_node_name"
-        ))
-        .bind(live_node_names)
-        .bind(missing_grace_secs)
-        .bind(i64::from(max_per_tick))
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&self.pool)
+        let mut changed = demotion::demote_unobserved_ready_nodes(
+            &self.pool,
+            live_node_names,
+            missing_grace_secs,
+            i64::from(max_per_tick),
+        )
         .await
         .db_context("failed to demote unobserved Kubernetes nodes")?;
         changed.sort_unstable();
@@ -126,13 +92,14 @@ impl K8sStore {
                 manage_state,
                 instance_id,
             },
-            || {
+            |abandoned_v2| {
                 tracing::warn!(
                     node_id = %node_id,
                     node_name = %node_name,
                     new_k8s_node_uid = %node_uid,
-                    "k8s Node UID changed for existing node row; cleared drain_phase/drain_mode/drain_started_at/drain_last_error — \
-                     any in-progress drain was abandoned"
+                    abandoned_v2,
+                    "k8s Node UID changed for existing node row; cleared drain_phase/drain_mode/drain_started_at/drain_last_error/\
+                     drain_engine/drain_status — any in-progress drain was abandoned (abandoned_v2 says whether it was a v2 drain)"
                 );
             },
         )
@@ -152,6 +119,25 @@ impl K8sStore {
                     ),
                 }
             }
+            // The same per-node skip as a tombstone: the next sync retries.
+            K8sNodeRegistrationError::AwaitingInstance => {
+                tracing::warn!(
+                    %node_id,
+                    node_name,
+                    %node_uid,
+                    "a Node under a new uid that reports no EC2 instance yet would take a v2 \
+                     drain's node; deferring its registration until the Node reports its \
+                     providerID"
+                );
+                crate::metrics::node_drain::v2_registration_deferred(&node_id.to_string());
+                SubstrateError::NodeTombstoned {
+                    message: format!(
+                        "kube node {node_name} role {role} has a new uid {node_uid} and no \
+                         instance yet, and the node has a v2 drain; deferring its registration \
+                         until the Node reports its providerID"
+                    ),
+                }
+            }
             K8sNodeRegistrationError::NotKubernetes => SubstrateError::Failed {
                 message: format!(
                     "Kubernetes node uid {node_uid} role {role} for {node_name} conflicts with a non-Kubernetes node"
@@ -165,6 +151,9 @@ impl K8sStore {
                     }
                     K8sNodeRegistrationStep::RecheckOwnership => {
                         "failed to re-check Kubernetes node ownership"
+                    }
+                    K8sNodeRegistrationStep::CheckUidChange => {
+                        "failed to check the v2 drain's Node UID"
                     }
                     K8sNodeRegistrationStep::ClearDrain => {
                         "failed to clear drain state on UID change"

@@ -80,3 +80,6 @@ pub async fn prune_cross_org_template_compat(
     .await?;
     Ok(result.rows_affected())
 }
+
+#[cfg(test)]
+mod cross_org_prune_tests;

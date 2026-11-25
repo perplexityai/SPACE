@@ -1,5 +1,6 @@
 //! `[rules.layers]`: the layer of each workspace member that is not yet in its
-//! layer's directory, which crates may use each store, the declared
+//! layer's directory, which crates may use each store and each coordinator,
+//! the declared
 //! exceptions to the layer order, and the mode of each of the layers rule's
 //! checks.
 
@@ -110,6 +111,10 @@ pub struct LayersConfig {
     /// Each store's package name to the packages that may depend on it.
     #[serde(default)]
     pub store_users: BTreeMap<String, PackageSet>,
+    /// Each coordinator's package name to the packages that may depend on
+    /// it.
+    #[serde(default)]
+    pub coordinator_users: BTreeMap<String, PackageSet>,
     /// Package name to the packages it may depend on although the layer
     /// order forbids it.
     #[serde(default)]
@@ -134,6 +139,9 @@ pub struct LayersConfig {
     pub test_only: BehaviourConfig,
     pub clients: BehaviourConfig,
     pub store_edges: BehaviourConfig,
+    pub coordinators: BehaviourConfig,
+    pub coordinator_edges: BehaviourConfig,
+    pub driver_reexports: BehaviourConfig,
     pub stale_entries: BehaviourConfig,
     pub policy_changed: BehaviourConfig,
     /// `[rules.layers.state]`, which store owns each table; the state checks
@@ -463,6 +471,7 @@ pub struct LayersPolicy {
     /// Package name to its layer as written.
     pub unmoved: Entries<String>,
     pub store_users: Entries<BTreeMap<String, usize>>,
+    pub coordinator_users: Entries<BTreeMap<String, usize>>,
     pub allowed_edges: Entries<BTreeMap<String, usize>>,
     pub storage: StoragePolicy,
     /// `protocols`, each package with the line it is written on.
@@ -532,6 +541,7 @@ struct PolicyRules {
 struct PolicyTable {
     unmoved: Option<BTreeMap<String, Vec<Spanned<String>>>>,
     store_users: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
+    coordinator_users: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     allowed_edges: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     storage: Option<PolicyStorage>,
     protocols: Option<Spanned<Vec<Spanned<String>>>>,
@@ -547,6 +557,9 @@ struct PolicyTable {
     test_only: Option<PolicyBehaviour>,
     clients: Option<PolicyBehaviour>,
     store_edges: Option<PolicyBehaviour>,
+    coordinators: Option<PolicyBehaviour>,
+    coordinator_edges: Option<PolicyBehaviour>,
+    driver_reexports: Option<PolicyBehaviour>,
     stale_entries: Option<PolicyBehaviour>,
     policy_changed: Option<PolicyBehaviour>,
     state: Option<PolicyState>,
@@ -642,6 +655,7 @@ impl LayersPolicy {
                     .collect(),
             };
         let store_users = lists("store_users", table.store_users);
+        let coordinator_users = lists("coordinator_users", table.coordinator_users);
         let allowed_edges = lists("allowed_edges", table.allowed_edges);
         let packages = |list: Option<Vec<Spanned<String>>>| {
             list.unwrap_or_default()
@@ -723,6 +737,9 @@ impl LayersPolicy {
             ("test_only", table.test_only),
             ("clients", table.clients),
             ("store_edges", table.store_edges),
+            ("coordinators", table.coordinators),
+            ("coordinator_edges", table.coordinator_edges),
+            ("driver_reexports", table.driver_reexports),
             ("stale_entries", table.stale_entries),
             ("policy_changed", table.policy_changed),
         ] {
@@ -760,6 +777,7 @@ impl LayersPolicy {
             line,
             unmoved,
             store_users,
+            coordinator_users,
             allowed_edges,
             storage,
             protocols,

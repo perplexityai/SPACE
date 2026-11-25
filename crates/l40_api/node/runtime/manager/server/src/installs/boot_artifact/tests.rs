@@ -7,13 +7,13 @@ use crate::installs::{
     test_support::LocalPublisher,
 };
 use pplx_space_accounts::JobId;
-use pplx_space_common_jobs::{Job, JobExecutor as _};
 use pplx_space_content_digest::Digest;
 use pplx_space_execution_spec::{ArtifactComponentKind, ComponentIdentity};
 use pplx_space_node_runtime_core::{
     artifact_store::StagedName,
     catalog::{CatalogError, RuntimeCatalog},
 };
+use pplx_space_node_runtime_manager_store::jobs::{Job, JobExecutor as _};
 use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::PermissionsExt as _;
 use std::{
@@ -147,7 +147,7 @@ impl Fixture {
         let job_id = JobId::new();
         let db = self.installer.executor.db();
         pplx_space_common_jobs::db::insert_job(
-            &db,
+            db.raw(),
             pplx_space_common_jobs::db::InsertJob {
                 job_id: &job_id,
                 kind: INSTALL_JOB_KIND,
@@ -160,7 +160,7 @@ impl Fixture {
             },
         )
         .unwrap();
-        pplx_space_common_jobs::db::get_job(&db, &job_id)
+        pplx_space_common_jobs::db::get_job(db.raw(), &job_id)
             .unwrap()
             .unwrap()
     }

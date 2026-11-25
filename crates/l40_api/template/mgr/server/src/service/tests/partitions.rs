@@ -25,7 +25,7 @@ fn twin() -> TemplateCachePartition {
     TemplateCachePartition::Environment(twin_environment())
 }
 
-fn insert_bound_build(conn: &rusqlite::Connection, environment: EnvironmentReference) {
+fn insert_bound_build(conn: &crate::db::Connection, environment: EnvironmentReference) {
     let mut manifest = TemplateManifest {
         runtime: "fc".to_string(),
         arch: "x86_64".to_string(),
@@ -146,6 +146,7 @@ async fn a_lookup_touches_only_the_build_it_serves() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT last_used_at FROM template_builds WHERE cache_partition = ?1",
                 [partition.key()],
@@ -157,6 +158,7 @@ async fn a_lookup_touches_only_the_build_it_serves() {
         .db
         .lock()
         .unwrap()
+        .raw()
         .execute("UPDATE template_builds SET last_used_at = '0'", [])
         .unwrap();
     let mut request = lookup(Some(twin_environment()));
@@ -656,13 +658,15 @@ async fn base_snapshot_reconcile_resolves_an_adopted_legacy_build() {
     {
         let conn = service.db.lock().unwrap();
         crate::db::delete_build(&conn, NAME, &hash(), TemplateCachePartition::Legacy).unwrap();
-        conn.execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
+        conn.raw()
+            .execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
             .unwrap();
-        conn.execute(
-            "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
-            [NAME],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
+                [NAME],
+            )
+            .unwrap();
     }
     let service = service.without_sbx_connect_retries();
 
@@ -756,6 +760,7 @@ async fn a_deferred_partition_reconcile_leaves_the_build_s_lru_clock_alone() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .execute("UPDATE template_builds SET last_used_at = '0'", [])
             .unwrap();
     };
@@ -764,6 +769,7 @@ async fn a_deferred_partition_reconcile_leaves_the_build_s_lru_clock_alone() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT last_used_at FROM template_builds WHERE cache_partition = ?1",
                 [twin().key()],
@@ -1049,13 +1055,15 @@ async fn a_required_lookup_answers_with_an_adopted_legacy_build_bound_to_it() {
     {
         let conn = service.db.lock().unwrap();
         crate::db::delete_build(&conn, NAME, &hash(), TemplateCachePartition::Legacy).unwrap();
-        conn.execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
+        conn.raw()
+            .execute("DELETE FROM template_snapshots WHERE name = ?1", [NAME])
             .unwrap();
-        conn.execute(
-            "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
-            [NAME],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE template_builds SET cache_partition = '' WHERE name = ?1",
+                [NAME],
+            )
+            .unwrap();
     }
     let mut request = required_lookup(twin_environment());
     request.get_mut().vcpu = None;
@@ -1132,6 +1140,7 @@ async fn a_required_lookup_touches_no_other_environment_s_build() {
             .db
             .lock()
             .unwrap()
+            .raw()
             .query_row(
                 "SELECT last_used_at FROM template_builds WHERE cache_partition = ''",
                 [],
@@ -1143,6 +1152,7 @@ async fn a_required_lookup_touches_no_other_environment_s_build() {
         .db
         .lock()
         .unwrap()
+        .raw()
         .execute("UPDATE template_builds SET last_used_at = '0'", [])
         .unwrap();
     let mut request = required_lookup(twin_environment());

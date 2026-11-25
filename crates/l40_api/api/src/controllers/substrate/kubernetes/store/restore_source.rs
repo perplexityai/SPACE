@@ -43,17 +43,7 @@ impl K8sStore {
 
         // Preserve the node that held the suspended bytes after placement
         // pointers have been cleared.
-        let executions_query = sql!(
-            "SELECT ske.k8s_node_name
-               FROM sandbox_k8s_executions ske
-              WHERE ske.sandbox_id = $1
-                AND ske.k8s_node_name IS NOT NULL
-              ORDER BY ske.generation DESC
-              LIMIT 1"
-        );
-        sqlx::query_scalar::<_, String>(executions_query)
-            .bind(sandbox.id)
-            .fetch_optional(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::latest_k8s_node_name(&self.pool, sandbox.id)
             .await
             .db_context("failed to query Kubernetes restore node preference")
     }
@@ -152,83 +142,39 @@ impl K8sStore {
         //   stale-prior-cycle and failed-placement reasons.
         let restore_retry = sandbox.lifecycle.trim().eq_ignore_ascii_case("restoring");
         let newest_remote = snapshot == RestoreSnapshotChoice::NewestRemote;
-        let snapshot_guard = if restore_retry && !newest_remote {
-            format!(
-                "AND {}",
-                restore_retry_source_snapshot_is_current("s", "sn")
-            )
+        // The marked branches of the last two choices use
+        // `snapshot_is_current_local_artifact`, the fragment the retention
+        // sweeper's never-prune-the-current-artifact guard is built from;
+        // see `restore_source::suspend_restore_storage_uri`.
+        let choice = if restore_retry && !newest_remote {
+            restore_source::SuspendRestoreSnapshot::RestoreRetrySource
+        } else if newest_remote {
+            restore_source::SuspendRestoreSnapshot::NewestRemote
         } else {
-            let legacy_snapshot_guard = if newest_remote {
-                no_newer_full_snapshot("s", "sn")
-            } else {
-                fresh_ready_snapshot_exists("s")
-            };
-            // The marked branch uses the shared fragment rather than an
-            // inline copy: this is the selector that resolves a marked
-            // row's restore source, and the retention sweeper's
-            // never-prune-the-current-artifact guard is built from the same
-            // fragment. Sharing it is what makes "the sweep cannot delete
-            // what restore would select" a property instead of a comment.
-            let marked_snapshot_guard = snapshot_is_current_local_artifact("s", "sn");
-            format!(
-                "AND (
-                    {marked_snapshot_guard}
-                    OR (s.current_local_artifact_id IS NULL AND {legacy_snapshot_guard})
-                )"
-            )
+            restore_source::SuspendRestoreSnapshot::PlacementFresh
         };
-        // `sql!` is expanded here, not in the shared body: it stamps the
-        // statement with *its own* `module_path!()`/`line!()`, which is what
-        // attributes an in-flight query in `pg_stat_activity` and DBM back to
-        // the code that issued it. Hoisting it into the helper would give both
-        // selectors one identical locator and silently move this one.
-        let query = sql!(format!(
-            "SELECT ssl.storage_connection_string
-               FROM sandboxes s
-               JOIN snapshots sn ON sn.sandbox_id = s.id
-               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-              WHERE s.id = $1
-                AND s.lifecycle IN ('suspended', 'restoring')
-                AND ssl.orphaned_at IS NULL
-                AND sn.type = 'full'
-                AND sn.state = 'ready'
-                {snapshot_guard}
-              ORDER BY sn.timestamp DESC
-              LIMIT 1"
-        ));
-        self.fetch_restore_storage_uri(query, sandbox.id, "suspend")
-            .await
+        let storage_uri =
+            restore_source::suspend_restore_storage_uri(&self.pool, sandbox.id, choice).await;
+        Self::checked_restore_storage_uri(storage_uri, "suspend")
     }
 
-    /// Run a restore-source selector and validate what it returns.
+    /// Validate what a restore-source selector returned.
     ///
-    /// Shared by the suspend and stopped selectors, which each keep their own
-    /// whole `SELECT`: the storage guidance requires a statement to stay
-    /// syntactically whole and reviewable at its query site, so only the
-    /// binding and the result processing are factored out here, never a
-    /// predicate. The cost is that a filter belonging to both — the
-    /// non-orphaned-location requirement, say — has to be fixed in two
-    /// places; that is the trade the guidance makes deliberately, in exchange
-    /// for each query being readable where it is written.
-    ///
-    /// `query` arrives already `sql!`-stamped by its caller, so each selector
-    /// keeps its own locator token and stays separable in `pg_stat_activity`
-    /// and DBM. Do not re-stamp it here.
+    /// Shared by the suspend and stopped selectors, whose statements are
+    /// `pplx_space_sandbox_store::restore_source`'s
+    /// `suspend_restore_storage_uri` and `stopped_restore_storage_uri`. Each
+    /// keeps its own whole `SELECT` and `sql!` locator there; only the error
+    /// mapping and the result processing are shared here.
     ///
     /// `label` names the caller in the two error messages. Parsing the URI is
     /// validation rather than conversion: the caller wants the wire string,
     /// and a value the catalog holds but `StorageUri` rejects is a stored-data
     /// fault worth failing on rather than handing to a node.
-    async fn fetch_restore_storage_uri(
-        &self,
-        query: String,
-        sandbox_id: SandboxId,
+    fn checked_restore_storage_uri(
+        storage_uri: Result<Option<String>, sqlx::Error>,
         label: &str,
     ) -> Result<Option<String>, SubstrateError> {
-        let storage_uri: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
-            .bind(sandbox_id)
-            .fetch_optional(&self.pool)
-            .await
+        let storage_uri = storage_uri
             // `db_context_with` rather than `db_context`: the message
             // interpolates the caller's `label`, so it cannot be a
             // `&'static str`.
@@ -319,7 +265,6 @@ impl K8sStore {
         &self,
         sandbox: &Sandbox,
     ) -> Result<Option<String>, SubstrateError> {
-        let pinned = snapshot_is_current_local_artifact("s", "sn");
         // Newest-first because a retried backup of one artifact mints a fresh
         // `snapshots` row per attempt while keeping the same
         // `local_artifact_id`: the pin can match several rows, and the latest
@@ -333,24 +278,8 @@ impl K8sStore {
         // there. The suspend sibling has no tiebreak and is not changed here:
         // its ordering is load-bearing for a guard that shields every matching
         // row, so narrowing it is a separate decision.
-        // Stamped here rather than in the shared body, for the reason the
-        // suspend selector's own call site gives.
-        let query = sql!(format!(
-            "SELECT ssl.storage_connection_string
-               FROM sandboxes s
-               JOIN snapshots sn ON sn.sandbox_id = s.id
-               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
-              WHERE s.id = $1
-                AND s.lifecycle = 'stopped'
-                AND ssl.orphaned_at IS NULL
-                AND sn.type = 'disk'
-                AND sn.state = 'ready'
-                AND {pinned}
-              ORDER BY sn.timestamp DESC, sn.id DESC
-              LIMIT 1"
-        ));
-        self.fetch_restore_storage_uri(query, sandbox.id, "stopped")
-            .await
+        let storage_uri = restore_source::stopped_restore_storage_uri(&self.pool, sandbox.id).await;
+        Self::checked_restore_storage_uri(storage_uri, "stopped")
     }
 
     /// The disk artifact the evacuation restore sweep re-places an evacuated
@@ -415,17 +344,8 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Vec<String>, SubstrateError> {
-        sqlx::query_scalar(sql!(
-            "SELECT DISTINCT BTRIM(k8s_node_name)
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1
-                AND NOT active
-                AND NULLIF(BTRIM(k8s_node_name), '') IS NOT NULL
-              ORDER BY 1"
-        ))
-        .bind(sandbox_id)
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to read the nodes earlier executions of the sandbox ran on")
+        pplx_space_sandbox_store::k8s_executions::inactive_k8s_node_names(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to read the nodes earlier executions of the sandbox ran on")
     }
 }

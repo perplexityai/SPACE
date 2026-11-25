@@ -9,6 +9,7 @@ use pplx_space_db_test_fixtures::{
 use pplx_space_sandbox_model::{SandboxActivationAttemptId, SandboxQuarantineSource};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use pplx_space_sql_locator::sql;
+use sqlx::types::Json;
 
 use super::*;
 

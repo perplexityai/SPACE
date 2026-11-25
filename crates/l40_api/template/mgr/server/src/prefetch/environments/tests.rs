@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use pplx_space_content_digest::Digest;
 
 use super::*;
@@ -17,7 +15,7 @@ fn partition(environment: EnvironmentReference) -> TemplateCachePartition {
 
 /// A ready build of the digest bound to `environment`, in the partition its
 /// binding maps to; `None` is an unbound build, in the legacy partition.
-fn cache(db: &Arc<Mutex<rusqlite::Connection>>, environment: Option<EnvironmentReference>) {
+fn cache(db: &crate::db::SharedConnection, environment: Option<EnvironmentReference>) {
     use pplx_space_execution_spec::{
         ArtifactComponentKind, ArtifactComponentMetadata, ArtifactFormat, ArtifactVersion,
         ExecutionMetadata,
@@ -64,7 +62,7 @@ fn cache(db: &Arc<Mutex<rusqlite::Connection>>, environment: Option<EnvironmentR
 
 #[tokio::test]
 async fn a_twin_is_pulled_once_per_tick_into_its_own_partition() {
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let twin = environment(1);
     let mut queued = HashSet::new();
 
@@ -137,7 +135,7 @@ async fn a_twin_is_pulled_once_per_tick_into_its_own_partition() {
 /// bound to the environment is still pulled there.
 #[tokio::test]
 async fn an_unbound_release_in_the_legacy_partition_is_left_to_the_environment_less_passes() {
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let initial = pplx_space_node_runtime_core::catalog::initial_environment_reference();
     let mut queued = HashSet::new();
     assert_eq!(
@@ -174,7 +172,7 @@ async fn an_unbound_release_in_the_legacy_partition_is_left_to_the_environment_l
 /// lock, and it's what lets the holder go.
 #[tokio::test(flavor = "current_thread")]
 async fn the_cache_lookup_waits_for_the_catalog_lock_off_the_async_worker() {
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let twin = environment(1);
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -419,7 +417,7 @@ async fn latest_n_zero_still_reads_the_environment_s_visibility_verdict()
     use crate::volume::tests::catalog::{Catalog, TEMPLATE, TOKEN};
     if std::env::var_os(CHILD_ENDPOINT).is_some() {
         assert!(pplx_space_test_env::enter_test_process(&[]));
-        let db = Arc::new(Mutex::new(crate::db::test_conn()));
+        let db = crate::db::SharedConnection::new(crate::db::test_conn());
         let pins = PinnedDigestsStore::new(db.clone());
         let tag_tuples =
             crate::prefetch::parse_prefetch_tags(&format!(r#"["{TEMPLATE}:retired"]"#)).unwrap();
@@ -484,7 +482,7 @@ async fn an_environment_s_lookups_overlap_rather_than_wait_in_turn()
     use crate::volume::tests::catalog::{Catalog, TEMPLATE, TOKEN};
     if std::env::var_os(OVERLAP_CHILD).is_some() {
         assert!(pplx_space_test_env::enter_test_process(&[]));
-        let db = Arc::new(Mutex::new(crate::db::test_conn()));
+        let db = crate::db::SharedConnection::new(crate::db::test_conn());
         let pins = PinnedDigestsStore::new(db.clone());
         let tag_tuples = crate::prefetch::parse_prefetch_tags(&format!(
             r#"["{TEMPLATE}:latest", "{TEMPLATE}:retired"]"#
@@ -548,7 +546,7 @@ async fn an_applied_lookup_is_recorded_as_answered() -> pplx_space_test_env::Tes
     use crate::volume::tests::catalog::{Catalog, TEMPLATE, TOKEN};
     if std::env::var_os(ANSWERED_CHILD).is_some() {
         assert!(pplx_space_test_env::enter_test_process(&[]));
-        let db = Arc::new(Mutex::new(crate::db::test_conn()));
+        let db = crate::db::SharedConnection::new(crate::db::test_conn());
         let pins = PinnedDigestsStore::new(db.clone());
         let tag_tuples =
             crate::prefetch::parse_prefetch_tags(&format!(r#"["{TEMPLATE}:latest"]"#)).unwrap();
@@ -635,7 +633,7 @@ async fn an_environment_lookup_whose_selector_is_ignored_keeps_only_its_verdict(
     use crate::volume::tests::catalog::{Catalog, TEMPLATE, TOKEN};
     if std::env::var_os(IGNORED_CHILD).is_some() {
         assert!(pplx_space_test_env::enter_test_process(&[]));
-        let db = Arc::new(Mutex::new(crate::db::test_conn()));
+        let db = crate::db::SharedConnection::new(crate::db::test_conn());
         let pins = PinnedDigestsStore::new(db.clone());
         let tag_tuples = if tag_lookup {
             crate::prefetch::parse_prefetch_tags(&format!(r#"["{TEMPLATE}:latest"]"#)).unwrap()

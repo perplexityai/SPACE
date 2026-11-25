@@ -35,7 +35,6 @@ hex = { workspace = true }
 jiff = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
@@ -55,10 +54,8 @@ pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-btrfs = { workspace = true }
 pplx-space-host-layout = { workspace = true }
-pplx-space-sql-locator = { workspace = true }
 pplx-space-template-cache-permissions = { workspace = true }
 pplx-space-file-io = { workspace = true, features = ["reflink"] }
-pplx-space-common-jobs = { workspace = true }
 pplx-space-lru-reaper = { workspace = true }
 pplx-space-content-digest = { workspace = true, features = ["serde"] }
 pplx-space-cpu-arch = { workspace = true, features = ["serde"] }
@@ -105,6 +102,10 @@ pplx-space-rpc-auth = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
 pplx-space-test-hooks = { workspace = true, features = ["test-hooks"] }
 rstest = { workspace = true }
+# The tests seed and inspect the database through a raw connection;
+# production reaches it only through pplx-space-template-mgr-store.
+pplx-space-template-mgr-store = { workspace = true, features = ["test-support"] }
+rusqlite = { workspace = true }
 # `postgres` builds the unreachable visibility pool of the catalog tests.
 sqlx = { workspace = true, features = ["postgres"] }
 tokio = { workspace = true, features = ["test-util"] }

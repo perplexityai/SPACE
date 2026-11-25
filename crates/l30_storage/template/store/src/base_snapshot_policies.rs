@@ -48,3 +48,35 @@ pub async fn delete(
     .await?;
     Ok(())
 }
+
+/// Set a present `template`'s policy, and read it back. `None` when the
+/// template isn't present, which writes nothing.
+pub async fn upsert_if_present(
+    executor: impl PgExecutor<'_>,
+    template: &TemplateName,
+    ensure_base_snapshot: bool,
+    snapshot_vcpu: i32,
+    snapshot_memory_mib: i32,
+) -> Result<Option<BaseSnapshotPolicy>, sqlx::Error> {
+    sqlx::query_as::<_, BaseSnapshotPolicy>(
+        sql!("INSERT INTO template_base_snapshot_policies
+                 (template, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib, updated_at)
+             SELECT name, $2, $3, $4, NOW()
+             FROM templates
+             WHERE name = $1
+               AND desired_state = $5
+             ON CONFLICT (template) DO UPDATE
+             SET ensure_base_snapshot = EXCLUDED.ensure_base_snapshot,
+                 snapshot_vcpu = EXCLUDED.snapshot_vcpu,
+                 snapshot_memory_mib = EXCLUDED.snapshot_memory_mib,
+                 updated_at = NOW()
+             RETURNING template, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib, updated_at"),
+    )
+    .bind(template.as_str())
+    .bind(ensure_base_snapshot)
+    .bind(snapshot_vcpu)
+    .bind(snapshot_memory_mib)
+    .bind(TemplateDesiredState::Present.as_str())
+    .fetch_optional(executor)
+    .await
+}

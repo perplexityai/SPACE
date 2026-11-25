@@ -5715,7 +5715,7 @@ async fn p2_forced_drain_evacuates_residents_while_blocker_count_fails() {
 /// this one also passes against the pre-change tick, because a *successful*
 /// enumeration returning zero always reached the drive. It pins the criterion,
 /// not the fix; the query that made the zero case unreachable is regressed
-/// against in `store::pinned_local_only_scale_tests`.
+/// against in `pplx_space_sandbox_store::pinned_local_only`'s tests.
 #[tokio::test]
 async fn p3_forced_drain_with_zero_pinned_local_snapshots_reaches_evacuations() {
     let node = NodeId::new();

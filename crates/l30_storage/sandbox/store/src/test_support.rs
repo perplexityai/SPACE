@@ -16,6 +16,9 @@
 //! variants), a list out of declaration order and an entry dropped from
 //! either list. A variant appended after the last one, or a tombstone given
 //! a position but not listed, still has to be listed by hand.
+//!
+//! Its submodules expose some of this crate's production statements to other
+//! crates' tests.
 
 use pplx_space_sandbox_model::SandboxLifecycle;
 
@@ -196,6 +199,9 @@ pub fn known_defects<W, const N: usize>(matrix: &[(&str, [(W, Expect); N])]) -> 
         .filter(|(_, expect)| *expect == Expect::KnownDefect)
         .count()
 }
+
+pub mod admin_occupancy;
+pub mod sweeper;
 
 #[cfg(test)]
 mod tests;

@@ -68,7 +68,7 @@ use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId, SnapshotName};
 use crate::db::LocalArtifactRow;
 use crate::db::local_artifact_leases as leases;
 pub(crate) use crate::db::local_artifact_leases::NamedArtifactPublication;
-pub use crate::db::local_artifact_leases::{ArtifactState, ParseArtifactStateError, PendingBackup};
+pub(crate) use crate::db::local_artifact_leases::{ArtifactState, PendingBackup};
 
 /// Reason a checkout (restore or delete) failed.
 #[derive(Debug, thiserror::Error)]

@@ -2864,10 +2864,7 @@ mod failed_cleanup_stop_route;
 
 mod postgres_backed {
 
-    use super::super::store::{
-        LIST_COMMAND_READY_PENDING_SQL, NOTE_FAILED_CLEANUP_ATTEMPT_SQL,
-        failed_active_execution_scope, list_unrestorable_restoring_query,
-    };
+    use super::super::store::failed_active_execution_scope;
     use super::*;
     use pplx_space_accounts::NodeId;
     use pplx_space_db_test_fixtures::try_pg_test_db;
@@ -2875,9 +2872,13 @@ mod postgres_backed {
     use pplx_space_sandbox_model::SandboxId;
     use pplx_space_sandbox_model::SandboxLifecycle;
     use pplx_space_sandbox_store::sweeper::{
-        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL,
-        REPAIR_FAILED_ACTIVE_EXECUTION_SQL, converge_restoring_query, fail_candidate_query,
-        fail_unrestorable_restoring_query, list_aged_transient_query, revert_to_suspended_query,
+        AgedTransientRow, fail_unrestorable_restoring_query, list_aged_transient_query,
+        list_unrestorable_restoring_query,
+    };
+    use pplx_space_sandbox_store::test_support::sweeper::{
+        HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
+        REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
+        converge_restoring_query, fail_candidate_query, revert_to_suspended_query,
         undo_revert_to_suspended_query,
     };
     use pplx_space_snapshot_model::SnapshotId;
@@ -5399,8 +5400,8 @@ mod postgres_backed {
     }
 
     /// The failed-cleanup statements bind the Kubernetes substrate: a direct
-    /// row with the same failed-with-active-execution shape is not listed,
-    /// not rotated, and not repaired.
+    /// row with the same failed-with-active-execution shape is not listed
+    /// and not repaired.
     #[tokio::test(flavor = "current_thread")]
     async fn r21_failed_cleanup_statements_skip_direct_rows() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
@@ -5435,17 +5436,6 @@ mod postgres_backed {
             .map(|row| row.id)
             .collect();
         assert_eq!(listed, vec![k8s]);
-
-        let rotated = |sandbox_id: SandboxId| async move {
-            sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)
-                .bind(sandbox_id)
-                .bind(kubernetes)
-                .execute(pool)
-                .await
-                .map(|result| result.rows_affected())
-        };
-        assert_eq!(rotated(direct).await?, 0, "a direct row is not rotated");
-        assert_eq!(rotated(k8s).await?, 1);
 
         let repaired = |sandbox_id: SandboxId| async move {
             sqlx::query_scalar::<_, SandboxId>(REPAIR_FAILED_ACTIVE_EXECUTION_SQL)

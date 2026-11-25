@@ -47,7 +47,9 @@
 //! is the one every aborted campaign gets, returning in-flight items whose
 //! leases lapsed to pending. The admin API refuses to start one, so only a
 //! campaign started some other way, or by a newer API during a rollout, can
-//! be in that state.
+//! be in that state. A campaign whose kind this build doesn't know at all is
+//! logged and skipped by the store before the loop sees it, though an aborted
+//! one's lapsed in-flight items are still returned to pending.
 //!
 //! An operator's abort leaves a campaign's in-flight items to drain: their
 //! workers can't renew a finished campaign's lease, so each drops its work

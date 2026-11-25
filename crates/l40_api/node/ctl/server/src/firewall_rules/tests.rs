@@ -71,9 +71,9 @@ impl Node {
         let service = NodeCtlService::new(
             tx.clone(),
             crate::ClusterReconcileTrigger::new(tx, NODE),
-            Arc::new(std::sync::Mutex::new(
-                rusqlite::Connection::open_in_memory().expect("open in-memory SQLite"),
-            )),
+            pplx_space_node_ctl_store::database::SharedConnection::new(
+                pplx_space_node_ctl_store::database::Connection::open_in_memory(),
+            ),
             Some(wake),
         );
         Self {
@@ -240,6 +240,7 @@ async fn each_wake_syncs_only_a_fetched_assignment_at_most_once() {
             pending_round: Some(FirewallRulesPendingRound {
                 round: 1,
                 issued_at: None,
+                assignment_generation: Some(1),
             }),
         }))
         .unwrap();

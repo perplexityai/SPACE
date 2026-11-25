@@ -157,34 +157,19 @@ impl K8sStore {
         pod_uid: &PodUid,
         pod_ip: PodIp,
     ) -> Result<bool, SubstrateError> {
-        let result = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET pod_ip = $1::INET,
-                 state = CASE WHEN state = 'created' THEN 'running' ELSE state END,
-                 updated_at = CASE
-                     WHEN pod_ip IS DISTINCT FROM $1::INET OR state = 'created' THEN NOW()
-                     ELSE updated_at
-                 END
-             WHERE sandbox_id = $2
-               AND generation = $3
-               AND active
-               AND pod_name = $4
-               AND COALESCE(route_activation_id, activation_attempt_id) = $5
-               AND NULLIF(BTRIM(pod_uid), '') = $6
-             RETURNING 1"
-        ))
-        .bind(pod_ip.to_string())
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(pod_name)
-        .bind(route_activation_id.as_uuid())
-        .bind(pod_uid.as_str())
-        .fetch_optional(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::pod_placement::refresh_selected_route_pod_ip(
+            &self.pool,
+            sandbox_id,
+            generation,
+            pod_name,
+            route_activation_id,
+            pod_uid.as_str(),
+            &pod_ip.to_string(),
+        )
         .await
         .map_err(|err| SubstrateError::Failed {
             message: format!("failed to persist selected Kubernetes route pod IP: {err}"),
-        })?;
-        Ok(result.is_some())
+        })
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn claim_active_execution_pod_materialization(
@@ -204,25 +189,12 @@ impl K8sStore {
 
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
         // held one, so the record that a pod ran outlives the UID.
-        let claimed = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET state = CASE WHEN state = 'recovering' THEN state ELSE 'creating' END,
-                 pod_uid = NULL,
-                 pod_ip = NULL,
-                 pod_materialized_at = COALESCE(
-                     pod_materialized_at,
-                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
-                 ),
-                 updated_at = NOW()
-             WHERE sandbox_id = $1 AND generation = $2 AND active
-             RETURNING 1"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .fetch_optional(&mut *tx)
-        .await
-        .db_context("failed to claim pod materialization")?
-        .is_some();
+        let claimed =
+            pplx_space_sandbox_store::k8s_executions::pod_placement::claim_pod_materialization(
+                &mut tx, sandbox_id, generation,
+            )
+            .await
+            .db_context("failed to claim pod materialization")?;
 
         tx.commit()
             .await

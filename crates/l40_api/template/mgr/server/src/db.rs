@@ -1,25 +1,21 @@
 use std::path::Path;
 
-use rusqlite::{Connection, Result, params};
-
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_net_common::NetworkPolicyV1;
 pub use pplx_space_policy_authority::PolicyAuthority;
-use pplx_space_sql_locator::sql;
 use pplx_space_template_mgr_store::builds::{self, TemplateBuildRow};
 use pplx_space_template_mgr_store::database;
 use pplx_space_template_mgr_store::node_dirty_refs::{self, NodeDirtyRefRow};
 use pplx_space_template_mgr_store::template_local_state;
+pub(crate) use pplx_space_template_mgr_store::{
+    Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction,
+};
 use pplx_space_template_mgr_store::{network_policy_notifications, pins};
 
 pub const DB_PATH: &str = pplx_space_host_layout::paths::TEMPLATE_MANAGER_DB;
 
 pub fn open() -> Result<Connection, database::SqliteError> {
     database::open(Path::new(DB_PATH))
-}
-
-fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
-    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
 }
 
 #[cfg(test)]
@@ -29,24 +25,24 @@ pub fn init_in_memory(conn: &mut Connection) {
         .chain(database::MIGRATOR.iter())
         .filter(|migration| migration.migration_type.is_up_migration())
     {
-        conn.execute_batch(migration.sql.as_ref()).unwrap();
+        conn.raw().execute_batch(migration.sql.as_ref()).unwrap();
     }
 }
 
 /// In-memory SQLite connection with the template-manager schema applied, for tests.
 #[cfg(test)]
 pub(crate) fn test_conn() -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory();
     init_in_memory(&mut conn);
     conn
 }
 
 pub(crate) use pplx_space_template_mgr_store::now;
 
-pub(crate) fn mutex_poison_error(context: &'static str) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+pub(crate) fn mutex_poison_error(context: &'static str) -> Error {
+    Error::to_sql_conversion(std::io::Error::other(format!(
         "{context}: sqlite mutex poisoned"
-    ))))
+    )))
 }
 
 fn saturating_u64_to_i64(value: u64) -> i64 {
@@ -74,7 +70,9 @@ pub struct BuildRow {
     pub arch: String,
     pub artifact_size_bytes: u64,
     pub state: String,
+    #[cfg(test)]
     pub owner_type: String,
+    #[cfg(test)]
     pub owner_id: String,
     pub execution_metadata_json: Option<String>,
 }
@@ -138,7 +136,9 @@ impl From<TemplateBuildRow> for BuildRow {
             arch: row.arch,
             artifact_size_bytes: row.artifact_size_bytes,
             state: row.state,
+            #[cfg(test)]
             owner_type: row.owner_type,
+            #[cfg(test)]
             owner_id: row.owner_id,
             execution_metadata_json: row.execution_metadata_json,
         }
@@ -221,20 +221,19 @@ fn normalize_build_date(s: &str) -> String {
     s.to_string()
 }
 
-fn invalid_build_upsert(message: &'static str) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+fn invalid_build_upsert(message: &'static str) -> Error {
+    Error::to_sql_conversion(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         message,
-    )))
+    ))
 }
 
 pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     let manifest: pplx_space_template_manifest::TemplateManifest =
-        serde_json::from_str(b.manifest_json)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        serde_json::from_str(b.manifest_json).map_err(Error::to_sql_conversion)?;
     let execution = manifest
         .execution_metadata()
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        .map_err(Error::to_sql_conversion)?;
     if let Some(execution) = execution {
         let runtime_matches = pplx_space_execution_spec::RuntimeKind::parse(b.runtime)
             .is_ok_and(|runtime| runtime == execution.runtime().kind);
@@ -268,7 +267,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
     let execution_json = execution
         .map(serde_json::to_string)
         .transpose()
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        .map_err(Error::to_sql_conversion)?;
     let runtime_version = execution.map(|value| value.runtime().version.as_str());
     let guest_os = execution.map(|value| value.guest().os.as_str());
     let state_format_name = execution
@@ -313,7 +312,7 @@ pub fn upsert_build(conn: &Connection, b: &BuildUpsert<'_>) -> Result<()> {
             format: component.format.as_ref().map(|value| value.as_str()),
         })
         .collect();
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     if !builds::upsert_build(&tx, &row, &components)? {
         tracing::warn!(
             template = b.name,
@@ -357,7 +356,7 @@ pub fn touch_build(
     builds::touch_build(conn, name, content_hash, cache_partition, &ts)
 }
 
-pub use pplx_space_template_mgr_store::builds::BuildEvictionRow;
+pub(crate) use pplx_space_template_mgr_store::builds::BuildEvictionRow;
 
 /// Return every `ready` build with the timestamps the eviction
 /// planner needs. The planner is purely functional, so this is the
@@ -384,10 +383,10 @@ pub(crate) fn set_last_used_at_for_test(
     content_hash: &str,
     last_used_at_secs: u64,
 ) -> Result<()> {
-    conn.execute(
+    conn.raw().execute(
         "UPDATE template_builds SET last_used_at = ?3
          WHERE name = ?1 AND content_hash = ?2",
-        params![name, content_hash, last_used_at_secs.to_string()],
+        rusqlite::params![name, content_hash, last_used_at_secs.to_string()],
     )?;
     Ok(())
 }
@@ -416,7 +415,7 @@ pub fn delete_build(
 }
 
 pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     template_local_state::delete_template_rows(&tx, name)?;
     tx.commit()?;
     Ok(())
@@ -426,7 +425,7 @@ pub fn delete_template_local_state(conn: &Connection, name: &str) -> Result<()> 
 /// so a build a concurrent pull just recorded keeps its settings. Returns
 /// whether it deleted.
 pub fn delete_template_local_state_without_builds(conn: &Connection, name: &str) -> Result<bool> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     if template_local_state::template_has_builds(&tx, name)? {
         return Ok(false);
     }
@@ -512,24 +511,24 @@ pub fn list_build_partitions(conn: &Connection, name: &str) -> Result<Vec<Templa
 
 // ── Snapshots ──────────────────────────────────────────────────────────────
 
-pub use pplx_space_template_mgr_store::snapshots::{
+pub(crate) use pplx_space_template_mgr_store::snapshots::{
     SnapshotKey, SnapshotRow, delete_snapshot, delete_snapshots_for_build, get_snapshot,
     list_snapshots, upsert_snapshot,
 };
 
 // ── Pools ──────────────────────────────────────────────────────────────────
 
-pub use pplx_space_template_mgr_store::pools::{
+pub(crate) use pplx_space_template_mgr_store::pools::{
     PoolRow, delete_pool, get_all_pools, get_pool, insert_pool,
 };
 
 // ── Template settings ──────────────────────────────────────────────────────
 
-pub use pplx_space_template_mgr_store::template_settings::{
-    TemplateNetworkPolicyUpdate, TemplateNetworkPolicyUpsertError, TemplateSettingsPolicies,
-    TemplateSettingsRow, get_template_settings, list_template_settings,
-    list_template_snapshot_policies, record_snapshot_reconcile_completed,
-    record_snapshot_reconcile_started, update_template_snapshot_policy,
+pub(crate) use pplx_space_template_mgr_store::template_settings::{
+    TemplateNetworkPolicyUpdate, TemplateNetworkPolicyUpsertError, TemplateSettingsRow,
+    get_template_settings, list_template_settings, list_template_snapshot_policies,
+    record_snapshot_reconcile_completed, record_snapshot_reconcile_started,
+    update_template_snapshot_policy,
 };
 use pplx_space_template_mgr_store::template_settings::{
     try_update_template_network_policy_tx, upsert_template_settings_tx,
@@ -540,7 +539,7 @@ pub fn upsert_template_settings(
     template: &str,
     default_auto_lifecycle: &AutoLifecyclePolicy,
 ) -> Result<()> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     upsert_template_settings_tx(
         &tx,
         template,
@@ -566,7 +565,7 @@ pub fn try_upsert_template_network_policy(
     default_network_policy_generation: u64,
     authority: PolicyAuthority,
 ) -> std::result::Result<bool, TemplateNetworkPolicyUpsertError> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let decision = try_update_template_network_policy_tx(
         &tx,
         template,
@@ -592,7 +591,7 @@ pub fn update_template_settings_with_outbox(
     conn: &Connection,
     update: TemplateSettingsUpdate<'_>,
 ) -> std::result::Result<TemplateSettingsUpdateOutcome, TemplateNetworkPolicyUpsertError> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let mut auto_lifecycle_applied = false;
     if let Some(policy) = update.default_auto_lifecycle {
         auto_lifecycle_applied = upsert_template_settings_tx(
@@ -649,7 +648,7 @@ pub fn update_template_settings_with_outbox(
 }
 
 fn enqueue_node_dirty_network_policy_template_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     template: &str,
 ) -> Result<bool> {
     let ts = now();
@@ -658,16 +657,13 @@ fn enqueue_node_dirty_network_policy_template_tx(
 }
 
 pub fn enqueue_node_dirty_template_inventory(conn: &Connection, template: &str) -> Result<bool> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let queued = enqueue_node_dirty_template_inventory_tx(&tx, template)?;
     tx.commit()?;
     Ok(queued)
 }
 
-fn enqueue_node_dirty_template_inventory_tx(
-    tx: &rusqlite::Transaction<'_>,
-    template: &str,
-) -> Result<bool> {
+fn enqueue_node_dirty_template_inventory_tx(tx: &Transaction<'_>, template: &str) -> Result<bool> {
     let ts = now();
     let changed = node_dirty_refs::enqueue_template_inventory(tx, template, &ts)?;
     Ok(changed != 0)
@@ -676,14 +672,14 @@ fn enqueue_node_dirty_template_inventory_tx(
 /// Acknowledge only the obligations read before sending. A newer enqueue, even
 /// for a previously deleted key, remains pending for the worker's next retry.
 pub fn delete_node_dirty_refs(conn: &Connection, refs: &[NodeDirtyRefRow]) -> Result<usize> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let deleted = node_dirty_refs::delete_node_dirty_refs_at_revision(&tx, refs)?;
     tx.commit()?;
     Ok(deleted)
 }
 
 fn enqueue_template_network_policy_notification_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     template: &str,
 ) -> Result<bool> {
     let ts = now();
@@ -722,23 +718,15 @@ pub fn delete_template_network_policy_notifications(
     conn: &Connection,
     rows: &[TemplateNetworkPolicyNotificationRow],
 ) -> Result<usize> {
-    let tx = immediate_transaction(conn)?;
+    let tx = Transaction::immediate(conn)?;
     let mut deleted = 0;
     for row in rows {
-        deleted += tx.execute(
-            sql!(
-                "DELETE FROM template_network_policy_notifications
-             WHERE template = ?1
-               AND generation = ?2
-               AND authority = ?3
-               AND policy_json = ?4"
-            ),
-            params![
-                row.template,
-                saturating_u64_to_i64(row.generation),
-                row.authority.as_str(),
-                row.policy_json
-            ],
+        deleted += network_policy_notifications::acknowledge(
+            &tx,
+            &row.template,
+            row.generation,
+            row.authority,
+            &row.policy_json,
         )?;
     }
     tx.commit()?;

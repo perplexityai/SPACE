@@ -13,14 +13,17 @@
 //! is locked first either way.
 
 use pplx_space_accounts::ClientId;
-use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_model::SandboxId;
+#[cfg(test)]
+use pplx_space_sandbox_model::SandboxLifecycle;
 use pplx_space_sql_locator::sql;
 
 /// Lifecycles in which no activation can be creating a runtime. The record
 /// isn't written in them, so a teardown, a stop or a suspend that observes a
 /// pod doesn't re-attribute the sandbox. The typed lifecycles here are exactly
-/// those [`attributes_runtime`] rejects; `deleted` and `cleanup_required` are
-/// stored states with no [`SandboxLifecycle`] variant.
+/// those `attributes_runtime` rejects; `deleted` and `cleanup_required` are
+/// stored states with no
+/// [`SandboxLifecycle`](pplx_space_sandbox_model::SandboxLifecycle) variant.
 pub const UNATTRIBUTED_LIFECYCLES: [&str; 7] = [
     "deleting",
     "deleted",
@@ -35,7 +38,8 @@ pub const UNATTRIBUTED_LIFECYCLES: [&str; 7] = [
 /// `lifecycle`, so pod tracking may write its record. Exhaustive, so a new
 /// lifecycle has to be classified here; a test keeps
 /// [`UNATTRIBUTED_LIFECYCLES`] in step with it.
-pub const fn attributes_runtime(lifecycle: SandboxLifecycle) -> bool {
+#[cfg(test)]
+pub(crate) const fn attributes_runtime(lifecycle: SandboxLifecycle) -> bool {
     match lifecycle {
         SandboxLifecycle::Created
         | SandboxLifecycle::Creating
@@ -83,6 +87,7 @@ pub async fn set_activating_client(
 
 /// The sandbox's current record, read without a lock: `Ok(None)` when the
 /// sandbox is gone, `Ok(Some(None))` when nothing is recorded.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn activating_client(
     executor: impl sqlx::PgExecutor<'_>,
     sandbox_id: SandboxId,

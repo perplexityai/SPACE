@@ -103,7 +103,7 @@ pub enum ArtifactEntryRoleError {
     /// Empty role — every entry must carry a distinguishing label.
     #[error("artifact entry role must not be empty")]
     Empty,
-    /// Longer than [`MAX_ENTRY_ROLE_LEN`] bytes.
+    /// Longer than `MAX_ENTRY_ROLE_LEN` bytes.
     #[error("artifact entry role exceeds {MAX_ENTRY_ROLE_LEN} bytes")]
     TooLong,
     /// Contains a NUL byte, which would collide with the NUL

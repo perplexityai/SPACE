@@ -1007,8 +1007,8 @@ pub fn mark_suspending_quarantined(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn mark_starting_quarantined(
+#[cfg(test)]
+pub(crate) fn mark_starting_quarantined(
     conn: &Connection,
     id: &str,
     reason_code: SandboxQuarantineReasonCode,
@@ -1026,7 +1026,7 @@ pub fn mark_starting_quarantined(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn mark_restoring_quarantined(
+pub(crate) fn mark_restoring_quarantined(
     conn: &Connection,
     id: &str,
     reason_code: SandboxQuarantineReasonCode,
@@ -1043,13 +1043,13 @@ pub fn mark_restoring_quarantined(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn rollback_starting(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
+#[cfg(test)]
+pub(crate) fn rollback_starting(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
     rollback_activation_state(conn, id, SandboxState::Starting, state)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn rollback_restoring(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
+#[cfg(test)]
+pub(crate) fn rollback_restoring(conn: &Connection, id: &str, state: SandboxState) -> Result<bool> {
     rollback_activation_state(conn, id, SandboxState::Restoring, state)
 }
 

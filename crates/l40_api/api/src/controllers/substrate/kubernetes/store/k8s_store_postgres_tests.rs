@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db_with_max_connections};
 use pplx_space_k8s_node_id::space_k8s_node_id;
-use pplx_space_sandbox_portability::portable_for_restore_affinity;
+use pplx_space_sandbox_portability::{fresh_ready_snapshot_exists, portable_for_restore_affinity};
 use time::OffsetDateTime;
 
 use super::*;
@@ -15,6 +15,8 @@ use super::*;
 use pplx_space_test_env::TestResult;
 
 mod cleanup_recovery_lifecycle_matrix_tests;
+mod delete_publication_lock_order_tests;
+mod drain_recovery_gate_tests;
 mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod node_registration_tests;
@@ -1630,7 +1632,7 @@ async fn started_recovery_does_not_recreate_execution_after_teardown() -> TestRe
         tokio::spawn(async move { recovery_store.claim_started_recovery(sandbox_id).await });
     wait_for_blocked_query(
         &fixture.pool,
-        "%SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE%",
+        "%SELECT s.lifecycle, n.drain_engine%FOR UPDATE OF s%",
         None,
     )
     .await?;
@@ -1683,7 +1685,7 @@ async fn started_recovery_maps_concurrent_suspend_to_retryable_deferral() -> Tes
         tokio::spawn(async move { recovery_store.claim_started_recovery(sandbox_id).await });
     wait_for_blocked_query(
         &fixture.pool,
-        "%SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE%",
+        "%SELECT s.lifecycle, n.drain_engine%FOR UPDATE OF s%",
         None,
     )
     .await?;
@@ -1795,7 +1797,7 @@ async fn concurrent_claim_loses_to_cleanup_recovery(lifecycle: SandboxLifecycle)
     });
     wait_for_blocked_query(
         &fixture.pool,
-        "%SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE%",
+        "%SELECT s.lifecycle, n.drain_engine%FOR UPDATE OF s%",
         None,
     )
     .await?;

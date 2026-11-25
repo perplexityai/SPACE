@@ -217,7 +217,7 @@ pub fn startup_transient_cleanup_reason(state: impl Into<SandboxStatus>) -> Stri
 }
 
 /// The `(keep_filesystem, completion)` cleanup that startup recovery owes
-/// `row`, if any: [`cleanup_intent_for_startup_recovery`], except that a
+/// `row`, if any: `cleanup_intent_for_startup_recovery`, except that a
 /// `suspending` row whose runtime is still live under an active
 /// teardown-suspend job is left to that job. The job backs up the staged
 /// capture, then finalizes the runtime. Marking the row `suspended` instead

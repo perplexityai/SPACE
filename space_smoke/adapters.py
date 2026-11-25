@@ -1280,6 +1280,7 @@ class KindHarness:
         body: dict[str, object] | None = None,
         *,
         expected: tuple[int, ...] = (200, 201, 202, 204),
+        idempotency_key: str | None = None,
     ) -> Any:
         self._require_isolated_kind("admin smoke operations")
         token_file = self.environment.get("SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE")
@@ -1294,7 +1295,7 @@ class KindHarness:
             headers={
                 "Authorization": "Bearer " + token,
                 "Content-Type": "application/json",
-                "Idempotency-Key": str(uuid.uuid4()),
+                "Idempotency-Key": idempotency_key or str(uuid.uuid4()),
             },
             data=json.dumps(body).encode() if body is not None else None,
         )

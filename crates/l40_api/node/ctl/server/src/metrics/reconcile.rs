@@ -1,6 +1,7 @@
-//! node-ctl's reconcile metrics: queue claims, desired-state application and
-//! auto-lifecycle delete delivery. The facet-keyed queue and run metrics every
-//! reconciling service shares are in `pplx-space-reconcile-metrics`.
+//! node-ctl's reconcile metrics: queue claims, desired-state application,
+//! port exposure apply-state publication and auto-lifecycle delete delivery.
+//! The facet-keyed queue and run metrics every reconciling service shares are
+//! in `pplx-space-reconcile-metrics`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -88,6 +89,27 @@ pub fn desired_state_apply(result: DesiredStateApplyResult) {
         1,
         &[tag("result", result.as_str())],
     );
+}
+
+/// `reconcile.port_exposure_apply_state_publish`: port exposure apply-state
+/// reports node-ctl's sandbox desired-state facet sync published and
+/// cluster-api answered, counted per report on each publish attempt.
+/// `result:accepted|refused`. cluster-api refuses a report that names no
+/// exposure on this node, including when the sandbox was deleted or placed on
+/// another node while the report was in flight. Each sync re-sends the reports
+/// of the sandboxes it applies, so a report that keeps being refused counts
+/// again on every sync. A failed RPC counts nothing here; its client span and
+/// log carry it.
+pub fn port_exposure_apply_state_publish(accepted: u64, refused: u64) {
+    for (result, reports) in [("accepted", accepted), ("refused", refused)] {
+        if reports > 0 {
+            counter(
+                "reconcile.port_exposure_apply_state_publish",
+                reports,
+                &[tag("result", result)],
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

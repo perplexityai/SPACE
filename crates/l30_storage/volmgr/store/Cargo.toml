@@ -13,14 +13,28 @@ sqlite.volume-manager = ["jobs", "volume_attachments"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes the raw connection to volume-manager's test suites, which enable it
+# as a dev-dependency to seed and inspect rows directly.
+test-support = []
+
 [dependencies]
+ref-cast = { workspace = true }
 rusqlite = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 thiserror = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
 
 # internal
+pplx-space-common-jobs = { workspace = true }
 pplx-space-job-id = { workspace = true, features = ["rusqlite"] }
 pplx-space-sandbox-model = { workspace = true }
 pplx-space-snapshot-model = { workspace = true }
 pplx-space-sql-locator = { workspace = true }
 pplx-space-sqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

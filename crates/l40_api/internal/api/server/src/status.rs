@@ -47,12 +47,12 @@ use super::*;
 pub(super) async fn prune_absent_node_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    present_sandbox_ids: &[SandboxId],
+    locked_candidate_ids: &[SandboxId],
 ) -> Result<(), Status> {
     pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes(
         &mut *conn,
         node_id,
-        present_sandbox_ids,
+        locked_candidate_ids,
         FACET_NETWORK_POLICY,
     )
     .await

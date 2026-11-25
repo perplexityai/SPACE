@@ -20,7 +20,10 @@ use super::sweeper::{EvacuationRestoreTarget, EvacuationRestoreTargetParseError}
 
 mod activity_tests;
 mod create_finish_tests;
+mod direct_tests;
 mod insert_unplaced_tests;
+mod read_modules_tests;
+mod row_locks_tests;
 mod sibling_tables_tests;
 mod uuid_codec_tests;
 

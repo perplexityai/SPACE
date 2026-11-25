@@ -36,8 +36,8 @@ use super::*;
 use pplx_space_template_manifest::{TemplateManifest, TemplateMetadata};
 
 fn lock_recovery_db<'a>(
-    db: &'a Mutex<rusqlite::Connection>,
-) -> Result<std::sync::MutexGuard<'a, rusqlite::Connection>, String> {
+    db: &'a crate::db::SharedConnection,
+) -> Result<crate::db::ConnectionGuard<'a>, String> {
     db.lock()
         .map_err(|_| "template DB mutex poisoned".to_string())
 }
@@ -384,12 +384,12 @@ async fn verify_bootable_artifact_hash(
 }
 
 async fn lookup_build_row(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     name: &str,
     content_hash: &str,
     partition: crate::db::TemplateCachePartition,
 ) -> Result<Option<crate::db::BuildRow>, String> {
-    let db = Arc::clone(db);
+    let db = db.clone();
     let n = name.to_string();
     let h = content_hash.to_string();
     tokio::task::spawn_blocking(move || {
@@ -413,10 +413,10 @@ struct ValidatedBuildRow {
 }
 
 async fn insert_validated_build_row(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     row: ValidatedBuildRow,
 ) -> Result<(), String> {
-    let db = Arc::clone(db);
+    let db = db.clone();
     tokio::task::spawn_blocking(move || {
         let conn = lock_recovery_db(&db)?;
         crate::db::upsert_build(
@@ -441,12 +441,12 @@ async fn insert_validated_build_row(
 }
 
 async fn delete_stale_build_row(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     name: &str,
     content_hash: &str,
     partition: crate::db::TemplateCachePartition,
 ) -> Result<(), String> {
-    let db = Arc::clone(db);
+    let db = db.clone();
     let n = name.to_string();
     let h = content_hash.to_string();
     tokio::task::spawn_blocking(move || {
@@ -1018,7 +1018,7 @@ pub(super) fn build_staging_dir_is_stale(path: &Path) -> bool {
 /// `(content_hash, partition)` builds whose snapshots didn't all register,
 /// for the GC tick to retry.
 async fn reconcile_base_snapshots_for_template(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     name: &str,
     name_dir: &Path,
 ) -> Vec<(String, crate::db::TemplateCachePartition)> {
@@ -1067,7 +1067,7 @@ async fn reconcile_base_snapshots_for_template(
 /// so this registers nothing for a build without one. Returns how many it
 /// registered and the first error, if any snapshot failed to read or record.
 async fn reconcile_base_snapshots_for_build(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     name: &str,
     snap_hash: &str,
     partition: crate::db::TemplateCachePartition,
@@ -1082,7 +1082,7 @@ async fn reconcile_base_snapshots_for_build(
     let mut first_error = read_error;
     let mut registered = 0;
     for (vcpu, memory_mib, snap_hash_val) in snapshots {
-        let db = Arc::clone(db);
+        let db = db.clone();
         let n = name.to_string();
         let h = snap_hash.to_string();
         let config_dir = snap_hash_dir.join(format!("{vcpu}vcpu-{memory_mib}mib"));
@@ -1133,7 +1133,7 @@ async fn reconcile_base_snapshots_for_build(
 /// so a dir read before a prune may be gone by now; checking under the DB
 /// lock keeps a row from coming back over files that went.
 fn upsert_snapshot_if_present(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     key: crate::db::SnapshotKey<'_>,
     snapshot_hash: &str,
     config_dir: &Path,
@@ -1214,10 +1214,10 @@ fn read_base_snapshot_dirs(dir: &Path) -> (Vec<(u32, u32, String)>, Option<Strin
 }
 
 async fn prune_catalog_rows_missing_on_disk(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     artifact_store: &TemplateArtifactStore,
 ) {
-    let db = Arc::clone(db);
+    let db = db.clone();
     let artifact_store = artifact_store.clone();
     match tokio::task::spawn_blocking(move || {
         let Ok(conn) = db.lock() else {
@@ -1257,12 +1257,13 @@ async fn prune_catalog_rows_missing_on_disk(
                     content_hash = %content_hash,
                     "stuck 'deleting' template build: artifacts intact, restoring to 'ready'"
                 );
-                let _ = conn.execute(
-                    "UPDATE template_builds SET state = 'ready'
-                     WHERE name = ?1 AND content_hash = ?2 AND cache_partition = ?3
-                       AND state = 'deleting'",
-                    rusqlite::params![name, content_hash, partition.key()],
-                );
+                let _ =
+                    pplx_space_template_mgr_store::eviction::startup_reset_deleting_build_to_ready(
+                        &conn,
+                        name,
+                        content_hash,
+                        *partition,
+                    );
             }
         }
 
@@ -1327,7 +1328,7 @@ async fn prune_catalog_rows_missing_on_disk(
         }
 
         drop(conn);
-        match crate::pinned_digests::PinnedDigestsStore::new(Arc::clone(&db))
+        match crate::pinned_digests::PinnedDigestsStore::new(db.clone())
             .prune_without_local_builds()
         {
             Ok(pruned) if pruned > 0 => {
@@ -1381,7 +1382,7 @@ fn parse_build_dir_name(dir_name: &str) -> Option<(&str, crate::db::TemplateCach
 /// waits for a later tick.
 fn rowless_build_dirs(
     root: &Path,
-    db: &Mutex<rusqlite::Connection>,
+    db: &crate::db::SharedConnection,
     puller: &crate::volume::VolumePuller,
 ) -> Vec<(String, String, PathBuf)> {
     let mut dirs = Vec::new();
@@ -1485,7 +1486,7 @@ impl TemplateManagerService {
             .lock()
             .map(|cursor| cursor.clone())
             .unwrap_or_default();
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let puller = self.volume_puller.clone();
         let scan = tokio::task::spawn_blocking(move || {
             let rowless = rowless_build_dirs(&root, &db, &puller);
@@ -1888,7 +1889,7 @@ impl TemplateManagerService {
         {
             match self.pool_handle.lock() {
                 Ok(mut handle) if handle.is_none() => {
-                    let db = Arc::clone(&self.db);
+                    let db = self.db.clone();
                     *handle = Some(tokio::spawn(crate::pool_manager::pool_loop(db)));
                     tracing::debug!("pool manager loop started");
                 }

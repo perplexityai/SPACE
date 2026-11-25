@@ -49,7 +49,10 @@ async fn worker_selection_reads_only_direct_nodes() -> TestResult {
     .await?;
     let only_direct = HashSet::from([direct]);
 
-    let ready = fixture.substrate.random_ready_nodes("worker").await?;
+    let ready = fixture
+        .substrate
+        .random_ready_nodes(SpaceNodeRole::Worker)
+        .await?;
     assert_eq!(node_ids(&ready), only_direct, "cached-ready node selection");
 
     assert_eq!(

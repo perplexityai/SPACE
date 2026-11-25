@@ -122,11 +122,17 @@ For new work:
   instead of ANDing the running value. Never choose a runtime endpoint from
   a row's label.
 - `node_direct`, `sandbox_direct_route_identities` and
-  `sandbox_direct_route_provenance` are Direct's tables. Outside tests, write
-  them only from `direct.rs` and the Direct node registry, and read them
-  through an existing query that joins them (archcheck's
-  `pattern_ratchet.direct_tables` fails a new use outside `direct.rs` and
-  `direct/`; its baseline lists today's).
+  `sandbox_direct_route_provenance` are Direct's tables, owned by
+  `pplx-space-direct-store`. Outside tests, write the route-identity and
+  provenance tables only from `direct.rs`, through that store's verbs,
+  and `node_direct` only from the Direct node registry
+  (`routes/admin/node_maintenance.rs`), through
+  `pplx-space-direct-coordinator`, which writes it together with `nodes`.
+  Elsewhere, read them only through an existing query that joins them
+  (archcheck's `pattern_ratchet.direct_tables` fails a new use, or a new
+  mention of the store's or the coordinator's crate, outside `direct.rs`,
+  `direct/`, the store, the coordinator and a storage crate's `direct`
+  module (`src/direct.rs`, `src/direct/`); its baseline lists today's).
 - Direct-table joins in shared code, `Unsupported` trait defaults
   (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`,
   `select_ready_worker_node_api_target`) and `supports_node_drain`, a

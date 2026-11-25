@@ -414,7 +414,7 @@ pub(super) fn teardown_owns_suspending_row(conn: &Connection, row: &SandboxRow) 
 }
 
 /// A `suspending` row an active teardown-suspend job owns, with the job's
-/// execution generation (see [`teardown_owned_suspending_rows`]).
+/// execution generation (see [`scan::teardown_owned_suspending`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TeardownOwnedSuspendingRow {
     pub sandbox_id: String,

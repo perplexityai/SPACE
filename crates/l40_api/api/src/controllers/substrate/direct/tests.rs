@@ -11,6 +11,7 @@ use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_node_model::{NodeManagedBy, NodePoolName};
 use pplx_space_sandbox_store::test_support::stored_lifecycle_matrix;
 use pplx_space_snapshot_model::{ArtifactKind, LocalArtifactId};
+use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateName;
 use sqlx::PgPool;
 

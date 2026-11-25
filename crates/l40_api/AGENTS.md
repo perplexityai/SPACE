@@ -2,8 +2,8 @@
 
 Use cases and their entry points (handlers, loops, sweepers, jobs), and each
 service's `*-client`. An API crate depends on API, Domain and Foundation
-crates and on the stores that list it as a user; a client depends only on
-Domain, Foundation and other clients.
+crates and on the stores and coordinators that list it as a user; a client
+depends only on Domain, Foundation and other clients.
 
 - Belongs: `pplx-space-sbx-mgr` (path `sbx/mgr/server`), the sandbox manager
   service; `pplx-space-sbx-mgr-client` (path `sbx/mgr/client`), its client. A

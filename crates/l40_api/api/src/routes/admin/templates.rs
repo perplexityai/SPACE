@@ -1,9 +1,6 @@
 use pplx_space_accounts::{NodeId, OrgId};
 
-use pplx_space_sql_locator::sql;
-use pplx_space_template_release_original::{digest_original, spelling_original};
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::{
@@ -16,8 +13,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
+use pplx_space_cluster_trigger_queue::enqueue_triggers_tx;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_node_registration_store::direct::registry as direct_registry;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope,
     RequestFingerprint,
@@ -27,7 +26,6 @@ use pplx_space_template_model::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, types::Json as SqlxJson};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -64,7 +62,6 @@ use crate::{
         ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx,
         requeue_node_reconcile_refs_for_nodes_tx,
     },
-    reconcile_trigger::enqueue_triggers_tx,
     routes::{
         AppState,
         admin::{
@@ -81,7 +78,7 @@ type ApiErrorResponse = (StatusCode, Json<PublicErrorEnvelope>);
 type TemplateRow =
     pplx_space_template_store::templates::AdminTemplate<Vec<crate::models::SnapshotInfoResponse>>;
 
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 struct TemplateReleaseRow {
     id: Uuid,
     template_name: String,
@@ -100,15 +97,6 @@ impl From<pplx_space_template_release_store::lookup::VisibleRelease> for Templat
             created_at: release.created_at,
         }
     }
-}
-
-#[derive(Debug, FromRow)]
-struct BaseSnapshotPolicyRow {
-    template: String,
-    ensure_base_snapshot: bool,
-    snapshot_vcpu: i32,
-    snapshot_memory_mib: i32,
-    updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Serialize)]
@@ -376,23 +364,18 @@ async fn fetch_template(
     pool: &sqlx::PgPool,
     template_name: &TemplateName,
 ) -> Result<Option<TemplateRow>, sqlx::Error> {
-    Ok(fetch_template_rows(pool, Some(template_name))
-        .await?
-        .into_iter()
-        .next())
-}
-
-async fn fetch_template_rows(
-    pool: &sqlx::PgPool,
-    template_name: Option<&TemplateName>,
-) -> Result<Vec<TemplateRow>, sqlx::Error> {
-    pplx_space_template_store::templates::list_admin(pool, template_name).await
+    Ok(
+        pplx_space_template_store::templates::list_admin(pool, Some(template_name))
+            .await?
+            .into_iter()
+            .next(),
+    )
 }
 
 /// The node-discovery read this module's reconcile enqueues begin with.
 ///
-/// `reconcile_trigger` carries its own near-copy of the predicate for a
-/// different call shape; this is not the only place it appears.
+/// `pplx_space_cluster_trigger_queue::fetch_trigger_targets` carries its own near-copy
+/// of the predicate for a different call shape; this is not the only place it appears.
 ///
 /// Separate from the enqueue writes because the two do not classify the same
 /// way. It reads `nodes` and `node_direct` and writes nothing, so on a request
@@ -408,19 +391,7 @@ async fn fetch_template_rows(
 async fn reconcile_target_node_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT DISTINCT n.id
-         FROM nodes n
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         WHERE n.role IN ('worker', 'builder')
-           AND (
-             n.managed_by != $1
-             OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
-           )"
-    ))
-    .bind(SubstrateKind::Space)
-    .fetch_all(&mut **tx)
-    .await
+    direct_registry::live_worker_and_builder_ids(&mut **tx, SubstrateKind::Space).await
 }
 
 /// The enqueue writes, for a caller that already holds the node ids.
@@ -501,7 +472,7 @@ pub async fn list_templates(
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    match fetch_template_rows(&state.pool, None).await {
+    match pplx_space_template_store::templates::list_admin(&state.pool, None).await {
         Ok(rows) => {
             Json(rows.into_iter().map(template_response).collect::<Vec<_>>()).into_response()
         }
@@ -556,64 +527,16 @@ pub async fn create_template(
         Err(response) => return response.into_response(),
     };
     let create_result: Result<Option<TemplateRow>, sqlx::Error> = async {
-        let row = sqlx::query_as::<_, TemplateRow>(
-            sql!("INSERT INTO templates
-                 (id, name, description, org_id, desired_state, network_policy_json, network_policy_generation)
-             VALUES ($1, $2, $3, $4, $6, $5, 1)
-             ON CONFLICT (name) DO UPDATE
-             SET description = EXCLUDED.description,
-                 org_id = COALESCE(templates.org_id, EXCLUDED.org_id),
-                 desired_state = EXCLUDED.desired_state,
-                 delete_requested_at = NULL,
-                 delete_requested_by = NULL,
-                 delete_operation_id = NULL,
-                 network_policy_json = EXCLUDED.network_policy_json,
-                 network_policy_generation =
-                     templates.network_policy_generation
-                     + CASE WHEN templates.network_policy_json IS DISTINCT FROM EXCLUDED.network_policy_json
-                            THEN 1 ELSE 0 END,
-                 updated_at = NOW()
-             WHERE (templates.org_id IS NULL OR templates.org_id = EXCLUDED.org_id)
-               AND (
-                   templates.desired_state = $6
-                   OR (
-                       templates.desired_state = $7
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM node_template_inventory nti
-                           WHERE nti.template_name = EXCLUDED.name
-                       )
-                   )
-               )
-             RETURNING name, description, org_id, desired_state, network_policy_generation, created_at,
-                       NULL::TEXT AS built_at,
-                       NULL::TEXT AS content_hash,
-                       NULL::TEXT AS runtime,
-                       NULL::TEXT AS runtime_version,
-                       NULL::TEXT AS arch,
-                       NULL::BOOLEAN AS has_base_snapshot,
-                       NULL::INTEGER AS pool_target,
-                       NULL::INTEGER AS pool_current,
-                       NULL::BIGINT AS artifact_size_bytes,
-                       NULL::BIGINT AS cache_size_bytes,
-                       NULL::BIGINT AS base_snapshot_size_bytes,
-                       NULL::JSONB AS snapshots,
-                       NULL::INTEGER AS vcpu,
-                       NULL::INTEGER AS memory_mib,
-                       NULL::INTEGER AS disk_size_mb,
-                       NULL::JSONB AS default_auto_lifecycle,
-                       network_policy_json AS network_policy,
-                       NULL::BIGINT AS observed_network_policy_generation,
-                       NULL::TEXT AS observed_network_policy_authority"),
+        let row = pplx_space_template_store::templates::create_or_undelete(
+            &mut *tx,
+            pplx_space_template_store::templates::AdminCreate {
+                id: TemplateId::new(),
+                name: &template_name,
+                description: request.description.as_deref(),
+                org_id: managing_org_id,
+                network_policy: &request.network_policy,
+            },
         )
-        .bind(TemplateId::new().as_uuid())
-        .bind(template_name.as_str())
-        .bind(&request.description)
-        .bind(managing_org_id)
-        .bind(SqlxJson(&request.network_policy))
-        .bind(TemplateDesiredState::Present.as_str())
-        .bind(TemplateDesiredState::Deleted.as_str())
-        .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
             return Ok(None);
@@ -726,45 +649,23 @@ pub async fn update_template(
         }
 
         if let Some(policy) = &request.default_auto_lifecycle {
-            sqlx::query(sql!(
-                "INSERT INTO template_default_auto_lifecycle_policies
-                     (template, default_auto_lifecycle_json, updated_at)
-                 SELECT name, $2, NOW()
-                 FROM templates
-                 WHERE name = $1
-                   AND desired_state = $3
-                 ON CONFLICT (template) DO UPDATE
-                 SET default_auto_lifecycle_json = EXCLUDED.default_auto_lifecycle_json,
-                     updated_at = NOW()"
-            ))
-            .bind(template_name.as_str())
-            .bind(SqlxJson(policy))
-            .bind(TemplateDesiredState::Present.as_str())
-            .execute(&mut *tx)
+            pplx_space_template_store::default_auto_lifecycle_policies::upsert_if_present(
+                &mut *tx,
+                &template_name,
+                policy,
+            )
             .await
             .map_err(|error| (ContentionScope::Writing, error))?;
             scope = ContentionScope::Writing;
         }
 
         if let Some(policy) = &request.network_policy {
-            let updated = sqlx::query_scalar::<_, i64>(sql!(
-                "UPDATE templates
-                 SET network_policy_json = $2,
-                     network_policy_generation =
-                       CASE WHEN network_policy_json IS DISTINCT FROM $2
-                            THEN network_policy_generation + 1
-                            ELSE network_policy_generation END,
-                     updated_at = NOW()
-                 WHERE name = $1
-                   AND desired_state = $4
-                   AND ($3::BIGINT IS NULL OR network_policy_generation = $3)
-                 RETURNING network_policy_generation"
-            ))
-            .bind(template_name.as_str())
-            .bind(SqlxJson(policy))
-            .bind(expected_generation.map(|generation| generation as i64))
-            .bind(TemplateDesiredState::Present.as_str())
-            .fetch_optional(&mut *tx)
+            let updated = pplx_space_template_store::templates::replace_network_policy_if_present(
+                &mut *tx,
+                &template_name,
+                policy,
+                expected_generation.map(|generation| generation as i64),
+            )
             .await
             .map_err(|error| (ContentionScope::Writing, error))?;
             scope = ContentionScope::Writing;
@@ -774,15 +675,11 @@ pub async fn update_template(
         }
 
         if let Some(description) = &request.description {
-            sqlx::query(sql!(
-                "UPDATE templates
-                 SET description = $2, updated_at = NOW()
-                 WHERE name = $1 AND desired_state = $3"
-            ))
-            .bind(template_name.as_str())
-            .bind(description)
-            .bind(TemplateDesiredState::Present.as_str())
-            .execute(&mut *tx)
+            pplx_space_template_store::templates::set_description_if_present(
+                &mut *tx,
+                &template_name,
+                description,
+            )
             .await
             .map_err(|error| (ContentionScope::Writing, error))?;
             scope = ContentionScope::Writing;
@@ -887,15 +784,6 @@ fn template_delete_fingerprint(
         tracing::error!(%error, "failed to build template delete request fingerprint");
         api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     })
-}
-
-/// Whether a public operation can still run: it exists and is queued or
-/// running.
-async fn delete_operation_is_active(
-    pool: &sqlx::PgPool,
-    operation_id: pplx_space_public_api::OperationId,
-) -> Result<bool, sqlx::Error> {
-    pplx_space_public_operation_store::operations::is_active(pool, operation_id).await
 }
 
 pub async fn delete_template(
@@ -1058,7 +946,12 @@ pub async fn delete_template(
             // current delete: it would never run, and installing it could
             // displace an active replacement. The caller retries with a new
             // key.
-            match delete_operation_is_active(&state.pool, operation_id).await {
+            match pplx_space_public_operation_store::operations::is_active(
+                &state.pool,
+                operation_id,
+            )
+            .await
+            {
                 Ok(true) => operation_id,
                 Ok(false) => {
                     return (
@@ -1131,29 +1024,14 @@ pub async fn delete_template(
         // The operation id is replaced only when it still names the stale
         // operation observed above, so a concurrent replacement keeps its
         // own id instead of being overwritten.
-        let updated = sqlx::query(sql!(
-            "UPDATE templates
-             SET desired_state = $2,
-                 delete_requested_at = COALESCE(delete_requested_at, NOW()),
-                 delete_requested_by = COALESCE(delete_requested_by, $3),
-                 delete_operation_id = CASE
-                     WHEN delete_operation_id IS NULL
-                       OR delete_operation_id = $6 THEN $4
-                     ELSE delete_operation_id
-                 END,
-                 updated_at = NOW()
-             WHERE name = $1
-               AND desired_state <> $5"
-        ))
-        .bind(template_name.as_str())
-        .bind(TemplateDesiredState::Deleting.as_str())
-        .bind(actor.id)
-        .bind(operation.as_uuid())
-        .bind(TemplateDesiredState::Deleted.as_str())
-        .bind(stale_delete_operation_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let updated = pplx_space_template_store::templates::request_delete(
+            &mut *tx,
+            &template_name,
+            actor.id,
+            operation.as_uuid(),
+            stale_delete_operation_id,
+        )
+        .await?;
         if updated > 0 {
             enqueue_template_refs_tx(
                 &mut tx,
@@ -2102,7 +1980,9 @@ pub async fn list_template_builds(
         )
         .into_response();
     }
-    match super::template_store::template_exists(&state.pool, &template_name).await {
+    match pplx_space_template_store::templates::exists_not_deleted(&state.pool, &template_name)
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return api_error(StatusCode::NOT_FOUND, "Template not found").into_response(),
         Err(error) => {
@@ -2368,28 +2248,13 @@ pub async fn tag_template_release(
         // The template row first, then the release, as `delete_template_release`
         // takes them, so a tag and a delete of one release queue rather than
         // deadlock.
-        sqlx::query(sql!(
-            "SELECT 1
-             FROM templates t
-             JOIN template_releases r ON r.template_name = t.name
-             WHERE r.id = $1
-             FOR NO KEY UPDATE OF t"
-        ))
-        .bind(release_id)
-        .execute(&mut *tx)
-        .await?;
-        let row = sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-            "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
-             FROM template_releases r
-             JOIN templates t ON t.name = r.template_name
-             WHERE r.id = $1
-               AND t.desired_state = $2
-             FOR UPDATE OF r"
-        ))
-        .bind(release_id)
-        .bind(TemplateDesiredState::Present.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
+        pplx_space_template_store::templates::lock_no_key_update_of_release(&mut tx, release_id)
+            .await?;
+        let row = pplx_space_template_release_store::lookup::lock_release_of_present_template(
+            &mut tx, release_id,
+        )
+        .await?
+        .map(TemplateReleaseRow::from);
         let Some(row) = row else {
             return Ok(TagMove::ReleaseMissing);
         };
@@ -2407,8 +2272,12 @@ pub async fn tag_template_release(
         // lock is what makes the precondition and the move one step. A tag
         // created between this read and the insert below has committed by the
         // time `DO NOTHING` reports it, so one more read finds and locks it.
-        let mut previous =
-            current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+        let mut previous = pplx_space_template_store::release_tags::current_release_locked(
+            &mut tx,
+            &row.template_name,
+            tag.as_str(),
+        )
+        .await?;
         for _ in 0..2 {
             if let Some(expected) = expected
                 && expected != previous
@@ -2450,8 +2319,12 @@ pub async fn tag_template_release(
                 tx.commit().await?;
                 return Ok(TagMove::Moved { row, previous });
             }
-            previous =
-                current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+            previous = pplx_space_template_store::release_tags::current_release_locked(
+                &mut tx,
+                &row.template_name,
+                tag.as_str(),
+            )
+            .await?;
         }
         Ok(TagMove::Raced)
     }
@@ -2560,40 +2433,11 @@ async fn original_release_of(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     release: &TemplateReleaseRow,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    /// Built once: every input is a literal or a bind placeholder.
-    static QUERY: LazyLock<String> = LazyLock::new(|| {
-        sql!(format!(
-            "SELECT r.id FROM template_releases r
-             WHERE r.template_name = $1
-               AND r.hash IN (replace($2, 'sha256:', ''),
-                              'sha256:' || replace($2, 'sha256:', ''))
-               AND {digest_original}",
-            digest_original = digest_original("r"),
-        ))
-    });
-    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
-        .bind(&release.template_name)
-        .bind(&release.content_hash)
-        .fetch_optional(&mut **tx)
-        .await
-}
-
-/// The release a tag points at, locking its row for the rest of the
-/// transaction, or `None` when the tag does not exist.
-async fn current_tag_release_for_update(
-    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
-    template_name: &str,
-    tag: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
-        "SELECT template_release_id
-         FROM template_release_tags
-         WHERE template_name = $1 AND tag = $2
-         FOR UPDATE"
-    ))
-    .bind(template_name)
-    .bind(tag)
-    .fetch_optional(&mut **tx)
+    pplx_space_template_release_store::lookup::original_release_id(
+        &mut **tx,
+        &release.template_name,
+        &release.content_hash,
+    )
     .await
 }
 
@@ -2654,16 +2498,8 @@ pub async fn delete_template_release(
         // that adds the release's first twin. `NO KEY UPDATE` still conflicts
         // with that lock, but not with the key-share locks node publications'
         // foreign-key checks take on the template row.
-        sqlx::query(sql!(
-            "SELECT 1
-             FROM templates t
-             JOIN template_releases r ON r.template_name = t.name
-             WHERE r.id = $1
-             FOR NO KEY UPDATE OF t"
-        ))
-        .bind(release_id)
-        .execute(&mut *tx)
-        .await?;
+        pplx_space_template_store::templates::lock_no_key_update_of_release(&mut tx, release_id)
+            .await?;
         // A writer that predates the shared rule can tag the other
         // spelling's release without the template lock; its insert only
         // key-share locks the release it names. Locking every release of the
@@ -2671,52 +2507,17 @@ pub async fn delete_template_release(
         // release of the digest inserted after this lock can't make a tag
         // resolve to the deleted release: once the delete commits, the
         // digest original is one of the surviving releases.
-        sqlx::query(sql!(
-            "SELECT 1
-             FROM template_releases r
-             JOIN template_releases digest
-               ON digest.template_name = r.template_name
-              AND replace(digest.hash, 'sha256:', '')
-                = replace(r.hash, 'sha256:', '')
-             WHERE r.id = $1
-             FOR UPDATE OF digest"
-        ))
-        .bind(release_id)
-        .execute(&mut *tx)
-        .await?;
+        pplx_space_template_release_store::removal::lock_releases_of_digest(&mut tx, release_id)
+            .await?;
         // A tag resolves to the digest original of the release it names, and
         // a tag written before the shared rule can name the other spelling's
         // original. The release's own tags go with it, except `latest`, which
         // keeps the template's default. Any tag on another release of the
         // digest outlives the delete and would resolve to a different
         // release, so it guards the digest original too.
-        /// Built once: every input is a literal or a bind placeholder.
-        static SERVES_A_TAG: LazyLock<String> = LazyLock::new(|| {
-            sql!(format!(
-                "SELECT EXISTS (
-                     SELECT 1
-                     FROM template_release_tags t
-                     WHERE t.template_release_id = $1
-                       AND t.tag = 'latest')
-                 OR EXISTS (
-                     SELECT 1
-                     FROM template_releases r
-                     JOIN template_releases tagged
-                       ON tagged.template_name = r.template_name
-                      AND replace(tagged.hash, 'sha256:', '')
-                        = replace(r.hash, 'sha256:', '')
-                     JOIN template_release_tags t
-                       ON t.template_release_id = tagged.id
-                     WHERE r.id = $1
-                       AND tagged.id <> r.id
-                       AND {digest_original})",
-                digest_original = digest_original("r"),
-            ))
-        });
-        let serves_a_tag: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(SERVES_A_TAG.as_str()))
-            .bind(release_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let serves_a_tag =
+            pplx_space_template_release_store::lookup::release_serves_a_tag(&mut *tx, release_id)
+                .await?;
         if serves_a_tag {
             return Ok(DeleteRelease::Refused(
                 "template release is missing, still tagged latest, or serving a tag on its other spelling",
@@ -2725,25 +2526,9 @@ pub async fn delete_template_release(
         // Deleting an original that has twins would make the oldest twin,
         // bound to another environment, the release every lookup without an
         // environment resolves. Its twins go first; a twin itself may go.
-        /// Built once: every input is a literal or a bind placeholder.
-        static HAS_TWINS: LazyLock<String> = LazyLock::new(|| {
-            sql!(format!(
-                "SELECT EXISTS (
-                     SELECT 1
-                     FROM template_releases r
-                     JOIN template_releases twin
-                       ON twin.template_name = r.template_name
-                      AND twin.hash = r.hash
-                      AND (twin.created_at, twin.id) > (r.created_at, r.id)
-                     WHERE r.id = $1
-                       AND {spelling_original})",
-                spelling_original = spelling_original("r"),
-            ))
-        });
-        let has_twins: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(HAS_TWINS.as_str()))
-            .bind(release_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let has_twins =
+            pplx_space_template_release_store::lookup::release_has_twins(&mut *tx, release_id)
+                .await?;
         if has_twins {
             return Ok(DeleteRelease::Refused(
                 "template release has twins bound to other environments; delete them first",
@@ -2918,27 +2703,17 @@ pub async fn update_base_snapshot_policy(
         Ok(tx) => tx,
         Err(response) => return response.into_response(),
     };
-    let result: Result<Option<BaseSnapshotPolicyRow>, sqlx::Error> = async {
-        let row = sqlx::query_as::<_, BaseSnapshotPolicyRow>(
-            sql!("INSERT INTO template_base_snapshot_policies
-                 (template, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib, updated_at)
-             SELECT name, $2, $3, $4, NOW()
-             FROM templates
-             WHERE name = $1
-               AND desired_state = $5
-             ON CONFLICT (template) DO UPDATE
-             SET ensure_base_snapshot = EXCLUDED.ensure_base_snapshot,
-                 snapshot_vcpu = EXCLUDED.snapshot_vcpu,
-                 snapshot_memory_mib = EXCLUDED.snapshot_memory_mib,
-                 updated_at = NOW()
-             RETURNING template, ensure_base_snapshot, snapshot_vcpu, snapshot_memory_mib, updated_at"),
+    let result: Result<
+        Option<pplx_space_template_store::base_snapshot_policies::BaseSnapshotPolicy>,
+        sqlx::Error,
+    > = async {
+        let row = pplx_space_template_store::base_snapshot_policies::upsert_if_present(
+            &mut *tx,
+            &template_name,
+            request.ensure_base_snapshot,
+            snapshot_vcpu as i32,
+            snapshot_memory_mib as i32,
         )
-        .bind(template_name.as_str())
-        .bind(request.ensure_base_snapshot)
-        .bind(snapshot_vcpu as i32)
-        .bind(snapshot_memory_mib as i32)
-        .bind(TemplateDesiredState::Present.as_str())
-        .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
             return Ok(None);
@@ -3090,24 +2865,14 @@ pub async fn upsert_template_pool(
         Err(response) => return response.into_response(),
     };
     let result = async {
-        let result = sqlx::query(sql!(
-            "INSERT INTO template_pool_policies (template, target_count, boot_mode, updated_at)
-             SELECT name, $2, $3, NOW()
-             FROM templates
-             WHERE name = $1
-               AND desired_state = $4
-             ON CONFLICT (template) DO UPDATE
-             SET target_count = EXCLUDED.target_count,
-                 boot_mode = EXCLUDED.boot_mode,
-                 updated_at = NOW()"
-        ))
-        .bind(template_name.as_str())
-        .bind(target_count as i32)
-        .bind(&boot_mode)
-        .bind(TemplateDesiredState::Present.as_str())
-        .execute(&mut *tx)
+        let upserted = pplx_space_template_store::pool_policies::upsert_if_present(
+            &mut *tx,
+            &template_name,
+            target_count as i32,
+            &boot_mode,
+        )
         .await?;
-        if result.rows_affected() == 0 {
+        if !upserted {
             return Ok(false);
         }
         let mut refs = vec![ReconcileRef::template_desired_state(template_name.clone())];

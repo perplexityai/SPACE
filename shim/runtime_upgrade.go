@@ -53,6 +53,11 @@ type runtimeUpgradeIntent struct {
 	authorization             *pb.RuntimeUpgradeAuthorization
 	targetState               pb.WakeTargetState
 	checkpointLocalArtifactID *string
+	// attemptID is the attempt the pod's create runs as: kubelet's pod UID
+	// (kubeletPodUID), never nil or empty, since a pod without one is
+	// refused. The upgrade's route identity names the same pod
+	// (runtimeUpgradeRequest).
+	attemptID *string
 }
 
 // sandboxRuntimeUpgrade parses a runtime upgrade pod's annotations, or
@@ -82,6 +87,16 @@ func (s *ociSpec) sandboxRuntimeUpgrade() (*runtimeUpgradeIntent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s must be a UUID: %w", sandboxRuntimeUpgradeOperationIDAnnotation, err)
 	}
+	attemptID, err := s.kubeletPodUID()
+	if err != nil {
+		return nil, err
+	}
+	// Without kubelet's UID the route identity would fall back to
+	// space.pplx.net/pod-uid, which a replacement pod can inherit, and
+	// sbx-manager could hand this pod another pod's execution.
+	if attemptID == nil {
+		return nil, fmt.Errorf("a %s pod needs %s or %s", runtimeUpgradeCheckpoint, kubernetesPodUIDAnnotation, kubernetesCriSandboxUIDAnnotation)
+	}
 	intent := &runtimeUpgradeIntent{
 		operationID:       operationID.String(),
 		targetEnvironment: annotation(sandboxRuntimeUpgradeTargetEnvironmentAnnotation),
@@ -89,6 +104,7 @@ func (s *ociSpec) sandboxRuntimeUpgrade() (*runtimeUpgradeIntent, error) {
 			AuthorizationId: annotation(sandboxRuntimeUpgradeAuthorizationIDAnnotation),
 			Reason:          annotation(sandboxRuntimeUpgradeAuthorizationReasonAnnotation),
 		},
+		attemptID: attemptID,
 	}
 	for _, required := range []struct{ key, value string }{
 		{sandboxRuntimeUpgradeTargetEnvironmentAnnotation, intent.targetEnvironment},
@@ -130,6 +146,14 @@ func (s *ociSpec) sandboxRuntimeUpgrade() (*runtimeUpgradeIntent, error) {
 // readiness verifies. A suspended source (one that names its checkpoint)
 // carries the restore's storage URI and source node as where the node stages
 // a sandbox absent from it; a stopped one must be on this node already.
+// Kubelet's pod UID is the attempt id: kubelet retries a failed create under
+// the same pod UID, and gives a replacement pod a new one, so its retries are
+// one attempt, and sbx-manager (with attempt finality on) answers them with
+// that attempt's rollback or refusal once it's final rather than fencing and
+// booting again. The route identity names that pod too, whatever
+// space.pplx.net/pod-uid says: sbx-manager hands a running execution only to
+// the pod its route identity names, and tells a different one to release its
+// pod, so the attempt and the pod it answers must be the same one.
 func runtimeUpgradeRequest(start *pb.StartRequest, intent *runtimeUpgradeIntent) *pb.UpgradeRuntimeRequest {
 	var stageFrom *pb.RuntimeUpgradeStageFrom
 	if intent.checkpointLocalArtifactID != nil && start.SuspendRestoreStorageUri != nil {
@@ -145,6 +169,9 @@ func runtimeUpgradeRequest(start *pb.StartRequest, intent *runtimeUpgradeIntent)
 	start.ExpectedLocalArtifactId = nil
 	start.TargetState = pb.WakeTargetState_WAKE_TARGET_STATE_UNSPECIFIED
 	start.Blocking = true
+	if intent.attemptID != nil && start.RouteIdentity != nil {
+		start.RouteIdentity.PodUid = ptr(*intent.attemptID)
+	}
 	return &pb.UpgradeRuntimeRequest{
 		SandboxId:                 start.SandboxId,
 		OperationId:               intent.operationID,
@@ -154,6 +181,7 @@ func runtimeUpgradeRequest(start *pb.StartRequest, intent *runtimeUpgradeIntent)
 		TargetState:               intent.targetState,
 		StageFrom:                 stageFrom,
 		CheckpointLocalArtifactId: intent.checkpointLocalArtifactID,
+		AttemptId:                 intent.attemptID,
 	}
 }
 
@@ -179,6 +207,12 @@ func upgradeRuntime(ctx context.Context, client pb.SandboxManagerClient, start *
 		pb.RuntimeUpgradeOutcome_RUNTIME_UPGRADE_OUTCOME_ALREADY_ON_TARGET:
 	default:
 		return nil, status.Errorf(codes.Internal, "sbx-manager UpgradeRuntime returned outcome %s", response.GetOutcome())
+	}
+	// The answer names the attempt it ran as, which is this pod's UID; one
+	// that names another attempt isn't this pod's to run or release. A node
+	// that predates the field, or runs with finality off, names none.
+	if response.AttemptId != nil && intent.attemptID != nil && response.GetAttemptId() != *intent.attemptID {
+		return nil, status.Errorf(codes.Internal, "sbx-manager UpgradeRuntime answered attempt %s for this pod's attempt %s", response.GetAttemptId(), *intent.attemptID)
 	}
 	if intent.stopped() {
 		return nil, nil

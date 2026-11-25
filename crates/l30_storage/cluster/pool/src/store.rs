@@ -20,11 +20,11 @@ use crate::{
     FailedAutoscaleCandidate, InvalidAutoscaleRow, ManualPoolConfigSpec, NewPoolSlot,
     OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError,
     PoolReservation, PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease,
-    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TEMPLATE_USAGE_SANDBOX_ID_LIMIT,
-    TemplateWarmPoolUsage, WarmPoolConfigRef, WarmPoolPolicyShape,
+    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TemplateWarmPoolUsage,
+    WarmPoolConfigRef, WarmPoolPolicyShape,
     models::{
-        PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
-        vcpu_to_i32,
+        PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease,
+        TEMPLATE_USAGE_SANDBOX_ID_LIMIT, memory_to_mib_i32, vcpu_to_i32,
     },
     rows::{
         ClaimedPoolSlotRow, PoolConfigRow, PoolObservedDemandRow, PoolPolicyReleaseRow,
@@ -134,6 +134,121 @@ pub struct WarmPoolStore {
     pool: PgPool,
 }
 
+/// [`WarmPoolStore::demanded_policy_release_rows`]'s statement. Binds `$1`
+/// (the demanded release ids) and `$2` and `$3` (the disk I/O defaults).
+pub(crate) const DEMANDED_POLICY_RELEASES: &str = sql!(
+    "SELECT
+             demanded.id AS template_release_id,
+             p.template_name,
+             demanded.hash AS content_hash,
+             p.vcpu,
+             p.memory_mib,
+             p.disk_mib,
+             COALESCE(p.disk_io_max_operations_per_sec, $2)
+                 AS disk_io_max_operations_per_sec,
+             COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $3)
+                 AS disk_io_max_bandwidth_mib_per_sec,
+             p.min_ready_slots,
+             p.max_ready_slots,
+             p.refill_per_tick,
+             p.max_warming_slots,
+             p.retain_releases,
+             FALSE AS retained
+         FROM warm_pool_policies p
+         JOIN LATERAL (
+             SELECT release.id,
+                    release.hash,
+                    COALESCE(
+                        (
+                            SELECT MAX(published.modified_at)
+                            FROM template_release_tags published
+                            JOIN template_releases tagged
+                              ON tagged.id = published.template_release_id
+                            -- Tags on either spelling of the digest: one written
+                            -- before the shared rule can sit on the other spelling.
+                            WHERE tagged.template_name = release.template_name
+                              AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
+                                                  'sha256:' || replace(release.hash, 'sha256:', ''))
+                        ),
+                        release.created_at
+                    ) AS published_at
+             FROM template_releases release
+             WHERE release.template_name = p.template_name
+               AND release.type = p.runtime
+               AND release.id = ANY($1::UUID[])
+         ) demanded ON TRUE
+         WHERE p.enabled
+         ORDER BY p.template_name, p.vcpu, p.memory_mib,
+                  demanded.published_at DESC, demanded.id DESC"
+);
+
+/// [`WarmPoolStore::retained_policy_release_rows`]'s statement. Binds `$1` and
+/// `$2` (the disk I/O defaults) and `$3` (the initial environment).
+pub(crate) static RETAINED_POLICY_RELEASES: LazyLock<String> = LazyLock::new(|| {
+    sql!(format!(
+        "SELECT
+         COALESCE(twin.id, retained.id) AS template_release_id,
+         p.template_name,
+         retained.hash AS content_hash,
+         p.vcpu,
+         p.memory_mib,
+         p.disk_mib,
+         COALESCE(p.disk_io_max_operations_per_sec, $1)
+             AS disk_io_max_operations_per_sec,
+         COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $2)
+             AS disk_io_max_bandwidth_mib_per_sec,
+         p.min_ready_slots,
+         p.max_ready_slots,
+         p.refill_per_tick,
+         p.max_warming_slots,
+         p.retain_releases,
+         TRUE AS retained
+     FROM warm_pool_policies p
+     JOIN LATERAL (
+         SELECT release.id,
+              release.hash,
+              COALESCE(
+                  (
+                      SELECT MAX(published.modified_at)
+                      FROM template_release_tags published
+                      JOIN template_releases tagged
+                        ON tagged.id = published.template_release_id
+                      -- Tags on either spelling of the digest: one written
+                      -- before the shared rule can sit on the other spelling.
+                      WHERE tagged.template_name = release.template_name
+                        AND tagged.hash IN (replace(release.hash, 'sha256:', ''),
+                                            'sha256:' || replace(release.hash, 'sha256:', ''))
+                  ),
+                  release.created_at
+              ) AS published_at
+          FROM template_releases release
+          WHERE release.template_name = p.template_name
+            AND release.type = p.runtime
+            -- Digest originals only: a twin of a retained release,
+            -- bound to another environment, or the other spelling's
+            -- original of its digest would use up a retain slot and
+            -- warm slots no create claims.
+            AND {digest_original}
+          ORDER BY published_at DESC, release.id DESC
+          LIMIT p.retain_releases
+     ) retained ON TRUE
+     -- Creates of a retained release run the release its build
+     -- resolves to, so that release's pools are the ones claimed.
+     LEFT JOIN LATERAL (
+         SELECT CASE WHEN $3::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
+     ) twin ON TRUE
+     WHERE p.enabled
+     ORDER BY p.template_name, p.vcpu, p.memory_mib,
+              retained.published_at DESC, retained.id DESC",
+        digest_original = digest_original("release"),
+        resolved = pplx_space_template_release_store::resolved_release_sql(
+            "p.template_name",
+            "retained.hash",
+            "$3",
+        ),
+    ))
+});
+
 impl WarmPoolStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -143,7 +258,8 @@ impl WarmPoolStore {
         &self.pool
     }
 
-    pub async fn enabled_configs(&self) -> Result<PoolConfigRead> {
+    #[cfg(test)]
+    pub(crate) async fn enabled_configs(&self) -> Result<PoolConfigRead> {
         let rows = sqlx::query_as::<_, PoolConfigRow>(sql!(
             "SELECT c.id, c.template_release_id, r.template_name, r.hash AS content_hash,
                     c.vcpu, c.memory_mib, c.disk_mib, c.disk_io_max_operations_per_sec,
@@ -819,72 +935,31 @@ impl WarmPoolStore {
         &self,
         initial_environment: Option<&str>,
     ) -> Result<Vec<PoolPolicyReleaseRow>> {
-        static STATEMENT: LazyLock<String> = LazyLock::new(|| {
-            sql!(format!(
-                "SELECT
-                 COALESCE(twin.id, retained.id) AS template_release_id,
-                 p.template_name,
-                 retained.hash AS content_hash,
-                 p.vcpu,
-                 p.memory_mib,
-                 p.disk_mib,
-                 COALESCE(p.disk_io_max_operations_per_sec, $1)
-                     AS disk_io_max_operations_per_sec,
-                 COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $2)
-                     AS disk_io_max_bandwidth_mib_per_sec,
-                 p.min_ready_slots,
-                 p.max_ready_slots,
-                 p.refill_per_tick,
-                 p.max_warming_slots,
-                 p.retain_releases,
-                 TRUE AS retained
-             FROM warm_pool_policies p
-             JOIN LATERAL (
-                 SELECT release.id,
-                      release.hash,
-                      COALESCE(
-                          (
-                              SELECT MAX(published.modified_at)
-                              FROM template_release_tags published
-                              JOIN template_releases tagged
-                                ON tagged.id = published.template_release_id
-                              -- Tags on either spelling of the digest: one written
-                              -- before the shared rule can sit on the other spelling.
-                              WHERE tagged.template_name = release.template_name
-                                AND replace(tagged.hash, 'sha256:', '')
-                                  = replace(release.hash, 'sha256:', '')
-                          ),
-                          release.created_at
-                      ) AS published_at
-                  FROM template_releases release
-                  WHERE release.template_name = p.template_name
-                    AND release.type = p.runtime
-                    -- Digest originals only: a twin of a retained release,
-                    -- bound to another environment, or the other spelling's
-                    -- original of its digest would use up a retain slot and
-                    -- warm slots no create claims.
-                    AND {digest_original}
-                  ORDER BY published_at DESC, release.id DESC
-                  LIMIT p.retain_releases
-             ) retained ON TRUE
-             -- Creates of a retained release run the release its build
-             -- resolves to, so that release's pools are the ones claimed.
-             LEFT JOIN LATERAL (
-                 SELECT CASE WHEN $3::TEXT IS NULL THEN NULL ELSE {resolved} END AS id
-             ) twin ON TRUE
-             WHERE p.enabled
-             ORDER BY p.template_name, p.vcpu, p.memory_mib,
-                      retained.published_at DESC, retained.id DESC",
-                digest_original = digest_original("release"),
-                resolved = pplx_space_template_release_store::resolved_release_sql(
-                    "p.template_name",
-                    "retained.hash",
-                    "$3",
-                ),
-            ))
-        });
         Ok(
-            sqlx::query_as::<_, PoolPolicyReleaseRow>(sqlx::AssertSqlSafe(STATEMENT.as_str()))
+            sqlx::query_as::<_, PoolPolicyReleaseRow>(sqlx::AssertSqlSafe(
+                RETAINED_POLICY_RELEASES.as_str(),
+            ))
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
+                    .expect("disk I/O default fits in PostgreSQL BIGINT"),
+            )
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
+                    .expect("disk I/O default fits in PostgreSQL BIGINT"),
+            )
+            .bind(initial_environment)
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn demanded_policy_release_rows(
+        &self,
+        demanded_release_ids: &[Uuid],
+    ) -> Result<Vec<PoolPolicyReleaseRow>> {
+        Ok(
+            sqlx::query_as::<_, PoolPolicyReleaseRow>(DEMANDED_POLICY_RELEASES)
+                .bind(demanded_release_ids)
                 .bind(
                     i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
                         .expect("disk I/O default fits in PostgreSQL BIGINT"),
@@ -893,72 +968,9 @@ impl WarmPoolStore {
                     i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
                         .expect("disk I/O default fits in PostgreSQL BIGINT"),
                 )
-                .bind(initial_environment)
                 .fetch_all(&self.pool)
                 .await?,
         )
-    }
-
-    async fn demanded_policy_release_rows(
-        &self,
-        demanded_release_ids: &[Uuid],
-    ) -> Result<Vec<PoolPolicyReleaseRow>> {
-        Ok(sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
-            "SELECT
-                 demanded.id AS template_release_id,
-                 p.template_name,
-                 demanded.hash AS content_hash,
-                 p.vcpu,
-                 p.memory_mib,
-                 p.disk_mib,
-                 COALESCE(p.disk_io_max_operations_per_sec, $2)
-                     AS disk_io_max_operations_per_sec,
-                 COALESCE(p.disk_io_max_bandwidth_mib_per_sec, $3)
-                     AS disk_io_max_bandwidth_mib_per_sec,
-                 p.min_ready_slots,
-                 p.max_ready_slots,
-                 p.refill_per_tick,
-                 p.max_warming_slots,
-                 p.retain_releases,
-                 FALSE AS retained
-             FROM warm_pool_policies p
-             JOIN LATERAL (
-                 SELECT release.id,
-                        release.hash,
-                        COALESCE(
-                            (
-                                SELECT MAX(published.modified_at)
-                                FROM template_release_tags published
-                                JOIN template_releases tagged
-                                  ON tagged.id = published.template_release_id
-                                -- Tags on either spelling of the digest: one written
-                                -- before the shared rule can sit on the other spelling.
-                                WHERE tagged.template_name = release.template_name
-                                  AND replace(tagged.hash, 'sha256:', '')
-                                    = replace(release.hash, 'sha256:', '')
-                            ),
-                            release.created_at
-                        ) AS published_at
-                 FROM template_releases release
-                 WHERE release.template_name = p.template_name
-                   AND release.type = p.runtime
-                   AND release.id = ANY($1::UUID[])
-             ) demanded ON TRUE
-             WHERE p.enabled
-             ORDER BY p.template_name, p.vcpu, p.memory_mib,
-                      demanded.published_at DESC, demanded.id DESC"
-        ))
-        .bind(demanded_release_ids)
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
-        )
-        .bind(
-            i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
-                .expect("disk I/O default fits in PostgreSQL BIGINT"),
-        )
-        .fetch_all(&self.pool)
-        .await?)
     }
 
     /// Recent creates by release and shape. A create's release is the one
@@ -1453,6 +1465,21 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $4
+               -- A slot on a node with any drain engine recorded (a v2
+               -- drain, its cancel, or an engine this build doesn't know) is
+               -- never claimed: a v2 node's VMs are leaving, a sealed node
+               -- refuses the claim's activation, and an unknown engine fails
+               -- closed. A v1 drain's node (engine NULL) is claimed as
+               -- before, and so is a slot with no node name. The engine-set
+               -- nodes' names are read once for the statement, not per
+               -- candidate slot; `node_k8s.k8s_node_name` is NOT NULL, so the
+               -- list holds no NULL to make `<> ALL` unknown.
+               AND (s.k8s_node_name IS NULL OR s.k8s_node_name <> ALL (ARRAY(
+                   SELECT nk.k8s_node_name
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE n.drain_engine IS NOT NULL
+               )))
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"
@@ -1502,6 +1529,14 @@ impl WarmPoolStore {
                AND s.disk_io_max_bandwidth_mib_per_sec = c.disk_io_max_bandwidth_mib_per_sec
                AND s.pod_ip IS NOT NULL
                AND s.pod_namespace = $2
+               -- As `claim_ready_slot`: never a slot on a node with any
+               -- drain engine recorded; a v1 drain's node is claimed.
+               AND (s.k8s_node_name IS NULL OR s.k8s_node_name <> ALL (ARRAY(
+                   SELECT nk.k8s_node_name
+                     FROM node_k8s nk
+                     JOIN nodes n ON n.id = nk.node_id
+                    WHERE n.drain_engine IS NOT NULL
+               )))
              ORDER BY s.ready_at ASC
              FOR UPDATE OF s SKIP LOCKED
              LIMIT 1"
@@ -1700,11 +1735,12 @@ impl WarmPoolStore {
     }
 
     /// Read the claimed slot's pod identity for the bind transaction. This is
-    /// a column read only: the bind's writes go to sandbox-owned tables and
-    /// live with the API substrate that owns them, keeping each domain's
-    /// tables written from one home. `None` means the claim vanished between
-    /// the claim transaction and the bind (reaped or invalidated), and the
-    /// caller must abort the bind. Runs after [`Self::bind_claimed_slot`],
+    /// a column read only: the bind's write to the sandbox's execution row is
+    /// `pplx-space-sandbox-store`'s
+    /// `k8s_executions::pool_claim::insert_first_generation`, keeping each
+    /// domain's tables written from one home. `None` means the claim vanished
+    /// between the claim transaction and the bind (reaped or invalidated), and
+    /// the caller must abort the bind. Runs after [`Self::bind_claimed_slot`],
     /// whose CAS already row-locks the slot; the `FOR UPDATE` here keeps the
     /// read self-sufficiently locked if callers ever reorder.
     pub async fn bind_source(

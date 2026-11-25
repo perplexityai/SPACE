@@ -629,9 +629,49 @@ pub(crate) fn pool_store_error(
     substrate::pool_error(message, error).into()
 }
 
+/// The process switch that lets the admin API's `:drain` start a v2 node
+/// drain, which the cluster controller also checks at startup. The drain
+/// gates don't read it: they follow the drain a node records.
+pub struct DrainV2Switch;
+
+impl DrainV2Switch {
+    /// The environment variable that turns the switch on.
+    pub const ENV: &'static str = "SPACE_DRAIN_V2_ENABLED";
+}
+
+/// How long a call refused while its sandbox's node drain still makes the
+/// sandbox durable is told to wait before it asks again: once the drain has,
+/// the same call lands on another node.
+pub(crate) const NODE_DRAIN_RETRY_AFTER: Duration = Duration::from_secs(10);
+
+impl ControllerError {
+    /// The retryable 503 of a call a node drain refuses for now, with
+    /// [`NODE_DRAIN_RETRY_AFTER`].
+    pub(crate) fn node_draining(message: impl Into<String>) -> Self {
+        Self::service_unavailable(message).with_retry_after_header(NODE_DRAIN_RETRY_AFTER)
+    }
+}
+
+/// Whether `status` is a node's refusal of a VM activation because a drain
+/// sealed it ([`pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER`]).
+pub(crate) fn is_activation_sealed(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status
+            .message()
+            .contains(pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER)
+}
+
 impl From<tonic::Status> for ControllerError {
     fn from(status: tonic::Status) -> Self {
         use pplx_space_native_files::FileCallFailure as _;
+        // A sealed node refuses before any VM work, so the call is retried,
+        // as the drain gate's own refusal is.
+        if is_activation_sealed(&status) {
+            return Self::node_draining(format!(
+                "sandbox cannot be activated yet: a node drain sealed its node; retry shortly: {}",
+                status.message()
+            ));
+        }
         let failure = pplx_space_native_files::WorkerFailure::from_status(&status);
         let http_status = failure.status();
         let retry_after = failure.retry_after();

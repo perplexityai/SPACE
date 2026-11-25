@@ -13,18 +13,16 @@ stand in for the slot.
 from __future__ import annotations
 
 import concurrent.futures
-import os
 import time
 import unittest
 import uuid
-from pathlib import Path
 
 import psycopg
+from firewall_rules_postgres import apply_migrations, database_url
 from psycopg import errors, sql
 from psycopg.conninfo import make_conninfo
 from required_test_deps import unavailable_dependency
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "db" / "postgres"
 # The organization the migrations seed.
 LOCAL_ORG = uuid.UUID("00000000-0000-0000-0000-000000000001")
 SLOT_KEY = "firewall_rules_rollouts_unfinished_slot_key"
@@ -32,47 +30,6 @@ SLOT_CHECK = "firewall_rules_rollouts_unfinished_slot_check"
 UNFINISHED_PHASES = ("canary", "rolling", "paused")
 # Bounds every wait, so a regression fails instead of hanging the run.
 WAIT_SECONDS = 30
-
-
-def database_url() -> str:
-    # ci/scripts/run-python-tests.sh starts one Postgres for the Python tests
-    # and names it with PRUNE_CLUSTER_ARTIFACTS_TEST_DATABASE_URL. The tests
-    # create a database of their own on it and drop it afterwards.
-    for name in (
-        "FIREWALL_RULES_TEST_DATABASE_URL",
-        "PRUNE_CLUSTER_ARTIFACTS_TEST_DATABASE_URL",
-    ):
-        url = os.environ.get(name)
-        if url:
-            return url
-    unavailable_dependency(
-        "postgres",
-        "set FIREWALL_RULES_TEST_DATABASE_URL to a Postgres where the tests may "
-        "create a database, or run them through ci/scripts/run-python-tests.sh",
-    )
-
-
-def migration_files() -> list[Path]:
-    files = sorted(
-        MIGRATIONS_DIR.glob("*.up.sql"),
-        key=lambda path: int(path.name.split("_", 1)[0]),
-    )
-    if not files:
-        raise AssertionError(f"no Postgres migrations under {MIGRATIONS_DIR}")
-    return files
-
-
-def apply_migrations(url: str) -> None:
-    # As SQLx does: each file in its own transaction, unless its first line
-    # opts out.
-    with psycopg.connect(url, autocommit=True) as conn:
-        for path in migration_files():
-            text = path.read_text()
-            if text.startswith("-- no-transaction"):
-                conn.execute(text)
-            else:
-                with conn.transaction():
-                    conn.execute(text)
 
 
 class FirewallRulesRolloutSlotTest(unittest.TestCase):

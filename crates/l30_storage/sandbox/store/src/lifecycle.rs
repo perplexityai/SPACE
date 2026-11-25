@@ -35,15 +35,6 @@ impl StoredSandboxLifecycle {
             Self::Deleted => "deleted",
         }
     }
-
-    /// The live-state view: `Some` for shared-vocabulary states, `None` for
-    /// the terminal tombstone.
-    pub const fn live(self) -> Option<SandboxLifecycle> {
-        match self {
-            Self::Live(lifecycle) => Some(lifecycle),
-            Self::Deleted => None,
-        }
-    }
 }
 
 impl std::fmt::Display for StoredSandboxLifecycle {

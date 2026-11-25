@@ -1,10 +1,16 @@
 //! The live-sandbox quota count, which reads `sandboxes` beside this store's
-//! `public_operations` in one statement.
+//! `public_operations` in one statement, and the advisory transaction locks
+//! that serialize it: one per limit, keyed by the limit's owner (an org or a
+//! subject) and the caller's namespace seed.
+//!
+//! The caller owns the lock order, the mode it picks for each limit, the
+//! `lock_timeout` it sets around the locks and what a timed-out wait means.
 
 use pplx_space_accounts::{OrgId, UserId};
 use pplx_space_public_api::{OperationKind, PUBLIC_SANDBOX_ID_PREFIX};
 use pplx_space_sql_locator::sql;
-use sqlx::PgExecutor;
+use sqlx::{PgExecutor, Postgres, Transaction};
+use uuid::Uuid;
 
 /// What [`sandboxes_held`] counts: the org's, and the subject's share.
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +82,42 @@ pub const SANDBOXES_HELD: &str = sql!(
                )
        ) held"
 );
+
+/// Take the shared advisory transaction lock on (`id`, `seed`). It lasts
+/// until the caller's transaction ends, and waits only for holders of
+/// [`lock_quota_exclusive`] on the same key.
+pub async fn lock_quota_shared(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    seed: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, $2))"
+    ))
+    .bind(id)
+    .bind(seed)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Take the exclusive advisory transaction lock on (`id`, `seed`). It lasts
+/// until the caller's transaction ends, and waits for every holder of either
+/// mode on the same key.
+pub async fn lock_quota_exclusive(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    seed: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
+    ))
+    .bind(id)
+    .bind(seed)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// Count with [`SANDBOXES_HELD`], for in-flight creates of `api_product`;
 /// see there for what is counted.

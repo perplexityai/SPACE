@@ -116,12 +116,15 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 use pplx_space_cluster_pool::{PoolError, WarmPoolStore};
 use pplx_space_durations::PositiveDuration;
 use pplx_space_node_model::{NodeDrainMode, SubstrateKind};
+use pplx_space_node_registration_store::locks;
 use pplx_space_sandbox_model::{ExecutionGeneration, SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_portability::{
     failed_repair_revert_eligibility, newest_full_snapshot_unambiguous,
     pod_less_drain_revert_loses_no_newer_bytes,
 };
 use pplx_space_sandbox_store::drain;
+use pplx_space_sandbox_store::k8s_executions::pod_less_giveup;
+use pplx_space_sandbox_store::row_locks;
 use pplx_space_sql_locator::sql;
 use sqlx::PgPool;
 
@@ -445,6 +448,7 @@ where
                          WHERE n.id = $2
                            AND n.drain_phase = $6
                            AND n.drain_mode = $7
+                           AND n.drain_engine IS NULL
                     )
                 ), FALSE) AS row_matches,
                 EXISTS (
@@ -598,24 +602,9 @@ async fn recover_pod_less_sandbox_locked(
     // arm's `UPDATE` would go unseen. The shared lock makes the undrain wait
     // for this commit, or, if it committed first, the guard read below sees
     // it. The drained-node terminator's flip fences the same way.
-    sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR SHARE"))
-        .bind(candidate.source_node_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
-        .bind(candidate.sandbox_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(sql!(
-        "SELECT 1
-           FROM sandbox_k8s_executions
-          WHERE sandbox_id = $1
-          ORDER BY generation
-            FOR UPDATE"
-    ))
-    .bind(candidate.sandbox_id)
-    .execute(&mut *tx)
-    .await?;
+    locks::share_lock_node(&mut tx, candidate.source_node_id).await?;
+    row_locks::lock_exists(&mut tx, candidate.sandbox_id).await?;
+    pod_less_giveup::lock_executions_in_generation_order(&mut tx, candidate.sandbox_id).await?;
 
     let eligible = precheck(&mut *tx, candidate).await?.and_then(|generation| {
         if generation == expected {
@@ -647,12 +636,10 @@ async fn recover_pod_less_sandbox_locked(
     // The observed guard tolerated a `failed`, pid-less record. Left behind,
     // it would keep a reverted row reading `failed` through the observed-state
     // overlay, and once the node is gone nothing would publish over it.
-    sqlx::query(sql!(
-        "DELETE FROM sandbox_observed_states
-          WHERE sandbox_id = $1 AND status = 'failed' AND pid IS NULL"
-    ))
-    .bind(candidate.sandbox_id)
-    .execute(&mut *tx)
+    pplx_space_sandbox_teardown::observed_states::clear_failed_observation(
+        &mut tx,
+        candidate.sandbox_id,
+    )
     .await?;
 
     tx.commit().await?;
@@ -663,19 +650,7 @@ async fn retire_executions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions e
-            SET active = FALSE,\n\
-                state = 'suspended',\n\
-                pod_ip = NULL,\n\
-                terminated_at = COALESCE(e.terminated_at, NOW()),\n\
-                updated_at = NOW()
-          WHERE e.sandbox_id = $1
-            AND e.active"
-    ))
-    .bind(sandbox_id)
-    .execute(&mut **tx)
-    .await?;
+    pod_less_giveup::retire_active_executions(&mut **tx, sandbox_id).await?;
     Ok(())
 }
 

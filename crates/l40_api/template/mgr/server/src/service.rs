@@ -225,9 +225,11 @@ fn remove_dir_all_if_exists(path: &Path) -> Result<(), io::Error> {
     }
 }
 
-fn lock_status<'a, T>(mutex: &'a Mutex<T>, context: &str) -> Result<MutexGuard<'a, T>, Status> {
-    mutex
-        .lock()
+fn lock_status<'a>(
+    db: &'a crate::db::SharedConnection,
+    context: &str,
+) -> Result<crate::db::ConnectionGuard<'a>, Status> {
+    db.lock()
         .map_err(|_| Status::internal(format!("{context} mutex poisoned")))
 }
 
@@ -390,7 +392,7 @@ type SnapshotRepairKey = (String, String, TemplateCachePartition);
 
 #[derive(Clone)]
 pub struct TemplateManagerService {
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     artifact_store: TemplateArtifactStore,
     production_hash_algorithm: HashAlg,
     feature_flags: FeatureFlagClient,
@@ -411,7 +413,7 @@ pub struct TemplateManagerService {
     /// failed transiently). New job kinds add a `match` arm in
     /// [`crate::background_jobs::TemplateBackgroundExecutor`] — no
     /// new worker.
-    background_worker: pplx_space_common_jobs::BackgroundWorker<
+    background_worker: pplx_space_template_mgr_store::jobs::JobWorker<
         crate::background_jobs::TemplateBackgroundExecutor,
     >,
     /// Connect budget this service spends reaching sandbox-manager.
@@ -1495,10 +1497,7 @@ fn gc_delete_disk_fn(artifact_store: TemplateArtifactStore) -> crate::eviction::
                     // The wrapping `Code::SQLITE_IOERR` is a
                     // synthetic carrier; the underlying error
                     // is logged by `run_loop`.
-                    rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                        Some(err),
-                    )
+                    crate::db::Error::io_failure(err)
                 })
             })
         },
@@ -1774,10 +1773,10 @@ fn spawn_observed_background_loop(
 }
 
 impl TemplateManagerService {
-    pub fn new(conn: rusqlite::Connection) -> Result<Self, rusqlite::Error> {
+    pub fn new(conn: crate::db::Connection) -> Result<Self, crate::db::Error> {
         crate::db::ensure_template_settings_for_builds(&conn)?;
-        let db = Arc::new(Mutex::new(conn));
-        let background_worker = crate::background_jobs::build_worker(Arc::clone(&db));
+        let db = crate::db::SharedConnection::new(conn);
+        let background_worker = crate::background_jobs::build_worker(db.clone());
         Ok(Self {
             db,
             artifact_store: TemplateArtifactStore::default(),
@@ -1832,8 +1831,9 @@ impl TemplateManagerService {
     /// to call `recover_and_log` at startup and `shutdown` at exit.
     pub fn background_worker(
         &self,
-    ) -> pplx_space_common_jobs::BackgroundWorker<crate::background_jobs::TemplateBackgroundExecutor>
-    {
+    ) -> pplx_space_template_mgr_store::jobs::JobWorker<
+        crate::background_jobs::TemplateBackgroundExecutor,
+    > {
         self.background_worker.clone()
     }
 
@@ -1866,9 +1866,9 @@ impl TemplateManagerService {
 
     #[cfg(test)]
     pub(crate) fn new_with_template_root(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         root: impl Into<PathBuf>,
-    ) -> Result<Self, rusqlite::Error> {
+    ) -> Result<Self, crate::db::Error> {
         // These protocol/cache fixtures use the host's temporary filesystem;
         // explicit NoCoW materialization has its own disposable btrfs coverage.
         let mut service = Self::new(conn)?
@@ -1948,32 +1948,32 @@ impl TemplateManagerService {
     /// dropped. Cooperative shutdown via `CancellationToken` is a
     /// follow-up.
     pub fn spawn_prefetch_loop(&self) {
-        let pins = crate::pinned_digests::PinnedDigestsStore::new(Arc::clone(&self.db));
+        let pins = crate::pinned_digests::PinnedDigestsStore::new(self.db.clone());
         let puller = self.volume_puller.clone();
         let cfg = crate::prefetch::PrefetchConfig::from_env();
         spawn_observed_background_loop("prefetch", crate::prefetch::run_loop(pins, puller, cfg));
     }
 
     pub fn spawn_node_state_dirty_syncer(&self) {
-        crate::node_state_sync::spawn_dirty_outbox_worker(Arc::clone(&self.db));
+        crate::node_state_sync::spawn_dirty_outbox_worker(self.db.clone());
     }
 
     /// Spawn the LRU eviction loop. Budgeted by
     /// `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` (default 100 GiB): when it is
-    /// explicitly zero, [`crate::eviction::run_loop`] evicts nothing and
+    /// explicitly zero, `crate::eviction::run_loop` evicts nothing and
     /// only checks build dirs without a row on each tick.
     ///
     /// The loop owns:
-    /// - The shared `Arc<Mutex<Connection>>` (same instance as the
+    /// - The `SharedConnection` (same instance as the
     ///   prefetcher and the volume puller).
-    /// - A clone of [`TemplateArtifactStore`] for disk deletes.
+    /// - A clone of `TemplateArtifactStore` for disk deletes.
     /// - A closure that lazily connects to sbx-mgr per tick. A
     ///   failed `List` short-circuits the tick — without an active
     ///   set we cannot safely evict; grace-period age is the backstop
     ///   for any digest the snapshot might have missed.
     pub fn spawn_eviction_loop(&self, shutdown: CancellationToken) {
         let cfg = crate::eviction::GcConfig::from_env();
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let artifact_store = self.artifact_store.clone();
 
         let fetch_active: crate::eviction::FetchActiveFn =
@@ -2044,7 +2044,7 @@ impl TemplateManagerService {
     }
 
     pub fn spawn_network_policy_notification_syncer(&self) {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         tokio::spawn(async move {
             let mut delay = std::time::Duration::from_secs(1);
             loop {
@@ -2141,7 +2141,7 @@ impl TemplateManagerService {
         let service = self.clone_for_snapshot_reconcile();
         tokio::spawn(async move {
             let snapshot_policies = {
-                let db = Arc::clone(&service.db);
+                let db = service.db.clone();
                 tokio::task::spawn_blocking(move || {
                     let Ok(conn) = db.lock() else {
                         tracing::warn!(
@@ -2412,7 +2412,7 @@ impl TemplateManagerService {
                 })?,
         };
 
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let n = template_id.to_string();
         let h = content_hash.to_string();
         tokio::task::spawn_blocking(move || -> Result<(), Status> {
@@ -2827,7 +2827,7 @@ impl TemplateManagerService {
         &self,
         template: &str,
     ) -> Result<Option<pplx_space_execution_catalog::guest::GuestProfile>, Status> {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template = template.to_owned();
         tokio::task::spawn_blocking(move || {
             let conn = db

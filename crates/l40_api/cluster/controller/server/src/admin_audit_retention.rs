@@ -1,4 +1,3 @@
-use pplx_space_sql_locator::sql;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -96,24 +95,12 @@ impl RetentionSink for AdminAuditRetentionStore {
         let max_delete_per_tick = i64::from(max_delete_per_tick);
         let mut tx = self.pool.begin().await?;
 
-        let aged_deleted = sqlx::query_scalar::<_, String>(sql!(
-            "WITH candidates AS (
-                 SELECT id
-                   FROM admin_audit_events
-                  WHERE created_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                  ORDER BY created_at ASC, id ASC
-                  LIMIT $2
-             )
-             DELETE FROM admin_audit_events e
-              USING candidates c
-              WHERE e.id = c.id
-              RETURNING e.id::TEXT"
-        ))
-        .bind(retention_secs)
-        .bind(max_delete_per_tick)
-        .fetch_all(&mut *tx)
-        .await?
-        .len();
+        let aged_deleted = pplx_space_admin_audit_store::delete_older_than(
+            &mut *tx,
+            retention_secs,
+            max_delete_per_tick,
+        )
+        .await?;
 
         let remaining_delete_budget =
             max_delete_per_tick.saturating_sub(i64::try_from(aged_deleted).unwrap_or(i64::MAX));

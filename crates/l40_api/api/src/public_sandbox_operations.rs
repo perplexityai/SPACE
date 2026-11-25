@@ -1,6 +1,5 @@
 use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use crate::metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
@@ -17,6 +16,9 @@ use pplx_space_public_api::{
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
 };
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle, SandboxLifecycleParseError};
+use pplx_space_sandbox_store::{
+    SandboxMetadata, SandboxMetadataValue as ControllerSandboxMetadataValue,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
@@ -32,8 +34,7 @@ use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
 use crate::controllers::substrate::ExecutionActivityKind;
 use crate::controllers::{ControllerError, SnapshotUploadCheck, SnapshotUploadInFlight};
 use crate::models::{
-    CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
-    SandboxMetadataValue as ControllerSandboxMetadataValue,
+    CreateSandboxRequest as ControllerCreateSandboxRequest,
     SandboxNetworkPolicyPatch as ControllerSandboxNetworkPolicyPatch,
     UpdateSandboxRequest as ControllerUpdateSandboxRequest, User,
 };
@@ -1033,15 +1034,7 @@ async fn fetch_actor(
     user_id: UserId,
     org_id: OrgId,
 ) -> Result<User, CreateSandboxExecutionError> {
-    let actor = sqlx::query_as::<_, User>(sql!(
-        "SELECT *
-         FROM users
-         WHERE id = $1 AND org_id = $2"
-    ))
-    .bind(user_id)
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await?;
+    let actor = pplx_space_accounts_store::users::organization_user(pool, org_id, user_id).await?;
     actor.ok_or(CreateSandboxExecutionError::ActorNotFound)
 }
 

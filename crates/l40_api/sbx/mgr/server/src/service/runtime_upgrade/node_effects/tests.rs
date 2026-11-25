@@ -87,7 +87,7 @@ pub(in crate::service::runtime_upgrade) fn fixture(
         std::fs::write(checkpoint.join("vmstate"), b"vmstate").unwrap();
     }
     let node = node.serve();
-    let service = SandboxManagerService::new_with_options(
+    let mut service = SandboxManagerService::new_with_options(
         conn,
         SandboxManagerServiceOptions {
             node_manager: node.connector(),
@@ -95,6 +95,9 @@ pub(in crate::service::runtime_upgrade) fn fixture(
             ..SandboxManagerServiceOptions::for_test()
         },
     );
+    // The fixture exercises attempt finality; the switch-off tests turn it
+    // off.
+    service.runtime_upgrade_attempt_finality = true;
     Fixture {
         _directory: directory,
         cache,
@@ -253,7 +256,9 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
     // A cold start without the rootfs would boot a fresh template clone.
     let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
     std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let Refusal::Final(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("a missing rootfs is final for the pod");
+    };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("rootfs"), "{error}");
     // And one the rollback of its preserved copy restores: a non-empty
@@ -267,7 +272,12 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
             "directory" => std::fs::create_dir(&rootfs).unwrap(),
             _ => std::os::unix::fs::symlink(&elsewhere, &rootfs).unwrap(),
         }
-        let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+        let error = f
+            .effects()
+            .inspect_local_disk(&f.row())
+            .await
+            .unwrap_err()
+            .into_status();
         assert_eq!(
             error.code(),
             tonic::Code::FailedPrecondition,
@@ -292,7 +302,11 @@ async fn inspection_refuses_a_sandbox_without_its_local_disk() {
     let f = fixture(SandboxState::Suspended, true, FakeNodeManager::default());
     f.effects().inspect_local_disk(&f.row()).await.unwrap();
     std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/cow.luks")).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    // Retryable: finishing a checkpoint staged here lays the COW down once
+    // the staged-checkpoint switch is on, so a retry may find it.
+    let Refusal::Retry(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("a missing COW may be laid down for a retry");
+    };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("COW"), "{error}");
 }
@@ -383,7 +397,12 @@ async fn a_cow_only_copy_needs_a_node_manager_that_restores_one() {
         assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
 
         std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
-        let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+        let error = f
+            .effects()
+            .inspect_local_disk(&f.row())
+            .await
+            .unwrap_err()
+            .into_status();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
         assert!(
             error.message().contains("roll node-manager out first"),
@@ -415,7 +434,12 @@ async fn the_switch_off_refuses_a_cow_only_copy() {
         )
         .unwrap();
     std::fs::remove_file(f.cache.join(&f.sandbox_id).join("instance/rootfs.ext4")).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(
         error
@@ -454,7 +478,12 @@ async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin
 
     // One that doesn't parse names nothing either.
     set_digest(Some("not a digest"));
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
     assert!(error.message().contains("template digest"), "{error}");
 
     // Without a digest, nothing names the bytes the COW was written over.
@@ -467,7 +496,12 @@ async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin
             crate::db::fixture::params![f.sandbox_id],
         )
         .unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("template digest"), "{error}");
 
@@ -477,7 +511,12 @@ async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin
     for digest in [None, Some(DIGEST)] {
         set_digest(digest);
         std::fs::write(&rootfs, b"").unwrap();
-        let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+        let error = f
+            .effects()
+            .inspect_local_disk(&f.row())
+            .await
+            .unwrap_err()
+            .into_status();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
         assert!(error.message().contains("rootfs.ext4"), "{error}");
         assert!(
@@ -489,7 +528,12 @@ async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin
     std::fs::write(&elsewhere, b"disk").unwrap();
     std::fs::remove_file(&rootfs).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &rootfs).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
     assert!(
         error.message().contains("empty or not a regular file"),
         "{error}"
@@ -504,7 +548,12 @@ async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin
     // to one that isn't.
     let cow = f.cache.join(&f.sandbox_id).join("instance/cow.luks");
     std::fs::write(&cow, b"").unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
     assert!(
         error.message().contains("empty or not a regular file"),
@@ -514,11 +563,61 @@ async fn an_encrypted_sandbox_needs_its_cow_and_a_template_digest_for_its_origin
     std::fs::write(&target, b"cow").unwrap();
     std::fs::remove_file(&cow).unwrap();
     std::os::unix::fs::symlink(&target, &cow).unwrap();
-    let error = f.effects().inspect_local_disk(&f.row()).await.unwrap_err();
+    let error = f
+        .effects()
+        .inspect_local_disk(&f.row())
+        .await
+        .unwrap_err()
+        .into_status();
     assert!(
         error.message().contains("empty or not a regular file"),
         "{error}"
     );
+}
+
+/// A required file whose path can't be checked, here because a file sits
+/// where its parent directory belongs, may be checkable on a retry, so the
+/// refusal is a retry; one that's absent is final.
+#[test]
+fn a_required_file_that_cant_be_checked_is_a_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let not_a_directory = directory.path().join("instance");
+    std::fs::write(&not_a_directory, b"").unwrap();
+    let Refusal::Retry(error) =
+        required_file(&not_a_directory.join("rootfs.ext4"), "rootfs").unwrap_err()
+    else {
+        panic!("a path that can't be checked is not final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    let Refusal::Final(_) =
+        required_file(&directory.path().join("rootfs.ext4"), "rootfs").unwrap_err()
+    else {
+        panic!("an absent file is final for the pod");
+    };
+}
+
+/// Runtime metadata that can't be read, here a directory where the file
+/// belongs, may be readable on a retry, so its refusal is a retry; metadata
+/// that reads but doesn't parse answers every retry the same way and is
+/// final. Both answer `FAILED_PRECONDITION`.
+#[tokio::test]
+async fn inspection_retries_metadata_it_cant_read_and_refuses_metadata_it_cant_parse() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let metadata = f.cache.join(&f.sandbox_id).join("metadata.json");
+    let _ = std::fs::remove_file(&metadata);
+    std::fs::create_dir(&metadata).unwrap();
+    let Refusal::Retry(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("unreadable metadata is not final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    std::fs::remove_dir(&metadata).unwrap();
+    std::fs::write(&metadata, b"not json").unwrap();
+    let Refusal::Final(error) = f.effects().inspect_local_disk(&f.row()).await.unwrap_err() else {
+        panic!("unparseable metadata is final for the pod");
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
 }
 
 #[tokio::test]

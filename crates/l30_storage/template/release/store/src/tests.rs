@@ -19,7 +19,7 @@ const TEMPLATE: &str = "seed";
 const HASH: &str = "sha256:abababababababababababababababababababababababababababababababab";
 const LOCATION: &str = "s3://templates-bucket/space/templates/seed/sha256:abababababababababababababababababababababababababababababababab?region=us-east-1";
 
-fn environment(byte: u8) -> EnvironmentReference {
+pub(crate) fn environment(byte: u8) -> EnvironmentReference {
     EnvironmentReference::new(Digest::sha256([byte; 32]))
 }
 
@@ -35,7 +35,7 @@ fn bound(environment: EnvironmentReference) -> PartitionSelector {
     }
 }
 
-fn metadata(environment: EnvironmentReference) -> serde_json::Value {
+pub(crate) fn metadata(environment: EnvironmentReference) -> serde_json::Value {
     serde_json::json!({ "environment": environment.to_string() })
 }
 
@@ -53,7 +53,7 @@ async fn twin_ready_db() -> TestResult<Option<pplx_space_db_test_fixtures::TestD
     Ok(Some(db))
 }
 
-async fn insert_template(pool: &PgPool, name: &str) -> TestResult {
+pub(crate) async fn insert_template(pool: &PgPool, name: &str) -> TestResult {
     sqlx::query("INSERT INTO templates (id, name) VALUES ($1, $2)")
         .bind(Uuid::now_v7())
         .bind(name)
@@ -116,7 +116,7 @@ async fn set_state(pool: &PgPool, environment: EnvironmentReference, state: &str
 
 /// Make `environment` the cluster default, as the policy store's
 /// `set_default` leaves the rows: allowed, and the policy's default.
-async fn set_default(pool: &PgPool, environment: EnvironmentReference) -> TestResult {
+pub(crate) async fn set_default(pool: &PgPool, environment: EnvironmentReference) -> TestResult {
     set_state(pool, environment, "allowed").await?;
     sqlx::query(
         "UPDATE runtime_environment_policy
@@ -130,7 +130,11 @@ async fn set_default(pool: &PgPool, environment: EnvironmentReference) -> TestRe
 }
 
 /// Catalog `environment` with the runtime version sort key `version`.
-async fn catalog(pool: &PgPool, environment: EnvironmentReference, version: &[i32]) -> TestResult {
+pub(crate) async fn catalog(
+    pool: &PgPool,
+    environment: EnvironmentReference,
+    version: &[i32],
+) -> TestResult {
     sqlx::query(
         "INSERT INTO runtime_environments (
              environment_ref, runtime, runtime_version, version_sort_key, kernel_version,
@@ -1914,5 +1918,155 @@ async fn registration_fills_only_a_missing_binding_or_owner() -> TestResult {
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(owner, Some(pplx_space_db_test_fixtures::SEED_ORG_ID));
+    Ok(())
+}
+
+/// Whether another transaction can take `lock` on release `release` now.
+async fn release_lock_free(pool: &PgPool, release: Uuid, lock: &str) -> TestResult<bool> {
+    let mut other = pool.begin().await?;
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM template_releases WHERE id = $1 FOR {lock} NOWAIT"
+    )))
+    .bind(release)
+    .execute(&mut *other)
+    .await;
+    other.rollback().await?;
+    match result {
+        Ok(_) => Ok(true),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn release_locks_last_until_the_callers_transaction_ends() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let bound = metadata(environment(1));
+    let original = seeded(&db.pool, Some(bound.clone())).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let other_spelling = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+
+    let mut tx = db.pool.begin().await?;
+    assert_eq!(
+        registration::lock_execution_metadata(&mut tx, original).await?,
+        Some(bound)
+    );
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    assert!(release_lock_free(&db.pool, other_spelling, "UPDATE").await?);
+    tx.rollback().await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(matches!(
+        registration::lock_execution_metadata(&mut tx, Uuid::now_v7()).await,
+        Err(sqlx::Error::RowNotFound)
+    ));
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    let release = lookup::lock_release_of_present_template(&mut tx, original)
+        .await?
+        .expect("a present template's release");
+    assert_eq!(
+        (release.id, release.content_hash.as_str()),
+        (original, HASH)
+    );
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    let mut other = db.pool.begin().await?;
+    sqlx::query("SELECT 1 FROM templates WHERE name = $1 FOR UPDATE NOWAIT")
+        .bind(TEMPLATE)
+        .execute(&mut *other)
+        .await?;
+    other.rollback().await?;
+    tx.rollback().await?;
+    sqlx::query("UPDATE templates SET desired_state = 'deleting' WHERE name = $1")
+        .bind(TEMPLATE)
+        .execute(&db.pool)
+        .await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(
+        lookup::lock_release_of_present_template(&mut tx, original)
+            .await?
+            .is_none()
+    );
+    assert!(release_lock_free(&db.pool, original, "UPDATE").await?);
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    removal::lock_releases_of_digest(&mut tx, other_spelling).await?;
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    assert!(!release_lock_free(&db.pool, other_spelling, "KEY SHARE").await?);
+    tx.rollback().await?;
+    assert!(release_lock_free(&db.pool, original, "UPDATE").await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn original_lookups_and_the_twin_check_follow_the_shared_rule() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let original = seeded(&db.pool, None).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let other_spelling = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+    for hash in [HASH, bare] {
+        assert_eq!(
+            lookup::original_release_id(&db.pool, TEMPLATE, hash).await?,
+            Some(original),
+            "the original that owns a location wins under either spelling"
+        );
+    }
+    assert_eq!(
+        lookup::original_release_id(&db.pool, "other", HASH).await?,
+        None
+    );
+    let registered = registration::original_release(&db.pool, TEMPLATE, HASH, bare)
+        .await?
+        .expect("the digest's original");
+    assert_eq!((registered.id, registered.hash.as_str()), (original, HASH));
+    assert!(
+        registration::original_release(&db.pool, "other", HASH, bare)
+            .await?
+            .is_none()
+    );
+
+    assert!(!lookup::release_serves_a_tag(&db.pool, original).await?);
+    pplx_space_template_store::test_support::tag_release(
+        &db.pool,
+        TEMPLATE,
+        other_spelling,
+        "stable",
+    )
+    .await?;
+    assert!(
+        lookup::release_serves_a_tag(&db.pool, original).await?,
+        "a tag on the other spelling resolves to the digest original"
+    );
+    pplx_space_template_store::test_support::tag_release(&db.pool, TEMPLATE, original, "pinned")
+        .await?;
+    assert!(
+        !lookup::release_serves_a_tag(&db.pool, other_spelling).await?,
+        "a non-original serves neither its own non-latest tag nor a tag on another release of the digest"
+    );
+    pplx_space_template_store::test_support::tag_release(
+        &db.pool,
+        TEMPLATE,
+        other_spelling,
+        "latest",
+    )
+    .await?;
+    assert!(lookup::release_serves_a_tag(&db.pool, other_spelling).await?);
+
+    assert!(!lookup::release_has_twins(&db.pool, original).await?);
+    let twin = insert_release(&db.pool, TEMPLATE, HASH, Some(metadata(environment(2)))).await?;
+    assert!(lookup::release_has_twins(&db.pool, original).await?);
+    assert!(
+        !lookup::release_has_twins(&db.pool, twin).await?,
+        "a twin is no original"
+    );
+    assert!(
+        !lookup::release_has_twins(&db.pool, other_spelling).await?,
+        "the other spelling's original has no twin of its own"
+    );
     Ok(())
 }

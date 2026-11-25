@@ -1,4 +1,5 @@
 use pplx_space_accounts::{OrgId, UserId};
+use pplx_space_sql_locator::sql;
 use uuid::Uuid;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
@@ -1655,6 +1656,72 @@ mod cross_org_routes {
                 "{path}: {error}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_create_validates_sandbox_request_limits() -> TestResult {
+        use pplx_space_public_api::limits::MIN_SANDBOX_MEMORY_MIB;
+
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let create = |resources: serde_json::Value| {
+            json!({
+                "org_id": harness.tenant_org,
+                "sandbox": {
+                    "name": null,
+                    "template": "seed",
+                    "runtime": "fc",
+                    "env": {},
+                    "metadata": {},
+                    "resources": resources,
+                },
+            })
+        };
+
+        let (status, error) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-below-min-memory")],
+                Some(create(json!({ "memory_mib": MIN_SANDBOX_MEMORY_MIB - 1 }))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(
+            error.to_string().contains("resources.memory_mib"),
+            "{error}"
+        );
+        let enqueued: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM public_operations WHERE org_id = $1 AND kind = $2"
+        ))
+        .bind(harness.tenant_org.as_uuid())
+        .bind(OperationKind::CreateSandbox.as_str())
+        .fetch_one(&harness.db.pool)
+        .await?;
+        assert_eq!(enqueued, 0, "rejected create must not enqueue an operation");
+
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-at-min-memory")],
+                Some(create(json!({ "memory_mib": MIN_SANDBOX_MEMORY_MIB }))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-omitted-resources")],
+                Some(create(serde_json::Value::Null)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+
         Ok(())
     }
 }

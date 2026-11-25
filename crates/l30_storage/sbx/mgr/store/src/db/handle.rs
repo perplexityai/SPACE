@@ -107,8 +107,8 @@ impl Error {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn into_raw(self) -> rusqlite::Error {
+    #[cfg(test)]
+    pub(crate) fn into_raw(self) -> rusqlite::Error {
         self.0
     }
 }

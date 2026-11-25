@@ -31,6 +31,7 @@ use pplx_space_node_api_client::proto::{
     SetFacetSyncDisabledResponse, TriggerStateReconciliationRequest,
     TriggerStateReconciliationResponse,
 };
+use pplx_space_node_ctl_store::database::{self, Connection, SharedConnection, Transaction};
 use pplx_space_node_ctl_store::reconciliation_status;
 use pplx_space_node_mgr_client::{
     CacheDiskSchedulingEffect, NetworkPoolStatusReader, NodeManagerGrpcClient,
@@ -40,7 +41,6 @@ use pplx_space_service_lifecycle::DEFAULT_DRAIN_TIMEOUT;
 use pplx_space_service_mutex::{AcquireOutcome, ServiceMutex};
 use pplx_space_state_reconciliation::ReconcileReason;
 use pplx_space_uds_peer_auth::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
-use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -272,7 +272,7 @@ pub enum RunNodeCtlError {
     #[error("failed to open node-ctl's SQLite database: {0}")]
     OpenDatabase(#[source] pplx_space_node_ctl_store::database::SqliteError),
     #[error("failed to seed reconciliation status rows: {0}")]
-    InitReconciliationStatus(#[source] rusqlite::Error),
+    InitReconciliationStatus(#[source] database::Error),
     #[error("failed to bind the node-ctl socket: {0}")]
     BindSocket(#[source] pplx_space_unix_socket_bind::BindUnixSocketError),
     /// The worker returned before shutdown was requested: a dead per-node loop.
@@ -307,7 +307,7 @@ struct NodeCtlReconciliationConfig {
 struct NodeCtlService {
     tx: mpsc::Sender<WorkItem>,
     cluster_reconcile_trigger: cluster_reconcile_trigger::ClusterReconcileTrigger,
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     peer_authorizer: UdsPeerAuthorizer,
     /// Firewall rule delivery, which only a test fixture turns on.
     firewall_rules: Option<firewall_rules::Wake>,
@@ -317,7 +317,7 @@ impl NodeCtlService {
     fn new(
         tx: mpsc::Sender<WorkItem>,
         cluster_reconcile_trigger: ClusterReconcileTrigger,
-        db: Arc<Mutex<Connection>>,
+        db: SharedConnection,
         firewall_rules: Option<firewall_rules::Wake>,
     ) -> Self {
         Self {
@@ -444,7 +444,7 @@ struct SchedulingSnapshot {
 }
 
 struct NodeCtlWorker {
-    db: Arc<Mutex<Connection>>,
+    db: SharedConnection,
     node_id: String,
     node_role: Option<NodeRole>,
     /// The resolved reconciliation poll, as `spawn_poll_loop` runs it.
@@ -640,7 +640,7 @@ pub async fn run(
         .map_err(RunNodeCtlError::OpenDatabase)?;
     init_reconciliation_status(&db, poll_interval_secs)
         .map_err(RunNodeCtlError::InitReconciliationStatus)?;
-    let db = Arc::new(Mutex::new(db));
+    let db = SharedConnection::new(db);
 
     let (tx, rx) = mpsc::channel(WORK_QUEUE_CAPACITY);
     let cluster_reconcile_trigger = ClusterReconcileTrigger::new(tx.clone(), &node_id);
@@ -837,7 +837,7 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn init_reconciliation_status(conn: &Connection, poll_interval_secs: u64) -> rusqlite::Result<()> {
+fn init_reconciliation_status(conn: &Connection, poll_interval_secs: u64) -> database::Result<()> {
     let now = now_secs();
     for name in [
         NETWORK_POLICY_RECONCILER,
@@ -1095,11 +1095,11 @@ impl NodeCtl for NodeCtlService {
         }
         facets::validate_refs(&refs).map_err(Status::invalid_argument)?;
         {
-            let mut db = self
+            let db = self
                 .db
                 .lock()
                 .map_err(|_poisoned| Status::internal("node-ctl database lock poisoned"))?;
-            dirty_state::mark_refs(&mut db, &refs)
+            dirty_state::mark_refs(&db, &refs)
                 .map_err(|error| Status::internal(format!("mark facet dirty: {error}")))?;
         }
         match self.tx.try_send(WorkItem::SyncDirty) {
@@ -1683,12 +1683,12 @@ impl NodeCtlWorker {
         outcome
     }
 
-    fn mark_next_due(&self, next_due_at: i64) -> rusqlite::Result<()> {
-        let mut db = self
+    fn mark_next_due(&self, next_due_at: i64) -> database::Result<()> {
+        let db = self
             .db
             .lock()
-            .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
-        let tx = db.transaction()?;
+            .map_err(|_poisoned| database::Error::invalid_query())?;
+        let tx = Transaction::deferred(&db)?;
         for name in [
             NETWORK_POLICY_RECONCILER,
             SANDBOX_DESIRED_STATE_RECONCILER,
@@ -1928,12 +1928,12 @@ impl NodeCtlWorker {
         }
     }
 
-    fn mark_reconcile_started_for(&self, name: &str) -> rusqlite::Result<()> {
+    fn mark_reconcile_started_for(&self, name: &str) -> database::Result<()> {
         let now = now_secs();
         let db = self
             .db
             .lock()
-            .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
+            .map_err(|_poisoned| database::Error::invalid_query())?;
         reconciliation_status::mark_started(&db, name, now)
     }
 
@@ -2088,13 +2088,13 @@ impl NodeCtlWorker {
         name: &str,
         stats: &ReconcileStats,
         error: Option<&str>,
-    ) -> rusqlite::Result<()> {
+    ) -> database::Result<()> {
         let now = now_secs();
         let success = error.is_none();
         let db = self
             .db
             .lock()
-            .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
+            .map_err(|_poisoned| database::Error::invalid_query())?;
         reconciliation_status::mark_finished(
             &db,
             name,
@@ -2112,11 +2112,11 @@ impl NodeCtlWorker {
 }
 
 fn read_reconciliation_statuses(
-    db: &Arc<Mutex<Connection>>,
-) -> rusqlite::Result<Vec<ReconciliationStatus>> {
+    db: &SharedConnection,
+) -> database::Result<Vec<ReconciliationStatus>> {
     let db = db
         .lock()
-        .map_err(|_poisoned| rusqlite::Error::InvalidQuery)?;
+        .map_err(|_poisoned| database::Error::invalid_query())?;
     let rows = reconciliation_status::list(&db)?;
     Ok(rows
         .into_iter()

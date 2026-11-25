@@ -224,7 +224,10 @@ impl Fixture {
     }
 
     async fn complete(&self) -> Result<(), Status> {
-        self.service.complete_staged_upgrade_disk(&self.row()).await
+        self.service
+            .complete_staged_upgrade_disk(&self.row())
+            .await
+            .map_err(super::super::Refusal::into_status)
     }
 
     fn recorded_execution(&self) -> Option<pplx_space_execution_spec::ExecutionMetadata> {

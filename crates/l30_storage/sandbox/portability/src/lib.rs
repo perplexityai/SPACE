@@ -715,7 +715,7 @@ pub fn snapshot_is_live_restore_source(sandbox_alias: &str, snapshot_alias: &str
 /// When the newest full snapshot is `failed` (the current evacuation upload
 /// failed), this makes [`latest_full_snapshot_ready`] false, so the sandbox is
 /// not restore-pending and keeps blocking source release. It does **not**
-/// wedge: the node-drain reupload queue (`pinned_local_only_sandboxes_query`)
+/// wedge: the node-drain reupload queue (`pplx_space_sandbox_store::pinned_local_only::page`)
 /// uses [`snapshot_durable_for_source_release`] — also marker-aware — so a
 /// marked sandbox whose newest snapshot is `failed` is enumerated, reuploaded
 /// from the on-disk artifacts (still present, since the source can't terminate
@@ -2133,20 +2133,6 @@ pub fn started_restore_source_absent(sandbox_alias: &str, settle_param: &str) ->
 }
 
 /// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
-/// is **portable for drain-completion**:
-///
-/// `{alias}.lifecycle = 'suspended' AND <fresh ready snapshot exists>`.
-///
-/// Use this at decision points that gate the source node's drain on the
-/// absence of local-only snapshots. `suspending` / `restoring` rows are
-/// deliberately excluded — their state isn't yet uploadable so they always
-/// block drain regardless of any prior snapshot.
-pub fn portable_for_drain_completion(sandbox_alias: &str) -> String {
-    let snapshot_exists = fresh_ready_snapshot_exists(sandbox_alias);
-    format!("{sandbox_alias}.lifecycle = 'suspended' AND {snapshot_exists}")
-}
-
-/// SQL fragment evaluating to TRUE iff the sandbox aliased as `sandbox_alias`
 /// is **portable for restore-affinity drop**:
 ///
 /// `{alias}.lifecycle IN ('suspended', 'restoring') AND <fresh ready snapshot exists>`.
@@ -2357,5 +2343,7 @@ pub mod execution_supersession;
 mod drain_gate_differential_tests;
 #[cfg(test)]
 mod inflight_upload_shape_differential_tests;
+#[cfg(test)]
+mod portable_predicate_tests;
 #[cfg(test)]
 mod queued_artifact_recoverable_tests;

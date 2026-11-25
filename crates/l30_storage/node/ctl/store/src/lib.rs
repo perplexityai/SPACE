@@ -6,16 +6,25 @@
 //! and `dirty_node_state`, which no code reads or writes today.
 //!
 //! [`database`] migrates and opens the database, which node-ctl does at
-//! startup. Every other function takes a `rusqlite::Connection`, so a caller
-//! passes its own connection or open transaction, and returns rusqlite's
-//! error unchanged. node-ctl keeps the transactions whose reads guard its
-//! writes: run each verb whose doc asks for it inside the caller's
-//! transaction. node-ctl's claim, clear and failure writes to `dirty_facets`
-//! stay at their call sites, because each re-checks the row's claim in its
-//! `WHERE`: the claim takes only unclaimed rows or rows whose claim went
-//! stale, and the other writes match the batch's claim token. The clear's
-//! delete and the two updates that record a failed attempt also match the
-//! claimed generation.
+//! startup, and holds the handle types callers name. Every other function
+//! takes a [`database::Connection`], so a caller passes the connection its
+//! [`database::SharedConnection`] lock holds or a [`database::Transaction`]
+//! it opened, and fails with [`database::Error`], whose `Display` and
+//! `source` are rusqlite's. node-ctl keeps the transactions whose reads guard
+//! its writes: run each verb whose doc asks for it inside the caller's
+//! transaction. This crate's `AGENTS.md` states the rules for its public
+//! surface.
+//!
+//! [`dirty_facets`]' claim, clear and failure writes are guarded transitions:
+//! each re-checks the row's claim in its `WHERE`. The claim takes only
+//! unclaimed rows or rows whose claim went stale, and the other writes match
+//! the batch's claim token. The clear's delete and the two updates that record
+//! a failed attempt also match the claimed generation. Each binds the claim
+//! token, generation and times the caller decided on and returns whether it
+//! matched (the claim, how many rows it took); matching nothing is a normal
+//! outcome, another claim or a newer mark having won. node-ctl keeps the
+//! transaction around a batch's clear or failure and decides what each
+//! outcome means.
 
 #![forbid(unsafe_code)]
 

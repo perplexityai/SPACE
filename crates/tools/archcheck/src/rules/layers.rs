@@ -20,8 +20,16 @@
 //!   clients.
 //! - `store_edges`: an API or Storage crate depends on a store only if the
 //!   store lists it as a user.
+//! - `coordinators` and `coordinator_edges`: a coordinator, a Storage crate
+//!   named `*-coordinator` that runs one transaction across stores, sits at
+//!   `<area>/coordinator` without a leaf, declares no state and depends on
+//!   no other coordinator; an API crate depends on one only if it lists it
+//!   as a user, and a store never does ([`coordinator`]).
+//! - `driver_reexports`: no Storage crate's library root re-exports a driver
+//!   ([`coordinator`]).
 //! - `storage_access` and `codec_features`: only stores and storage helpers
-//!   depend on a database or object storage driver, but for a Foundation or
+//!   depend on a database or object storage driver (a coordinator is no
+//!   store), but for a Foundation or
 //!   Domain codec's optional dependency on a codec facade, or turn on
 //!   another crate's driver feature; each with a baseline table
 //!   ([`storage`]).
@@ -38,6 +46,7 @@
 //! Baseline tables are keyed by package name, so moving a crate into its
 //! layer directory leaves them alone.
 
+mod coordinator;
 mod domain;
 mod facade;
 mod graph;
@@ -259,6 +268,16 @@ impl Rule for Layers {
             (Problem::TestOnly, "test_only", config.test_only.mode),
             (Problem::Clients, "clients", config.clients.mode),
             (Problem::StoreEdges, "store_edges", config.store_edges.mode),
+            (
+                Problem::Coordinators,
+                "coordinators",
+                config.coordinators.mode,
+            ),
+            (
+                Problem::CoordinatorEdges,
+                "coordinator_edges",
+                config.coordinator_edges.mode,
+            ),
         ] {
             findings.extend(
                 verdicts
@@ -268,6 +287,10 @@ impl Rule for Layers {
                     .map(|violation| edge_finding(None, behaviour, mode, violation)),
             );
         }
+        findings.extend(coordinator::declared_state(config, &graph));
+        findings.extend(coordinator::misnamed(config, &graph));
+        findings.extend(coordinator::misplaced(config, &graph));
+        findings.extend(coordinator::driver_reexports(ctx, config, &graph));
         if let (Some(state), Some(unowned)) = (&config.state, &config.unowned) {
             findings.extend(state::check(ctx, config, state, unowned, &graph));
         }
@@ -969,13 +992,40 @@ fn detail(ctx: &Context, graph: &Graph<'_>, problem: Problem, edge: &Edge<'_>) -
              the service's *-protocol crate, which both can depend on.",
             items()
         ),
+        Problem::Coordinators => format!(
+            ": {from} is a coordinator (an l30_storage crate named *-coordinator), which depends \
+             only on l20_domain, l10_foundation and the stores that list it in [rules.{RULE}] \
+             store_users, but it depends on the coordinator {to}, {declared}. Coordinators don't \
+             nest: call the store verbs {to} calls{} from {from}, in the lock order {to} \
+             documents, with {from} listed as each store's user; or merge the two coordinators.",
+            items()
+        ),
+        Problem::CoordinatorEdges if from_layer == Layer::Storage => format!(
+            ": {from} (l30_storage) depends on the coordinator {to}, {declared}, but a store never \
+             uses a coordinator: a coordinator runs one transaction across stores, so its edges \
+             point at stores, not from them. Move what {from} uses{} into {from}, or run the \
+             transaction from the l40_api crate that decides it, through {to}.",
+            items()
+        ),
+        Problem::CoordinatorEdges => format!(
+            ": {from} ({from_layer}) depends on the coordinator {to}, {declared}, but {to} does not \
+             list it in [rules.{RULE}] coordinator_users in {CONFIG_FILE}. A coordinator is used \
+             only by the services that list it: if {from} runs this transaction, add it to {to}'s \
+             users, which {RULE}.policy_changed reports; otherwise reach the state through its \
+             owner's API (the crate root or its client)."
+        ),
         Problem::StoreEdges => {
             let unlisted = format!(
                 ": {from} ({from_layer}) depends on the store {to}, {declared}, but {to} does not \
                  list it in [rules.{RULE}] store_users in {CONFIG_FILE}."
             );
             let users = format!("add it to {to}'s users, which {RULE}.policy_changed reports");
-            if from_layer == Layer::Storage {
+            if edge.from.is_coordinator() {
+                format!(
+                    "{unlisted} A coordinator depends only on the stores that list it: if \
+                     {from}'s transaction calls {to}, {users}; otherwise remove the dependency."
+                )
+            } else if from_layer == Layer::Storage {
                 // A store can't reach an API crate, so the read stays in a
                 // store.
                 format!(

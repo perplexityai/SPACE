@@ -3,12 +3,12 @@
 
 use pplx_space_auto_lifecycle::AutoLifecyclePolicy;
 use pplx_space_sql_locator::sql;
-use pplx_space_template_model::TemplateName;
+use pplx_space_template_model::{TemplateDesiredState, TemplateName};
 use sqlx::{PgExecutor, types::Json};
 
 /// Set `template`'s default auto-lifecycle policy to `policy`, whatever the
 /// template's desired state. The update route's write, gated on a present
-/// template, stays at its call site.
+/// template, is [`upsert_if_present`].
 pub async fn upsert(
     executor: impl PgExecutor<'_>,
     template: &TemplateName,
@@ -82,4 +82,30 @@ pub async fn delete(
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Set a present `template`'s default auto-lifecycle policy to `policy`.
+/// `false` when the template isn't present, which writes nothing.
+pub async fn upsert_if_present(
+    executor: impl PgExecutor<'_>,
+    template: &TemplateName,
+    policy: &AutoLifecyclePolicy,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "INSERT INTO template_default_auto_lifecycle_policies
+                     (template, default_auto_lifecycle_json, updated_at)
+                 SELECT name, $2, NOW()
+                 FROM templates
+                 WHERE name = $1
+                   AND desired_state = $3
+                 ON CONFLICT (template) DO UPDATE
+                 SET default_auto_lifecycle_json = EXCLUDED.default_auto_lifecycle_json,
+                     updated_at = NOW()"
+    ))
+    .bind(template.as_str())
+    .bind(Json(policy))
+    .bind(TemplateDesiredState::Present.as_str())
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() != 0)
 }

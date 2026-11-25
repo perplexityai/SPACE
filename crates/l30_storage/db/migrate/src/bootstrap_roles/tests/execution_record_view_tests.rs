@@ -101,8 +101,9 @@ const STORAGE_VEND_NODE_LOOKUP: &str = sql!(
      WHERE k.k8s_node_uid IS NOT NULL"
 );
 
-/// The execution claim's generation allocation (`execution_rows.rs` in the api
-/// crate), which reads through the view.
+/// The execution claim's generation allocation
+/// (`k8s_executions::claim::mint_generation` in the sandbox store), which
+/// reads through the view.
 const EXECUTION_GENERATION_ALLOCATION: &str = sql!(
     "SELECT COALESCE(MAX(generation), 0) + 1
      FROM sandbox_k8s_executions
@@ -455,7 +456,9 @@ async fn views_keep_the_old_row_types_and_writes_reach_the_base_tables() -> Test
     assert_eq!(placed, 1);
 
     // The retired-generation insert's `INSERT ... SELECT ... WHERE NOT EXISTS
-    // ... ON CONFLICT DO NOTHING` (`execution_rows.rs` in the api crate).
+    // ... ON CONFLICT DO NOTHING`
+    // (`k8s_executions::claim::retire_pool_reserved_generation` in the sandbox
+    // store).
     let other_sandbox = seed_sandbox(&mut conn, &node_id).await?;
     let retired = sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (

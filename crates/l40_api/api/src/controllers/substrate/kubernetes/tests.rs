@@ -9691,7 +9691,7 @@ mod kubernetes_tests {
                          SELECT 1 FROM pg_stat_activity
                          WHERE datname = current_database()
                            AND wait_event_type = 'Lock'
-                           AND query LIKE '%SELECT lifecycle FROM sandboxes%FOR UPDATE%'
+                           AND query LIKE '%SELECT s.lifecycle, n.drain_engine%FOR UPDATE OF s%'
                      )"
                 ))
                 .fetch_one(&pool)
@@ -15008,6 +15008,34 @@ mod kubernetes_tests {
         assert_eq!(
             disposition,
             WakeRpcErrorDisposition::ReadinessPoll("missing_runtime_context")
+        );
+    }
+
+    /// A node a drain sealed refuses the wake with the shared marker; the
+    /// wake answers it as the drain gate's retryable refusal, never as a
+    /// failed wake, and nothing else reads as one.
+    #[test]
+    fn a_sealed_nodes_refusal_is_its_own_disposition() {
+        use super::super::support::{WakeRpcErrorDisposition, classify_wake_rpc_error};
+
+        let sealed = tonic::Status::failed_precondition(format!(
+            "{} (generation 7); refusing the resume activation of sandbox s",
+            pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER
+        ));
+        assert_eq!(
+            classify_wake_rpc_error(&sealed),
+            WakeRpcErrorDisposition::NodeSealed
+        );
+        assert_eq!(
+            classify_wake_rpc_error(&tonic::Status::failed_precondition("something else")),
+            WakeRpcErrorDisposition::Fail
+        );
+        assert_eq!(
+            classify_wake_rpc_error(&tonic::Status::internal(
+                pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER
+            )),
+            WakeRpcErrorDisposition::Fail,
+            "only the node's FailedPrecondition carries the refusal"
         );
     }
 

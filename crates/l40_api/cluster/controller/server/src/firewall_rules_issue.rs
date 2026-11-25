@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use pplx_space_accounts::NodeId;
-use pplx_space_cluster_reconciler::enqueue_triggers_tx;
+use pplx_space_cluster_trigger_queue::enqueue_triggers_tx;
 use pplx_space_firewall_rules_store::{
     Issuance, LeasedTarget, Wakeup, issue_canary_and_release, lease_first_canary,
 };

@@ -129,7 +129,7 @@ impl TemplateManagerService {
         // Spawned, so a caller that stops waiting cannot interrupt the
         // eviction between a build's `deleting` swap and its final row delete.
         let eviction = tokio::spawn({
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let gate = self.eviction_gate.clone();
             let name = template.clone();
             let disk = crate::eviction::EvictionDisk {
@@ -192,7 +192,7 @@ impl TemplateManagerService {
     }
 
     async fn template_local_state_exists(&self, template: &str) -> Result<bool, Status> {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let name = template.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = db
@@ -327,7 +327,7 @@ impl TemplateManagerService {
     }
 
     async fn delete_template_local_state(&self, template: &str) -> Result<(), Status> {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let name = template.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = db.lock().map_err(|_| {
@@ -348,7 +348,7 @@ impl TemplateManagerService {
     ) -> Result<Response<ListTemplatesResponse>, Status> {
         self.authorize_peer(&request, "ListTemplates", ALLOW_TEMPLATE_OBSERVER)?;
         // Fetch all builds from DB
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let (builds, all_snapshots, pools, template_settings) =
             tokio::task::spawn_blocking(move || {
                 let conn = db
@@ -649,7 +649,7 @@ impl TemplateManagerService {
         // Network policy validation is independent of the content hash, so run
         // it before any disk work.
         if let Some(requested_policy) = requested_network_policy.as_ref() {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let name = template_id.clone();
             let requested_policy = requested_policy.clone();
             let existing_policy = tokio::task::spawn_blocking(move || {
@@ -808,7 +808,7 @@ impl TemplateManagerService {
         register_source.cleanup();
 
         // Persist to DB
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let name = template_id.clone();
         let hash = content_hash.clone();
         let date = build_date.clone();
@@ -837,7 +837,7 @@ impl TemplateManagerService {
                 &name,
                 requested_network_policy_for_db.as_ref(),
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, crate::db::Error>(())
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
@@ -911,7 +911,7 @@ impl TemplateManagerService {
         .await?;
         register_source.cleanup();
         let (build_date, environment) = {
-            let db = Arc::clone(&self.db);
+            let db = self.db.clone();
             let name = template_id.to_string();
             let hash = content_hash.to_string();
             let requested_network_policy = requested_network_policy.cloned();

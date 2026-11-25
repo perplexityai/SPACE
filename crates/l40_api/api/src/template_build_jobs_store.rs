@@ -1,7 +1,6 @@
 use std::str::FromStr;
 
 use pplx_space_accounts::{NodeId, OrgId, SystemPublicationGrantId, TenantPublicationGrantId};
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::{BuildRunId, BuildRunIdParseError, TemplateName};
 use pplx_space_template_store::{build_base_grants, build_jobs, publication_grants, templates};
 use sqlx::{PgExecutor, PgPool};
@@ -97,7 +96,7 @@ impl TemplateBuildJobsStore {
         template_name: &TemplateName,
         org_id: OrgId,
     ) -> Result<bool, sqlx::Error> {
-        template_build_owner_matches(&self.pool, template_name, org_id).await
+        templates::not_owned_by_another_org(&self.pool, template_name, org_id).await
     }
 
     pub(crate) async fn record_accepted_build(
@@ -112,7 +111,7 @@ impl TemplateBuildJobsStore {
         if grants.tenant_publication.is_some() && builder_node_id.is_none() {
             return Err(TemplateBuildJobsStoreError::BuilderIdentityRequired);
         }
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !templates::not_owned_by_another_org(&self.pool, template_name, org_id).await? {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
         let daemon_job_id_text = daemon_job_id.to_string();
@@ -139,8 +138,14 @@ impl TemplateBuildJobsStore {
                 Self::pin_base_grant(&mut *tx, base_grant, builder_node_id).await?;
             }
             if let Some(publication_grant) = grants.tenant_publication {
-                Self::pin_tenant_publication_grant(&mut *tx, publication_grant, builder_node_id)
-                    .await?;
+                // The pin has the same lifetime as the base grant's pin; other
+                // submissions' grants are untouched.
+                publication_grants::pin_tenant_to_builder(
+                    &mut *tx,
+                    publication_grant,
+                    builder_node_id,
+                )
+                .await?;
             }
         }
         tx.commit().await?;
@@ -164,12 +169,7 @@ impl TemplateBuildJobsStore {
         template_name: &TemplateName,
         base: &TemplateName,
     ) -> Result<BuildBaseGrantId, sqlx::Error> {
-        sqlx::query(sql!(
-            "DELETE FROM template_build_base_grants
-             WHERE granted_at < NOW() - INTERVAL '7 days'"
-        ))
-        .execute(&self.pool)
-        .await?;
+        build_base_grants::delete_expired(&self.pool).await?;
         let grant = BuildBaseGrantId(uuid::Uuid::now_v7());
         build_base_grants::insert(&self.pool, grant.as_uuid(), template_name, base, org_id).await?;
         Ok(grant)
@@ -188,12 +188,7 @@ impl TemplateBuildJobsStore {
         &self,
         template_name: &TemplateName,
     ) -> Result<SystemPublicationGrantId, TemplateBuildJobsStoreError> {
-        sqlx::query(sql!(
-            "DELETE FROM template_system_publication_grants
-             WHERE granted_at < NOW() - INTERVAL '7 days'"
-        ))
-        .execute(&self.pool)
-        .await?;
+        publication_grants::delete_expired_system(&self.pool).await?;
         let grant = SystemPublicationGrantId::new();
         publication_grants::insert_system(&self.pool, grant, template_name).await?;
         Ok(grant)
@@ -225,12 +220,7 @@ impl TemplateBuildJobsStore {
         org_id: OrgId,
         template_name: &TemplateName,
     ) -> Result<TenantPublicationGrantId, TemplateBuildJobsStoreError> {
-        sqlx::query(sql!(
-            "DELETE FROM template_tenant_publication_grants
-             WHERE granted_at < NOW() - INTERVAL '7 days'"
-        ))
-        .execute(&self.pool)
-        .await?;
+        publication_grants::delete_expired_tenant(&self.pool).await?;
         let grant = TenantPublicationGrantId::new();
         publication_grants::insert_tenant(&self.pool, grant, template_name, org_id).await?;
         Ok(grant)
@@ -244,17 +234,6 @@ impl TemplateBuildJobsStore {
     ) -> Result<(), TemplateBuildJobsStoreError> {
         publication_grants::delete_tenant(&self.pool, grant).await?;
         Ok(())
-    }
-
-    /// Pin one submission's publication grant to the builder that accepted
-    /// it, with the same lifetime as its base grant's pin. Other submissions'
-    /// grants are untouched.
-    async fn pin_tenant_publication_grant(
-        executor: impl PgExecutor<'_>,
-        grant: TenantPublicationGrantId,
-        builder_node_id: NodeId,
-    ) -> Result<(), sqlx::Error> {
-        publication_grants::pin_tenant_to_builder(executor, grant, builder_node_id).await
     }
 
     /// Pin one submission's base grant to the builder that accepted it. From
@@ -275,7 +254,7 @@ impl TemplateBuildJobsStore {
         template_name: &TemplateName,
         build_id: &str,
     ) -> Result<Option<BuildJob>, TemplateBuildJobsStoreError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !templates::not_owned_by_another_org(&self.pool, template_name, org_id).await? {
             return Ok(None);
         }
         let daemon_job_id =
@@ -325,7 +304,7 @@ impl TemplateBuildJobsStore {
         build_id: &str,
         spec: BuildSpec,
     ) -> Result<(), TemplateBuildJobsStoreError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !templates::not_owned_by_another_org(&self.pool, template_name, org_id).await? {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
         let recorded = build_jobs::record_spec(
@@ -353,7 +332,7 @@ impl TemplateBuildJobsStore {
         template_name: &TemplateName,
         build_id: &str,
     ) -> Result<Option<BuildSpec>, TemplateBuildJobsStoreError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+        if !templates::not_owned_by_another_org(&self.pool, template_name, org_id).await? {
             return Ok(None);
         }
         let row = build_jobs::spec(&self.pool, template_name, build_id, org_id).await?;
@@ -367,14 +346,6 @@ impl TemplateBuildJobsStore {
         })
         .transpose()
     }
-}
-
-pub(crate) async fn template_build_owner_matches(
-    pool: &PgPool,
-    template_name: &TemplateName,
-    org_id: OrgId,
-) -> Result<bool, sqlx::Error> {
-    templates::not_owned_by_another_org(pool, template_name, org_id).await
 }
 
 fn optional_i32_to_u32(value: Option<i32>) -> Result<Option<u32>, TemplateBuildJobsStoreError> {

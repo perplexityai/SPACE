@@ -26,12 +26,6 @@ use uuid::Uuid;
 
 use super::*;
 
-/// A page cap large enough that nothing in this module truncates. Truncation
-/// is `pinned_local_only_scale_tests`' subject; conflating the two would make
-/// a fixture change there able to fail an assertion here for an unrelated
-/// reason.
-const TEST_PAGE_CAP: NonZeroUsize = NonZeroUsize::new(64).unwrap();
-
 /// How long ago the node last reported its backup inventory.
 #[derive(Clone, Copy)]
 enum Gate {
@@ -168,77 +162,20 @@ async fn analyze(pool: &PgPool) -> TestResult {
 }
 
 /// Run the history statement directly — the oracle every differential here is
-/// taken against.
+/// taken against. Its page is far larger than any fixture here, so nothing in
+/// this module truncates; truncation is the store's scale tests' subject.
 async fn history_answer(
     pool: &PgPool,
     node: NodeId,
     exclude_legacy: bool,
 ) -> TestResult<Vec<SandboxId>> {
-    let query = pinned_local_only_sandboxes_query(exclude_legacy, TEST_PAGE_CAP);
-    Ok(
-        sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node)
-            .fetch_all(pool)
-            .await?,
-    )
+    Ok(sandbox_store::pinned_local_only::page(pool, node, exclude_legacy).await?)
 }
 
-/// Whether the gate fragment believes this node's inventory.
+/// Whether the gate believes this node's inventory. Which reports it believes
+/// is pinned by the node status store's own tests.
 async fn gate_is_fresh(pool: &PgPool, node: NodeId) -> TestResult<bool> {
-    let query = node_backup_inventory_gate_query();
-    Ok(
-        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node)
-            .fetch_one(pool)
-            .await?,
-    )
-}
-
-/// The gate believes a recent report, and nothing else.
-///
-/// Runs first because every fallback assertion below is an assertion that the
-/// gate said no. If the gate said no for the wrong reason — or said no
-/// always — those tests would still pass while proving nothing, so the three
-/// cases are pinned separately here.
-#[tokio::test(flavor = "current_thread")]
-async fn the_gate_believes_a_recent_report_and_nothing_else() -> TestResult {
-    let Some(db) = try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let pool = &db.pool;
-
-    for (gate, expected, name) in [
-        (Gate::Fresh, true, "a report inside the window"),
-        (Gate::Stale, false, "a report older than the window"),
-        (Gate::NeverReported, false, "a node that never reported"),
-    ] {
-        let node = insert_node_with_gate(pool, gate).await?;
-        assert_eq!(
-            gate_is_fresh(pool, node).await?,
-            expected,
-            "{name} must read as fresh={expected}"
-        );
-    }
-
-    // A node with no `node_status_snapshots` row at all — the state between
-    // registration and first census. Distinct from `NeverReported`, which has
-    // a row with a NULL column, and reachable in production, so it gets its
-    // own case rather than being assumed to behave like one.
-    let bare = NodeId::new();
-    sqlx::query(sql!(
-        "INSERT INTO nodes (id, address, role, managed_by, state)
-         VALUES ($1, '10.0.0.82'::inet, 'worker', 'k8s', 'registered')"
-    ))
-    .bind(bare)
-    .execute(pool)
-    .await?;
-    assert!(
-        !gate_is_fresh(pool, bare).await?,
-        "a node with no census row at all must not be believed — the EXISTS \
-         has nothing to match, and reading that as fresh would trust an empty \
-         queue for a node that has never spoken"
-    );
-    Ok(())
+    Ok(backup_inventory::fresh(pool, node).await?)
 }
 
 /// With the flag off, the queue is invisible — including where it would have
@@ -516,7 +453,7 @@ async fn the_queue_path_carries_an_artifact_identity_history_cannot() -> TestRes
 ///
 /// It holds because the queue and the release decision are different
 /// statements. The queue drives *work enumeration*; `draining → drained` is
-/// gated by `drain_blocking_sandboxes_query`, which counts from `sandboxes`
+/// gated by `drain_gate_blockers::count_on_node`, which counts from `sandboxes`
 /// through `drain_gate_blockers_for_node` and never consults the queue —
 /// `count_drain_blocking_sandboxes_on_node` does not even take the flag. A
 /// wrong-empty queue is therefore covered twice: the rows it omits are still
@@ -566,11 +503,7 @@ async fn a_wrongly_empty_queue_cannot_release_a_node_still_holding_an_artifact()
     );
 
     // The property. The gate is a different statement and it is not fooled.
-    let gate = drain_blocking_sandboxes_query();
-    let blockers: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(gate.as_str())))
-        .bind(node)
-        .fetch_one(pool)
-        .await?;
+    let blockers = sandbox_store::drain_gate_blockers::count_on_node(pool, node).await?;
     assert!(
         blockers >= 1,
         "the release gate must still hold this node: the queue said nothing \
@@ -585,10 +518,7 @@ async fn a_wrongly_empty_queue_cannot_release_a_node_still_holding_an_artifact()
     // gate that never returns zero at all.
     make_durable(pool, unbacked, node).await?;
     analyze(pool).await?;
-    let cleared: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(gate.as_str())))
-        .bind(node)
-        .fetch_one(pool)
-        .await?;
+    let cleared = sandbox_store::drain_gate_blockers::count_on_node(pool, node).await?;
     assert_eq!(
         cleared, 0,
         "control: once the artifact is durable the same gate must release the \
@@ -633,11 +563,7 @@ async fn a_node_held_by_unrepresentable_bytes_still_converges() -> TestResult {
 
     // Premise: this row really does block the gate, or there is nothing to
     // converge and the assertion below would hold trivially.
-    let gate = drain_blocking_sandboxes_query();
-    let blockers: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(gate.as_str())))
-        .bind(node)
-        .fetch_one(pool)
-        .await?;
+    let blockers = sandbox_store::drain_gate_blockers::count_on_node(pool, node).await?;
     assert!(
         blockers >= 1,
         "premise: an unpinned suspended row with no durable copy must block \
@@ -793,11 +719,7 @@ async fn a_blocker_no_promotion_can_act_on_leaves_the_queue_complete() -> TestRe
 
     // Premise: the gate does count this row, so a gate-keyed fallback would
     // have fired here and the assertion below is not true by construction.
-    let gate = drain_blocking_sandboxes_query();
-    let blockers: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(gate.as_str())))
-        .bind(node)
-        .fetch_one(pool)
-        .await?;
+    let blockers = sandbox_store::drain_gate_blockers::count_on_node(pool, node).await?;
     assert!(
         blockers >= 1,
         "premise: a pinned `suspending` row must block the gate"

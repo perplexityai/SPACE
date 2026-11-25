@@ -97,7 +97,7 @@ impl crate::service::SandboxManagerService {
     pub(in crate::service) async fn complete_staged_upgrade_disk(
         &self,
         sandbox: &SandboxRow,
-    ) -> Result<(), Status> {
+    ) -> Result<(), super::Refusal> {
         if !self.staged_checkpoint_disk || !sandbox.state.is_unowned(SandboxState::Suspended) {
             return Ok(());
         }
@@ -137,8 +137,9 @@ impl crate::service::SandboxManagerService {
         if metadata_json.is_empty() && !sandbox.volume_encryption {
             return Ok(());
         }
-        self.materialize_staged_checkpoint_disk(sandbox, pinned, metadata_json)
-            .await
+        Ok(self
+            .materialize_staged_checkpoint_disk(sandbox, pinned, metadata_json)
+            .await?)
     }
 
     async fn materialize_staged_checkpoint_disk(

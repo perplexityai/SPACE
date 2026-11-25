@@ -20,17 +20,37 @@
 //! The releases themselves and their storage locations are
 //! `pplx-space-template-release-store`'s.
 //!
-//! Every verb is a free function over an executor, so it runs in the
-//! caller's transaction. Some reads join other stores' tables, such as the
-//! admin template list's node inventory and the create's builder-reported
-//! auto-lifecycle default; none writes them. Some statements on these
-//! tables still run at their call sites, among them: the tag move's lock of
-//! the tag row; reads that lock rows (`FOR UPDATE`, `FOR NO KEY UPDATE`,
-//! `FOR SHARE`); writes guarded by the template's desired state, owner or
-//! network policy generation; statements compared against the database
-//! clock, such as the grant checks, consumption and sweeps, and tombstone
-//! retention's delete; and other statements that also read or write
-//! another store's tables.
+//! Every verb is a free function, so it runs in the caller's transaction.
+//! Most take any executor. Some reads join other stores' tables, such as
+//! the admin template list's node inventory, the create's builder-reported
+//! auto-lifecycle default, and the node-facing policy reads' sandboxes,
+//! pool configs and releases; none writes them.
+//!
+//! * **Locks.** A verb whose row lock the caller relies on after the
+//!   statement (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, as the
+//!   visibility flip, the node-group allowlist check, the template and
+//!   release deletes, the tag move, release registration and the
+//!   pool-config writes take them) is named for the lock and takes the
+//!   caller's transaction; the lock lasts until that transaction ends. Lock
+//!   timeouts stay with the caller.
+//! * **Database clock.** Statements that compare against `NOW()`, such as
+//!   the grant checks, consumption and sweeps, the node-facing policy
+//!   reads' build-base grants, and tombstone retention's delete, keep the
+//!   comparison in their SQL and run in the executor the caller passes.
+//! * **Guarded writes.** Writes that re-check a precondition in their
+//!   `WHERE` (the template's desired state, owner or network policy
+//!   generation for the admin create and undelete, the update route's
+//!   writes, the delete request and the policy upserts; the grant's target,
+//!   owner, freshness and builder for grant consumption) bind the guard's
+//!   values and return the outcome; matching nothing is an outcome, not an
+//!   error. The caller keeps its transaction and decides what each outcome means.
+//!
+//! Statements that also write another store's tables stay at their call
+//! sites. Reads of these tables that interpolate a
+//! `pplx_space_template_release_original` fragment aren't this store's, as
+//! it is not one of that crate's users; among them, the admin release
+//! delete's check of the tags a release serves is
+//! `pplx-space-template-release-store`'s `lookup::release_serves_a_tag`.
 
 pub mod base_snapshot_policies;
 pub mod build_base_grants;

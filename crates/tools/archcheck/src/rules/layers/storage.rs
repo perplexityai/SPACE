@@ -24,7 +24,7 @@
 //!   and a facade's own on a driver. Its findings also cover a facade's
 //!   source beyond its listed exports ([`facade`]), which no baseline entry
 //!   tolerates.
-//! - `codec_features`: a driver feature of a crate outside Storage, one that
+//! - `codec_features`: a driver feature of a crate other than a store, one that
 //!   turns on an optional dependency on a driver or helper, itself, through
 //!   the features it requests of an optional dependency, or by forwarding to
 //!   another crate's driver feature, may be enabled by stores and helpers:
@@ -35,6 +35,10 @@
 //!   then a driver feature, whose enabling is checked. A store's own
 //!   driver features are not checked: depending on a store is the way to
 //!   reach storage.
+//!
+//! A coordinator, the Storage crate that runs one transaction across stores,
+//! is no store: it holds no SQL and reaches storage only through the stores'
+//! verbs, so both checks treat it as they treat an API crate.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -97,7 +101,7 @@ pub(super) struct Storage<'a> {
     /// The Foundation crates derivation finds that `helpers` doesn't list,
     /// each with the drivers it requires: no helper until listed.
     unlisted: BTreeMap<&'a str, BTreeSet<&'a str>>,
-    /// Each driver feature of each crate outside Storage, by crate and
+    /// Each driver feature of each crate other than a store, by crate and
     /// feature.
     features: BTreeMap<&'a str, BTreeMap<String, Reach>>,
     /// `storage_access` violations, as `(from, driver or helper)`.
@@ -191,9 +195,10 @@ impl<'a> Storage<'a> {
     }
 
     /// Whether `member` is a store or a storage helper, which may use
-    /// drivers and helpers and enable driver features.
+    /// drivers and helpers and enable driver features; a coordinator is
+    /// neither.
     fn may_use(&self, member: &Member<'_>) -> bool {
-        member.layer == Some(Layer::Storage) || self.helpers.contains_key(member.name())
+        member.is_store() || self.helpers.contains_key(member.name())
     }
 
     /// Whether `from`'s dependency on `to` is a required driver dependency
@@ -231,7 +236,7 @@ impl<'a> Storage<'a> {
                 || (self.is_facade(member.name()) && config.storage.drivers.contains(to)))
     }
 
-    /// Each crate's driver features, outside Storage, to a fixpoint: a
+    /// Each crate's driver features, outside the stores, to a fixpoint: a
     /// feature that turns on an optional dependency on a driver or helper,
     /// or forwards to a feature that does, its own or another such crate's.
     fn driver_features(
@@ -242,7 +247,7 @@ impl<'a> Storage<'a> {
         let members: Vec<&Member<'a>> = graph
             .members
             .values()
-            .filter(|member| member.layer != Some(Layer::Storage))
+            .filter(|member| !member.is_store())
             .collect();
         let tables: BTreeMap<&str, BTreeMap<String, Vec<String>>> = members
             .iter()
@@ -500,15 +505,27 @@ impl<'a> Storage<'a> {
             } else {
                 ""
             };
-            let detail = format!(
-                ": {from} ({layer}) depends on {to}, {what}, {}{optional}, but only l30_storage \
-                 crates and storage helpers may: nothing above l30_storage reaches a database or \
-                 object storage directly, l10_foundation does only in a helper that names \
-                 nothing SPACE-specific, and l20_domain and other l10_foundation crates hold at \
-                 most a codec, behind an optional normal dependency on a codec facade. {fixes} \
-                 See {GUIDE}.",
-                dependency.describe(),
-            );
+            let detail = if member.is_coordinator() {
+                format!(
+                    ": {from} is a coordinator (an l30_storage crate named *-coordinator) and \
+                     depends on {to}, {what}, {}{optional}, but a coordinator holds no SQL and \
+                     takes no driver, storage helper or codec facade: only stores and storage \
+                     helpers reach a database or object storage. Fix: move the code that uses \
+                     it{items} into the store that owns the rows, as a verb the coordinator calls \
+                     in its transaction. {no_helper} See {GUIDE}.",
+                    dependency.describe(),
+                )
+            } else {
+                format!(
+                    ": {from} ({layer}) depends on {to}, {what}, {}{optional}, but only \
+                     stores and storage helpers may: nothing above l30_storage \
+                     reaches a database or object storage directly, l10_foundation does only in \
+                     a helper that names nothing SPACE-specific, and l20_domain and other \
+                     l10_foundation crates hold at most a codec, behind an optional normal \
+                     dependency on a codec facade. {fixes} See {GUIDE}.",
+                    dependency.describe(),
+                )
+            };
             self.access.insert(
                 key,
                 Crossing {
@@ -609,7 +626,7 @@ impl<'a> Storage<'a> {
             };
             let detail = format!(
                 ": {from} ({layer}) enables the `{feature}` feature of {target}, {how}, which \
-                 {turns_on}, but only l30_storage crates and storage helpers may turn on a driver \
+                 {turns_on}, but only stores and storage helpers may turn on a driver \
                  feature, directly or through a feature of an l10_foundation or l20_domain \
                  crate's own that forwards to it. Fix: drop the feature, move the code that needs it, such as a codec or \
                  a client, into a store in l30_storage (which may enable the feature itself) or a \
@@ -762,7 +779,7 @@ impl<'a> Storage<'a> {
     }
 
     /// The member `package` names, if it has driver features: a crate
-    /// outside Storage.
+    /// other than a store.
     fn featured<'b>(&self, graph: &'b Graph<'_>, package: &str) -> Option<&'b str> {
         let member = graph.member(package)?;
         self.features
@@ -785,7 +802,7 @@ impl<'a> Storage<'a> {
         if let Some(why) = left_out(member) {
             return format!("{from} {why}, which the storage checks leave out");
         }
-        if member.layer == Some(Layer::Storage) {
+        if member.is_store() {
             return format!("{from} is a store, which may reach storage");
         }
         if self.helpers.contains_key(from) {
@@ -820,7 +837,7 @@ impl<'a> Storage<'a> {
         };
         match graph.member(package) {
             None => format!("no workspace member is named {package}"),
-            Some(target) if target.layer == Some(Layer::Storage) => {
+            Some(target) if target.is_store() => {
                 format!("{package} is a store, whose features are not checked")
             }
             Some(_)

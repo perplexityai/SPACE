@@ -230,7 +230,7 @@ pub(crate) async fn reflink_only(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Remove every file under `staging_dir` whose path is not in `keep`.
 ///
-/// Call at startup, before [`BackgroundWorker::recover`], with `keep`
+/// Call at startup, before [`JobWorker::recover_and_log`], with `keep`
 /// populated from the staged paths of every job currently in
 /// `pending`/`running`. Files left behind by jobs that completed or
 /// permanently failed before the previous process exit are unreferenced
@@ -238,7 +238,7 @@ pub(crate) async fn reflink_only(src: &Path, dst: &Path) -> Result<(), String> {
 /// logged at WARN and counted, not surfaced (an unremovable staging file
 /// is a noisy disk-leak, not a correctness bug).
 ///
-/// [`BackgroundWorker::recover`]: pplx_space_common_jobs::BackgroundWorker::recover
+/// [`JobWorker::recover_and_log`]: pplx_space_volmgr_store::jobs::JobWorker::recover_and_log
 pub fn cleanup_orphans(staging_dir: &Path, keep: &HashSet<PathBuf>) -> usize {
     let Ok(entries) = std::fs::read_dir(staging_dir) else {
         return 0;

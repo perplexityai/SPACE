@@ -10,15 +10,16 @@ use crate::metrics::sandbox::api::RequestedKind;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_node_drain::{NODE_DRAIN_ENGINE_V2, V2DrainPhase};
 use pplx_space_node_model::{NodeDrain, NodeDrainPhase, NodeManagedBy, NodeRole};
 use pplx_space_node_registration_store::drain_reads;
 use pplx_space_postgres_pool::contention;
-use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_deleting};
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+#[cfg(test)]
 use pplx_space_sql_locator::sql;
 use user_admission::{UserLifecycleRequest, admit_user_lifecycle};
 
@@ -184,22 +185,20 @@ async fn begin_delete_against_active_fork(
     if active_fork {
         return Err(fork_in_progress_conflict());
     }
-    let previous_lifecycle = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut *guard)
-    .await
-    .map_err(|error| db_contention_error("failed to read sandbox lifecycle before delete", &error))?
-    .map(|lifecycle| {
-        lifecycle
-            .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
-            .map_err(|error| {
-                tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
-                ControllerError::internal("sandbox has invalid lifecycle")
-            })
-    })
-    .transpose()?;
+    let previous_lifecycle = sandbox_store::row_locks::lock_lifecycle(&mut guard, sandbox_id)
+        .await
+        .map_err(|error| {
+            db_contention_error("failed to read sandbox lifecycle before delete", &error)
+        })?
+        .map(|lifecycle| {
+            lifecycle
+                .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
+                .map_err(|error| {
+                    tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
+                    ControllerError::internal("sandbox has invalid lifecycle")
+                })
+        })
+        .transpose()?;
     mark_deleting(&mut guard, sandbox_id)
         .await
         .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
@@ -1088,16 +1087,26 @@ async fn run_stop_or_kill(
     }
 }
 
-/// The drain gate's single read of the sandbox row and its primary node.
-#[derive(sqlx::FromRow)]
-struct DrainGateRow {
-    portable: bool,
-    drain_phase: Option<NodeDrainPhase>,
-    drain_mode: Option<String>,
-    /// Whether `COALESCE(target_node_id, active_node_id)` names a node row.
-    primary_found: bool,
-    /// Whether that node has a `node_k8s` row.
-    mapped: bool,
+/// What the drain gate's read says about a sandbox: the drain of the node
+/// its next placement-affecting call would land on
+/// ([`fetch_node_drain_gate`]), whether its active or target node, or a
+/// candidate the executions fallback read, has a drain engine recorded (a
+/// v2 drain, or an engine this build doesn't know), whether one of those
+/// engines is one this build doesn't know, and whether it is stopped.
+pub(super) struct NodeDrainGate {
+    pub(super) state: Option<NodeDrain>,
+    pub(super) non_v1_drain_named: bool,
+    pub(super) unknown_engine_named: bool,
+    pub(super) stopped: bool,
+}
+
+/// The drain state of [`fetch_node_drain_gate`]'s read alone.
+#[cfg(test)]
+pub(super) async fn fetch_active_node_drain_state(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Option<NodeDrain>, sqlx::Error> {
+    Ok(fetch_node_drain_gate(pool, sandbox_id).await?.state)
 }
 
 /// Fetch the `drain_phase` of the node that the next placement-affecting
@@ -1129,28 +1138,38 @@ struct DrainGateRow {
 ///
 /// Returns `Ok(Some(state))` when either the primary or fallback node is
 /// in some drain phase (`draining` / `drained` / `terminating`), carrying that
-/// node's `drain_mode` alongside it; the primary's phase wins when both
+/// node's `drain_mode` alongside it, or has a v2 drain whose cancel is still
+/// pending, or a drain engine this build doesn't know
+/// ([`NodeDrain::Unknown`]); the primary's phase wins when both
 /// produce a non-NULL value (so a draining `target_node_id` is reported as the
 /// source of the conflict). Returns `Ok(None)` when neither candidate resolves
 /// to a draining node — direct-substrate sandboxes always fall through here
 /// because they have no `sandbox_k8s_executions` rows and no drain phase in
-/// practice.
+/// practice. A drain phase this build doesn't know fails the read with a
+/// decode error.
 ///
 /// The mode is resolved through [`NodeDrainMode::from_column_str`], so a NULL
 /// or unrecognized `drain_mode` on a node that *is* draining reads as
 /// [`NodeDrainMode::Gentle`] and leaves this gate open. That direction is
 /// deliberate: a mode nobody set must not 409 every access and placement call
 /// for the sandboxes on that node.
-pub(super) async fn fetch_active_node_drain_state(
+///
+/// The rest of [`NodeDrainGate`] comes from the same statement. The drain
+/// engines its active and target nodes record and whether it is stopped are
+/// read whatever its portability: a portable sandbox has no drain state, but a stop there
+/// still leaves it on its node. The engines of the executions fallback's
+/// candidates come from the fallback's own read, when it runs.
+pub(super) async fn fetch_node_drain_gate(
     pool: &PgPool,
     sandbox_id: SandboxId,
-) -> Result<Option<NodeDrain>, sqlx::Error> {
+) -> Result<NodeDrainGate, sqlx::Error> {
     // Suspended-or-restoring sandboxes with a fresh ready S3 snapshot are
     // portable — restore can land them on any healthy node, so a drain phase
     // on their historical placement is no longer a reason to block
     // placement-affecting calls. Skip the rest of the gate in that case via
-    // the shared portability predicate. The `lifecycle IN ('suspended',
-    // 'restoring')` scope is load-bearing: for `started` / `paused` the
+    // the shared portability predicate `portable_for_restore_affinity`, which
+    // `placement_gate` reads. The `lifecycle IN ('suspended', 'restoring')`
+    // scope is load-bearing: for `started` / `paused` the
     // canonical state lives in the VM's live memory on the source node, not
     // in the snapshot, so a ready prior-cycle snapshot is stale relative to
     // the live VM and must not release the gate. `restoring` is included
@@ -1162,43 +1181,71 @@ pub(super) async fn fetch_active_node_drain_state(
     // sandbox row, so they are one statement: a snapshot at least as
     // consistent as the two reads it replaces. `portable` is only consulted
     // first; the primary columns are ignored when it is true.
-    let portable_predicate = portable_for_restore_affinity("s");
-    let gate_query = format!(
-        "SELECT COALESCE(({portable_predicate}), FALSE) AS portable,
-                n.drain_phase,
-                n.drain_mode,
-                n.id IS NOT NULL AS primary_found,
-                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
-           FROM sandboxes s
-           LEFT JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
-          WHERE s.id = $1"
-    );
-    let gate: Option<DrainGateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(gate_query.as_str())))
-        .bind(sandbox_id)
-        .fetch_optional(pool)
-        .await?;
+    let gate = sandbox_store::placement_gate::placement_gate(pool, sandbox_id).await?;
+    let mut engines = gate
+        .as_ref()
+        .map_or_else(Vec::new, |row| row.drain_engines_named.clone());
+    let stopped = gate.as_ref().is_some_and(|row| row.stopped);
+    let resolved = resolve_drain_state(pool, sandbox_id, gate).await?;
+    engines.extend(resolved.fallback_engines);
+    let non_v1_drain_named = !engines.is_empty();
+    let unknown_engine_named = engines
+        .iter()
+        .any(|engine| engine.as_str() != NODE_DRAIN_ENGINE_V2);
+    Ok(NodeDrainGate {
+        state: resolved.state,
+        non_v1_drain_named,
+        unknown_engine_named,
+        stopped,
+    })
+}
+
+/// [`resolve_drain_state`]'s answer: the drain state, and the drain engines
+/// recorded on the executions fallback's candidates it read, whichever of
+/// them won the state.
+struct ResolvedDrain {
+    state: Option<NodeDrain>,
+    fallback_engines: Vec<String>,
+}
+
+/// The drain state [`fetch_node_drain_gate`] answers, from the gate's
+/// read of the sandbox row and its primary node, and the drain engines the
+/// executions fallback's candidates record, when it read them: a candidate
+/// whose drain didn't win the state may still be sealed under a v2 drain.
+async fn resolve_drain_state(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    gate: Option<sandbox_store::placement_gate::PlacementGateRow>,
+) -> Result<ResolvedDrain, sqlx::Error> {
+    let primary_only = |state| ResolvedDrain {
+        state,
+        fallback_engines: Vec::new(),
+    };
     if gate.as_ref().is_some_and(|row| row.portable) {
-        return Ok(None);
+        return Ok(primary_only(None));
     }
 
     // Primary lookup: drain phase + mode of the node that the next placement-
     // affecting call would land on. `target_node_id` wins over
     // `active_node_id` so this mirrors `preferred_restore_node_name`.
     // Yields `None` when the sandbox row is missing or both placement
-    // columns are NULL (or name no node row), and `Some((None, _))` when the
-    // node exists but is not draining — both cases fall through to the
+    // columns are NULL (or name no node row), and a row without a phase when
+    // the node exists but is not draining — both cases fall through to the
     // executions fallback below.
-    let primary: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = gate
-        .filter(|row| row.primary_found)
-        .map(|row| (row.drain_phase, row.drain_mode, row.mapped));
+    let primary = gate.filter(|row| row.primary_found);
     // `mapped` is whether the primary node has a `node_k8s` row. It decides
     // whether the executions fallback is even reachable: the substrate uses the
     // fallback only when the primary can't be resolved to a k8s node, so for a
     // mapped primary the fallback is not where placement lands and consulting it
     // would 409 on a node nothing is going to touch.
-    let primary_mapped = primary.as_ref().is_some_and(|(_, _, mapped)| *mapped);
-    let primary_state =
-        primary.and_then(|(phase, mode, _)| NodeDrain::from_v1_columns(phase, mode.as_deref()));
+    let primary_mapped = primary.as_ref().is_some_and(|row| row.mapped);
+    let primary_state = primary.and_then(|row| {
+        NodeDrain::from_columns(
+            row.drain_engine.as_deref(),
+            row.drain_phase.map(NodeDrainPhase::as_str),
+            row.drain_mode.as_deref(),
+        )
+    });
     // Return early **only** when the primary actually blocks. A non-blocking
     // primary must still fall through to the executions fallback, because
     // `preferred_restore_node_name` uses that fallback when the primary has no
@@ -1206,7 +1253,7 @@ pub(super) async fn fetch_active_node_drain_state(
     // on. Short-circuiting on a gentle primary would mask a forced or
     // terminating fallback and let wake/access race an evacuation there.
     if primary_state.is_some_and(NodeDrain::blocks_placement) {
-        return Ok(primary_state);
+        return Ok(primary_only(primary_state));
     }
     // A non-blocking *mapped* primary is the whole answer: placement resolves to
     // it, so a historical execution row naming some older drained node is not a
@@ -1216,26 +1263,16 @@ pub(super) async fn fetch_active_node_drain_state(
     // absent or unmapped — that is when the substrate itself falls back, and
     // when a gentle primary could otherwise mask a forced fallback.
     if primary_mapped {
-        return Ok(primary_state);
+        return Ok(primary_only(primary_state));
     }
 
     // Fallback: the latest `sandbox_k8s_executions.k8s_node_name`. The
     // unique index on (sandbox_id, generation) makes the LIMIT 1
     // deterministic per sandbox.
-    let latest_k8s_name: Option<String> = sqlx::query_scalar(sql!(
-        "SELECT ske.k8s_node_name
-           FROM sandbox_k8s_executions ske
-          WHERE ske.sandbox_id = $1
-            AND ske.k8s_node_name IS NOT NULL
-          ORDER BY ske.generation DESC
-          LIMIT 1"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+    let latest_k8s_name =
+        pplx_space_sandbox_store::k8s_executions::latest_k8s_node_name(pool, sandbox_id).await?;
     let Some(k8s_node_name) = latest_k8s_name else {
-        return Ok(primary_state);
+        return Ok(primary_only(primary_state));
     };
 
     // Resolve the latest execution's k8s node name to drain state via
@@ -1249,22 +1286,44 @@ pub(super) async fn fetch_active_node_drain_state(
     // whether the gate fires. Preferring a blocking sibling happens below, in
     // Rust, so the mode policy stays where `from_column_str` is rather than
     // being restated in an `ORDER BY`.
+    //
+    // A v2 drain being cancelled has no phase, and its node may still be
+    // sealed: an engine without a phase is a candidate too.
     let siblings = drain_reads::draining_nodes_for_k8s_node_name(pool, &k8s_node_name).await?;
+    let fallback_engines = siblings
+        .iter()
+        .filter_map(|node| node.drain_engine.clone())
+        .collect();
     let siblings: Vec<NodeDrain> = siblings
         .into_iter()
         .filter_map(|node| {
-            NodeDrain::from_v1_columns(Some(node.drain_phase), node.drain_mode.as_deref())
+            NodeDrain::from_columns(
+                node.drain_engine.as_deref(),
+                node.drain_phase.map(NodeDrainPhase::as_str),
+                node.drain_mode.as_deref(),
+            )
         })
         .collect();
-    // Precedence: any blocking candidate wins, whichever side it came from; else
-    // the primary if it had a phase at all (so a caller can still see "draining,
-    // gently"); else any sibling.
-    Ok(siblings
-        .iter()
-        .copied()
+    Ok(ResolvedDrain {
+        state: drain_state_precedence(primary_state, &siblings),
+        fallback_engines,
+    })
+}
+
+/// The candidate the gate answers with, of the primary and the siblings of
+/// the latest execution's node: one that blocks placement, whichever side it
+/// came from; else one that refuses VM activations, the primary first; else
+/// the primary if it had a phase at all (so a caller can still see
+/// "draining, gently"); else the first sibling.
+fn drain_state_precedence(primary: Option<NodeDrain>, siblings: &[NodeDrain]) -> Option<NodeDrain> {
+    let candidates = || primary.iter().chain(siblings).copied();
+    // A candidate that blocks wins over one that only refuses activations,
+    // which wins over the primary.
+    candidates()
         .find(|state| state.blocks_placement())
-        .or(primary_state)
-        .or_else(|| siblings.first().copied()))
+        .or_else(|| candidates().find(|state| state.refuses_activations()))
+        .or(primary)
+        .or_else(|| siblings.first().copied())
 }
 
 /// Build the 409 returned when a drained-node guard fires. Centralised so
@@ -1277,6 +1336,35 @@ pub(super) fn drain_block_conflict(action: SandboxAction, drain: NodeDrain) -> C
     ))
 }
 
+/// The refusal of a call a drain refuses: v1's 409
+/// ([`drain_block_conflict`]), and, under a v2 drain or one this build
+/// doesn't know, a 503 with `Retry-After`, a client that gives up on a 409
+/// retries. Its text says what the call waits for: a v2 drain's node makes a
+/// sandbox that isn't `stopped` durable while it is sealed, and once it has,
+/// the same call lands on another node; a `stopped` one stays where it is
+/// until the node is undrained or the sandbox is deleted; a cancel pending
+/// ends once the node is undrained.
+pub(crate) fn drain_refusal(
+    action: SandboxAction,
+    drain: NodeDrain,
+    stopped: bool,
+) -> ControllerError {
+    let waits_for = match drain {
+        NodeDrain::V1 { .. } => return drain_block_conflict(action, drain),
+        NodeDrain::V2 {
+            phase: V2DrainPhase::Cancelling,
+        } => "the node is being undrained; retry shortly",
+        NodeDrain::V2 { .. } if stopped => {
+            "a v2 drain doesn't move stopped sandboxes: undrain the node or delete the sandbox"
+        }
+        NodeDrain::V2 { .. } => "the drain is making it durable elsewhere; retry shortly",
+        NodeDrain::Unknown => "retry shortly",
+    };
+    ControllerError::node_draining(format!(
+        "sandbox cannot {action} yet: its node is {drain} under a node drain; {waits_for}"
+    ))
+}
+
 /// Drain gate for paths that will unconditionally place / re-place the sandbox
 /// on its resolved node (`COALESCE(target_node_id, active_node_id)`),
 /// regardless of lifecycle: the explicit-action gate in
@@ -1285,25 +1373,187 @@ pub(super) fn drain_block_conflict(action: SandboxAction, drain: NodeDrain) -> C
 /// runtime is unreachable (including non-dormant lifecycles like `started`
 /// or `restoring`).
 ///
-/// Returns 409 when the resolved node is `drained` or `terminating`, or is
-/// `draining` under a **forced** drain. A gentle drain does not block — see
-/// [`NodeDrain::blocks_placement`].
+/// Refuses when the resolved node is `drained` or `terminating`, or is
+/// `draining` under a **forced** v1 drain. A gentle v1 drain does not block —
+/// see [`NodeDrain::blocks_placement`]. A v1 refusal is a 409; every v2
+/// refusal is a 503 with a `Retry-After` ([`drain_refusal`]): retried once
+/// the drain has made the sandbox durable, the call lands on another node.
+///
+/// It refuses nothing for a sandbox whose current state is durable: a
+/// `suspended` or `restoring` row whose current snapshot is durable gets no
+/// drain state from [`fetch_node_drain_gate`], whatever its node,
+/// and its activation lands elsewhere. A stopped row gets main's answer: a
+/// v2 drain doesn't move a stopped sandbox.
+///
+/// A **forced** v1 drain, and a v2 drain once `drained` or `terminating`,
+/// refuse every call this gate sees on any other sandbox of the node,
+/// running or not ([`NodeDrain::blocks_placement`]). A v2 drain while
+/// `draining`, or with its cancel pending, blocks no placement: its node
+/// keeps running sandboxes running. But the node is sealed and would refuse
+/// a VM activation itself ([`NodeDrain::refuses_activations`]), so it
+/// refuses every action on a sandbox that isn't `started` except the ones
+/// that activate no VM ([`activates_no_vm`]). That covers an access path's call
+/// as well (an exec, a `spaced` call, a port open, an update), whose runtime
+/// client wakes a sandbox it finds dormant. Under it a `started` sandbox's
+/// calls go through, and so does every suspend, stop, kill, pause,
+/// checkpoint, snapshot setting and stats read; a delete doesn't pass this
+/// gate. A stop, a kill and a rollback without restart of a sandbox whose
+/// active or target node has a v2 drain, or an engine this build doesn't
+/// know, recorded are refused apart
+/// ([`ensure_stop_admitted_by_v2_drain`], [`ensure_stop_admitted_by_drain`]).
 pub(super) async fn ensure_resolved_node_not_draining(
     pool: &PgPool,
     sandbox_id: SandboxId,
     action: SandboxAction,
 ) -> Result<(), ControllerError> {
-    let drain_state = fetch_active_node_drain_state(pool, sandbox_id)
+    let gate = fetch_drain_gate(pool, sandbox_id).await?;
+    refuse_under_drain(pool, sandbox_id, action, &gate).await
+}
+
+/// The drain gate's read, as a controller error when it fails.
+async fn fetch_drain_gate(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<NodeDrainGate, ControllerError> {
+    fetch_node_drain_gate(pool, sandbox_id)
         .await
         .map_err(|err| {
             crate::controllers::db_contention_error("failed to load node drain state", &err)
-        })?;
+        })
+}
+
+/// [`ensure_resolved_node_not_draining`]'s decision from the gate's read.
+async fn refuse_under_drain(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    action: SandboxAction,
+    gate: &NodeDrainGate,
+) -> Result<(), ControllerError> {
+    let drain_state = gate.state;
+    let refused = match drain_state {
+        Some(state) if state.blocks_placement() => true,
+        Some(state) if !activates_no_vm(action) && state.refuses_activations() => {
+            !sandbox_started(pool, sandbox_id).await.map_err(|err| {
+                crate::controllers::db_contention_error("failed to load the sandbox", &err)
+            })?
+        }
+        _ => false,
+    };
     if let Some(state) = drain_state
-        && state.blocks_placement()
+        && refused
     {
-        return Err(drain_block_conflict(action, state));
+        return Err(drain_refusal(action, state, gate.stopped));
     }
     Ok(())
+}
+
+/// The drain gate of a rollback without restart, which ends the sandbox
+/// stopped: it refuses what [`ensure_resolved_node_not_draining`] refuses, as
+/// every rollback's gate does, then the rollback itself while a node the
+/// sandbox names, active or target, has a v2 drain or an unknown engine
+/// recorded, or its drain state is one ([`refuse_stop_under_v2_drain`]), from
+/// one read.
+pub(super) async fn ensure_stop_admitted_by_drain(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    action: SandboxAction,
+) -> Result<(), ControllerError> {
+    let gate = fetch_drain_gate(pool, sandbox_id).await?;
+    refuse_under_drain(pool, sandbox_id, action, &gate).await?;
+    refuse_stop_under_v2_drain(action, &gate)
+}
+
+/// The stop gate of a stop or kill (`:stop`, `:kill`, and the admin
+/// `:force-stop` and `:force-kill`, which all run [`SandboxAction::Stop`] or
+/// [`SandboxAction::Kill`]): [`refuse_stop_under_v2_drain`] from the drain
+/// gate's read, which a v1 drain's stop never had refused. The drain state
+/// the read returns ([`fetch_node_drain_gate`]'s) is the caller's,
+/// to pick its runtime client, so the stop reads the gate once.
+pub(super) async fn ensure_stop_admitted_by_v2_drain(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    action: SandboxAction,
+) -> Result<Option<NodeDrain>, ControllerError> {
+    let gate = fetch_drain_gate(pool, sandbox_id).await?;
+    refuse_stop_under_v2_drain(action, &gate)?;
+    Ok(gate.state)
+}
+
+/// Refuse an action that ends the gate's sandbox stopped while a node it names,
+/// active or target, has a v2 drain recorded: in any phase, its cancel
+/// pending included, the node is sealed. A v2 drain doesn't move a stopped
+/// sandbox and never terminates a node that holds one, so a stop there would
+/// hold the drain. The refusal is a retryable 503 with `Retry-After`; once
+/// the node is undrained the call goes through. A delete isn't refused.
+///
+/// It fails closed: a drain engine this build doesn't know on either node is
+/// refused too, and so is a gate whose drain state is a v2 drain or
+/// [`NodeDrain::Unknown`], which the executions fallback answers when both
+/// placement columns are NULL or the primary node is unmapped. So is any
+/// fallback candidate with a drain engine recorded, though a placement-
+/// blocking v1 drain on another candidate won the drain state: that
+/// candidate's node is sealed all the same. The refusal
+/// and the state the Stop arm picks its runtime client from then agree. A v1
+/// drain (no engine) is never refused here.
+///
+/// It follows the node's persisted drain, not this process's
+/// `SPACE_DRAIN_V2_ENABLED`: with no drain engine recorded, which with drain
+/// v2 off is every node, everything is admitted, and a v2 drain keeps its
+/// stops refused on a replica whose switch is off, during the switch-on
+/// rollout and after a switch-off that left a drain or its cancel pending.
+fn refuse_stop_under_v2_drain(
+    action: SandboxAction,
+    gate: &NodeDrainGate,
+) -> Result<(), ControllerError> {
+    let state_v2 = matches!(gate.state, Some(NodeDrain::V2 { .. }));
+    let state_unknown = matches!(gate.state, Some(NodeDrain::Unknown));
+    if !(gate.non_v1_drain_named || state_v2 || state_unknown) {
+        return Ok(());
+    }
+    if gate.unknown_engine_named || state_unknown {
+        return Err(ControllerError::node_draining(format!(
+            "sandbox cannot {action} yet: its node is in a drain state this build doesn't know \
+             under a node drain; retry shortly"
+        )));
+    }
+    Err(ControllerError::node_draining(format!(
+        "sandbox cannot {action} yet: its node is under a v2 node drain, which doesn't move \
+         stopped sandboxes; retry once the node is undrained, or delete the sandbox"
+    )))
+}
+
+/// Whether `action` is known to activate no VM, so a sealed node lets it
+/// through on a sandbox that isn't running. Every other action is refused
+/// there: a start, wake, restore or resume, and an access path's call or an
+/// update, whose runtime client wakes a dormant sandbox. A stats read uses
+/// the non-recovering client ([`SandboxController::stats`]), so it wakes
+/// nothing. An allow-list, so a new action is refused until it is known to
+/// activate nothing.
+const fn activates_no_vm(action: SandboxAction) -> bool {
+    match action {
+        SandboxAction::Suspend
+        | SandboxAction::Stop
+        | SandboxAction::Kill
+        | SandboxAction::Pause
+        | SandboxAction::Checkpoint
+        | SandboxAction::EnableSnapshots
+        | SandboxAction::DisableSnapshots
+        | SandboxAction::Stats => true,
+        SandboxAction::Start
+        | SandboxAction::Wake
+        | SandboxAction::ImplicitWake(_)
+        | SandboxAction::Restore
+        | SandboxAction::Resume
+        | SandboxAction::OpenPort
+        | SandboxAction::Rollback
+        | SandboxAction::Spaced
+        | SandboxAction::Update => false,
+    }
+}
+
+/// Whether the sandbox row is `started`.
+async fn sandbox_started(pool: &PgPool, sandbox_id: SandboxId) -> Result<bool, sqlx::Error> {
+    sandbox_store::row_reads::is_started(pool, sandbox_id).await
 }
 
 /// Access-path drain gate. Returns 409 when the sandbox's resolved node
@@ -1318,10 +1568,14 @@ pub(super) async fn ensure_resolved_node_not_draining(
 /// for the short window before the reconciler suspends + migrates it; users
 /// see a clear "node is draining" error rather than a flaky stuck pod.
 ///
-/// Under a **gentle** drain there is no migration window to protect, so this
-/// does not fire while the node is `draining` — serving traffic normally is
-/// the mode's entire purpose. It still fires once the node reaches `drained`
-/// or `terminating`.
+/// Under a **gentle** v1 drain a running sandbox keeps serving traffic, which
+/// is the mode's entire purpose, so this lets its calls through while the
+/// node is `draining`: there is no migration window to protect. A v2 drain
+/// does the same while `draining` or with its cancel pending, since its
+/// sealed node keeps running VMs running; a call on a sandbox that isn't
+/// `started` is refused with a 503, since its runtime client would wake the
+/// sandbox on the sealed node ([`ensure_resolved_node_not_draining`]).
+/// Every drain fires this once the node reaches `drained` or `terminating`.
 pub(super) async fn ensure_access_path_not_blocked_by_drain(
     pool: &PgPool,
     sandbox: &Sandbox,
@@ -1629,7 +1883,6 @@ impl SandboxController {
             activating_client,
             sandbox.activating_client_id.as_ref(),
         );
-
         // Classify at entry; callers that join another activation clear this.
         let entry_lifecycle = sandbox.lifecycle.parse::<SandboxLifecycle>().ok();
         let mut requested_kind = action.requested_size_kind(entry_lifecycle);
@@ -1653,6 +1906,17 @@ impl SandboxController {
                 }
                 return Err(err);
             }
+
+            // A stop or kill answers to the node's v2 drain here, before its
+            // `*_requested` event, so a refused stop leaves none on each retry
+            // of its operation. The drain state the same read returns picks the
+            // Stop arm's runtime client below, so a stop reads the gate once,
+            // as it did.
+            let stop_drain_state = if matches!(action, SandboxAction::Stop | SandboxAction::Kill) {
+                Some(ensure_stop_admitted_by_v2_drain(pool, id, action).await?)
+            } else {
+                None
+            };
 
             // Validate activation options before admission and the requested event:
             // a malformed request (e.g. `ready_timeout_secs=0`) must be rejected
@@ -2217,12 +2481,8 @@ impl SandboxController {
                 // user their sandbox; it returns 503 for a cleanup whose pod
                 // is already gone.
                 SandboxAction::Stop | SandboxAction::Kill => {
-                    let drain_state =
-                        fetch_active_node_drain_state(pool, id)
-                            .await
-                            .map_err(|err| {
-                                db_contention_error("failed to load node drain state", &err)
-                            })?;
+                    // Read at the entry's stop gate.
+                    let drain_state = stop_drain_state.flatten();
                     if drain_state.is_some() {
                         let maybe_client =
                             self.substrate.reachable_runtime_client(typed_id).await?;

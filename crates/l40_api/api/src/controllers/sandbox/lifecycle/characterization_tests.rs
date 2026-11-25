@@ -1033,7 +1033,8 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
 ///
 /// Direct suspend is the exception: it persists its suspend artifact under
 /// `SELECT ... FOR UPDATE` on the sandbox row
-/// (`persist_optional_current_local_artifact`), which conflicts with
+/// (`persist_optional_current_local_artifact`, through sandbox-store's
+/// `row_locks::lock_id`), which conflicts with
 /// `FOR KEY SHARE`. It waits on that lock while the child insert is open and
 /// completes once the insert ends.
 ///
@@ -1118,9 +1119,11 @@ async fn completed_actions_do_not_wait_for_a_key_share_lock() -> TestResult {
         None,
     );
     tokio::pin!(suspend);
-    // Only the artifact lock itself, located by its `sql!` module, and only
-    // while this test's child insert is what blocks it: other api statements
-    // end in the same `FOR UPDATE` text.
+    // Only `row_locks::lock_id`'s statement, located by its `sql!` module
+    // and text, and only while this test's child insert is what blocks it.
+    // Other callers share that statement, so the locator does not single
+    // out the artifact lock among them; that the suspend waits in the
+    // artifact lock is an inference from the code.
     let artifact_lock_wait = async {
         loop {
             let waiting: bool = sqlx::query_scalar(sql!(
@@ -1130,7 +1133,7 @@ async fn completed_actions_do_not_wait_for_a_key_share_lock() -> TestResult {
                       WHERE datname = current_database()
                         AND wait_event_type = 'Lock'
                         AND $1 = ANY(pg_blocking_pids(pid))
-                        AND query ~ '^/\*pplx_space_api::controllers::substrate:[0-9]+\*/ SELECT id FROM sandboxes WHERE id = \$1 FOR UPDATE$'
+                        AND query ~ '^/\*pplx_space_sandbox_store::row_locks:[0-9]+\*/ SELECT id FROM sandboxes WHERE id = \$1 FOR UPDATE$'
                  )"
             ))
             .bind(holder)

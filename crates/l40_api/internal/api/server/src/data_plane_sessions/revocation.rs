@@ -3,42 +3,17 @@
 use super::*;
 use pplx_space_data_plane_session_store as data_plane_session_store;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct RevocationRow {
-    pub(super) session_id: String,
-    pub(super) protocol_session_id: Option<String>,
-    pub(super) org_id: OrgId,
-    pub(super) revocation_epoch: i64,
-    pub(super) revocation_status: String,
-    pub(super) revocation_reason: Option<String>,
-    pub(super) revocation_updated_at: OffsetDateTime,
-    pub(super) org_revocation_epoch: i64,
-}
-
 pub(crate) async fn revocation_state_for_session(
     pool: &sqlx::PgPool,
     request: GetDataPlaneSessionRevocationStateRequest,
 ) -> Result<GetDataPlaneSessionRevocationStateResponse, Status> {
     let session_id = required(&request.session_id, "session_id")?;
     let protocol_session_id = optional(request.protocol_session_id.as_deref());
-    let row = sqlx::query_as::<_, RevocationRow>(sql!(
-        "SELECT d.session_id,
-                d.protocol_session_id,
-                d.org_id,
-                d.revocation_epoch,
-                d.revocation_status,
-                d.revocation_reason,
-                d.revocation_updated_at,
-                COALESCE(o.epoch, 0) AS org_revocation_epoch
-         FROM data_plane_sessions d
-         LEFT JOIN data_plane_org_revocation_epochs o ON o.org_id = d.org_id
-         WHERE d.session_id = $1
-           AND ($2::TEXT IS NULL OR d.protocol_session_id = $2)
-           AND (d.expires_at IS NULL OR d.expires_at > NOW())"
-    ))
-    .bind(&session_id)
-    .bind(protocol_session_id.as_deref())
-    .fetch_optional(pool)
+    let row = data_plane_session_store::live_session_revocation(
+        pool,
+        &session_id,
+        protocol_session_id.as_deref(),
+    )
     .await
     .map_err(|error| Status::internal(format!("get data-plane revocation state: {error}")))?
     .ok_or_else(|| Status::not_found("data-plane session not found"))?;

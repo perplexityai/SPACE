@@ -6,6 +6,7 @@ use pplx_space_execution_spec::{
 };
 use pplx_space_execution_spec::{ArtifactFormat, ArtifactVersion};
 use pplx_space_template_manifest::TemplateManifest;
+use rusqlite::params;
 
 use pplx_space_template_mgr_store::node_dirty_refs::list_node_dirty_refs;
 
@@ -59,17 +60,19 @@ fn local_policy_generations_advance_across_changes_and_template_recreation() {
         delete_template_local_state(&conn, &name).unwrap();
     }
     assert_eq!(
-        conn.query_row(
-            "SELECT COUNT(*) FROM template_local_policy_sequence",
-            [],
-            |row| row.get::<_, i64>(0)
-        )
-        .unwrap(),
+        conn.raw()
+            .query_row(
+                "SELECT COUNT(*) FROM template_local_policy_sequence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
         1
     );
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM template_settings", [], |row| row
-            .get::<_, i64>(0))
+        conn.raw()
+            .query_row("SELECT COUNT(*) FROM template_settings", [], |row| row
+                .get::<_, i64>(0))
             .unwrap(),
         1
     );
@@ -81,18 +84,19 @@ fn delayed_legacy_policy_ack_preserves_same_generation_new_payload_or_authority(
     // Older producers can enqueue generation-zero notifications even after the
     // owner schema has normalized the committed local policy generation.
     let enqueue_legacy = |policy: &NetworkPolicyV1, authority: PolicyAuthority| {
-        conn.execute(
-            "INSERT INTO template_network_policy_notifications
+        conn.raw()
+            .execute(
+                "INSERT INTO template_network_policy_notifications
                  (template, policy_json, generation, authority, requested_at, updated_at)
              VALUES ('legacy', ?1, 0, ?2, '0', '0')
              ON CONFLICT(template) DO UPDATE SET policy_json = excluded.policy_json,
                  authority = excluded.authority",
-            params![
-                serde_json::to_string_pretty(policy).unwrap(),
-                authority.as_str()
-            ],
-        )
-        .unwrap();
+                params![
+                    serde_json::to_string_pretty(policy).unwrap(),
+                    authority.as_str()
+                ],
+            )
+            .unwrap();
     };
     for (policy, authority) in [
         (NetworkPolicyV1::deny_all(), PolicyAuthority::Local),
@@ -120,7 +124,8 @@ fn delayed_legacy_policy_ack_preserves_same_generation_new_payload_or_authority(
 fn local_generation_triggers_cover_old_writers_without_recursion_or_cluster_rewrites() {
     for recursive in [false, true] {
         let conn = test_conn();
-        conn.pragma_update(None, "recursive_triggers", recursive)
+        conn.raw()
+            .pragma_update(None, "recursive_triggers", recursive)
             .unwrap();
         let generation = || {
             get_template_settings(&conn, "base")
@@ -139,16 +144,17 @@ fn local_generation_triggers_cover_old_writers_without_recursion_or_cluster_rewr
         let first = generation();
         assert!(first > 0);
         let enqueue_old_writer = || {
-            conn.execute(
-                "INSERT INTO template_network_policy_notifications
+            conn.raw()
+                .execute(
+                    "INSERT INTO template_network_policy_notifications
                      (template, policy_json, generation, authority, requested_at, updated_at)
                  SELECT template, default_network_policy_json, 0, 'local', '0', '0'
                  FROM template_settings WHERE template = 'base'
                  ON CONFLICT(template) DO UPDATE SET policy_json = excluded.policy_json,
                      generation = excluded.generation, authority = excluded.authority",
-                [],
-            )
-            .unwrap();
+                    [],
+                )
+                .unwrap();
             let notification = list_template_network_policy_notifications(&conn, 10)
                 .unwrap()
                 .remove(0);
@@ -156,20 +162,22 @@ fn local_generation_triggers_cover_old_writers_without_recursion_or_cluster_rewr
             notification
         };
         let previous = enqueue_old_writer();
-        conn.execute(
-            "UPDATE template_settings SET default_network_policy_json = ?1,
+        conn.raw()
+            .execute(
+                "UPDATE template_settings SET default_network_policy_json = ?1,
                 default_network_policy_generation = 0 WHERE template = 'base'",
-            [serde_json::to_string(&NetworkPolicyV1::deny_all()).unwrap()],
-        )
-        .unwrap();
+                [serde_json::to_string(&NetworkPolicyV1::deny_all()).unwrap()],
+            )
+            .unwrap();
         assert_eq!(generation(), first + 1);
         let current = enqueue_old_writer();
         assert_ne!(current.policy, previous.policy);
-        conn.execute(
-            "UPDATE template_network_policy_notifications SET policy_json = ?1, generation = 0",
-            [serde_json::to_string(&previous.policy).unwrap()],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE template_network_policy_notifications SET policy_json = ?1, generation = 0",
+                [serde_json::to_string(&previous.policy).unwrap()],
+            )
+            .unwrap();
         let repaired = list_template_network_policy_notifications(&conn, 10).unwrap();
         assert_eq!(repaired[0].policy, current.policy);
         assert_eq!(repaired[0].generation, current.generation);
@@ -313,6 +321,7 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
         .unwrap();
 
         let projected: (String, String, String, String) = conn
+            .raw()
             .query_row(
                 "SELECT runtime_version, guest_os, state_format_name, state_format_version
              FROM template_builds WHERE name = 'seed' AND content_hash = 'sha256:build'",
@@ -330,6 +339,7 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
             )
         );
         let role_key: String = conn
+            .raw()
             .query_row(
                 "SELECT role_key FROM template_build_components
              WHERE name = 'seed' AND content_hash = 'sha256:build' AND kind = 'kernel'",
@@ -339,6 +349,7 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
             .unwrap();
         assert_eq!(role_key, "");
         let stored_json: String = conn
+            .raw()
             .query_row(
                 "SELECT execution_metadata_json FROM template_builds
              WHERE name = 'seed' AND content_hash = 'sha256:build'",
@@ -356,21 +367,23 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
 #[test]
 fn ensure_template_settings_preserves_unreadable_settings_rows() {
     let conn = test_conn();
-    conn.execute(
-        "INSERT INTO template_settings
+    conn.raw()
+        .execute(
+            "INSERT INTO template_settings
          (template, default_auto_lifecycle_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?3)",
-        params!["base", "not valid json", "now"],
-    )
-    .unwrap();
+            params!["base", "not valid json", "now"],
+        )
+        .unwrap();
 
     let error = ensure_template_settings(&conn, "base").unwrap_err();
     assert!(matches!(
-        error,
+        error.raw(),
         rusqlite::Error::FromSqlConversionFailure(..)
     ));
 
     let stored_json: String = conn
+        .raw()
         .query_row(
             "SELECT default_auto_lifecycle_json FROM template_settings WHERE template = ?1",
             params!["base"],
@@ -383,7 +396,9 @@ fn ensure_template_settings_preserves_unreadable_settings_rows() {
 #[test]
 fn delete_build_removes_execution_component_rows() {
     let conn = test_conn();
-    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.raw()
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
     upsert_test_build_with_execution(&conn, "base", "sha256:build");
 
     delete_build(
@@ -395,6 +410,7 @@ fn delete_build_removes_execution_component_rows() {
     .unwrap();
 
     let component_count: u32 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_build_components
              WHERE name = ?1 AND content_hash = ?2",
@@ -408,13 +424,16 @@ fn delete_build_removes_execution_component_rows() {
 #[test]
 fn delete_template_local_state_removes_execution_component_rows() {
     let conn = test_conn();
-    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.raw()
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
     upsert_test_build_with_execution(&conn, "base", "sha256:build-a");
     upsert_test_build_with_execution(&conn, "base", "sha256:build-b");
 
     delete_template_local_state(&conn, "base").unwrap();
 
     let component_count: u32 = conn
+        .raw()
         .query_row(
             "SELECT COUNT(*) FROM template_build_components WHERE name = ?1",
             params!["base"],
@@ -611,17 +630,19 @@ fn a_stale_dirty_ref_ack_cannot_delete_a_recreated_key() {
 fn a_same_timestamp_dirty_ref_write_invalidates_the_ack() {
     for recursive_triggers in [false, true] {
         let conn = test_conn();
-        conn.pragma_update(None, "recursive_triggers", recursive_triggers)
+        conn.raw()
+            .pragma_update(None, "recursive_triggers", recursive_triggers)
             .unwrap();
         assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
         let sent = list_node_dirty_refs(&conn, 10).unwrap();
 
         // An upsert within the same second rewrites both timestamps unchanged.
-        conn.execute(
-            "UPDATE node_dirty_refs SET requested_at = requested_at, updated_at = updated_at",
-            [],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE node_dirty_refs SET requested_at = requested_at, updated_at = updated_at",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             delete_node_dirty_refs(&conn, &sent).unwrap(),
             0,
@@ -636,7 +657,8 @@ fn dirty_ref_revision_exhaustion_keeps_the_pending_obligation() {
     let conn = test_conn();
     assert!(enqueue_node_dirty_template_inventory(&conn, "base").unwrap());
     let pending = list_node_dirty_refs(&conn, 10).unwrap();
-    conn.execute("UPDATE node_dirty_ref_revision SET value = ?1", [i64::MAX])
+    conn.raw()
+        .execute("UPDATE node_dirty_ref_revision SET value = ?1", [i64::MAX])
         .unwrap();
 
     enqueue_node_dirty_template_inventory(&conn, "base").unwrap_err();
@@ -750,7 +772,7 @@ fn cluster_template_auto_lifecycle_does_not_override_local_authority() {
 #[test]
 fn broken_template_network_policy_fails_read() {
     let conn = test_conn();
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO template_settings
              (template, default_auto_lifecycle_json, default_network_policy_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?4)",
@@ -766,7 +788,7 @@ fn broken_template_network_policy_fails_read() {
     let error = ensure_template_network_policy(&conn, "base").unwrap_err();
 
     assert!(matches!(
-        error,
+        error.raw(),
         rusqlite::Error::FromSqlConversionFailure(..)
     ));
 }
@@ -872,6 +894,7 @@ fn same_key_upserts_replace_in_place_in_each_partition(
             .unwrap()
             .artifact_size_bytes;
         let components = conn
+            .raw()
             .query_row(
                 "SELECT COUNT(*) FROM template_build_components
                  WHERE name = 'seed' AND cache_partition = ?1",
@@ -904,7 +927,7 @@ fn same_key_upserts_replace_in_place_in_each_partition(
         ..ready_build("seed", "sha256:build", size)
     };
     let set_state = |conn: &Connection, state: &str| {
-        conn.execute(
+        conn.raw().execute(
             "UPDATE template_builds SET state = ?1 WHERE name = 'seed' AND cache_partition = ?2",
             [state, &partition.key()],
         )
@@ -935,9 +958,8 @@ fn same_key_upserts_replace_in_place_in_each_partition(
     assert_eq!(snapshots(&conn, partition), ["sha256:second"]);
     assert_eq!(snapshots(&conn, sibling), ["sha256:sibling"]);
 
-    let store = crate::pinned_digests::PinnedDigestsStore::new(std::sync::Arc::new(
-        std::sync::Mutex::new(conn),
-    ));
+    let store =
+        crate::pinned_digests::PinnedDigestsStore::new(crate::db::SharedConnection::new(conn));
     store
         .upsert_tag("seed", "latest", sibling, "sha256:sibling")
         .unwrap();
@@ -951,6 +973,7 @@ fn same_key_upserts_replace_in_place_in_each_partition(
     let conn = conn.lock().unwrap();
     let pins = |cache_partition: TemplateCachePartition| -> Vec<String> {
         let mut stmt = conn
+            .raw()
             .prepare(
                 "SELECT content_hash FROM template_pinned_tags
                  WHERE name = 'seed' AND tag = 'latest' AND cache_partition = ?1",
@@ -983,17 +1006,19 @@ fn upsert_build_refuses_to_clobber_deleting_state() {
     upsert_build(&conn, &ready_build("seed", "sha256:aa", 100)).unwrap();
 
     // Eviction Phase 1: flip to deleting.
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        params!["seed", "sha256:aa"],
-    )
-    .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            params!["seed", "sha256:aa"],
+        )
+        .unwrap();
 
     // Concurrent pull's final upsert tries to flip back to ready.
     upsert_build(&conn, &ready_build("seed", "sha256:aa", 200)).unwrap();
 
     // State must remain 'deleting' — the pull lost the race.
     let state: String = conn
+        .raw()
         .query_row(
             "SELECT state FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "sha256:aa"],
@@ -1005,6 +1030,7 @@ fn upsert_build_refuses_to_clobber_deleting_state() {
     // Size from the deleting-time state is also preserved (the
     // WHERE skipped the whole UPDATE, not just `state`).
     let size: i64 = conn
+        .raw()
         .query_row(
             "SELECT artifact_size_bytes FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "sha256:aa"],
@@ -1025,11 +1051,12 @@ fn is_build_marked_deleting_matches_state() {
 
     assert!(!is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
 
-    conn.execute(
-        "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
-        params!["seed", "sha256:aa"],
-    )
-    .unwrap();
+    conn.raw()
+        .execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
+            params!["seed", "sha256:aa"],
+        )
+        .unwrap();
     assert!(is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
 
     // Missing row → false (not an error).
@@ -1045,6 +1072,7 @@ fn upsert_build_seeds_last_used_at_from_created_at() {
     upsert_build(&conn, &ready_build("seed", "sha256:aa", 100)).unwrap();
 
     let (created, last_used): (String, String) = conn
+        .raw()
         .query_row(
             "SELECT created_at, last_used_at FROM template_builds
              WHERE name = ?1 AND content_hash = ?2",
@@ -1070,6 +1098,7 @@ fn touch_build_updates_last_used_at() {
     // Plant a known-old `last_used_at`, then touch.
     set_last_used_at_for_test(&conn, "seed", "sha256:aa", 1_000).unwrap();
     let before: String = conn
+        .raw()
         .query_row(
             "SELECT last_used_at FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "sha256:aa"],
@@ -1087,6 +1116,7 @@ fn touch_build_updates_last_used_at() {
     .unwrap();
 
     let after: String = conn
+        .raw()
         .query_row(
             "SELECT last_used_at FROM template_builds WHERE name = ?1 AND content_hash = ?2",
             params!["seed", "sha256:aa"],
@@ -1150,14 +1180,15 @@ fn list_eviction_candidates_excludes_non_ready_states() {
     // Direct INSERT for a non-ready state — `upsert_build` always
     // writes `ready` via the `BuildUpsert.state` field today, so
     // we exercise the SQL filter, not the upsert path.
-    conn.execute(
-        "INSERT INTO template_builds
+    conn.raw()
+        .execute(
+            "INSERT INTO template_builds
              (name, content_hash, build_date, manifest_json, runtime, arch,
               artifact_size_bytes, state, created_at, last_used_at)
          VALUES (?1, ?2, '2026-01-01T00:00:00Z', '{}', 'fc', 'aarch64', 200, 'building', ?3, ?3)",
-        params!["seed", "sha256:building", now()],
-    )
-    .unwrap();
+            params!["seed", "sha256:building", now()],
+        )
+        .unwrap();
 
     let rows = list_eviction_candidates(&conn).unwrap();
     assert_eq!(rows.len(), 1, "non-ready rows must be filtered out");
@@ -1174,34 +1205,38 @@ fn list_pinned_build_keys_unions_tag_and_release_pins() {
     let ts = now();
     // Tag pin and release pin on the same digest (the common
     // "latest is also one of latest-N" case).
-    conn.execute(
-        "INSERT INTO template_pinned_tags (name, tag, content_hash, updated_at)
+    conn.raw()
+        .execute(
+            "INSERT INTO template_pinned_tags (name, tag, content_hash, updated_at)
          VALUES ('seed', 'latest', 'sha256:aa', ?1)",
-        params![ts],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO template_pinned_releases
+            params![ts],
+        )
+        .unwrap();
+    conn.raw()
+        .execute(
+            "INSERT INTO template_pinned_releases
              (name, content_hash, release_id, release_created_at, updated_at)
          VALUES ('seed', 'sha256:aa', 'rel-1', '2026-01-01T00:00:00Z', ?1)",
-        params![ts],
-    )
-    .unwrap();
+            params![ts],
+        )
+        .unwrap();
     // Distinct release pin for a different digest.
-    conn.execute(
-        "INSERT INTO template_pinned_releases
+    conn.raw()
+        .execute(
+            "INSERT INTO template_pinned_releases
              (name, content_hash, release_id, release_created_at, updated_at)
          VALUES ('seed', 'sha256:bb', 'rel-2', '2026-02-01T00:00:00Z', ?1)",
-        params![ts],
-    )
-    .unwrap();
+            params![ts],
+        )
+        .unwrap();
     // Tag-only pin on a third digest, different template.
-    conn.execute(
-        "INSERT INTO template_pinned_tags (name, tag, content_hash, updated_at)
+    conn.raw()
+        .execute(
+            "INSERT INTO template_pinned_tags (name, tag, content_hash, updated_at)
          VALUES ('code-runtime', 'latest', 'sha256:cc', ?1)",
-        params![ts],
-    )
-    .unwrap();
+            params![ts],
+        )
+        .unwrap();
 
     let mut keys = list_pinned_build_keys(&conn).unwrap();
     keys.sort();
@@ -1383,12 +1418,13 @@ fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
 
     assert_eq!(build.content_hash, "sha256:new");
     let last_used = |content_hash: &str| -> String {
-        conn.query_row(
-            "SELECT last_used_at FROM template_builds WHERE content_hash = ?1",
-            [content_hash],
-            |row| row.get(0),
-        )
-        .unwrap()
+        conn.raw()
+            .query_row(
+                "SELECT last_used_at FROM template_builds WHERE content_hash = ?1",
+                [content_hash],
+                |row| row.get(0),
+            )
+            .unwrap()
     };
     assert_ne!(last_used("sha256:new"), "0");
     assert_eq!(last_used("sha256:old"), "0");

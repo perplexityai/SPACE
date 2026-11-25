@@ -62,7 +62,7 @@
 //!    and warm each release bound to it (a twin, or the release itself) in
 //!    that environment's cache partition. Its tag pins are written under that
 //!    partition, its release pins join the keep set, and its pulls join the
-//!    same drain under the same visibility gate. See [`environments`].
+//!    same drain under the same visibility gate. See `environments`.
 //!
 //! ## Why both passes
 //!
@@ -88,7 +88,7 @@
 //!   tuple of the template leaves the prune keep-set; the template's
 //!   release pins prune to empty), which makes any residue *eligible*
 //!   for LRU eviction. Note the weaker verb: unpinning does not
-//!   evict. [`crate::eviction`] is enabled by default (100 GiB budget) —
+//!   evict. `crate::eviction` is enabled by default (100 GiB budget) —
 //!   and being enabled, it only reclaims once the node is *over budget*,
 //!   and never within the grace period (1800 s default). So the residue
 //!   becomes evictable, on the GC's schedule rather than this tick's.
@@ -214,7 +214,7 @@
 //! `Generic` too whenever it beats the flip or hits a stale replica —
 //! which puts a private rootfs on a shared node, with only the
 //! (budget- and grace-gated) evictor to clean it up. Once
-//! [`dispatch_pull`] spawns, nothing recalls the task: the verdict has
+//! `dispatch_pull` spawns, nothing recalls the task: the verdict has
 //! to land while the pull is still a queued decision.
 //!
 //! ### No switch opens the gate
@@ -1174,7 +1174,7 @@ async fn tick(
         // which matches `template_releases.hash` directly and tolerates
         // a bare (non-`sha256:`-prefixed) digest.
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
             PrefetchPull {
@@ -1193,7 +1193,7 @@ async fn tick(
             continue;
         }
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
             PrefetchPull {
@@ -1211,7 +1211,7 @@ async fn tick(
     for pull in environment_pulls {
         let trigger = pull.trigger();
         spawned.push(dispatch_pull(
-            Arc::clone(&db),
+            db.clone(),
             volume_puller.clone(),
             Arc::clone(semaphore),
             PrefetchPull {
@@ -1646,14 +1646,14 @@ fn flush_org_specific_release_pins(
 }
 
 /// Run `op` against the [`PinnedDigestsStore`] on a blocking thread.
-/// Centralizes the `spawn_blocking` + `rusqlite::Error → String`
+/// Centralizes the `spawn_blocking` + `crate::db::Error → String`
 /// conversion so the call sites in [`tick`] aren't dominated by
 /// boilerplate. The closure runs on a blocking worker because every
 /// store method takes the SQLite mutex synchronously.
 async fn spawn_blocking_store_op<T, F>(pins: PinnedDigestsStore, op: F) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnOnce(&PinnedDigestsStore) -> rusqlite::Result<T> + Send + 'static,
+    F: FnOnce(&PinnedDigestsStore) -> crate::db::Result<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || op(&pins))
         .await
@@ -1718,7 +1718,7 @@ struct PrefetchPull {
 /// here, sending the digest as-is against `template_releases.hash`
 /// and bypassing any tag-based path entirely.
 fn dispatch_pull(
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     puller: VolumePuller,
     semaphore: Arc<Semaphore>,
     pull: PrefetchPull,

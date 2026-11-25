@@ -12,7 +12,6 @@ postgres = [
   "node_local_backup_pending",
   "sandbox_ecw_credential_epochs",
   "sandbox_k8s_executions",
-  "sandbox_observed_states",
   "sandbox_port_exposures",
   "sandbox_snapshot_inventory",
   "sandboxes",
@@ -26,22 +25,31 @@ default = []
 # Exposes `test_support` to other crates' test suites as a dev-dependency
 # feature: `StoredSandboxLifecycle::all`, every value Postgres
 # `sandboxes.lifecycle` can hold, and the reader for writer × stored-lifecycle
-# expectation tables. This crate's unit tests get it under `cfg(test)`.
+# expectation tables; `attribute_runtime::activating_client`, the read of a
+# sandbox's activating-client record, for the api's attribution tests;
+# `test_support::sweeper`, the transient-lifecycle sweeper's statements, for
+# the cluster controller's sweeper tests; `test_support::admin_occupancy`, the
+# node and fleet occupancy statements, for the api's plan tests; and
+# `direct::sandbox_listing::admin::AdminIdSearch::id_prefix`, the ID-prefix
+# range a search binds, for the api's admin-search tests. This crate's unit
+# tests get them under `cfg(test)`.
 test-support = []
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid", "time"] }
 thiserror = { workspace = true }
-time = { workspace = true }
+time = { workspace = true, features = ["serde-human-readable"] }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
 pplx-space-accounts = { workspace = true, features = ["sqlx", "serde"] }
 pplx-space-auto-lifecycle = { workspace = true, features = ["serde"] }
 pplx-space-cluster-pool = { workspace = true }
-pplx-space-sandbox-model = { workspace = true, features = ["sqlx"] }
-pplx-space-node-model = { workspace = true, features = ["sqlx"] }
+pplx-space-sandbox-model = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-node-model = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-net-common = { workspace = true, features = ["serde"] }
+pplx-space-node-status-store = { workspace = true }
 pplx-space-durations = { workspace = true, features = ["serde"] }
 pplx-space-execution-spec = { workspace = true, features = ["serde"] }
 pplx-space-k8s-ids = { workspace = true, features = ["serde", "sqlx"] }
@@ -52,6 +60,7 @@ pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-semver = { workspace = true, features = ["sqlx"] }
 pplx-space-snapshot-model = { workspace = true, features = ["sqlx"] }
 pplx-space-sql-locator = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

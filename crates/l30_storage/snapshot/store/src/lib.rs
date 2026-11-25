@@ -24,12 +24,18 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod attempt;
+pub mod checkpoint;
 pub mod claimed;
 pub mod disk_artifact;
 pub mod environment;
+pub mod fork_source;
 pub mod listing;
 pub mod lost;
+pub mod orphan_locations;
 mod placement;
+pub mod public;
+pub mod quarantine_recovery;
+pub mod retention;
 pub mod storage_location;
 pub mod upload;
 pub use placement::{SnapshotStoragePlacement, storage_placements};

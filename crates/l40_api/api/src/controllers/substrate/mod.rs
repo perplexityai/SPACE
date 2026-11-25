@@ -30,7 +30,6 @@ mod readiness_stub {
 #[cfg(not(feature = "kubernetes"))]
 pub use readiness_stub::ReflectorReady;
 
-use pplx_space_sql_locator::sql;
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
@@ -74,7 +73,6 @@ use pplx_space_node_api_client::{
     },
 };
 use pplx_space_public_api::OperationId;
-use pplx_space_sandbox_portability::deleting_snapshot_matches_artifact;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use time::OffsetDateTime;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -414,13 +412,10 @@ pub(crate) async fn persist_optional_current_local_artifact(
         .begin()
         .await
         .db_context("failed to start current local artifact transaction")?;
-    let sandbox_exists =
-        sqlx::query_scalar::<_, Uuid>(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
-            .bind(sandbox_id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .db_context("failed to lock sandbox for current local artifact")?
-            .is_some();
+    let sandbox_exists = pplx_space_sandbox_store::row_locks::lock_id(&mut tx, sandbox_id)
+        .await
+        .db_context("failed to lock sandbox for current local artifact")?
+        .is_some();
     if !sandbox_exists {
         tx.rollback()
             .await
@@ -659,6 +654,13 @@ pub enum SubstrateError {
     Unschedulable { message: String },
     #[error("{message}")]
     Conflict { message: String },
+    /// The node refused the activation because a node drain sealed it
+    /// ([`pplx_space_rpc_contracts::wake_signals::ACTIVATIONS_SEALED_MARKER`]),
+    /// before any VM work. Answered as the drain gate's retryable 503: the
+    /// node refuses it until the drain has made the sandbox durable, after
+    /// which the call lands elsewhere, or until the node is undrained.
+    #[error("{message}")]
+    NodeSealed { message: String },
     #[error("{message}")]
     FailedPrecondition { message: String },
     #[error("{message}")]
@@ -748,8 +750,10 @@ pub enum SubstrateError {
     #[error("{message}")]
     Unsupported { message: String },
     /// A node that was already admin-terminated still appears in substrate
-    /// state and an upsert was attempted against it. Inventory callers
-    /// should skip; pod-placement callers should treat as a conflict.
+    /// state and an upsert was attempted against it, or a registration was
+    /// deferred, as a Node under a new UID that reports no instance yet for
+    /// a row with a v2 drain in any phase, its cancel included. Inventory callers should
+    /// skip; pod-placement callers should treat as a conflict.
     #[error("{message}")]
     NodeTombstoned { message: String },
     /// A marker-guarded evacuation restore claim
@@ -979,6 +983,7 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::Conflict { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
             }
+            SubstrateError::NodeSealed { message } => ControllerError::node_draining(message),
             SubstrateError::FailedPrecondition { message } => {
                 ControllerError::new(axum::http::StatusCode::PRECONDITION_FAILED, message)
             }

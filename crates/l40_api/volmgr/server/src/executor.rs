@@ -35,9 +35,6 @@ use dashmap::DashMap;
 use pplx_space_accounts::OrgId;
 use pplx_space_artifact_model::{SnapshotArtifact, StorageUri};
 use pplx_space_byok_model::{KekProvider, MasterKeyIdentifier};
-use pplx_space_common_jobs::{
-    Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
-};
 use pplx_space_file_io::sparse::{SparseDataRange, SparseFileWriter, SparseMaterialization};
 use pplx_space_object_store::{
     ObjectMeta, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
@@ -49,6 +46,9 @@ use pplx_space_subject_model::{SubjectId, SubjectIdParseError};
 use pplx_space_volmgr_client::{
     VERIFIED_REPLICA_PROVENANCE_VERSION, VerifiedReplicaProvenance,
     verified_replica_provenance_path,
+};
+use pplx_space_volmgr_store::jobs::{
+    Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -176,7 +176,7 @@ impl<'de> serde::Deserialize<'de> for FileMode {
 /// execute does not lose the typed identity. The `#[serde(alias = "sandbox_id")]`
 /// keeps deserialization of pre-rename payloads sitting in the SQLite job
 /// queue working — those store a bare sandbox UUID in this slot, which is
-/// re-typed via [`parse_subject_id_with_legacy_fallback`] at execute time.
+/// re-typed via `parse_subject_id_with_legacy_fallback` at execute time.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferPayload {
     #[serde(alias = "sandbox_id")]
@@ -261,7 +261,7 @@ pub struct TransferPayload {
 /// worker's `from_json` step rather than reaching credmgr. `wrapped_dek`
 /// is the opaque ciphertext we persist; the AADs (artifact-level wrap +
 /// per-entry chunk) are derived at execute time from the payload's
-/// subject, `artifact_id`, and entry `role` via [`derive_artifact_aads`],
+/// subject, `artifact_id`, and entry `role` via `derive_artifact_aads`,
 /// so no AAD bytes round-trip through the request or the SQLite row.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TransferEncryption {
@@ -1060,7 +1060,7 @@ pub struct TransferExecutorConfig {
     /// Deployment upload policy with one shared streaming-buffer budget.
     pub snapshot_upload_mode: SnapshotUploadMode,
     /// Maximum concurrent CPU-bound zstd passes (compress or decompress).
-    /// `0` auto-sizes to the CPU quota. See [`resolved_codec_concurrency`].
+    /// `0` auto-sizes to the CPU quota. See `resolved_codec_concurrency`.
     pub codec_concurrency: usize,
     /// Decode zstd pulls inline with the ranged download (one pass) instead
     /// of a separate read-back decompress step. Kill switch for rollout;

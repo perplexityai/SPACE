@@ -631,6 +631,24 @@ pub struct DrainRequest {
     /// `deny_unknown_fields`), which fails closed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_undrained: bool,
+    /// The drain engine to run; `None` keeps a drain in flight on its engine
+    /// and starts a new one on v1 while `SPACE_DRAIN_V2_ENABLED` is off; with
+    /// it on, a new drain that names no engine is refused. Skipped when `None`, so a request that
+    /// doesn't name one stays byte-identical to what the previous release
+    /// accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<NodeDrainEngine>,
+    /// How long a v2 drain keeps the node's running sandboxes running, in
+    /// seconds from the drain's start: its deadline is `drain_started_at`
+    /// plus this, and at it the node suspends whatever still runs. 0
+    /// suspends them at once. Required to start a v2 drain; against a v2
+    /// drain in flight it may be omitted, or move the deadline earlier, and
+    /// one that would move it later is a 409. Refused on a v1 drain, and so
+    /// is `mode: forced` on a v2 one, for which this is 0. Skipped when
+    /// `None`, so a request that doesn't carry one stays byte-identical to
+    /// what the previous release accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_seconds: Option<u64>,
 }
 
 #[cfg(feature = "serde")]

@@ -1,6 +1,7 @@
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_teardown::direct::observed_publication::PublishedObservedState;
 use uuid::Uuid;
 
 use super::ArtifactComponentProjection;
@@ -64,6 +65,40 @@ pub(super) struct PublishedSandboxRow {
     pub(super) state_changed_at: Option<String>,
     pub(super) execution_generation: Option<i64>,
     pub(super) pod_uid: Option<String>,
+}
+
+impl PublishedSandboxRow {
+    /// The columns the observed-state write records.
+    pub(super) fn observed_state(&self) -> PublishedObservedState<'_> {
+        PublishedObservedState {
+            sandbox_id: self.sandbox_id,
+            status: self.status.as_deref(),
+            state_changed_at: self.state_changed_at.as_deref(),
+            template: self.template.as_deref(),
+            runtime: self.runtime.as_deref(),
+            spaced_version: self.spaced_version.as_deref(),
+            runtime_version: self.runtime_version.as_deref(),
+            guest_os: self.guest_os.as_deref(),
+            guest_arch: self.guest_arch.as_deref(),
+            state_format_name: self.state_format_name.as_deref(),
+            state_format_version: self.state_format_version.as_deref(),
+            execution_metadata: self.execution_metadata.as_ref(),
+            pid: self.pid,
+            namespace: self.namespace.as_deref(),
+            uptime: self.uptime.as_deref(),
+            sandbox_owner: self.sandbox_owner.as_deref(),
+            sandbox_user: self.sandbox_user.as_deref(),
+            image_hash: self.image_hash.as_deref(),
+            snapshots_enabled: self.snapshots_enabled,
+            pool_template: self.pool_template.as_deref(),
+            failure_reason: self.failure_reason.as_deref(),
+            observed_created_at: self.observed_created_at.as_deref(),
+            network_tx_bytes: self.network_tx_bytes,
+            network_rx_bytes: self.network_rx_bytes,
+            disk_usage_bytes: self.disk_usage_bytes,
+            auto_lifecycle_authority: self.auto_lifecycle_authority,
+        }
+    }
 }
 
 /// A narrow SQL projection of the published lifecycle.

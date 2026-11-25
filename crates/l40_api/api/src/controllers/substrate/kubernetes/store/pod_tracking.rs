@@ -2,6 +2,7 @@
 //! started-suspend recovery that runs after execution cleanup.
 
 use super::*;
+use pplx_space_sandbox_store::k8s_executions::pod_tracking as k8s_execution_pod_tracking;
 use pplx_space_sandbox_store::pod_tracking;
 
 impl K8sStore {
@@ -156,15 +157,10 @@ impl K8sStore {
         if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
             return Ok(true);
         }
-        let active_exists: bool = sqlx::query_scalar(sql!(
-            "SELECT EXISTS (
-                 SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active
-             )"
-        ))
-        .bind(sandbox_id)
-        .fetch_one(&mut *tx)
-        .await
-        .db_context("failed to re-check execution absence")?;
+        let active_exists = pplx_space_sandbox_store::k8s_executions::exists(&mut *tx, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .db_context("failed to re-check execution absence")?;
         if active_exists {
             return Ok(false);
         }
@@ -218,31 +214,16 @@ impl K8sStore {
         {
             return Ok(false);
         }
-        let filled = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET pod_uid = $4,
-                    pod_materialized_at = COALESCE(
-                        pod_materialized_at,
-                        CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
-                    ),
-                    updated_at = NOW()
-              WHERE sandbox_id = $1
-                AND generation IS NOT DISTINCT FROM $2
-                AND active
-                AND activation_attempt_id IS NOT DISTINCT FROM $3
-                AND NULLIF(BTRIM(pod_uid), '') IS NULL
-                AND route_activation_id IS NOT DISTINCT FROM $5"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(activation_attempt_id)
-        .bind(pod_uid)
-        .bind(route_activation_id)
-        .execute(&mut *tx)
+        let filled = k8s_execution_pod_tracking::backfill_missing_pod_uid(
+            &mut tx,
+            sandbox_id,
+            generation,
+            activation_attempt_id,
+            pod_uid,
+            route_activation_id,
+        )
         .await
-        .db_context("failed to backfill pod uid")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to backfill pod uid")?;
         if filled
             && self.attribution.is_enabled()
             && let Some(generation) = generation
@@ -337,35 +318,17 @@ impl K8sStore {
 
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
         // held one, so the record that a pod ran outlives the UID.
-        let cleared = sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-             SET pod_uid = NULL,
-                 pod_ip = NULL,
-                 k8s_node_name = NULL,
-                 pod_materialized_at = COALESCE(
-                     pod_materialized_at,
-                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
-                 ),
-                 updated_at = NOW()
-             WHERE sandbox_id = $1
-               AND generation = $2
-               AND active
-               AND state = $3
-               AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $4
-               AND pod_ip IS NOT DISTINCT FROM $5::INET
-               AND k8s_node_name IS NOT DISTINCT FROM $6"
-        ))
-        .bind(sandbox_id)
-        .bind(generation.get())
-        .bind(ActiveExecutionState::RecoveryFailed.as_str())
-        .bind(expected_pod_uid)
-        .bind(expected_pod_ip)
-        .bind(expected_k8s_node_name)
-        .execute(&mut *tx)
+        let cleared = k8s_execution_pod_tracking::clear_absent_recovery_pod(
+            &mut tx,
+            sandbox_id,
+            generation,
+            ActiveExecutionState::RecoveryFailed.as_str(),
+            expected_pod_uid,
+            expected_pod_ip,
+            expected_k8s_node_name,
+        )
         .await
-        .db_context("failed to clear missing recovery pod metadata")?
-        .rows_affected()
-            > 0;
+        .db_context("failed to clear missing recovery pod metadata")?;
         if !cleared {
             tx.commit()
                 .await
@@ -437,20 +400,9 @@ impl K8sStore {
         generation: i64,
         pod_name: &str,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "SELECT EXISTS (
-                 SELECT 1
-                   FROM sandbox_k8s_executions
-                  WHERE sandbox_id = $1
-                    AND generation = $2
-                    AND pod_name = $3
-                    AND NOT active
-             )"
-        ))
-        .bind(sandbox_id)
-        .bind(generation)
-        .bind(pod_name)
-        .fetch_one(&self.pool)
+        pplx_space_sandbox_store::k8s_executions::generation_retired(
+            &self.pool, sandbox_id, generation, pod_name,
+        )
         .await
         .db_context("failed to read execution retirement")
     }

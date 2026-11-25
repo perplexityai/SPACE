@@ -118,7 +118,7 @@ async fn fanout_resolves_live_nodes_once_and_dead_letters_ghosts_without_resolvi
 
     let value_capture = pplx_space_metrics_emit::test_capture::capture_values_guard();
     process_claim(
-        &db.pool,
+        &Db::from(db.pool.clone()),
         resolver.clone(),
         Arc::new(TriggerNodeApiClientCache::default()),
         claim.clone(),

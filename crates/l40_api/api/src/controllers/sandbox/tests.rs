@@ -1,6 +1,7 @@
 use super::*;
 use pplx_space_k8s_ids::PodUid;
 use pplx_space_sandbox_model::SandboxActivationAttemptId;
+use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateId;
 
 mod activation_timeout_tests {

@@ -1,6 +1,5 @@
 use pplx_space_accounts::{OrgId, UserId};
 
-use pplx_space_sql_locator::sql;
 use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::time::Duration;
@@ -17,7 +16,7 @@ use pplx_space_public_operation_store::operations::{ClaimedPublicOperationRow, J
 use pplx_space_sandbox_model::{SandboxId, SandboxLifecycle};
 use pplx_space_sandbox_store as sandbox_store;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, Postgres, Row, Transaction, types::Json};
+use sqlx::{PgPool, Postgres, Transaction, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -27,16 +26,6 @@ use pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle;
 
 const DEFAULT_OPERATION_GC_DAYS: i64 = 7;
 
-fn update_claimed_payload_sql() -> &'static str {
-    sql!(
-        "UPDATE public_operations
-         SET payload_json = $4, updated_at = NOW()
-         WHERE operation_id = $1
-           AND claim_token = $2
-           AND claim_generation = $3
-           AND state = 'running'"
-    )
-}
 const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
 /// Advisory transaction lock that serializes dispatcher claims across
 /// controller replicas so the keyed-claim rule sees every committed claim.
@@ -261,32 +250,13 @@ impl PublicOperationStore {
         context: &crate::fork_operations::ForkFederatedCreateContext,
     ) -> Result<(), PublicOperationStoreError> {
         let context = serde_json::to_value(context).expect("federated create context serializes");
-        sqlx::query(sql!(
-            "UPDATE public_operations
-             SET payload_json = jsonb_set(payload_json, '{federated_create}', $4),
-                 updated_at = NOW()
-             WHERE org_id = $1 AND actor_user_id = $2 AND operation_id = $3
-               AND api_product = 'native' AND kind = 'create_sandbox' AND state = 'queued'
-               AND payload_json #>> '{federated_create,issuer}' = $4->>'issuer'
-               AND payload_json #>> '{federated_create,org_id}' = $4->>'org_id'
-               AND payload_json #>> '{federated_create,subject_id}' = $4->>'subject_id'
-               AND ($4->>'service_grant_expires_at_unix')::BIGINT > EXTRACT(EPOCH FROM NOW())
-               AND CASE
-                   WHEN $4->>'service_grant_issued_at_unix' IS NOT NULL
-                    AND payload_json #>> '{federated_create,service_grant_issued_at_unix}' IS NOT NULL
-                   THEN ($4->>'service_grant_issued_at_unix')::BIGINT >
-                     (payload_json #>> '{federated_create,service_grant_issued_at_unix}')::BIGINT
-                   WHEN $4->>'service_grant_issued_at_unix' IS NOT NULL THEN TRUE
-                   WHEN payload_json #>> '{federated_create,service_grant_issued_at_unix}' IS NOT NULL THEN FALSE
-                   ELSE ($4->>'service_grant_expires_at_unix')::BIGINT >
-                     (payload_json #>> '{federated_create,service_grant_expires_at_unix}')::BIGINT
-               END"
-        ))
-        .bind(org_id)
-        .bind(actor_user_id)
-        .bind(operation_id.as_uuid())
-        .bind(Json(context))
-        .execute(&self.pool)
+        operation_store::operations::renew_queued_native_create_grant(
+            &self.pool,
+            org_id,
+            actor_user_id,
+            operation_id,
+            context,
+        )
         .await?;
         Ok(())
     }
@@ -716,22 +686,11 @@ impl PublicOperationStore {
         api_product: ApiProduct,
         idempotency: &CreatePublicOperationIdempotency<'_>,
     ) -> Result<ObservePublicOperationIdempotency, PublicOperationStoreError> {
-        let row = sqlx::query_as::<_, PublicIdempotencyRow>(sql!(
-            "SELECT operation_id, request_fingerprint
-             FROM public_idempotency_records
-             WHERE org_id = $1
-               AND api_product = $2
-               AND method = $3
-               AND path_template = $4
-               AND idempotency_key = $5
-               AND expires_at > NOW()"
-        ))
-        .bind(org_id)
-        .bind(api_product.as_str())
-        .bind(idempotency.method.as_str())
-        .bind(idempotency.path_template.as_str())
-        .bind(idempotency.key.as_str())
-        .fetch_optional(&self.pool)
+        let row = operation_store::idempotency::find_live(
+            &self.pool,
+            api_product.as_str(),
+            idempotency.store_key(org_id),
+        )
         .await?
         .map(PublicIdempotencyRecord::try_from)
         .transpose()?;
@@ -825,22 +784,13 @@ impl PublicOperationStore {
         claim_token: &str,
         operation: &ClaimedPublicOperation,
     ) -> Result<bool, PublicOperationStoreError> {
-        let updated = sqlx::query(sql!(
-            "UPDATE public_operations
-             SET claimed_at = NOW(), updated_at = NOW()
-             WHERE operation_id = $1
-               AND claim_token = $2
-               AND claim_generation = $3
-               AND state = $4"
-        ))
-        .bind(operation.id.as_uuid())
-        .bind(claim_token)
-        .bind(operation.claim_generation)
-        .bind(OperationState::Running.as_str())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(updated == 1)
+        Ok(operation_store::operations::renew_claim(
+            &self.pool,
+            operation.id,
+            claim_token,
+            operation.claim_generation,
+        )
+        .await?)
     }
 
     pub async fn fail_claimed_operation(
@@ -891,15 +841,14 @@ impl PublicOperationStore {
         &self,
         input: UpdateClaimedPublicOperationPayload,
     ) -> Result<bool, PublicOperationStoreError> {
-        let changed = sqlx::query(update_claimed_payload_sql())
-            .bind(input.operation_id.as_uuid())
-            .bind(input.claim_token)
-            .bind(input.claim_generation)
-            .bind(Json(input.payload_json))
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(changed == 1)
+        Ok(operation_store::operations::set_claimed_payload(
+            &self.pool,
+            input.operation_id,
+            &input.claim_token,
+            input.claim_generation,
+            input.payload_json,
+        )
+        .await?)
     }
 
     pub async fn update_claimed_payload_in_transaction(
@@ -907,15 +856,14 @@ impl PublicOperationStore {
         tx: &mut Transaction<'_, Postgres>,
         input: UpdateClaimedPublicOperationPayload,
     ) -> Result<bool, PublicOperationStoreError> {
-        let changed = sqlx::query(update_claimed_payload_sql())
-            .bind(input.operation_id.as_uuid())
-            .bind(input.claim_token)
-            .bind(input.claim_generation)
-            .bind(Json(input.payload_json))
-            .execute(&mut **tx)
-            .await?
-            .rows_affected();
-        Ok(changed == 1)
+        Ok(operation_store::operations::set_claimed_payload(
+            &mut **tx,
+            input.operation_id,
+            &input.claim_token,
+            input.claim_generation,
+            input.payload_json,
+        )
+        .await?)
     }
 
     pub async fn scrub_claimed_fork_federated_service_grant(
@@ -923,23 +871,14 @@ impl PublicOperationStore {
         claim_token: &str,
         operation: &ClaimedPublicOperation,
     ) -> Result<bool, PublicOperationStoreError> {
-        let updated = sqlx::query(sql!(
-            "UPDATE public_operations
-             SET payload_json = payload_json #- $4::text[],
-                 updated_at = NOW()
-             WHERE operation_id = $1
-               AND claim_token = $2
-               AND claim_generation = $3
-               AND state = 'running'"
-        ))
-        .bind(operation.id.as_uuid())
-        .bind(claim_token)
-        .bind(operation.claim_generation)
-        .bind(crate::fork_operations::FORK_FEDERATED_SERVICE_GRANT_JSON_PATH)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(updated == 1)
+        Ok(operation_store::operations::scrub_claimed_payload_path(
+            &self.pool,
+            operation.id,
+            claim_token,
+            operation.claim_generation,
+            crate::fork_operations::FORK_FEDERATED_SERVICE_GRANT_JSON_PATH,
+        )
+        .await?)
     }
 
     pub async fn gc_expired(
@@ -1043,8 +982,8 @@ async fn claim_created_operation_tx(
     let row =
         operation_store::operations::claim_created(&mut **tx, operation_id, &claim_token).await?;
     let operation = ClaimedPublicOperation::try_from(row)?;
-    append_operation_event_tx(
-        tx,
+    operation_store::events::append(
+        &mut **tx,
         operation.id,
         PublicOperationEventType::Claimed,
         serde_json::json!({
@@ -1284,25 +1223,6 @@ pub struct InlineOrgLimit {
     pub claim_stale_after: Duration,
 }
 
-/// Cost: the organization's running operations, however claimed, through
-/// `idx_public_operations_org_state`, which has none of the other columns, so
-/// the claim-token, claim-time and kind filters apply after the read. Without
-/// that index this read every running row in the fleet through
-/// `idx_public_operations_state_next_attempt`, or, under a generic plan,
-/// intersected that with every operation the organization retains through
-/// `idx_public_operations_tenant_created`. A constant rather than a literal at
-/// its query site so `inline_org_limit_plan_tests` can `EXPLAIN` the text this
-/// runs.
-const INLINE_ORG_AT_LIMIT: &str = sql!(
-    "SELECT COUNT(*) >= $2
-       FROM public_operations
-      WHERE state = $3
-        AND org_id = $1
-        AND starts_with(claim_token, $4)
-        AND claimed_at > NOW() - make_interval(secs => $5::BIGINT)
-        AND kind <> ALL($6)"
-);
-
 /// Whether `org_id` already has `limit` operations other than teardowns
 /// running under a live admission claim, the claims processes take to
 /// execute what they admit (warm-pool creates included). The dispatcher's
@@ -1314,25 +1234,23 @@ const INLINE_ORG_AT_LIMIT: &str = sql!(
 /// one. Each such admission holds an inline permit in its process, so the
 /// overshoot is bounded by the permits free across the API processes.
 ///
-/// Counted with [`INLINE_ORG_AT_LIMIT`]; see there for what it reads.
+/// Counted with
+/// [`INLINE_ORG_AT_LIMIT`](operation_store::operations::INLINE_ORG_AT_LIMIT);
+/// see there for what it reads.
 async fn inline_org_at_limit_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
     org_limit: InlineOrgLimit,
 ) -> Result<bool, sqlx::Error> {
-    let teardown_labels = TEARDOWN_KINDS
-        .iter()
-        .map(|kind| kind.as_str().to_string())
-        .collect::<Vec<_>>();
-    sqlx::query_scalar::<_, bool>(INLINE_ORG_AT_LIMIT)
-        .bind(org_id)
-        .bind(i64::from(org_limit.limit.get()))
-        .bind(OperationState::Running.as_str())
-        .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
-        .bind(duration_secs_i64(org_limit.claim_stale_after))
-        .bind(&teardown_labels)
-        .fetch_one(&mut **tx)
-        .await
+    operation_store::operations::inline_org_at_limit(
+        &mut **tx,
+        org_id,
+        i64::from(org_limit.limit.get()),
+        ADMISSION_CLAIM_TOKEN_PREFIX,
+        duration_secs_i64(org_limit.claim_stale_after),
+        TEARDOWN_KINDS,
+    )
+    .await
 }
 
 /// Why admission left an operation it created queued instead of claiming it
@@ -1590,19 +1508,13 @@ impl PublicOperationAdmission {
             return Ok(None);
         };
         if joinable.system {
-            let handed_over = sqlx::query_scalar::<_, Uuid>(sql!(
-                "UPDATE public_operations
-                    SET actor_user_id = $2, updated_at = NOW()
-                  WHERE operation_id = $1
-                    AND actor_user_id IS NULL
-                    AND state = 'queued'
-                  RETURNING operation_id"
-            ))
-            .bind(joinable.operation_id)
-            .bind(actor_user_id)
-            .fetch_optional(&mut *self.tx)
+            let handed_over = operation_store::operations::hand_over_queued_system_operation(
+                &mut *self.tx,
+                joinable.operation_id,
+                actor_user_id,
+            )
             .await?;
-            if handed_over.is_none() {
+            if !handed_over {
                 return Ok(None);
             }
         }
@@ -2106,8 +2018,8 @@ pub async fn create_operation_tx(
     )
     .await?;
 
-    append_operation_event_tx(
-        tx,
+    operation_store::events::append(
+        &mut **tx,
         operation_id,
         PublicOperationEventType::Created,
         serde_json::json!({
@@ -2197,8 +2109,8 @@ async fn cancel_superseded_create_tx(
         error.clone(),
     )
     .await?;
-    append_operation_event_tx(
-        tx,
+    operation_store::events::append(
+        &mut **tx,
         create_id,
         PublicOperationEventType::Canceled,
         serde_json::json!({
@@ -2228,29 +2140,12 @@ async fn cancel_creates_superseded_by_delete_tx(
     target_id: &str,
     delete_id: OperationId,
 ) -> Result<SupersededCreates, PublicOperationStoreError> {
-    let active = sqlx::query_as::<_, (Uuid, String, bool)>(sql!(
-        "SELECT operation_id, api_product, state = $5 AND claim_token = ''
-         FROM public_operations
-         WHERE org_id = $1
-           AND target_type = $2
-           AND target_id = $3
-           AND kind = $4
-           AND state IN ($5, $6)
-           AND requested_at <= NOW()
-         ORDER BY requested_at, operation_id
-         FOR UPDATE"
-    ))
-    .bind(org_id)
-    .bind(OperationTargetType::Sandbox.as_str())
-    .bind(target_id)
-    .bind(OperationKind::CreateSandbox.as_str())
-    .bind(OperationState::Queued.as_str())
-    .bind(OperationState::Running.as_str())
-    .fetch_all(&mut **tx)
-    .await?;
+    let active =
+        operation_store::operations::lock_active_creates_on_sandbox(tx, org_id, target_id).await?;
     let creates = active
         .into_iter()
-        .filter_map(|(create, api_product, unclaimed)| unclaimed.then_some((create, api_product)));
+        .filter(|create| create.unclaimed)
+        .map(|create| (create.operation_id, create.api_product));
     let mut superseded = SupersededCreates::default();
     for (create, api_product) in creates {
         superseded
@@ -2303,13 +2198,7 @@ pub(crate) async fn lock_active_sandbox_operation(
     } else {
         format!("{org_id}:{target_id}:{}", kind.as_str())
     };
-    sqlx::query(sql!(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
-    ))
-    .bind(lock_key)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    operation_store::operations::lock_sandbox_key(tx, &lock_key).await
 }
 
 /// Kinds that name a sandbox as their target but are not in its queue. A
@@ -2325,14 +2214,6 @@ pub(crate) async fn lock_active_sandbox_operation(
 /// their SQL, so who serializes, who holds work back and who counts as other
 /// work for the sandbox cannot drift apart.
 const OUTSIDE_SANDBOX_QUEUE_KINDS: &[OperationKind] = &[OperationKind::ForkSandbox];
-
-/// [`OUTSIDE_SANDBOX_QUEUE_KINDS`] as the labels SQL binds.
-fn outside_sandbox_queue_labels() -> Vec<&'static str> {
-    OUTSIDE_SANDBOX_QUEUE_KINDS
-        .iter()
-        .map(|kind| kind.as_str())
-        .collect()
-}
 
 /// The sandbox whose queue an operation of `kind` on `target_id` joins: its
 /// target when that names a sandbox, unless `kind` is one of
@@ -2380,13 +2261,7 @@ async fn lock_sandbox_queue(
     org_id: OrgId,
     target_id: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
-    ))
-    .bind(format!("{org_id}:{target_id}:queue"))
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    operation_store::operations::lock_sandbox_key(tx, &format!("{org_id}:{target_id}:queue")).await
 }
 
 /// The queued or running `kind` operation on a sandbox that a new request
@@ -2452,16 +2327,6 @@ async fn claim_operations(
     }
 
     let claim_token = new_claim_token();
-    let kind_labels = input
-        .claimable_kinds
-        .iter()
-        .map(|kind| kind.as_str().to_string())
-        .collect::<Vec<_>>();
-
-    let teardown_labels = TEARDOWN_KINDS
-        .iter()
-        .map(|kind| kind.as_str().to_string())
-        .collect::<Vec<_>>();
     let mut tx = pool.begin().await?;
     let keyed = mode == ClaimMode::Keyed;
     if keyed {
@@ -2473,12 +2338,9 @@ async fn claim_operations(
         // busy lock makes this tick claim nothing rather than wait. The same
         // round trip turns off JIT, which the keyed claim's cost estimate can
         // trigger and which costs more than the query.
-        let (claim_lock_held, _jit) = sqlx::query_as::<_, (bool, String)>(sql!(
-            "SELECT pg_try_advisory_xact_lock($1), set_config('jit', 'off', true)"
-        ))
-        .bind(PUBLIC_OPERATION_CLAIM_LOCK_KEY)
-        .fetch_one(&mut *tx)
-        .await?;
+        let claim_lock_held =
+            operation_store::claim_queue::try_lock_claims(&mut tx, PUBLIC_OPERATION_CLAIM_LOCK_KEY)
+                .await?;
         if !claim_lock_held {
             tx.rollback().await?;
             return Ok(PublicOperationClaim {
@@ -2488,348 +2350,48 @@ async fn claim_operations(
             });
         }
     }
-    // Across keys, claim in order of when each operation became claimable,
-    // so a requeued retry waits behind work queued before its backoff
-    // expired. With `$11` (keyed) set, `blocked` lets at most one operation
-    // per sandbox start: none while one runs under a live claim; otherwise a
-    // stale claim first, so its token is rotated before anything else on the
-    // sandbox can start beside its old execution; otherwise the
-    // earliest-requested one if it is due; otherwise the earliest due delete
-    // with no create requested before it, so a delete is not stuck behind
-    // work in retry backoff but never overtakes a create. Only sandboxes with
-    // more than one active operation can hold anything back, so the window
-    // pass reads just those, in one sort. Kinds outside a sandbox's queue
-    // (`$8`, `OUTSIDE_SANDBOX_QUEUE_KINDS`: forks) stay outside the key.
-    // With `$11` unset (the kill switch) `blocked` is empty. Teardowns
-    // (`$14`: deletes and kills) and other work are picked apart. At most
-    // `$12` of the claim are other work, which keeps
-    // the slots reserved for teardowns free of it. While other work is due, at
-    // most `$13` are teardowns, which keeps the slots reserved for other work
-    // free of them; with none due, teardowns may take any free slot. The claim
-    // then takes the first `$1` of both, in the same order. Both picks lock
-    // their rows before that last `LIMIT`, so up to `$12 + $13 - $1` rows stay
-    // locked but unclaimed until this transaction commits. A concurrent
-    // unkeyed claim skips them meanwhile, and a keyed one does not run while
-    // this claim holds the claim lock. With `$15` above zero, it limits each
-    // organization's operations other than teardowns: `org_slots` counts the
-    // ones it runs under a live claim, except one claimed as it was created
-    // (`$17`), which the process that created it runs, and, in claim order,
-    // the ones this claim would add. An organization is waiting while it has
-    // such work due and holds fewer than `$15`. While another one is
-    // waiting, an organization gets no more than `$15`. While none is, it may
-    // go past `$15`, but operations past their organization's limit are taken
-    // only among the first `$12 - $16` admissible ones in claim order, so
-    // that `$16` of the free slots open to other work stay free for work
-    // another organization submits later. Organizations all at their limit
-    // share that one budget.
-    // No more than `2 * $12` of an organization's due operations can be
-    // admitted, so the rank reads only those: `due_other` reads every due
-    // one once, an organization with more gets a top-N pass of its own, and
-    // the others' go to the window whole, which keeps one organization's
-    // backlog out of the sort.
-    // That rank needs a window, which cannot share a level with `FOR
-    // UPDATE`, so `first_other` admits up to `2 * $12` and `picked_other`
-    // locks the first `$12` of them it can by key, re-checking that each is
-    // still claimable. Admitting more than it takes keeps a row another
-    // transaction has locked from shrinking the claim, unless more than `$12`
-    // of the admitted ones are. A locked row still counts toward its
-    // organization's limit and the headroom budget in this claim, since
-    // finding it locked takes the lock, so work admitted only past it waits
-    // for the next claim. When it claims nothing, the statement returns
-    // one row with no operation, whose `org_limit_held_back` says whether
-    // other work was due and the organization limit held all of it back.
-    let rows = sqlx::query(sql!(
-        "WITH shared AS (
-             SELECT org_id, target_id
-             FROM public_operations
-             WHERE $11::BOOLEAN
-               AND state IN ($4, $5)
-               AND target_type = $7
-               AND target_id IS NOT NULL
-               AND kind = ANY($6)
-               AND kind <> ALL($8)
-             GROUP BY org_id, target_id
-             HAVING COUNT(*) > 1
-         ),
-         active AS (
-             SELECT operation_id,
-                    op.org_id,
-                    op.target_id,
-                    requested_at,
-                    kind,
-                    next_attempt_at <= NOW() AS due,
-                    state = $5 AND claim_token <> ''
-                        AND claimed_at > NOW() - make_interval(secs => $2::BIGINT) AS live,
-                    state = $5 AND claim_token <> ''
-                        AND claimed_at <= NOW() - make_interval(secs => $2::BIGINT) AS stale
-             FROM shared
-             JOIN public_operations op
-               ON op.org_id = shared.org_id
-              AND op.target_type = $7
-              AND op.target_id = shared.target_id
-             WHERE op.state IN ($4, $5)
-               AND op.kind = ANY($6)
-               AND op.kind <> ALL($8)
-         ),
-         ranked AS (
-             SELECT operation_id,
-                    ROW_NUMBER() OVER queue AS position,
-                    FIRST_VALUE(due) OVER queue AS head_due,
-                    BOOL_OR(live) OVER whole AS sandbox_live,
-                    BOOL_OR(stale) OVER whole AS sandbox_stale,
-                    stale AND NOT COALESCE(BOOL_OR(stale) OVER earlier, FALSE) AS first_stale,
-                    kind = $9
-                        AND due
-                        AND NOT COALESCE(BOOL_OR(kind = $10) OVER earlier, FALSE)
-                        AND NOT COALESCE(BOOL_OR(kind = $9 AND due) OVER earlier, FALSE)
-                        AS first_free_delete
-             FROM active
-             WINDOW queue AS (
-                        PARTITION BY org_id, target_id ORDER BY requested_at, operation_id
-                    ),
-                    whole AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
-                    earlier AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
-         ),
-         blocked AS (
-             SELECT operation_id
-             FROM ranked
-             WHERE sandbox_live
-                OR (sandbox_stale AND NOT first_stale)
-                OR (NOT sandbox_stale AND head_due AND position > 1)
-                OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
-         ),
-         org_live AS (
-             SELECT org_id, COUNT(*) AS live
-             FROM public_operations
-             WHERE $15::BIGINT > 0
-               AND state = $5
-               AND claim_token <> ''
-               AND NOT starts_with(claim_token, $17)
-               AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
-               AND kind = ANY($6)
-               AND kind <> ALL($14)
-             GROUP BY org_id
-         ),
-         due_other AS MATERIALIZED (
-             SELECT candidate.operation_id,
-                    candidate.org_id,
-                    candidate.next_attempt_at,
-                    candidate.requested_at,
-                    GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
-                    candidate.claim_token <> '' AS reclaimed,
-                    candidate.started_at IS NULL AS first_start
-             FROM public_operations candidate
-             WHERE candidate.state IN ($4, $5)
-               AND candidate.kind = ANY($6)
-               AND candidate.kind <> ALL($14)
-               AND candidate.next_attempt_at <= NOW()
-               AND (
-                   candidate.claim_token = ''
-                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
-               )
-               AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
-         ),
-         due_orgs AS (
-             SELECT org_id, COUNT(*) AS due
-             FROM due_other
-             GROUP BY org_id
-         ),
-         org_first AS (
-             SELECT due_other.*
-             FROM due_other
-             JOIN due_orgs ON due_orgs.org_id = due_other.org_id
-             WHERE due_orgs.due <= 2 * $12
-             UNION ALL
-             SELECT first.*
-             FROM due_orgs
-             CROSS JOIN LATERAL (
-                 SELECT *
-                 FROM due_other
-                 WHERE due_other.org_id = due_orgs.org_id
-                 ORDER BY next_attempt_at, requested_at, operation_id
-                 LIMIT 2 * $12
-             ) first
-             WHERE due_orgs.due > 2 * $12
-         ),
-         other_candidates AS (
-             SELECT org_first.*,
-                    COALESCE(org_live.live, 0) AS org_held,
-                    COALESCE(org_live.live, 0) + ROW_NUMBER() OVER (
-                        PARTITION BY org_first.org_id
-                        ORDER BY org_first.next_attempt_at, org_first.requested_at, org_first.operation_id
-                    ) AS org_slots
-             FROM org_first
-             LEFT JOIN org_live ON org_live.org_id = org_first.org_id
-         ),
-         waiting AS (
-             SELECT COUNT(*) AS orgs
-             FROM due_orgs
-             LEFT JOIN org_live ON org_live.org_id = due_orgs.org_id
-             WHERE COALESCE(org_live.live, 0) < $15
-         ),
-         admissible AS (
-             SELECT other.*,
-                    ROW_NUMBER() OVER (
-                        ORDER BY other.next_attempt_at, other.requested_at, other.operation_id
-                    ) AS admissible_rank
-             FROM other_candidates other
-             WHERE $15::BIGINT = 0
-                OR other.org_slots <= $15
-                -- Past its limit only while no other organization waits.
-                OR (SELECT orgs FROM waiting) = CASE WHEN other.org_held < $15 THEN 1 ELSE 0 END
-         ),
-         first_other AS (
-             SELECT operation_id, next_attempt_at, requested_at, claimable_at, reclaimed, first_start
-             FROM admissible
-             WHERE $15::BIGINT = 0
-                OR org_slots <= $15
-                OR admissible_rank <= $12 - $16
-             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
-             LIMIT 2 * $12
-         ),
-         picked_other AS (
-             SELECT candidate.operation_id,
-                    first_other.next_attempt_at,
-                    first_other.requested_at,
-                    first_other.claimable_at,
-                    first_other.reclaimed,
-                    first_other.first_start
-             FROM first_other
-             JOIN public_operations candidate
-               ON candidate.operation_id = first_other.operation_id
-             WHERE candidate.state IN ($4, $5)
-               AND candidate.next_attempt_at <= NOW()
-               AND (
-                   candidate.claim_token = ''
-                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
-               )
-             ORDER BY first_other.next_attempt_at ASC,
-                      first_other.requested_at ASC,
-                      first_other.operation_id ASC
-             LIMIT $12
-             FOR UPDATE OF candidate SKIP LOCKED
-         ),
-         picked_teardown AS (
-             SELECT candidate.operation_id,
-                    candidate.next_attempt_at,
-                    candidate.requested_at,
-                    GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
-                    candidate.claim_token <> '' AS reclaimed,
-                    candidate.started_at IS NULL AS first_start
-             FROM public_operations candidate
-             WHERE candidate.state IN ($4, $5)
-               AND candidate.kind = ANY($6)
-               AND candidate.kind = ANY($14)
-               AND candidate.next_attempt_at <= NOW()
-               AND (
-                   candidate.claim_token = ''
-                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
-               )
-               AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
-             ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
-             LIMIT CASE WHEN EXISTS (SELECT 1 FROM picked_other) THEN $13 ELSE $1 END
-             FOR UPDATE OF candidate SKIP LOCKED
-         ),
-         picked AS (
-             SELECT operation_id, claimable_at, reclaimed, first_start
-             FROM (
-                 SELECT * FROM picked_other
-                 UNION ALL
-                 SELECT * FROM picked_teardown
-             ) claimable
-             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
-             LIMIT $1
-         ),
-         claimed AS (
-             UPDATE public_operations o
-             SET state = $5,
-                 attempts = o.attempts + 1,
-                 claim_token = $3,
-                 claim_generation = o.claim_generation + 1,
-                 claimed_at = NOW(),
-                 started_at = COALESCE(o.started_at, NOW()),
-                 progress_message = CASE
-                     WHEN o.progress_message = '' THEN 'operation claimed'
-                     ELSE o.progress_message
-                 END,
-                 updated_at = NOW()
-             FROM picked
-             WHERE o.operation_id = picked.operation_id
-             RETURNING o.operation_id,
-                       o.org_id,
-                       o.actor_user_id,
-                       o.api_product,
-                       o.kind,
-                       o.target_type,
-                       o.target_id,
-                       o.payload_json,
-                       o.attempts,
-                       o.claim_generation,
-                       o.traceparent,
-                       CASE WHEN picked.first_start
-                           THEN FLOOR(EXTRACT(EPOCH FROM NOW() - o.created_at))::BIGINT
-                       END AS age_at_first_claim_secs,
-                       (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
-                           AS queue_wait_ms,
-                       picked.reclaimed
-         )
-         SELECT claimed.*, summary.org_limit_held_back
-         FROM (
-             SELECT $12::BIGINT > 0
-                    AND NOT EXISTS (SELECT 1 FROM first_other)
-                    AND EXISTS (SELECT 1 FROM other_candidates) AS org_limit_held_back
-         ) summary
-         LEFT JOIN claimed ON TRUE"
-    ))
-    .bind(i64::from(input.limits.total))
-    .bind(duration_secs_i64(input.claim_stale_after))
-    .bind(&claim_token)
-    .bind(OperationState::Queued.as_str())
-    .bind(OperationState::Running.as_str())
-    .bind(&kind_labels)
-    .bind(OperationTargetType::Sandbox.as_str())
-    .bind(outside_sandbox_queue_labels())
-    .bind(OperationKind::DeleteSandbox.as_str())
-    .bind(OperationKind::CreateSandbox.as_str())
-    .bind(keyed)
-    .bind(i64::from(input.limits.non_teardown.min(input.limits.total)))
-    .bind(i64::from(
-        input
-            .limits
-            .teardown_while_other_due
-            .min(input.limits.total),
-    ))
-    .bind(&teardown_labels)
-    .bind(
-        input
-            .limits
-            .per_org_non_teardown
-            .map_or(0, |limit| i64::from(limit.contended.get())),
+    // The claim's rules, and which rows it leaves locked, are
+    // `claim_queue::claim_due`'s.
+    let claimed = operation_store::claim_queue::claim_due(
+        &mut tx,
+        operation_store::claim_queue::DueClaim {
+            total: i64::from(input.limits.total),
+            claim_stale_after_secs: duration_secs_i64(input.claim_stale_after),
+            claim_token: &claim_token,
+            claimable_kinds: input.claimable_kinds,
+            outside_queue_kinds: OUTSIDE_SANDBOX_QUEUE_KINDS,
+            keyed,
+            non_teardown: i64::from(input.limits.non_teardown.min(input.limits.total)),
+            teardown_while_other_due: i64::from(
+                input
+                    .limits
+                    .teardown_while_other_due
+                    .min(input.limits.total),
+            ),
+            teardown_kinds: TEARDOWN_KINDS,
+            per_org_non_teardown: input
+                .limits
+                .per_org_non_teardown
+                .map_or(0, |limit| i64::from(limit.contended.get())),
+            per_org_headroom: input
+                .limits
+                .per_org_non_teardown
+                .map_or(0, |limit| i64::from(limit.headroom)),
+            admission_claim_token_prefix: ADMISSION_CLAIM_TOKEN_PREFIX,
+        },
     )
-    .bind(
-        input
-            .limits
-            .per_org_non_teardown
-            .map_or(0, |limit| i64::from(limit.headroom)),
-    )
-    .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
-    .fetch_all(&mut *tx)
     .await?;
 
-    let mut operations = Vec::with_capacity(rows.len());
-    let mut queue_waits = Vec::with_capacity(rows.len());
-    let mut org_limit_held_back = false;
-    for row in rows {
-        if row.try_get::<Option<Uuid>, _>("operation_id")?.is_none() {
-            org_limit_held_back = row.try_get("org_limit_held_back")?;
-            continue;
-        }
-        let row = DispatcherClaimRow::from_row(&row)?;
+    let org_limit_held_back = claimed.org_limit_held_back;
+    let mut operations = Vec::with_capacity(claimed.operations.len());
+    let mut queue_waits = Vec::with_capacity(claimed.operations.len());
+    for row in claimed.operations {
+        let row = row?;
         let operation = ClaimedPublicOperation::try_from(row.operation)?;
         // A stale reclaim was already running, so its wait is not queue time.
         queue_waits.push((!row.reclaimed).then_some(row.queue_wait_ms));
-        append_operation_event_tx(
-            &mut tx,
+        operation_store::events::append(
+            &mut *tx,
             operation.id,
             PublicOperationEventType::Claimed,
             serde_json::json!({
@@ -2869,34 +2431,18 @@ async fn complete_claimed_operation(
     input: CompleteClaimedPublicOperation,
 ) -> Result<bool, PublicOperationStoreError> {
     let mut tx = pool.begin().await?;
-    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
-        "UPDATE public_operations
-         SET state = $3,
-             claim_token = '',
-             completed_at = NOW(),
-             progress_message = $4,
-             result_json = $5,
-             payload_json = CASE WHEN kind = 'create_sandbox'
-                 THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
-                 ELSE payload_json END,
-             updated_at = NOW()
-         WHERE operation_id = $1
-           AND claim_token = $2
-           AND state = $6
-         RETURNING operation_id"
-    ))
-    .bind(input.operation_id.as_uuid())
-    .bind(&input.claim_token)
-    .bind(OperationState::Succeeded.as_str())
-    .bind(&input.progress_message)
-    .bind(Json(input.result_json.clone()))
-    .bind(OperationState::Running.as_str())
-    .fetch_optional(&mut *tx)
+    let updated = operation_store::operations::complete_claimed(
+        &mut *tx,
+        input.operation_id,
+        &input.claim_token,
+        &input.progress_message,
+        input.result_json.clone(),
+    )
     .await?;
 
-    if updated.is_some() {
-        append_operation_event_tx(
-            &mut tx,
+    if updated {
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Completed,
             serde_json::json!({
@@ -2907,7 +2453,7 @@ async fn complete_claimed_operation(
         .await?;
     }
     tx.commit().await?;
-    Ok(updated.is_some())
+    Ok(updated)
 }
 
 async fn fail_claimed_operation(
@@ -2915,36 +2461,21 @@ async fn fail_claimed_operation(
     input: FailClaimedPublicOperation,
 ) -> Result<bool, PublicOperationStoreError> {
     let mut tx = pool.begin().await?;
-    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
-        "UPDATE public_operations
-         SET state = $3,
-             claim_token = '',
-             completed_at = NOW(),
-             progress_message = $4,
-             terminal_error_code = $5,
-             terminal_error_json = $6,
-             payload_json = CASE WHEN kind = 'create_sandbox'
-                 THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
-                 ELSE payload_json END,
-             updated_at = NOW()
-         WHERE operation_id = $1
-           AND claim_token = $2
-           AND state = $7
-         RETURNING operation_id"
-    ))
-    .bind(input.operation_id.as_uuid())
-    .bind(&input.claim_token)
-    .bind(OperationState::Failed.as_str())
-    .bind(&input.progress_message)
-    .bind(input.terminal_error_code.as_str())
-    .bind(Json(input.terminal_error_json.clone()))
-    .bind(OperationState::Running.as_str())
-    .fetch_optional(&mut *tx)
+    let updated = operation_store::operations::fail_claimed(
+        &mut *tx,
+        input.operation_id,
+        &input.claim_token,
+        operation_store::operations::TerminalError {
+            progress_message: &input.progress_message,
+            code: input.terminal_error_code.as_str(),
+            error: input.terminal_error_json.clone(),
+        },
+    )
     .await?;
 
-    if updated.is_some() {
-        append_operation_event_tx(
-            &mut tx,
+    if updated {
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Failed,
             serde_json::json!({
@@ -2956,7 +2487,7 @@ async fn fail_claimed_operation(
         .await?;
     }
     tx.commit().await?;
-    Ok(updated.is_some())
+    Ok(updated)
 }
 
 async fn expire_claimed_operation(
@@ -2965,38 +2496,21 @@ async fn expire_claimed_operation(
     claim_token: &str,
 ) -> Result<bool, PublicOperationStoreError> {
     let mut tx = pool.begin().await?;
-    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
-        "UPDATE public_operations
-         SET state = $3,
-             claim_token = '',
-             attempts = GREATEST(attempts - 1, 0),
-             started_at = NULL,
-             completed_at = NOW(),
-             progress_message = $4,
-             terminal_error_code = $5,
-             terminal_error_json = $6,
-             payload_json = CASE WHEN kind = 'create_sandbox'
-                 THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
-                 ELSE payload_json END,
-             updated_at = NOW()
-         WHERE operation_id = $1
-           AND claim_token = $2
-           AND state = $7
-         RETURNING operation_id"
-    ))
-    .bind(input.operation_id.as_uuid())
-    .bind(claim_token)
-    .bind(OperationState::Expired.as_str())
-    .bind(&input.progress_message)
-    .bind(input.terminal_error_code.as_str())
-    .bind(Json(input.terminal_error_json.clone()))
-    .bind(OperationState::Running.as_str())
-    .fetch_optional(&mut *tx)
+    let updated = operation_store::operations::expire_claimed(
+        &mut *tx,
+        input.operation_id,
+        claim_token,
+        operation_store::operations::TerminalError {
+            progress_message: &input.progress_message,
+            code: input.terminal_error_code.as_str(),
+            error: input.terminal_error_json.clone(),
+        },
+    )
     .await?;
 
-    if updated.is_some() {
-        append_operation_event_tx(
-            &mut tx,
+    if updated {
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Expired,
             expired_event(&input),
@@ -3004,7 +2518,7 @@ async fn expire_claimed_operation(
         .await?;
     }
     tx.commit().await?;
-    Ok(updated.is_some())
+    Ok(updated)
 }
 
 fn expired_event(input: &ExpirePublicOperation) -> serde_json::Value {
@@ -3020,32 +2534,15 @@ async fn expire_overdue_queued_operations(
     input: OverdueQueuedPublicOperations<'_>,
     expiry: impl Fn(&OverdueQueuedPublicOperation) -> ExpirePublicOperation,
 ) -> Result<Vec<OverdueQueuedPublicOperation>, PublicOperationStoreError> {
-    let kind_labels = input
-        .kinds
-        .iter()
-        .map(|kind| kind.as_str().to_string())
-        .collect::<Vec<_>>();
     let mut tx = pool.begin().await?;
     // Locked, so nothing claims them between this read and the write below.
-    let rows = sqlx::query_as::<_, (Uuid, String, i32, String)>(sql!(
-        "SELECT operation_id, kind, attempts, progress_message
-         FROM public_operations
-         WHERE state = $1
-           AND claim_token = ''
-           AND started_at IS NULL
-           AND api_product = $2
-           AND kind = ANY($3)
-           AND created_at <= NOW() - make_interval(secs => $4::BIGINT)
-         ORDER BY created_at, operation_id
-         LIMIT $5
-         FOR UPDATE SKIP LOCKED"
-    ))
-    .bind(OperationState::Queued.as_str())
-    .bind(input.api_product.as_str())
-    .bind(&kind_labels)
-    .bind(duration_secs_i64(input.max_age))
-    .bind(i64::from(input.limit))
-    .fetch_all(&mut *tx)
+    let rows = operation_store::operations::lock_overdue_queued(
+        &mut tx,
+        input.api_product.as_str(),
+        input.kinds,
+        duration_secs_i64(input.max_age),
+        i64::from(input.limit),
+    )
     .await?;
     if rows.is_empty() {
         tx.rollback().await?;
@@ -3053,12 +2550,12 @@ async fn expire_overdue_queued_operations(
     }
     let overdue = rows
         .into_iter()
-        .map(|(operation_id, kind, attempts, progress_message)| {
+        .map(|row| {
             Ok(OverdueQueuedPublicOperation {
-                id: OperationId::from_uuid(operation_id),
-                kind: parse_stored_enum("kind", &kind)?,
-                attempts,
-                progress_message,
+                id: OperationId::from_uuid(row.operation_id),
+                kind: parse_stored_enum("kind", &row.kind)?,
+                attempts: row.attempts,
+                progress_message: row.progress_message,
             })
         })
         .collect::<Result<Vec<_>, PublicOperationStoreError>>()?;
@@ -3112,18 +2609,11 @@ async fn release_claimed_operation(
     // Locked before looking for a delete, so one committing meanwhile is
     // either seen below or, waiting on this row, sees the requeued create
     // and cancels it itself.
-    let kind = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT kind
-         FROM public_operations
-         WHERE operation_id = $1
-           AND claim_token = $2
-           AND state = $3
-         FOR UPDATE"
-    ))
-    .bind(input.operation_id.as_uuid())
-    .bind(&input.claim_token)
-    .bind(OperationState::Running.as_str())
-    .fetch_optional(&mut *tx)
+    let kind = operation_store::operations::claimed_kind_locked(
+        &mut tx,
+        input.operation_id,
+        &input.claim_token,
+    )
     .await?;
     let Some(kind) = kind else {
         tx.rollback().await?;
@@ -3138,34 +2628,22 @@ async fn release_claimed_operation(
         tx.commit().await?;
         return Ok(ReleasedClaim::Superseded { delete_id });
     }
-    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
-        "UPDATE public_operations
-         SET state = $3,
-             claim_token = '',
-             progress_message = $4,
-             next_attempt_at = NOW() + make_interval(secs => $5::DOUBLE PRECISION),
-             attempts = GREATEST(attempts - CASE WHEN $7 THEN 0 ELSE 1 END, 0),
-             started_at = CASE WHEN $8 THEN NULL ELSE started_at END,
-             updated_at = NOW()
-         WHERE operation_id = $1
-           AND claim_token = $2
-           AND state = $6
-         RETURNING operation_id"
-    ))
-    .bind(input.operation_id.as_uuid())
-    .bind(&input.claim_token)
-    .bind(OperationState::Queued.as_str())
-    .bind(&input.progress_message)
-    .bind(input.retry_after.as_secs_f64())
-    .bind(OperationState::Running.as_str())
-    .bind(input.count_attempt)
-    .bind(input.undo_first_start)
-    .fetch_optional(&mut *tx)
+    let updated = operation_store::operations::requeue_claimed(
+        &mut *tx,
+        input.operation_id,
+        &input.claim_token,
+        operation_store::operations::Requeue {
+            progress_message: &input.progress_message,
+            retry_after_secs: input.retry_after.as_secs_f64(),
+            count_attempt: input.count_attempt,
+            undo_first_start: input.undo_first_start,
+        },
+    )
     .await?;
 
-    if updated.is_some() {
-        append_operation_event_tx(
-            &mut tx,
+    if updated {
+        operation_store::events::append(
+            &mut *tx,
             input.operation_id,
             PublicOperationEventType::Requeued,
             serde_json::json!({
@@ -3176,7 +2654,7 @@ async fn release_claimed_operation(
         .await?;
     }
     tx.commit().await?;
-    Ok(if updated.is_some() {
+    Ok(if updated {
         ReleasedClaim::Requeued
     } else {
         ReleasedClaim::Lost
@@ -3198,70 +2676,19 @@ async fn gc_expired(
     // Operation owners register sensitive payload paths so terminal rows can
     // be scrubbed independently of row-retention expiry.
     for rule in input.payload_scrub_rules {
-        sqlx::query(sql!(
-            "WITH terminal_operations AS (
-             SELECT operation_id
-             FROM public_operations
-             WHERE kind = $2
-               AND state IN ($3, $4, $5, $6)
-               AND payload_json #> $7::text[] IS NOT NULL
-             ORDER BY updated_at ASC, operation_id ASC
-             LIMIT $1
-             FOR UPDATE SKIP LOCKED
-         )
-         UPDATE public_operations AS operation
-         SET payload_json = operation.payload_json #- $7::text[],
-             updated_at = NOW()
-         FROM terminal_operations
-         WHERE operation.operation_id = terminal_operations.operation_id"
-        ))
-        .bind(max_records)
-        .bind(rule.kind.as_str())
-        .bind(OperationState::Succeeded.as_str())
-        .bind(OperationState::Failed.as_str())
-        .bind(OperationState::Canceled.as_str())
-        .bind(OperationState::Expired.as_str())
-        .bind(rule.json_path)
-        .execute(&mut *tx)
+        operation_store::operations::scrub_finished_payload_path(
+            &mut *tx,
+            rule.kind,
+            rule.json_path,
+            max_records,
+        )
         .await?;
     }
 
-    let operation_ids = sqlx::query_scalar::<_, Uuid>(sql!(
-        "SELECT operation_id
-         FROM public_operations
-         WHERE state IN ($2, $3, $4, $5)
-           AND gc_after <= NOW()
-         ORDER BY gc_after ASC, operation_id ASC
-         LIMIT $1"
-    ))
-    .bind(max_records)
-    .bind(OperationState::Succeeded.as_str())
-    .bind(OperationState::Failed.as_str())
-    .bind(OperationState::Canceled.as_str())
-    .bind(OperationState::Expired.as_str())
-    .fetch_all(&mut *tx)
-    .await?;
+    let operation_ids = operation_store::operations::due_for_gc(&mut *tx, max_records).await?;
 
-    // The batch's ids are collected first, as an array, so the delete finds
-    // them through the primary key rather than joining the whole table. The
-    // outer `expires_at` check is what a selected row is held to once its
-    // lock is free: a record renewed while this waits on it is rechecked as
-    // renewed and kept.
-    let idempotency_rows = sqlx::query_scalar::<_, Uuid>(sql!(
-        "DELETE FROM public_idempotency_records
-         WHERE id = ANY(ARRAY(
-             SELECT id
-             FROM public_idempotency_records
-             WHERE expires_at <= NOW()
-             ORDER BY expires_at ASC, id ASC
-             LIMIT $1
-         ))
-           AND expires_at <= NOW()
-         RETURNING id"
-    ))
-    .bind(max_records)
-    .fetch_all(&mut *tx)
-    .await?;
+    let idempotency_rows =
+        operation_store::idempotency::delete_expired_batch(&mut *tx, max_records).await?;
 
     let dependent_idempotency_rows =
         operation_store::idempotency::delete_for_operations(&mut *tx, &operation_ids).await?;
@@ -3288,23 +2715,11 @@ async fn find_idempotency_record(
     api_product: ApiProduct,
     idempotency: &CreatePublicOperationIdempotency<'_>,
 ) -> Result<Option<PublicIdempotencyRecord>, PublicOperationStoreError> {
-    let row = sqlx::query_as::<_, PublicIdempotencyRow>(sql!(
-        "SELECT operation_id, request_fingerprint
-         FROM public_idempotency_records
-         WHERE org_id = $1
-           AND api_product = $2
-           AND method = $3
-           AND path_template = $4
-           AND idempotency_key = $5
-           AND expires_at > NOW()
-         FOR UPDATE"
-    ))
-    .bind(org_id)
-    .bind(api_product.as_str())
-    .bind(idempotency.method.as_str())
-    .bind(idempotency.path_template.as_str())
-    .bind(idempotency.key.as_str())
-    .fetch_optional(&mut **tx)
+    let row = operation_store::idempotency::lock_live(
+        tx,
+        api_product.as_str(),
+        idempotency.store_key(org_id),
+    )
     .await?;
 
     row.map(PublicIdempotencyRecord::try_from).transpose()
@@ -3324,21 +2739,16 @@ pub(crate) async fn delete_expired_idempotency_record_tx(
     // violation. A caller that performs the live-record lookup separately must
     // either hold the per-key advisory lock or treat a concurrently inserted
     // live record as the winner.
-    sqlx::query(sql!(
-        "DELETE FROM public_idempotency_records
-         WHERE org_id = $1
-           AND api_product = $2
-           AND method = $3
-           AND path_template = $4
-           AND idempotency_key = $5
-           AND expires_at <= NOW()"
-    ))
-    .bind(org_id)
-    .bind(api_product.as_str())
-    .bind(method.as_str())
-    .bind(path_template.as_str())
-    .bind(key.as_str())
-    .execute(&mut **tx)
+    operation_store::idempotency::delete_expired(
+        &mut **tx,
+        api_product.as_str(),
+        operation_store::idempotency::IdempotencyKeyRef {
+            org_id,
+            method: method.as_str(),
+            path_template: path_template.as_str(),
+            idempotency_key: key.as_str(),
+        },
+    )
     .await?;
     Ok(())
 }
@@ -3371,10 +2781,11 @@ async fn lock_idempotency_key(
     api_product: ApiProduct,
     idempotency: &CreatePublicOperationIdempotency<'_>,
 ) -> Result<(), PublicOperationStoreError> {
-    sqlx::query(sql!("SELECT pg_advisory_xact_lock($1)"))
-        .bind(idempotency_lock_key(org_id, api_product, idempotency))
-        .execute(&mut **tx)
-        .await?;
+    operation_store::idempotency::lock_key(
+        tx,
+        idempotency_lock_key(org_id, api_product, idempotency),
+    )
+    .await?;
     Ok(())
 }
 
@@ -3401,15 +2812,6 @@ fn idempotency_lock_key(
             .expect("sha256 digest should contain at least eight bytes"),
     );
     i64::from_be_bytes(key)
-}
-
-pub async fn append_operation_event_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    operation_id: OperationId,
-    event_type: PublicOperationEventType,
-    event_json: serde_json::Value,
-) -> Result<i64, sqlx::Error> {
-    operation_store::events::append(&mut **tx, operation_id, event_type, event_json).await
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3459,14 +2861,6 @@ struct PublicIdempotencyRecord {
     request_fingerprint: RequestFingerprint,
 }
 
-#[derive(Debug, FromRow)]
-struct DispatcherClaimRow {
-    #[sqlx(flatten)]
-    operation: ClaimedPublicOperationRow,
-    queue_wait_ms: f64,
-    reclaimed: bool,
-}
-
 /// The `target_id` values an admin filter on `target_id` matches: the typed
 /// string itself, and, when it parses as a sandbox id in either form, both
 /// forms (see [`sandbox_target_id_forms`]).
@@ -3503,12 +2897,6 @@ fn sandbox_target_id_forms(sandbox_id: SandboxId) -> [String; 2] {
         pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string(),
         sandbox_id.to_string(),
     ]
-}
-
-#[derive(Debug, FromRow)]
-struct PublicIdempotencyRow {
-    operation_id: Option<Uuid>,
-    request_fingerprint: String,
 }
 
 fn public_operation_record(
@@ -3604,10 +2992,10 @@ fn public_operation_event(
     })
 }
 
-impl TryFrom<PublicIdempotencyRow> for PublicIdempotencyRecord {
+impl TryFrom<operation_store::idempotency::OperationKeyRow> for PublicIdempotencyRecord {
     type Error = PublicOperationStoreError;
 
-    fn try_from(row: PublicIdempotencyRow) -> Result<Self, Self::Error> {
+    fn try_from(row: operation_store::idempotency::OperationKeyRow) -> Result<Self, Self::Error> {
         Ok(Self {
             operation_id: row.operation_id.map(OperationId::from_uuid),
             request_fingerprint: RequestFingerprint::parse(row.request_fingerprint.clone())
@@ -3653,7 +3041,5 @@ fn duration_secs_i64(duration: Duration) -> i64 {
 
 #[cfg(test)]
 mod inline_org_limit_plan_tests;
-#[cfg(test)]
-pub(crate) mod plan_explain;
 #[cfg(test)]
 mod tests;

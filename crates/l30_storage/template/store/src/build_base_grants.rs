@@ -1,8 +1,11 @@
 //! One build submission's authority to read its base template
 //! (`template_build_base_grants`).
 //!
-//! Each verb touches only the grant it names. The sweep of expired grants
-//! compares against the database clock and runs at its call site.
+//! Each verb touches only the grant it names, except [`delete_expired`],
+//! the sweep of expired grants, which compares against the database clock
+//! in its SQL. The node-facing template policy reads that check a grant is
+//! fresh are [`crate::templates`]'s, as they read the template it covers;
+//! the node-scoped release lookups check it in their own statements.
 
 use pplx_space_accounts::{NodeId, OrgId};
 use pplx_space_sql_locator::sql;
@@ -46,6 +49,18 @@ pub async fn pin_to_builder(
     ))
     .bind(id)
     .bind(builder_node_id.as_uuid())
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Delete every grant recorded more than seven days before the database's
+/// `NOW()`, the longest validity any reader honours.
+pub async fn delete_expired(executor: impl PgExecutor<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "DELETE FROM template_build_base_grants
+             WHERE granted_at < NOW() - INTERVAL '7 days'"
+    ))
     .execute(executor)
     .await?;
     Ok(())

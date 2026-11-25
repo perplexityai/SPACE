@@ -9,10 +9,25 @@
 //! nodes through their registration, [`drain_reads`] reads the drain columns
 //! without writing them, [`drain_write`] writes them checking only the node
 //! id, [`tombstone`] records terminated nodes, [`inventory`] lists the
-//! Kubernetes nodes, and [`node_group`] mirrors their node-group labels.
+//! Kubernetes nodes, [`demotion`] demotes ready ones missing from the
+//! cluster, [`node_group`] mirrors their node-group labels, and
+//! [`orphan_reap_refusal`] says why the drained-node terminator's reap of a
+//! gone node's row refused. [`direct`] holds the statements that join or test
+//! a node's Direct registration in `node_direct` (`pplx-space-direct-store`'s):
+//! the admin node row and the hard deletes of Direct nodes and their expired
+//! tombstones, and in its submodules a Direct node's endpoint, the Direct
+//! substrate's placement candidates, and the admin node registry's reads and
+//! the writes of a Direct node's `nodes` row ([`direct::registry`]).
+//! [`stale_reconcile_work`] finds the Kubernetes nodes the reconcile queue GC
+//! may treat as gone.
+//! [`orphan_reap_refusal`] also counts `sandboxes` rows, which belong to
+//! `pplx-space-sandbox-store`, through the residency and portability
+//! fragments the reap's guards use.
 //!
 //! Every verb runs on the caller's executor, so it composes into the
-//! caller's transaction. The drain-phase compare-and-sets, whose `WHERE`
+//! caller's transaction. The row locks in [`locks`] and
+//! [`direct::lock_admin_node`] take the caller's transaction instead, and
+//! hold until it ends. The drain-phase compare-and-sets, whose `WHERE`
 //! re-checks the current phase, stay with their callers.
 
 use pplx_space_accounts::NodeId;
@@ -20,13 +35,18 @@ use pplx_space_k8s_ids::{K8sNodeName, K8sNodeUid};
 use pplx_space_node_model::{NodeRole, SubstrateKind};
 use pplx_space_sql_locator::sql;
 
+pub mod demotion;
+pub mod direct;
 pub mod drain_reads;
 pub mod drain_v2;
 pub mod drain_write;
 pub mod inventory;
+pub mod locks;
 pub mod lookup;
 pub mod node_group;
+pub mod orphan_reap_refusal;
 mod register;
+pub mod stale_reconcile_work;
 pub mod tombstone;
 pub use register::{
     K8sNodeRegistration, K8sNodeRegistrationError, K8sNodeRegistrationStep, register_k8s_node,

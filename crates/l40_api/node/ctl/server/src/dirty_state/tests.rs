@@ -1,4 +1,5 @@
 use pplx_space_node_ctl_store::database;
+use rusqlite::params;
 
 use super::*;
 
@@ -38,7 +39,7 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
     let old_now = crate::now_secs().saturating_sub(10);
     let old_next_attempt = old_now.saturating_add(300);
 
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO dirty_facets
              (facet, element, dirty, dirty_generation, attempts, last_error,
               updated_at, last_attempt_at, next_attempt_at, claim_token, claimed_at)
@@ -48,15 +49,15 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
 
     drop(conn);
     database::migrate(&db_path).await?;
-    let mut conn = database::open(&db_path)?;
+    let conn = database::open(&db_path)?;
 
     let marked_at = crate::now_secs();
     mark_refs(
-        &mut conn,
+        &conn,
         &[FacetRef::new(FACET_TEMPLATE_INVENTORY, Some("seed"))],
     )?;
 
-    let row = conn.query_row(
+    let row = conn.raw().query_row(
         "SELECT dirty, dirty_generation, attempts, last_error, next_attempt_at,
                 claim_token, claimed_at, dead_at, dead_reason
          FROM dirty_facets
@@ -90,12 +91,12 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
 
     // The retired baseline's actual checksum distinguishes legacy history
     // from a public migration whose version alone was corrupted.
-    conn.execute(
+    conn.raw().execute(
         "UPDATE _sqlx_migrations SET version = 4, description = 'baseline',
          checksum = X'622273a5ff539a8ecbbb30b42b3893dcfb168c11483e6ce3123e03c2b0ca0dec35eb9027f104aadee6445b5720ea7563'",
         [],
     )?;
-    let history = conn.query_row(
+    let history = conn.raw().query_row(
         "SELECT version, checksum FROM _sqlx_migrations",
         [],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),

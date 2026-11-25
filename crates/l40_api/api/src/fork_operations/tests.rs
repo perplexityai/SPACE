@@ -488,12 +488,10 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
     let store = PublicOperationStore::new(db.pool.clone());
 
     let mut delete_guard = db.pool.begin().await?;
-    sqlx::query(pplx_space_sql_locator::sql!(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
-    ))
-    .bind(source_sandbox_id.as_uuid())
-    .bind(pplx_space_sandbox_store::fork_source_lifecycle::FORK_SOURCE_LIFECYCLE_LOCK_SEED)
-    .execute(&mut *delete_guard)
+    pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle(
+        &mut delete_guard,
+        source_sandbox_id,
+    )
     .await?;
 
     let admission = begin_fork_operation_admission(

@@ -462,6 +462,9 @@ pub struct SandboxManagerService {
     network_credentials_enabled: bool,
     /// [`STAGED_CHECKPOINT_DISK_ENV`], read once at startup.
     staged_checkpoint_disk: bool,
+    /// Whether runtime upgrade attempts are final
+    /// ([`runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV`], off by default).
+    runtime_upgrade_attempt_finality: bool,
     node_manager: NodeManagerConnector,
     /// See [`SandboxManagerServiceOptions::volume_manager_socket_path`].
     volume_manager_socket_path: PathBuf,
@@ -1939,6 +1942,10 @@ impl SandboxManagerService {
             ),
             staged_checkpoint_disk: pplx_space_env_vars::env_flag_var(
                 STAGED_CHECKPOINT_DISK_ENV,
+                false,
+            ),
+            runtime_upgrade_attempt_finality: pplx_space_env_vars::env_flag_var(
+                runtime_upgrade::ATTEMPT_FINALITY_ENABLED_ENV,
                 false,
             ),
             gateway_caller_client: options.node_manager.lazy(),

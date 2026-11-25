@@ -2,6 +2,10 @@
 //! shared pool configuration, per-connection setup and pool-occupancy
 //! metrics every control-plane service uses, and the lock-contention
 //! classification for errors those pools return.
+//!
+//! It also owns the types store verbs take and return, so their callers never
+//! name the driver: [`Db`], [`Tx`], [`Executor`] and [`DbError`] (see
+//! [`db`]).
 
 use pplx_space_sql_locator::sql;
 use std::num::NonZeroU32;
@@ -14,8 +18,13 @@ use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 pub mod contention;
+pub mod db;
+mod error;
 pub mod identity;
 pub mod metrics;
+
+pub use db::{Db, Executor, Tx};
+pub use error::{DbError, DbErrorKind};
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 

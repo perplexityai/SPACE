@@ -60,10 +60,13 @@ pub(super) mod service_tests {
     fn allocation_storage_failures_are_retryable_at_the_rpc_boundary() {
         for error in [
             crate::slot_pool::SlotStoreError::LockPoisoned,
-            crate::slot_pool::SlotStoreError::Database(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                None,
-            )),
+            crate::slot_pool::SlotStoreError::Database(
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )
+                .into(),
+            ),
         ] {
             assert_eq!(
                 allocate_error_to_status(AllocateSlotError::Store(error)).code(),

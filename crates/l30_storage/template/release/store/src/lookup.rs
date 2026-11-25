@@ -1,5 +1,7 @@
-//! Reads of releases for the api's creates, placement, pool configs and admin
-//! routes. None takes a lock.
+//! Reads of releases for the api's creates, placement, pool claims and
+//! configs, and admin routes. None takes a lock but
+//! [`lock_release_of_present_template`], the admin tag move's, whose lock
+//! lasts until the caller's transaction ends.
 
 use pplx_space_accounts::OrgId;
 use pplx_space_content_digest::HashAlg;
@@ -11,7 +13,7 @@ use pplx_space_template_model::{
     TemplateArtifactDigest, TemplateArtifactDigestPrefix, TemplateDesiredState, TemplateName,
     TemplateTag, TemplateVisibility,
 };
-use pplx_space_template_release_original::digest_original;
+use pplx_space_template_release_original::{digest_original, spelling_original};
 use sqlx::PgExecutor;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -29,7 +31,8 @@ pub struct VisibleRelease {
     pub created_at: OffsetDateTime,
 }
 
-/// A release a caller named by id, with its stored hash.
+/// A release's id and stored hash, as [`named_release`] and
+/// [`pool_target_release`] read it.
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct NamedRelease {
     pub id: Uuid,
@@ -193,6 +196,53 @@ pub async fn named_release(
     .bind(content_hash)
     .fetch_optional(executor)
     .await
+}
+
+/// The release a Kubernetes pool claim or config upsert targets: the
+/// release matching `content_hash`, under either spelling, when one is
+/// pinned, otherwise the release of the digest tagged `latest` (the tag may
+/// sit on the other spelling's original when it predates the shared rule),
+/// otherwise the newest release of the template. Only digest originals are
+/// candidates (`pplx_space_template_release_original::digest_original`, the
+/// release the create path and the warm-pool store resolve the digest to): a
+/// twin bound to another environment is registered after its original and
+/// would otherwise be the newest, and the other spelling's original of a
+/// digest would hold slots no create claims. The hash comes back as stored.
+pub async fn pool_target_release(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    content_hash: Option<&str>,
+) -> Result<Option<NamedRelease>, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id, r.hash AS content_hash
+             FROM template_releases r
+             WHERE r.template_name = $1
+               AND ($2::TEXT IS NULL
+                    OR r.hash IN (replace($2, 'sha256:', ''),
+                                  'sha256:' || replace($2, 'sha256:', '')))
+               AND {digest_original}
+             ORDER BY EXISTS (
+                          SELECT 1
+                          FROM template_release_tags t
+                          JOIN template_releases tagged
+                            ON tagged.id = t.template_release_id
+                           AND tagged.template_name = t.template_name
+                          WHERE t.template_name = r.template_name
+                            AND t.tag = 'latest'
+                            AND tagged.hash IN (replace(r.hash, 'sha256:', ''),
+                                                'sha256:' || replace(r.hash, 'sha256:', ''))) DESC,
+                      r.created_at DESC
+             LIMIT 1",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_as::<_, NamedRelease>(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name)
+        .bind(content_hash)
+        .fetch_optional(executor)
+        .await
 }
 
 /// Every environment a release is bound to, an unbound release counting as
@@ -430,3 +480,119 @@ pub async fn release_population(
 
 #[cfg(test)]
 mod tests;
+
+/// The release `release_id` when its template is present, or `None`,
+/// locking the release's row `FOR UPDATE` until the caller's transaction
+/// ends. The admin tag move locks the template's row first
+/// (`pplx_space_template_store::templates::lock_no_key_update_of_release`).
+pub async fn lock_release_of_present_template(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    release_id: Uuid,
+) -> Result<Option<VisibleRelease>, sqlx::Error> {
+    sqlx::query_as::<_, VisibleRelease>(sql!(
+        "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
+             FROM template_releases r
+             JOIN templates t ON t.name = r.template_name
+             WHERE r.id = $1
+               AND t.desired_state = $2
+             FOR UPDATE OF r"
+    ))
+    .bind(release_id)
+    .bind(TemplateDesiredState::Present.as_str())
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// The id of the original release of `template_name` at `content_hash`,
+/// either spelling, under either spelling of the digest
+/// (`pplx_space_template_release_original::digest_original`): the release
+/// tags attach to, which [`original_release_environment`] reads the binding
+/// of. `None` when no release has the digest.
+pub async fn original_release_id(
+    executor: impl PgExecutor<'_>,
+    template_name: &str,
+    content_hash: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT r.id FROM template_releases r
+             WHERE r.template_name = $1
+               AND r.hash IN (replace($2, 'sha256:', ''),
+                              'sha256:' || replace($2, 'sha256:', ''))
+               AND {digest_original}",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(template_name)
+        .bind(content_hash)
+        .fetch_optional(executor)
+        .await
+}
+
+/// Whether release `release_id` is its spelling's original
+/// (`pplx_space_template_release_original::spelling_original`) and has
+/// twins: releases of the same template and exact hash registered after it.
+/// The admin release delete refuses to delete such an original.
+pub async fn release_has_twins(
+    executor: impl PgExecutor<'_>,
+    release_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static HAS_TWINS: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT EXISTS (
+                     SELECT 1
+                     FROM template_releases r
+                     JOIN template_releases twin
+                       ON twin.template_name = r.template_name
+                      AND twin.hash = r.hash
+                      AND (twin.created_at, twin.id) > (r.created_at, r.id)
+                     WHERE r.id = $1
+                       AND {spelling_original})",
+            spelling_original = spelling_original("r"),
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(HAS_TWINS.as_str()))
+        .bind(release_id)
+        .fetch_one(executor)
+        .await
+}
+
+/// Whether release `release_id` is tagged `latest`, or is its digest's
+/// original (`pplx_space_template_release_original::digest_original`) while a
+/// tag names another release of the same digest, under either spelling. The
+/// admin release delete refuses to delete such a release.
+pub async fn release_serves_a_tag(
+    executor: impl PgExecutor<'_>,
+    release_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static SERVES_A_TAG: LazyLock<String> = LazyLock::new(|| {
+        sql!(format!(
+            "SELECT EXISTS (
+                     SELECT 1
+                     FROM template_release_tags t
+                     WHERE t.template_release_id = $1
+                       AND t.tag = 'latest')
+                 OR EXISTS (
+                     SELECT 1
+                     FROM template_releases r
+                     JOIN template_releases tagged
+                       ON tagged.template_name = r.template_name
+                      AND tagged.hash IN (replace(r.hash, 'sha256:', ''),
+                                          'sha256:' || replace(r.hash, 'sha256:', ''))
+                     JOIN template_release_tags t
+                       ON t.template_release_id = tagged.id
+                     WHERE r.id = $1
+                       AND tagged.id <> r.id
+                       AND {digest_original})",
+            digest_original = digest_original("r"),
+        ))
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(SERVES_A_TAG.as_str()))
+        .bind(release_id)
+        .fetch_one(executor)
+        .await
+}
