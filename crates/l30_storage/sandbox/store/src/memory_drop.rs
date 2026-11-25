@@ -58,6 +58,13 @@ pub struct MemoryDropCandidate {
     pub full_snapshot_id: SnapshotId,
     /// Its storage location's connection string, unvalidated.
     pub storage_connection_string: String,
+    /// Whether the sandbox's rootfs is encrypted (`COALESCE(s.volume_encryption, FALSE)`).
+    pub volume_encryption: bool,
+    /// The template digest recorded on `sandboxes.content_hash`, if any.
+    pub sandbox_content_hash: Option<String>,
+    /// The template digest recorded on the pinned full snapshot's
+    /// `snapshots.content_hash`, if any.
+    pub snapshot_content_hash: Option<String>,
 }
 
 /// Whether to read the candidate under a row lock.
@@ -93,8 +100,6 @@ pub enum MemoryDropRefusal {
     /// The row is placed, or a restore is about to take it: an active node,
     /// an evacuation claim or an active execution.
     Placed,
-    /// The row is volume-encrypted.
-    Encrypted,
     /// The pin isn't a `full` `suspend` artifact.
     NotFullSuspendPin,
     /// No ready, unorphaned snapshot row holds the pinned artifact.
@@ -118,7 +123,6 @@ impl MemoryDropRefusal {
             Self::NotSuspended => "not_suspended",
             Self::Sealed => "memory_drop_in_progress",
             Self::Placed => "placed",
-            Self::Encrypted => "encrypted",
             Self::NotFullSuspendPin => "not_full_suspend_pin",
             Self::NoDurableCopy => "no_durable_copy",
             Self::NewerFullSnapshot => "newer_full_snapshot",
@@ -130,7 +134,7 @@ impl MemoryDropRefusal {
 /// The conditions on `s`, the `sandboxes` row, that don't involve the pinned
 /// artifact's snapshot rows. [`candidate`] and [`refusal`] both read them, so
 /// the two can't drift.
-fn row_conditions() -> [(&'static str, String); 7] {
+fn row_conditions() -> [(&'static str, String); 6] {
     [
         ("kubernetes", "s.managed_by = $2".to_string()),
         (
@@ -151,10 +155,6 @@ fn row_conditions() -> [(&'static str, String); 7] {
                    AND ske.active
             )"
             .to_string(),
-        ),
-        (
-            "unencrypted",
-            "NOT COALESCE(s.volume_encryption, FALSE)".to_string(),
         ),
         (
             "full_suspend_pin",
@@ -213,8 +213,6 @@ fn durable_copy() -> String {
 /// * a Kubernetes row, `suspended`, with no live restore lease (no other drop
 ///   holds its seal), no active node, no evacuation claim and no active
 ///   execution: nothing is restoring it or about to;
-/// * not volume-encrypted. A BYOK artifact is sealed to its role, so its
-///   rootfs can't be relabelled as a disk artifact by copying it;
 /// * pinned to a `full` `suspend` artifact with a ready, unorphaned snapshot
 ///   row: the bytes the pin names are durable;
 /// * that snapshot row is the sandbox's newest full snapshot, ignoring a
@@ -251,7 +249,8 @@ pub async fn candidate(
         CandidateRead::Locked => "FOR UPDATE OF s",
     };
     let query = sql!(format!(
-        "SELECT s.org_id, s.current_local_artifact_id, sn.id, ssl.storage_connection_string
+        "SELECT s.org_id, s.current_local_artifact_id, sn.id, ssl.storage_connection_string,
+                COALESCE(s.volume_encryption, FALSE), s.content_hash, sn.content_hash
            FROM sandboxes s
            JOIN snapshots sn ON sn.sandbox_id = s.id
            JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
@@ -264,7 +263,15 @@ pub async fn candidate(
           LIMIT 1
           {lock}"
     ));
-    type Row = (OrgId, LocalArtifactId, SnapshotId, String);
+    type Row = (
+        OrgId,
+        LocalArtifactId,
+        SnapshotId,
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+    );
     let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(query))
         .bind(sandbox_id)
         // A bind, not a `'k8s'` literal: the label's spelling stays with
@@ -273,12 +280,23 @@ pub async fn candidate(
         .fetch_optional(executor)
         .await?;
     Ok(row.map(
-        |(org_id, pinned_artifact_id, full_snapshot_id, storage_connection_string)| {
+        |(
+            org_id,
+            pinned_artifact_id,
+            full_snapshot_id,
+            storage_connection_string,
+            volume_encryption,
+            sandbox_content_hash,
+            snapshot_content_hash,
+        )| {
             MemoryDropCandidate {
                 org_id,
                 pinned_artifact_id,
                 full_snapshot_id,
                 storage_connection_string,
+                volume_encryption,
+                sandbox_content_hash,
+                snapshot_content_hash,
             }
         },
     ))
@@ -319,7 +337,7 @@ pub async fn refusal(
            FROM sandboxes s
           WHERE s.id = $1"
     ));
-    type Row = (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool);
+    type Row = (bool, bool, bool, bool, bool, bool, bool, bool, bool);
     let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(query))
         .bind(sandbox_id)
         .bind(SubstrateKind::Kubernetes)
@@ -331,7 +349,6 @@ pub async fn refusal(
         suspended,
         unsealed,
         unplaced,
-        unencrypted,
         full_suspend_pin,
         durable,
         newest,
@@ -347,7 +364,6 @@ pub async fn refusal(
         (suspended, MemoryDropRefusal::NotSuspended),
         (unsealed, MemoryDropRefusal::Sealed),
         (unplaced, MemoryDropRefusal::Placed),
-        (unencrypted, MemoryDropRefusal::Encrypted),
         (full_suspend_pin, MemoryDropRefusal::NotFullSuspendPin),
         (durable, MemoryDropRefusal::NoDurableCopy),
         (newest, MemoryDropRefusal::NewerFullSnapshot),
@@ -479,12 +495,16 @@ pub async fn commit(
             AND s.restore_lease_token = $4
             AND s.current_local_artifact_id = $3
             AND s.current_local_artifact_kind = 'full'
+            AND COALESCE(s.volume_encryption, FALSE) = $5
+            AND s.content_hash IS NOT DISTINCT FROM $6
             AND {NODE_GONE}"
     ))))
     .bind(sandbox_id)
     .bind(disk_artifact_id)
     .bind(candidate.pinned_artifact_id)
     .bind(token)
+    .bind(candidate.volume_encryption)
+    .bind(&candidate.sandbox_content_hash)
     .execute(executor)
     .await?;
     Ok(result.rows_affected() == 1)

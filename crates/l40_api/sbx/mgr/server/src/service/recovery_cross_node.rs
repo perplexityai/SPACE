@@ -901,10 +901,11 @@ fn transition_restored_sandbox_to_suspended_parts(
 }
 
 /// Whether an artifact's kind and origin make it a disk image a stop minted —
-/// the only artifact an evacuated stopped sandbox may be materialized from or
-/// left pinning. Shared by the staged-sidecar check and the local-row check so
-/// the two can't disagree on what "evacuated disk" means.
-pub(super) fn is_stop_origin_disk(
+/// the artifact an evacuated stopped sandbox or a memory-dropped suspended
+/// sandbox pins. Shared by the staged-sidecar check, the local-row check, and
+/// encrypted cold-start rootfs preparation so they can't disagree on what a
+/// stop-origin disk pin means.
+pub(crate) fn is_stop_origin_disk(
     kind: Option<pplx_space_snapshot_model::ArtifactKind>,
     origin: Option<pplx_space_snapshot_model::ArtifactOrigin>,
 ) -> bool {

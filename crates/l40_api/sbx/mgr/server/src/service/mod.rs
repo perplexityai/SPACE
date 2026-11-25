@@ -2211,6 +2211,7 @@ mod ingress_protection;
 mod reconcile;
 mod recovery;
 mod recovery_cross_node;
+pub(crate) use recovery_cross_node::is_stop_origin_disk;
 mod retained_filesystem_discard;
 #[cfg(test)]
 mod route_identity_tests;

@@ -200,6 +200,7 @@ async fn a_start_never_formats_a_cow_over_a_staged_checkpoints_writes() {
         let pinned = PinnedCheckpoint {
             template_hash: (sidecar != Sidecar::Undigested).then_some(DIGEST),
             local_artifact_id: (sidecar != Sidecar::Unpinned).then_some(pin),
+            stop_disk: false,
             suspended: false,
             lay_checkpoint_cow: true,
         };
@@ -354,6 +355,7 @@ async fn a_suspended_sandbox_boots_its_pinned_checkpoints_cow() {
             PinnedCheckpoint {
                 template_hash: Some(DIGEST),
                 local_artifact_id: (!matches!(sidecar, RowUnpinned)).then_some(pin),
+                stop_disk: false,
                 suspended,
                 lay_checkpoint_cow: switch,
             },
@@ -477,6 +479,7 @@ async fn an_unusable_pinned_checkpoint_cow_is_refused_before_node_manager_is_ask
                 PinnedCheckpoint {
                     template_hash: Some(DIGEST),
                     local_artifact_id: Some(pin),
+                    stop_disk: false,
                     suspended: true,
                     lay_checkpoint_cow: true,
                 },
@@ -507,4 +510,441 @@ async fn an_unusable_pinned_checkpoint_cow_is_refused_before_node_manager_is_ask
         0,
         "node-manager was asked"
     );
+}
+
+/// A `stop`-origin encrypted disk artifact (such as a memory-dropped suspend)
+/// carries no memory volume to restore, so a suspended sandbox pinned to it
+/// always lays `snapshot/cow.luks` without setting `fork_source`, even when
+/// `lay_checkpoint_cow` is off — and refuses if `snapshot/snapshot.json` is
+/// missing, plaintext, or names another kind/origin rather than formatting a
+/// fresh COW or opening a stale `instance/cow.luks`. Once the sandbox has woken
+/// or stopped locally, `instance/cow.luks` opens without overwriting newer
+/// writes, and a missing `instance/cow.luks` is refused rather than formatted
+/// fresh.
+#[tokio::test(flavor = "current_thread")]
+async fn a_suspended_sandbox_pinned_to_its_stop_disk_always_lays_its_cow() {
+    use pplx_space_node_mgr_client::proto::{
+        PrepareEncryptedRootfsRequest, PrepareEncryptedRootfsResponse,
+    };
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&sent);
+    let node = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary(
+            "PrepareEncryptedRootfs",
+            move |request: PrepareEncryptedRootfsRequest| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((request.restore_cow_source, request.fork_source));
+                Ok(PrepareEncryptedRootfsResponse {
+                    mapper_path: "/dev/mapper/rootfs".into(),
+                })
+            },
+        )
+        .serve();
+    let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+        pplx_space_sandbox_model::SandboxActivationAttemptId::new(),
+        None,
+    );
+    #[derive(Clone, Copy, Debug)]
+    enum Sidecar {
+        Missing,
+        Pinned,
+        Plaintext,
+        SuspendFull,
+        StaleFork,
+        AnotherArtifact,
+        RowUnpinned,
+        AnotherTemplate,
+        Undigested,
+        AnotherSandbox,
+        ForeignEncryptionSource,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum StagedCow {
+        Present,
+        Missing,
+        Empty,
+        HardLinked,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Outcome {
+        LaysStaged,
+        OpensInstance,
+        CowNotLaid,
+        CowUnusable,
+        IdentityError,
+    }
+    use Outcome::*;
+    use Sidecar::*;
+    use StagedCow::*;
+    // (suspended, stop_disk, switch, sidecar, instance COW, staged COW, outcome)
+    let cases = [
+        (
+            true,
+            true,
+            false,
+            Pinned,
+            false,
+            StagedCow::Present,
+            LaysStaged,
+        ),
+        (
+            true,
+            true,
+            false,
+            Pinned,
+            true,
+            StagedCow::Present,
+            LaysStaged,
+        ),
+        (
+            true,
+            true,
+            true,
+            Pinned,
+            false,
+            StagedCow::Present,
+            LaysStaged,
+        ),
+        (
+            true,
+            true,
+            true,
+            Pinned,
+            true,
+            StagedCow::Present,
+            LaysStaged,
+        ),
+        (
+            true,
+            true,
+            false,
+            Sidecar::Missing,
+            false,
+            StagedCow::Missing,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            Sidecar::Missing,
+            true,
+            StagedCow::Missing,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            Plaintext,
+            false,
+            StagedCow::Missing,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            Plaintext,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            SuspendFull,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            StaleFork,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            false,
+            false,
+            Pinned,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            AnotherArtifact,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            false,
+            false,
+            RowUnpinned,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            AnotherTemplate,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            Undigested,
+            true,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            true,
+            true,
+            false,
+            Pinned,
+            true,
+            StagedCow::Missing,
+            CowUnusable,
+        ),
+        (true, true, false, Pinned, true, Empty, CowUnusable),
+        (true, true, false, Pinned, true, HardLinked, CowUnusable),
+        (
+            true,
+            true,
+            false,
+            AnotherSandbox,
+            true,
+            StagedCow::Present,
+            IdentityError,
+        ),
+        (
+            true,
+            true,
+            false,
+            ForeignEncryptionSource,
+            true,
+            StagedCow::Present,
+            IdentityError,
+        ),
+        (
+            false,
+            false,
+            false,
+            RowUnpinned,
+            true,
+            StagedCow::Present,
+            OpensInstance,
+        ),
+        (
+            false,
+            false,
+            true,
+            RowUnpinned,
+            true,
+            StagedCow::Present,
+            OpensInstance,
+        ),
+        (
+            false,
+            false,
+            false,
+            RowUnpinned,
+            false,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+        (
+            false,
+            false,
+            false,
+            RowUnpinned,
+            false,
+            StagedCow::Missing,
+            CowNotLaid,
+        ),
+        (
+            false,
+            true,
+            false,
+            Sidecar::Missing,
+            true,
+            StagedCow::Missing,
+            OpensInstance,
+        ),
+        (
+            false,
+            true,
+            false,
+            Sidecar::Missing,
+            false,
+            StagedCow::Missing,
+            CowNotLaid,
+        ),
+        (
+            false,
+            true,
+            false,
+            StaleFork,
+            true,
+            StagedCow::Present,
+            OpensInstance,
+        ),
+        (
+            false,
+            true,
+            false,
+            StaleFork,
+            false,
+            StagedCow::Present,
+            CowNotLaid,
+        ),
+    ];
+    for (suspended, stop_disk, switch, sidecar, instance, staged_cow, outcome) in cases {
+        let cache = tempfile::tempdir().unwrap();
+        let id = pplx_space_sandbox_model::SandboxId::new().to_string();
+        let dir = cache.path().join(&id);
+        std::fs::create_dir_all(dir.join("instance")).unwrap();
+        std::fs::create_dir_all(dir.join("snapshot")).unwrap();
+        if instance {
+            std::fs::write(dir.join("instance/cow.luks"), b"post-wake writes").unwrap();
+        }
+        let staged_path = dir.join("snapshot/cow.luks");
+        match staged_cow {
+            StagedCow::Present => std::fs::write(&staged_path, b"sealed").unwrap(),
+            StagedCow::Missing => {}
+            Empty => std::fs::write(&staged_path, b"").unwrap(),
+            HardLinked => {
+                std::fs::write(&staged_path, b"sealed").unwrap();
+                std::fs::hard_link(&staged_path, dir.join("alias")).unwrap();
+            }
+        }
+        let pin = pplx_space_snapshot_model::LocalArtifactId::new();
+        if !matches!(sidecar, Sidecar::Missing) {
+            let named = match sidecar {
+                AnotherArtifact => pplx_space_snapshot_model::LocalArtifactId::new(),
+                _ => pin,
+            };
+            let mut meta = serde_json::json!({
+                "version": 2,
+                "sandbox_id": id,
+                "size_bytes": 6,
+                "created_at": "2026-11-24T00:00:00Z",
+                "source": {"runtime": "fc", "template_id": "seed", "content_hash": DIGEST},
+                "encrypted": !matches!(sidecar, Plaintext),
+                "local_artifact_id": named.to_string(),
+                "artifact_kind": if matches!(sidecar, SuspendFull) { "full" } else { "disk" },
+                "artifact_origin": match sidecar {
+                    SuspendFull => "suspend",
+                    StaleFork => "fork",
+                    _ => "stop",
+                },
+            });
+            match sidecar {
+                AnotherSandbox => {
+                    meta["sandbox_id"] = pplx_space_sandbox_model::SandboxId::new()
+                        .to_string()
+                        .into();
+                }
+                AnotherTemplate => {
+                    meta["source"]["content_hash"] = OTHER_DIGEST.into();
+                }
+                ForeignEncryptionSource | StaleFork => {
+                    meta["rootfs_encryption_source"] = pplx_space_sandbox_model::SandboxId::new()
+                        .to_string()
+                        .into();
+                }
+                Sidecar::Missing
+                | Pinned
+                | Plaintext
+                | SuspendFull
+                | AnotherArtifact
+                | RowUnpinned
+                | Undigested => {}
+            }
+            std::fs::write(
+                dir.join("snapshot/snapshot.json"),
+                serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+        }
+        let before = sent.lock().unwrap().len();
+
+        let result = prepare_encrypted_rootfs(
+            cache.path(),
+            &id,
+            PinnedCheckpoint {
+                template_hash: (!matches!(sidecar, Undigested)).then_some(DIGEST),
+                local_artifact_id: (!matches!(sidecar, RowUnpinned)).then_some(pin),
+                stop_disk,
+                suspended,
+                lay_checkpoint_cow: switch,
+            },
+            fence,
+            None,
+            &node.connector(),
+        )
+        .await;
+
+        let case = (suspended, stop_disk, switch, sidecar, instance, staged_cow);
+        let sent = sent.lock().unwrap();
+        match outcome {
+            LaysStaged | OpensInstance => {
+                assert_eq!(result.unwrap(), "/dev/mapper/rootfs", "{case:?}");
+                assert_eq!(sent.len(), before + 1, "{case:?}");
+                assert_eq!(
+                    sent[before],
+                    (
+                        (outcome == LaysStaged).then(|| staged_path.to_string_lossy().into_owned()),
+                        None,
+                    ),
+                    "{case:?}"
+                );
+            }
+            CowNotLaid => {
+                assert!(
+                    matches!(
+                        result,
+                        Err(EncryptedRootfsPrepareError::CheckpointCowNotLaid)
+                    ),
+                    "{case:?}: {result:?}"
+                );
+                assert_eq!(sent.len(), before, "{case:?}");
+            }
+            CowUnusable => {
+                assert!(
+                    matches!(
+                        result,
+                        Err(EncryptedRootfsPrepareError::CheckpointCowUnusable)
+                    ),
+                    "{case:?}: {result:?}"
+                );
+                assert_eq!(sent.len(), before, "{case:?}");
+            }
+            IdentityError => {
+                assert!(
+                    matches!(result, Err(EncryptedRootfsPrepareError::MetadataIdentity)),
+                    "{case:?}: {result:?}"
+                );
+                assert_eq!(sent.len(), before, "{case:?}");
+            }
+        }
+    }
 }

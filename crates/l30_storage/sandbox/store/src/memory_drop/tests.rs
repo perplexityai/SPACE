@@ -251,11 +251,6 @@ const DISQUALIFIERS: &[(&str, MemoryDropRefusal, &str)] = &[
           WHERE id = $1 AND $2::UUID IS NOT NULL",
     ),
     (
-        "volume encrypted",
-        MemoryDropRefusal::Encrypted,
-        "UPDATE sandboxes SET volume_encryption = TRUE WHERE id = $1 AND $2::UUID IS NOT NULL",
-    ),
-    (
         "pinned to a disk artifact",
         MemoryDropRefusal::AlreadyDropped,
         "UPDATE sandboxes
@@ -808,5 +803,59 @@ async fn no_restore_claim_takes_a_sealed_row_until_the_seal_expires() -> TestRes
     let disk = LocalArtifactId::from_uuid(Uuid::now_v7());
     assert!(!commit(&db.pool, fixture.sandbox_id, token, &read, disk).await?);
     assert!(!dropped(&db.pool, fixture.sandbox_id).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn encrypted_row_is_eligible_and_commits() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let fixture = Fixture::insert(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET volume_encryption = TRUE WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+
+    assert_eq!(fixture.refusal(&db.pool).await?, None);
+    let plain = fixture
+        .read(&db.pool)
+        .await?
+        .expect("encrypted row is eligible");
+    assert!(plain.volume_encryption);
+
+    let token = Uuid::now_v7();
+    let sealed_candidate = seal_row(&db.pool, fixture.sandbox_id, token, TTL)
+        .await?
+        .expect("encrypted row seals");
+    assert!(sealed_candidate.volume_encryption);
+
+    let disk = LocalArtifactId::from_uuid(Uuid::now_v7());
+    let mut wrong_encryption = sealed_candidate.clone();
+    wrong_encryption.volume_encryption = false;
+    assert!(
+        !commit(&db.pool, fixture.sandbox_id, token, &wrong_encryption, disk).await?,
+        "mismatched volume_encryption guard must refuse commit"
+    );
+    let mut wrong_hash = sealed_candidate.clone();
+    wrong_hash.sandbox_content_hash =
+        Some("sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned());
+    assert!(
+        !commit(&db.pool, fixture.sandbox_id, token, &wrong_hash, disk).await?,
+        "mismatched sandbox_content_hash guard must refuse commit"
+    );
+    assert!(!dropped(&db.pool, fixture.sandbox_id).await?);
+
+    assert!(commit(&db.pool, fixture.sandbox_id, token, &sealed_candidate, disk).await?);
+    assert!(dropped(&db.pool, fixture.sandbox_id).await?);
+    let encrypted_after: bool = sqlx::query_scalar(sql!(
+        "SELECT volume_encryption FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(encrypted_after);
     Ok(())
 }
