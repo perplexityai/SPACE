@@ -328,7 +328,7 @@ the actual logical upload total and omits that node-local identity.
 | Reader disconnect, timeout, or daemon shutdown | Close the pipe read end, join the kernel writer, then release its lease lock and reader slot. A retry generates a fresh stream. |
 | Job commits completed, failed, or cancelled | The one-minute orphan sweep can release its lease. It cannot race an active kernel reader because deletion takes the same lease lock. |
 | Census incomplete or malformed payload | Delete nothing; log and retry next minute. Each sweep is bounded to 30 seconds. |
-| Snapshot superseded or source identity changed | Reject reuse of the replacement source; existing job retry/failure convergence owns the outcome. |
+| Snapshot superseded or source identity changed | Node-manager rejects reuse of the replacement source. Sandbox-manager reads the artifact directory's sidecar before it registers an upload, before its first push and after its last: a sidecar naming a later artifact fails the job permanently, and the registered row is marked failed, best effort. Pushes already queued when the last read finds it leave objects under that failed row for retention. A sidecar that named the artifact before the pushes and is gone after them fails only the attempt. An upload that finished submitting keeps its staged copies and leased source, and its retries carry on. |
 | Upload budget becomes zero | Existing source jobs compress into a temporary file and use the supported file uploader. New captures materialize their send file. |
 | Metadata submission or finalization interrupted | Recover persisted VM/metadata job IDs and retry the immutable backup attempt; do not publish Ready early. |
 

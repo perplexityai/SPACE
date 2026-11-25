@@ -74,9 +74,12 @@ fn record_admitted_registration(local_artifact_id: &str) {
 }
 
 /// A `FinalizeArtifactBackup` a stub answered, as the node sent it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(in crate::service::grpc_lifecycle) struct FinalizedBackup {
     pub(in crate::service::grpc_lifecycle) backup_attempt_id: String,
+    /// `SuspendSnapshotTerminalState`, as sent.
+    pub(in crate::service::grpc_lifecycle) target_state: i32,
+    pub(in crate::service::grpc_lifecycle) failure_reason: Option<String>,
     pub(in crate::service::grpc_lifecycle) suspend_uncommitted: bool,
 }
 
@@ -86,13 +89,7 @@ pub(in crate::service::grpc_lifecycle) fn finalized_backups() -> Vec<FinalizedBa
     FINALIZED_BACKUPS
         .lines()
         .iter()
-        .map(|line| {
-            let (backup_attempt_id, suspend_uncommitted) = line.split_once(' ').unwrap();
-            FinalizedBackup {
-                backup_attempt_id: backup_attempt_id.to_owned(),
-                suspend_uncommitted: suspend_uncommitted.parse().unwrap(),
-            }
-        })
+        .map(|line| serde_json::from_str(line).unwrap())
         .collect()
 }
 
@@ -100,10 +97,15 @@ pub(in crate::service::grpc_lifecycle) fn finalized_backups() -> Vec<FinalizedBa
 pub(in crate::service::grpc_lifecycle) fn record_finalized_backup(
     request: &pplx_space_node_api_client::proto::FinalizeArtifactBackupRequest,
 ) {
-    FINALIZED_BACKUPS.append(&format!(
-        "{} {}",
-        request.backup_attempt_id, request.suspend_uncommitted
-    ));
+    FINALIZED_BACKUPS.append(
+        &serde_json::to_string(&FinalizedBackup {
+            backup_attempt_id: request.backup_attempt_id.clone(),
+            target_state: request.target_state,
+            failure_reason: request.failure_reason.clone(),
+            suspend_uncommitted: request.suspend_uncommitted,
+        })
+        .unwrap(),
+    );
 }
 
 /// A cluster-api stub. Its `BeginArtifactBackup` refuses every
@@ -410,7 +412,7 @@ where
 }
 
 /// Answer one gRPC `request` with `handler`, for a stub's `tower::Service`.
-pub(in crate::service) async fn answer<B, Req, Resp>(
+pub(crate) async fn answer<B, Req, Resp>(
     request: http::Request<B>,
     handler: impl Fn(Req) -> Result<Resp, tonic::Status>,
 ) -> http::Response<tonic::body::Body>

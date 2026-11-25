@@ -1096,15 +1096,118 @@ pub(crate) fn prepare_suspend_snapshot(
     })
 }
 
+/// Why [`submit_prepared_snapshot`] returned no transfer handles.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SubmitPreparedSnapshotError {
+    /// The artifact directory holds another artifact, so no attempt can
+    /// upload this one. Found before the first push, nothing was submitted.
+    /// Found after the last, the pushes already queued upload objects under
+    /// the attempt's prefix, whose row is then marked failed, and retention
+    /// prunes them as it does a partial submit's.
+    #[error(transparent)]
+    Superseded(#[from] SupersededArtifact),
+    /// Anything a later attempt may get past.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for SubmitPreparedSnapshotError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&str> for SubmitPreparedSnapshotError {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.to_owned())
+    }
+}
+
+/// An upload's artifact directory holds another artifact than the one the
+/// upload was prepared for: a later publication replaced it.
+#[derive(Debug, thiserror::Error)]
+#[error("{snapshot_dir} now holds artifact {current}, not {expected}")]
+pub(crate) struct SupersededArtifact {
+    snapshot_dir: PathBuf,
+    expected: LocalArtifactId,
+    current: LocalArtifactId,
+}
+
+/// What an upload's artifact directory says of the artifact the upload was
+/// prepared for, when it doesn't name another one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArtifactDirectory {
+    /// Its sidecar names the upload's artifact.
+    Holds,
+    /// The payload names no artifact, or the sidecar is missing, unreadable
+    /// or names none.
+    Unknown,
+}
+
+/// The artifact a snapshot directory's sidecar names, read without validating
+/// the artifact. `None` is an absent, unreadable or unparsable sidecar:
+/// unknown identity, never evidence about ownership.
+pub(crate) fn sidecar_artifact_id(snapshot_dir: &Path) -> Option<LocalArtifactId> {
+    #[derive(serde::Deserialize)]
+    struct Identity {
+        local_artifact_id: Option<LocalArtifactId>,
+    }
+    let path = snapshot_dir.join(SNAPSHOT_METADATA_FILENAME);
+    serde_json::from_slice::<Identity>(&std::fs::read(path).ok()?)
+        .ok()?
+        .local_artifact_id
+}
+
+/// Whether `prepared`'s directory still holds the artifact it uploads. Each
+/// sandbox publishes its suspends into one directory, so a later publication
+/// replaces the bytes an upload prepared earlier would read, and retires the
+/// artifact. Only a sidecar naming another artifact is an error.
+///
+/// A publication writes the artifact id beside the capture it names, with the
+/// retained source captured with it, so the id alone tells the artifacts
+/// apart. Nothing asks node-manager: it refuses a send source inspection
+/// outright while a few are running, and a suspend's preparation inspects
+/// its source just before its handoff submits, so another inspection would
+/// get that preparation refused more often. A source gone under the same
+/// artifact gets node-manager's refusal of its send, as before.
+pub(crate) fn check_prepared_artifact_identity(
+    prepared: &SnapshotUploadJobs,
+) -> Result<ArtifactDirectory, SupersededArtifact> {
+    let Some(expected) = prepared.meta.local_artifact_id else {
+        return Ok(ArtifactDirectory::Unknown);
+    };
+    match sidecar_artifact_id(&prepared.snapshot_dir) {
+        Some(current) if current != expected => Err(SupersededArtifact {
+            snapshot_dir: prepared.snapshot_dir.clone(),
+            expected,
+            current,
+        }),
+        Some(_) => Ok(ArtifactDirectory::Holds),
+        None => Ok(ArtifactDirectory::Unknown),
+    }
+}
+
 /// Submit a prepared upload intent to the vol-mgr at `volume_manager_socket`.
 ///
 /// The immutable snapshot attempt determines every source and destination, so
 /// replay after a worker restart rejoins vol-mgr's persisted transfer jobs.
-pub async fn submit_prepared_snapshot(
+///
+/// Each push stages its bytes as it is submitted: vol-mgr reflinks a file, and
+/// node-manager leases a copy of a retained send source, which it refuses once
+/// the directory retains another. The artifact directory's identity
+/// ([`check_prepared_artifact_identity`]) brackets the pushes. Another
+/// artifact before the first push submits nothing; another one after the last
+/// is [`SubmitPreparedSnapshotError::Superseded`], and a sidecar that named the
+/// artifact before and is gone after is a failure a later attempt may get
+/// past. A publication renames whole directories and a replaced artifact
+/// never comes back, so a sidecar naming the artifact at both ends proves
+/// every push between them staged its bytes.
+pub(crate) async fn submit_prepared_snapshot(
     prepared: &SnapshotUploadJobs,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     volume_manager_socket: &Path,
-) -> Result<SnapshotUploadJobs, String> {
+) -> Result<SnapshotUploadJobs, SubmitPreparedSnapshotError> {
+    let before = check_prepared_artifact_identity(prepared)?;
     let mut prepared = prepared.clone();
     if !prepared.deferred_metadata
         && let Some(source_id) = prepared.meta.rootfs_send_source_id
@@ -1222,7 +1325,7 @@ pub async fn submit_prepared_snapshot(
     }
 
     if !errors.is_empty() {
-        return Err(format!(
+        return Err(SubmitPreparedSnapshotError::Failed(format!(
             "vol-mgr submit_push_file failed for {} of {} artifacts; \
              {} successfully-queued upload(s) will run as S3 orphans for \
              snapshot {} until retention prunes them: [{}]",
@@ -1231,7 +1334,20 @@ pub async fn submit_prepared_snapshot(
             job_ids.len(),
             prepared.snapshot_id,
             errors.join("; ")
-        ));
+        )));
+    }
+
+    // The other end of the bracket the function's doc describes.
+    let after = check_prepared_artifact_identity(&prepared)?;
+    if before == ArtifactDirectory::Holds && after == ArtifactDirectory::Unknown {
+        return Err(SubmitPreparedSnapshotError::Failed(format!(
+            "{} no longer names artifact {} after its pushes were submitted",
+            prepared.snapshot_dir.display(),
+            prepared
+                .meta
+                .local_artifact_id
+                .map_or_else(String::new, |artifact| artifact.to_string()),
+        )));
     }
 
     let mut submitted = prepared.clone();

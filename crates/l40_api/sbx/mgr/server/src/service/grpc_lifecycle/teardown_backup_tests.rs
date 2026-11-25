@@ -438,13 +438,20 @@ enum Transfers {
     /// As vol-mgr reports a transfer whose retries ran out during an
     /// object-store outage.
     Failed,
+    /// As vol-mgr answers a probe with an error the upload retries past.
+    Unreadable,
 }
 
+/// Run once, as [`FakeVolumeManager`] accepts the next push.
+type OnPush = Box<dyn FnOnce() + Send>;
+
 /// A vol-mgr on a test-owned socket that accepts every push and reports every
-/// transfer as `Transfers` says.
+/// transfer as `Transfers` says, counting the pushes it accepted.
 struct FakeVolumeManager {
     socket: std::path::PathBuf,
     transfers: std::sync::Arc<std::sync::Mutex<Transfers>>,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    on_next_push: std::sync::Arc<std::sync::Mutex<Option<OnPush>>>,
     stop: tokio_util::sync::CancellationToken,
     _dir: tempfile::TempDir,
 }
@@ -457,6 +464,10 @@ impl FakeVolumeManager {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let transfers = std::sync::Arc::new(std::sync::Mutex::new(transfers));
         let observed = std::sync::Arc::clone(&transfers);
+        let accepted = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+        let counted = std::sync::Arc::clone(&accepted);
+        let on_next_push = std::sync::Arc::<std::sync::Mutex<Option<OnPush>>>::default();
+        let hooked = std::sync::Arc::clone(&on_next_push);
         let rpc = tower::service_fn(move |request: http::Request<tonic::body::Body>| {
             let method = request
                 .uri()
@@ -466,6 +477,8 @@ impl FakeVolumeManager {
                 .unwrap_or_default()
                 .to_owned();
             let transfers = *observed.lock().unwrap();
+            let counted = std::sync::Arc::clone(&counted);
+            let hooked = std::sync::Arc::clone(&hooked);
             async move {
                 Ok::<_, std::convert::Infallible>(match method.as_str() {
                     "SubmitPushFile" => {
@@ -473,6 +486,10 @@ impl FakeVolumeManager {
                             if transfers == Transfers::Refused {
                                 return Err(Status::unavailable("volume-manager is handing off"));
                             }
+                            if let Some(hook) = hooked.lock().unwrap().take() {
+                                hook();
+                            }
+                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             Ok(vol::SubmitTransferResponse {
                                 job_id: JobId::new().to_string(),
                             })
@@ -481,8 +498,11 @@ impl FakeVolumeManager {
                     }
                     "GetTransferJob" => {
                         answer(request, move |request: vol::GetTransferJobRequest| {
+                            if transfers == Transfers::Unreadable {
+                                return Err(Status::internal("transfer record unreadable"));
+                            }
                             let (status, error) = match transfers {
-                                Transfers::Refused | Transfers::Running => {
+                                Transfers::Refused | Transfers::Running | Transfers::Unreadable => {
                                     (vol::TransferJobStatus::Running, None)
                                 }
                                 Transfers::Completed => (vol::TransferJobStatus::Completed, None),
@@ -518,6 +538,8 @@ impl FakeVolumeManager {
         Self {
             socket,
             transfers,
+            accepted,
+            on_next_push,
             stop,
             _dir: dir,
         }
@@ -525,6 +547,15 @@ impl FakeVolumeManager {
 
     fn report(&self, transfers: Transfers) {
         *self.transfers.lock().unwrap() = transfers;
+    }
+
+    fn accepted_pushes(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Run `hook` as the next push is accepted, before it is answered.
+    fn on_next_push(&self, hook: OnPush) {
+        *self.on_next_push.lock().unwrap() = Some(hook);
     }
 }
 
@@ -613,7 +644,9 @@ async fn node_local_handoff(
     options.snapshot_upload_retry_backoff_secs = upload_retry_secs.map(|secs| vec![secs]);
     let service = SandboxManagerService::new_with_options(conn, options);
     let artifact_id = LocalArtifactId::new();
-    let snapshot_dir = scratch.join("suspend");
+    let snapshot_dir = crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+        &scratch.join(&id),
+    );
     crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
         &snapshot_dir,
         &id,
@@ -1206,7 +1239,214 @@ async fn upload_of_a_rolled_back_suspend_reports_it_uncommitted() {
         ]
         .map(|(backup_attempt_id, suspend_uncommitted)| FinalizedBackup {
             backup_attempt_id,
+            target_state: pplx_space_node_api_client::proto::SuspendSnapshotTerminalState::Ready
+                as i32,
+            failure_reason: None,
             suspend_uncommitted,
+        });
+        expected.sort_by(|a, b| a.backup_attempt_id.cmp(&b.backup_attempt_id));
+        assert_eq!(finalized, expected);
+    })
+    .await;
+}
+
+/// Wait for `upload`'s first attempt to fail and its retry to be scheduled.
+async fn retrying(service: &SandboxManagerService, upload: &JobId) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let job = service
+                .snapshot_upload_worker
+                .get_job(upload)
+                .unwrap()
+                .unwrap();
+            if job.attempts == 1
+                && job.status == pplx_space_common_jobs::JobStatus::Pending.as_str()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upload's first attempt fails and retries");
+}
+
+/// Publish a newer capture of `sandbox_id` over its canonical snapshot
+/// directory, `snapshot_dir`, as a later suspend does, retiring the one there.
+fn publish_newer_capture(snapshot_dir: &std::path::Path, sandbox_id: &str) {
+    use crate::service::suspend_snapshot_publication as publication;
+    let newer = LocalArtifactId::new();
+    let staging = publication::suspend_snapshot_staging_dir(snapshot_dir.parent().unwrap(), newer);
+    publication::write_full_suspend_artifact(&staging, sandbox_id, newer, b"a-newer-capture");
+    publication::publish_suspend_snapshot_dir(
+        &staging,
+        snapshot_dir,
+        newer,
+        &crate::retained_source::RetainedSourceVerdicts::default(),
+    )
+    .unwrap();
+}
+
+/// Let `upload`'s scheduled retry run now. The tests that call this schedule
+/// retries an hour out, so that a retry runs only once the test has set up
+/// what it meets. The worker sleeps out a retry's delay in memory, so it is
+/// woken through startup recovery, which spawns every pending job again with
+/// the delay left on it.
+fn release_retry(service: &SandboxManagerService, upload: &JobId) {
+    let changed = service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE jobs SET next_attempt_at = NULL WHERE job_id = ?1 AND status = 'pending'",
+            crate::db::fixture::params![upload.to_string()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the upload waits for its retry");
+    assert_eq!(
+        service.snapshot_upload_worker.recover_and_log("test"),
+        [*upload]
+    );
+}
+
+/// When, against a node-local suspend's upload, a later suspend publishes a
+/// newer capture over the sandbox's snapshot directory.
+#[derive(Clone, Copy, Debug)]
+enum Publication {
+    /// Before the upload submitted anything: vol-mgr refused the handoff's
+    /// pushes and the upload's first attempt.
+    BeforePushes,
+    /// While the upload's next attempt submits, at its first push.
+    AtFirstPush,
+    /// After the handoff staged the upload's transfers, once an attempt
+    /// polling them failed in a way the upload retries past.
+    AfterStaging,
+}
+
+/// A suspend whose backup handoff failed rolls back keeping its capture
+/// pinned, its upload live, and a later suspend publishes over the sandbox's
+/// snapshot directory. An upload that hadn't staged its transfers by then ends
+/// for good on its next attempt, its row finalized failed: before it submits
+/// anything, it submits nothing more to a vol-mgr that would take every
+/// push, and one the publication meets mid-submit doesn't register its
+/// pushes, which carry another capture's files. One whose transfers were
+/// already staged keeps their bytes and completes on its next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_a_later_publication_supersedes_ends_unless_its_transfers_were_staged() {
+    use super::retired_teardown_tests::{FinalizedBackup, finalized_backups, with_cluster_api};
+    use pplx_space_common_jobs::{JobFailure, JobStatus};
+    use pplx_space_node_api_client::proto::SuspendSnapshotTerminalState;
+
+    with_cluster_api(BackupControlPlane::default(), async || {
+        let case = async |publication: Publication| {
+            let volume_manager = FakeVolumeManager::serve(match publication {
+                Publication::BeforePushes | Publication::AtFirstPush => Transfers::Refused,
+                Publication::AfterStaging => Transfers::Running,
+            });
+            let scratch = tempfile::tempdir().unwrap();
+            let sandbox_id = SandboxId::new();
+            let id = sandbox_id.to_string();
+            let NodeLocalHandoff {
+                service,
+                snapshot_dir,
+                handoff,
+                ..
+            } = node_local_handoff(
+                sandbox_id,
+                &volume_manager,
+                scratch.path(),
+                true,
+                Some(3600),
+            )
+            .await;
+            match publication {
+                Publication::BeforePushes | Publication::AtFirstPush => {
+                    handoff.expect_err("vol-mgr refuses the handoff's pushes");
+                }
+                Publication::AfterStaging => {
+                    handoff.expect("the handoff stages the upload");
+                    volume_manager.report(Transfers::Unreadable);
+                }
+            }
+            assert!(
+                crate::db::rollback_suspending_to_paused(&service.db.lock().unwrap(), &id).unwrap()
+            );
+            let upload = only_upload(&service, &id).job_id;
+            retrying(&service, &upload).await;
+            let pushed = volume_manager.accepted_pushes();
+
+            match publication {
+                Publication::AtFirstPush => {
+                    let (snapshot_dir, id) = (snapshot_dir.clone(), id.clone());
+                    volume_manager
+                        .on_next_push(Box::new(move || publish_newer_capture(&snapshot_dir, &id)));
+                }
+                Publication::BeforePushes | Publication::AfterStaging => {
+                    publish_newer_capture(&snapshot_dir, &id);
+                }
+            }
+            volume_manager.report(Transfers::Completed);
+            release_retry(&service, &upload);
+            let ended = service
+                .snapshot_upload_worker
+                .wait_for_job(&upload, std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+
+            assert_eq!(ended.attempts, 2, "{publication:?}: {ended:?}");
+            match publication {
+                Publication::BeforePushes | Publication::AtFirstPush => {
+                    assert_eq!(
+                        ended.status,
+                        JobStatus::Failed.as_str(),
+                        "{publication:?}: {ended:?}"
+                    );
+                    assert!(
+                        matches!(ended.failure, Some(JobFailure::Permanent { .. })),
+                        "{publication:?}: {ended:?}"
+                    );
+                }
+                Publication::AfterStaging => {
+                    assert_eq!(
+                        ended.status,
+                        JobStatus::Completed.as_str(),
+                        "{publication:?}: {ended:?}"
+                    );
+                }
+            }
+            if matches!(publication, Publication::BeforePushes) {
+                assert_eq!(volume_manager.accepted_pushes(), pushed);
+            }
+            super::retired_teardown_tests::drain(&service).await;
+            (publication, backup_attempt(&ended))
+        };
+        let ends = futures_util::future::join3(
+            Box::pin(case(Publication::BeforePushes)),
+            Box::pin(case(Publication::AtFirstPush)),
+            Box::pin(case(Publication::AfterStaging)),
+        )
+        .await;
+
+        let mut finalized = finalized_backups();
+        finalized.sort_by(|a, b| a.backup_attempt_id.cmp(&b.backup_attempt_id));
+        let mut expected = [ends.0, ends.1, ends.2].map(|(publication, backup_attempt_id)| {
+            let (target_state, failure_reason) = match publication {
+                Publication::BeforePushes | Publication::AtFirstPush => (
+                    SuspendSnapshotTerminalState::Failed,
+                    Some(
+                        "a later suspend superseded the artifact before its upload finished"
+                            .to_owned(),
+                    ),
+                ),
+                Publication::AfterStaging => (SuspendSnapshotTerminalState::Ready, None),
+            };
+            FinalizedBackup {
+                backup_attempt_id,
+                target_state: target_state as i32,
+                failure_reason,
+                // The ready backup is of a suspend that rolled back to `paused`.
+                suspend_uncommitted: matches!(publication, Publication::AfterStaging),
+            }
         });
         expected.sort_by(|a, b| a.backup_attempt_id.cmp(&b.backup_attempt_id));
         assert_eq!(finalized, expected);

@@ -3,6 +3,7 @@
 use pplx_space_snapshot_model::LocalArtifactId;
 
 use super::*;
+use crate::snapshot_upload::sidecar_artifact_id;
 use std::collections::VecDeque;
 use std::fs::ReadDir;
 use std::path::{Path, PathBuf};
@@ -236,20 +237,6 @@ impl SandboxManagerService {
         }
         Ok(paths)
     }
-}
-
-/// The artifact a snapshot directory's sidecar names, read without validating
-/// the artifact. `None` is an absent, unreadable or unparsable sidecar:
-/// unknown identity, never evidence about ownership.
-fn sidecar_artifact_id(snapshot_dir: &Path) -> Option<LocalArtifactId> {
-    #[derive(serde::Deserialize)]
-    struct Identity {
-        local_artifact_id: Option<LocalArtifactId>,
-    }
-    let path = snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
-    serde_json::from_slice::<Identity>(&std::fs::read(path).ok()?)
-        .ok()?
-        .local_artifact_id
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -102,10 +102,6 @@ pub(in crate::service) struct DrainActions {
     /// The failures under the generation they happened under; a pass under
     /// another generation starts from none.
     failures: Mutex<(Option<u64>, DrainFailures)>,
-    /// The captures failed drain suspends left pinned with their upload
-    /// live, by sandbox, until a later attempt settles them
-    /// ([`Self::settle_captures`]).
-    captures: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl Default for DrainActions {
@@ -124,7 +120,6 @@ impl DrainActions {
             evacuating: Mutex::default(),
             running: Mutex::default(),
             failures: Mutex::default(),
-            captures: Mutex::default(),
         }
     }
 
@@ -163,43 +158,6 @@ impl DrainActions {
     /// Forget the evacuating, at a cancel.
     pub(super) fn stop_evacuating(&self) {
         *lock(&self.evacuating) = None;
-    }
-
-    /// Settle the captures earlier failed drain suspends of `sandbox_id`
-    /// left, after another attempt: `before` and `after` are the row's pin
-    /// around the attempt, `failed` whether it failed, and `uploading`
-    /// whether `after`'s upload job is live. A suspend that fails after its
-    /// capture was published rolls the VM back keeping that capture pinned,
-    /// its upload queued; a later publication retires it, and from then on
-    /// its upload can only fail, retrying for its whole budget. Returns the
-    /// remembered captures the pin has moved past, whose uploads to end;
-    /// `after`, the pin now, is never one of them. A failed attempt that
-    /// pinned a capture of its own with a live upload is remembered; a
-    /// successful one forgets the sandbox.
-    pub(super) fn settle_captures(
-        &self,
-        sandbox_id: &str,
-        before: Option<&str>,
-        after: Option<&str>,
-        failed: bool,
-        uploading: bool,
-    ) -> Vec<String> {
-        let mut captures = lock(&self.captures);
-        let mut remembered = captures.remove(sandbox_id).unwrap_or_default();
-        let superseded = remembered
-            .iter()
-            .filter(|capture| Some(capture.as_str()) != after)
-            .cloned()
-            .collect();
-        remembered.retain(|capture| Some(capture.as_str()) == after);
-        if let Some(pinned) = after.filter(|pinned| failed && uploading && Some(*pinned) != before)
-        {
-            remembered.insert(pinned.to_owned());
-        }
-        if failed && !remembered.is_empty() {
-            captures.insert(sandbox_id.to_owned(), remembered);
-        }
-        superseded
     }
 
     pub(super) fn running(&self) -> BTreeMap<String, DrainAction> {
@@ -461,7 +419,6 @@ impl SandboxManagerService {
         let wake_lock = self.auto_lifecycle.wake_lock(sandbox_id);
         let wake_guard = wake_lock.lock_owned().await;
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        let pinned_before = sandbox.current_local_artifact_id.map(|pin| pin.to_string());
         if !from.allows(sandbox.state.unowned()) {
             return Ok(());
         }
@@ -480,74 +437,14 @@ impl SandboxManagerService {
             true,
             Some(SandboxEventTrigger::System),
         );
-        let suspended = async {
-            let (_, publication) = self
-                .prepare_suspend_snapshot_publication_after_locks(
-                    &context,
-                    &wake_guard,
-                    &artifact_guard,
-                )
-                .await?;
-            self.complete_suspend_snapshot_publication(publication)
-                .await
-        }
-        .await;
-        drop(artifact_guard);
-        drop(wake_guard);
-        let pinned_after = self
-            .lookup_sandbox(sandbox_id)
-            .ok()
-            .and_then(|row| row.current_local_artifact_id)
-            .map(|pin| pin.to_string());
-        let uploading = pinned_after
-            .as_deref()
-            .is_some_and(|pin| self.upload_job_active(pin));
-        for capture in self.drain_actions.settle_captures(
-            sandbox_id,
-            pinned_before.as_deref(),
-            pinned_after.as_deref(),
-            suspended.is_err(),
-            uploading,
-        ) {
-            self.end_superseded_capture_upload(sandbox_id, &capture);
-        }
-        suspended
-    }
-
-    /// End the upload of `capture`, a capture of `sandbox_id` an earlier
-    /// failed drain suspend left pinned and a later publication retired
-    /// ([`DrainActions::settle_captures`]). Its job can only fail from here,
-    /// and would retry for its whole budget while the `creating` snapshot row
-    /// it registered refuses the sandbox's delete. The job is cancelled, as
-    /// eviction cancels an evicted artifact's, and the row marked failed, as
-    /// an exhausted upload's is.
-    pub(super) fn end_superseded_capture_upload(&self, sandbox_id: &str, capture: &str) {
-        let Ok(artifact) = capture.parse::<pplx_space_snapshot_model::LocalArtifactId>() else {
-            return;
-        };
-        let cancelled = self.db_conn().and_then(|conn| {
-            crate::db::snapshot_upload_jobs::cancel_superseded_upload_job(&conn, artifact)
-                .map_err(|error| Status::internal(format!("db error: {error}")))
-        });
-        match cancelled {
-            Ok(Some(job)) => {
-                tracing::info!(
-                    sandbox_id,
-                    local_artifact_id = capture,
-                    job_id = %job.job_id,
-                    "ended the upload of a drain suspend's capture a later publication superseded"
-                );
-                tokio::spawn(async move {
-                    crate::snapshot_upload_jobs::converge_superseded_upload(&job).await;
-                });
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                sandbox_id,
-                local_artifact_id = capture,
-                %error,
-                "can't end the upload of a drain suspend's superseded capture"
-            ),
-        }
+        let (_, publication) = self
+            .prepare_suspend_snapshot_publication_after_locks(
+                &context,
+                &wake_guard,
+                &artifact_guard,
+            )
+            .await?;
+        self.complete_suspend_snapshot_publication(publication)
+            .await
     }
 }

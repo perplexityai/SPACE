@@ -978,3 +978,270 @@ fn storage_uri_honours_key_prefix() {
         ),
     );
 }
+
+/// What an upload's artifact directory's sidecar holds.
+#[derive(Clone, Copy, Debug)]
+enum Sidecar {
+    /// The payload's artifact.
+    Same,
+    /// Another artifact, as a later publication leaves it.
+    OtherArtifact,
+    /// A sidecar that names no artifact.
+    NoIdentity,
+    Missing,
+    Unparseable,
+}
+
+/// What [`check_prepared_artifact_identity`] decided.
+#[derive(Debug, PartialEq, Eq)]
+enum Identity {
+    Holds,
+    Unknown,
+    Superseded,
+}
+
+/// Write `sidecar` into `dir` for an upload of `artifact`.
+fn write_sidecar(dir: &Path, sidecar: Sidecar, artifact: LocalArtifactId) {
+    let path = dir.join(SNAPSHOT_METADATA_FILENAME);
+    let json = match sidecar {
+        Sidecar::Same => serde_json::json!({ "local_artifact_id": artifact }),
+        Sidecar::OtherArtifact => {
+            serde_json::json!({ "local_artifact_id": LocalArtifactId::new() })
+        }
+        Sidecar::NoIdentity => serde_json::json!({ "sandbox_id": "sbx" }),
+        Sidecar::Missing => {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        Sidecar::Unparseable => {
+            std::fs::write(&path, b"{").unwrap();
+            return;
+        }
+    };
+    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+}
+
+/// An upload's directory shows it superseded only when its sidecar names
+/// another artifact. A payload that names no artifact, and a sidecar that is
+/// missing, can't be read or names none, say nothing either way.
+#[test]
+fn an_upload_is_superseded_only_by_a_sidecar_naming_another_artifact() {
+    // (payload names its artifact, sidecar, decision)
+    let cases = [
+        (true, Sidecar::Same, Identity::Holds),
+        (true, Sidecar::OtherArtifact, Identity::Superseded),
+        (true, Sidecar::NoIdentity, Identity::Unknown),
+        (true, Sidecar::Missing, Identity::Unknown),
+        (true, Sidecar::Unparseable, Identity::Unknown),
+        (false, Sidecar::Same, Identity::Unknown),
+        (false, Sidecar::OtherArtifact, Identity::Unknown),
+    ];
+    for (names_artifact, sidecar, expected) in cases {
+        let case = format!("{names_artifact} {sidecar:?}");
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = LocalArtifactId::new();
+        let mut payload = crate::snapshot_upload_jobs::tests::reclaim_fixture_payload(
+            &artifact.to_string(),
+            temp.path().to_path_buf(),
+        );
+        if !names_artifact {
+            payload.meta.local_artifact_id = None;
+        }
+        write_sidecar(temp.path(), sidecar, artifact);
+
+        let decided = match check_prepared_artifact_identity(&payload) {
+            Ok(ArtifactDirectory::Holds) => Identity::Holds,
+            Ok(ArtifactDirectory::Unknown) => Identity::Unknown,
+            Err(SupersededArtifact { .. }) => Identity::Superseded,
+        };
+
+        assert_eq!(decided, expected, "{case}");
+    }
+}
+
+/// What a [`RecordingVolumeManager`] does to its artifact directory on the
+/// first push it accepts.
+type OnFirstPush = Box<dyn FnOnce() + Send>;
+
+/// A volume-manager on a test-owned socket that records every push submitted
+/// to it, by the artifact file it names, and refuses a btrfs-send push when
+/// told to, as one for a replaced source is refused. It runs `on_first_push`
+/// as it accepts its first push, before answering.
+struct RecordingVolumeManager {
+    socket: std::path::PathBuf,
+    submitted: std::sync::Arc<std::sync::Mutex<Vec<(String, JobId)>>>,
+    stop: tokio_util::sync::CancellationToken,
+    _dir: tempfile::TempDir,
+}
+
+impl RecordingVolumeManager {
+    fn serve(refuse_send: bool, on_first_push: Option<OnFirstPush>) -> Self {
+        use pplx_space_volmgr_client::proto as vol;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("volume-manager.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let submitted = std::sync::Arc::<std::sync::Mutex<Vec<(String, JobId)>>>::default();
+        let recorded = std::sync::Arc::clone(&submitted);
+        let on_first_push = std::sync::Arc::new(std::sync::Mutex::new(on_first_push));
+        let rpc = tower::service_fn(move |request: http::Request<tonic::body::Body>| {
+            let method = request
+                .uri()
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let recorded = std::sync::Arc::clone(&recorded);
+            let on_first_push = std::sync::Arc::clone(&on_first_push);
+            async move {
+                let record = move |name: String| {
+                    if let Some(hook) = on_first_push.lock().unwrap().take() {
+                        hook();
+                    }
+                    let job_id = JobId::new();
+                    recorded.lock().unwrap().push((name, job_id));
+                    Ok(vol::SubmitTransferResponse {
+                        job_id: job_id.to_string(),
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(match method.as_str() {
+                    "SubmitPushFile" => {
+                        crate::service::answer(request, move |push: vol::PushFileRequest| {
+                            let name = Path::new(&push.local_path).file_name().unwrap();
+                            record(name.to_string_lossy().into_owned())
+                        })
+                        .await
+                    }
+                    "SubmitPushBtrfsSend" => {
+                        crate::service::answer(request, move |_: vol::PushBtrfsSendRequest| {
+                            if refuse_send {
+                                return Err(tonic::Status::failed_precondition(
+                                    "send source identity changed",
+                                ));
+                            }
+                            record(ROOTFS_BTRFS_SEND_FILENAME.to_owned())
+                        })
+                        .await
+                    }
+                    _ => tonic::Status::unimplemented(method).into_http(),
+                })
+            }
+        });
+        let stop = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(
+            tonic::transport::Server::builder().serve_with_incoming_shutdown(
+                rpc,
+                tokio_stream::wrappers::UnixListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+        );
+        Self {
+            socket,
+            submitted,
+            stop,
+            _dir: dir,
+        }
+    }
+
+    fn submitted(&self) -> Vec<(String, JobId)> {
+        self.submitted.lock().unwrap().clone()
+    }
+}
+
+impl Drop for RecordingVolumeManager {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// A deferred upload of `artifact`, its sidecar naming it.
+fn prepared_deferred_upload(
+    deferred: &DeferredArtifact,
+    artifact: LocalArtifactId,
+) -> SnapshotUploadJobs {
+    let mut prepared = deferred
+        .prepare(Some(deferred.retained(1000, true)))
+        .unwrap();
+    assert!(prepared.deferred_metadata);
+    prepared.meta.local_artifact_id = Some(artifact);
+    write_sidecar(&deferred.dir, Sidecar::Same, artifact);
+    prepared
+}
+
+/// A deferred upload submits its btrfs-send last, after the files: node-manager
+/// leases the retained source as the send is submitted and refuses a source the
+/// directory no longer retains, so a publication before it can't leave the
+/// attempt's files beside another capture's rootfs. A refused send fails the
+/// attempt. The transfer IDs are in the artifact order the worker reads them in.
+#[tokio::test]
+async fn a_deferred_upload_submits_its_send_last_and_fails_once_it_is_refused() {
+    for refuse_send in [false, true] {
+        let deferred = DeferredArtifact::new();
+        let prepared = prepared_deferred_upload(&deferred, LocalArtifactId::new());
+        let volume_manager = RecordingVolumeManager::serve(refuse_send, None);
+
+        let submitted = submit_prepared_snapshot(
+            &prepared,
+            &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            &volume_manager.socket,
+        )
+        .await;
+
+        let pushes = volume_manager.submitted();
+        let names: Vec<&str> = pushes.iter().map(|(name, _)| name.as_str()).collect();
+        if refuse_send {
+            assert!(
+                matches!(submitted, Err(SubmitPreparedSnapshotError::Failed(_))),
+                "{submitted:?}"
+            );
+            assert_eq!(names, ["vmstate", "memory"]);
+        } else {
+            assert_eq!(names, ["vmstate", "memory", ROOTFS_BTRFS_SEND_FILENAME]);
+            assert_eq!(
+                submitted.unwrap().job_ids,
+                pushes.iter().map(|(_, job_id)| *job_id).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// The sidecar is read again after the last push. A publication of another
+/// artifact while the pushes were submitted supersedes the upload; a sidecar
+/// gone by then fails only the attempt; one that still names the artifact
+/// returns every transfer.
+#[tokio::test]
+async fn a_publication_while_an_upload_submits_supersedes_it() {
+    // (what happens to the sidecar at the first push, outcome)
+    let cases = [
+        (None, "submitted"),
+        (Some(Sidecar::OtherArtifact), "superseded"),
+        (Some(Sidecar::Missing), "failed"),
+    ];
+    for (at_first_push, expected) in cases {
+        let deferred = DeferredArtifact::new();
+        let artifact = LocalArtifactId::new();
+        let prepared = prepared_deferred_upload(&deferred, artifact);
+        let dir = deferred.dir.clone();
+        let volume_manager = RecordingVolumeManager::serve(
+            false,
+            at_first_push.map(|sidecar| -> OnFirstPush {
+                Box::new(move || write_sidecar(&dir, sidecar, artifact))
+            }),
+        );
+
+        let submitted = submit_prepared_snapshot(
+            &prepared,
+            &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            &volume_manager.socket,
+        )
+        .await;
+
+        let outcome = match &submitted {
+            Ok(_) => "submitted",
+            Err(SubmitPreparedSnapshotError::Superseded(_)) => "superseded",
+            Err(SubmitPreparedSnapshotError::Failed(_)) => "failed",
+        };
+        assert_eq!(outcome, expected, "{at_first_push:?}: {submitted:?}");
+        assert_eq!(volume_manager.submitted().len(), 3, "{at_first_push:?}");
+    }
+}
