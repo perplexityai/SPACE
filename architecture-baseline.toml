@@ -10,12 +10,8 @@
 [pattern_ratchet.direct_tables]
 "crates/l30_storage/cluster/trigger/queue/src/lib.rs" = 1
 "crates/l30_storage/sandbox/store/src/lib.rs" = 2
-"crates/l40_api/api/src/public_template_operations.rs" = 1
-"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 6
-"crates/l40_api/api/src/routes/admin/templates.rs" = 1
-"crates/l40_api/cluster/controller/server/src/tombstone_retention.rs" = 1
+"crates/l40_api/api/src/routes/admin/node_maintenance.rs" = 4
 "crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs" = 1
-"crates/l40_api/internal/api/server/src/lib.rs" = 1
 
 [pattern_ratchet.kubernetes_access]
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.

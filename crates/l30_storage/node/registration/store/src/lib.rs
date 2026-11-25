@@ -12,11 +12,14 @@
 //! Kubernetes nodes, [`demotion`] demotes ready ones missing from the
 //! cluster, [`node_group`] mirrors their node-group labels, and
 //! [`orphan_reap_refusal`] says why the drained-node terminator's reap of a
-//! gone node's row refused. [`direct`] reads the admin node row, which joins
-//! the node's Direct registration, and hard-deletes Direct nodes and their
-//! expired tombstones; [`direct::registry`] writes a Direct node's `nodes` row
-//! for the admin node registry. [`stale_reconcile_work`] finds the Kubernetes
-//! nodes the reconcile queue GC may treat as gone.
+//! gone node's row refused. [`direct`] holds the statements that join or test
+//! a node's Direct registration in `node_direct` (`pplx-space-direct-store`'s):
+//! the admin node row and the hard deletes of Direct nodes and their expired
+//! tombstones, and in its submodules a Direct node's endpoint, the Direct
+//! substrate's placement candidates, and the admin node registry's reads and
+//! the writes of a Direct node's `nodes` row ([`direct::registry`]).
+//! [`stale_reconcile_work`] finds the Kubernetes nodes the reconcile queue GC
+//! may treat as gone.
 //! [`orphan_reap_refusal`] also counts `sandboxes` rows, which belong to
 //! `pplx-space-sandbox-store`, through the residency and portability
 //! fragments the reap's guards use.

@@ -8,6 +8,7 @@ use crate::public_template_operations::tests::{
 };
 use pplx_space_cluster_pool::{PoolConfigOwner, PoolSlotState};
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_sql_locator::sql;
 
 use pplx_space_test_env::TestResult;
 

@@ -5,8 +5,12 @@
 //! Direct node, by id ([`delete_direct_node`]) and of its expired tombstones
 //! ([`prune_expired_direct_node_tombstones`]), whose `node_direct` rows go by
 //! the schema's `ON DELETE CASCADE`. [`registry`] holds the admin Direct node
-//! registry's statements on `nodes`.
+//! registry's statements on `nodes`, and the reads of Direct nodes' registry
+//! rows. The other submodules hold the other reads of `nodes` joined to
+//! `node_direct`: [`endpoints`] and [`placement_candidates`].
 
+pub mod endpoints;
+pub mod placement_candidates;
 pub mod registry;
 
 use pplx_space_accounts::NodeId;

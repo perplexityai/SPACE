@@ -436,6 +436,7 @@ pplx-space-node-status-store = [
   "pplx-space-api",
   "pplx-space-cluster-controller-server",
   "pplx-space-internal-api-server",
+  "pplx-space-node-registration-store",
   "pplx-space-runtime-upgrade-campaign-store",
   "pplx-space-sandbox-store",
 ]

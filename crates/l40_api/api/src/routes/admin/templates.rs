@@ -1,6 +1,5 @@
 use pplx_space_accounts::{NodeId, OrgId};
 
-use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_node_registration_store::direct::registry as direct_registry;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope,
     RequestFingerprint,
@@ -396,19 +396,7 @@ async fn fetch_template_rows(
 async fn reconcile_target_node_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT DISTINCT n.id
-         FROM nodes n
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         WHERE n.role IN ('worker', 'builder')
-           AND (
-             n.managed_by != $1
-             OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
-           )"
-    ))
-    .bind(SubstrateKind::Space)
-    .fetch_all(&mut **tx)
-    .await
+    direct_registry::live_worker_and_builder_ids(&mut **tx, SubstrateKind::Space).await
 }
 
 /// The enqueue writes, for a caller that already holds the node ids.

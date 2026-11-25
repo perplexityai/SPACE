@@ -1,6 +1,5 @@
 use pplx_space_accounts::NodeId;
 
-use pplx_space_sql_locator::sql;
 use std::time::Duration;
 
 use pplx_space_cluster_pool::{TemplateWarmPoolUsage, WarmPoolStore};
@@ -391,20 +390,11 @@ async fn nodes_with_template_inventory(
     pool: &PgPool,
     template: &TemplateName,
 ) -> Result<Vec<NodeId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "SELECT DISTINCT nti.node_id
-         FROM node_template_inventory nti
-         JOIN nodes n ON n.id = nti.node_id
-         LEFT JOIN node_direct nd ON nd.node_id = n.id
-         WHERE nti.template_name = $1
-           AND (
-             n.managed_by != $2
-             OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL)
-           )"
-    ))
-    .bind(template.as_str())
-    .bind(SubstrateKind::Space)
-    .fetch_all(pool)
+    pplx_space_node_template_inventory_store::direct::template_holder_ids(
+        pool,
+        template,
+        SubstrateKind::Space,
+    )
     .await
 }
 
