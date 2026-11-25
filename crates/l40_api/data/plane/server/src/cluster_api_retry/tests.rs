@@ -13,6 +13,7 @@ use pplx_space_node_api_client::proto::{
 };
 use pplx_space_sandbox_model::SandboxId;
 use prost::Message as _;
+use tokio::net::TcpSocket;
 use tokio_util::sync::CancellationToken;
 
 use crate::native::{RouteResolutionError, resolve_session_route};
@@ -37,6 +38,10 @@ fn enter_insecure_test_process() -> bool {
 /// the Service's next replica answers there.
 struct RestartingClusterApi {
     addr: SocketAddr,
+    /// Bound to `addr` for the replica's whole life and never listening, so
+    /// that no other socket on the host takes the port while no replica
+    /// listens on it, and a dial there is refused.
+    _port: TcpSocket,
     resolves: Arc<AtomicUsize>,
     answer: fn() -> Response,
     stop: CancellationToken,
@@ -45,13 +50,18 @@ struct RestartingClusterApi {
 
 impl RestartingClusterApi {
     async fn start(answer: fn() -> Response) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = shared_port_socket();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1024).unwrap();
         let addr = listener.local_addr().unwrap();
+        let port = shared_port_socket();
+        port.bind(addr).unwrap();
         let resolves = Arc::new(AtomicUsize::new(0));
         let stop = CancellationToken::new();
         let server = serve(listener, resolves.clone(), answer, stop.clone());
         Self {
             addr,
+            _port: port,
             resolves,
             answer,
             stop,
@@ -68,17 +78,33 @@ impl RestartingClusterApi {
     async fn restart(&mut self, down_for: Duration) {
         self.stop.cancel();
         (&mut self.server).await.unwrap();
-        let addr = self.addr;
+        let refused = tokio::net::TcpStream::connect(self.addr).await;
+        assert_eq!(
+            refused.err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::ConnectionRefused),
+            "a stopped replica's address refuses"
+        );
+        let next = shared_port_socket();
+        next.bind(self.addr).unwrap();
         let resolves = self.resolves.clone();
         let answer = self.answer;
         let stop = CancellationToken::new();
         self.stop = stop.clone();
         self.server = tokio::spawn(async move {
             tokio::time::sleep(down_for).await;
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            serve(listener, resolves, answer, stop).await.unwrap();
+            serve(next.listen(1024).unwrap(), resolves, answer, stop)
+                .await
+                .unwrap();
         });
     }
+}
+
+/// A socket that can share a replica's port with the socket holding it. A
+/// socket that does not set `SO_REUSEPORT` cannot bind that port.
+fn shared_port_socket() -> TcpSocket {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_reuseport(true).unwrap();
+    socket
 }
 
 fn serve(
