@@ -3,7 +3,6 @@ use pplx_space_sandbox_model::SandboxId;
 use super::*;
 use pplx_space_net_common::NetworkPolicy;
 use pplx_space_sandbox_store as sandbox_store;
-use pplx_space_sql_locator::sql;
 
 use super::lifecycle::SandboxAction;
 
@@ -17,96 +16,6 @@ fn proto_spaced_version(value: Option<&str>) -> Option<SemVer> {
         }
     }
 }
-
-const SANDBOX_COLUMNS: &str = "
-    s.id,
-    s.name,
-    s.user_id,
-    owner_user.email AS user_email,
-    s.org_id,
-    owner_user.owner_source AS owner_source,
-    owner_user.upstream_issuer AS upstream_issuer,
-    owner_org.upstream_org_id AS upstream_org_id,
-    owner_user.upstream_subject_id AS upstream_subject_id,
-    s.managed_by,
-    s.lifecycle,
-    s.placement,
-    s.activating_client_id,
-    COALESCE(direct_route.current_node_id, s.active_node_id) AS active_node_id,
-    COALESCE(active_direct.name, active_k8s.k8s_node_name) AS active_node_name,
-    active_node.role AS active_node_role,
-    host(active_node.address) AS active_node_address,
-    COALESCE(direct_route.substrate_kind, active_node.managed_by) AS active_node_managed_by,
-    COALESCE(active_execution.generation, direct_route.execution_generation)
-        AS active_execution_generation,
-    COALESCE(active_execution.pod_uid, direct_route.pod_uid) AS active_pod_uid,
-    COALESCE(active_execution.route_activation_id, direct_route.activation_attempt_id)
-        AS active_activation_attempt_id,
-    COALESCE(ecw_credential.epoch, 1) AS ecw_credential_epoch,
-    s.target_node_id,
-    s.placement_changed_at,
-    s.template_id,
-    s.content_hash,
-    s.vcpu,
-    s.memory_mib,
-    s.disk_mib,
-    s.disk_io_max_operations_per_sec,
-    s.disk_io_max_bandwidth_mib_per_sec,
-    s.env,
-    s.metadata,
-    s.auto_lifecycle_json AS auto_lifecycle,
-    s.auto_lifecycle_state_json AS auto_lifecycle_state,
-    s.network_policy_override_json AS network_policy,
-    s.network_policy_generation,
-    COALESCE(s.volume_encryption, FALSE) AS volume_encryption,
-    t.network_policy_json AS template_network_policy,
-    t.network_policy_generation AS template_network_policy_generation,
-    s.next_auto_event_at,
-    s.snapshots_enabled_desired,
-    s.command_ready_pending,
-    s.last_used_at,
-    s.last_access_at,
-    s.last_command_at,
-    s.created_at,
-    s.updated_at,
-    COALESCE(release_tags.tags, ARRAY[]::TEXT[]) AS release_tags
-";
-
-const SANDBOX_JOIN_TAIL: &str = "
-    JOIN users owner_user ON owner_user.id = s.user_id
-    JOIN organizations owner_org ON owner_org.id = s.org_id
-    LEFT JOIN templates t ON t.name = s.template_id
-    LEFT JOIN sandbox_direct_route_identities direct_route
-        ON direct_route.sandbox_id = s.id
-    LEFT JOIN nodes active_node
-        ON active_node.id = COALESCE(direct_route.current_node_id, s.active_node_id)
-    LEFT JOIN node_direct active_direct ON active_direct.node_id = active_node.id
-    LEFT JOIN node_k8s active_k8s ON active_k8s.node_id = active_node.id
-    LEFT JOIN sandbox_ecw_credential_epochs ecw_credential
-        ON ecw_credential.sandbox_id = s.id
-    LEFT JOIN LATERAL (
-        SELECT e.generation,
-               NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
-               e.route_activation_id
-        FROM sandbox_k8s_executions e
-        WHERE e.sandbox_id = s.id
-          AND e.active
-        ORDER BY e.generation DESC
-        LIMIT 1
-    ) active_execution ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT ARRAY_AGG(trt.tag ORDER BY trt.tag) AS tags
-        FROM template_releases tr
-        JOIN template_release_tags trt ON trt.template_release_id = tr.id
-        WHERE tr.template_name = s.template_id
-          AND tr.hash = s.content_hash
-    ) release_tags ON TRUE
-";
-
-const SANDBOX_FROM: &str = "
-    sandboxes s
-    {sandbox_join_tail}
-";
 
 fn format_age(epoch_str: &str) -> Option<String> {
     let epoch: u64 = epoch_str.parse().ok()?;
@@ -672,22 +581,12 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
     }
 }
 
-pub fn sandbox_query(sql: &str) -> String {
-    sql.replace("{sandbox_columns}", SANDBOX_COLUMNS)
-        .replace("{sandbox_from}", SANDBOX_FROM)
-        .replace("{sandbox_join_tail}", SANDBOX_JOIN_TAIL)
-}
-
+/// The sandbox's response row; `None` when there is no row.
 pub async fn fetch_sandbox(
     executor: impl sqlx::PgExecutor<'_>,
     id: SandboxId,
 ) -> Result<Option<Sandbox>, sqlx::Error> {
-    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sandbox_query(
-        "SELECT {sandbox_columns} FROM {sandbox_from} WHERE s.id = $1",
-    ))))
-    .bind(id)
-    .fetch_optional(executor)
-    .await
+    sandbox_store::direct::sandbox_listing::by_id(executor, id).await
 }
 
 /// Marks a pooled sandbox as started/on-node after its wake completes and

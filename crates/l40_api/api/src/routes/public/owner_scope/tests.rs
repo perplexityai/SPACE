@@ -760,7 +760,7 @@ async fn statements_during(
 fn sandbox_row_loads(statements: &[String]) -> usize {
     statements
         .iter()
-        .filter(|locator| locator.starts_with("pplx_space_api::controllers::sandbox::responses:"))
+        .filter(|locator| locator.starts_with("pplx_space_sandbox_store::direct::sandbox_listing:"))
         .count()
 }
 

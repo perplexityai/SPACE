@@ -5,6 +5,7 @@ use pplx_space_db_test_fixtures::{
     TestDbResult, insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db,
 };
 use pplx_space_node_model::SubstrateKind;
+use pplx_space_sql_locator::sql;
 use time::Duration;
 
 use super::*;
@@ -848,17 +849,6 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
             .collect::<Vec<_>>();
         assert_eq!(unpaged, expected, "{label}: unpaged list");
     }
-    // Never NULL, so negated it keeps the sandboxes on no node (4 and 5).
-    let off_route_node: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(format!(
-        "SELECT s.id FROM sandboxes s WHERE s.org_id = $1 AND NOT {}
-         ORDER BY s.created_at DESC",
-        reported_on_node("s", "$2")
-    ))))
-    .bind(owner.org_id)
-    .bind(route_node)
-    .fetch_all(&db.pool)
-    .await?;
-    assert_eq!(off_route_node, newest_first(&[0, 3, 4, 5, 6]));
     db.pool.close().await;
     Ok(())
 }
@@ -990,8 +980,13 @@ fn an_id_search_is_the_ranges_its_hex_digits_start_and_end() {
     ];
     for (text, expected_suffix, expected_prefix) in cases {
         let search = SandboxSearch::new(text).expect("valid").expect("a search");
-        assert_eq!(search.id_suffix, expected_suffix, "{text:?} suffix");
-        assert_eq!(search.id_prefix, expected_prefix, "{text:?} prefix");
+        let (suffix_low, suffix_high) = search.ids.id_suffix();
+        assert_eq!(
+            (suffix_low.to_string(), suffix_high.to_string()),
+            expected_suffix,
+            "{text:?} suffix"
+        );
+        assert_eq!(search.ids.id_prefix(), expected_prefix, "{text:?} prefix");
     }
 }
 

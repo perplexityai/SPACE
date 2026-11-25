@@ -9,14 +9,12 @@ use uuid::Uuid;
 
 use pplx_space_accounts::{NodeId, SandboxOwnerSource};
 use pplx_space_auto_lifecycle::{
-    AutoLifecyclePolicy, AutoLifecycleRuntimeState, AutoLifecycleStatus, SandboxAutoLifecyclePatch,
+    AutoLifecyclePolicy, AutoLifecycleStatus, SandboxAutoLifecyclePatch,
 };
 use pplx_space_content_digest::Digest;
 use pplx_space_execution_spec::ArtifactVersion;
-use pplx_space_k8s_ids::PodUid;
 use pplx_space_net_common::{NetworkPolicy, NetworkPolicyV1};
 use pplx_space_node_model::{NodeAddress, NodeManagedBy, NodePoolName, NodeRole};
-use pplx_space_sandbox_model::{EcwCredentialEpoch, SandboxActivationAttemptId};
 use pplx_space_semver::SemVer;
 use pplx_space_template_model::TemplateReference;
 
@@ -101,77 +99,10 @@ pub struct Session {
     pub created_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct Sandbox {
-    pub id: SandboxId,
-    pub name: Option<String>,
-    /// SPACE user row that owns the sandbox. Federated owners map onto local
-    /// user/org rows so downstream paths keep the normal sandbox FK shape.
-    pub user_id: UserId,
-    /// The current email of `user_id`'s user, read with the row. A federated
-    /// owner's user row holds a generated placeholder, which no response
-    /// shows (see `SandboxResponse::user_email`).
-    #[serde(default)]
-    pub user_email: Option<String>,
-    pub org_id: OrgId,
-    pub owner_source: SandboxOwnerSource,
-    pub upstream_issuer: Option<String>,
-    pub upstream_org_id: Option<String>,
-    pub upstream_subject_id: Option<String>,
-    pub managed_by: String,
-    pub lifecycle: String,
-    pub placement: String,
-    /// The client id whose activation created the current runtime; `None`
-    /// when nothing is recorded.
-    pub activating_client_id: Option<pplx_space_accounts::ClientId>,
-    pub active_node_id: Option<NodeId>,
-    pub active_node_name: Option<String>,
-    pub active_node_role: Option<NodeRole>,
-    pub active_node_address: Option<NodeAddress>,
-    pub active_node_managed_by: Option<NodeManagedBy>,
-    pub target_node_id: Option<NodeId>,
-    pub active_execution_generation: Option<i64>,
-    pub active_pod_uid: Option<PodUid>,
-    pub active_activation_attempt_id: Option<SandboxActivationAttemptId>,
-    pub ecw_credential_epoch: EcwCredentialEpoch,
-    pub placement_changed_at: Option<OffsetDateTime>,
-    pub template_id: Option<String>,
-    pub content_hash: Option<String>,
-    pub release_tags: Vec<String>,
-    pub vcpu: Option<i32>,
-    pub memory_mib: Option<i32>,
-    pub disk_mib: Option<i32>,
-    pub disk_io_max_operations_per_sec: i64,
-    pub disk_io_max_bandwidth_mib_per_sec: i64,
-    pub env: sqlx::types::Json<BTreeMap<String, String>>,
-    pub metadata: sqlx::types::Json<SandboxMetadata>,
-    pub auto_lifecycle: sqlx::types::Json<AutoLifecyclePolicy>,
-    pub auto_lifecycle_state: sqlx::types::Json<AutoLifecycleRuntimeState>,
-    pub network_policy: Option<sqlx::types::Json<NetworkPolicy>>,
-    pub network_policy_generation: i64,
-    pub template_network_policy: Option<sqlx::types::Json<NetworkPolicyV1>>,
-    pub template_network_policy_generation: Option<i64>,
-    pub next_auto_event_at: Option<i64>,
-    pub snapshots_enabled_desired: bool,
-    /// BYOK: this sandbox runs on dm-crypt encrypted volumes. Immutable for
-    /// the sandbox's lifetime — stamped in the create INSERT, never UPDATEd.
-    /// Loaded with COALESCE so pre-column (NULL) rows read plaintext.
-    pub volume_encryption: bool,
-    /// `started` was reported to the caller before the guest command API was
-    /// confirmed ready (a budget-exhausted slow create whose pod proxy was
-    /// reachable). The access path forces a command-ready confirmation and
-    /// clears this on success; until then a data-plane op gets the
-    /// SDK-recoverable `sandbox_timeout` rather than a bare upstream error.
-    #[serde(default)]
-    pub command_ready_pending: bool,
-    pub last_used_at: Option<OffsetDateTime>,
-    pub last_access_at: Option<OffsetDateTime>,
-    pub last_command_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
-}
+/// A sandbox's response row, owned by the sandbox store with the
+/// statements that read it and re-exported here so the api's existing
+/// `crate::models::Sandbox` paths keep resolving.
+pub use pplx_space_sandbox_store::direct::sandbox_listing::Sandbox;
 
 /// Per-organization Key Encryption Key. Populated by tenant
 /// onboarding; consumed by the credmgr at wrap/unwrap time.
