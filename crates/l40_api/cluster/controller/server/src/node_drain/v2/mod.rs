@@ -52,10 +52,12 @@
 //!    changes nothing else. Once the report has nothing pending or blocked
 //!    and every evacuation is recorded, the node moves to `drained`.
 //! 4. **Drained**: no sandbox-row write, and the node isn't called. Every
-//!    suspended row still homed on the node whose snapshot is durable is
-//!    added to `evacuated_total` (a v2 drain never moves a stopped sandbox,
-//!    so none is counted), a `drain_status` write only: the node evicts a
-//!    durable copy on its own, so one it evicted before a report named it
+//!    suspended row still homed on the node that the terminate would
+//!    release (its snapshot durable, no restore or activation of it in
+//!    flight) is added to `evacuated_total` (a v2 drain never moves a
+//!    stopped sandbox, so none is counted), a `drain_status` write only,
+//!    which re-checks the phase instead of locking the row: the node evicts
+//!    a durable copy on its own, so one it evicted before a report named it
 //!    evacuated is counted too.
 //! 5. **Terminating** (`:terminate` moved it here, from `drained`): one fresh
 //!    `DrainNode` call, whose report is recorded as a draining one's. Only
@@ -64,8 +66,9 @@
 //!    never fenced: the terminate transaction, under the node's row lock,
 //!    cleans up the references of the rows that no longer need the node, the
 //!    only sandbox-row writes the loop makes (the durable suspended rows
-//!    naming it are released, and their executions retired:
-//!    `pplx_space_sandbox_store::drain_terminate`), requires that nothing
+//!    naming it are released, their executions retired, and counted in
+//!    `evacuated_total`: `pplx_space_sandbox_store::drain_terminate`),
+//!    requires that nothing
 //!    names the node (whose blockers go to `drain_last_error`), and records
 //!    the instance to terminate, `node_k8s.instance_id`, as the fence
 //!    (`drain_status.terminate_instance`). Any other outcome, a failed call
@@ -606,11 +609,12 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         node_id: NodeId,
         message: &str,
     ) -> impl std::future::Future<Output = ()> + Send;
-    /// Add every durably suspended row still homed on the `drained` node
-    /// under `generation` to its drain's `evacuated_total`, under the node's
-    /// row lock
-    /// (`pplx_space_sandbox_store::drain_terminate::durable_suspended_rows_naming`):
-    /// a `drain_status` write only, no sandbox row. The ids it found.
+    /// Add every row still naming the `drained` node under `generation`
+    /// that the terminate would release to its drain's `evacuated_total`
+    /// (`pplx_space_sandbox_store::drain_terminate::releasable_suspended_rows_naming`),
+    /// with no row lock: the write re-checks that the row is still that
+    /// generation's `drained` node. A `drain_status` write only, no sandbox
+    /// row. The ids it found.
     fn count_drained_evacuations(
         &self,
         node_id: NodeId,
@@ -618,8 +622,8 @@ pub trait DrainV2Sink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<Vec<SandboxId>, String>> + Send;
     /// The terminate transaction, under the node's row lock: re-check the
     /// generation's unfenced `terminating` node, release its durable
-    /// suspended rows, require that nothing names the node, and write the
-    /// fence.
+    /// suspended rows and count them in `evacuated_total`, require that
+    /// nothing names the node, and write the fence.
     fn fence(
         &self,
         node_id: NodeId,

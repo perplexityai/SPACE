@@ -410,7 +410,8 @@ fn report_pending(pending: &[&str]) -> StoredV2Report {
 /// The drained tick adds the durable rows it finds to `evacuated_total`,
 /// keeping those a report recorded, sorted and without repeats, and keeps
 /// the rest of the status; adding only ids the set holds writes nothing,
-/// and under another generation it adds nothing.
+/// and under another generation, or in another phase than the one asked
+/// for, it adds nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn the_drained_tick_adds_to_the_evacuated_set_once() -> TestDbResult<()> {
     let db = pg_test_db().await?;
@@ -432,11 +433,13 @@ async fn the_drained_tick_adds_to_the_evacuated_set_once() -> TestDbResult<()> {
         )
         .await?
     );
+    set(pool, node_id, Some("drained"), serde_json::json!({})).await?;
     assert!(
         add_v2_evacuated(
             pool,
             node_id,
             generation,
+            "drained",
             &[recorded.clone(), unreported.clone()]
         )
         .await?
@@ -448,18 +451,26 @@ async fn the_drained_tick_adds_to_the_evacuated_set_once() -> TestDbResult<()> {
     );
     assert_eq!(status.report, Some(report));
     assert!(
-        !add_v2_evacuated(pool, node_id, generation, std::slice::from_ref(&unreported)).await?,
-        "every id counted already: no write"
-    );
-    assert!(
         !add_v2_evacuated(
             pool,
             node_id,
-            generation + 1,
-            &["00000000-0000-4000-8000-0000000000c3".to_owned()]
+            generation,
+            "drained",
+            std::slice::from_ref(&unreported)
         )
-        .await?
+        .await?,
+        "every id counted already: no write"
     );
+    let new = "00000000-0000-4000-8000-0000000000c3".to_owned();
+    for (case, generation, phase) in [
+        ("another generation", generation + 1, "drained"),
+        ("another phase", generation, "terminating"),
+    ] {
+        assert!(
+            !add_v2_evacuated(pool, node_id, generation, phase, std::slice::from_ref(&new)).await?,
+            "{case}"
+        );
+    }
     assert_eq!(
         status_of(pool, node_id).await?.evacuated_total,
         [unreported, recorded]

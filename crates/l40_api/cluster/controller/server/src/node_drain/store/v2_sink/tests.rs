@@ -719,14 +719,17 @@ async fn listed(pool: &PgPool, node_id: NodeId) -> TestResult<V2Node> {
         .ok_or("listed")?)
 }
 
-/// The drained tick adds every durably suspended row still homed on its
-/// generation's `drained` node to the drain's `evacuated_total`, writing no
+/// The drained tick adds every row still naming its generation's `drained`
+/// node that the terminate would release (suspended, durable, no restore or
+/// activation in flight) to the drain's `evacuated_total`, writing no
 /// sandbox row, the first one the node evicted before any report named it
 /// evacuated. One a report already recorded isn't counted twice, and ids
 /// already in the set stay, sorted. A v2 drain never moves a stopped
 /// sandbox, so a stopped row isn't counted, even with its disk durable since
-/// its stop; nor is a suspended row that isn't durable. A node of another generation
-/// or phase counts nothing.
+/// its stop; nor is a suspended row that isn't durable. The count takes no
+/// row lock, so its write re-checks the row: a node of another generation,
+/// or one that left `drained` (`:terminate` moved it on, or it was
+/// undrained), has nothing written.
 #[tokio::test(flavor = "current_thread")]
 async fn the_drained_tick_counts_each_durable_suspended_row_once_and_writes_no_sandbox_row()
 -> TestResult {
@@ -802,15 +805,16 @@ async fn the_drained_tick_counts_each_durable_suspended_row_once_and_writes_no_s
 
     count_v2_drained_evacuations(pool, node_id, 7).await?;
     assert_eq!(total().await?, expected, "counted again, added nothing");
-    for (generation, phase) in [(8, "drained"), (7, "terminating")] {
-        let other = v2_node(pool, Some(phase), done(7, serde_json::json!({}))).await?;
+    for (generation, phase) in [(8, Some("drained")), (7, Some("terminating")), (7, None)] {
+        let other = v2_node(pool, phase, done(7, serde_json::json!({}))).await?;
         let row = sandbox(pool, "suspended", Some(other)).await?;
         durable(pool, row).await?;
-        assert!(
-            count_v2_drained_evacuations(pool, other, generation)
-                .await?
-                .is_empty(),
-            "{phase} under {generation}"
+        let before = columns(pool, other).await?;
+        count_v2_drained_evacuations(pool, other, generation).await?;
+        assert_eq!(
+            columns(pool, other).await?,
+            before,
+            "{phase:?} under {generation}: nothing written"
         );
     }
     Ok(())
@@ -819,8 +823,10 @@ async fn the_drained_tick_counts_each_durable_suspended_row_once_and_writes_no_s
 /// The terminate transaction fences only its generation's unfenced
 /// `terminating` node with a recorded instance, after its reference
 /// cleanup: the durably suspended rows naming it released, their executions
-/// retired. A row or execution that still names it holds the fence,
-/// recorded in `drain_last_error`, while the cleanup it ran commits.
+/// retired, and counted in `evacuated_total`, though no drained tick ran
+/// before the terminate. A row or execution that still names it holds the
+/// fence, recorded in `drain_last_error`, while the cleanup it ran commits,
+/// its count included.
 #[tokio::test(flavor = "current_thread")]
 async fn the_terminate_transaction_fences_only_an_empty_node() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -924,6 +930,8 @@ async fn the_terminate_transaction_fences_only_an_empty_node() -> TestResult {
             .fetch_one(pool)
             .await?;
             assert_eq!((active, target), (None, None), "{case}: released");
+            let status = StoredV2Status::from_column(stored.as_ref())?.ok_or("status")?;
+            assert_eq!(status.evacuated_total, [id.to_string()], "{case}: counted");
         }
     }
     Ok(())

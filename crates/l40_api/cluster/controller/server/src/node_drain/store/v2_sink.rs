@@ -77,38 +77,36 @@ async fn lock_v2_node(
         .map_err(sqlx::Error::from)
 }
 
-/// Add every durable row still homed on the `drained` v2 node under
-/// `generation` to the drain's `evacuated_total`, under the node's row lock:
-/// its suspended rows whose state a durable snapshot holds
-/// ([`pplx_space_sandbox_store::drain_terminate::durable_suspended_rows_naming`]).
-/// A v2 drain never moves a stopped sandbox, so none is counted. A
-/// `drain_status` write only, made only when a row isn't counted yet; no
-/// sandbox row is written. Returns the ids the set holds now of those rows;
-/// none for a row that is no longer that generation's `drained` node.
+/// Add every row still naming the `drained` v2 node under `generation` that
+/// the terminate would release to the drain's `evacuated_total`: its
+/// suspended rows whose state a durable snapshot holds and whose restore or
+/// activation isn't in flight
+/// ([`pplx_space_sandbox_store::drain_terminate::releasable_suspended_rows_naming`]).
+/// A v2 drain never moves a stopped sandbox, so none is counted. It takes
+/// no row lock: the read is a plain read, and the write re-checks that the
+/// row is still that generation's `drained` node
+/// ([`add_v2_evacuated`]). A `drain_status` write only, made only when a row
+/// isn't counted yet; no sandbox row is written. Returns the ids it found,
+/// which a row no longer that generation's `drained` node didn't add.
 pub(crate) async fn count_v2_drained_evacuations(
     pool: &PgPool,
     node_id: NodeId,
     generation: i64,
 ) -> Result<Vec<SandboxId>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let Some(node) = lock_v2_node(&mut tx, node_id).await? else {
-        return Ok(Vec::new());
-    };
-    if !node.is_v2("drained", generation) {
-        return Ok(Vec::new());
-    }
-    let durable =
-        pplx_space_sandbox_store::drain_terminate::durable_suspended_rows_naming(&mut *tx, node_id)
-            .await?;
+    let releasable = pplx_space_sandbox_store::drain_terminate::releasable_suspended_rows_naming(
+        pool,
+        node_id,
+        execution_ownership_ttl_secs(),
+    )
+    .await?;
     // The node evicts a durable copy on its own, and one it evicted before a
     // report named it evacuated leaves the report: these rows are the
     // count's only witness of it.
-    if !durable.is_empty() {
-        let ids: Vec<String> = durable.iter().map(ToString::to_string).collect();
-        add_v2_evacuated(&mut *tx, node_id, generation, &ids).await?;
+    if !releasable.is_empty() {
+        let ids: Vec<String> = releasable.iter().map(ToString::to_string).collect();
+        add_v2_evacuated(pool, node_id, generation, "drained", &ids).await?;
     }
-    tx.commit().await?;
-    Ok(durable)
+    Ok(releasable)
 }
 
 /// The terminate transaction of the v2 node under `generation`, under its
@@ -118,12 +116,14 @@ pub(crate) async fn count_v2_drained_evacuations(
 /// need the node, the only sandbox-row writes the v2 loop makes: the
 /// durable suspended rows naming it are released
 /// ([`pplx_space_sandbox_store::drain_terminate::release_durable_suspended`]),
-/// each with its execution on the node retired. Then nothing may name the
+/// each with its execution on the node retired, and added to the drain's
+/// `evacuated_total`, so a row the node evicted before any report or
+/// drained tick named it is counted too. Then nothing may name the
 /// node any more (the require-empty predicate,
 /// [`pplx_space_sandbox_store::drain_terminate::node_references`]), and
 /// `drain_status.terminate_instance` records `node_k8s.instance_id`, the
 /// instance to terminate. A refusal of the predicate records what holds the
-/// node in `drain_last_error` and commits the cleanup. A v2 drain never
+/// node in `drain_last_error` and commits the cleanup, the count included. A v2 drain never
 /// moves a stopped sandbox: the node reports one pending, so the fresh check
 /// never lets this run while the node holds one, and a stopped row that
 /// still names the node holds it like any other reference.
@@ -142,13 +142,17 @@ pub(crate) async fn fence_v2_node(
     let Some(instance_id) = node.instance_id else {
         return Ok(Fence::NoInstance);
     };
-    pplx_space_sandbox_store::drain_terminate::release_durable_suspended(
+    let released = pplx_space_sandbox_store::drain_terminate::release_durable_suspended(
         &mut *tx,
         node_id,
         node.k8s_node_name.as_deref(),
         execution_ownership_ttl_secs(),
     )
     .await?;
+    if !released.is_empty() {
+        let ids: Vec<String> = released.iter().map(ToString::to_string).collect();
+        add_v2_evacuated(&mut *tx, node_id, generation, "terminating", &ids).await?;
+    }
     let references = pplx_space_sandbox_store::drain_terminate::node_references(
         &mut *tx,
         node_id,

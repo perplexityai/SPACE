@@ -107,8 +107,9 @@ impl V2Node {
     }
 }
 
-/// Add every durably suspended row still homed on a `drained` node to its drain's
-/// `evacuated_total`: a `drain_status` write only.
+/// Add every row still naming a `drained` node that the terminate would
+/// release (suspended, durable, no restore or activation in flight) to its
+/// drain's `evacuated_total`: a `drain_status` write only.
 pub(super) async fn count_drained<S: DrainV2Sink>(sink: &S, node_id: NodeId, generation: u64) {
     if let Err(error) = sink.count_drained_evacuations(node_id, generation).await {
         sink.record_error(
