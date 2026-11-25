@@ -2413,13 +2413,21 @@ pub(crate) mod service_tests {
         use pplx_space_sandbox_model::SandboxTransitionReceiptKind;
         // Exercise the real Wake join before dropping all request/service state.
         // The NULL injection models carrying B only in volatile request memory.
+        // The test models a process restart, not a host crash, so neither
+        // connection needs SQLite's per-commit fsyncs, which wait behind every
+        // other writer on a busy disk.
+        let open = |path: &std::path::Path| {
+            let conn = crate::db::Connection::open_at(path).unwrap();
+            conn.pragma_update(None, "synchronous", "OFF").unwrap();
+            conn
+        };
         for (persist_operation, allocated) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("manager.sqlite");
-            let mut conn = crate::db::Connection::open_at(&path).unwrap();
-            crate::db::create_test_schema(&mut conn);
+            crate::db::create_test_schema_on_disk(&path);
+            let conn = open(&path);
             let sandbox_id = SandboxId::new();
             let id = sandbox_id.to_string();
             insert_test_sandbox(&conn, &id, SandboxState::Stopped);
@@ -2491,8 +2499,7 @@ pub(crate) mod service_tests {
                     .unwrap();
             }
             drop(service);
-            let recovered =
-                service_for_teardown_test(crate::db::Connection::open_at(&path).unwrap());
+            let recovered = service_for_teardown_test(open(&path));
             recovered
                 .recover_interrupted_startup_states()
                 .await
