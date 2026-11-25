@@ -526,24 +526,21 @@ impl SandboxManagerService {
         // admitted stop holds a producer token until its state write commits:
         // it takes only the wake lock, which a drain's artifact-lock confirm
         // doesn't exclude, so a drain that seals the node meanwhile reports
-        // the sandbox pending instead of finding it where it was. An idle
-        // suspend isn't held, since the drain wants it. The node's Stop RPC
-        // isn't refused: the Kubernetes teardown calls it first in every
-        // delete.
-        let idle_stop = if action == AutoLifecycleIdleAction::Stop {
-            let admitted = match sandbox.state.unowned() {
-                Some(SandboxState::Suspended) => self
-                    .activation_seal
-                    .admit_producer("idle auto-stop", &sandbox.id, false)
-                    .map(Some),
-                Some(SandboxState::Started | SandboxState::Paused) => self
-                    .activation_seal
-                    .admit_stop_of_vm("idle auto-stop", &sandbox.id)
-                    .map(Some),
-                _ => Ok(None),
-            };
-            match admitted {
-                Ok(token) => token,
+        // the sandbox pending instead of finding it where it was. The stop
+        // leaves the sandbox without a VM, so it asks as a producer for a
+        // sandbox with none. An idle suspend isn't held, since the drain
+        // wants it. The node's Stop RPC isn't refused: the Kubernetes
+        // teardown calls it first in every delete.
+        let idle_stop = if action == AutoLifecycleIdleAction::Stop
+            && matches!(
+                sandbox.state.unowned(),
+                Some(SandboxState::Suspended | SandboxState::Started | SandboxState::Paused)
+            ) {
+            match self
+                .activation_seal
+                .admit_producer("idle auto-stop", &sandbox.id, false)
+            {
+                Ok(token) => Some(token),
                 Err(sealed) => {
                     tracing::debug!(
                         sandbox_id = %sandbox.id,

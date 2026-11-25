@@ -555,12 +555,12 @@ fn a_sealed_node_refuses_only_the_producers_of_sandboxes_without_a_vm() {
     unknown.assert_quiesced();
 }
 
-/// The admission of work that would leave a sandbox without a VM stopped,
-/// the idle auto-stop of a suspended sandbox, which asks as a producer of a
-/// sandbox without a VM: a node known sealed refuses it with the sealed
-/// refusal and counts nothing; a node never sealed, cancelled or whose seal
-/// row can't be read admits it, and counts it in flight until its token is
-/// dropped.
+/// The admission of work that would leave a sandbox stopped, the idle
+/// auto-stop of a suspended, started or paused sandbox, which asks as a
+/// producer of a sandbox without a VM: a node known sealed refuses it with
+/// the sealed refusal and counts nothing; a node never sealed, cancelled or
+/// whose seal row can't be read admits it, and counts it in flight until its
+/// token is dropped.
 #[test]
 fn a_sealed_node_refuses_work_that_would_leave_a_sandbox_stopped() {
     let db = SharedConnection::new(crate::db::test_conn());
@@ -594,46 +594,6 @@ fn a_sealed_node_refuses_work_that_would_leave_a_sandbox_stopped() {
     let admitted = unknown
         .admit_producer("idle auto-stop", SANDBOX, false)
         .unwrap();
-    assert_eq!(unknown.status().producers_in_flight, [SANDBOX]);
-    drop(admitted);
-    unknown.assert_quiesced();
-}
-
-/// The admission of work that would stop a sandbox with a VM and leave it
-/// stopped, the idle auto-stop of a started or paused sandbox: a node known
-/// sealed refuses it with the sealed refusal, though the sandbox has a VM,
-/// and counts nothing; a node never sealed, cancelled or whose seal row can't
-/// be read admits it, and counts it in flight as a producer until its token
-/// is dropped, so a seal that lands meanwhile finds it.
-#[test]
-fn a_sealed_node_refuses_work_that_would_stop_a_vm() {
-    let db = SharedConnection::new(crate::db::test_conn());
-    let seal = ActivationSeal::load(&db.lock().unwrap());
-    let admitted = seal.admit_stop_of_vm("idle auto-stop", SANDBOX).unwrap();
-    seal.seal(&db, 3).unwrap();
-    let status = seal.status();
-    assert_eq!(status.producers_in_flight, [SANDBOX]);
-    assert!(status.in_flight.is_empty());
-    drop(admitted);
-    seal.assert_quiesced();
-    let refused = seal
-        .admit_stop_of_vm("idle auto-stop", SANDBOX)
-        .unwrap_err();
-    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        refused.message().starts_with(ACTIVATIONS_SEALED_MARKER)
-            && refused.message().contains("idle auto-stop"),
-        "{refused:?}"
-    );
-    seal.assert_quiesced();
-    seal.unseal(&db, 3).unwrap();
-    drop(seal.admit_stop_of_vm("idle auto-stop", SANDBOX).unwrap());
-    seal.assert_quiesced();
-
-    hide_seal_table(&db);
-    let unknown = ActivationSeal::load(&db.lock().unwrap());
-    assert!(unknown.read_error().is_some());
-    let admitted = unknown.admit_stop_of_vm("idle auto-stop", SANDBOX).unwrap();
     assert_eq!(unknown.status().producers_in_flight, [SANDBOX]);
     drop(admitted);
     unknown.assert_quiesced();
